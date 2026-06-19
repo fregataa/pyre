@@ -2040,6 +2040,9 @@ impl Optimization for OptRewrite {
                                     op: source_box,
                                     invented_name: false,
                                     preamble_op: std::rc::Rc::new(replay),
+                                    // Non-invented loop-invariant producer: the
+                                    // SameAs arm is never taken, so no source.
+                                    same_as_source: None,
                                 }),
                             );
                         }
@@ -2258,10 +2261,10 @@ impl Optimization for OptRewrite {
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        _ctx: &mut OptContext,
+        ctx: &mut OptContext,
     ) {
         for (_, op) in &self.loop_invariant_producer {
-            sb.add_loopinvariant_op(op.clone());
+            sb.add_loopinvariant_op(ctx, op.clone());
         }
     }
 

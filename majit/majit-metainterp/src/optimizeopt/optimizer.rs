@@ -67,12 +67,13 @@ pub struct Optimizer {
     last_guard_op_idx: Option<usize>,
     /// optimizer.py:241/304/632-634 `replaces_guard` — maps an emitted
     /// guard op to its replacement. RPython keys this dict by the guard
-    /// `op` object itself (object identity); pyre keys by `op.pos:
-    /// OpRef`. The parity invariant is that `alloc_op_position` issues
-    /// a fresh OpRef per emitted guard so OpRef → Op is bijective on
-    /// the guard subspace, matching RPython's object-identity keying.
-    /// No site re-uses an OpRef across distinct guard ops.
-    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Op>,
+    /// `op` object itself (object identity); pyre keys by the guard op's
+    /// canonical box (`BoxRef`, compared by `Rc::ptr_eq`), the box-identity
+    /// analog of `op is op`. Every key is resolved through
+    /// `ctx.get_box_replacement(op.pos)` so insert and lookup agree on the
+    /// canonical box. Guard ops are never Const, so the key is always a
+    /// ptr-stable ResOp box.
+    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -202,8 +203,10 @@ pub struct Optimizer {
     /// at `setup_optimizations` time.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     /// optimizer.py:246 `self._emittedoperations = {}`. Tracks the
-    /// set of OpRefs the optimizer has emitted (or that
-    /// `replace_guard_op` substituted in place of an emitted op).
+    /// set of ops the optimizer has emitted (or that `replace_guard_op`
+    /// substituted in place of an emitted op). RPython keys this set by
+    /// the op object (`op in self._emittedoperations` is identity-keyed);
+    /// pyre keys by the emitted op's canonical box (`BoxRef`, `Rc::ptr_eq`).
     /// Populated at:
     /// - `emit_operation` after `ctx.emit` (optimizer.py:674
     ///   `self._emittedoperations[op] = None` inside _emit_operation).
@@ -212,11 +215,10 @@ pub struct Optimizer {
     ///
     /// Read by `as_operation(opref, required_opnum)` (optimizer.py:369-377)
     /// which returns the opref iff it has been emitted *and* its opcode
-    /// matches the optional `required_opnum`. Used by callers that need
-    /// to verify an OpRef refers to an actually-emitted op before
-    /// reasoning about descriptor-shared guards or other emit-bound
-    /// metadata.
-    pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
+    /// matches the optional `required_opnum`. The lookup resolves the
+    /// queried opref through `ctx.get_box_replacement` so it compares the
+    /// same canonical box the insert recorded.
+    pub emitted_operations: majit_ir::vec_set::VecSet<BoxRef>,
     /// One-shot explicit `input_ops` seed for the next
     /// `optimize_with_constants_and_inputs_at` run. When `Some`, the
     /// canonical producer `Rc<Op>` slice is used directly as
@@ -1218,11 +1220,24 @@ impl Optimizer {
         self.last_guard_op_idx
     }
 
-    /// optimizer.py: notice_guard_future_condition(op)
-    /// Record that a guard at the given position should be replaced
-    /// with the given op when the future condition is realized.
-    pub fn notice_guard_future_condition(&mut self, guard_pos: OpRef, replacement: Op) {
-        self.replaces_guard.insert(guard_pos, replacement);
+    /// optimizer.py:307 replace_guard: `self.replaces_guard[op] = value.last_guard_pos`.
+    /// Record that a guard at the given position should be replaced when the
+    /// future condition is realized. PyPy keys `replaces_guard` by the raw `op`
+    /// object identity, and `_emit_operation` (optimizer.py:660) looks it up by
+    /// the raw `orig_op` — both before `get_box_replacement`. `resolve_to_boxref`
+    /// yields that producer box (chain root, before `_forwarded`), so insert and
+    /// the emit-time lookup compare the same raw box.
+    /// (The method keeps its historical name; the body performs replace_guard's
+    /// insert.)
+    pub fn notice_guard_future_condition(
+        &mut self,
+        ctx: &OptContext,
+        guard_pos: OpRef,
+        replacement: Op,
+    ) {
+        if let Some(box_ref) = ctx.resolve_to_boxref(guard_pos) {
+            self.replaces_guard.insert(box_ref, replacement);
+        }
     }
 
     /// optimizer.py:713: replace_guard_op(old_op_pos, new_op)
@@ -1232,10 +1247,18 @@ impl Optimizer {
     /// the new guard takes over the emit identity, so it must enter
     /// the emit set even though it was substituted post-hoc rather
     /// than directly emitted via `_emit_operation`.
-    pub fn replace_guard_op(&mut self, old_pos: OpRef, new_guard: Op) {
+    pub fn replace_guard_op(&mut self, ctx: &OptContext, old_pos: OpRef, new_guard: Op) {
         let new_pos = new_guard.pos.get();
-        self.replaces_guard.insert(old_pos, new_guard);
-        self.emitted_operations.insert(new_pos);
+        // replaces_guard is keyed by the raw `op` identity (optimizer.py:307),
+        // so resolve to the producer box without following `_forwarded`.
+        if let Some(box_ref) = ctx.resolve_to_boxref(old_pos) {
+            self.replaces_guard.insert(box_ref, new_guard);
+        }
+        // optimizer.py:747 `self._emittedoperations[new_op] = None` — new_op is
+        // the canonical (get_box_replacement'd) emitted op, so this insert stays
+        // canonical, matching the emit-set keying in `_emit_operation`.
+        self.emitted_operations
+            .insert(ctx.get_box_replacement(new_pos));
     }
 
     /// optimizer.py:369-377 `as_operation(op, required_opnum=-1)`:
@@ -1266,10 +1289,14 @@ impl Optimizer {
                 return None;
             }
         }
-        if self.emitted_operations.contains(&opref) {
-            Some(opref)
-        } else {
-            None
+        // optimizer.py:374 `if op in self._emittedoperations` keys by the op's
+        // own (raw) identity, not its forwarded replacement. `resolve_to_boxref`
+        // is the producer box (chain root, before `_forwarded`); the emit set is
+        // populated with the canonical box, so this matches iff the raw op is the
+        // canonical op — exactly PyPy's `op in _emittedoperations`.
+        match ctx.resolve_to_boxref(opref) {
+            Some(box_ref) if self.emitted_operations.contains(&box_ref) => Some(opref),
+            _ => None,
         }
     }
 
@@ -1637,7 +1664,8 @@ impl Optimizer {
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
     pub fn force_at_the_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let mut rec: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
+        let mut rec: majit_ir::vec_set::VecSet<crate::r#box::BoxRef> =
+            majit_ir::vec_set::VecSet::new();
         self.force_at_the_end_of_preamble_rec(opref, ctx, &mut rec)
     }
 
@@ -1645,7 +1673,7 @@ impl Optimizer {
         &mut self,
         opref: OpRef,
         ctx: &mut OptContext,
-        rec: &mut majit_ir::vec_set::VecSet<OpRef>,
+        rec: &mut majit_ir::vec_set::VecSet<crate::r#box::BoxRef>,
     ) -> OpRef {
         let resolved = ctx.get_replacement_opref(opref);
         let resolved_box = ctx.get_box_replacement_box(opref);
@@ -1683,10 +1711,16 @@ impl Optimizer {
                 | crate::optimizeopt::info::PtrInfo::VirtualArray(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)
         ) {
-            if rec.contains(&resolved) {
+            // info.py:231 `rec[self] = None` keys the recursion guard by the
+            // virtual's PtrInfo object identity; in pyre one virtual head box
+            // <-> one PtrInfo, so key by the canonical resolved box.
+            let resolved_box_key = resolved_box
+                .clone()
+                .expect("virtual PtrInfo implies a resolved box");
+            if rec.contains(&resolved_box_key) {
                 return resolved;
             }
-            rec.insert(resolved);
+            rec.insert(resolved_box_key);
             info.force_at_the_end_of_preamble(|child| {
                 self.force_at_the_end_of_preamble_rec(child, ctx, rec)
             });
@@ -3262,17 +3296,18 @@ impl Optimizer {
                     if arg.is_constant() {
                         continue;
                     }
-                    if let Some(&new_pos) = remap.get(&arg.raw()) {
-                        // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0 fires
-                        // across check.py corpus + lib tests) — every
-                        // non-const operand reaching const-compact is
-                        // producer-bound. The rewrite stays as a safety net
-                        // until the loop retires with OpRef demotion (#9).
-                        debug_assert!(
-                            false,
+                    // A non-const operand reaching const-compact is always
+                    // producer-bound (skipped by `arg_is_bound` above), so a
+                    // position-only operand at a remapped slot is unreachable
+                    // (PYRE_REMAP_PROBE 2026-06-11: 0 fires across check.py
+                    // corpus + lib tests). The #9 grind retires the
+                    // position-only rewrite; a hard guard replaces it so any
+                    // regression panics instead of silently minting a stale
+                    // position-only box.
+                    if remap.contains_key(&arg.raw()) {
+                        unreachable!(
                             "position-only non-const operand hit const-compact remap: {arg:?}"
                         );
-                        op.setarg(i, BoxRef::from_opref(arg.with_raw(new_pos)));
                     }
                 }
                 if let Some(fail_args) = op.fail_args.borrow_mut().as_mut() {
@@ -3286,18 +3321,11 @@ impl Optimizer {
                             continue;
                         }
                         let arg_opref = arg.to_opref();
-                        if !arg_opref.is_constant() {
-                            if let Some(&new_pos) = remap.get(&arg_opref.raw()) {
-                                // Measured dead, same evidence as the args
-                                // loop above.
-                                debug_assert!(
-                                    false,
-                                    "position-only failarg hit const-compact remap: {arg_opref:?}"
-                                );
-                                *arg = majit_ir::operand::Operand::from_boxref(
-                                    &BoxRef::from_opref(arg_opref.with_raw(new_pos)),
-                                );
-                            }
+                        // Unreachable, same evidence as the args loop above.
+                        if !arg_opref.is_constant() && remap.contains_key(&arg_opref.raw()) {
+                            unreachable!(
+                                "position-only failarg hit const-compact remap: {arg_opref:?}"
+                            );
                         }
                     }
                 }
@@ -3330,8 +3358,23 @@ impl Optimizer {
                     remap_opref(&mut opref);
                     *arg = crate::r#box::BoxRef::from_opref(opref);
                 };
-                for arg in &mut state.next_iteration_args {
-                    remap_boxref(arg);
+                // next_iteration_args now carries the canonical Phase-1 boxes that
+                // double as exported_infos keys. Remap by `set_position` (as
+                // short_inputargs below) to preserve box identity across
+                // compaction: a `from_opref` re-mint would sever the ptr_eq carry
+                // that import_state's exported_infos lookup depends on.
+                for arg in &state.next_iteration_args {
+                    let opref = arg.to_opref();
+                    // Const args carry their value inline (no body position):
+                    // `set_position` is a Const no-op and `opref.raw()` panics on
+                    // an inline-Const OpRef, so skip them. Their Rc identity (the
+                    // exported_infos key) is preserved untouched.
+                    if opref.is_constant() {
+                        continue;
+                    }
+                    let mut opref = opref;
+                    remap_opref(&mut opref);
+                    arg.set_position(opref.raw());
                 }
                 for arg in &mut state.end_args {
                     remap_boxref(arg);
@@ -3348,19 +3391,13 @@ impl Optimizer {
                     remap_opref(&mut opref);
                     arg.set_position(opref.raw());
                 }
-                // Remap exported_infos keys (Const keys pass through)
-                let old_infos = std::mem::take(&mut state.exported_infos);
-                for (key, value) in old_infos {
-                    let new_key = if key.is_constant() {
-                        key
-                    } else {
-                        remap
-                            .get(&key.raw())
-                            .map(|&p| key.with_raw(p))
-                            .unwrap_or(key)
-                    };
-                    state.exported_infos.insert(new_key, value);
-                }
+                // exported_infos is keyed by box identity (Rc::ptr_eq), so its keys
+                // need NO position remap — the lookup matches by Rc, not OpRef. The
+                // keys are the same Rcs as next_iteration_args (for end_args) /
+                // bound producer boxes (for label/short-box args), whose positions
+                // already moved through the shared set_position Cell above; a
+                // mem::take + re-insert under a remapped OpRef would only re-mint
+                // fresh non-ptr_eq keys and break the carry.
                 // Remap exported short boxes
                 for entry in &mut state.exported_short_boxes {
                     // Cell::get() returns a copy; the previous
@@ -3382,15 +3419,16 @@ impl Optimizer {
                         let mut arg = entry.op.arg(i).to_opref();
                         let pre = arg;
                         remap_opref(&mut arg);
-                        // Measured dead (PYRE_REMAP_PROBE 2026-06-11): no
-                        // position-only exported-short-box operand was ever
-                        // remapped; rewrite kept as a safety net until the
-                        // loop retires with OpRef demotion (#9).
-                        debug_assert!(
+                        // A position-only exported-short-box operand is never
+                        // remapped (PYRE_REMAP_PROBE 2026-06-11: 0 fires), so
+                        // its frozen position stays valid and needs no rewrite.
+                        // A hard guard replaces the position-only re-mint (#9):
+                        // any regression panics instead of silently leaving a
+                        // stale position.
+                        assert!(
                             arg == pre,
                             "position-only exported-short-box arg remapped: {pre:?}"
                         );
-                        entry.op.setarg(i, BoxRef::from_opref(arg));
                     }
                     if let Some(fa) = entry.op.fail_args.borrow_mut().as_mut() {
                         for arg in fa.iter_mut() {
@@ -3403,14 +3441,13 @@ impl Optimizer {
                             let mut arg_opref = arg.to_opref();
                             let pre = arg_opref;
                             remap_opref(&mut arg_opref);
-                            // Measured dead, same evidence as the args loop.
-                            debug_assert!(
+                            // Never remapped (same evidence) — frozen position
+                            // stays valid, no rewrite; a hard guard replaces the
+                            // position-only re-mint (#9).
+                            assert!(
                                 arg_opref == pre,
                                 "position-only exported-short-box failarg remapped: {pre:?}"
                             );
-                            *arg = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(
-                                arg_opref,
-                            ));
                         }
                     }
                     // same_as_source: same rule as res below — the stored
@@ -4244,8 +4281,14 @@ impl Optimizer {
             // and clears it.
 
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
+            // optimizer.py:660 `orig_op in self.replaces_guard` keys by the raw
+            // `orig_op` identity (before get_box_replacement), so resolve to the
+            // producer box without following `_forwarded`.
             if self.can_replace_guards {
-                if let Some(replacement) = self.replaces_guard.remove(&op.pos.get()) {
+                if let Some(replacement) = ctx
+                    .resolve_to_boxref(op.pos.get())
+                    .and_then(|box_ref| self.replaces_guard.remove(&box_ref))
+                {
                     let target_pos = replacement.pos.get().raw() as usize;
                     if target_pos < ctx.new_operations.len() {
                         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -4327,8 +4370,10 @@ impl Optimizer {
         // optimizer.py:674 `self._emittedoperations[op] = None` — record
         // the freshly emitted op so `as_operation` can later confirm it
         // is in the emit set before downstream callers reason about
-        // descriptor-sharing or other emit-bound state.
-        self.emitted_operations.insert(emitted);
+        // descriptor-sharing or other emit-bound state. Keyed by the
+        // emitted op's canonical box (the box-identity analog of `op`).
+        self.emitted_operations
+            .insert(ctx.get_box_replacement(emitted));
         // optimizer.py:84-92 `_emit_operation` clears the REMOVED
         // sentinel on each successful emit. Cross-pass readers
         // (rewrite.py:712-718 `optimize_GUARD_NO_EXCEPTION`) see the
@@ -6497,6 +6542,7 @@ mod tests {
                     op.pos.set(OpRef::op_typed(14, op.result_type()));
                     std::rc::Rc::new(op)
                 },
+                same_as_source: None,
             },
         );
 

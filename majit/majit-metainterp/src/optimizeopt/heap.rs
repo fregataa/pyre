@@ -405,7 +405,7 @@ impl CachedField {
             let mut op =
                 Op::with_descr(opcode, &[ctx.materialize_box_at(structbox)], descr.clone());
             op.pos.set(cached_val);
-            sb.add_heap_op(op);
+            sb.add_heap_op(ctx, op);
         }
     }
 }
@@ -654,7 +654,7 @@ impl ArrayCachedItem {
             let idx_b = ctx.materialize_box_at(idx_ref);
             let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
             op.pos.set(cached_val);
-            sb.add_heap_op(op);
+            sb.add_heap_op(ctx, op);
         }
     }
 }
@@ -1669,14 +1669,18 @@ impl OptHeap {
             .map(|arg| ctx.resolve_box_box(&arg).to_opref())
             .collect();
         while let Some(owner) = stack.pop() {
+            // heap.py:173-174 resolves the owner through `get_box_replacement`
+            // at every use. A dependency recorded in `heapc_deps` carries the
+            // box that was canonical at escape time; its producer can be
+            // forwarded afterwards (`make_equal_to`), so re-resolve here before
+            // the dedup and the owner record, mirroring the canonical seed args.
+            let owner = ctx.get_replacement_opref(owner);
             if owners.contains(&owner) {
                 continue;
             }
             owners.push(owner);
             if let Some(owner_box) = ctx.get_box_replacement_box(owner) {
                 if let Some(deps) = self.heapc_deps.get(&owner_box) {
-                    // deps were stored as canonical boxes at escape_from_write,
-                    // so the position view is already the canonical OpRef.
                     stack.extend(deps.iter().map(|dep| dep.to_opref()));
                 }
             }
@@ -4077,6 +4081,7 @@ mod tests {
                     op: BoxRef::from_opref(source),
                     invented_name: false,
                     preamble_op: std::rc::Rc::new(preamble_op),
+                    same_as_source: None,
                 },
             );
         })
