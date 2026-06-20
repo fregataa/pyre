@@ -492,6 +492,15 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         // `__builtin__.int/float/bool` / `lltype.cast_*` /
         // `rarithmetic.intmask` / `rarithmetic.r_uint`.
         "same_as" => Ok("same_as".to_string()),
+        // `str` — RPython `add_operator('str', 1, ..)` (`operation.py`),
+        // dispatched at `rtyper.rs "str" => rtype_str` into the per-repr
+        // `ll_str` lowering and annotated `SomeString` (`unaryop.rs str =>
+        // SomeString()`).  `front::mir`'s `format!`-chain expansion
+        // (`collapse_fmt_chains`) renders each `{}` placeholder argument
+        // with `OpKind::UnaryOp { op: "str", .. }` — the orthodox
+        // string-build lowering (`str(arg)` ++ `ll_strconcat`) in place of
+        // the graph-less `fmt::rt::Argument::new_display` chain.
+        "str" => Ok("str".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
              flowspace counterpart (operation.py:465-474 registers \
@@ -686,21 +695,11 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.
         kind if is_str_const_define(kind) => false,
-        // The `hint_promote` / `hint_promote_or_string` markers lower to
-        // a non-raising `same_as(arg)` (`rtyper.py:478-481` internal
-        // renaming) in `translate_op` — they emit no raising op.  Matched
-        // before the general `Call` arm, same as the elisions above.
-        OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
-            ..
-        } if segments.len() == 1
-            && matches!(
-                segments[0].as_str(),
-                "hint_promote" | "hint_promote_or_string"
-            ) =>
-        {
-            false
-        }
+        // A `hint(x, **kwds)` op (`OpKind::Hint`) lowers to a non-raising
+        // `same_as(value)` (`rtyper.py:478-481` internal renaming) in
+        // `translate_op` — it emits no raising op.  Matched before the
+        // general `Call` arm, same as the elisions above.
+        OpKind::Hint { .. } => false,
         // `core::cmp::{eq..ge}` / `core::slice::{len,iter}` /
         // `core::num::wrapping_mul` lower to pure, non-raising flowspace
         // ops (see `nonraising_core_bridge_opname`); classify the
@@ -817,6 +816,19 @@ pub fn translate_op(
         | OpKind::GuardFalse { .. }
         | OpKind::GuardValue { .. }
         | OpKind::VableForce { .. } => Ok(Vec::new()),
+
+        // `hint(x, **kwds)` (`OpKind::Hint`) is an identity outside the JIT:
+        // the flowspace oracle types its result as `same_as(value)` — the
+        // `rtyper.py:478-481` internal-renaming op — exactly as RPython's
+        // `hint` op is a no-op in the genc/non-JIT build, while the JIT
+        // codewriter (`jtransform::rewrite_op_hint`) is what rewrites it to
+        // the `<kind>_guard_value` family.  `jit::promote(x)` and
+        // `#[elidable_promote]`'s `hint_promote_or_string` both land here.
+        OpKind::Hint { value, .. } => {
+            let value_hl = lookup_operand(value_map, value, op, "value")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("same_as", vec![value_hl], result)])
+        }
 
         // ─── pyre-only `OpKind::Abort` marker ───
         // Front-end `lower_expr::stop_unsupported` / `continue_with_unknown`
@@ -1177,52 +1189,6 @@ pub fn translate_op(
                 // by the registry) and routes through
                 // `FunctionRepr::call(hop)` (`rpbc.py:199`).
                 CallTarget::FunctionPath { segments } => {
-                    // `hint_promote_or_string` is a synthesised marker
-                    // emitted by the frontend when the elidable_promote
-                    // decorator wraps a function — it inserts
-                    // `let __self_promoted = hint_promote_or_string(self);`
-                    // for each promoted arg.  Upstream RPython
-                    // `rlib/jit.py:191-194` lifts this through a host
-                    // function that, in non-JIT contexts, is an identity
-                    // (`hint(x, promote_string=True)` returns `x`).  The
-                    // marker has no source-level implementation in pyre,
-                    // so the registry can never resolve it; lower it here
-                    // as `same_as(arg)` — the RPython internal renaming
-                    // op (`rtyper.py:478-481`) the rtyper already
-                    // handles via `rbuiltin::rtype_same_as`.  Tracing-
-                    // time JIT promotion semantics still get applied via
-                    // the wrapper's outer call structure and the rtyper-
-                    // side `hint` op recognition (`rtyper.rs:2033 "hint"`
-                    // arm); the inner identity is all the marker
-                    // contributes outside the JIT lift.
-                    if segments.len() == 1 && segments[0] == "hint_promote_or_string" {
-                        let mut iter = arg_hls.into_iter();
-                        let arg = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "hint_promote_or_string requires at least one arg".to_string(),
-                            )
-                        })?;
-                        return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
-                    }
-                    // `hint_promote` is the `front::mir` marker for
-                    // `jit::promote(x)` = `hint(x, promote=True)`
-                    // (`rlib/jit.py:101`).  As with `hint_promote_or_string`
-                    // above, the marker has no registry entry; lower it to
-                    // `same_as(arg)` (`rtyper.py:478-481` internal renaming)
-                    // so the dual-gate real path types the result as the
-                    // arg's repr instead of skipping.  The residual
-                    // `OpKind::Call` survives untouched into `jtransform`,
-                    // where `rewrite_op_hint` emits the
-                    // `<kind>_guard_value` family (`jtransform.py:608-614`).
-                    if segments.len() == 1 && segments[0] == "hint_promote" {
-                        let mut iter = arg_hls.into_iter();
-                        let arg = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "hint_promote requires at least one arg".to_string(),
-                            )
-                        })?;
-                        return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
-                    }
                     // `core` method spellings of upstream operations:
                     // pyre source writes `a.min(b)` /
                     // `a != b`-via-`PartialEq::ne` / `v.len()` /
@@ -1344,35 +1310,43 @@ pub fn translate_op(
                         ))));
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
-                    // `<[T]>::len(slice)` — the slice-receiver `.len()`
-                    // method call.  Rust lowers `slice.len()` to a MIR
-                    // call to `core::slice::<impl [T]>::len`, not to the
-                    // `Rvalue::Len` that `front/mir.rs` lowers to a
-                    // `__len` synthetic.  There is no source body for the
-                    // intrinsic to register, so route it to the rtyper's
-                    // `len` operation (`rtyper.rs:2016 "len" arm` →
-                    // `Repr.rtype_len`), the same dispatch upstream
+                    // The `len` operation in its three spellings: the
+                    // `__len` synthetic `front/mir.rs` lowers `Rvalue::Len`
+                    // (and the `<str>::is_empty` decomposition) to; the
+                    // slice-receiver `core::slice::<Impl>::len`; and the
+                    // `<str>::len` method.  Rust lowers `slice.len()` /
+                    // `s.len()` to MIR calls to those intrinsics, which
+                    // have no source body to register.  Route all three to
+                    // the rtyper's `len` operation (`rtyper.rs:2016 "len"
+                    // arm` → `Repr.rtype_len`), the same dispatch upstream
                     // `op.len(v)` reaches via `unaryop.py:867-870`.  The
-                    // receiver annotates as `SomeList` (slices map to
-                    // `SomeList` in `bookkeeper`), so `rtype_len` lands on
-                    // the list repr's `ll_length` lowering.
-                    if segments.len() == 4
-                        && segments[0] == "core"
-                        && segments[1] == "slice"
-                        && segments[2] == "<Impl>"
-                        && segments[3] == "len"
-                    {
+                    // rtyper dispatches on the receiver repr: a slice maps
+                    // to `SomeList` (`ll_length`), a `&str` to `SomeString`
+                    // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
+                    // is registered as an opname graph and lowered to the
+                    // `strlen`/`arraylen_gc` blackhole op
+                    // (`jit_codewriter::jtransform_opname::lower_graph`), so
+                    // these are real `len` ops, not symbolic residuals.
+                    let is_len_op = (segments.len() == 1 && segments[0] == "__len")
+                        || (segments.len() == 4
+                            && segments[0] == "core"
+                            && segments[1] == "slice"
+                            && segments[2] == "<Impl>"
+                            && segments[3] == "len")
+                        || (segments.len() >= 3
+                            && segments[segments.len() - 3] == "str"
+                            && segments[segments.len() - 2] == "<Impl>"
+                            && segments[segments.len() - 1] == "len");
+                    if is_len_op {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
-                                "core::slice::<Impl>::len requires exactly one receiver arg, got {}",
+                                "len operation requires exactly one receiver arg, got {}",
                                 arg_hls.len()
                             )));
                         }
                         let mut iter = arg_hls.into_iter();
                         let arg = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "core::slice::<Impl>::len requires a receiver arg".to_string(),
-                            )
+                            TyperError::message("len operation requires a receiver arg".to_string())
                         })?;
                         return Ok(vec![FlowspaceOp::new("len", vec![arg], result)]);
                     }
@@ -1792,6 +1766,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::Input { .. } => "Input",
         OpKind::ConstInt(_) => "ConstInt",
         OpKind::ConstBool(_) => "ConstBool",
+        OpKind::ConstSymbolic { .. } => "ConstSymbolic",
         OpKind::ConstFloat(_) => "ConstFloat",
         OpKind::FieldRead { .. } => "FieldRead",
         OpKind::FieldWrite { .. } => "FieldWrite",
