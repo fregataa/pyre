@@ -3055,6 +3055,12 @@ fn init_dict_view_values_type(ns: &mut DictStorage) {
 ///     hasn't ported.
 fn init_pytraceback_type(ns: &mut DictStorage) {
     // pytraceback.py:45-49 descr_get_tb_lasti / descr_set_tb_lasti.
+    //
+    // pyre stores `lasti` as an instruction-unit index (`PyFrame.last_instr`
+    // increments by 1 per instruction), whereas CPython's `tb_lasti` is a
+    // byte offset (2 bytes per code unit).  Report the byte-offset form so
+    // `code.co_positions()` consumers — `traceback._get_code_position` does
+    // `instruction_index // 2` — recover the right instruction.
     let lasti_getter = make_builtin_function_with_arity(
         "tb_lasti",
         |args| {
@@ -3063,7 +3069,7 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(tb) };
-            Ok(pyre_object::w_int_new(lasti))
+            Ok(pyre_object::w_int_new(lasti * 2))
         },
         2,
     );
@@ -3075,8 +3081,9 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
             if tb.is_null() {
                 return Ok(pyre_object::w_none());
             }
+            // Inverse of the getter: incoming byte offset → instruction index.
             let v = crate::baseobjspace::int_w(w_value)?;
-            unsafe { crate::pytraceback::w_pytraceback_set_lasti(tb, v) };
+            unsafe { crate::pytraceback::w_pytraceback_set_lasti(tb, v / 2) };
             Ok(pyre_object::w_none())
         },
         3,
@@ -3177,14 +3184,26 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
         make_getset_property_named(next_getter, next_setter, pyre_object::PY_NULL, "tb_next"),
     );
 
-    // pytraceback.py:34 descr_get_tb_frame — placeholder returning
-    // None until `PyFrame` grows a `PyObject` header.  Convergence
-    // path documented in `pytraceback.rs`.
+    // pytraceback.py:34 descr_get_tb_frame — `PyFrame` is not a
+    // Python-visible W_Root, so return a `sys.namespace` frame stub
+    // built from the data the traceback retains (`w_code` + stamped
+    // line number).  Convergence path documented in `pytraceback.rs`.
     let frame_getter = make_builtin_function_with_arity(
         "tb_frame",
         |args| {
-            let _tb = args[1];
-            Ok(pyre_object::w_none())
+            let tb = args[1];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let (w_code, lineno) = unsafe {
+                (
+                    crate::pytraceback::w_pytraceback_get_w_code(tb),
+                    crate::pytraceback::w_pytraceback_get_lineno(tb),
+                )
+            };
+            Ok(crate::module::sys::interp_sys::make_traceback_frame_stub(
+                w_code, lineno,
+            ))
         },
         2,
     );
@@ -5828,6 +5847,56 @@ fn init_code_type(ns: &mut DictStorage) {
             },
             2,
         )),
+    );
+    // code.co_positions() — PEP 657 per-instruction source positions
+    // (`pycode.py` exposes `co_positions` via `co_positions_iterator`).
+    // Yields one `(start_line, end_line, start_col, end_col)` tuple per
+    // instruction from the decoded `CodeObject.locations` table.
+    // `traceback._get_code_position` indexes the result at `tb_lasti // 2`,
+    // so the `tb_lasti` getter reports the byte-offset form
+    // (`2 * instruction_index`) to land on the same entry.
+    //
+    // The column fields are reported as `None`: pyre lacks the
+    // `compile(PyCF_ONLY_AST)` AST surface that `traceback`'s 3.14 caret
+    // anchoring (`_should_show_carets` / `_byte_offset_to_character_offset`)
+    // re-parses, and a `None` column makes `format_frame_summary`
+    // (`traceback.py:556-561`) take the column-free single-line branch —
+    // the same graceful degradation CPython uses when range info is absent
+    // (`-X no_debug_ranges`).  Line numbers stay exact.
+    dict_storage_store(
+        ns,
+        "co_positions",
+        make_builtin_function("co_positions", |args| {
+            let w_self = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            if w_self.is_null() || !unsafe { crate::pycode::is_code(w_self) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor 'co_positions' requires a 'code' object",
+                ));
+            }
+            let code_ptr =
+                unsafe { crate::pycode::w_code_get_ptr(w_self) } as *const crate::CodeObject;
+            let rows: Vec<pyre_object::PyObjectRef> = if code_ptr.is_null() {
+                Vec::new()
+            } else {
+                let code = unsafe { &*code_ptr };
+                code.locations
+                    .iter()
+                    .map(|(start, end)| {
+                        pyre_object::w_tuple_new(vec![
+                            pyre_object::w_int_new(start.line.get() as i64),
+                            pyre_object::w_int_new(end.line.get() as i64),
+                            pyre_object::w_none(),
+                            pyre_object::w_none(),
+                        ])
+                    })
+                    .collect()
+            };
+            let n = rows.len();
+            Ok(pyre_object::w_seq_iter_new(
+                pyre_object::w_list_new(rows),
+                n,
+            ))
+        }),
     );
 }
 
@@ -10256,35 +10325,46 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
 /// bytesobject.py descr_decode → stringmethods.py:196 decode_object
 pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
+    // are positional-or-keyword, so accept them from either side.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let w_encoding = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "encoding"));
+    let w_errors = pos
+        .get(2)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "errors"));
     // unicodeobject.py:1669 — encoding/errors must be str (space.text_w)
-    if args.len() >= 2
-        && !unsafe { pyre_object::is_str(args[1]) }
-        && !unsafe { pyre_object::is_none(args[1]) }
-    {
-        let tn = unsafe { (*(*args[1]).ob_type).name };
-        return Err(crate::PyError::type_error(format!(
-            "decode() argument 'encoding' must be str, not {tn}",
-        )));
+    if let Some(enc) = w_encoding {
+        if !unsafe { pyre_object::is_str(enc) } && !unsafe { pyre_object::is_none(enc) } {
+            let tn = unsafe { (*(*enc).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "decode() argument 'encoding' must be str, not {tn}",
+            )));
+        }
     }
-    if args.len() >= 3
-        && !unsafe { pyre_object::is_str(args[2]) }
-        && !unsafe { pyre_object::is_none(args[2]) }
-    {
-        let tn = unsafe { (*(*args[2]).ob_type).name };
-        return Err(crate::PyError::type_error(format!(
-            "decode() argument 'errors' must be str, not {tn}",
-        )));
+    if let Some(err) = w_errors {
+        if !unsafe { pyre_object::is_str(err) } && !unsafe { pyre_object::is_none(err) } {
+            let tn = unsafe { (*(*err).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "decode() argument 'errors' must be str, not {tn}",
+            )));
+        }
     }
-    let encoding = if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
-        unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
-    } else {
-        "utf-8".to_string()
+    let encoding = match w_encoding {
+        Some(e) if unsafe { pyre_object::is_str(e) } => unsafe {
+            pyre_object::w_str_get_value(e).to_string()
+        },
+        _ => "utf-8".to_string(),
     };
-    let errors = if args.len() >= 3 && unsafe { pyre_object::is_str(args[2]) } {
-        unsafe { pyre_object::w_str_get_value(args[2]).to_string() }
-    } else {
-        "strict".to_string()
+    let errors = match w_errors {
+        Some(e) if unsafe { pyre_object::is_str(e) } => unsafe {
+            pyre_object::w_str_get_value(e).to_string()
+        },
+        _ => "strict".to_string(),
     };
     let err_mode = errors.as_str();
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");

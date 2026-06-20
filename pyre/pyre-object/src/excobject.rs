@@ -28,6 +28,8 @@ pub static EXC_ATTRIBUTE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("Attri
 pub static EXC_RUNTIME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("RuntimeError");
 pub static EXC_STOP_ITERATION_TYPE: PyType = crate::pyobject::new_pytype("StopIteration");
 pub static EXC_IMPORT_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ImportError");
+pub static EXC_MODULE_NOT_FOUND_ERROR_TYPE: PyType =
+    crate::pyobject::new_pytype("ModuleNotFoundError");
 pub static EXC_NOT_IMPLEMENTED_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("NotImplementedError");
 pub static EXC_ASSERTION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AssertionError");
@@ -62,6 +64,9 @@ pub static EXC_LOOKUP_ERROR_TYPE: PyType = crate::pyobject::new_pytype("LookupEr
 /// W_UnicodeError = _new_exception('UnicodeError', W_ValueError, ...)`
 /// — intermediate parent for UnicodeDecodeError and UnicodeEncodeError.
 pub static EXC_UNICODE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("UnicodeError");
+/// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` — subclass
+/// of Exception raised by `compile`/`exec`/`eval`/`ast.parse`.
+pub static EXC_SYNTAX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SyntaxError");
 
 /// Per-`ExcKind` `ob_type` resolver. `w_exception_new` writes the
 /// returned pointer into the allocated `W_ExceptionObject` so the
@@ -84,6 +89,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::RuntimeError => &EXC_RUNTIME_ERROR_TYPE,
         ExcKind::StopIteration => &EXC_STOP_ITERATION_TYPE,
         ExcKind::ImportError => &EXC_IMPORT_ERROR_TYPE,
+        ExcKind::ModuleNotFoundError => &EXC_MODULE_NOT_FOUND_ERROR_TYPE,
         ExcKind::NotImplementedError => &EXC_NOT_IMPLEMENTED_ERROR_TYPE,
         ExcKind::AssertionError => &EXC_ASSERTION_ERROR_TYPE,
         ExcKind::ReferenceError => &EXC_REFERENCE_ERROR_TYPE,
@@ -99,6 +105,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::LookupError => &EXC_LOOKUP_ERROR_TYPE,
         ExcKind::UnicodeError => &EXC_UNICODE_ERROR_TYPE,
         ExcKind::UnicodeTranslateError => &EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+        ExcKind::SyntaxError => &EXC_SYNTAX_ERROR_TYPE,
     }
 }
 
@@ -178,6 +185,17 @@ pub enum ExcKind {
     /// `W_<Kind>Object` structs, one GC type id per kind with isolated
     /// layouts — would be more PyPy-orthodox but is not implemented.
     UnicodeTranslateError = 28,
+    /// Subclass of ImportError raised when a module cannot be found.
+    /// Identity-only like ImportError (no flattened per-class fields).
+    ModuleNotFoundError = 29,
+    /// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` —
+    /// raised by `compile` / `exec` / `eval` / `ast.parse` on malformed
+    /// source.  Identity-only port: a dedicated kind so `ob_type` and
+    /// `isinstance(e, SyntaxError)` discriminate it; the
+    /// `(msg, (filename, lineno, offset, text))` `__init__` and the
+    /// flattened `msg`/`filename`/`lineno`/`offset`/`text` slots remain
+    /// TODO (the generic `args_w` constructor is used for now).
+    SyntaxError = 30,
 }
 
 impl ExcKind {
@@ -543,7 +561,7 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::UnicodeTranslateError as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::SyntaxError as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
@@ -1241,6 +1259,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::OverflowError => "OverflowError",
         ExcKind::ArithmeticError => "ArithmeticError",
         ExcKind::ImportError => "ImportError",
+        ExcKind::ModuleNotFoundError => "ModuleNotFoundError",
         ExcKind::NotImplementedError => "NotImplementedError",
         ExcKind::AssertionError => "AssertionError",
         ExcKind::ReferenceError => "ReferenceError",
@@ -1256,6 +1275,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::LookupError => "LookupError",
         ExcKind::UnicodeError => "UnicodeError",
         ExcKind::UnicodeTranslateError => "UnicodeTranslateError",
+        ExcKind::SyntaxError => "SyntaxError",
     }
 }
 
@@ -1280,6 +1300,10 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
     }
     if type_name == "RuntimeError" {
         return matches!(kind, ExcKind::RuntimeError | ExcKind::RecursionError);
+    }
+    // ImportError hierarchy — ModuleNotFoundError is-a ImportError.
+    if type_name == "ImportError" {
+        return matches!(kind, ExcKind::ImportError | ExcKind::ModuleNotFoundError);
     }
     // OSError hierarchy — FileNotFoundError is-a OSError is-a Exception.
     // IOError / EnvironmentError are aliases for OSError in Python 3.
@@ -1336,6 +1360,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "OverflowError" => Some(ExcKind::OverflowError),
         "ArithmeticError" => Some(ExcKind::ArithmeticError),
         "ImportError" => Some(ExcKind::ImportError),
+        "ModuleNotFoundError" => Some(ExcKind::ModuleNotFoundError),
         "NotImplementedError" => Some(ExcKind::NotImplementedError),
         "AssertionError" => Some(ExcKind::AssertionError),
         "ReferenceError" => Some(ExcKind::ReferenceError),
@@ -1364,6 +1389,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "LookupError" => Some(ExcKind::LookupError),
         "UnicodeError" => Some(ExcKind::UnicodeError),
         "UnicodeTranslateError" => Some(ExcKind::UnicodeTranslateError),
+        "SyntaxError" => Some(ExcKind::SyntaxError),
         _ => None,
     }
 }
