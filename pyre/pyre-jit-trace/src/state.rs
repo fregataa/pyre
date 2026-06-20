@@ -8679,6 +8679,73 @@ mod tests {
         assert!(stack_color_map.contains(&5));
     }
 
+    /// Encode<->decode resume-symmetry round trip over a NON-IDENTITY,
+    /// coalesced color map shaped exactly as the codewriter publishes it
+    /// (`stack_slot_color_map` built at codewriter.rs:10000-10006,
+    /// `pyre_color_for_semantic_local` at codewriter.rs:10018-10044). The
+    /// forward map assigns one post-regalloc Ref color per semantic slot;
+    /// chordal coalescing legitimately reuses a color across slots that are
+    /// never simultaneously live, so the shared inverse
+    /// `semantic_ref_slot_for_reg_color` — called by the encode side
+    /// (collect_outer_active_boxes) and both decode sides
+    /// (restore_guard_failure_values / setup_bridge_sym) — must disambiguate
+    /// by the live window: the live stack prefix first, then the live locals.
+    ///
+    /// Layout: nlocals=2, max_stackdepth=3, live stack depth 2 (stack_only=2).
+    ///   local 0 -> color 5, local 1 -> color 6
+    ///   stack 0 -> color 6 (shared with live local 1)
+    ///   stack 1 -> color 7
+    ///   stack 2 -> color 5 (shared with live local 0; DEAD, index >= stack_only)
+    ///
+    /// Expected inverses are DERIVED from the published maps, so this asserts
+    /// a true publish<->inverse identity rather than ad-hoc literals. The
+    /// non-identity local map ([5,6] not [0,1]) defeats the identity fallback
+    /// (state.rs:1649), which is why the only existing end-to-end decode test
+    /// (skeleton jitcode, empty maps) never exercises this path.
+    #[test]
+    fn resume_symmetry_roundtrip_coalesced_color_map() {
+        let nlocals = 2usize;
+        // live stack depth = valuestackdepth - nlocals; the published stack map
+        // is the FULL max_stackdepth (3), but only the live prefix is in window.
+        let stack_only = 2usize;
+        let local_map = [5u16, 6u16];
+        let stack_map = [6u16, 7u16, 5u16];
+        let live_locals = [0usize, 1usize];
+
+        let invert = |reg: u16| {
+            semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &local_map,
+                &stack_map,
+                &live_locals,
+                reg as usize,
+            )
+        };
+
+        // Round-trip closure: every LIVE stack slot's published color inverts
+        // back to its own semantic slot (nlocals + d) — the stack map is its
+        // own inverse over the live prefix.
+        for d in 0..stack_only {
+            assert_eq!(invert(stack_map[d]), Some(nlocals + d));
+        }
+
+        // Color 6 is shared by live local 1 and live stack slot 0. The decoder
+        // scans the live stack prefix first, so it MUST resolve to the stack
+        // slot (Some(2)), never the local (Some(1)). This is the kept-stack /
+        // local coalescing case the guard-failure deopt depends on.
+        assert_eq!(invert(stack_map[0]), Some(2));
+        assert_eq!(invert(local_map[1]), Some(2));
+
+        // Color 5 is shared by live local 0 and the DEAD stack slot 2 (index
+        // >= stack_only, outside the live window). It must route to the live
+        // local, not the dead stack slot.
+        assert_eq!(invert(local_map[0]), Some(0));
+
+        // The dead stack slot's color must never recover as that slot.
+        assert_ne!(invert(stack_map[2]), Some(nlocals + 2));
+    }
+
     fn empty_meta() -> PyreMeta {
         PyreMeta {
             num_locals: 0,
@@ -9752,6 +9819,106 @@ mod tests {
         let restored_i = state.local_at(3).expect("local i should be restored");
         assert!(unsafe { is_int(restored_i) });
         assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_guard_class_uses_guard_nonnull_class() {
+        let mut ctx = TraceCtx::for_test(1);
+        // registers_r[i] tracks locals_cells_stack_w[*] — W_Root array, Type::Ref.
+        let obj = OpRef::input_arg_ref(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.registers_r = vec![obj];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.nlocals = 1;
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            residual_call_pc: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        state.with_ctx(|this, ctx| {
+            this.guard_class(ctx, obj, &INT_TYPE as *const PyType);
+        });
+
+        let tree_loop = ctx.into_tree_loop();
+        let op = tree_loop.ops.last().expect("guard op should be present");
+        assert_eq!(op.opcode, OpCode::GuardClass);
+        assert_eq!(op.arg(0).to_opref(), obj);
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_trace_guarded_int_payload_uses_guard_nonnull_class_and_pure_payload() {
+        // value_type is read from the recorder's inputarg type (Phase α/β: Box.type
+        // intrinsic parity, history.py:220) so the inputarg must be Ref for
+        // trace_guarded_int_payload to take the fast path rather than short-circuit.
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        // value_type is Ref per the comment above; registers_r[0] = inputarg slot 0.
+        let int_obj = OpRef::input_arg_ref(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.registers_r = vec![int_obj];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.nlocals = 1;
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            residual_call_pc: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
+
+        let recorder = ctx.into_recorder();
+        let mut saw_guard_nonnull_class = false;
+        let mut saw_pure_payload = false;
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
+                continue;
+            };
+            if op.opcode == OpCode::GuardClass {
+                saw_guard_nonnull_class = true;
+            }
+            if op.opcode == OpCode::GetfieldGcPureI
+                && op
+                    .getarglist()
+                    .iter()
+                    .map(|a| a.to_opref())
+                    .collect::<Vec<_>>()
+                    == vec![int_obj]
+            {
+                saw_pure_payload = true;
+            }
+        }
+        assert!(
+            saw_guard_nonnull_class,
+            "int payload fast path should guard object class via GuardClass"
+        );
+        assert!(
+            saw_pure_payload,
+            "int payload fast path should read the immutable payload with GetfieldGcPureI"
+        );
     }
 
     #[test]

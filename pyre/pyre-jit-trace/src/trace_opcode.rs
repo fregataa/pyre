@@ -5362,7 +5362,15 @@ impl MIFrame {
             return;
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
-        self.generate_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
+        // pyjitpl.py:1521 records GUARD_CLASS. The obj is non-null by
+        // construction here (every caller passes a value-stack operand or a
+        // freshly read object, the same invariant under which the codewriter
+        // emits guard_class at jtransform.py:1004-1010 handle_getfield_typeptr).
+        // A genuinely null-fed class-guarded slot is rejected structurally by
+        // the cross-loop-CUT abort in compile_loop_body, not by the guard form.
+        // The optimizer strengthens a separately-recorded preceding GUARD_NONNULL
+        // into GUARD_NONNULL_CLASS (rewrite.py:408-444 / optimize_guard_class).
+        self.generate_guard(ctx, OpCode::GuardClass, &[obj, expected_type_const]);
         // heapcache.py:470-473: class_now_known sets class + nullity.
         ctx.heap_cache_mut()
             .class_now_known(obj, expected_type as usize as i64);
@@ -8059,6 +8067,111 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // LOAD_FAST_LOAD_FAST / LOAD_FAST_BORROW_LOAD_FAST_BORROW walker
+        // activation via trait-path delegation.
+        //
+        // The load-side superinstruction siblings of StoreFastStoreFast: two
+        // packed var_num local indices the r0-only arm entry leaves unbound
+        // (ResidualCallArgUnbound), the same payload-seed gap as the single
+        // LoadFast hook above.  Resolve both indices + names from the code
+        // pool and delegate to `OpcodeStepExecutor::load_fast_pair_checked`,
+        // whose MIFrame override is two trace-aware `load_local_value` +
+        // `push_value` pairs — i.e. exactly two single-LoadFast pushes.  The
+        // borrow / non-borrow distinction collapses at the trace level (the
+        // single LoadFast / LoadFastBorrow hook above already routes both
+        // through `load_fast_checked`), so both superinstructions share the
+        // one pair recorder.  `push_value` advances vsd, so this bypasses
+        // `apply_walker_stack_effect` via the early return.
+        if let Instruction::LoadFastLoadFast { var_nums }
+        | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } = instruction
+        {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx1 = pyre_interpreter::var_nums_to_first_index(*var_nums, op_arg);
+            let idx2 = pyre_interpreter::var_nums_to_second_index(*var_nums, op_arg);
+            let name1 = if idx1 < pyre_interpreter::code_varnames_len(code) {
+                code.varnames[idx1].as_ref()
+            } else {
+                "<cell>"
+            };
+            let name2 = if idx2 < pyre_interpreter::code_varnames_len(code) {
+                code.varnames[idx2].as_ref()
+            } else {
+                "<cell>"
+            };
+            OpcodeStepExecutor::load_fast_pair_checked(self, idx1, name1, idx2, name2)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // TO_BOOL walker activation via trait-path delegation.
+        //
+        // The compiler only emits TO_BOOL ahead of a truthiness consumer
+        // (POP_JUMP_IF_TRUE/FALSE or UNARY_NOT), each of which re-evaluates
+        // the operand's truthiness through its own guard.  The MIFrame
+        // `to_bool` override is therefore a stack-neutral no-op (the explicit
+        // bool materialisation is redundant under tracing), matching exactly
+        // what the trait leg's `execute_to_bool` already records.  An entry
+        // hook delegating to the same no-op preserves that — routing through
+        // the auto-gen arm walk instead would emit the arm's bool-conversion
+        // residual and diverge.  Early return bypasses
+        // `apply_walker_stack_effect` (net-zero effect, nothing to record).
+        if let Instruction::ToBool = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::to_bool(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // LOAD_NAME / STORE_NAME walker activation via trait-path delegation.
+        //
+        // Module-level namespace ops whose name operand is an oparg-derived
+        // index into `code.names` — the r0-only arm entry leaves that payload
+        // register unbound (ResidualCallArgUnbound), the same gap the single
+        // LoadFast hook handles.  Resolve the name here and delegate to the
+        // existing `OpcodeStepExecutor::load_name` / `store_name` (the methods
+        // `execute_load_name` / `execute_store_name` call on the trait leg),
+        // whose MIFrame impls record the live namespace lookup/store IR and
+        // advance the vsd shadow via push_value / pop_value — so the early
+        // return bypasses `apply_walker_stack_effect`.
+        if let Instruction::LoadName { namei } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx = namei.get(op_arg) as usize;
+            OpcodeStepExecutor::load_name(self, code.names[idx].as_ref(), idx)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if let Instruction::StoreName { namei } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx = namei.get(op_arg) as usize;
+            OpcodeStepExecutor::store_name(self, code.names[idx].as_ref(), idx)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // LOAD_GLOBAL walker activation via trait-path delegation.
+        //
+        // The oparg packs the name index (>> 1) and the PUSH_NULL flag (& 1).
+        // Resolve both and delegate to the existing
+        // `OpcodeStepExecutor::load_global` (the method `execute_load_global`
+        // calls on the trait leg) → `load_name_value`, the shared celldict
+        // ModuleDictStrategy live lookup both legs already use (the auto-gen
+        // arm aborts on the oparg-derived &str name argument).  This
+        // delegation is the LIVE lookup, not the EffectInfo-residual cell fold
+        // (`try_walker_load_global_cell_fold`, jitcode_dispatch.rs) — the
+        // early return bypasses the arm walk where that fold lives, so the
+        // moving-GC const-fold hazard it guards against (#336, fixed by the
+        // can_move skip) is not on this path.  push_value (+ the optional
+        // PUSH_NULL push) advances vsd.
+        if let Instruction::LoadGlobal { namei } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let raw = namei.get(op_arg) as usize;
+            let name_idx = raw >> 1;
+            let push_null = (raw & 1) != 0;
+            OpcodeStepExecutor::load_global(
+                self,
+                code.names[name_idx].as_ref(),
+                name_idx,
+                push_null,
+            )?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_FAST walker activation via trait-path delegation.
         //
         // Same oparg-payload shape as LoadFast (the var_num local index is
@@ -8095,6 +8208,26 @@ impl MIFrame {
         if let Instruction::BinaryOp { op } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::binary_op(self, op.get(op_arg))?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // COMPARE_OP walker activation via trait-path delegation (non-fused).
+        //
+        // The fused COMPARE_OP + POP_JUMP_IF_* path is handled earlier by
+        // `try_fused_compare_goto_if_not` (pyjitpl.py:541-556 parity), which
+        // returns before this dispatch — so this hook only sees the
+        // standalone (result-materialised) CompareOp the fusion declined.
+        // Same MAY-RAISE shape as BinaryOp: delegate to
+        // `OpcodeStepExecutor::compare_op` (the method `execute_compare_op`
+        // calls on the trait leg), which pops the two operands, emits the
+        // typed comparison IR (IntLt/FloatLt behind class guards) or the
+        // generic `compare_value` residual, and pushes the boxed bool.  The
+        // following PopJumpIf* / consumer reads that bool exactly as on the
+        // trait leg.  `pop_value` / `push_value` handle vsd; early return
+        // bypasses `apply_walker_stack_effect`.
+        if let Instruction::CompareOp { opname } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::compare_op(self, opname.get(op_arg))?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
@@ -8198,6 +8331,262 @@ impl MIFrame {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::reraise(self, depth.get(op_arg))?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // RAISE_VARARGS walker activation via trait-path delegation.
+        //
+        // Structural twin of the Reraise hook above: `raise_varargs` always
+        // returns `Err(PyError)` (it raises), seeding `last_exc_box` /
+        // `last_exc_value` on the valid-raise path before returning.  The `?`
+        // propagates that `Err` out as the dispatch `step_result`, exactly as
+        // `execute_raise_varargs` does on the trait leg; `trace_code_step`'s
+        // post-dispatch handling is keyed on the instruction type
+        // (`Instruction::RaiseVarargs` → `handle_raise_varargs` when
+        // `last_exc_box != NONE`, else `handle_possible_exception`), so it
+        // runs identically on either dispatch leg.  Unlike a branch guard
+        // this records no kept-stack snapshot, so the #124 resume gap does
+        // not apply.
+        if let Instruction::RaiseVarargs { argc } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::raise_varargs(self, u32::from(argc.get(op_arg)) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // BUILD_TUPLE / UNPACK_SEQUENCE walker activation via trait-path
+        // delegation.
+        //
+        // These two opcodes carry a specialised, virtualization-aware
+        // recorder (`MIFrame::trace_build_tuple_value` /
+        // `unpack_sequence_value`): the arity-2 int/float build emits
+        // `NewWithVtable` + inline `value0`/`value1` `SetfieldGc` + paired
+        // `w_class` guards so `OptVirtualize` can elide a tuple that is
+        // built only to be immediately unpacked (`makespecialisedtuple2`
+        // parity).  The auto-gen arm jitcode records the OPAQUE
+        // `bh_build_tuple` residual instead, which OptVirtualize cannot see
+        // through (it also aborts `InlineCallArityMismatch` when the tuple
+        // flows through an inlined call).  Routing through the generic arm
+        // walk would therefore both lose the virtualization and abort on
+        // inlined tuples — so dispatch them here, reusing the exact shared
+        // opcode functions the trait leg runs
+        // (`OpcodeStepExecutor::build_tuple` → `opcode_build_tuple` →
+        // `pop_n` + `SharedOpcodeHandler::build_tuple` + `push_value`).
+        // `pop_n`/`pop_value`/`push_value` update the symbolic + concrete-
+        // shadow stacks + vsd shadow, so this bypasses
+        // `apply_walker_stack_effect` (the early `return` below skips both
+        // the arm walk and the post-walk resync).  Same delegation pattern
+        // as the StoreSubscr / PushNull / Reraise hooks above.
+        if let Instruction::BuildTuple { count } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::build_tuple(self, count.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if let Instruction::UnpackSequence { count } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::unpack_sequence(self, count.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // BUILD_MAP walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `BuildMap` inlines the interpreter's
+        // `SharedOpcodeHandler::build_map` (`build_map_from_refs`, eval.rs:1267)
+        // and switches on its `Result<_, PyError>` Ok/Err discriminant — which
+        // the arm walk cannot make concrete (`BuildMap|SwitchValueNotConcrete`).
+        // The entry-hook instead dispatches `OpcodeStepExecutor::build_map`,
+        // resolving to MIFrame's trace-aware override (`trace_build_map` emits
+        // the BUILD_MAP IR + maintains the concrete dict shadow, exactly like
+        // `build_tuple`), bypassing the concrete `build_map_from_refs` the arm
+        // walk inlines.  `pop_n` (count*2) / `push_value` keep the symbolic +
+        // concrete-shadow stacks + vsd shadow coherent, so this bypasses
+        // `apply_walker_stack_effect`.  Same delegation pattern as the
+        // BuildTuple / UnpackSequence hooks above.
+        if let Instruction::BuildMap { count } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::build_map(self, count.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // STORE_FAST_STORE_FAST walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode lowers to a chain of `residual_call` ops
+        // whose funcptr `constants_i` entries are unresolved symbolic-hash
+        // placeholders (not patched by `patch_constants_i_fnaddrs`); the arm
+        // walk would `blr` an unmapped address, and its authoritative
+        // `try_execute_residual_call_via_executor` would concretely run the
+        // real `PyFrame::store_fast_store_fast`, popping the LIVE frame's
+        // value stack — which the trace walk never populates (only symbolic
+        // `pop_value` / vsd advance), underflowing `PyFrame::pop`.
+        //
+        // Both hazards are arm-walk-only.  Delegate to
+        // `OpcodeStepExecutor::store_fast_store_fast` (→ `pop_value` ×2 +
+        // `store_local_value` ×2) exactly as trait dispatch does: `pop_value`
+        // is the symbolic pop and `store_local_value` records the
+        // `setarrayitem_vable` write into the virtualizable locals (the
+        // frame is forced on deopt), so there is no live-frame pop and no
+        // unresolved residual.  `var_nums_to_first_index` /
+        // `var_nums_to_second_index` fold the paired local indices from
+        // `op_arg` (the same `#[elidable_cannot_raise]` helpers the seam
+        // uses).  Same delegation pattern as the BuildTuple / UnpackSequence
+        // hooks above; bypasses `apply_walker_stack_effect`.
+        if let Instruction::StoreFastStoreFast { var_nums } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx1 = pyre_interpreter::var_nums_to_first_index(*var_nums, op_arg);
+            let idx2 = pyre_interpreter::var_nums_to_second_index(*var_nums, op_arg);
+            OpcodeStepExecutor::store_fast_store_fast(self, idx1, idx2)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // POP_TOP / PUSH_EXC_INFO / POP_EXCEPT — the exception-handler trio.
+        //
+        // The auto-gen arm jitcodes recurse through `inline_call` into the
+        // exc-info-stack helper jitcodes whose `PyFrame::pop` is concrete-
+        // executed by `try_execute_residual_call_via_executor` against the live
+        // frame and underflows (`pyframe.rs:1320`, raise_catch_loop /
+        // exception_inlined_callee_caught) — the same live-frame-pop hazard the
+        // StoreFastStoreFast / StoreSubscr hooks above avoid.  Delegate to the
+        // shared symbolic handlers the trait leg already runs: `opcode_pop_top`
+        // (`pop_value`), `OpcodeStepExecutor::push_exc_info` /
+        // `pop_except` (vable-only `pop_value`/`push_value` for the stack
+        // effect plus the EC `sys_exc_value` save/restore GETFIELD_GC /
+        // SETFIELD_GC).  `pop_value`/`push_value` keep the symbolic + vable
+        // shadow + vsd coherent, so this bypasses `apply_walker_stack_effect`
+        // (the early `return` skips both the arm walk and the post-walk
+        // resync).  Same delegation pattern as the hooks above.
+        if matches!(instruction, Instruction::PopTop) {
+            use pyre_interpreter::SharedOpcodeHandler;
+            let _ = op_arg;
+            let _ = SharedOpcodeHandler::pop_value(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if matches!(instruction, Instruction::PushExcInfo) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            OpcodeStepExecutor::push_exc_info(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if matches!(instruction, Instruction::PopExcept) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            OpcodeStepExecutor::pop_except(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // CHECK_EXC_MATCH — same exception-handler family, same two
+        // arm-walk hazards the trio above avoids.  The auto-gen arm inlines
+        // the concrete `eval::check_exc_match` whose `pop`/`peek` run against
+        // the live frame via `try_execute_residual_call_via_executor`
+        // (live-frame-pop underflow), and `validate_check_exc_match_class`'s
+        // `Result` Ok/Err is a `SwitchValueNotConcrete` arm-walk abort.  The
+        // `MIFrame::check_exc_match` override records complete leg-independent
+        // IR — symbolic `pop_value` of the match type, a read of the
+        // raise-seeded `sym.last_exc_value`, and a `push_value` of a
+        // `const_ref` bool (the immortal TRUE/FALSE singleton); it records no
+        // guard and is in neither `instruction_may_raise` nor
+        // `instruction_needs_pre_opcode_snapshot`, so there is no
+        // dispatch-leg-dependent snapshot.  The class-mismatch `TypeError`
+        // `?`-propagates as a trace Abort identically on either leg.  Same
+        // delegation pattern as the PopTop / PushExcInfo / PopExcept hooks.
+        if matches!(instruction, Instruction::CheckExcMatch) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            OpcodeStepExecutor::check_exc_match(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // COPY walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `Copy` lowers `opcode_copy_value`
+        // (`peek_at` + `push_value`), whose `Result<(), PyError>` Ok/Err
+        // discriminant the arm walk cannot make concrete
+        // (`Copy|SwitchValueNotConcrete`); the result-shell scope does not
+        // drain it because `copy_value` forwards to the shared
+        // `peek_at`/`push_value` stack ops (a whole-program lowering, not a
+        // per-opcode slice).  The blocker is arm-walk-only: `COPY i`
+        // duplicates the stack slot at `peek_at(i)` and pushes it — a pure
+        // symbolic stack manipulation that records no IR op (the duplicated
+        // `FrontendOp` flows to consumers directly, like the `PushNull`
+        // constant slot).  Delegate to `OpcodeStepExecutor::copy_value`
+        // exactly as `execute_copy` (pyopcode.rs:1989) does;
+        // `peek_at`/`push_value` keep the symbolic + concrete-shadow stacks
+        // + vsd shadow coherent, so this bypasses `apply_walker_stack_effect`.
+        // Same delegation pattern as the PopTop / PushNull hooks above.
+        if let Instruction::Copy { i } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::copy_value(self, i.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // RETURN_VALUE — the root portal exit.  Unlike every hook above it
+        // propagates a control-flow `StepResult::Return`, NOT `Continue`.
+        // The opcode records no IR itself: `return_value` (the default
+        // `OpcodeStepExecutor::return_value`, which MIFrame does not override)
+        // is `pop_value` + `finish_value` -> `StepResult::Return(value)`; the
+        // `Finish` + `ensure_boxed_for_ca` + `store_token_in_vable` are
+        // emitted post-dispatch in `trace_step_result_to_action`'s Return
+        // arm, reached identically by both legs.  It CANNOT go via the arm
+        // walk: the arm's `ref_return/r` surfaces as
+        // `DispatchOutcome::SubReturn` (`is_top_level=false`), the wrong shape
+        // for a root return.  The entry hook propagates the Return verbatim
+        // (`dispatch_via_walker_for_opcode` returns it unchanged).  It records
+        // no guard and is in neither `instruction_may_raise` nor
+        // `instruction_needs_pre_opcode_snapshot`, so there is no
+        // dispatch-leg-dependent snapshot; the dispatch gate routes
+        // inline-frame ReturnValue to the trait leg, so only the root
+        // portal-exit case is flipped.
+        if matches!(instruction, Instruction::ReturnValue) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            let step = OpcodeStepExecutor::return_value(self)?;
+            return Ok(Some(step));
+        }
+
+        // JUMP_BACKWARD — the loop back-edge.  It CANNOT route through the
+        // arm walk, whose `ref_return/r`-style terminator surfaces as
+        // `DispatchOutcome::SubReturn` and whose top-level outcomes are
+        // rejected; the loop close needs `StepResult::CloseLoop`, which only
+        // the entry hook can propagate.  Delegate to the same pub
+        // `execute_jump_backward` the trait dispatch arm calls
+        // (pyopcode.rs:2942), with `next_instr = self.orgpc + 1` — identical
+        // to the trait leg's `pc + 1`, since `set_orgpc(pc)` ran before the
+        // gate and `close_loop_args_at`'s loop-header override of `orgpc` has
+        // not happened yet.  `jump_backward` returns `StepResult::CloseLoop`,
+        // which `dispatch_via_walker_for_opcode` propagates verbatim and
+        // `trace_step_result_to_action` maps to `CloseLoopWithArgs` — the
+        // identical mapping the trait leg uses.  Unlike PopJumpIf (two
+        // divergent recording paths), JumpBackward has a SINGLE shared
+        // `close_loop_args_at` reached identically by both legs, and is absent
+        // from `apply_walker_stack_effect` (zero net stack delta) and
+        // `instruction_needs_pre_opcode_snapshot`, so the GuardFutureCondition
+        // snapshot reads the same pre-gate orgpc / vable shadow / registers_r
+        // on either leg.  The dispatch gate keeps inline-frame JumpBackward on
+        // the trait leg.
+        if matches!(instruction, Instruction::JumpBackward { .. }) {
+            let next_instr = self.orgpc + 1;
+            let step = pyre_interpreter::execute_jump_backward(
+                self,
+                code,
+                *instruction,
+                op_arg,
+                next_instr,
+            )?;
+            return Ok(Some(step));
+        }
+
+        // JUMP_BACKWARD_NO_INTERRUPT — no guard, no loop close: just
+        // `set_next_instr(next_instr - delta)`, returns Continue.  Delegate to
+        // the same pub `execute_jump_backward_no_interrupt` the trait arm
+        // calls (pyopcode.rs:3096); it subtracts the delta from `next_instr`
+        // directly (no `skip_caches`), so `next_instr = self.orgpc + 1` (==
+        // the trait leg's `pc + 1`) is required for the identical target.
+        if matches!(instruction, Instruction::JumpBackwardNoInterrupt { .. }) {
+            let next_instr = self.orgpc + 1;
+            let step = pyre_interpreter::execute_jump_backward_no_interrupt(
+                self,
+                *instruction,
+                op_arg,
+                next_instr,
+            )?;
+            return Ok(Some(step));
         }
 
         Ok(None)
@@ -9273,22 +9662,25 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // through `ref_copy/r>r` (`assembler.rs::emit_const_r`), so arms
     // decode without residual-call wrappers around unit variants.
     //
-    // BuildTuple / UnpackSequence are intentionally NOT in this set: the
-    // trait-dispatch handlers (`trace_build_tuple_value`,
-    // `unpack_sequence_value`) carry the specialised arity-2 tuple
-    // build/unpack fast paths, and the walker's jitcode dispatch cannot
-    // yet express them (it aborts with `InlineCallArityMismatch` when the
-    // tuple flows through an inlined call). Keep them on the trait path
-    // until the walker can encode the specialised tuple layout.
+    // BuildTuple / UnpackSequence are walker-handled via the
+    // `try_walker_direct_opcode_dispatch` entry hook (NOT the auto-gen arm
+    // jitcode): the hook delegates to `OpcodeStepExecutor::build_tuple` /
+    // `unpack_sequence`, which run the specialised arity-2 tuple
+    // build/unpack fast paths (`trace_build_tuple_value` /
+    // `unpack_sequence_value`).  The generic arm jitcode CANNOT express
+    // those (it records the opaque `bh_build_tuple` residual and aborts
+    // `InlineCallArityMismatch` when the tuple flows through an inlined
+    // call), so the direct hook is the orthodox dispatch — the same shape
+    // as the StoreSubscr / PushNull / Reraise hooks.
     //
-    // StoreFastStoreFast is also excluded: its codewriter arm lowers to a
-    // chain of `residual_call` ops whose funcptr `constants_i` entries are
-    // unresolved placeholders (not patched by `patch_constants_i_fnaddrs`,
-    // which only rewrites build→runtime fnaddr pairs). The walker reads one
-    // of those placeholders as the call target and branches to it (`blr`),
-    // faulting on an unmapped address. Route it through the trait handler
-    // (`opcode_store_fast_store_fast`) until the arm's helper fnaddrs are
-    // resolved.
+    // StoreFastStoreFast is walker-handled via the
+    // `try_walker_direct_opcode_dispatch` entry hook (NOT the auto-gen arm
+    // jitcode): the hook delegates to
+    // `OpcodeStepExecutor::store_fast_store_fast`, whose symbolic
+    // `pop_value` + `store_local_value` (`setarrayitem_vable`) avoid both
+    // arm-walk hazards — the unresolved placeholder funcptrs the arm `blr`s
+    // and the concrete live-frame `PyFrame::pop` underflow.  See the hook
+    // comment for detail.
     matches!(
         instruction,
         Instruction::Nop
@@ -9312,6 +9704,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // a register the r0-only arm entry leaves unbound.
             | Instruction::LoadFast { .. }
             | Instruction::LoadFastBorrow { .. }
+            // LoadFastLoadFast / LoadFastBorrowLoadFastBorrow handled by the
+            // dispatch_via_walker_for_opcode entry hook: resolves both packed
+            // var_num local indices + names and delegates to
+            // OpcodeStepExecutor::load_fast_pair_checked (two trace-aware
+            // load_local_value + push_value pairs).  The auto-gen arm reads
+            // the packed var_nums oparg payload from a register the r0-only
+            // arm entry leaves unbound — same gap as the single LoadFast.
+            | Instruction::LoadFastLoadFast { .. }
+            | Instruction::LoadFastBorrowLoadFastBorrow { .. }
             // StoreFast handled by the dispatch_via_walker_for_opcode entry
             // hook: delegates to OpcodeStepExecutor::store_fast (pop_value
             // advances vsd, setarrayitem_vable_r writes the local).
@@ -9323,6 +9724,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // ×2 + specialised arithmetic IR + push_value).  May-raise; the
             // Err propagates to trace_code_step like the trait leg.
             | Instruction::BinaryOp { .. }
+            // CompareOp (non-fused) handled by the entry hook: delegates to
+            // OpcodeStepExecutor::compare_op (typed comparison IR or generic
+            // compare_value residual + push bool). May-raise; Err propagates
+            // like the trait leg. The fused compare+branch path is handled
+            // earlier by try_fused_compare_goto_if_not and never reaches here.
+            | Instruction::CompareOp { .. }
             | Instruction::ExtendedArg
             | Instruction::Resume { .. }
             | Instruction::Cache
@@ -9331,6 +9738,13 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::EndFor
             | Instruction::UnaryNot
             | Instruction::UnaryInvert
+            // ToBool handled by the dispatch_via_walker_for_opcode entry hook:
+            // delegates to the stack-neutral no-op `to_bool` (truthiness is
+            // re-evaluated by the following branch / UnaryNot guard, so the
+            // bool materialisation is redundant under tracing).  Early return,
+            // so no apply_walker_stack_effect arm — unlike UnaryNot/UnaryInvert
+            // above, which arm-walk.
+            | Instruction::ToBool
             | Instruction::GetIter
             | Instruction::MatchMapping
             | Instruction::MatchSequence
@@ -9366,15 +9780,25 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::DictMerge { .. }
             | Instruction::SetFunctionAttribute { .. }
             | Instruction::UnpackEx { .. }
-            // Instruction::LoadName / StoreName excluded: the trait
-            // handlers (`load_name_value` / `store_name_value`) carry the
-            // celldict ModuleDictStrategy fast path (LOAD_GLOBAL_cached
-            // celldict.py:285-322: QUASIIMMUT_FIELD version dep + elidable
-            // cell fold; STORE_GLOBAL_cached celldict.py:328-333:
-            // layout-agnostic setitem_str). The walker's jitcode arm for
-            // these aborts with ResidualCallArgUnbound on the &str name
-            // argument — it was never exercised before module-level frames
-            // became portals.
+            // LoadName / StoreName handled by the
+            // dispatch_via_walker_for_opcode entry hook: it resolves the
+            // &str name from `code.names[idx]` and delegates to the trait
+            // `load_name` / `store_name` (celldict ModuleDictStrategy fast
+            // path — LOAD_GLOBAL_cached celldict.py:285-322; STORE_GLOBAL_cached
+            // celldict.py:328-333). The auto-gen arm walk aborts on the
+            // oparg-derived &str name argument (ResidualCallArgUnbound); the
+            // hook pre-resolves it, the same gap the single LoadFast hook
+            // handles.
+            | Instruction::LoadName { .. }
+            | Instruction::StoreName { .. }
+            // LoadGlobal handled by the dispatch_via_walker_for_opcode entry
+            // hook: resolves the name index + PUSH_NULL flag and delegates to
+            // the trait load_global → load_name_value (shared celldict live
+            // lookup). The early return bypasses the arm walk + the
+            // EffectInfo-residual cell fold (try_walker_load_global_cell_fold),
+            // so the #336 moving-GC const-fold hazard is off this path. Same
+            // oparg-derived &str name gap as LoadName.
+            | Instruction::LoadGlobal { .. }
             | Instruction::StoreGlobal { .. }
             | Instruction::DeleteAttr { .. }
             | Instruction::ImportName { .. }
@@ -9408,6 +9832,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::MakeCell { .. }
             | Instruction::ConvertValue { .. }
             | Instruction::Reraise { .. } // walker hook in dispatch_via_walker_for_opcode delegates to MIFrame::reraise which returns Err(PyError) with reraise_lasti seeded — `step_result.err().map(|e| e.reraise_lasti)` extraction works the same on either leg
+            | Instruction::RaiseVarargs { .. } // walker hook delegates to MIFrame::raise_varargs (always Err, seeds last_exc_box); trace_code_step's RaiseVarargs post-dispatch handler (handle_raise_varargs) is keyed on the instruction type, so it runs identically on either leg
             | Instruction::PopJumpIfNone { .. }
             | Instruction::PopJumpIfNotNone { .. }
             | Instruction::ForIter { .. }
@@ -9431,36 +9856,31 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // only r0.  Re-enable once arm-entry operand seeding (#405)
             // lands on dispatch_via_miframe_at_opcode_entry.
             | Instruction::StoreSubscr // handled by dispatch_via_walker_for_opcode entry hook
-            // Instruction::PopExcept excluded: same bridge-tracing
-            // rationale as PushExcInfo below — its arm manages the
-            // exception-info stack via impure helper jitcodes the walker
-            // cannot execute concretely, so on the bridge leg the handler's
-            // stack is left inflated and the loop-back `Jump` carries the
-            // wrong arg count.  Trait dispatch executes it concretely.
-            // Instruction::PushExcInfo excluded: its codewriter arm
-            // `inline_call`s the exception-info-stack helper jitcodes,
-            // which branch on the concrete result of an impure /
-            // may-raise `residual_call`.  The production walker only folds
-            // the concrete result of *pure* calls
-            // (`try_fold_pure_call_via_executor`), so the helper's
-            // post-call `goto_if_not` reads a `Null` concrete and mis-routes
-            // into the helper's `raise/r` tail — surfacing a spurious
-            // `SubRaise { exc_concrete: Null }` that aborts every bridge
-            // trace of an exception handler.  The walker path was never
-            // exercised before (the main loop only traces the no-exception
-            // path; the bridge that reaches the handler never compiled
-            // until the exc-value threading fix landed).  Keep PUSH_EXC_INFO
-            // on trait dispatch — which executes the opcode concretely — the
-            // same rationale that excludes `Reraise` above, until the walker
-            // can execute impure residual calls during tracing.
-            // Instruction::PopTop excluded: in the exception-handler
-            // region it pops the matched exception value off the stack the
-            // PUSH_EXC_INFO / POP_EXCEPT helpers manage.  Leaving it on the
-            // walker while those are trait-dispatched desyncs the bridge's
-            // handler-region stack, producing a loop-back `Jump` with the
-            // wrong arg count (bridge fails to compile) and a backend
-            // regalloc panic.  Keep the whole handler region on one concrete
-            // (trait) leg so the bridge's framestate matches the loop entry.
+            // PopExcept / PushExcInfo / PopTop — the exception-handler trio —
+            // handled by the dispatch_via_walker_for_opcode entry hook
+            // (try_walker_direct_opcode_dispatch), NOT the generic arm-jitcode
+            // walk.  The arm walk recurses through `inline_call` into the
+            // exc-info-stack helper jitcodes whose `PyFrame::pop` is
+            // concrete-executed by `try_execute_residual_call_via_executor`
+            // against the live frame and underflows (`pyframe.rs:1320`); the
+            // hook instead delegates to the shared symbolic
+            // `opcode_pop_top`/`push_exc_info`/`pop_except` (vable-only
+            // `pop_value`/`push_value` for the stack effect), exactly as the
+            // StoreSubscr / StoreFastStoreFast hooks avoid the same
+            // live-frame-pop hazard.
+            | Instruction::PopExcept
+            | Instruction::PushExcInfo
+            | Instruction::PopTop
+            // CheckExcMatch — same exception-handler family, handled by the
+            // entry hook (NOT the arm walk): the arm inlines the concrete
+            // `eval::check_exc_match` (live-frame pop underflow) and a
+            // `validate_check_exc_match_class` Result the walk cannot make
+            // concrete (`SwitchValueNotConcrete`).  The hook delegates to the
+            // `MIFrame::check_exc_match` override (symbolic `pop_value` +
+            // raise-seeded `sym.last_exc_value` read + `const_ref` bool push,
+            // no guard), exactly as the PopTop / PushExcInfo / PopExcept hooks
+            // avoid the same live-frame-pop hazard.
+            | Instruction::CheckExcMatch
             // PushNull is handled by the dispatch_via_walker_for_opcode
             // entry hook (direct const-NULL symbolic push): its auto-gen
             // arm is an inert residual wrapper (`opcode_push_null` is not
@@ -9468,6 +9888,41 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // vsd-resync route loses the push and underflows the
             // following CALL.
             | Instruction::PushNull
+            // BuildTuple / UnpackSequence handled by the
+            // dispatch_via_walker_for_opcode entry hook, delegating to the
+            // specialised `OpcodeStepExecutor::build_tuple` /
+            // `unpack_sequence` recorders (see the hook comment): the
+            // generic arm records an opaque residual that loses
+            // OptVirtualize's build→unpack elision and aborts
+            // `InlineCallArityMismatch` on inlined tuples.
+            | Instruction::BuildTuple { .. }
+            | Instruction::UnpackSequence { .. }
+            // ReturnValue — the root portal exit, handled by the entry hook
+            // (NOT the arm walk, whose ref_return/r surfaces as SubReturn,
+            // the wrong shape for a root return).  The hook propagates the
+            // default OpcodeStepExecutor::return_value's StepResult::Return
+            // verbatim; the Finish is emitted post-dispatch in
+            // trace_step_result_to_action's Return arm on both legs.  Records
+            // no guard; the dispatch gate keeps inline-frame ReturnValue on
+            // the trait leg, so only the root exit is flipped.
+            | Instruction::ReturnValue
+            // JumpBackward / JumpBackwardNoInterrupt — the loop back-edge,
+            // handled by the entry hook (NOT the arm walk, which surfaces
+            // SubReturn / rejects the top-level CloseLoop outcome).  The hook
+            // delegates to the same pub execute_jump_backward(_no_interrupt)
+            // the trait dispatch arms call, propagating StepResult::CloseLoop
+            // verbatim.  Unlike PopJumpIf, JumpBackward has a single shared
+            // close_loop_args_at reached identically by both legs (no
+            // leg-dependent kept-stack snapshot); the gate keeps inline-frame
+            // JumpBackward on the trait leg.
+            | Instruction::JumpBackward { .. }
+            | Instruction::JumpBackwardNoInterrupt { .. }
+            // StoreFastStoreFast handled by the
+            // dispatch_via_walker_for_opcode entry hook, delegating to the
+            // symbolic `OpcodeStepExecutor::store_fast_store_fast` (the arm
+            // jitcode carries unresolved placeholder funcptrs and would pop
+            // the live frame; see the hook comment).
+            | Instruction::StoreFastStoreFast { .. }
     )
 }
 
