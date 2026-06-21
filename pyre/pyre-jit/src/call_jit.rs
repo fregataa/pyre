@@ -1463,6 +1463,62 @@ impl Drop for VableRollbackRoots {
     }
 }
 
+/// RAII guard registering each `Ref`-typed slot of the resume `deadframe`
+/// copy as a GC root for the duration of `blackhole_from_resumedata`.
+///
+/// `deadframe` is an off-heap copy of the guard-failure values
+/// (`result.values`).  The collector is moving, so a minor collection
+/// triggered while `blackhole_from_resumedata` lazily materializes virtuals
+/// (`getvirtual_ptr` → allocator) relocates the boxed objects and leaves the
+/// copy holding from-space pointers; `decode_ref` (resume.rs:1575) then reads
+/// a stale pointer for a box-sourced slot and the blackhole dereferences
+/// freed memory.  Resume *constants* are already forwarded by
+/// `rd_consts_root_walker`, but the box-sourced slots here are not.
+/// Registering each `Ref` element slot makes the root walker forward it in
+/// place, mirroring `VableRollbackRoots` (#326).
+///
+/// Only `Ref`-typed slots are registered: `Int`/`Float` slots hold raw
+/// scalars (`decode_ref` boxes those lazily via `box_int`/`box_float`), and a
+/// scalar that happened to alias a managed address must never be treated as a
+/// root.  `deadframe_types[idx]` is parallel to `deadframe[idx]` (resume.rs
+/// `decode_ref` keys the same index), so the type gate is exact.
+struct ResumeDeadframeRoots {
+    slots: Vec<*mut *mut u8>,
+}
+
+impl ResumeDeadframeRoots {
+    fn register(deadframe: &mut [i64], deadframe_types: Option<&[majit_ir::Type]>) -> Self {
+        let mut slots = Vec::new();
+        if let Some(types) = deadframe_types {
+            for (idx, ty) in types.iter().enumerate() {
+                if !matches!(ty, majit_ir::Type::Ref) {
+                    continue;
+                }
+                let Some(cell) = deadframe.get_mut(idx) else {
+                    break;
+                };
+                // Null / `NULLREF` slots carry no object to forward.
+                if *cell == 0 {
+                    continue;
+                }
+                let slot = cell as *mut i64 as *mut *mut u8;
+                if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
+                    slots.push(slot);
+                }
+            }
+        }
+        Self { slots }
+    }
+}
+
+impl Drop for ResumeDeadframeRoots {
+    fn drop(&mut self) {
+        for &slot in &self.slots {
+            pyre_object::gc_hook::try_gc_remove_root(slot);
+        }
+    }
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -1521,6 +1577,17 @@ pub fn blackhole_resume_via_rd_numb(
                     .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
             )
         };
+
+    // Own the guard-failure values in host memory so the box-sourced `Ref`
+    // slots can be registered as GC roots: `blackhole_from_resumedata` below
+    // lazily materializes virtuals, and a minor collection during that work
+    // would relocate the boxed objects out from under the off-heap copy.
+    // Rooting forwards each `Ref` slot in place; `decode_ref` then reads the
+    // live (to-space) pointer rather than a dangling from-space one.  The
+    // `to_vec` uses the host allocator, so it cannot itself trigger a GC.
+    let mut deadframe_buf: Vec<i64> = deadframe.to_vec();
+    let _deadframe_roots = ResumeDeadframeRoots::register(&mut deadframe_buf, deadframe_types);
+    let deadframe: &[i64] = &deadframe_buf;
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
@@ -4366,6 +4433,43 @@ pub extern "C" fn bh_load_deref_value_fn(cell: i64, w_code_ptr: i64, deref_idx: 
         return 0;
     }
     value as i64
+}
+
+/// STORE_DEREF residual (`store_deref_value` HLOp → `residual_call_r_r`).
+/// `cell` is the slot read from `locals_cells_stack_w`; `value` is the
+/// popped stack operand.  Mirrors `store_deref`: when the slot holds a
+/// cell, mutate the cell's contents in place (`w_cell_set`, incminimark
+/// write barrier inside) and return the unchanged cell so the caller
+/// re-stores the same pointer into the slot; otherwise return the raw
+/// `value` so the caller writes it into the slot directly.  Runs no user
+/// code and never raises (`CallFlavor::Plain`).
+pub extern "C" fn bh_store_deref_value_fn(cell: i64, value: i64) -> i64 {
+    let slot = cell as pyre_object::PyObjectRef;
+    if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+        unsafe { pyre_object::w_cell_set(slot, value as pyre_object::PyObjectRef) };
+        cell
+    } else {
+        value
+    }
+}
+
+/// MAKE_CELL residual (`make_cell_value` HLOp → `residual_call_r_r`).
+/// `current` is the slot read from `locals_cells_stack_w`.  Mirrors
+/// `make_cell`: wrap the value in a fresh cell when the slot does not
+/// already hold one (`initialize_frame_scopes` installs cells for pure
+/// cellvars, so only an argument slot promoted to a cellvar still holds a
+/// raw value here), and return the cell the caller stores back into the
+/// slot.  A slot already holding a cell is returned unchanged so a
+/// never-reassigned cellvar does not become a cell wrapping a cell.
+/// Allocates (may trigger a minor GC) but runs no user code and never
+/// raises (`CallFlavor::Plain`).
+pub extern "C" fn bh_make_cell_fn(current: i64) -> i64 {
+    let cur = current as pyre_object::PyObjectRef;
+    if cur.is_null() || !unsafe { pyre_object::is_cell(cur) } {
+        pyre_object::w_cell_new(cur) as i64
+    } else {
+        current
+    }
 }
 
 /// UNARY_NEGATIVE residual (`unary_negative` HLOp → `residual_call_r_r`).
