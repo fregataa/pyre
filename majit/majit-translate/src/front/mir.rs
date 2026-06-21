@@ -1007,6 +1007,16 @@ pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerE
     lower_fun_decl_with_static_addrs(llbc, fd, crate::HostStaticAddrs::default())
 }
 
+/// Whether the framestate-threaded lowering runs for acyclic bodies.
+/// Default-on; `PYRE_MIR_FRAMESTATE=0` / `=false` is the rollback escape
+/// hatch to the monotonic lowering.
+fn framestate_enabled() -> bool {
+    !matches!(
+        std::env::var("PYRE_MIR_FRAMESTATE").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 pub fn lower_fun_decl_with_static_addrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -1115,33 +1125,36 @@ pub fn lower_fun_decl_with_static_addrs(
         }
         Ok(())
     };
-    // Opt-in framestate-threaded lowering for acyclic bodies (the GAP-B
-    // path that threads locals as block inputargs / phis).  Default
-    // (flag unset) keeps the monotonic lowering so the gate stays green
-    // while the new path is validated.  On a framestate failure the body
-    // falls back to the monotonic path — so flag-on is never worse than
-    // flag-off — unless `PYRE_MIR_FRAMESTATE_STRICT` is set, which
-    // propagates the error for debugging.
-    if std::env::var_os("PYRE_MIR_FRAMESTATE").is_some() {
+    // Framestate-threaded lowering for acyclic bodies (the GAP-B path
+    // that threads locals as block inputargs / phis).  Default-on;
+    // `PYRE_MIR_FRAMESTATE=0` rolls back to the monotonic lowering.  On a
+    // framestate failure the body falls back to the monotonic path — so
+    // the threaded path is never worse than the monotonic one — unless
+    // `PYRE_MIR_FRAMESTATE_STRICT` is set, which propagates the error for
+    // debugging.
+    if framestate_enabled() {
         let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
         if lo.mir_model_is_acyclic() {
-            match lo.lower_framestate() {
-                Ok(()) => {
-                    // Run the shared post-lowering stage uniformly, same
-                    // as the linear / RPO paths below.  `finish` folds
-                    // constant exitswitches, drops `Abort` arms and runs
-                    // `simplify_lowered_graph`; gating it on result-exc
-                    // activity would let the framestate path keep dead
-                    // arms the other strategies prune, diverging the
-                    // graph for the same body.  The result-exc-specific
-                    // `clear_unreachable_blocks` stays gated inside
-                    // `finish`, and the exception-link ABI (raise-through
-                    // vs Result return) the transforms install runs here
-                    // too — uniform across lowering strategies.
-                    finish(&mut lo)?;
-                    return Ok(lo.graph);
-                }
+            // Treat the threaded lowering and its shared post-lowering
+            // stage (`finish`) as one attempt.  `finish` runs uniformly,
+            // same as the linear / RPO paths below — it folds constant
+            // exitswitches, drops `Abort` arms, runs `simplify_lowered_graph`
+            // and installs the exception-link ABI (raise-through vs Result
+            // return); gating it on result-exc activity would let the
+            // framestate path keep dead arms the other strategies prune.
+            // A post-pass (e.g. the result-exc diamond rewrite) can reject
+            // a body the threading itself accepted, and the threading can
+            // fail on a CFG shape it does not yet model, so fold both into
+            // one fallback: on any error fall through to the monotonic path
+            // below, which is known to lower the body — the threaded path
+            // is never worse than the monotonic one.
+            let attempt = lo.lower_framestate().and_then(|()| finish(&mut lo));
+            match attempt {
+                Ok(()) => return Ok(lo.graph),
                 Err(e) => {
+                    if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                        eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
+                    }
                     if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
                         return Err(e);
                     }
@@ -1766,6 +1779,23 @@ impl<'a> Lowering<'a> {
         postorder.into_iter().rev().collect()
     }
 
+    /// Stub `bb_id` as a dead bare-raise block: clear its body / exits /
+    /// exitswitch, close it with a `set_raise`, and mark it `dead`.  Used
+    /// for blocks the framestate threading must not lower — model-
+    /// unreachable orphan `on_unwind` chains and `If`-arms a const-bool
+    /// discriminant folded away (see [`Self::lower_framestate`]).  The
+    /// real-path `function_graph_to_flowspace` prunes `dead` blocks
+    /// (`remove_dead_blocks` parity), so the stub's orphan etype/evalue
+    /// never reach the rtyper as undefined operands.
+    fn stub_dead_block(&mut self, bb_id: BlockId) {
+        let blk = self.graph.block_mut(bb_id);
+        blk.operations.clear();
+        blk.exits.clear();
+        blk.exitswitch = None;
+        self.graph.set_raise(bb_id, "mir-dead");
+        self.graph.block_mut(bb_id).dead = true;
+    }
+
     /// Lower the body threading locals as block inputargs / phis via
     /// per-block [`FrameState`]s, instead of the function-wide monotonic
     /// `local_var` table.  Restricted to acyclic bodies (the caller gates
@@ -1822,11 +1852,30 @@ impl<'a> Lowering<'a> {
 
         // Pass 1 — RPO walk: setstate, inputargs, lower, snapshot, union.
         for &bb in &rpo {
-            let st = entry_state[bb].clone().ok_or_else(|| {
-                LowerError::Unsupported(format!(
-                    "framestate: reachable bb{bb} has no entry state (RPO/union bug)"
-                ))
-            })?;
+            let st = match entry_state[bb].clone() {
+                Some(st) => st,
+                None => {
+                    // No live predecessor edge reached this block.  RPO
+                    // over `model_succs` visits every model-predecessor
+                    // before `bb`, and each unions its *lowered* exits
+                    // into `bb`'s entry; a still-empty entry here means
+                    // every model edge into `bb` was an `If`-arm that
+                    // `lower_switch` folded away on a const-bool
+                    // discriminant (a translation-time `const` gate such
+                    // as `if WITHPREBUILTINT`), so `bb` is unreachable in
+                    // the produced graph even though `mir_model_reachable`
+                    // — which reads the raw terminator, pre-fold — marks
+                    // it reachable.  Stub it dead exactly like the model-
+                    // unreachable orphan chains below; the real-path
+                    // adapter's reachability prune removes it, and
+                    // threading dead state would only mint phis the legacy
+                    // fallback cannot type.  `bb` is never bb0 (the
+                    // startblock is seeded and visited first), so a bare
+                    // raise stub is well-formed.
+                    self.stub_dead_block(self.block_id[bb]);
+                    continue;
+                }
+            };
             self.setstate(&st);
             let bb_id = self.block_id[bb];
             // The startblock keeps its parameter inputargs + Input ops;
@@ -1852,7 +1901,30 @@ impl<'a> Lowering<'a> {
                 self.block_entry_local_var[bb] = self.local_var.clone();
             }
             self.lower_block(bb)?;
-            let ex = self.getstate();
+            let mut ex = self.getstate();
+            // Scrub phantom locals before threading.  A slot bound to a
+            // Variable that is neither an inputarg nor an op result of this
+            // block has no definition in the produced graph — e.g. a MIR
+            // local the body never assigns, conservatively kept live by
+            // `compute_mir_liveness` and prebound in `new`, that the
+            // fully-inlined source leaves dead (the unread `MaybeUninit`
+            // scratch a monomorphized `core::ptr::swap` carries).  The
+            // monotonic path threads only `target_input_locals` (live-in)
+            // via per-block prebind inputargs, so its copy is always a
+            // defined block inputarg; the framestate threads every `Some`
+            // slot positionally, so an undefined phantom would reach Pass 2
+            // as a `Link.arg` defined at no source.  Drop it to `None`: a
+            // dead local is irrelevant, and a later read of a genuinely
+            // live-but-undefined slot still fails loud as an uninitialised
+            // local through `resolve_place` — the same use-before-def
+            // signal the monotonic `edge_args` raises.
+            for slot in ex.entries.iter_mut() {
+                if let Some(v) = slot
+                    && !self.graph.variable_defined_in_block(bb_id, v)
+                {
+                    *slot = None;
+                }
+            }
             exit_state[bb] = Some(ex.clone());
             // Union this exit into each model successor's entry state.
             // Successors are read off the just-closed exits (the model
@@ -1888,30 +1960,33 @@ impl<'a> Lowering<'a> {
         // Model-unreachable blocks: orphan `on_unwind` cleanup chains that
         // no lowered exit targets — `lower_terminator` strips every unwind
         // edge (Goto / Assert / Drop / Call all forward to the success
-        // continuation only), so `model_succs` is exactly the set of
-        // lowered exits and an unreachable block here is genuinely
-        // unreferenced.  Mark them `dead` and stub a bare raise so the
-        // graph stays closed for the legacy fallback path, which consumes
-        // this same `FunctionGraph`.  The real path's
-        // `function_graph_to_flowspace` prunes `dead` blocks outright
-        // (`remove_dead_blocks` parity), so the stub's orphan etype/evalue
-        // never reach the rtyper as undefined operands.
+        // continuation only).  `model_succs` is a *superset* of the
+        // lowered exits — it reads the raw terminator and so still lists an
+        // `If`-arm a const-bool discriminant later folds away — but it is
+        // never a subset, so `reachable[bb]` false (outside the
+        // `model_succs` closure) is a sufficient deadness signal: such a
+        // block is genuinely unreferenced.  (The folded-arm case, where a
+        // block IS in the closure yet has no live lowered predecessor, is
+        // caught in Pass 1 by the empty-entry stub above.)  Mark them
+        // `dead` so the graph stays closed for the legacy fallback path,
+        // which consumes this same `FunctionGraph`.
         for bb in 0..n {
             if reachable[bb] {
                 continue;
             }
-            let bb_id = self.block_id[bb];
-            let blk = self.graph.block_mut(bb_id);
-            blk.operations.clear();
-            blk.exits.clear();
-            blk.exitswitch = None;
-            self.graph.set_raise(bb_id, "mir-dead");
-            self.graph.block_mut(bb_id).dead = true;
+            self.stub_dead_block(self.block_id[bb]);
         }
 
         // Pass 2 — re-argument the goto / branch links from framestates.
         for &bb in &rpo {
             let bb_id = self.block_id[bb];
+            // A block Pass 1 stubbed dead (empty-entry const-fold orphan)
+            // has no exit state and a bare-raise body — its links carry no
+            // framestate args to re-argument.  Skip it; the final guard
+            // and the real-path dead-block prune both ignore it too.
+            if self.graph.block(bb_id).dead {
+                continue;
+            }
             let ex = exit_state[bb].clone().ok_or_else(|| {
                 LowerError::Unsupported(format!("framestate: bb{bb} missing exit state in pass 2"))
             })?;
@@ -3306,6 +3381,7 @@ impl<'a> Lowering<'a> {
                     .static_addr_op(&segments)
                     .or_else(|| self.static_int_value_op(&segments))
                     .or_else(|| self.const_eval_global(id))
+                    .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
@@ -3735,6 +3811,120 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Fold a `NamedConst` global whose initializer is exactly
+    /// `size_of::<T>()` / `align_of::<T>()` to the concrete byte size /
+    /// alignment Charon resolved for `T`'s layout.  The const's value is
+    /// a build-time constant of the extraction target, so folding it to
+    /// a `ConstInt` removes the residual accessor call the layout-size
+    /// consts (`FUNCTION_OBJECT_SIZE`, `W_DICT_OBJECT_SIZE`, …) otherwise
+    /// lower to (a `FunctionPath` the rtyper cannot register).
+    ///
+    /// Accepts only the *exact* shape — `_0` (the const's value) is written
+    /// once, by a single `size_of`/`align_of` call, unconditionally — and
+    /// returns `None` for anything richer so it keeps the residual accessor
+    /// path, mirroring the strict single-statement acceptance in
+    /// [`Self::const_eval_global`].  Rejected:
+    ///   * a `Switch` terminator (data-dependent control flow), so the call
+    ///     can never be made conditional;
+    ///   * any statement that assigns `_0` (a computed value such as
+    ///     `size_of::<A>() + size_of::<B>()`, whose `+` writes `_0`);
+    ///   * a second `_0`-defining call, or a `_0`-defining call to any
+    ///     function other than `size_of`/`align_of`;
+    ///   * a body with no `Return`.
+    /// Linear `Goto`s and panic-cleanup terminators (`Abort`,
+    /// `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
+    /// do *not* write `_0`, are permitted: none of them define the const
+    /// value, so with no `Switch` the single `size_of` call is its
+    /// unconditional sole definer.  Also `None` for a non-ADT type argument
+    /// (primitive / pointer / tuple, which has no `TypeDecl` layout to
+    /// read) or a layout Charon left unresolved.
+    fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return None;
+        }
+        let init_id = gd.rest.get("init")?.as_u64()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+
+        // The single `size_of`/`align_of` call that defines `_0`, captured
+        // as `(want_align, type_argument)`.  `term()`/`stmt_kind()` return
+        // owned values, so the type expression is cloned out of the call.
+        let mut found: Option<(bool, serde_json::Value)> = None;
+        let mut saw_return = false;
+        for block in &body.body {
+            for stmt in &block.statements {
+                match stmt.stmt_kind() {
+                    Ok(StmtKind::StorageLive(_))
+                    | Ok(StmtKind::StorageDead(_))
+                    | Ok(StmtKind::PlaceMention(_)) => {}
+                    // A statement writing `_0` means the value is computed,
+                    // not the bare `size_of`/`align_of` call result.
+                    Ok(StmtKind::Assign(place, _)) if matches!(place.kind, PlaceKind::Local(0)) => {
+                        return None;
+                    }
+                    // An assignment to a temporary cannot reach `_0` without
+                    // an `_0` write we already reject, so it is inert here.
+                    Ok(StmtKind::Assign(_, _)) => {}
+                    // `Assert` statements and anything unparsed: bail.
+                    _ => return None,
+                }
+            }
+            match block.term() {
+                // Data-dependent control flow or an unreadable terminator:
+                // the const value would not be the unconditional size_of.
+                Ok(TermKind::Switch { .. }) | Ok(TermKind::Unknown) | Err(_) => {
+                    return None;
+                }
+                Ok(TermKind::Return) => saw_return = true,
+                Ok(TermKind::Call { call, .. })
+                    if matches!(call.dest.kind, PlaceKind::Local(0)) =>
+                {
+                    let CallFunc::Regular(reg) = &call.func else {
+                        return None;
+                    };
+                    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                        return None;
+                    };
+                    let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+                        "core::mem::size_of" => false,
+                        "core::mem::align_of" => true,
+                        // `_0` defined by some other function: not a bare
+                        // size_of/align_of const.
+                        _ => return None,
+                    };
+                    // A second `_0`-defining call makes the value
+                    // order-dependent; only a single one is foldable.
+                    if found.is_some() {
+                        return None;
+                    }
+                    let ty = reg.generics.get("types")?.as_array()?.first()?.clone();
+                    found = Some((want_align, ty));
+                }
+                // `Goto` / `Abort` / `UnwindResume` / `Drop` / `Assert`, and
+                // any call that does not define `_0`: linear continuation or
+                // panic cleanup, none of which write the const value.
+                Ok(_) => {}
+            }
+        }
+        let (want_align, ty) = found?;
+        if !saw_return {
+            return None;
+        }
+        let adt = self.resolve_tyexpr_to_adt_def_id(&ty)?;
+        let layout = self.llbc.type_by_id(adt)?.layout_for_target("")?;
+        let value = if want_align {
+            layout.align
+        } else {
+            layout.size
+        }?;
+        Some(OpKind::ConstInt(value as i64))
+    }
+
     // -----------------------------------------------------------------------
     // Terminators
     // -----------------------------------------------------------------------
@@ -3936,7 +4126,9 @@ impl<'a> Lowering<'a> {
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.is_noop_ptr_cast(&reg)
-                        || self.is_reflexive_into_iter(&reg))
+                        || self.is_reflexive_into_iter(&reg)
+                        || self.is_hint_must_use(&reg)
+                        || self.is_arguments_from_str(&reg))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -3965,6 +4157,42 @@ impl<'a> Lowering<'a> {
                         kind: cast_pointer_marker_op(root, args[0].clone()),
                     });
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
+                // identity in the lifted value model (String/&str and
+                // Vec/&[T] share one repr), so alias the destination to
+                // the receiver instead of emitting a `deref` method call
+                // the rtyper cannot route on the classdef-less receiver.
+                if args.len() == 1 && self.is_container_identity_deref(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<String as AsRef<str>>::as_ref` / `String::as_str` /
+                // `<String as Borrow<str>>::borrow` — a `&str` view of the
+                // same string, identity in the lifted value model, so alias
+                // the destination to the receiver instead of emitting an
+                // `as_ref` method call the rtyper cannot route on the
+                // classdef-less string receiver.
+                if args.len() == 1 && self.is_string_to_str_identity(&reg, &call.dest.ty) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<str|String as ToString>::to_string` on a string-family
+                // receiver — a `String` clone that is an identity in the
+                // lifted value model, so alias the destination to the
+                // receiver instead of emitting an unregistered `to_string`.
+                if args.len() == 1 && self.is_to_string_identity(&reg, first_arg_ty.as_ref()) {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -4153,6 +4381,23 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `alloc::fmt::format` of a no-placeholder constant
+                // message — `format!("literal")`, whose `format_args!`
+                // lowered to `Arguments::from_str` (aliased to its
+                // `__str_const` operand by the identity fold above).  The
+                // render of a constant string is that string, so alias the
+                // result to the constant instead of leaving an unregistered
+                // `alloc::fmt::format` call.
+                if args.len() == 1
+                    && self.is_fmt_format_call(&reg)
+                    && self.traces_to_str_const(&args[0])
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -4907,6 +5152,160 @@ impl<'a> Lowering<'a> {
         tyref_class_root(dest_ty, self.llbc)
     }
 
+    /// `<String as Deref>::deref(&self) -> &str` / `<Vec<T> as
+    /// Deref>::deref(&self) -> &[T]` (and their `deref_mut`).  Unlike the
+    /// `Box`/`FrameBox` handles [`Self::deref_cast_root`] reinterprets as a
+    /// typed struct pointer, the owning-container deref returns the same
+    /// value the lifted model already carries: Rust `String`/`&str` both
+    /// lower to the immutable rpy_string and `Vec<T>`/`&[T]` both to the
+    /// rpy_list, so `*s` is identity.  `deref_cast_root` returns `None`
+    /// here (a `str`/slice target has no class root), so without this the
+    /// callsite falls through to a `CallTarget::Method` `deref` getattr the
+    /// rtyper cannot route on the classdef-less receiver.  Bind the
+    /// destination to the argument instead, the same alias shape as the
+    /// blanket-`into` identity above.
+    fn is_container_identity_deref(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+            return false;
+        }
+        deref_impl_owner_leaf(self.llbc, fd)
+            .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
+    }
+
+    /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
+    /// `String::as_str(&self) -> &str`, and
+    /// `<String as Borrow<str>>::borrow(&self) -> &str` — every one
+    /// returns a `&str` view of the same string, an identity in the
+    /// lifted value model (Rust `String`/`&str`/`str` all lower to the
+    /// immutable rpy_string).  Without the intercept the call keeps a
+    /// `CallTarget::Method` `as_ref` getattr the rtyper cannot route on
+    /// the classdef-less string receiver (the `Cannot find attribute
+    /// "as_ref" on UnicodeString` wall).  Bind the destination to the
+    /// receiver instead, the same alias shape as the container deref
+    /// above.  Gated on the `str`-typed result so `String`'s sibling
+    /// `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>` impls — whose
+    /// `&[u8]`/etc. result is a *different* value-model family — keep
+    /// their ordinary lowering.
+    fn is_string_to_str_identity(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        let Some(leaf) = np.rsplit("::").next() else {
+            return false;
+        };
+        if !matches!(leaf, "as_ref" | "as_str" | "borrow") {
+            return false;
+        }
+        if deref_impl_owner_leaf(self.llbc, fd).as_deref() != Some("String") {
+            return false;
+        }
+        tyref_strips_to_str(dest_ty, self.llbc)
+    }
+
+    /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
+    /// (`alloc::string::<Impl>::to_string`) — a `String` clone of a value
+    /// that is already a string in the lifted model (`String`/`&str`/`str`
+    /// all lower to the immutable rpy_string), so it is an identity.  The
+    /// path alone cannot tell the string specialization from the blanket
+    /// `impl<T: Display> ToString for T` (both monomorphize to the same
+    /// `<Impl>::to_string`), so gate on the receiver type: fold only when
+    /// the argument is itself string-family.  A non-string `to_string`
+    /// (an integer's `ll_int2dec`) has a receiver outside the family and
+    /// keeps its ordinary lowering.
+    fn is_to_string_identity(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if !fd.item_meta.name_path().ends_with("::to_string") {
+            return false;
+        }
+        first_arg_ty.is_some_and(|ty| {
+            tyref_is_string_adt(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
+        })
+    }
+
+    /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
+    /// — the call whose `format_args!` argument the #277 recognizer
+    /// back-traces.  `write!`/`writeln!` lower to `fmt::Write::write_fmt`
+    /// (a `Result`), never `fmt::format`, so the two-segment tail keeps
+    /// the match precise.
+    fn is_fmt_format_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let np = fd.item_meta.name_path();
+            let segs: Vec<String> = np.split("::").map(str::to_string).collect();
+            fmt_path_ends_with(&segs, &["fmt", "format"])
+        })
+    }
+
+    /// `fmt::Arguments::from_str(s)` — the no-placeholder `format_args!`
+    /// constructor a constant message lowers to (`debug_assert!` /
+    /// `assert!` / `panic!` with a literal, and `format!("literal")`).
+    /// Its sole argument is the `&'static str` literal itself (an already
+    /// string-family value in the lifted model), so the `Arguments` is the
+    /// constant string: the caller aliases the destination to that operand
+    /// instead of emitting the unregistered ctor.  The result then flows
+    /// either to a residualized panic (`Abort` → `RaiseImplicit`) or to
+    /// `alloc::fmt::format` (handled by [`Self::traces_to_str_const`]).
+    fn is_arguments_from_str(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        // `from_str` is an inherent-impl associated function on
+        // `core::fmt::Arguments`, so its `name_path()` carries an `<Impl>`
+        // placeholder, not the owner name — resolve the owner the same way
+        // `call_target_segments` spells the `["fmt", "Arguments",
+        // "from_str"]` `FunctionPath` (via `impl_method_owner_for_fundecl`).
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
+                leaf == "from_str" && owner.ends_with("fmt::Arguments")
+            })
+        })
+    }
+
+    /// Whether `var` is produced by a `__str_const` synthetic call (a
+    /// string literal — see [`Lowering::emit_constant`]), following the
+    /// cross-block back-trace.  Used to recognize `alloc::fmt::format`
+    /// applied to a constant message (a folded `Arguments::from_str`),
+    /// whose render is the constant itself.
+    fn traces_to_str_const(&self, var: &Variable) -> bool {
+        use crate::model::{CallTarget, OpKind};
+        resolve_to_producer_op(&self.graph, var)
+            .and_then(|(b, i)| {
+                self.graph
+                    .blocks
+                    .iter()
+                    .find(|blk| blk.id == b)
+                    .and_then(|blk| blk.operations.get(i))
+                    .map(|op| &op.kind)
+            })
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.first().map(String::as_str) == Some("__str_const")
+                )
+            })
+    }
+
     /// The blanket `impl<I: Iterator> IntoIterator for I`
     /// (`core::iter::traits::collect`) — its `into_iter(self) -> I`
     /// returns the receiver unchanged, so a `for` desugar's `into_iter`
@@ -4921,6 +5320,21 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "core::iter::traits::collect::<Impl>::into_iter"
         })
+    }
+
+    /// `core::hint::must_use(value)` — the identity wrapper
+    /// (`pub const fn must_use<T>(value: T) -> T`) the compiler inserts to
+    /// carry an `unused_must_use` lint through macro-generated code.  It
+    /// returns its argument unchanged and `core` has no graph body for it
+    /// (an unregistered callee), so the callsite aliases its argument
+    /// instead of calling the missing identity body.
+    fn is_hint_must_use(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::hint::must_use")
     }
 
     /// `f64::is_nan(self)` — `core` has no graph body (Opaque), so the
@@ -7424,6 +7838,26 @@ fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
 }
 
+/// Whether a `TyRef` resolves (behind `Ref`/dedup/hash-cons wrappers) to
+/// the `str` builtin — the unsized string slice (`{"Builtin": "Str"}`).
+/// Distinct from `[u8]` (the `Slice` builtin) and from `[T]`/`Box`/named
+/// ADTs, so it pins the string-family result of a `String -> &str` view
+/// apart from `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` impls.
+fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| {
+            n.as_object()?
+                .get("Adt")?
+                .as_object()?
+                .get("id")?
+                .as_object()
+        })
+        .and_then(|id| id.get("Builtin"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Str")
+}
+
 /// The qualified declaration path of a `TyRef`'s base ADT, after
 /// stripping `Ref` / hash-cons wrappers.  `None` for non-ADT types.
 fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
@@ -8775,9 +9209,6 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
 /// `None` when `var` traces to a `Const`, a function input (no producing
 /// op), a phi merge (a block with more than one incoming `Link`, so no
 /// single producer), or a producer not yet emitted into `graph`.
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn resolve_to_producer_op(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -8844,9 +9275,6 @@ fn resolve_to_producer_op(
 /// untouched) on any high-bit control byte other than `0xC0` — i.e. a
 /// format spec with width/precision/fill or an explicit positional/named
 /// argument — and on non-UTF-8 literal bytes.
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -8897,9 +9325,6 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
 /// once the ctor is found. Returns `None` if `array_var` is not produced
 /// by an `Array` ctor, or its `__pos_i` writes are not the contiguous
 /// range `0..n`.
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn read_array_literal_elements(
     graph: &FunctionGraph,
     array_var: &crate::flowspace::model::Variable,
@@ -8942,9 +9367,6 @@ fn read_array_literal_elements(
 /// following cross-block links via [`resolve_to_producer_op`]. Used to
 /// read the packed-format pieces byte array (each `__pos_i` element is a
 /// `ConstInt` byte).
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn resolve_const_int(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -8963,7 +9385,6 @@ fn resolve_const_int(
 /// `new_debug` constructor in the parallel args array (the packed pieces
 /// template does not encode the choice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum FmtArgKind {
     Display,
     Debug,
@@ -8972,7 +9393,6 @@ enum FmtArgKind {
 /// One placeholder argument recovered from a `format_args!` chain: the
 /// value Variable the placeholder renders and its Display/Debug flavour.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct FmtArg {
     value: crate::flowspace::model::Variable,
     kind: FmtArgKind,
@@ -8982,7 +9402,6 @@ struct FmtArg {
 /// pieces interleaved with the rendered placeholder arguments
 /// (`pieces.len() == args.len() + 1`).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct FmtChain {
     pieces: Vec<String>,
     args: Vec<FmtArg>,
@@ -8992,7 +9411,6 @@ struct FmtChain {
 /// crate-qualified spelling (`core::fmt::Arguments::new`) and the
 /// crate-stripped front-end spelling (`fmt::Arguments::new`) both
 /// resolve.
-#[allow(dead_code)]
 fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
     segments.len() >= tail.len()
         && segments[segments.len() - tail.len()..]
@@ -9003,7 +9421,6 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
 
 /// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
 /// builds from the on-stack pieces+args arrays.
-#[allow(dead_code)]
 fn is_arguments_new_path(segments: &[String]) -> bool {
     fmt_path_ends_with(segments, &["Arguments", "new"])
 }
@@ -9011,7 +9428,6 @@ fn is_arguments_new_path(segments: &[String]) -> bool {
 /// Classify a `fmt::rt::Argument::new_display` / `new_debug` constructor
 /// path. Any other path (positional/named/width-bearing argument ctor) is
 /// not in the recognized subset.
-#[allow(dead_code)]
 fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
     if fmt_path_ends_with(segments, &["Argument", "new_display"]) {
         Some(FmtArgKind::Display)
@@ -9028,7 +9444,6 @@ fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
 /// value written into that tuple field. Returns `var` unchanged when it
 /// is not produced by a `FieldRead` (value passed directly), and `None`
 /// when the tuple field has conflicting writers.
-#[allow(dead_code)]
 fn unwrap_fmt_arg_tuple_ref(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -9080,7 +9495,6 @@ fn unwrap_fmt_arg_tuple_ref(
 /// element is the result of a `fmt::rt::Argument::new_display` /
 /// `new_debug` constructor, whose sole argument back-traces (through the
 /// tuple-ref wrap) to the rendered value.
-#[allow(dead_code)]
 fn extract_fmt_arg(
     graph: &FunctionGraph,
     arg_elem: &crate::flowspace::model::Variable,
@@ -9112,7 +9526,6 @@ fn extract_fmt_arg(
 /// Returns `None` (the recognizer leaves the graph untouched) on any
 /// shape outside the recognized subset, so it never fires on an
 /// unsupported chain.
-#[allow(dead_code)]
 fn extract_fmt_chain(
     graph: &FunctionGraph,
     fmt_args_var: &crate::flowspace::model::Variable,
@@ -9154,7 +9567,6 @@ fn extract_fmt_chain(
 /// constant lowering uses (see [`Lowering::emit_constant`]); the flowspace
 /// adapter pre-folds it to the upstream string `Constant` and types it as
 /// a String.
-#[allow(dead_code)]
 fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Variable {
     use crate::model::{CallTarget, OpKind, ValueType};
     let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -9175,7 +9587,6 @@ fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Vari
 /// Variable. The `"add"` opname passes through the flowspace adapter
 /// unchanged; when both operands type as String the rtyper routes it to
 /// `pair(StringRepr, StringRepr).rtype_add` → `direct_call(ll_strconcat)`.
-#[allow(dead_code)]
 fn emit_str_add(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
@@ -10160,33 +10571,6 @@ mod tests {
         assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
     }
 
-    /// Throwaway IR-capture probe for the #277 fmt recognizer: dumps the
-    /// lowered front-end op sequence for `stack_underflow_error` (the
-    /// canonical `type_error(format!("…{x}"))` chain) so the byte-array
-    /// piece decoder can be anchored to the real `Array`/`ConstInt` shape.
-    /// Ignored by default (loads the 242MB real LLBC); run with
-    /// `cargo test -p majit-translate --lib dump_fmt_chain_ir -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn dump_fmt_chain_ir() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "stack_underflow_error")
-            .expect("lower stack_underflow_error");
-        for block in &graph.blocks {
-            eprintln!("block {:?} inputargs={:?}", block.id, block.inputargs);
-            for (idx, op) in block.operations.iter().enumerate() {
-                eprintln!("  [{idx}] result={:?} kind={:?}", op.result, op.kind);
-            }
-            for link in &block.exits {
-                eprintln!("  exit -> {:?} args={:?}", link.target, link.args);
-            }
-        }
-    }
-
     #[test]
     fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
         use super::{FmtArgKind, extract_fmt_chain};
@@ -10944,6 +11328,52 @@ mod tests {
         );
         assert_eq!(args, vec![arg]);
         assert_eq!(result_ty, ValueType::Ref(Some("W_CastTarget".to_string())));
+    }
+
+    /// Anchor [`Lowering::fold_size_const_global`] to the real lowered
+    /// IR of `function_new_impl` (= reads `FUNCTION_OBJECT_SIZE`, a
+    /// `const usize = size_of::<Function>()`).  The global read must fold
+    /// to `Function`'s concrete byte size (144) rather than residualize
+    /// as an unregisterable `FunctionPath` accessor call.  Ignored by
+    /// default (loads the 249MB real LLBC); run with `cargo test -p
+    /// majit-translate --lib fold_size_const_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn fold_size_const_real_function_object_size() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "function_new_impl").expect("lower function_new_impl");
+
+        let ops: Vec<&OpKind> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .map(|op| &op.kind)
+            .collect();
+
+        // The `size_of::<Function>()` const read folded to its byte size.
+        assert!(
+            ops.iter().any(|k| matches!(k, OpKind::ConstInt(144))),
+            "expected a ConstInt(144) for the folded FUNCTION_OBJECT_SIZE"
+        );
+        // No residual accessor call to the const remains.
+        let residual = ops.iter().any(|k| {
+            matches!(
+                k,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|s| s.ends_with("FUNCTION_OBJECT_SIZE"))
+            )
+        });
+        assert!(
+            !residual,
+            "FUNCTION_OBJECT_SIZE must not residualize as a FunctionPath call"
+        );
     }
 
     /// Minimal `Llbc` carrying only `trait_impls` — the surface
