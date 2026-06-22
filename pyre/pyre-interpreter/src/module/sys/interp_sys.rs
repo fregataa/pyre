@@ -255,7 +255,9 @@ pub fn exc_info_direct() -> PyObjectRef {
 pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
     dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
-    dict_storage_store(ns, "version", w_str_new("3.13.0 (pyre 0.0.1)"));
+    // Format matches `platform._sys_version`'s CPython parser:
+    // `version (buildinfo) [compiler]`.
+    dict_storage_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1) [Rust]"));
     dict_storage_store(
         ns,
         "platform",
@@ -278,17 +280,25 @@ pub fn register_module(ns: &mut DictStorage) {
             "big"
         }),
     );
-    dict_storage_store(
-        ns,
-        "version_info",
-        w_tuple_new(vec![
-            w_int_new(3),
-            w_int_new(13),
-            w_int_new(0),
-            w_str_new("final"),
-            w_int_new(0),
-        ]),
-    );
+    // sys.version_info — structseq(major, minor, micro, releaselevel,
+    // serial); a tuple subclass so `>= (3, 14)` / `[0]` and `.major` both work.
+    {
+        let version_info_type = crate::structseq::make_struct_seq(
+            "sys.version_info",
+            &["major", "minor", "micro", "releaselevel", "serial"],
+        );
+        let vi = crate::structseq::new_instance(
+            version_info_type,
+            vec![
+                w_int_new(3),
+                w_int_new(14),
+                w_int_new(6),
+                w_str_new("final"),
+                w_int_new(0),
+            ],
+        );
+        dict_storage_store(ns, "version_info", vi);
+    }
     // sys.modules — live dict synced with the import cache.
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
@@ -510,14 +520,14 @@ pub fn register_module(ns: &mut DictStorage) {
             "version",
             w_tuple_new(vec![
                 w_int_new(3),
-                w_int_new(13),
-                w_int_new(0),
+                w_int_new(14),
+                w_int_new(6),
                 w_str_new("final"),
                 w_int_new(0),
             ]),
         );
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "hexversion", w_int_new(0x030d00f0));
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "cache_tag", w_str_new("pyre-3.13"));
+        let _ = crate::baseobjspace::setattr_str(impl_obj, "hexversion", w_int_new(0x030e06f0));
+        let _ = crate::baseobjspace::setattr_str(impl_obj, "cache_tag", w_str_new("pyre-3.14"));
         let _ = crate::baseobjspace::setattr_str(impl_obj, "_multiarch", w_str_new(""));
         dict_storage_store(ns, "implementation", impl_obj);
     }
@@ -553,6 +563,17 @@ pub fn register_module(ns: &mut DictStorage) {
         let _ = crate::baseobjspace::setattr_str(fi, "rounds", w_int_new(1));
         dict_storage_store(ns, "float_info", fi);
     }
+    // sysmodule.c — `sys.float_repr_style` is "short" wherever float repr
+    // uses David Gay's shortest-round-trip algorithm (always, here).
+    dict_storage_store(ns, "float_repr_style", w_str_new("short"));
+    // sys.thread_info — structseq(name, lock, version).
+    {
+        let ti = make_sys_namespace_instance();
+        let _ = crate::baseobjspace::setattr_str(ti, "name", w_str_new("pthread"));
+        let _ = crate::baseobjspace::setattr_str(ti, "lock", w_str_new("semaphore"));
+        let _ = crate::baseobjspace::setattr_str(ti, "version", w_none());
+        dict_storage_store(ns, "thread_info", ti);
+    }
     // sys.int_info — structseq with int implementation details.
     {
         let ii = make_sys_namespace_instance();
@@ -562,8 +583,14 @@ pub fn register_module(ns: &mut DictStorage) {
         let _ = crate::baseobjspace::setattr_str(ii, "str_digits_check_threshold", w_int_new(640));
         dict_storage_store(ns, "int_info", ii);
     }
-    // sys.executable
-    dict_storage_store(ns, "executable", w_str_new("pyre"));
+    dict_storage_store(ns, "hexversion", w_int_new(0x030e06f0));
+    // sys.executable — absolute path to the running interpreter so that
+    // subprocess spawns via `sys.executable` resolve.
+    let executable = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "pyre".to_owned());
+    dict_storage_store(ns, "executable", w_str_new(&executable));
     // sys.prefix / exec_prefix
     dict_storage_store(ns, "prefix", w_str_new(""));
     dict_storage_store(ns, "exec_prefix", w_str_new(""));
@@ -586,6 +613,80 @@ pub fn register_module(ns: &mut DictStorage) {
             make_builtin_function_with_arity("is_available", |_| Ok(w_bool_from(false)), 0),
         );
         dict_storage_store(ns, "_jit", jit);
+    }
+    // sys.monitoring — PEP 669 low-impact monitoring API. The runtime hooks
+    // are stubbed (no events ever fire), but the namespace, tool-id
+    // constants, sentinels, and `events` flags are present so importing
+    // modules (bdb/pdb/cProfile/coverage tooling) succeed and can build
+    // their tracer objects.
+    {
+        let mon = make_sys_namespace_instance();
+        // Tool-id constants (Python/instrumentation.c).
+        for (name, id) in [
+            ("DEBUGGER_ID", 0),
+            ("COVERAGE_ID", 1),
+            ("PROFILER_ID", 2),
+            ("OPTIMIZER_ID", 5),
+        ] {
+            let _ = crate::baseobjspace::setattr_str(mon, name, w_int_new(id));
+        }
+        // DISABLE / MISSING sentinels — distinct singleton objects compared
+        // by identity (`callback() == DISABLE`, `assertIs(x, MISSING)`).
+        let _ = crate::baseobjspace::setattr_str(mon, "DISABLE", make_sys_namespace_instance());
+        let _ = crate::baseobjspace::setattr_str(mon, "MISSING", make_sys_namespace_instance());
+        // events namespace — `1 << event_id` flags that OR together.
+        {
+            let events = make_sys_namespace_instance();
+            let _ = crate::baseobjspace::setattr_str(events, "NO_EVENTS", w_int_new(0));
+            for (i, name) in [
+                "PY_START",
+                "PY_RESUME",
+                "PY_RETURN",
+                "PY_YIELD",
+                "CALL",
+                "LINE",
+                "INSTRUCTION",
+                "JUMP",
+                "BRANCH_LEFT",
+                "BRANCH_RIGHT",
+                "STOP_ITERATION",
+                "RAISE",
+                "EXCEPTION_HANDLED",
+                "PY_UNWIND",
+                "PY_THROW",
+                "RERAISE",
+                "C_RETURN",
+                "C_RAISE",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let _ = crate::baseobjspace::setattr_str(events, name, w_int_new(1i64 << i));
+            }
+            // BRANCH retained as an alias of BRANCH_LEFT for callers predating
+            // the 3.14 left/right split.
+            let _ = crate::baseobjspace::setattr_str(events, "BRANCH", w_int_new(1i64 << 8));
+            let _ = crate::baseobjspace::setattr_str(mon, "events", events);
+        }
+        // Runtime hooks — no-op stubs returning sensible defaults.
+        let store_fn = |obj, name: &'static str, f: crate::gateway::BuiltinCodeFn, arity: u16| {
+            let _ = crate::baseobjspace::setattr_str(
+                obj,
+                name,
+                make_builtin_function_with_arity(name, f, arity),
+            );
+        };
+        store_fn(mon, "use_tool_id", |_| Ok(w_none()), 2);
+        store_fn(mon, "free_tool_id", |_| Ok(w_none()), 1);
+        store_fn(mon, "clear_tool_id", |_| Ok(w_none()), 1);
+        store_fn(mon, "get_tool", |_| Ok(w_none()), 1);
+        store_fn(mon, "register_callback", |_| Ok(w_none()), 3);
+        store_fn(mon, "set_events", |_| Ok(w_none()), 2);
+        store_fn(mon, "get_events", |_| Ok(w_int_new(0)), 1);
+        store_fn(mon, "set_local_events", |_| Ok(w_none()), 3);
+        store_fn(mon, "get_local_events", |_| Ok(w_int_new(0)), 2);
+        store_fn(mon, "restart_events", |_| Ok(w_none()), 0);
+        dict_storage_store(ns, "monitoring", mon);
     }
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
@@ -742,17 +843,65 @@ pub fn register_module(ns: &mut DictStorage) {
             w_str_new("atexit"),
         ]),
     );
-    // sys.exception — returns the currently handled exception or None
+    // sys.exception() — the value half of `sys.exc_info()`: the exception
+    // instance currently being handled, or None outside an `except` block.
     dict_storage_store(
         ns,
         "exception",
-        make_builtin_function_with_arity("exception", |_| Ok(w_none()), 0),
+        make_builtin_function_with_arity(
+            "exception",
+            |_| {
+                let exc = crate::eval::get_current_exception();
+                Ok(unsafe {
+                    if exc.is_null() || !pyre_object::is_exception(exc) {
+                        w_none()
+                    } else {
+                        exc
+                    }
+                })
+            },
+            0,
+        ),
     );
     // sys.exc_clear — no-op
     dict_storage_store(
         ns,
         "exc_clear",
         make_builtin_function_with_arity("exc_clear", |_| Ok(w_none()), 0),
+    );
+    // sys.is_remote_debug_enabled() — no remote-debug interface is wired,
+    // so always False.
+    dict_storage_store(
+        ns,
+        "is_remote_debug_enabled",
+        make_builtin_function_with_arity(
+            "is_remote_debug_enabled",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            0,
+        ),
+    );
+    // sys.copyright — informational string consumed by `site` and `test`.
+    dict_storage_store(
+        ns,
+        "copyright",
+        w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
+    );
+    // sys.getsizeof(obj[, default]) — pyre has no per-object size accounting
+    // (vm.py getsizeof): return the caller-supplied `default`, and raise
+    // TypeError when it is omitted.
+    dict_storage_store(
+        ns,
+        "getsizeof",
+        make_builtin_function_with_arity(
+            "getsizeof",
+            |args| match args.get(1).copied() {
+                Some(w_default) => Ok(w_default),
+                None => Err(crate::PyError::type_error(
+                    "getsizeof(object, default) -> int: object size is not tracked; supply a default",
+                )),
+            },
+            1,
+        ),
     );
     // sys.gettrace / settrace
     dict_storage_store(

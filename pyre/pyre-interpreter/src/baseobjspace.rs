@@ -840,6 +840,10 @@ pub(crate) fn is_true_slot(obj: PyObjectRef) -> Result<bool, PyError> {
         if is_float(obj) {
             return Ok(w_float_get_value(obj) != 0.0);
         }
+        if pyre_object::is_complex(obj) {
+            return Ok(pyre_object::w_complex_get_real(obj) != 0.0
+                || pyre_object::w_complex_get_imag(obj) != 0.0);
+        }
         if is_str(obj) {
             return Ok(w_str_len(obj) != 0);
         }
@@ -2490,6 +2494,40 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// `__slots__` storage fallback for a native-layout subclass instance.
+///
+/// A `W_Member` slot normally reads/writes the receiver's mapdict slot
+/// storage (`MapdictSlotsSupport`), which only a `W_InstanceObject` carries.
+/// A subclass of a builtin type with a fixed Rust payload (e.g. a subclass
+/// of `array.array`) keeps that native layout and has no mapdict, so the
+/// slot is instead backed by the instance `__dict__` — the same side table
+/// (`mapdict::INSTANCE_DICT`) that already holds the subclass's regular
+/// attributes. `None`/`false` means the receiver has no writable dict.
+pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return None;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, name) }
+}
+
+pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return false;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str(w_dict, name, value) };
+    true
+}
+
+pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return false;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(w_dict, name) }
+}
+
 /// interpreter/baseobjspace.py:70-73 W_Root.setdict(space, w_dict).
 ///
 /// ```python
@@ -2895,6 +2933,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::itertoolsmodule::is_dropwhile(obj)
             || pyre_object::itertoolsmodule::is_filterfalse(obj)
             || pyre_object::itertoolsmodule::is_pairwise(obj)
+            || pyre_object::itertoolsmodule::is_cycle(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -2902,7 +2941,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 // takewhile/dropwhile expose `__reduce__` + `__setstate__`,
                 // filterfalse `__reduce__` only (interp_itertools.py
                 // W_TakeWhile/W_DropWhile/W_FilterFalse typedefs); pairwise
-                // exposes neither.
+                // exposes neither.  cycle exposes both (W_Cycle typedef).
+                "__reduce__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                    Some((cycle_reduce_method, "__reduce__", 1))
+                }
+                "__setstate__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                    Some((cycle_setstate_method, "__setstate__", 2))
+                }
                 "__reduce__" if pyre_object::itertoolsmodule::is_takewhile(obj) => {
                     Some((takewhile_reduce_method, "__reduce__", 1))
                 }
@@ -3204,7 +3249,25 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 "__self__" => {
                     return Ok(pyre_object::methodobject::w_method_get_self(obj));
                 }
-                _ => {}
+                // `__class__` resolves to the `method` type itself (handled by
+                // the generic type dispatch below), never forwarded.
+                "__class__" => {}
+                _ => {
+                    // `classobject.c method_getattro` — attributes defined on
+                    // the method type win (`__call__` / `__repr__` / `__eq__`
+                    // / `__hash__`); any other name is forwarded to `__func__`
+                    // (`__name__` / `__qualname__` / `__code__` / `__doc__` /
+                    // `__defaults__` / `__annotations__` / …).
+                    let on_method_type = crate::typedef::r#type(obj)
+                        .map(|t| lookup_in_type_where(t, name).is_some())
+                        .unwrap_or(false);
+                    if !on_method_type {
+                        let func = pyre_object::methodobject::w_method_get_func(obj);
+                        if !func.is_null() {
+                            return getattr_str(func, name);
+                        }
+                    }
+                }
             }
         }
         if is_instance(obj) {
@@ -3985,7 +4048,15 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 return Ok(pyre_object::w_dict_proxy_new(canonical));
             }
             if name == "__bases__" {
-                return Ok(w_type_get_bases(obj));
+                // typeobject.py:1027 descr_get__bases__ — `object` (the root
+                // type) carries no bases tuple; surface the empty tuple rather
+                // than the null sentinel so `reversed(cls.__bases__)` and the
+                // C3 helpers in `functools` don't dereference null.
+                let bases = w_type_get_bases(obj);
+                if bases.is_null() {
+                    return Ok(w_tuple_new(vec![]));
+                }
+                return Ok(bases);
             }
             // PEP 649 lazy annotations: when `cls.__annotations__` is
             // requested and only `__annotate_func__` (or `__annotate__`)
@@ -4375,15 +4446,20 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // bogus "wrapper loop".
     if name == "__doc__" || name == "__module__" || name == "__annotations__" {
         // baseobjspace.py:46-50 W_Root.getdictvalue — consult the
-        // instance dict (exception `w_dict` slot, hasdict objects),
-        // else None.
+        // instance dict (exception `w_dict` slot, hasdict objects).
         let w_dict = getdict_backing(obj);
         if !w_dict.is_null() {
             if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
                 return Ok(value);
             }
         }
-        return Ok(w_none());
+        // `__module__` is not a universal attribute: an object whose
+        // type-MRO carries no `__module__` (e.g. a builtin instance like
+        // `(0).__module__`) raises AttributeError rather than reporting
+        // None.  `__doc__`/`__annotations__` keep the None default.
+        if name != "__module__" {
+            return Ok(w_none());
+        }
     }
     // Exception attributes — PyPy: W_BaseException attributes
     if unsafe { pyre_object::is_exception(obj) } {
@@ -6178,7 +6254,12 @@ pub(crate) unsafe fn get(
         }
         // typedef.py:511: w_result = w_obj.getslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let found = crate::objspace::std::mapdict::getslotvalue(obj, index);
+        let found = if is_instance(obj) {
+            crate::objspace::std::mapdict::getslotvalue(obj, index)
+        } else {
+            // Native-layout subclass instance — slot backed by __dict__.
+            native_slot_get(obj, pyre_object::w_member_get_name(descr))
+        };
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
@@ -6256,7 +6337,22 @@ unsafe fn set(
         }
         // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
         let index = pyre_object::w_member_get_index(descr);
-        crate::objspace::std::mapdict::setslotvalue(obj, index, value);
+        if is_instance(obj) {
+            crate::objspace::std::mapdict::setslotvalue(obj, index, value);
+        } else {
+            // Native-layout subclass instance — slot backed by __dict__.
+            let slot_name = pyre_object::w_member_get_name(descr);
+            if !native_slot_set(obj, slot_name, value) {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::AttributeError,
+                    format!(
+                        "'{}' object attribute '{}' is read-only",
+                        (*(*obj).ob_type).name,
+                        slot_name,
+                    ),
+                ));
+            }
+        }
         return Ok(true);
     }
 
@@ -6310,7 +6406,12 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         }
         // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let removed = crate::objspace::std::mapdict::delslotvalue(obj, index);
+        let removed = if is_instance(obj) {
+            crate::objspace::std::mapdict::delslotvalue(obj, index)
+        } else {
+            // Native-layout subclass instance — slot backed by __dict__.
+            native_slot_del(obj, pyre_object::w_member_get_name(descr))
+        };
         if !removed {
             let slot_name = pyre_object::w_member_get_name(descr);
             return Err(crate::PyError::new(
@@ -7289,10 +7390,20 @@ pub fn call_function(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef
 
 /// PyPy: baseobjspace.py `callable_w`.
 pub fn callable_w(obj: PyObjectRef) -> bool {
+    // `PyCallable_Check` — the builtin callable kinds (function / builtin
+    // function, bound method, static- and classmethod, type) dispatch through
+    // dedicated slots rather than a `__call__` dict entry, so each is
+    // recognised directly; any other object is callable iff its type defines
+    // `__call__`.  Mirrors `builtins::builtin_callable`.
     unsafe {
         is_function(obj)
             || is_type(obj)
-            || (is_instance(obj) && lookup_in_type(w_instance_get_type(obj), "__call__").is_some())
+            || pyre_object::is_method(obj)
+            || pyre_object::propertyobject::is_staticmethod(obj)
+            || pyre_object::propertyobject::is_classmethod(obj)
+            || crate::typedef::r#type(obj)
+                .and_then(|t| lookup_in_type(t, "__call__"))
+                .is_some()
     }
 }
 
@@ -8461,6 +8572,7 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || pyre_object::itertoolsmodule::is_dropwhile(obj)
             || pyre_object::itertoolsmodule::is_filterfalse(obj)
             || pyre_object::itertoolsmodule::is_pairwise(obj)
+            || pyre_object::itertoolsmodule::is_cycle(obj)
         {
             return true;
         }
@@ -8546,11 +8658,33 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
     }
     unsafe {
-        // Builtin iterables
+        // Builtin iterables.  An exact list/tuple uses the direct storage
+        // iterator; a subclass may override `__iter__`, in which case the
+        // override is dispatched.  The inherited base `list/tuple.__iter__`
+        // (which itself calls back into `iter()`) is collapsed to the
+        // storage iterator to avoid an infinite recursion.
         if is_list(obj) {
+            if !pyre_object::is_exact_list(obj) {
+                if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE))
+                        && !is_none(method)
+                    {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
             return Ok(pyre_object::w_seq_iter_new(obj, w_list_len(obj)));
         }
         if is_tuple(obj) {
+            if !pyre_object::is_exact_tuple(obj) {
+                if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE))
+                        && !is_none(method)
+                    {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
             return Ok(pyre_object::w_seq_iter_new(obj, w_tuple_len(obj)));
         }
         if pyre_object::is_generic_alias(obj) {
@@ -8623,6 +8757,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::itertoolsmodule::is_dropwhile(obj)
             || pyre_object::itertoolsmodule::is_filterfalse(obj)
             || pyre_object::itertoolsmodule::is_pairwise(obj)
+            || pyre_object::itertoolsmodule::is_cycle(obj)
         {
             return Ok(obj);
         }
@@ -8654,6 +8789,12 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `iter(callable, sentinel)` product — its own iterator.
         if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
             return Ok(obj);
+        }
+        // `array.array` — `interp_array.py descr_iter` returns
+        // `space.newseqiter(self)` (a fresh index cursor, not self).
+        if pyre_object::array_object::is_array(obj) {
+            let len = pyre_object::array_object::w_array_len(obj);
+            return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
         // — `space.lookup(w_obj, '__iter__')` is type-MRO-only; PyPy never
@@ -8698,7 +8839,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         for i in 0..n {
                             match getitem(obj, w_int_new(i)) {
                                 Ok(item) => items.push(item),
-                                Err(_) => break,
+                                Err(e)
+                                    if e.kind == crate::PyErrorKind::IndexError
+                                        || e.kind == crate::PyErrorKind::StopIteration =>
+                                {
+                                    break;
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
                         let count = items.len();
@@ -8706,12 +8853,21 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         return Ok(pyre_object::w_seq_iter_new(list, count));
                     }
                 }
-                // No __len__: iterate up to a reasonable bound, breaking on
-                // any error (PyPy: descroperation iter_via_getitem with sentinel).
+                // No __len__: probe up to a reasonable bound.
+                // `W_SeqIterObject.descr_next` (iterobject.py) ends the
+                // iteration only on IndexError; `iter_iternext`
+                // (iterobject.c) also treats StopIteration as the end.
+                // Any other `__getitem__` error propagates.
                 for i in 0..1_000_000i64 {
                     match getitem(obj, w_int_new(i)) {
                         Ok(item) => items.push(item),
-                        Err(_) => break,
+                        Err(e)
+                            if e.kind == crate::PyErrorKind::IndexError
+                                || e.kind == crate::PyErrorKind::StopIteration =>
+                        {
+                            break;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 let count = items.len();
@@ -8783,6 +8939,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     n += 1;
                 }
                 found
+            } else if pyre_object::array_object::is_array(seq) {
+                if (idx as usize) < pyre_object::array_object::w_array_len(seq) {
+                    Some(pyre_object::array_object::w_array_unpack_item(
+                        seq,
+                        idx as usize,
+                    ))
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -9026,6 +9191,67 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_next = next(it.w_iterator)?;
             it.w_prev = w_next;
             return Ok(pyre_object::w_tuple_new(vec![w_prev, w_next]));
+        }
+        // itertools.cycle — interp_itertools.py W_Cycle.next_w
+        //
+        //     def next_w(self):
+        //         if self.index > 0:
+        //             if not self.saved_w:
+        //                 raise OperationError(self.space.w_StopIteration, ...)
+        //             try:
+        //                 w_obj = self.saved_w[self.index]
+        //             except IndexError:
+        //                 self.index = 1
+        //                 w_obj = self.saved_w[0]
+        //             else:
+        //                 self.index += 1
+        //         else:
+        //             try:
+        //                 w_obj = self.space.next(self.w_iterable)
+        //             except OperationError as e:  # StopIteration
+        //                 self.index = 1
+        //                 if not self.saved_w:
+        //                     raise
+        //                 w_obj = self.saved_w[0]
+        //             else:
+        //                 self.saved_w.append(w_obj)
+        //         return w_obj
+        if pyre_object::itertoolsmodule::is_cycle(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Cycle);
+            // Cycling pass (index > 0): replay `saved` after the source ended.
+            if it.index > 0 {
+                let n = pyre_object::w_list_len(it.saved) as i64;
+                if n == 0 {
+                    return Err(PyError::stop_iteration());
+                }
+                if it.index < n {
+                    let w_obj = pyre_object::w_list_getitem(it.saved, it.index)
+                        .expect("cycle saved index in range");
+                    it.index += 1;
+                    return Ok(w_obj);
+                }
+                // `IndexError` — wrap to the start; index left at 1 so the
+                // next call reads `saved[1]`.
+                it.index = 1;
+                return Ok(pyre_object::w_list_getitem(it.saved, 0).expect("cycle saved non-empty"));
+            }
+            // First pass (index == 0): pull from the source, saving each.
+            match next(it.w_iterable) {
+                Ok(w_obj) => {
+                    pyre_object::w_list_append(it.saved, w_obj);
+                    return Ok(w_obj);
+                }
+                Err(e) if e.kind == PyErrorKind::StopIteration => {
+                    it.index = 1;
+                    if pyre_object::w_list_len(it.saved) == 0 {
+                        return Err(PyError::stop_iteration());
+                    }
+                    return Ok(
+                        pyre_object::w_list_getitem(it.saved, 0).expect("cycle saved non-empty")
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
         // `pypy/objspace/std/dictmultiobject.py:809-845 _new_next`
         // line-by-line — two parity-mandated checks:
@@ -9369,6 +9595,56 @@ fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe { property_copy(args[0], None, None, args.get(1).copied()) }
 }
 
+/// `descriptor.py W_Property.get` as the type-dict `__get__` entry — args
+/// are `[property, obj, objtype]`.  The implicit descriptor path special-
+/// cases properties in `get()` above; this entry exists so explicit
+/// `prop.__get__(...)`, `hasattr(prop, '__get__')`, and descriptor
+/// introspection see it.
+pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let prop = args[0];
+        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        // `if space.is_w(w_obj, space.w_None): return self`
+        if obj.is_null() || is_none(obj) {
+            return Ok(prop);
+        }
+        let fget = w_property_get_fget(prop);
+        if fget.is_null() || is_none(fget) {
+            return Err(property_no_accessor(prop, obj, "getter"));
+        }
+        crate::call::call_function_impl_result(fget, &[obj])
+    }
+}
+
+/// `descriptor.py W_Property.set` — args `[property, obj, value]`.
+pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let prop = args[0];
+        let obj = args[1];
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let fset = w_property_get_fset(prop);
+        if fset.is_null() || is_none(fset) {
+            return Err(property_no_accessor(prop, obj, "setter"));
+        }
+        crate::call::call_function_impl_result(fset, &[obj, value])?;
+        Ok(pyre_object::w_none())
+    }
+}
+
+/// `descriptor.py W_Property.delete` — args `[property, obj]`.
+pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let prop = args[0];
+        let obj = args[1];
+        let fdel = w_property_get_fdel(prop);
+        if fdel.is_null() || is_none(fdel) {
+            return Err(property_no_accessor(prop, obj, "deleter"));
+        }
+        crate::call::call_function_impl_result(fdel, &[obj])?;
+        Ok(pyre_object::w_none())
+    }
+}
+
 // ── Generator methods ────────────────────────────────────────────────
 //
 // PyPy: pypy/interpreter/generator.py GeneratorIterator
@@ -9546,6 +9822,60 @@ fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
     };
     let state = w_tuple_new(vec![w_pred, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state]))
+}
+
+/// `cycle.__reduce__` — `interp_itertools.py W_Cycle.descr_reduce`:
+/// `(type(self), (iterable,), (list(saved), index))`.  The saved buffer is
+/// copied into a fresh list (`space.newlist(self.saved_w)`) so later
+/// cycling cannot mutate the pickled state.
+fn cycle_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    // Capture every field before any allocation (`w_list_new` /
+    // `w_tuple_new` may collect): the saved elements go into a `Vec`
+    // that `w_list_new` pins, and `w_iterable` / `index` are read up
+    // front rather than across an allocation.
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
+    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_Cycle) };
+    let w_iterable = it.w_iterable;
+    let index = it.index;
+    let n = unsafe { pyre_object::w_list_len(it.saved) };
+    let mut saved = Vec::with_capacity(n);
+    for i in 0..n as i64 {
+        saved.push(
+            unsafe { pyre_object::w_list_getitem(it.saved, i) }
+                .expect("cycle saved index in range"),
+        );
+    }
+    let state = w_tuple_new(vec![w_list_new(saved), w_int_new(index)]);
+    Ok(w_tuple_new(vec![
+        w_type,
+        w_tuple_new(vec![w_iterable]),
+        state,
+    ]))
+}
+
+/// `cycle.__setstate__` — `interp_itertools.py W_Cycle.descr_setstate`:
+/// unpack `(saved, index)`, replace `saved_w` with a fresh list of the
+/// unpacked elements, and restore `index`.  Reassigning the `saved`
+/// pointer field requires the GC write barrier so an old→young edge is
+/// recorded.
+fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    // `unpackiterable` iterates the pickled state and may collect; pin the
+    // receiver and the state tuple so they (and, transitively, the saved
+    // list reached through the tuple) survive each iteration.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_self = args[0];
+    let w_state = args.get(1).copied().unwrap_or(w_none());
+    pyre_object::gc_roots::pin_root(w_self);
+    pyre_object::gc_roots::pin_root(w_state);
+    let state_w = unpackiterable(w_state, 2)?;
+    let saved_w = unpackiterable(state_w[0], -1)?;
+    let w_saved = w_list_new(saved_w);
+    let index = int_w(state_w[1])?;
+    let it = unsafe { &mut *(w_self as *mut pyre_object::itertoolsmodule::W_Cycle) };
+    it.saved = w_saved;
+    pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+    it.index = index;
+    Ok(w_none())
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)

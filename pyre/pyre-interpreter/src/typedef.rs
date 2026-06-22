@@ -257,6 +257,12 @@ pub fn init_typeobjects() {
         let type_type = new_typeobject_with_base("type", init_type_type, object_type);
         // hasdict/weakrefable/acceptable now set by typedef.py:34,37,43 logic
         // in new_typeobject_with_base_and_layout from init_type_type's dict contents.
+        // typeobject.py:691-701 W_TypeObject._lifeline_/getweakref/setweakref/
+        // delweakref — every type object supports weakrefs regardless of the
+        // `weakrefable` flag inferred from its dict.  Mark the metaclass so that
+        // instances of `type` (i.e. all classes) route through the weakref
+        // side table; subclassed metaclasses inherit it via copy_flags_from_bases.
+        unsafe { pyre_object::w_type_set_weakrefable(type_type, true) };
         reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
         let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
 
@@ -289,6 +295,28 @@ pub fn init_typeobjects() {
                 init_float_type,
                 object_type,
                 &FLOAT_TYPE as *const PyType,
+            ) as usize,
+        );
+
+        // complex — complexobject.c, bases=(object,)
+        reg.insert(
+            &pyre_object::COMPLEX_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "complex",
+                init_complex_type,
+                object_type,
+                &pyre_object::COMPLEX_TYPE as *const PyType,
+            ) as usize,
+        );
+
+        // array.array — interp_array.py, bases=(object,)
+        reg.insert(
+            &pyre_object::array_object::ARRAY_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "array.array",
+                crate::module::array::init_array_type,
+                object_type,
+                &pyre_object::array_object::ARRAY_TYPE as *const PyType,
             ) as usize,
         );
 
@@ -744,6 +772,10 @@ pub fn init_typeobjects() {
             &pyre_object::itertoolsmodule::PAIRWISE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
         );
+        reg.insert(
+            &pyre_object::itertoolsmodule::CYCLE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.cycle", |_| {}, object_type) as usize,
+        );
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
@@ -911,6 +943,23 @@ unsafe fn stamp_new_descr_self(ns_ptr: *mut DictStorage, type_obj: PyObjectRef) 
                 crate::function::function_set_new_self(inner, type_obj);
             }
         }
+    }
+    // typeobject.py:1738-1742 — `if isinstance(descrvalue, GetSetProperty):
+    // descrvalue = descrvalue.copy_for_type(w_type)`.  Bind every reqcls-less
+    // GetSetProperty in the namespace to its owning type so that
+    // `T.__dict__['x'].__objclass__` (descr_get_objclass reads `w_objclass`)
+    // resolves instead of raising "generic self has no __objclass__".
+    let mut rebinds: Vec<(String, PyObjectRef)> = Vec::new();
+    for (key, &descr) in (*ns_ptr).entries() {
+        if !descr.is_null() && pyre_object::getsetproperty::is_getset_property(descr) {
+            let bound = copy_for_type(descr, type_obj);
+            if !std::ptr::eq(bound, descr) {
+                rebinds.push((key.to_string(), bound));
+            }
+        }
+    }
+    for (key, bound) in rebinds {
+        (*ns_ptr).insert(key, bound);
     }
 }
 
@@ -1182,6 +1231,34 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // on it don't clobber the value-cached singleton.
     let float_val = unsafe { pyre_object::w_float_get_value(value) };
     let obj = pyre_object::w_float_new(float_val);
+    unsafe {
+        (*obj).w_class = cls;
+    }
+    Ok(obj)
+}
+
+fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = crate::builtins::builtin_complex(&args[1..])?;
+    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+        return Ok(value);
+    }
+    let complex_typeobj = gettypefor(&pyre_object::COMPLEX_TYPE);
+    if complex_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+        return Ok(value);
+    }
+    // Subclass path — retag a fresh W_ComplexObject with the subclass.
+    let (re, im) = unsafe {
+        (
+            pyre_object::w_complex_get_real(value),
+            pyre_object::w_complex_get_imag(value),
+        )
+    };
+    let obj = pyre_object::w_complex_new(re, im);
     unsafe {
         (*obj).w_class = cls;
     }
@@ -1840,7 +1917,22 @@ fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__iter__",
-        make_builtin_function_with_arity("__iter__", |args| crate::baseobjspace::iter(args[0]), 1),
+        // Build the storage iterator directly rather than re-entering
+        // `space.iter()` — a `list` subclass that calls `super().__iter__()`
+        // would otherwise be re-dispatched back to its own override.
+        make_builtin_function_with_arity(
+            "__iter__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if obj.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                Ok(pyre_object::w_seq_iter_new(obj, unsafe {
+                    pyre_object::w_list_len(obj)
+                }))
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
@@ -3962,13 +4054,19 @@ fn init_tuple_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__iter__",
+        // Build the storage iterator directly rather than re-entering
+        // `space.iter()` — a `tuple` subclass that calls `super().__iter__()`
+        // would otherwise be re-dispatched back to its own override.
         make_builtin_function_with_arity(
             "__iter__",
             |args| {
-                if args.is_empty() {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if obj.is_null() {
                     return Ok(pyre_object::w_none());
                 }
-                crate::baseobjspace::iter(args[0])
+                Ok(pyre_object::w_seq_iter_new(obj, unsafe {
+                    pyre_object::w_tuple_len(obj)
+                }))
             },
             1,
         ),
@@ -4342,6 +4440,32 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(curr)
 }
 
+/// `UnionType.__class_getitem__(items)` — `typing.Union` is bound to this
+/// type, so `Union[int, str]` folds the members back into `int | str`.  A
+/// single member is returned unwrapped (`Union[int]` is `int`).
+fn union_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
+    // args[0] = cls (UnionType), args[1] = items.
+    let items_raw = args.get(1).copied().unwrap_or_else(pyre_object::w_none);
+    let items: Vec<PyObjectRef> = if unsafe { pyre_object::is_tuple(items_raw) } {
+        let len = unsafe { pyre_object::w_tuple_len(items_raw) };
+        (0..len)
+            .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(items_raw, i as i64) })
+            .collect()
+    } else {
+        vec![items_raw]
+    };
+    if items.is_empty() {
+        return Err(crate::PyError::type_error(
+            "Cannot take a Union of no types.",
+        ));
+    }
+    let mut curr = items[0];
+    for &next in &items[1..] {
+        curr = crate::genericalias::create_union(curr, next)?;
+    }
+    Ok(curr)
+}
+
 fn init_union_type(ns: &mut DictStorage) {
     // UnionType.__args__ — returns the tuple of union member types
     let args_getter = make_builtin_function_with_arity(
@@ -4380,6 +4504,16 @@ fn init_union_type(ns: &mut DictStorage) {
         ns,
         "__getitem__",
         make_builtin_function("__getitem__", union_getitem),
+    );
+    // UnionType.__class_getitem__ — `typing.Union` is this type, so
+    // `Union[int, str]` folds members into a union.
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            union_class_getitem,
+        )),
     );
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
     dict_storage_store(
@@ -5007,6 +5141,22 @@ fn init_type_type(ns: &mut DictStorage) {
         "__init__",
         make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
     );
+    // type.__call__(cls, *args) — typeobject.c type_call.  The implicit
+    // instantiation path handles `Cls()` directly, but a custom metaclass
+    // whose `__call__` delegates via `super().__call__(...)` needs this
+    // entry to resolve to the default __new__/__init__ behaviour.
+    dict_storage_store(
+        ns,
+        "__call__",
+        make_builtin_function("__call__", |args| {
+            let Some((&cls, rest)) = args.split_first() else {
+                return Err(crate::PyError::type_error(
+                    "type.__call__() takes at least 1 argument (0 given)",
+                ));
+            };
+            crate::call::type_call_instantiate(cls, rest)
+        }),
+    );
     // type.__annotations__ / __dict__ / __mro__ / __name__ / __bases__
     // are exposed as getset descriptors so
     // `type.__dict__['<name>'].__get__(cls)` invokes the underlying getter
@@ -5088,6 +5238,27 @@ fn init_type_type(ns: &mut DictStorage) {
         }
     });
     dict_storage_store(ns, "mro", mro_method);
+
+    // typeobject.py:1269-1272 descr___subclasses__ — return the list of
+    // immediate subclasses recorded in `weak_subclasses` (dead weakrefs
+    // filtered out by `w_type_get_subclasses`).
+    let subclasses_method = make_builtin_function("__subclasses__", |args| {
+        // `type.__subclasses__` resolves unbound when read off `type` itself
+        // (it lives in `type`'s own dict, so it is not bound to a metatype
+        // instance); calling it without the class argument is the
+        // "unbound method ... needs an argument" TypeError, not a crash.
+        let cls = match args.first() {
+            Some(&c) if unsafe { pyre_object::is_type(c) } => c,
+            _ => {
+                return Err(crate::PyError::type_error(
+                    "unbound method type.__subclasses__() needs an argument",
+                ));
+            }
+        };
+        let subs = unsafe { pyre_object::w_type_get_subclasses(cls) };
+        Ok(pyre_object::w_list_new(subs))
+    });
+    dict_storage_store(ns, "__subclasses__", subclasses_method);
 
     // `pypy/objspace/std/typeobject.py:614-624 get_module` /
     // `:1241-1247 descr_get__module` / `descr_set__module`.
@@ -5262,7 +5433,89 @@ fn init_type_type(ns: &mut DictStorage) {
         },
         2,
     );
-    dict_storage_store(ns, "__bases__", make_getset_descriptor(bases_getter));
+    let bases_setter = make_builtin_function_with_arity("__bases__", type_set_bases, 3);
+    dict_storage_store(
+        ns,
+        "__bases__",
+        make_getset_property_named(
+            bases_getter,
+            bases_setter,
+            pyre_object::PY_NULL,
+            "__bases__",
+        ),
+    );
+}
+
+/// `type.__bases__` setter (typeobject.py:1064-1105 `descr_set__bases__`).
+/// Heap types only; the new bases must be a non-empty tuple of classes whose
+/// best base shares the current instance layout (so instances stay valid).
+/// On success the MRO is recomputed and the type is re-registered on its new
+/// bases.
+fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        let w_type = args[1];
+        let w_value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let type_name = pyre_object::w_type_get_name(w_type);
+        if !pyre_object::w_type_is_heaptype(w_type) {
+            return Err(crate::PyError::type_error(format!(
+                "can't set {type_name}.__bases__"
+            )));
+        }
+        if w_value.is_null() || !pyre_object::is_tuple(w_value) {
+            return Err(crate::PyError::type_error(format!(
+                "can only assign tuple to {type_name}.__bases__"
+            )));
+        }
+        let n = pyre_object::w_tuple_len(w_value);
+        if n == 0 {
+            return Err(crate::PyError::type_error(format!(
+                "can only assign non-empty tuple to {type_name}.__bases__"
+            )));
+        }
+        // find_best_base: pick the base with the most-derived instance layout.
+        let mut w_bestbase = pyre_object::PY_NULL;
+        let mut best_layout: *const pyre_object::typeobject::Layout = std::ptr::null();
+        for i in 0..n {
+            let Some(w_base) = pyre_object::w_tuple_getitem(w_value, i as i64) else {
+                continue;
+            };
+            if std::ptr::eq(w_base, w_type) {
+                return Err(crate::PyError::type_error(
+                    "a __bases__ item causes an inheritance cycle",
+                ));
+            }
+            if !pyre_object::is_type(w_base) {
+                return Err(crate::PyError::type_error(format!(
+                    "{type_name}.__bases__ must be tuple of classes, not '{}'",
+                    (*(*w_base).ob_type).name
+                )));
+            }
+            let cand_layout = pyre_object::w_type_get_layout_ptr(w_base);
+            if best_layout.is_null()
+                || (cand_layout != best_layout
+                    && !cand_layout.is_null()
+                    && (*cand_layout).issublayout(best_layout))
+            {
+                w_bestbase = w_base;
+                best_layout = cand_layout;
+            }
+        }
+        // Instances keep their current layout, so the new best base must share
+        // it (no instance-size change).  Adding layout-neutral mixin bases such
+        // as Generic is fine; switching to an incompatible solid base is not.
+        let cur_layout = pyre_object::w_type_get_layout_ptr(w_type);
+        if best_layout != cur_layout {
+            return Err(crate::PyError::type_error(format!(
+                "__bases__ assignment: '{}' object layout differs from '{type_name}'",
+                pyre_object::w_type_get_name(w_bestbase)
+            )));
+        }
+        pyre_object::typeobject::w_type_set_bases(w_type, w_value);
+        let mro = crate::baseobjspace::compute_mro(w_type);
+        pyre_object::w_type_set_mro(w_type, mro);
+        pyre_object::typeobject::w_type_ready(w_type);
+        Ok(pyre_object::w_none())
+    }
 }
 
 /// function/builtin_function_or_method — PyPy: function.py Function typedef
@@ -5524,6 +5777,34 @@ fn init_function_type_common(ns: &mut DictStorage) {
         }
     });
     dict_storage_store(ns, "__globals__", make_getset_descriptor(globals_getter));
+    // `func.__builtins__` — `_PyEval_BuiltinsFromGlobals(globals)`: look up
+    // `__builtins__` in the function's globals; a Module yields its dict,
+    // any other value is returned directly, and an absent key falls back to
+    // the default builtin Module.  `pick_builtin_obj` already performs that
+    // resolution (honoring a custom `__builtins__`); convert the Module it
+    // returns to its dict so callers see a mapping (annotationlib's
+    // `{**annotate.__builtins__, **annotate.__globals__}`).
+    let func_builtins_getter = make_builtin_function("__builtins__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        let w_globals = unsafe { crate::function::function_get_globals_obj(func) };
+        let exec_ctx = crate::call::take_last_exec_ctx();
+        let w_builtin = crate::baseobjspace::pick_builtin_obj(w_globals, exec_ctx);
+        if w_builtin.is_null() {
+            Ok(pyre_object::w_none())
+        } else if unsafe { pyre_object::is_module(w_builtin) } {
+            Ok(unsafe { pyre_object::w_module_get_w_dict(w_builtin) })
+        } else {
+            Ok(w_builtin)
+        }
+    });
+    dict_storage_store(
+        ns,
+        "__builtins__",
+        make_getset_descriptor(func_builtins_getter),
+    );
     // `pypy/interpreter/typedef.py:805 __objclass__ = getset_func_objclass`
     //
     // ```python
@@ -5619,6 +5900,13 @@ fn init_function_type_common(ns: &mut DictStorage) {
 
 fn init_function_type(ns: &mut DictStorage) {
     init_function_type_common(ns);
+    // `funcobject.c func_new` — `FunctionType(code, globals, name=None,
+    // argdefs=None, closure=None, kwdefaults=None)`.
+    dict_storage_store(
+        ns,
+        "__new__",
+        make_new_descr(crate::function::descr_function_new),
+    );
     dict_storage_store(
         ns,
         "__get__",
@@ -5786,6 +6074,90 @@ fn init_builtin_code_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "co_name", make_getset_descriptor(co_name_getter));
+
+    // Signature-derived attrs (fget_co_argcount etc., typedef.py). A
+    // builtin code with no recorded Signature reports zero/empty so
+    // inspect.signature() degrades to an empty signature instead of
+    // raising AttributeError.
+    fn code_sig(args: &[pyre_object::PyObjectRef]) -> Option<&'static crate::gateway::Signature> {
+        let code = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if code.is_null() {
+            None
+        } else {
+            unsafe { crate::builtin_code_get_signature(code) }
+        }
+    }
+    let argcount_getter = make_builtin_function_with_arity(
+        "co_argcount",
+        |args| {
+            Ok(pyre_object::w_int_new(
+                code_sig(args).map_or(0, |s| s.num_argnames()) as i64,
+            ))
+        },
+        2,
+    );
+    dict_storage_store(ns, "co_argcount", make_getset_descriptor(argcount_getter));
+    let posonly_getter = make_builtin_function_with_arity(
+        "co_posonlyargcount",
+        |args| {
+            Ok(pyre_object::w_int_new(
+                code_sig(args).map_or(0, |s| s.num_posonlyargnames()) as i64,
+            ))
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "co_posonlyargcount",
+        make_getset_descriptor(posonly_getter),
+    );
+    let kwonly_getter = make_builtin_function_with_arity(
+        "co_kwonlyargcount",
+        |args| {
+            Ok(pyre_object::w_int_new(
+                code_sig(args).map_or(0, |s| s.num_kwonlyargnames()) as i64,
+            ))
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "co_kwonlyargcount",
+        make_getset_descriptor(kwonly_getter),
+    );
+    let varnames_getter = make_builtin_function_with_arity(
+        "co_varnames",
+        |args| {
+            let names = code_sig(args)
+                .map(|s| {
+                    s.getallvarnames()
+                        .iter()
+                        .map(|n| pyre_object::w_str_new(n))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(pyre_object::w_tuple_new(names))
+        },
+        2,
+    );
+    dict_storage_store(ns, "co_varnames", make_getset_descriptor(varnames_getter));
+    let flags_getter = make_builtin_function_with_arity(
+        "co_flags",
+        |args| {
+            let mut flags = 0i64;
+            if let Some(s) = code_sig(args) {
+                if s.has_vararg() {
+                    flags |= 0x04; // CO_VARARGS
+                }
+                if s.has_kwarg() {
+                    flags |= 0x08; // CO_VARKEYWORDS
+                }
+            }
+            Ok(pyre_object::w_int_new(flags))
+        },
+        2,
+    );
+    dict_storage_store(ns, "co_flags", make_getset_descriptor(flags_getter));
 }
 
 fn init_method_type(ns: &mut DictStorage) {
@@ -5964,7 +6336,11 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             // None → AttributeError("'%T' object has no attribute '%s'").
             let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
             let index = unsafe { pyre_object::w_member_get_index(descr) };
-            let found = unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) };
+            let found = if unsafe { pyre_object::is_instance(obj) } {
+                unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) }
+            } else {
+                crate::baseobjspace::native_slot_get(obj, slot_name)
+            };
             match found {
                 Some(v) => Ok(v),
                 None => Err(crate::PyError::new(
@@ -6007,7 +6383,21 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             }
             // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
             let index = unsafe { pyre_object::w_member_get_index(descr) };
-            unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
+            if unsafe { pyre_object::is_instance(obj) } {
+                unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
+            } else {
+                let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
+                if !crate::baseobjspace::native_slot_set(obj, slot_name, value) {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::AttributeError,
+                        format!(
+                            "'{}' object attribute '{}' is read-only",
+                            unsafe { (*(*obj).ob_type).name },
+                            slot_name,
+                        ),
+                    ));
+                }
+            }
             Ok(pyre_object::w_none())
         }),
     );
@@ -6040,7 +6430,11 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
             let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
             let index = unsafe { pyre_object::w_member_get_index(descr) };
-            let removed = unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) };
+            let removed = if unsafe { pyre_object::is_instance(obj) } {
+                unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) }
+            } else {
+                crate::baseobjspace::native_slot_del(obj, slot_name)
+            };
             if !removed {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::AttributeError,
@@ -6485,6 +6879,28 @@ fn init_property_type(ns: &mut DictStorage) {
             Ok(prop)
         }),
     );
+    // descriptor.py W_Property.typedef `__get__` / `__set__` / `__delete__`
+    // — the implicit descriptor path special-cases properties, but the
+    // type-dict entries make `prop.__get__`, `hasattr(prop, '__get__')`,
+    // and `_is_descriptor` see the property as a descriptor.
+    dict_storage_store(
+        ns,
+        "__get__",
+        make_builtin_function("__get__", crate::baseobjspace::property_descr_get_impl),
+    );
+    dict_storage_store(
+        ns,
+        "__set__",
+        make_builtin_function("__set__", crate::baseobjspace::property_descr_set_impl),
+    );
+    dict_storage_store(
+        ns,
+        "__delete__",
+        make_builtin_function(
+            "__delete__",
+            crate::baseobjspace::property_descr_delete_impl,
+        ),
+    );
 }
 
 /// `self` as a plain int — `int.real` / `numerator` / `conjugate` /
@@ -6551,6 +6967,36 @@ macro_rules! float_binop_rev {
                 pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b)
             } {
                 $op(b, args[0])
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+fn complex_binop_operand(b: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::is_complex(b)
+            || pyre_object::is_float(b)
+            || pyre_object::pyobject::is_int_or_long(b)
+            || pyre_object::is_bool(b)
+    }
+}
+macro_rules! complex_binop_fwd {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if complex_binop_operand(args[1]) {
+                $op(args[0], args[1])
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+macro_rules! complex_binop_rev {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if complex_binop_operand(args[1]) {
+                $op(args[1], args[0])
             } else {
                 Ok(pyre_object::w_not_implemented())
             }
@@ -6723,6 +7169,47 @@ float_binop_rev!(
     crate::objspace::descroperation::pow_builtin
 );
 
+complex_binop_fwd!(
+    complex_dunder_add,
+    crate::objspace::descroperation::add_builtin
+);
+complex_binop_rev!(
+    complex_dunder_radd,
+    crate::objspace::descroperation::add_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_sub,
+    crate::objspace::descroperation::sub_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rsub,
+    crate::objspace::descroperation::sub_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_mul,
+    crate::objspace::descroperation::mul_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rmul,
+    crate::objspace::descroperation::mul_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_truediv,
+    crate::objspace::descroperation::truediv_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rtruediv,
+    crate::objspace::descroperation::truediv_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_pow,
+    crate::objspace::descroperation::pow_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rpow,
+    crate::objspace::descroperation::pow_builtin
+);
+
 // Rich comparison dunders (`__eq__` / `__ne__` / `__lt__` / `__le__` /
 // `__gt__` / `__ge__`).  Each built-in numeric / sequence type only
 // compares against operands of an accepted type and returns
@@ -6737,6 +7224,9 @@ fn cmp_guard_int(b: PyObjectRef) -> bool {
 }
 fn cmp_guard_float(b: PyObjectRef) -> bool {
     unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) }
+}
+fn cmp_guard_complex(b: PyObjectRef) -> bool {
+    complex_binop_operand(b)
 }
 fn cmp_guard_str(b: PyObjectRef) -> bool {
     unsafe { pyre_object::is_str(b) }
@@ -6799,6 +7289,22 @@ cmp_dunder_set!(
     float_dunder_ge,
     cmp_guard_float
 );
+cmp_dunder!(complex_dunder_eq, Eq, cmp_guard_complex);
+cmp_dunder!(complex_dunder_ne, Ne, cmp_guard_complex);
+// complexobject.py:459 `_fail_cmp` — complex defines no ordering, so
+// __lt__/__le__/__gt__/__ge__ return NotImplemented; the `<` operator then
+// raises TypeError through the comparison fallback.
+macro_rules! complex_fail_cmp {
+    ($name:ident) => {
+        fn $name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            Ok(pyre_object::w_not_implemented())
+        }
+    };
+}
+complex_fail_cmp!(complex_dunder_lt);
+complex_fail_cmp!(complex_dunder_le);
+complex_fail_cmp!(complex_dunder_gt);
+complex_fail_cmp!(complex_dunder_ge);
 cmp_dunder_set!(
     str_dunder_eq,
     str_dunder_ne,
@@ -7224,6 +7730,246 @@ fn init_int_type(ns: &mut DictStorage) {
         ),
     );
 }
+/// Format one component of a complex repr: shortest float repr without
+/// the trailing `.0` that `float.__repr__` appends.
+fn complex_part_repr(val: f64) -> String {
+    if val.is_nan() {
+        return "nan".to_string();
+    }
+    if val.is_infinite() {
+        return if val < 0.0 {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    let s = crate::display::format_float_repr(val);
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
+/// `complexobject.c complex_repr` — `Xj` for a pure-`+0` real part, else
+/// `(re±imj)`.
+pub(crate) fn complex_repr_string(re: f64, im: f64) -> String {
+    if re == 0.0 && re.is_sign_positive() {
+        format!("{}j", complex_part_repr(im))
+    } else {
+        let sign = if im >= 0.0 || im.is_nan() { "+" } else { "-" };
+        format!(
+            "({}{}{}j)",
+            complex_part_repr(re),
+            sign,
+            complex_part_repr(im.abs())
+        )
+    }
+}
+
+fn init_complex_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(complex_descr_new));
+    let repr = |args: &[PyObjectRef]| {
+        let (re, im) = unsafe {
+            (
+                pyre_object::w_complex_get_real(args[0]),
+                pyre_object::w_complex_get_imag(args[0]),
+            )
+        };
+        Ok(pyre_object::w_str_new(&complex_repr_string(re, im)))
+    };
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity("__repr__", repr, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function_with_arity("__str__", repr, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__hash__",
+        make_builtin_function_with_arity(
+            "__hash__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_int_new(
+                    crate::objspace::descroperation::complex_hash(re, im),
+                ))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__bool__",
+        make_builtin_function_with_arity(
+            "__bool__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_bool_from(re != 0.0 || im != 0.0))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__abs__",
+        make_builtin_function_with_arity(
+            "__abs__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_float_new(re.hypot(im)))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__neg__",
+        make_builtin_function_with_arity(
+            "__neg__",
+            |args| crate::objspace::descroperation::neg(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__pos__",
+        make_builtin_function_with_arity(
+            "__pos__",
+            |args| crate::objspace::descroperation::pos(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__complex__",
+        make_builtin_function_with_arity(
+            "__complex__",
+            |args| {
+                // Return a plain `complex` with the same components.
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_complex_new(re, im))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "conjugate",
+        make_builtin_function_with_arity(
+            "conjugate",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_complex_new(re, -im))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_complex_new(
+                    re, im,
+                )]))
+            },
+            1,
+        ),
+    );
+    // complex.real / complex.imag — read-only float components.
+    dict_storage_store(
+        ns,
+        "real",
+        pyre_object::w_property_new(
+            make_builtin_function_with_arity(
+                "real",
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_real(args[0])
+                    }))
+                },
+                1,
+            ),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "imag",
+        pyre_object::w_property_new(
+            make_builtin_function_with_arity(
+                "imag",
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_imag(args[0])
+                    }))
+                },
+                1,
+            ),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
+    );
+    for (name, func) in [
+        ("__add__", complex_dunder_add as DunderFn),
+        ("__radd__", complex_dunder_radd),
+        ("__sub__", complex_dunder_sub),
+        ("__rsub__", complex_dunder_rsub),
+        ("__mul__", complex_dunder_mul),
+        ("__rmul__", complex_dunder_rmul),
+        ("__truediv__", complex_dunder_truediv),
+        ("__rtruediv__", complex_dunder_rtruediv),
+        ("__pow__", complex_dunder_pow),
+        ("__rpow__", complex_dunder_rpow),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+    for (name, func) in [
+        ("__eq__", complex_dunder_eq as DunderFn),
+        ("__ne__", complex_dunder_ne),
+        ("__lt__", complex_dunder_lt),
+        ("__le__", complex_dunder_le),
+        ("__gt__", complex_dunder_gt),
+        ("__ge__", complex_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+}
+
 fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(float_descr_new));
     // float.__getformat__(kind) → returns the format string for the
@@ -10573,6 +11319,9 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         if pyre_object::bytesobject::is_bytes_like(arg) {
             let data = pyre_object::bytesobject::bytes_like_data(arg);
             return Ok(new_bytes_like(args[0], data));
+        }
+        if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
+            return Ok(new_bytes_like(args[0], &data));
         }
     }
     // Iterable of ints — pypy/objspace/std/bytesobject.py _from_byte_sequence

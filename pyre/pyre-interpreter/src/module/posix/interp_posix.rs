@@ -169,39 +169,29 @@ pub fn register_module(ns: &mut DictStorage) {
     }
     crate::dict_storage_store(ns, "environ", w_environ);
     // _have_functions — list of HAVE_* macro names that were defined at
-    // build time. os.py uses this to populate the supports_* capability
-    // sets. Advertising a representative subset lets os.py module init
-    // complete successfully.
+    // build time. os.py uses this to populate the supports_* capability sets
+    // (supports_dir_fd / supports_fd / supports_follow_symlinks), which
+    // callers like shutil.rmtree consult to choose between fd-relative and
+    // path-based implementations. Only the macros whose functionality is
+    // actually implemented may be listed: the `*at` family is omitted because
+    // dir_fd is not honored, and HAVE_FDOPENDIR is omitted because
+    // scandir/listdir do not accept a file descriptor. HAVE_LSTAT remains so
+    // os.stat is reported in supports_follow_symlinks (follow_symlinks=False
+    // works).
     crate::dict_storage_store(
         ns,
         "_have_functions",
         pyre_object::w_list_new(vec![
-            pyre_object::w_str_new("HAVE_FACCESSAT"),
             pyre_object::w_str_new("HAVE_FCHDIR"),
             pyre_object::w_str_new("HAVE_FCHMOD"),
-            pyre_object::w_str_new("HAVE_FCHMODAT"),
             pyre_object::w_str_new("HAVE_FCHOWN"),
-            pyre_object::w_str_new("HAVE_FCHOWNAT"),
-            pyre_object::w_str_new("HAVE_FDOPENDIR"),
             pyre_object::w_str_new("HAVE_FEXECVE"),
             pyre_object::w_str_new("HAVE_FPATHCONF"),
-            pyre_object::w_str_new("HAVE_FSTATAT"),
             pyre_object::w_str_new("HAVE_FSTATVFS"),
             pyre_object::w_str_new("HAVE_FTRUNCATE"),
             pyre_object::w_str_new("HAVE_FUTIMENS"),
             pyre_object::w_str_new("HAVE_FUTIMES"),
-            pyre_object::w_str_new("HAVE_FUTIMESAT"),
-            pyre_object::w_str_new("HAVE_LINKAT"),
             pyre_object::w_str_new("HAVE_LSTAT"),
-            pyre_object::w_str_new("HAVE_MKDIRAT"),
-            pyre_object::w_str_new("HAVE_MKFIFOAT"),
-            pyre_object::w_str_new("HAVE_MKNODAT"),
-            pyre_object::w_str_new("HAVE_OPENAT"),
-            pyre_object::w_str_new("HAVE_READLINKAT"),
-            pyre_object::w_str_new("HAVE_RENAMEAT"),
-            pyre_object::w_str_new("HAVE_SYMLINKAT"),
-            pyre_object::w_str_new("HAVE_UNLINKAT"),
-            pyre_object::w_str_new("HAVE_UTIMENSAT"),
         ]),
     );
     // POSIX constants — real libc values (cross-platform subset).
@@ -310,7 +300,6 @@ pub fn register_module(ns: &mut DictStorage) {
         "fchdir",
         "link",
         "symlink",
-        "readlink",
         "chmod",
         "fchmod",
         "lchmod",
@@ -324,7 +313,6 @@ pub fn register_module(ns: &mut DictStorage) {
         "utime",
         "futimens",
         "futimes",
-        "scandir",
         "fdopendir",
         "execve",
         "execv",
@@ -592,6 +580,25 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity("remove", posix_unlink, 1),
     );
 
+    // ── posix.readlink(path, *, dir_fd=None) ──
+    // Returns the symlink target; a non-symlink raises OSError(EINVAL), which
+    // `posixpath.realpath` relies on to stop following links.
+    crate::dict_storage_store(
+        ns,
+        "readlink",
+        crate::make_builtin_function("readlink", |args| {
+            let arg = args
+                .first()
+                .copied()
+                .ok_or_else(|| crate::PyError::type_error("readlink() requires 1 argument"))?;
+            let path = extract_path(arg)?;
+            match std::fs::read_link(&path) {
+                Ok(target) => Ok(pyre_object::w_str_new(&target.to_string_lossy())),
+                Err(e) => Err(io_err(e, &path)),
+            }
+        }),
+    );
+
     // ── posix.mkdir(path, mode=0o777) ──
     crate::dict_storage_store(
         ns,
@@ -753,10 +760,9 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    // os.fspath() — PyPy: posixmodule.c posix_fspath. Returns the argument
-    // unchanged for str/bytes/bytearray (the protocol's identity case);
-    // any other object would normally trigger __fspath__ but we don't
-    // model that protocol yet.
+    // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.  str/bytes
+    // pass through unchanged (the protocol's identity case); any other
+    // object is resolved via `type(path).__fspath__(path)`.
     crate::dict_storage_store(
         ns,
         "fspath",
@@ -769,14 +775,23 @@ pub fn register_module(ns: &mut DictStorage) {
                         return Ok(arg);
                     }
                 }
-                // Try __fspath__ — for pathlib.Path-like objects.
-                if let Ok(method) = crate::baseobjspace::getattr_str(arg, "__fspath__") {
-                    let result = crate::call_function(method, &[arg]);
-                    if !result.is_null() {
-                        return Ok(result);
+                // `path_type.__fspath__(path)` — the descriptor read off the
+                // type is unbound, so `path` is supplied as the sole argument.
+                let path_type = crate::typedef::r#type(arg);
+                if let Some(pt) = path_type {
+                    if let Some(fspath_fn) =
+                        unsafe { crate::baseobjspace::lookup_in_type(pt, "__fspath__") }
+                    {
+                        return crate::call::call_function_impl_result(fspath_fn, &[arg]);
                     }
                 }
-                Ok(arg)
+                let type_name = match path_type {
+                    Some(pt) => unsafe { pyre_object::typeobject::w_type_get_name(pt) },
+                    None => "object",
+                };
+                Err(crate::PyError::type_error(format!(
+                    "expected str, bytes or os.PathLike object, not {type_name}"
+                )))
             },
             1,
         ),
@@ -986,27 +1001,9 @@ pub fn register_module(ns: &mut DictStorage) {
             return Err(crate::PyError::type_error("stat() missing argument"));
         }
         let path_obj = args[0];
-        let path_str = unsafe {
-            if pyre_object::is_str(path_obj) {
-                pyre_object::w_str_get_value(path_obj).to_string()
-            } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
-                let data = pyre_object::bytesobject::bytes_like_data(path_obj);
-                String::from_utf8_lossy(data).into_owned()
-            } else if let Ok(fspath) = crate::baseobjspace::getattr_str(path_obj, "__fspath__") {
-                let result = crate::call_function(fspath, &[path_obj]);
-                if !result.is_null() && pyre_object::is_str(result) {
-                    pyre_object::w_str_get_value(result).to_string()
-                } else {
-                    return Err(crate::PyError::type_error(
-                        "stat: path should be string, bytes, os.PathLike",
-                    ));
-                }
-            } else {
-                return Err(crate::PyError::type_error(
-                    "stat: path should be string, bytes, os.PathLike",
-                ));
-            }
-        };
+        let path_str = crate::gateway::fsencode_w(path_obj).map_err(|_| {
+            crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
+        })?;
         let meta = if follow_symlinks {
             host_fs::metadata(&path_str)
         } else {
@@ -1029,6 +1026,199 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }
     }
+
+    // ── posix.scandir(path=".") → ScandirIterator of DirEntry ──
+    // `posix_scandir` / `posixmodule.c` DirEntry + ScandirIterator. The
+    // entries are read eagerly into a list backing a context-manager
+    // iterator so `with os.scandir(p) as it:` and `for e in it:` both work.
+    //
+    // DirEntry holds `name`/`path` as instance attributes; the type carries
+    // is_dir/is_file/is_symlink/is_junction/stat/inode/__fspath__ which stat
+    // the stored path on demand.
+    type PyObjectRef = pyre_object::PyObjectRef;
+
+    fn dir_entry_path(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
+        let p = crate::baseobjspace::getattr_str(self_obj, "path")?;
+        Ok(unsafe { pyre_object::w_str_get_value(p) }.to_string())
+    }
+    fn dir_entry_follow(args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
+        let (_pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+            Some(v) => crate::baseobjspace::is_true(v),
+            None => Ok(true),
+        }
+    }
+    fn dir_entry_is_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let path = dir_entry_path(args[0])?;
+        let follow = dir_entry_follow(args)?;
+        let meta = if follow {
+            host_fs::metadata(&path)
+        } else {
+            host_fs::symlink_metadata(&path)
+        };
+        Ok(pyre_object::w_bool_from(meta.map(|m| m.is_dir()).unwrap_or(false)))
+    }
+    fn dir_entry_is_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let path = dir_entry_path(args[0])?;
+        let follow = dir_entry_follow(args)?;
+        let meta = if follow {
+            host_fs::metadata(&path)
+        } else {
+            host_fs::symlink_metadata(&path)
+        };
+        Ok(pyre_object::w_bool_from(
+            meta.map(|m| m.is_file()).unwrap_or(false),
+        ))
+    }
+    fn dir_entry_is_symlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let path = dir_entry_path(args[0])?;
+        Ok(pyre_object::w_bool_from(
+            host_fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+        ))
+    }
+    fn dir_entry_is_junction(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // POSIX has no junction points.
+        Ok(pyre_object::w_bool_from(false))
+    }
+    fn dir_entry_inode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let path = dir_entry_path(args[0])?;
+        let meta = host_fs::symlink_metadata(&path).map_err(|e| io_err(e, &path))?;
+        #[cfg(unix)]
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino() as i64
+        };
+        #[cfg(not(unix))]
+        let ino = {
+            let _ = &meta;
+            0i64
+        };
+        Ok(pyre_object::w_int_new(ino))
+    }
+    fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let path = dir_entry_path(args[0])?;
+        let follow = dir_entry_follow(args)?;
+        let meta = if follow {
+            host_fs::metadata(&path)
+        } else {
+            host_fs::symlink_metadata(&path)
+        };
+        match meta {
+            Ok(m) => {
+                #[cfg(target_os = "macos")]
+                let st_flags = macos_path_st_flags(&path, follow);
+                #[cfg(not(target_os = "macos"))]
+                let st_flags = 0u32;
+                Ok(make_stat_result(&m, st_flags))
+            }
+            Err(e) => Err(io_err(e, &path)),
+        }
+    }
+    fn dir_entry_fspath(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::baseobjspace::getattr_str(args[0], "path")
+    }
+    fn dir_entry_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let name = crate::baseobjspace::getattr_str(args[0], "name")?;
+        let name = unsafe { pyre_object::w_str_get_value(name) };
+        Ok(pyre_object::w_str_new(&format!("<DirEntry {name:?}>")))
+    }
+    fn dir_entry_type() -> PyObjectRef {
+        thread_local! {
+            static CELL: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+        }
+        CELL.with(|c| {
+            *c.get_or_init(|| {
+                let tp = crate::typedef::make_builtin_type("DirEntry", |ns| {
+                    for (name, f) in [
+                        ("is_dir", dir_entry_is_dir as crate::gateway::BuiltinCodeFn),
+                        ("is_file", dir_entry_is_file),
+                        ("is_symlink", dir_entry_is_symlink),
+                        ("is_junction", dir_entry_is_junction),
+                        ("inode", dir_entry_inode),
+                        ("stat", dir_entry_stat),
+                        ("__fspath__", dir_entry_fspath),
+                        ("__repr__", dir_entry_repr),
+                    ] {
+                        crate::dict_storage_store(ns, name, crate::make_builtin_function(name, f));
+                    }
+                });
+                unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+                tp
+            })
+        })
+    }
+
+    fn scandir_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        Ok(args[0])
+    }
+    fn scandir_iter_close(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        Ok(pyre_object::w_none())
+    }
+    fn scandir_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = args[0];
+        let idx = unsafe {
+            pyre_object::w_int_get_value(crate::baseobjspace::getattr_str(self_obj, "_index")?)
+        };
+        let entries = crate::baseobjspace::getattr_str(self_obj, "_entries")?;
+        let len = unsafe { pyre_object::w_list_len(entries) } as i64;
+        if idx >= len {
+            return Err(crate::PyError::stop_iteration());
+        }
+        let item = unsafe { pyre_object::w_list_getitem(entries, idx) }
+            .ok_or_else(crate::PyError::stop_iteration)?;
+        let _ = crate::baseobjspace::setattr_str(self_obj, "_index", pyre_object::w_int_new(idx + 1));
+        Ok(item)
+    }
+    fn scandir_iter_type() -> PyObjectRef {
+        thread_local! {
+            static CELL: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+        }
+        CELL.with(|c| {
+            *c.get_or_init(|| {
+                let tp = crate::typedef::make_builtin_type("ScandirIterator", |ns| {
+                    for (name, f) in [
+                        ("__iter__", scandir_iter_self as crate::gateway::BuiltinCodeFn),
+                        ("__next__", scandir_iter_next),
+                        ("__enter__", scandir_iter_self),
+                        ("__exit__", scandir_iter_close),
+                        ("close", scandir_iter_close),
+                    ] {
+                        crate::dict_storage_store(ns, name, crate::make_builtin_function(name, f));
+                    }
+                });
+                unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+                tp
+            })
+        })
+    }
+
+    fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let path = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
+            ".".to_string()
+        } else {
+            crate::gateway::fsencode_w(args[0])?
+        };
+        let entries = host_fs::read_dir(&path).map_err(|e| io_err(e, &path))?;
+        let list = pyre_object::w_list_new(Vec::new());
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err(e, &path))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let full = entry.path().to_string_lossy().to_string();
+            let de = pyre_object::w_instance_new(dir_entry_type());
+            let _ = crate::baseobjspace::setattr_str(de, "name", pyre_object::w_str_new(&name));
+            let _ = crate::baseobjspace::setattr_str(de, "path", pyre_object::w_str_new(&full));
+            unsafe { pyre_object::w_list_append(list, de) };
+        }
+        let it = pyre_object::w_instance_new(scandir_iter_type());
+        let _ = crate::baseobjspace::setattr_str(it, "_entries", list);
+        let _ = crate::baseobjspace::setattr_str(it, "_index", pyre_object::w_int_new(0));
+        Ok(it)
+    }
+    crate::dict_storage_store(ns, "scandir", crate::make_builtin_function("scandir", scandir_fn));
+    crate::dict_storage_store(ns, "DirEntry", dir_entry_type());
+
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
     // Routed through `host_env::posix::uname_info` when available so the
     // result reports the host's real POSIX strings ("Darwin", "Linux",

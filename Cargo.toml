@@ -35,6 +35,7 @@ members = [
     # pyre
     "pyre/pyre-object",
     "pyre/pyre-macros",
+    "pyre/pyre-native",
     "pyre/pyre-interpreter",
     "pyre/pyre-module",
     "pyre/pyre-jit",
@@ -48,6 +49,7 @@ members = [
 # pyre internal crates
 pyre-object = { version = "0.0.2", path = "pyre/pyre-object" }
 pyre-macros = { version = "0.0.2", path = "pyre/pyre-macros" }
+pyre-native = { version = "0.0.2", path = "pyre/pyre-native" }
 pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter" }
 pyre-module = { version = "0.0.2", path = "pyre/pyre-module" }
 pyre-jit = { version = "0.0.2", path = "pyre/pyre-jit" }
@@ -124,6 +126,10 @@ stacker = "0.1"
 siphasher = "1.0"
 caseless = "0.2"
 md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+sha3 = "0.10"
+blake2 = "0.10"
 
 # math
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }

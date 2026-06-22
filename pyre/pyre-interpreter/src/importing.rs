@@ -9,8 +9,14 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
+// `Path` is used only by the host_env source/package loaders; keep it gated
+// so an host_env-off build does not warn on an unused import. `PathBuf`
+// appears in the host_env-independent module-search surface
+// (`SYS_PATH`, `find_module`, `parent_package_path`, `load_part`) and must
+// stay in scope unconditionally.
 #[cfg(feature = "host_env")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_store};
@@ -183,10 +189,11 @@ pub fn install_builtin_modules() {
         "importlib" =>
         crate::module::importlib::interp_importlib::register_pkg
     );
-    pyre_install_module!(
-        "importlib.util" =>
-        crate::module::importlib::interp_importlib::register_util
-    );
+    // importlib.util is NOT registered as a builtin: with importlib.__path__
+    // pointing at the on-disk package, the real util.py loads from there and
+    // re-exports the full _bootstrap / _bootstrap_external surface
+    // (cache_from_source, source_from_cache, source_hash, find_spec, …) that
+    // a stub could only approximate.
     pyre_install_module!(
         "importlib.abc" =>
         crate::module::importlib::interp_importlib::register_abc
@@ -226,8 +233,14 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_random);
     pyre_install_module!(_pickle);
     pyre_install_module!(_struct);
+    pyre_install_module!(binascii);
+    pyre_install_module!(zlib);
+    pyre_install_module!(_typing);
+    pyre_install_module!(_hashlib);
+    pyre_install_module!(_blake2);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
+    pyre_install_module!(pyexpat);
 
     // `_sysconfigdata_{abiflags}_{platform}_{multiarch}` is a generated
     // Python module containing `build_time_vars = {...}` that sysconfig
@@ -258,27 +271,124 @@ pub fn install_builtin_modules() {
         "_warnings",
         "_heapq",
         "_tokenize",
-        "_typing",
         "_bisect",
-        "binascii",
-        "_hashlib",
-        "_sha2",
-        "_md5",
-        "_sha1",
-        "_sha3",
-        "_blake2",
         "_json",
-        "_csv",
         "marshal",
-        "_tracemalloc",
         "_stat",
         "_queue",
         "_zoneinfo",
-        "array",
-        "zlib",
     ] {
         register_builtin_module(name, empty_module_init);
     }
+    register_builtin_module("array", crate::module::array::init_array_module);
+    register_builtin_module("_csv", crate::module::_csv::init);
+    register_builtin_module("_scproxy", init_scproxy);
+    register_builtin_module("_tracemalloc", init_tracemalloc);
+    register_builtin_module("_sysconfig", init_sysconfig_stub);
+}
+
+/// `_sysconfig` stub — exposes `config_vars()` returning an empty dict. On
+/// POSIX `sysconfig` only consults this for the build variables that pyre does
+/// not generate; importing it is enough to satisfy `test_sysconfig`.
+fn init_sysconfig_stub(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "config_vars",
+        crate::make_builtin_function("config_vars", |_| Ok(pyre_object::w_dict_new())),
+    );
+}
+
+/// `_tracemalloc` stub — allocation tracking is not implemented, so the
+/// tracing primitives are neutral no-ops that let `tracemalloc` import and
+/// report an inactive tracer.
+fn init_tracemalloc(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "start",
+        crate::make_builtin_function("start", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "stop",
+        crate::make_builtin_function("stop", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "clear_traces",
+        crate::make_builtin_function("clear_traces", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "reset_peak",
+        crate::make_builtin_function("reset_peak", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "is_tracing",
+        crate::make_builtin_function("is_tracing", |_| Ok(pyre_object::w_bool_from(false))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_traceback_limit",
+        crate::make_builtin_function("get_traceback_limit", |_| Ok(pyre_object::w_int_new(1))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_tracemalloc_memory",
+        crate::make_builtin_function("get_tracemalloc_memory", |_| Ok(pyre_object::w_int_new(0))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_traced_memory",
+        crate::make_builtin_function("get_traced_memory", |_| {
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::w_int_new(0),
+                pyre_object::w_int_new(0),
+            ]))
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_get_traces",
+        crate::make_builtin_function("_get_traces", |_| Ok(pyre_object::w_list_new(Vec::new()))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_get_object_traceback",
+        crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
+    );
+}
+
+/// `_scproxy` — the macOS SystemConfiguration proxy probe that
+/// `urllib.request.getproxies_macosx_sysconf` / `proxy_bypass_macosx_sysconf`
+/// import.  Report "no system proxy configured" so the import succeeds and
+/// proxy resolution yields an empty mapping.
+fn init_scproxy(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "_get_proxies",
+        crate::make_builtin_function("_get_proxies", |_| Ok(pyre_object::w_dict_new())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_get_proxy_settings",
+        crate::make_builtin_function("_get_proxy_settings", |_| {
+            let d = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::w_dict_store(
+                    d,
+                    pyre_object::w_str_new("exclude_simple"),
+                    pyre_object::w_bool_from(false),
+                );
+                pyre_object::w_dict_store(
+                    d,
+                    pyre_object::w_str_new("exceptions"),
+                    pyre_object::w_list_new(Vec::new()),
+                );
+            }
+            Ok(d)
+        }),
+    );
 }
 
 /// Empty module initializer for C-extension stubs.
@@ -408,7 +518,7 @@ fn find_intree_stdlib() -> Option<PathBuf> {
 ///
 /// PyPy equivalent: initpath.py scans for lib-python/X.Y at startup.
 #[cfg(feature = "host_env")]
-fn detect_stdlib_path() -> Option<PathBuf> {
+pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
     // Explicit override.
     if let Ok(p) = host_os::var("PYRE_STDLIB") {
         let path = PathBuf::from(p);

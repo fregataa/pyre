@@ -36,6 +36,31 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Result<Option<String>, crate
     }
 }
 
+/// WTF-8 carrying variant of [`try_call_dunder`]: dispatches `__str__` /
+/// `__repr__` on an instance and preserves a surrogate-bearing result
+/// instead of folding it through a `&str` (which would panic).
+unsafe fn try_call_dunder_wtf8(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<Wtf8Buf>, crate::PyError> {
+    unsafe {
+        if !pyre_object::is_instance(obj) {
+            return Ok(None);
+        }
+        let Some(method) = crate::baseobjspace::lookup(obj, name) else {
+            return Ok(None);
+        };
+        if method.is_null() {
+            return Ok(None);
+        }
+        let result = crate::builtins::call_and_check(method, &[obj])?;
+        if pyre_object::is_str(result) {
+            return Ok(Some(pyre_object::w_str_get_wtf8(result).to_wtf8_buf()));
+        }
+        Err(dunder_returned_non_string(name, result))
+    }
+}
+
 /// `TypeError: __repr__ returned non-string (type 'X')` for a dunder whose
 /// override returned a non-`str` (`descroperation.py:918-920`).
 unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::PyError {
@@ -218,6 +243,11 @@ unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Optio
         } else if std::ptr::eq(tp, &FLOAT_TYPE as *const PyType) {
             let float_obj = obj as *const pyre_object::floatobject::W_FloatObject;
             Some(format_float_repr((*float_obj).floatval))
+        } else if std::ptr::eq(tp, &pyre_object::COMPLEX_TYPE as *const PyType) {
+            Some(crate::typedef::complex_repr_string(
+                pyre_object::w_complex_get_real(obj),
+                pyre_object::w_complex_get_imag(obj),
+            ))
         } else if std::ptr::eq(tp, &LONG_TYPE as *const PyType) {
             let long_obj = obj as *const pyre_object::longobject::W_LongObject;
             Some(format!("{}", &*(*long_obj).value))
@@ -337,6 +367,8 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         }
         let formatted = if let Some(s) = builtin_leaf_repr_string(obj, tp) {
             s
+        } else if pyre_object::array_object::is_array(obj) {
+            crate::module::array::array_repr_string(obj)?
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
             let Some(_guard) = ReprGuard::enter(obj) else {
                 return Ok("[...]".to_string());
@@ -864,6 +896,17 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
             }
             if pyre_object::is_exception(obj) {
                 if let Some(w) = exception_descr_str_wtf8(obj) {
+                    return Ok(w);
+                }
+            }
+            // An instance whose `__str__`/`__repr__` returns a
+            // surrogate-bearing str must keep WTF-8; the String-based
+            // `py_str` path would panic folding it to `&str`.
+            if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
+                if let Some(w) = try_call_dunder_wtf8(obj, "__str__")? {
+                    return Ok(w);
+                }
+                if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
                     return Ok(w);
                 }
             }

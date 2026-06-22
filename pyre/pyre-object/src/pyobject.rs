@@ -193,6 +193,7 @@ const _: () = {
 pub static INT_TYPE: PyType = new_pytype("int");
 pub static BOOL_TYPE: PyType = new_pytype("bool");
 pub static FLOAT_TYPE: PyType = new_pytype("float");
+pub static COMPLEX_TYPE: PyType = new_pytype("complex");
 pub static STR_TYPE: PyType = new_pytype("str");
 pub static LIST_TYPE: PyType = new_pytype("list");
 pub static TUPLE_TYPE: PyType = new_pytype("tuple");
@@ -649,6 +650,11 @@ pub unsafe fn is_float(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+pub unsafe fn is_complex(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COMPLEX_TYPE) }
+}
+
+#[inline]
 pub unsafe fn is_long(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &LONG_TYPE) }
 }
@@ -681,6 +687,22 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
             || py_type_check(obj, &SPECIALISED_TUPLE_FF_TYPE)
             || py_type_check(obj, &SPECIALISED_TUPLE_OO_TYPE)
     }
+}
+
+/// `PyTuple_CheckExact` — an exact `tuple`, excluding tuple subclasses.
+/// Covers the specialised arity-2 variants too: they all carry
+/// `w_class == get_instantiate(&TUPLE_TYPE)`, so comparing the user-visible
+/// class object (not `get_instantiate(ob_type)`) keeps them exact while a
+/// subclass instance (retagged `w_class`) reads as non-exact.
+#[inline]
+pub unsafe fn is_exact_tuple(obj: PyObjectRef) -> bool {
+    unsafe { is_tuple(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&TUPLE_TYPE)) }
+}
+
+/// `PyList_CheckExact` — an exact `list`, excluding list subclasses.
+#[inline]
+pub unsafe fn is_exact_list(obj: PyObjectRef) -> bool {
+    unsafe { is_list(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&LIST_TYPE)) }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py` makes both `W_DictObject` and

@@ -581,6 +581,33 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     call_callable_with_mode(frame, callable, args, CallMode::Jit)
 }
 
+/// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
+/// dispatches through `type(cls).__call__`.  The base `type` has no
+/// `__call__` dict entry — the implicit `__new__`/`__init__` path below is
+/// its `tp_call` — so any `__call__` resolved on a *non-`type`* metaclass
+/// is a genuine override (enum.EnumType, custom metaclasses with
+/// `__call__`).  Returns the override bound to `callable`, or `None` when
+/// the default class-instantiation path should run.
+fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
+    let metaclass = crate::typedef::r#type(callable)?;
+    if std::ptr::eq(metaclass, crate::typedef::w_type()) {
+        return None;
+    }
+    // Resolve __call__ AND where it is defined; the default `type.__call__`
+    // (the implicit instantiation path) is not an override, so a metaclass
+    // that merely inherits it — e.g. ABCMeta — keeps the fast path.
+    let (where_defined, call_descr) =
+        unsafe { crate::baseobjspace::lookup_where(metaclass, "__call__") }?;
+    if std::ptr::eq(where_defined, crate::typedef::w_type()) {
+        return None;
+    }
+    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, metaclass) }
+        .ok()
+        .flatten()
+        .unwrap_or(call_descr);
+    Some(bound)
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -606,6 +633,9 @@ fn call_callable_with_mode(
         return call_callable_with_mode(frame, func, &call_args, mode);
     }
     if unsafe { pyre_object::is_type(callable) } {
+        if let Some(bound) = metaclass_call_override(callable) {
+            return call_callable_with_mode(frame, bound, args, mode);
+        }
         return type_descr_call_with_mode(frame, callable, args, mode);
     }
 
@@ -837,6 +867,7 @@ pub(crate) fn resolve_kwargs(
                 if let Some(new_fn) =
                     unsafe { crate::baseobjspace::lookup_in_type(w_winner, "__new__") }
                 {
+                    let new_fn = unsafe { unwrap_static_new(new_fn) };
                     if unsafe { crate::is_function(new_fn) } {
                         (new_fn, 1usize)
                     } else {
@@ -1240,6 +1271,14 @@ pub fn call_with_kwargs(
         return call_with_kwargs(frame, func, &full_args, kwargs);
     }
 
+    // A class call routes through `type(cls).__call__` when the metaclass
+    // overrides it (enum functional API passes `module=`/`type=` kwargs).
+    if unsafe { pyre_object::is_type(callable) } {
+        if let Some(bound) = metaclass_call_override(callable) {
+            return call_with_kwargs(frame, bound, pos_args, kwargs);
+        }
+    }
+
     if unsafe { crate::is_function(callable) } {
         let code = unsafe { crate::getcode(callable) };
         // For builtins: pack kwargs into a dict as last arg.
@@ -1558,6 +1597,15 @@ pub fn call_with_kwargs(
                 )?,
             );
             func_frame.fix_array_ptrs();
+            // Generator/coroutine function: return a generator object
+            // instead of running the body, matching the positional call
+            // path's `code_flags_make_generator` branch.  Without this a
+            // generator function invoked with keyword arguments (e.g.
+            // `func(*args, **kwds)` from `contextlib.contextmanager`) would
+            // execute eagerly and surface the first yielded value.
+            if crate::pyframe::code_flags_make_generator(code.flags) {
+                return func_frame.into_generator();
+            }
             let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
             let eval_fn = if plain_mode {
                 crate::eval::eval_frame_plain
@@ -1576,7 +1624,15 @@ pub fn call_with_kwargs(
     if unsafe { pyre_object::is_type(callable) } {
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
+        // The `function` type is non-acceptable-as-base too, but its
+        // `tp_new` (`FunctionType(code, globals, ..., kwdefaults=...)`)
+        // does take keyword arguments, so route those through `__new__`.
+        let is_function_type = std::ptr::eq(
+            callable,
+            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+        );
         if !kwargs.is_empty()
+            && !is_function_type
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(callable) }
         {
             let type_name = unsafe { pyre_object::w_type_get_name(callable) };
@@ -1597,6 +1653,7 @@ pub fn call_with_kwargs(
         let instance = if let Some(new_fn) =
             unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") }
         {
+            let new_fn = unsafe { unwrap_static_new(new_fn) };
             let mut new_args = Vec::with_capacity(1 + pos_args.len());
             new_args.push(w_metaclass);
             new_args.extend_from_slice(pos_args);
@@ -1803,6 +1860,9 @@ pub fn call_function_impl_result(
         // Type object → descr_call: __new__ + __init__
         // PyPy: typeobject.py descr_call → lookup __new__, call, then __init__
         if pyre_object::is_type(callable) {
+            if let Some(bound) = metaclass_call_override(callable) {
+                return call_function_impl_result(bound, args);
+            }
             clear_call_error();
             let result = type_descr_call_impl(callable, args);
             if result.is_null() {
@@ -1893,6 +1953,25 @@ fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError> {
         )));
     }
     Ok(())
+}
+
+/// `type.__call__(cls, *args)` — the metaclass-level instantiation entry
+/// (`typeobject.c type_call`).  Runs `__new__`/`__init__` directly, WITHOUT
+/// re-dispatching through the metaclass (a custom metaclass `__call__` that
+/// delegates via `super().__call__` lands here), and surfaces the stashed
+/// error instead of a null sentinel.
+pub fn type_call_instantiate(
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
+    clear_call_error();
+    let result = type_descr_call_impl(w_type, args);
+    if result.is_null() {
+        if let Some(err) = take_call_error() {
+            return Err(err);
+        }
+    }
+    Ok(result)
 }
 
 /// Type call without a PyFrame.
@@ -2111,6 +2190,18 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
 ///
 /// PyPy: metaclass(name, bases, namespace, **kwds).
 /// Resolves kwargs to the metaclass __new__'s kwonly / **kwds parameters.
+/// `__new__` is stored as an implicit `staticmethod` (type_new_staticmethod);
+/// unwrap it to the underlying function so the signature-based dispatch and
+/// `is_function` fast-paths below see the real callable rather than the
+/// descriptor wrapper. Builtin `__new__` (not a staticmethod) passes through.
+unsafe fn unwrap_static_new(f: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::propertyobject::is_staticmethod(f) } {
+        unsafe { pyre_object::propertyobject::w_staticmethod_get_func(f) }
+    } else {
+        f
+    }
+}
+
 fn call_metaclass_with_kwargs(
     w_metaclass: PyObjectRef,
     name: PyObjectRef,
@@ -2165,6 +2256,7 @@ fn call_metaclass_with_kwargs(
     let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") };
 
     let instance = if let Some(new_fn) = new_fn {
+        let new_fn = unsafe { unwrap_static_new(new_fn) };
         // Resolve only against a user-defined __new__ with a real code
         // object; the builtin type.__new__ has none, so fall through.
         let is_user_fn = unsafe { crate::is_function(new_fn) }
@@ -2751,6 +2843,35 @@ fn build_class_inner(
         cell
     };
 
+    // typeobject.c type_new: every class carries `__doc__` (None when the
+    // body has no docstring) so instances inherit it through the type MRO.
+    // The compiler only stores `__doc__` when a docstring is present.  Skip
+    // the default when `__doc__` is a declared slot — a class variable would
+    // collide with the member descriptor (typing._SpecialForm).
+    {
+        let class_ns = unsafe { &mut *class_ns_ptr };
+        if class_ns.get("__doc__").is_none() {
+            let doc_is_slot = match class_ns.get("__slots__").copied() {
+                Some(slots)
+                    if unsafe {
+                        pyre_object::is_str(slots)
+                            || pyre_object::is_tuple(slots)
+                            || pyre_object::is_list(slots)
+                    } =>
+                {
+                    collect_slot_names(slots)
+                        .map(|names| names.iter().any(|n| n == "__doc__"))
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !doc_is_slot {
+                crate::dict_storage_store(class_ns, "__doc__", pyre_object::w_none());
+                class_ns.fix_ptr();
+            }
+        }
+    }
+
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     // PyPy: typeobject.py — if not bases_w: bases_w = [space.w_object]
@@ -2863,6 +2984,7 @@ fn build_class_inner(
             let class_ns = &mut *class_ns_ptr;
             class_ns.remove("__classcell__");
             class_ns.remove("__classdictcell__");
+            crate::builtins::type_new_wrap_special_methods(class_ns);
         }
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
         // typeobject.py:1143-1204 create_all_slots parity.

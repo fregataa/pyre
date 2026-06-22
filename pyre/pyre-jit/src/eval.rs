@@ -257,23 +257,21 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// Custom trace for `W_GeneratorObject` (generator.py GeneratorIterator).
 ///
 /// The suspended frame is held behind an opaque `frame_ptr`
-/// (`Box<PyFrame>`, off the active `CURRENT_FRAME` chain), so its
-/// `pycode` is not reachable from `walk_pyframe_roots`.  Visit it here so
-/// a code object whose only live reference is a suspended generator's
-/// frame stays a GC root once code objects become GC-managed (a generator
-/// can outlive its defining `Function`, the other code-object root).
-/// Inert while code objects remain Box-immortal — the visitor's
-/// `is_nursery_object_start` / `is_managed_heap_object` guard skips the
-/// non-managed pointer.  (The suspended frame's other PyObjectRef slots
-/// remain a separate pre-existing tracing gap; only `pycode` is needed
-/// for the code-object migration.)
+/// (`Box<PyFrame>`, off the active `CURRENT_FRAME` chain), so none of its
+/// slots are reachable from `walk_pyframe_roots`.  Forward the suspended
+/// frame's own GC slots — pycode, the locals/cells/valuestack array and
+/// its elements, the generator/yield-from slots, the globals/builtin
+/// object pointers, and the debug-data locals — through
+/// `walk_suspended_generator_frame` so a value live only through a
+/// suspended generator (e.g. a local held across a `yield` while
+/// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj =
         unsafe { &mut *(obj_addr as *mut pyre_object::generatorobject::W_GeneratorObject) };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
-        let pycode_slot = unsafe { &mut (*frame).pycode as *mut *const () };
-        f(pycode_slot as *mut majit_ir::GcRef);
+        let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+        pyre_interpreter::eval::walk_suspended_generator_frame(frame, &mut adapter);
     }
 }
 
@@ -1585,6 +1583,30 @@ thread_local! {
             w_instance_tid,
             pyre_object::instanceobject::W_INSTANCE_GC_TYPE_ID,
         );
+        // W_ComplexObject carries two f64s after the `PyObject` header and
+        // no managed pointers — a GC leaf like W_FloatObject.  Registered
+        // immediately after the last hardcoded-constant tid (instance = 53)
+        // so its fixed id 54 precedes the auto-numbered `#[pyre_class]` /
+        // per-ExcKind tids registered below.  Bound to `COMPLEX_TYPE` so the
+        // collector reads the correct size + leaf trace when a managed
+        // container holds a complex.
+        let w_complex_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::complexobject::W_ComplexObject>(),
+            object_tid,
+        ));
+        debug_assert_eq!(
+            w_complex_tid,
+            pyre_object::complexobject::W_COMPLEX_GC_TYPE_ID,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::COMPLEX_TYPE as *const _ as usize,
+            w_complex_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::COMPLEX_TYPE as *const _ as usize,
+            w_complex_tid,
+        );
         // `#[pyre_class]`-emitted typed-payload registrations.  Each
         // entry is one line consuming the macro-generated
         // `PyreClassDescriptor` static; `register_pyre_class` asserts
@@ -1801,6 +1823,28 @@ thread_local! {
             &mut gc,
             &mut pytype_to_tid,
             <pyre_object::zipobject::W_Zip
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_Cycle (`itertools.cycle`) — typed payload via `#[pyre_class]` in
+        // AUTO-ID mode.  Unlike the other itertools iterators, its `saved`
+        // list is owned solely by the W_Cycle (no external root), so the
+        // collector must trace both the `w_iterable` source and the `saved`
+        // replay buffer.  Tail of the tid chain so no earlier slot shifts.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::itertoolsmodule::W_Cycle
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_ArrayObject (`array.array`) — typed payload via `#[pyre_class]`
+        // in AUTO-ID mode; its elements are unboxed scalars in an off-GC
+        // `*mut Vec<u8>` buffer (the bytearray storage model), so the
+        // descriptor reports zero traced pointer fields.  Tail of the tid
+        // chain.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::array_object::W_ArrayObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each

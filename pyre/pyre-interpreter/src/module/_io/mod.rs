@@ -12,19 +12,12 @@ crate::py_module! {
     interpleveldefs: {
         "DEFAULT_BUFFER_SIZE" => w_int_new(8192),
     },
-    // BytesIO is the pure-Python in-memory binary stream pickle's
-    // Pickler/Unpickler write to and read from.
+    // BytesIO / StringIO are the pure-Python in-memory streams: pickle's
+    // Pickler/Unpickler use BytesIO; logging / traceback / csv use StringIO.
     appleveldefs: {
-        "_io_app.py" => ["BytesIO"],
+        "_io_app.py" => ["BytesIO", "StringIO"],
     },
     functions: {
-        "StringIO"        / * = |_| Ok(w_str_new("")),
-        "FileIO"          / * = |_| Ok(w_none()),
-        "BufferedReader"  / * = |_| Ok(w_none()),
-        "BufferedWriter"  / * = |_| Ok(w_none()),
-        "BufferedRWPair"  / * = |_| Ok(w_none()),
-        "BufferedRandom"  / * = |_| Ok(w_none()),
-        "TextIOWrapper"   / * = crate::builtins::text_io_wrapper_new,
         "IncrementalNewlineDecoder" / * = |_| Ok(w_none()),
         "open"            / * = crate::builtins::builtin_open,
         "open_code"       / * = |_| Ok(w_none()),
@@ -57,6 +50,8 @@ crate::py_module! {
 
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).
         let obj_type = crate::typedef::w_object();
+        let mut io_base_types: std::collections::HashMap<&str, pyre_object::PyObjectRef> =
+            std::collections::HashMap::new();
         for name in &["_IOBase", "_RawIOBase", "_BufferedIOBase", "_TextIOBase"] {
             let t = pyre_object::w_type_new(
                 name,
@@ -65,7 +60,41 @@ crate::py_module! {
             );
             unsafe { pyre_object::w_type_set_mro(t, vec![t, obj_type]) };
             unsafe { pyre_object::typeobject::w_type_ready(t) };
+            io_base_types.insert(name, t);
             crate::dict_storage_store(ns, name, t);
         }
+
+        // Concrete stream classes as subclassable W_TypeObjects.  stdlib
+        // modules derive from them at import (`class ExFileObject(
+        // io.BufferedReader)` in tarfile, `class _MockRawIO(...)` in
+        // test_io), so they must be real types, not function stubs.
+        // `FileIO` derives from `_RawIOBase`; the buffered classes from
+        // `_BufferedIOBase` (`Modules/_io/_iomodule.c` PyInit__io).
+        for (name, base_name) in &[
+            ("FileIO", "_RawIOBase"),
+            ("BufferedReader", "_BufferedIOBase"),
+            ("BufferedWriter", "_BufferedIOBase"),
+            ("BufferedRWPair", "_BufferedIOBase"),
+            ("BufferedRandom", "_BufferedIOBase"),
+        ] {
+            let base = io_base_types[base_name];
+            let t = crate::typedef::make_builtin_type_with_base(name, |_ns| {}, base);
+            unsafe {
+                pyre_object::w_type_set_acceptable_as_base_class(t, true);
+                pyre_object::typeobject::w_type_set_hasdict(t, true);
+            }
+            crate::dict_storage_store(ns, name, t);
+        }
+
+        // `TextIOWrapper` is a real (subclassable) type: stdlib modules such
+        // as argparse / pickle / _android_support derive from it
+        // (`class StdIOBuffer(io.TextIOWrapper)`).  Its `__init__` configures
+        // the underlying buffer + encoding so `TextIOWrapper(buffer, ...)`
+        // and a subclass's `super().__init__(...)` both work.
+        let text_io_wrapper = crate::builtins::text_io_wrapper_type();
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(text_io_wrapper, true);
+        }
+        crate::dict_storage_store(ns, "TextIOWrapper", text_io_wrapper);
     }
 }

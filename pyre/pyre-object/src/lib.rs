@@ -8,12 +8,14 @@ extern crate self as pyre_object;
 /// Typed-payload binding macro: see `pyre/pyre-macros/src/lib.rs`.
 pub use pyre_macros::pyre_class;
 
+pub mod array_object;
 pub mod boolobject;
 pub mod bytearrayobject;
 pub mod bytesobject;
 pub mod callableiteratorobject;
 pub mod celldict;
 pub mod cellobject;
+pub mod complexobject;
 pub mod dict_eq_hook;
 pub mod dictmultiobject;
 pub mod dictproxyobject;
@@ -64,6 +66,7 @@ pub use boolobject::*;
 pub use bytearrayobject::*;
 pub use bytesobject::*;
 pub use cellobject::*;
+pub use complexobject::*;
 pub use dictmultiobject::*;
 pub use dictproxyobject::*;
 pub use excobject::*;
