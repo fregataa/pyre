@@ -134,6 +134,23 @@ fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
     (std::mem::size_of::<usize>(), true)
 }
 
+/// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
+/// is stored at machine-word width regardless of the descr's recorded size: a
+/// pointer is 4 bytes on wasm32, so a fixed 8-byte store would clobber the
+/// adjacent field. There is no `SetfieldGcR` opcode, so the field type is the
+/// only signal — mirroring the `GetfieldGcR` read, which always loads pointers
+/// at i32 width. Non-pointer fields use the descr's true field width.
+fn setfield_store_size_from_descr(op: &Op) -> usize {
+    let descr = op.getdescr();
+    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
+        if fd.is_pointer_field() {
+            return std::mem::size_of::<usize>();
+        }
+        return fd.field_size();
+    }
+    std::mem::size_of::<usize>()
+}
+
 /// `(item_size, is_signed)` from an op's ArrayDescr; defaults to 8-byte
 /// signed when the descr is absent.
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
@@ -820,7 +837,7 @@ fn build_function(
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
                 emit_resolve(&mut sink, constants, op.arg(1).to_opref()); // value
-                let (size, _signed) = field_size_sign_from_descr(op);
+                let size = setfield_store_size_from_descr(op);
                 emit_sized_int_store(&mut sink, field_offset, size);
             }
 
@@ -847,8 +864,11 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // array ptr
                     sink.i32_wrap_i64();
-                    let len_offset = array_len_offset_from_descr(op);
-                    sink.i64_load(mem64(len_offset));
+                    let (len_offset, len_size) = array_len_layout_from_descr(op);
+                    // The length is a word-sized field (`Signed`/`WORD`): read it
+                    // at its real width, like `bh_arraylen_gc`. A fixed i64_load
+                    // would fold the next field into the high half on wasm32.
+                    emit_sized_int_load(&mut sink, len_offset, len_size, false);
                     sink.local_set(1 + vi);
                 }
             }
@@ -1648,11 +1668,21 @@ fn field_offset_from_descr(op: &Op) -> u64 {
     0
 }
 
-/// Extract array length offset from descr.
-fn array_len_offset_from_descr(_op: &Op) -> u64 {
-    // RPython arrays store length before the data.
-    // On wasm32, the length is typically at a fixed offset.
-    8 // default: length at offset 8 (after ob_type)
+/// `(length-field offset, length-field size)` from an op's ArrayDescr length
+/// descriptor, mirroring `bh_arraylen_gc`, which reads the length at
+/// `len_descr().offset()` at machine-word width. The offset is taken from the
+/// registered descr (not hardcoded) so it tracks the real per-target layout,
+/// and the size lets the caller load at the field's true width — a word-sized
+/// length is 4 bytes on wasm32, so a fixed 8-byte read would pull the adjacent
+/// field into the high half. Falls back to the conventional offset / word
+/// width when no length descr is registered.
+fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
+    op.with_array_descr(|ad| {
+        ad.len_descr()
+            .map(|ld| (ld.offset() as u64, ld.field_size()))
+    })
+    .flatten()
+    .unwrap_or((8, std::mem::size_of::<usize>()))
 }
 
 /// Compute array element address: base + base_size + index * item_size.

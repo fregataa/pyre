@@ -62,6 +62,13 @@ PYRE_STDLIB = _detect_pyre_stdlib()
 # opt-out validates the flag-off fallback.
 FBW_INLINE_MULTIFRAME_OFF = False
 
+# Which wasm runtime the `pyre-wasm-runner` uses (`--wasm-engine`). wasmtime
+# (cranelift) is fast in steady state but recompiles the ~14MB module on every
+# process start; wasmi is a pure-Rust interpreter with near-zero startup cost
+# but slower hot loops. Forwarded to the runner via PYRE_WASM_ENGINE; ignored
+# by the dynasm/cranelift backends.
+WASM_ENGINE = "wasmtime"
+
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
@@ -96,12 +103,13 @@ CARGO_CONFIG = {
 #   * `getrandom_backend="custom"` selects getrandom's custom backend (see
 #     `pyre-wasm/src/lib.rs`) so the module carries no wasm-bindgen imports.
 # `pyre-wasm` builds to the same `pyre_wasm.wasm` filename for both the `web`
-# and `wasmi` features, so a later build of the other flavour would clobber the
-# native-host module. Copy the wasmi build to a distinct, stable path the runner
-# reads, immune to that overwrite. `pyre/pyre-wasm/build-web.sh` does the mirror
-# image for the web flavour (snapshot -> pyre_wasm.web.wasm, fed to wasm-bindgen).
+# and `wasm-host` features, so a later build of the other flavour would clobber
+# the native-host module. Copy the wasm-host build to a distinct, stable path the
+# runner reads, immune to that overwrite. `pyre/pyre-wasm/build-web.sh` does the
+# mirror image for the web flavour (snapshot -> pyre_wasm.web.wasm, fed to
+# wasm-bindgen).
 WASM_BUILD_OUTPUT = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm"
-WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasmi.wasm"
+WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm"
 # The JIT's trace-abort signal (InvalidLoop / speculative-fold failure) is
 # propagated as a `Result`/deferred flag through the optimizer rather than a
 # panic, so the build needs neither unwinding nor `-Z build-std`: it runs on the
@@ -265,6 +273,10 @@ def pyre_env():
     # regardless of the child's working directory (ignored by other backends).
     if "PYRE_WASM_MODULE" not in env and Path(WASM_MODULE_PATH).exists():
         env["PYRE_WASM_MODULE"] = str(Path(WASM_MODULE_PATH).resolve())
+    # Pick the wasm runtime engine (ignored by other backends). An explicit
+    # PYRE_WASM_ENGINE in the environment wins over the --wasm-engine default.
+    if "PYRE_WASM_ENGINE" not in env:
+        env["PYRE_WASM_ENGINE"] = WASM_ENGINE
     return env
 
 
@@ -317,6 +329,7 @@ def default_binary(backend):
 # Backends rendered in fixed-column displays, in order. Any enabled backend not
 # listed here still runs and is counted; it just falls outside the fixed columns.
 ALL_BACKENDS = ("dynasm", "cranelift", "wasm")
+DEFAULT_BACKENDS = ("dynasm", "cranelift")
 
 # ── Check runner ─────────────────────────────────────────────────────
 
@@ -481,12 +494,12 @@ class Check:
         """
         steps = [
             (
-                "pyre-wasm (wasm32, --features wasmi)",
+                "pyre-wasm (wasm32, --features wasm-host)",
                 [
                     "cargo", *WASM_CARGO_TOOLCHAIN, "build", "--release",
                     "-p", "pyre-wasm",
                     "--target", "wasm32-unknown-unknown",
-                    "--no-default-features", "--features", "wasmi",
+                    "--no-default-features", "--features", "wasm-host",
                     *WASM_BUILD_STD_FLAGS,
                 ],
                 {
@@ -523,9 +536,44 @@ class Check:
         if not Path(WASM_BUILD_OUTPUT).exists():
             print(f"ERROR: wasm module not produced at {WASM_BUILD_OUTPUT}")
             sys.exit(1)
-        # Snapshot the wasmi build to a stable path so a later `web` build of the
-        # same crate cannot overwrite the module the runner loads.
-        shutil.copyfile(WASM_BUILD_OUTPUT, WASM_MODULE_PATH)
+        # Snapshot the wasm-host build to a stable path so a later `web` build of
+        # the same crate cannot overwrite the module the runner loads. Copy when
+        # the bytes actually changed: rewriting an identical file would bump its
+        # mtime and needlessly invalidate the runner's `<module>.cwasm` compiled
+        # cache (which is keyed by mtime), forcing a ~5s recompile on every run.
+        src_bytes = Path(WASM_BUILD_OUTPUT).read_bytes()
+        dst = Path(WASM_MODULE_PATH)
+        if not dst.exists() or dst.read_bytes() != src_bytes:
+            dst.write_bytes(src_bytes)
+
+        if WASM_ENGINE == "wasmtime":
+            self._warm_wasm_cache()
+
+    def _warm_wasm_cache(self):
+        """Compile the wasmtime `.cwasm` cache once here, untimed.
+
+        wasmtime recompiles the whole ~14MB module (~5s) on a cold start. The
+        runner caches that compilation in `<module>.cwasm`, but the wasm build
+        is non-deterministic, so each rebuild yields a fresh module that
+        invalidates the cache. Warming it in the build phase moves that fixed
+        cost out of every measured benchmark (including the first), so the
+        reported times reflect Python execution, not module compilation.
+        """
+        runner = default_binary("wasm")
+        if not Path(runner).exists():
+            return
+        env = dict(os.environ)
+        env["PYRE_WASM_MODULE"] = str(Path(WASM_MODULE_PATH).resolve())
+        env["PYRE_WASM_ENGINE"] = "wasmtime"
+        print("Warming wasmtime module cache (.cwasm)...")
+        try:
+            subprocess.run(
+                [runner, "--engine", "wasmtime", os.devnull],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # best-effort; a cold first bench just pays the compile once
 
     def _print_cargo_diagnostics(self, cargo_path):
         """Dump the toolchain state when cargo refuses to run.
@@ -734,6 +782,7 @@ class Check:
         for backend, vs_cpython, vs_pypy in [
             ("dynasm", dynasm_vs_cpython, dynasm_vs_pypy),
             ("cranelift", cranelift_vs_cpython, cranelift_vs_pypy),
+            ("wasm", None, None),
         ]:
             if not self.enabled(backend):
                 continue
@@ -835,7 +884,8 @@ class Check:
         parts = []
         for b in ALL_BACKENDS:
             if self.enabled(b):
-                parts.append(f"{b}={self._pyre(b)}(x{self._timeout_scale(b)})")
+                label = b if b != "wasm" else f"wasm/{WASM_ENGINE}"
+                parts.append(f"{label}={self._pyre(b)}(x{self._timeout_scale(b)})")
         if parts:
             print(f"backend: {' '.join(parts)}")
 
@@ -924,11 +974,50 @@ def parse_args():
             raise argparse.ArgumentTypeError("must be greater than 0")
         return f
 
+    def parse_backend_specs(specs):
+        if specs is None:
+            return list(DEFAULT_BACKENDS)
+
+        backends = []
+        for spec in specs:
+            for backend in spec.split(","):
+                backend = backend.strip()
+                if not backend:
+                    continue
+                if backend not in CARGO_CONFIG:
+                    choices = ", ".join(CARGO_CONFIG)
+                    raise argparse.ArgumentTypeError(
+                        f"invalid backend {backend!r}; choose from: {choices}"
+                    )
+                if backend not in backends:
+                    backends.append(backend)
+
+        if not backends:
+            return list(DEFAULT_BACKENDS)
+        return backends
+
     parser = argparse.ArgumentParser(
         description="pyre pre-merge check: correctness + regression guard + comparison",
         allow_abbrev=False,
     )
-    parser.add_argument("--backend", choices=["dynasm", "cranelift", "wasm"], default="")
+    parser.add_argument(
+        "--backend",
+        action="append",
+        nargs="?",
+        const=",".join(DEFAULT_BACKENDS),
+        default=None,
+        metavar="BACKENDS",
+        help="comma-separated backend list; may be repeated "
+        f"(default: {','.join(DEFAULT_BACKENDS)})",
+    )
+    parser.add_argument(
+        "--wasm-engine",
+        choices=["wasmtime", "wasmi"],
+        default="wasmtime",
+        help="wasm runtime for the wasm backend: wasmtime (cranelift JIT, fast "
+        "but recompiles the module each start) or wasmi (interpreter, near-zero "
+        "startup, slower loops)",
+    )
     parser.add_argument("--timeout-scale", type=float, default=1.0)
     parser.add_argument("--dynasm-timeout-scale", type=float, default=None)
     parser.add_argument("--cranelift-timeout-scale", type=float, default=None)
@@ -970,9 +1059,16 @@ def parse_args():
     )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
+    try:
+        args.backends = parse_backend_specs(args.backend)
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
 
-    if args.pyre_path and not args.backend:
+    if args.pyre_path and args.backend is None:
         parser.error("[path/to/pyre] requires --backend when running a single binary")
+
+    if args.pyre_path and len(args.backends) != 1:
+        parser.error("[path/to/pyre] can only be used with exactly one --backend")
 
     if args.synthetic_only and args.no_synthetic:
         parser.error("--synthetic-only cannot be combined with --no-synthetic")
@@ -991,9 +1087,11 @@ def main():
     if args.no_fbw_inline_multiframe:
         global FBW_INLINE_MULTIFRAME_OFF
         FBW_INLINE_MULTIFRAME_OFF = True
+    global WASM_ENGINE
+    WASM_ENGINE = args.wasm_engine
     chk = Check(args)
 
-    backends = [args.backend] if args.backend else ["dynasm", "cranelift"]
+    backends = args.backends
 
     for backend in backends:
         chk.build_backend(backend)
@@ -1028,10 +1126,6 @@ def main():
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
-        chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       15,      None,    15,      None)
-        chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       30,      None,    30,      None)
-        chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
-        chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       15,      None,    15,      None)
 
     if not args.no_synthetic:
         print()

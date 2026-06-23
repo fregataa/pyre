@@ -4,7 +4,7 @@
 //! It is the non-JS counterpart of `majit-backend-wasm/js/jit_glue.js` and
 //! implements the same host-import contract:
 //!
-//!   * the main module (`pyre-wasm` built with `--features wasmi`) imports
+//!   * the main module (`pyre-wasm` built with `--features wasm-host`) imports
 //!     `pyre_jit.{jit_compile_wasm, jit_execute_wasm, jit_free_wasm}` and
 //!     exports `memory`, `__indirect_function_table`, `pyre_alloc`,
 //!     `pyre_dealloc`, and `pyre_run_python`;
@@ -20,8 +20,10 @@
 //! wasm module is located via `$PYRE_WASM_MODULE` or `--module <path>`, else the
 //! default release artifact path.
 
+mod wasmi_host;
+
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use wasmtime::error::Context;
 use wasmtime::{
@@ -30,16 +32,37 @@ use wasmtime::{
 };
 
 // Frame call-area offsets — must match `majit-backend-wasm/src/codegen.rs`.
-const CALL_RESULT_OFS: usize = 2000;
-const CALL_FUNC_OFS: usize = 2008;
+// Shared with `wasmi_host`, which mirrors the same call-area protocol.
+pub(crate) const CALL_RESULT_OFS: usize = 2000;
+pub(crate) const CALL_FUNC_OFS: usize = 2008;
 // The arg count also lives at offset 2016, but the trampoline derives arity
 // (and the exact value types) from the resolved function's wasm signature
 // instead, which is authoritative on wasm32. Kept for layout documentation.
 #[allow(dead_code)]
-const CALL_NARGS_OFS: usize = 2016;
-const CALL_ARGS_OFS: usize = 2024;
+pub(crate) const CALL_NARGS_OFS: usize = 2016;
+pub(crate) const CALL_ARGS_OFS: usize = 2024;
 
-const DEFAULT_MODULE: &str = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm";
+pub(crate) const DEFAULT_MODULE: &str = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm";
+
+/// Which wasm runtime executes the module. `wasmtime` (cranelift) is fast in
+/// steady state but compiles the whole ~14MB module on load; `wasmi` is a
+/// pure-Rust interpreter with near-zero load cost but slower hot loops.
+/// Selected by `--engine` or `$PYRE_WASM_ENGINE` (CLI wins), default wasmtime.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WasmEngine {
+    Wasmtime,
+    Wasmi,
+}
+
+impl WasmEngine {
+    fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "wasmtime" => Ok(WasmEngine::Wasmtime),
+            "wasmi" => Ok(WasmEngine::Wasmi),
+            other => Err(format!("unknown engine {other:?} (want wasmtime|wasmi)")),
+        }
+    }
+}
 
 /// Per-store host state shared by all import callbacks.
 #[derive(Default)]
@@ -61,6 +84,7 @@ fn main() {
     let mut module_path: Option<PathBuf> = None;
     let mut script: Option<PathBuf> = None;
     let mut inspect = false;
+    let mut engine: Option<WasmEngine> = None;
 
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -72,9 +96,16 @@ fn main() {
                         .unwrap_or_else(|| fatal("--module needs a path")),
                 ))
             }
+            "--engine" => {
+                let v = argv
+                    .next()
+                    .unwrap_or_else(|| fatal("--engine needs a value"));
+                engine = Some(WasmEngine::parse(&v).unwrap_or_else(|e| fatal(&e)));
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: pyre-wasm-runner [--module <pyre_wasm.wasm>] [--inspect] <script.py>"
+                    "usage: pyre-wasm-runner [--module <pyre_wasm.wasm>] \
+                     [--engine wasmtime|wasmi] [--inspect] <script.py>"
                 );
                 std::process::exit(2);
             }
@@ -87,28 +118,50 @@ fn main() {
         .or_else(|| std::env::var_os("PYRE_WASM_MODULE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_MODULE));
 
+    // CLI `--engine` wins over `$PYRE_WASM_ENGINE`; default wasmtime.
+    let engine = engine
+        .or_else(|| {
+            std::env::var("PYRE_WASM_ENGINE")
+                .ok()
+                .map(|v| WasmEngine::parse(&v).unwrap_or_else(|e| fatal(&e)))
+        })
+        .unwrap_or(WasmEngine::Wasmtime);
+
     // The wasm runs on the calling thread's stack (sync wasmtime), so the
     // deep interpreter recursion needs a large host stack to back the
-    // generous `max_wasm_stack` set in `run`.
+    // generous `max_wasm_stack` set in `run`. wasmi runs on its own heap
+    // stacks, but the large reservation is harmless there too.
     let worker = std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
-        .spawn(move || -> Result<i32> {
+        .spawn(move || -> std::result::Result<i32, String> {
             if inspect {
-                inspect_module(&module_path)?;
-                return Ok(0);
+                return match engine {
+                    WasmEngine::Wasmtime => {
+                        inspect_module(&module_path).map(|()| 0).map_err(fmt_err)
+                    }
+                    WasmEngine::Wasmi => wasmi_host::inspect(&module_path),
+                };
             }
-            let script = script.context("no script given")?;
+            let script = script.ok_or_else(|| "no script given".to_string())?;
             let source = std::fs::read_to_string(&script)
-                .with_context(|| format!("read script {}", script.display()))?;
-            run(&module_path, &source)
+                .map_err(|e| format!("read script {}: {e}", script.display()))?;
+            match engine {
+                WasmEngine::Wasmtime => run(&module_path, &source).map_err(fmt_err),
+                WasmEngine::Wasmi => wasmi_host::run(&module_path, &source),
+            }
         })
         .expect("spawn worker thread");
 
     match worker.join() {
         Ok(Ok(code)) => std::process::exit(code),
-        Ok(Err(e)) => fatal(&format!("{e:?}")),
+        Ok(Err(e)) => fatal(&e),
         Err(_) => fatal("worker thread panicked"),
     }
+}
+
+/// Format a wasmtime error with its `{:?}` chain for the fatal handler.
+fn fmt_err(e: Error) -> String {
+    format!("{e:?}")
 }
 
 fn fatal(msg: &str) -> ! {
@@ -128,8 +181,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     config.async_stack_size(WASM_STACK + 1024 * 1024);
     let engine = Engine::new(&config)?;
 
-    let module = Module::from_file(&engine, module_path)
-        .with_context(|| format!("load wasm module {}", module_path.display()))?;
+    let module = load_main_module(&engine, module_path)?;
 
     let mut store = Store::new(&engine, Host::default());
     store.data_mut().next_id = 1;
@@ -194,6 +246,86 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// Load the main module, using a compiled `<module>.cwasm` cache to skip
+/// cranelift recompilation of the ~14MB module on every process start.
+///
+/// The cache is the engine's own `Module::serialize` artifact, so it is only
+/// usable by a byte-compatible engine build; `Module::deserialize_file`
+/// validates that and errors on mismatch. `deserialize_file` runs trusted
+/// precompiled native code and the `.cwasm` is otherwise independent of the
+/// `.wasm` contents, so the cache is bound to the exact bytes it was produced
+/// from: a sidecar `<module>.cwasm.sha256` records the SHA-256 of those bytes,
+/// and the cache is deserialized only when it matches the current module's
+/// hash. A rebuilt module or a pre-placed `.cwasm` therefore recompiles instead
+/// of running a stale or untrusted artifact. Set `PYRE_WASM_NO_CACHE` to bypass
+/// the cache entirely.
+fn load_main_module(engine: &Engine, module_path: &Path) -> Result<Module> {
+    let cache_disabled = std::env::var_os("PYRE_WASM_NO_CACHE").is_some();
+    let wasm_bytes = std::fs::read(module_path)
+        .with_context(|| format!("read wasm module {}", module_path.display()))?;
+    let hash = wasm_content_hash(&wasm_bytes);
+    let cache_path = cache_path_for(module_path);
+    let key_path = cache_key_path_for(module_path);
+
+    if !cache_disabled && cache_key_matches(&key_path, &hash) {
+        // SAFETY: the artifact was produced by this runner's own engine via
+        // `Module::serialize`; `deserialize_file` re-checks engine/version
+        // compatibility and returns Err (not UB) if it cannot be trusted. The
+        // key check above further proves it was compiled from the exact bytes
+        // we just read.
+        match unsafe { Module::deserialize_file(engine, &cache_path) } {
+            Ok(m) => return Ok(m),
+            Err(_) => { /* incompatible cache; recompile below */ }
+        }
+    }
+
+    let module = Module::new(engine, &wasm_bytes[..])
+        .with_context(|| format!("load wasm module {}", module_path.display()))?;
+    if !cache_disabled {
+        if let Ok(bytes) = module.serialize() {
+            // Best-effort: a failed cache write only forgoes the speedup. Write
+            // the artifact before the key so an interrupted write never leaves a
+            // key pointing at a half-written `.cwasm`.
+            if std::fs::write(&cache_path, bytes).is_ok() {
+                let _ = std::fs::write(&key_path, &hash);
+            }
+        }
+    }
+    Ok(module)
+}
+
+/// `<module>.cwasm` next to the module (full name kept, so
+/// `pyre_wasm.wasm-host.wasm` → `pyre_wasm.wasm-host.wasm.cwasm`).
+fn cache_path_for(module_path: &Path) -> PathBuf {
+    let mut s = module_path.as_os_str().to_owned();
+    s.push(".cwasm");
+    PathBuf::from(s)
+}
+
+/// Sidecar recording the SHA-256 of the `.wasm` its `.cwasm` was compiled from.
+fn cache_key_path_for(module_path: &Path) -> PathBuf {
+    let mut s = module_path.as_os_str().to_owned();
+    s.push(".cwasm.sha256");
+    PathBuf::from(s)
+}
+
+/// Hex SHA-256 of the module bytes, used as the cache key.
+fn wasm_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// The cache is usable only if its key sidecar exists and matches `hash`.
+fn cache_key_matches(key_path: &Path, hash: &str) -> bool {
+    matches!(std::fs::read_to_string(key_path), Ok(k) if k.trim() == hash)
+}
+
 fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
     let mut linker = Linker::new(engine);
 
@@ -253,7 +385,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         },
     )?;
 
-    // Host-filesystem imports for the wasmi build's module loader. The wasm32
+    // Host-filesystem imports for the wasm-host build's module loader. The wasm32
     // module has no filesystem of its own; these serve module source from the
     // host's real stdlib (`$PYRE_STDLIB`). See `pyre-wasm`'s `host_fs_provider`.
     linker.func_wrap(
@@ -520,7 +652,7 @@ fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<
 /// concatenation only exists at runtime (never as a static format template), so
 /// matching the combined prefix recovers the real formatted message — including
 /// the asserted values — rather than a `{…}`-placeholder template.
-fn recover_panic_messages(data: &[u8]) -> Vec<String> {
+pub(crate) fn recover_panic_messages(data: &[u8]) -> Vec<String> {
     let needle = b"[pyre panic] panicked at";
     let mut out: Vec<String> = Vec::new();
     let mut from = 0;
