@@ -503,8 +503,9 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         "str" => Ok("str".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
-             flowspace counterpart (operation.py:465-474 registers \
-             only `pos` / `neg` / `invert` / `bool` as unary ops; \
+             flowspace counterpart (operation.py registers \
+             `pos` / `neg` / `invert` / `bool` and the ported `str` \
+             as unary ops; \
              `same_as` is rtyper's internal renaming op per \
              rtyper.py:478-481; all 13 typed cast names retired \
              across Slices A.3 / B.1 / A.4a / A.4b / A.4c — frontend \
@@ -739,6 +740,15 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments },
             ..
         } if is_slice_reverse_segments(segments) => false,
+        // `[__iter_next]` (`front::iter_next`) lowers to the raising
+        // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
+        // = [StopIteration, RuntimeError]`).  Matched before the general
+        // `Call` arm, mirroring [`translate_op`]'s `[__iter_next]` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.len() == 1 && crate::front::iter_next::is_iter_next_segments(segments) => true,
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
@@ -1240,6 +1250,17 @@ pub fn translate_op(
                     // the shared table `op_canraise` mirrors.
                     if let Some(opname) = nonraising_core_bridge_opname(segments, arg_hls.len()) {
                         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
+                    }
+                    // `[__iter_next]` (`front::iter_next`) → the raising
+                    // flowspace `next` op (`operation.rs` `OpKind::Next`,
+                    // `can_only_throw = [StopIteration, RuntimeError]`).  The
+                    // block's `LastException` exits — set by the front-end
+                    // `next`-diamond rewrite — carry the exception edges, so
+                    // no edge-building happens here (unlike a `?`-tail op).
+                    if crate::front::iter_next::is_iter_next_segments(segments)
+                        && arg_hls.len() == 1
+                    {
+                        return Ok(vec![FlowspaceOp::new("next", arg_hls, result)]);
                     }
                     // `min`/`max` are the exception: they lower to a
                     // `simple_call(<builtin>)` (raising like any builtin

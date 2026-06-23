@@ -1115,7 +1115,10 @@ pub fn lower_fun_decl_with_static_addrs(
     let result_exc_ok_is_unit = result_exc_callee
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
-        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+        if !lo.result_exc_call_results.is_empty()
+            || result_exc_callee
+            || !lo.next_call_results.is_empty()
+        {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
             // `simplify_graph`, simplify.py:1075): the discriminant
@@ -1166,7 +1169,20 @@ pub fn lower_fun_decl_with_static_addrs(
         // treat a no-predecessor block as an extra root
         // (`transform_dead_op_vars`'s start set), and before the
         // `jit_codewriter` consumers that scan `graph.blocks` directly.
-        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+        // The `next`-diamond rewrite (`front::iter_next`) runs on the same
+        // simplified graph: the Option discriminant switch's default→Abort
+        // arm must be pruned first, identically to the `?` diamond.  It is
+        // fail-safe — a non-for-loop `Option` match is left as the residual
+        // call — so it runs over every recorded site and reports how many
+        // it actually rewrote.  Only an actual rewrite detaches blocks (the
+        // discriminant switch), so the unreachable-block sweep is gated on
+        // that count, leaving a declined graph byte-identical.
+        let next_rewritten = if lo.next_call_results.is_empty() {
+            0
+        } else {
+            crate::front::iter_next::rewire_next_call_sites(&mut lo.graph, &lo.next_call_results)
+        };
+        if !lo.result_exc_call_results.is_empty() || result_exc_callee || next_rewritten > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
         simplify_lowered_graph(&mut lo.graph);
@@ -1462,6 +1478,10 @@ struct Lowering<'a> {
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
     result_exc_call_results: Vec<(Variable, Option<String>)>,
+    /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
+    /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
+    /// after the body lowering completes.
+    next_call_results: Vec<Variable>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1592,6 +1612,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
+            next_call_results: Vec::new(),
         })
     }
 
@@ -4292,6 +4313,33 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<String>::deref` / `<str>::deref` and the Wtf8 string
+                // family: a `Deref` between two string-value types is a
+                // pointer-follow with no transformation.  `String` / `&str`
+                // / `Wtf8` / `Wtf8Buf` all project to the single immutable
+                // `s_unicode0` value, so the deref is identity — alias the
+                // destination to the argument directly (the same zero-op
+                // shape as the reflexive `into` above) instead of falling
+                // through to the residual `method("deref", …)` build, an
+                // unregistered callee.  `deref_cast_root` returns `None` for
+                // these (the `&str` dest resolves no struct root), so the
+                // cast arm below declines; gate on the receiver AND the
+                // destination both being string values so slice / `Vec`
+                // derefs (`&[T]`, root `Builtin::Slice`) keep their ordinary
+                // path.
+                if args.len() == 1
+                    && is_deref_call(&reg, self.llbc)
+                    && first_arg_ty
+                        .as_ref()
+                        .is_some_and(|t| tyref_is_string_value(t, self.llbc))
+                    && tyref_is_string_value(&call.dest.ty, self.llbc)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<Box<T>>::deref` / `<Rc<T>>::deref` / `<Arc<T>>::deref`
                 // / the workspace `FrameBox::deref` (+ their `deref_mut`)
                 // whose `&T` is a registered struct.  The handle is one
@@ -4600,6 +4648,39 @@ impl<'a> Lowering<'a> {
                             lhs: args[0].clone(),
                             rhs: args[0].clone(),
                             result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // The concrete container `IntoIterator::into_iter` impls
+                // (`&[T]`/`Vec`/`[T;N]`) construct a container iterator.
+                // Emit the `iter` operation on the container receiver — the
+                // `("slice","iter")` bridge routes it to `Repr::rtype_iter`
+                // (`ListIteratorRepr` via `make_iterator_repr`) — instead of
+                // the unregistered concrete-impl `FunctionPath` callee.  The
+                // canonical `core::slice::iter` segments are the bridge's
+                // recognised token; the receiver annotation (a `SomeList`)
+                // supplies the actual element repr.
+                if args.len() == 1 && self.is_concrete_iter_constructor(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "core".to_string(),
+                                    "slice".to_string(),
+                                    "iter".to_string(),
+                                ],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Ref(None),
                         },
                     });
                     self.local_var[dest_local] = Some(res);
@@ -4945,6 +5026,17 @@ impl<'a> Lowering<'a> {
             );
             self.result_exc_call_results
                 .push((result_var.clone(), suffix));
+        }
+        // Capture `Iterator::next()` results (`Option<T>`-typed) for the
+        // `next`-diamond rewiring pass (`front::iter_next`).  Recognition
+        // is liberal — any `next`-leaf call returning `Option` — because
+        // the rewrite itself validates the surrounding for-loop match and
+        // declines (leaving the residual call) on any other shape.
+        if let OpKind::Call { target, .. } = &op_kind
+            && crate::front::iter_next::is_iterator_next_target(target)
+            && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+        {
+            self.next_call_results.push(result_var.clone());
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var),
@@ -5614,6 +5706,30 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "core::iter::traits::collect::<Impl>::into_iter"
+        })
+    }
+
+    /// The concrete container `IntoIterator` impls — `<&[T] as
+    /// IntoIterator>::into_iter` and the `Vec` / array forms.  Unlike the
+    /// reflexive blanket (`is_reflexive_into_iter`), the receiver type
+    /// (the container) differs from the destination (a fresh iterator), so
+    /// they cannot be identity-aliased; the caller lowers them to the
+    /// `iter` operation on the container instead of an unregistered
+    /// `FunctionPath` callee.  The explicit `<[T]>::iter` already routes to
+    /// `iter` through the `("slice","iter")` bridge
+    /// (`flowspace_adapter::nonraising_core_bridge_opname`), so it is not
+    /// matched here.
+    fn is_concrete_iter_constructor(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::iter::<Impl>::into_iter"
+                    | "alloc::vec::<Impl>::into_iter"
+                    | "core::array::<Impl>::into_iter"
+            )
         })
     }
 
@@ -8449,6 +8565,50 @@ fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|id| id.get("Builtin"))
         .and_then(serde_json::Value::as_str)
         == Some("Str")
+}
+
+/// Whether a `TyRef` resolves (behind `Ref` / dedup wrappers) to a
+/// string-family value: the `alloc::string::String` ADT, the
+/// `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, or the `{Builtin: "Str"}`
+/// node (the bare `str` deref destination).  All four project to the
+/// single immutable `s_unicode0` value, so a `deref` between any two of
+/// them is value-identity.
+fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    // `{Builtin: "Str"}` — the bare `str` value (no ADT def-id).
+    if node
+        .get("Adt")
+        .and_then(|a| a.get("id"))
+        .and_then(|id| id.get("Builtin"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Str")
+    {
+        return true;
+    }
+    // Named string ADTs: `alloc::string::String` and the WTF-8 wrappers.
+    adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let np = td.item_meta.name_path();
+            np == "alloc::string::String"
+                || matches!(np.rsplit("::").next(), Some("Wtf8" | "Wtf8Buf"))
+        })
+}
+
+/// Whether `reg` resolves to a `Deref::deref` / `DerefMut::deref_mut`
+/// leaf, by the callee's `name_path` suffix.  Unlike `deref_cast_root`
+/// this makes no claim about the dereferenced type — the caller pairs it
+/// with a `tyref_is_string_value` receiver / dest gate.
+fn is_deref_call(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        let np = fd.item_meta.name_path();
+        np.ends_with("::deref") || np.ends_with("::deref_mut")
+    })
 }
 
 /// The qualified declaration path of a `TyRef`'s base ADT, after

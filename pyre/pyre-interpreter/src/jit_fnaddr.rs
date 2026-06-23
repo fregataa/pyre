@@ -729,6 +729,99 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         set_current_exc as *const (),
     );
 
+    // `w_type` / `w_object` — the `type` / `object` typeobject accessors
+    // read the `W_TYPE_TYPEOBJECT` / `W_OBJECT_TYPEOBJECT` `OnceLock<usize>`
+    // slots set once at startup.  Both carry `#[dont_look_inside]` (the
+    // `OnceLock::get` read has no registry-resolvable accessor graph), so
+    // the codewriter classifies the calls `Residual` and needs these
+    // bindings to bake real funcptrs instead of `symbolic_fnaddr_for_path`
+    // hashes.  Callers spell them `crate::typedef::w_type()`, the sole
+    // path form, with no crate-root re-export.
+    let w_type: fn() -> pyre_object::PyObjectRef = crate::typedef::w_type;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::typedef::w_type",
+        w_type as *const (),
+    );
+    let w_object: fn() -> pyre_object::PyObjectRef = crate::typedef::w_object;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::typedef::w_object",
+        w_object as *const (),
+    );
+
+    // Thread-local / `OnceLock` accessors that carry `#[dont_look_inside]`
+    // (the `.with` closure read has no extractable graph): the codewriter
+    // classifies the calls `Residual` and needs real funcptrs instead of
+    // `symbolic_fnaddr_for_path` hashes.  Error-slot twins of
+    // `get_current_exception` / `set_current_exception`, plus the weakref
+    // proxy type singletons (twins of `w_type` / `w_object`).
+    let set_call_error: fn(crate::PyError) = crate::call::set_call_error;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::call::set_call_error",
+        set_call_error as *const (),
+    );
+    let take_call_error: fn() -> Option<crate::PyError> = crate::call::take_call_error;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::call::take_call_error",
+        take_call_error as *const (),
+    );
+    let clear_call_error: fn() = crate::call::clear_call_error;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::call::clear_call_error",
+        clear_call_error as *const (),
+    );
+    let take_pending_hash_error: fn() -> crate::PyError =
+        crate::baseobjspace::take_pending_hash_error;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::take_pending_hash_error",
+        take_pending_hash_error as *const (),
+    );
+    let proxy_type: fn() -> pyre_object::PyObjectRef =
+        crate::module::_weakref::interp_weakref::proxy_type;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::module::_weakref::interp_weakref::proxy_type",
+        proxy_type as *const (),
+    );
+    let callable_proxy_type: fn() -> pyre_object::PyObjectRef =
+        crate::module::_weakref::interp_weakref::callable_proxy_type;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::module::_weakref::interp_weakref::callable_proxy_type",
+        callable_proxy_type as *const (),
+    );
+
+    // Stack-overflow / JIT-pending-exception bookkeeping accessors, all
+    // `#[dont_look_inside]` (PYRE_STACKTOOBIG static / TL_JIT_PENDING_EXCEPTION
+    // thread-local reads with no extractable graph).  The slowpath is
+    // already a C-ABI residual the backend calls directly; the wrappers
+    // become residual Calls.
+    let stack_slowpath: extern "C" fn(usize) -> u8 =
+        crate::stack_check::pyre_stack_too_big_slowpath;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::stack_check::pyre_stack_too_big_slowpath",
+        stack_slowpath as *const (),
+    );
+    let stack_check: fn() -> Result<(), crate::PyError> = crate::stack_check::stack_check;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::stack_check::stack_check",
+        stack_check as *const (),
+    );
+    let drain_jit_pending: fn() -> Result<(), crate::PyError> =
+        crate::stack_check::drain_jit_pending_exception;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::stack_check::drain_jit_pending_exception",
+        drain_jit_pending as *const (),
+    );
+
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
     // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
     // only honours the assertion when `function_fnaddrs.contains_key(p)`,
@@ -1141,12 +1234,21 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             excobject::EXC_UNICODE_ERROR_TYPE
         ),
         pytype_addr!(
+            "excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE",
+            excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "excobject::EXC_SYNTAX_ERROR_TYPE",
+            excobject::EXC_SYNTAX_ERROR_TYPE
+        ),
+        pytype_addr!(
             "generatorobject::GENERATOR_TYPE",
             generatorobject::GENERATOR_TYPE
         ),
         pytype_addr!("pyobject::INT_TYPE", pyobject::INT_TYPE),
         pytype_addr!("pyobject::BOOL_TYPE", pyobject::BOOL_TYPE),
         pytype_addr!("pyobject::FLOAT_TYPE", pyobject::FLOAT_TYPE),
+        pytype_addr!("pyobject::COMPLEX_TYPE", pyobject::COMPLEX_TYPE),
         pytype_addr!("pyobject::STR_TYPE", pyobject::STR_TYPE),
         pytype_addr!("pyobject::LIST_TYPE", pyobject::LIST_TYPE),
         pytype_addr!("pyobject::TUPLE_TYPE", pyobject::TUPLE_TYPE),
@@ -1376,6 +1478,22 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
         (
             "dictmultiobject::W_DICT_OBJECT_SIZE",
             pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE as i64,
+        ),
+        (
+            "specialisedtupleobject::SPECIALISED_TUPLE_II_OBJECT_SIZE",
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_OBJECT_SIZE as i64,
+        ),
+        (
+            "specialisedtupleobject::SPECIALISED_TUPLE_FF_OBJECT_SIZE",
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_OBJECT_SIZE as i64,
+        ),
+        (
+            "specialisedtupleobject::SPECIALISED_TUPLE_OO_OBJECT_SIZE",
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_OBJECT_SIZE as i64,
+        ),
+        (
+            "instanceobject::W_INSTANCE_OBJECT_SIZE",
+            pyre_object::instanceobject::W_INSTANCE_OBJECT_SIZE as i64,
         ),
     ]
 }
