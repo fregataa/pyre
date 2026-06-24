@@ -12,6 +12,34 @@
 use crate::intbound::IntBound;
 use crate::ptr_info::PtrInfo;
 
+/// info.py:851 `FloatConstInfo`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloatConstInfo {
+    pub _const: f64,
+}
+
+impl FloatConstInfo {
+    pub fn new(value: f64) -> Self {
+        Self { _const: value }
+    }
+
+    pub fn is_constant(&self) -> bool {
+        true
+    }
+
+    pub fn getconst(&self) -> f64 {
+        self._const
+    }
+}
+
+/// shortpreamble.py:376 `EmptyInfo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmptyInfo;
+
+impl EmptyInfo {
+    pub fn make_guards(&self) {}
+}
+
 /// `info.py` `AbstractInfo` hierarchy collapsed into a Rust enum.
 ///
 /// `Ptr` carries `Rc<RefCell<PtrInfo>>` so the underlying info object has
@@ -24,6 +52,8 @@ use crate::ptr_info::PtrInfo;
 pub enum OpInfo {
     /// No information known.
     Unknown,
+    /// shortpreamble.py:379 `empty_info` sentinel.
+    EmptyInfo(EmptyInfo),
     /// Known integer bounds. info.py:1264 IntBound.
     /// `IntBound::from_constant(v)` is the canonical Int constant carrier.
     IntBound(std::rc::Rc<std::cell::RefCell<IntBound>>),
@@ -33,19 +63,20 @@ pub enum OpInfo {
     Ptr(std::rc::Rc<std::cell::RefCell<PtrInfo>>),
     /// Known constant float value.
     /// info.py:851 FloatConstInfo — Float constant carrier.
-    FloatConst(f64),
+    FloatConstInfo(FloatConstInfo),
 }
 
 impl std::fmt::Debug for OpInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpInfo::Unknown => f.write_str("OpInfo::Unknown"),
+            OpInfo::EmptyInfo(v) => f.debug_tuple("OpInfo::EmptyInfo").field(v).finish(),
             OpInfo::IntBound(ib) => f
                 .debug_tuple("OpInfo::IntBound")
                 .field(&*ib.borrow())
                 .finish(),
             OpInfo::Ptr(p) => f.debug_tuple("OpInfo::Ptr").field(&*p.borrow()).finish(),
-            OpInfo::FloatConst(v) => f.debug_tuple("OpInfo::FloatConst").field(v).finish(),
+            OpInfo::FloatConstInfo(v) => f.debug_tuple("OpInfo::FloatConstInfo").field(v).finish(),
         }
     }
 }
@@ -64,17 +95,17 @@ impl OpInfo {
 
     pub fn is_constant(&self) -> bool {
         match self {
-            OpInfo::FloatConst(_) => true,
+            OpInfo::FloatConstInfo(v) => v.is_constant(),
             OpInfo::Ptr(p) => matches!(&*p.borrow(), PtrInfo::Constant(_)),
             OpInfo::IntBound(b) => b.borrow().is_constant(),
-            OpInfo::Unknown => false,
+            OpInfo::Unknown | OpInfo::EmptyInfo(_) => false,
         }
     }
 
     /// Get the constant float value if this is a FloatConst.
     pub fn get_constant_float(&self) -> Option<f64> {
         match self {
-            OpInfo::FloatConst(f) => Some(*f),
+            OpInfo::FloatConstInfo(f) => Some(f.getconst()),
             _ => None,
         }
     }

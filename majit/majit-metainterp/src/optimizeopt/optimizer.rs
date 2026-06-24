@@ -1,8 +1,8 @@
-use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 /// Main optimization driver.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
+use crate::optimizeopt::OptContext;
 use crate::optimizeopt::{
     earlyforce::OptEarlyForce,
     heap::OptHeap,
@@ -14,9 +14,268 @@ use crate::optimizeopt::{
 };
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
+use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
+use majit_ir::box_ref::BoxRef;
+
+/// optimizer.py:47-54 OptimizationResult: result of an optimization pass.
+#[derive(Debug)]
+pub enum OptimizationResult {
+    /// Emit this operation (possibly modified).
+    Emit(Op),
+    /// Replace with a different operation; continue with the next pass.
+    Replace(Op),
+    /// optimizer.py:567 `send_extra_operation(newop, opt=None)` — re-dispatch
+    /// the new op from the first optimization, dropping the original.
+    /// autogenintrules.py:54-55 uses this pattern for every rewrite-style
+    /// rule so that chained OptIntBounds rules (add_zero, int_is_zero, …)
+    /// fire on the rewritten op.
+    Restart(Op),
+    /// Remove the operation entirely.
+    Remove,
+    /// Pass the operation to the next pass unchanged.
+    PassOn,
+    /// rewrite.py:406 — a guard was proven to always fail; abort the trace.
+    /// RPython raises `InvalidLoop`; pyre threads it as a value (the driver
+    /// converts it to `Err(InvalidLoop)` at the pass barrier) so it works
+    /// under `panic=abort`.  Carries the abandon reason for diagnostics.
+    InvalidLoop(&'static str),
+}
+
+/// An optimization pass.
+///
+/// optimizer.py: Optimization base class.
+pub trait Optimization {
+    /// Process an operation. Called for each operation in the trace.
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult;
+
+    /// optimizer.py:71 propagate_postprocess — called AFTER the op has been
+    /// emitted through all passes and added to new_operations. Runs in
+    /// REVERSE pass order. RPython uses this for bounds propagation
+    /// (intbounds.py postprocess_GUARD_TRUE) and heap cache updates
+    /// (heap.py postprocess_GETFIELD_GC_I).
+    fn propagate_postprocess(&mut self, _op: &Op, _ctx: &mut OptContext) {}
+
+    /// optimizer.py:74-75 have_postprocess
+    fn have_postprocess(&self) -> bool {
+        false
+    }
+
+    /// optimizer.py:77-79 have_postprocess_op(opnum)
+    fn have_postprocess_op(&self, _opcode: OpCode) -> bool {
+        self.have_postprocess()
+    }
+
+    /// Called once before optimization starts.
+    fn setup(&mut self) {}
+
+    /// Called after all operations have been processed.
+    fn flush(&mut self, _ctx: &mut OptContext) {}
+
+    /// Mark this pass as Phase 2 (loop body). Phase 2 should not fully
+    /// virtualize New() ops because guard recovery_layout is not yet
+    /// populated. Default: no-op.
+    fn set_phase2(&mut self, _phase2: bool) {}
+
+    /// warmstate.py: pureop_historylength.
+    /// Only OptPure consumes this; other passes ignore it.
+    fn set_pureop_historylength(&mut self, _limit: usize) {}
+
+    /// `virtualize.py:140 vrefinfo =
+    /// self.optimizer.metainterp_sd.virtualref_info` parity hook.  Only
+    /// `OptVirtualize` reads this; other passes ignore it.
+    fn set_vrefinfo(&mut self, _vrefinfo: crate::virtualref::VirtualRefInfo) {}
+
+    /// optimizer.py:517 propagate_all_forward(trace, call_pure_results, flush).
+    /// Only OptPure consumes this; other passes ignore it.
+    fn set_call_pure_results(
+        &mut self,
+        _results: &majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    ) {
+    }
+
+    /// Name of this pass (for debugging).
+    fn name(&self) -> &'static str;
+
+    /// optimizer.py:557 parity hook — drain this pass's accumulated
+    /// `Counters.*` bumps into `staticdata.profiler` and reset the
+    /// internal accumulators.
+    ///
+    /// Each pass that records its own `Counters.*` bumps
+    /// (vector.py:139/146 OPT_VECTORIZE_TRY/OPT_VECTORIZED, heap.py
+    /// HEAPCACHED_OPS, ...) overrides this; the default impl does
+    /// nothing for passes that have no counters of their own.
+    /// `Optimizer::update_counters` calls this on every pass after
+    /// each `propagate_all_forward` exit.
+    fn drain_profiler_counters(&mut self, _profiler: &crate::jitprof::JitProfiler) {}
+
+    /// optimizer.py: produce_potential_short_preamble_ops(sb)
+    /// Contribute operations to the short preamble builder.
+    /// Called after preamble optimization to collect ops that bridges need to replay.
+    /// RPython passes `optimizer` for PtrInfo access. We pass `ctx`.
+    fn produce_potential_short_preamble_ops(
+        &self,
+        _sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        _ctx: &mut OptContext,
+    ) {
+        // Default: no contribution
+    }
+
+    /// heap.py:825-846 serialize_optheap(available_boxes) — export struct field triples.
+    /// `available_boxes`: None = no filter (accept all), Some = RPython filter.
+    fn export_cached_fields(
+        &self,
+        _ctx: &mut OptContext,
+        _available_boxes: Option<&[majit_ir::box_ref::BoxRef]>,
+    ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
+        Vec::new()
+    }
+
+    /// heap.py:870-883 deserialize_optheap — import struct fields.
+    fn import_cached_fields(
+        &mut self,
+        _entries: &[(OpRef, majit_ir::DescrRef, OpRef)],
+        _ctx: &mut OptContext,
+    ) {
+    }
+
+    /// heap.py:847-868 serialize_optheap(available_boxes) — export array item triples.
+    /// `available_boxes`: None = no filter (accept all), Some = RPython filter.
+    fn export_cached_arrayitems(
+        &self,
+        _ctx: &mut OptContext,
+        _available_boxes: Option<&[majit_ir::box_ref::BoxRef]>,
+    ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
+        Vec::new()
+    }
+
+    /// heap.py:885-894 deserialize_optheap — import array item triples.
+    fn import_cached_arrayitems(
+        &mut self,
+        _entries: &[(OpRef, i64, majit_ir::DescrRef, OpRef)],
+        _ctx: &mut OptContext,
+    ) {
+    }
+
+    /// rewrite.py:828-834 serialize_optrewrite
+    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
+        Vec::new()
+    }
+
+    /// rewrite.py:836-838 deserialize_optrewrite
+    fn deserialize_optrewrite(&mut self, _entries: &[(i64, OpRef)]) {}
+
+    /// shortpreamble.py:112-126: PureOp.produce_op / LoopInvariantOp.produce_op
+    /// Transfer imported PreambleOp entries from OptContext to this pass.
+    /// RPython calls `opt.optimizer.optpure` directly during produce_op.
+    /// In majit, the Optimization trait mediates this transfer.
+    fn install_preamble_pure_ops(&mut self, _ctx: &OptContext) {}
+
+    /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
+    fn export_arg_int_bounds(
+        &self,
+        _args: &[OpRef],
+        _ctx: &OptContext,
+    ) -> majit_ir::VecMap<majit_ir::operand::Operand, IntBound> {
+        majit_ir::VecMap::new()
+    }
+
+    /// optimizer.py: is_virtual(opref)
+    /// Whether an opref refers to a virtual object (for this pass).
+    fn is_virtual(&self, _opref: OpRef) -> bool {
+        false
+    }
+
+    /// RPython optimizer.py: emitting_operation(op)
+    /// Called before any operation is emitted to the output, regardless of
+    /// which pass emits it. This enables passes like OptHeap to force lazy
+    /// sets before guards, even when the guard is emitted by an earlier pass.
+    ///
+    /// `self_pass_idx` is this pass's own index in the optimizer pipeline.
+    /// RPython uses `self.next_optimization` to route lazy-set emissions
+    /// starting AFTER the current pass. In majit, pass this index to
+    /// `emit_extra` to achieve the same behavior.
+    fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
+}
+
+/// optimizer.py:900-909 `CantReplaceGuards`.
+///
+/// PyPy stores the optimizer reference on the context manager.  Pyre cannot
+/// keep a mutable borrow of `Optimizer` across the guarded section, so this
+/// object carries the saved `oldval` and `Optimizer::restore_can_replace_guards`
+/// applies it at scope exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CantReplaceGuards {
+    oldval: bool,
+}
+
+impl CantReplaceGuards {
+    fn new(oldval: bool) -> Self {
+        Self { oldval }
+    }
+}
+
+/// optimizer.py:29 `LoopInfo`.
+pub trait LoopInfo {
+    fn label_op(&self) -> Option<&Op> {
+        None
+    }
+
+    fn r#final(&self) -> bool;
+
+    fn post_loop_compilation(
+        &mut self,
+        _loop_ops: &[majit_ir::OpRc],
+        _jitdriver_sd: (),
+        _metainterp: (),
+        _jitcell_token: (),
+    ) {
+    }
+}
+
+/// optimizer.py:32-44 `BasicLoopInfo`.
+#[derive(Clone, Debug)]
+pub struct BasicLoopInfo {
+    pub inputargs: Vec<OpRef>,
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    pub jump_op: Option<Op>,
+    pub extra_same_as: Vec<Op>,
+    pub extra_before_label: Vec<Op>,
+    pub label_op: Option<Op>,
+}
+
+impl BasicLoopInfo {
+    pub fn new(
+        inputargs: Vec<OpRef>,
+        quasi_immutable_deps: Vec<(u64, u32)>,
+        jump_op: Option<Op>,
+    ) -> Self {
+        Self {
+            inputargs,
+            quasi_immutable_deps,
+            jump_op,
+            extra_same_as: Vec::new(),
+            extra_before_label: Vec::new(),
+            label_op: None,
+        }
+    }
+}
+
+impl LoopInfo for BasicLoopInfo {
+    fn label_op(&self) -> Option<&Op> {
+        self.label_op.as_ref()
+    }
+
+    fn r#final(&self) -> bool {
+        true
+    }
+}
 
 /// bridgeopt.py:124 parity: data needed to call
 /// deserialize_optimizer_knowledge after optimizer setup.
@@ -51,8 +310,7 @@ pub struct Optimizer {
     /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls. RPython uses value-based equality for keys.
-    pub call_pure_results:
-        crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results: majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     ///
@@ -73,7 +331,7 @@ pub struct Optimizer {
     /// `ctx.get_box_replacement(op.pos)` so insert and lookup agree on the
     /// canonical box. Guard ops are never Const, so the key is always a
     /// ptr-stable ResOp box.
-    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, Op>,
+    replaces_guard: majit_ir::VecMap<majit_ir::operand::Operand, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -230,7 +488,7 @@ pub struct Optimizer {
 }
 
 /// Lower a typed-`Value` constants pool into the dense
-/// `VecAssoc<u32, Const>` shape consumed by pyre-side guard metadata
+/// `VecMap<u32, Const>` shape consumed by pyre-side guard metadata
 /// builders, CompiledTrace storage, and the backend's
 /// `set_constants_pool` boundary.
 ///
@@ -238,9 +496,9 @@ pub struct Optimizer {
 /// constant classes — `Value::Void` panics rather than fabricate a
 /// nonexistent `ConstVoid`.
 pub(crate) fn lower_typed_constants_to_const_pool(
-    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
-) -> crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> {
-    let mut pool = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    constants: &majit_ir::VecMap<u32, majit_ir::Value>,
+) -> majit_ir::VecMap<u32, majit_ir::Const> {
+    let mut pool = majit_ir::VecMap::new();
     for (&k, v) in constants {
         pool.insert(k, v.to_const());
     }
@@ -268,7 +526,7 @@ fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Vec<bool
 
 pub(crate) fn sanitize_backend_constants_for_ops<'a>(
     ops: impl IntoIterator<Item = &'a Op>,
-    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
     constants
@@ -288,7 +546,7 @@ pub(crate) fn sanitize_backend_constants_for_ops<'a>(
 /// `constant_types` side table.
 pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
-    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ctx.new_operations.iter().map(|rc| rc.as_ref()));
 
@@ -309,7 +567,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         }
         let idx = pos.raw() as usize;
         let value = match op.forwarded.borrow().clone() {
-            crate::r#box::Forwarded::Const(c) => c.to_value(),
+            majit_ir::box_ref::Forwarded::Const(c) => c.to_value(),
             _ => return,
         };
         // A ref constant is never resolved from this backend pool: a referenced
@@ -387,7 +645,7 @@ impl Optimizer {
         let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
             return false;
         };
-        if !matches!(forwarded, crate::r#box::Forwarded::Const(_)) {
+        if !matches!(forwarded, majit_ir::box_ref::Forwarded::Const(_)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -441,7 +699,7 @@ impl Optimizer {
 
     fn apply_imported_virtual_state(
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
-        box_: &crate::r#box::BoxRef,
+        box_: &majit_ir::box_ref::BoxRef,
         ctx: &mut OptContext,
     ) {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
@@ -561,7 +819,7 @@ impl Optimizer {
                 ctx.set_ptr_info(
                     box_,
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                        crate::optimizeopt::info::VirtualArrayStructInfo {
+                        crate::optimizeopt::info::ArrayStructInfo {
                             descr: descr.clone(),
                             fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
@@ -647,8 +905,7 @@ impl Optimizer {
         // Non-virtual states advance label_slot without creating entries.
         // Virtual states create entries with fields from label_args.
         // Build a map from inputarg_index to imported_virtual for virtual lookup.
-        let mut iv_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, &ImportedVirtual> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut iv_map: majit_ir::VecMap<usize, &ImportedVirtual> = majit_ir::VecMap::new();
         for iv in &self.imported_virtuals {
             iv_map.insert(iv.inputarg_index, iv);
         }
@@ -664,8 +921,7 @@ impl Optimizer {
         // The map value caches the imported Phase 2 OpRef for the first
         // visit so subsequent revisits resolve to the same box (mirroring
         // RPython's setinfo_from_preamble.get_forwarded sharing).
-        let mut walk_visited: crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut walk_visited: majit_ir::VecMap<usize, OpRef> = majit_ir::VecMap::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
             if let Some(iv) = iv_map.get(&state_idx).copied() {
                 // Virtual state: process fields recursively, consuming slots
@@ -896,7 +1152,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
+        walk_visited: &mut majit_ir::VecMap<usize, OpRef>,
     ) -> OpRef {
         let key = std::rc::Rc::as_ptr(rc) as usize;
         if let Some(&cached) = walk_visited.get(&key) {
@@ -921,7 +1177,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
+        walk_visited: &mut majit_ir::VecMap<usize, OpRef>,
     ) -> OpRef {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
@@ -1081,7 +1337,7 @@ impl Optimizer {
                 ctx.set_ptr_info(
                     &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                        crate::optimizeopt::info::VirtualArrayStructInfo {
+                        crate::optimizeopt::info::ArrayStructInfo {
                             descr: descr.clone(),
                             fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
@@ -1129,9 +1385,9 @@ impl Optimizer {
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
-            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            call_pure_results: majit_ir::VecMap::new(),
             last_guard_op_idx: None,
-            replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            replaces_guard: majit_ir::VecMap::new(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
             quasi_immutable_deps: Vec::new(),
@@ -1358,28 +1614,27 @@ impl Optimizer {
     /// `self.optimizer.can_replace_guards` into `self.oldval` and sets
     /// the flag to False; `__exit__` restores from `self.oldval`.
     ///
-    /// pyre returns the previously-set value as a `bool` token. Callers
-    /// pair this with a manual restore (typically in a panic-safe
-    /// scope so the flag is restored even on unwind). This matches the
-    /// upstream save-old-then-set-false semantics exactly — including
-    /// the nested case where an outer scope has already set the flag
-    /// to False and the inner restore must preserve that.
+    /// pyre returns the `CantReplaceGuards` token carrying the previously-set
+    /// value. Callers pair this with a manual restore. This matches the
+    /// upstream save-old-then-set-false semantics exactly — including the
+    /// nested case where an outer scope has already set the flag to False and
+    /// the inner restore must preserve that.
     ///
     /// ```text
-    /// let oldval = optimizer.cant_replace_guards();
+    /// let guard = optimizer.cant_replace_guards();
     /// // ... guarded section ...
-    /// optimizer.restore_can_replace_guards(oldval);
+    /// optimizer.restore_can_replace_guards(guard);
     /// ```
-    pub fn cant_replace_guards(&mut self) -> bool {
+    pub fn cant_replace_guards(&mut self) -> CantReplaceGuards {
         let oldval = self.can_replace_guards;
         self.can_replace_guards = false;
-        oldval
+        CantReplaceGuards::new(oldval)
     }
 
     /// Pair with `cant_replace_guards` — restores the saved oldval.
     /// Matches `CantReplaceGuards.__exit__` (optimizer.py:908-909).
-    pub fn restore_can_replace_guards(&mut self, oldval: bool) {
-        self.can_replace_guards = oldval;
+    pub fn restore_can_replace_guards(&mut self, guard: CantReplaceGuards) {
+        self.can_replace_guards = guard.oldval;
     }
 
     /// **Legacy flat setter** kept for tests that exercise the flag
@@ -1886,7 +2141,7 @@ impl Optimizer {
     /// drop the `Virtual` fields / descr / cached_vinfo state).
     pub fn make_constant_class(
         ctx: &mut OptContext,
-        op: &crate::r#box::BoxRef,
+        op: &majit_ir::box_ref::BoxRef,
         class_value: i64,
         update_last_guard: bool,
     ) {
@@ -1972,7 +2227,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new())
+        self.optimize_with_constants(ops, &mut majit_ir::VecMap::new())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -1988,7 +2243,7 @@ impl Optimizer {
     pub fn optimize_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         self.optimize_with_constants_and_inputs(ops, constants, 0)
     }
@@ -2004,7 +2259,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> Vec<Op> {
         // `_at` traffics in `OpRc`; this `&[Op]` overload wraps each op in a
@@ -2036,7 +2291,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_oprc(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
         self.run_optimize_from_inputs(ops, constants, num_inputs, true)
@@ -2045,7 +2300,7 @@ impl Optimizer {
     pub(crate) fn run_optimize_from_inputs(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
         input_ops_from_ops: bool,
     ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
@@ -2081,7 +2336,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_at(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
@@ -2733,6 +2988,11 @@ impl Optimizer {
                     .filter(|op| op.opcode == OpCode::Jump)
                     .map(std::rc::Rc::new)
             });
+        let mut loop_info = BasicLoopInfo::new(
+            self.trace_inputargs.clone(),
+            self.quasi_immutable_deps.clone(),
+            jump.as_ref().map(|op| (**op).clone()),
+        );
         // RPython compile.py:327 `loop.operations = ([start_label] + preamble_ops
         // + loop_info.extra_same_as + loop_info.extra_before_label + [label_op]
         // + loop_ops)`: alias SameAs ops allocated during the preamble
@@ -2740,7 +3000,6 @@ impl Optimizer {
         // preamble body. Keep them in a side vector so they land at the
         // spliced parity position below instead of appearing in
         // `ctx.new_operations` past the terminator.
-        let mut extra_same_as_aliases: Vec<Op> = Vec::new();
         // `match` (not `jump.map(|jump| ...)`) so the `return Err(InvalidLoop)`
         // for the preview virtual-state mismatch below propagates out of
         // `optimize_with_constants_and_inputs_at`, not just the closure.
@@ -2840,7 +3099,7 @@ impl Optimizer {
                         // directly into `ctx.new_operations` would push the op
                         // past the already-sent terminal JUMP and force the
                         // loop-tail relocation workaround below.
-                        extra_same_as_aliases.push(op);
+                        loop_info.extra_same_as.push(op);
                         let orig_box = ctx.get_box_replacement_box(orig);
                         if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                             let fresh_info = match info {
@@ -3288,8 +3547,7 @@ impl Optimizer {
         // This ensures no position collisions between input block params and ops.
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
-            let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<u32, u32> =
-                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            let mut remap: majit_ir::VecMap<u32, u32> = majit_ir::VecMap::new();
 
             // Virtual input positions: optimizer used num_inputs+k, backend needs num_inputs+k
             for k in 0..num_virtual_inputs {
@@ -3339,7 +3597,7 @@ impl Optimizer {
                 }
                 if !matches!(
                     op.forwarded.borrow().clone(),
-                    crate::r#box::Forwarded::Const(_)
+                    majit_ir::box_ref::Forwarded::Const(_)
                 ) {
                     return;
                 }
@@ -3444,10 +3702,10 @@ impl Optimizer {
                         *opref = opref.with_raw(new_pos);
                     }
                 };
-                let remap_boxref = |arg: &mut crate::r#box::BoxRef| {
+                let remap_boxref = |arg: &mut majit_ir::box_ref::BoxRef| {
                     let mut opref = arg.to_opref();
                     remap_opref(&mut opref);
-                    *arg = crate::r#box::BoxRef::from_opref(opref);
+                    *arg = majit_ir::box_ref::BoxRef::from_opref(opref);
                 };
                 // next_iteration_args now carries the canonical Phase-1 boxes that
                 // double as exported_infos keys. Remap by `set_position` (as
@@ -3592,15 +3850,20 @@ impl Optimizer {
         // RPython ordering means splicing the alias `extra_same_as` ops
         // just ahead of that terminator so they execute at end of preamble
         // and never appear past the Jump. With the dedup loop now
-        // accumulating into `extra_same_as_aliases` (see the closure
+        // accumulating into `loop_info.extra_same_as` (see the closure
         // above), no `ctx.emit`-after-terminator cleanup is needed.
-        if !extra_same_as_aliases.is_empty() {
+        if !loop_info.extra_same_as.is_empty() || !loop_info.extra_before_label.is_empty() {
             let term_idx = ops
                 .iter()
                 .position(|op| op.opcode == OpCode::Jump || op.opcode == OpCode::Finish)
                 .unwrap_or(ops.len());
-            for (offset, op) in extra_same_as_aliases.into_iter().enumerate() {
+            let extra_same_as_len = loop_info.extra_same_as.len();
+            for (offset, op) in loop_info.extra_same_as.into_iter().enumerate() {
                 ops.insert(term_idx + offset, std::rc::Rc::new(op));
+            }
+            let before_label_idx = term_idx + extra_same_as_len;
+            for (offset, op) in loop_info.extra_before_label.into_iter().enumerate() {
+                ops.insert(before_label_idx + offset, std::rc::Rc::new(op));
             }
         }
         // resume.py:411-417 parity: store_final_boxes_in_guard
@@ -3650,7 +3913,7 @@ impl Optimizer {
     pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
         runtime_boxes: &[OpRef],
@@ -4042,11 +4305,8 @@ impl Optimizer {
         &self,
         args: &[OpRef],
         ctx: &mut OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<
-        majit_ir::operand::Operand,
-        crate::optimizeopt::intutils::IntBound,
-    > {
-        let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    ) -> majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound> {
+        let mut exported = majit_ir::VecMap::new();
         for pass in &self.passes {
             // Each pass resolves through the same `ctx`, so a box for one
             // canonical position is memoized to a single `Rc` — entries across
@@ -5106,7 +5366,7 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::rooted_resop_box;
+    use crate::history::test_support::rooted_resop_box;
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};
@@ -5535,7 +5795,7 @@ mod tests {
             ],
         )];
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -5557,8 +5817,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(2));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 2);
 
         assert_eq!(
             hits.get(),
@@ -5625,8 +5884,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 3);
 
         let call_count = result
             .iter()
@@ -5680,7 +5938,7 @@ mod tests {
         ];
 
         // Position-only op-args / fail-args replaced by the `rooted_resop_box`
-        // drop-in (box.rs test_support: a bound ResOp box whose synthetic
+        // drop-in (box_ref.rs test_support: a bound ResOp box whose synthetic
         // producer is rooted in the thread-local pool; sheds to `Operand::Op`,
         // `to_opref`s to the same `(type, position)` so position-keyed
         // resolution is unchanged). CallMayForceR's result is consumed as a Ref
@@ -5689,7 +5947,7 @@ mod tests {
         // dangling positions stay `Type::Int` exactly as the fixture wired them.
         // Detached fail-arg synthetics resolve to themselves (the `same_box`
         // arm, mod.rs:4637), deferring to the OpRef store — no `Operand::Box`.
-        use crate::r#box::test_support::rooted_resop_box;
+        use crate::history::test_support::rooted_resop_box;
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
             &[
@@ -5803,8 +6061,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 3);
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -5836,7 +6093,7 @@ mod tests {
 
     #[test]
     fn test_default_pipeline_processes_trace() {
-        use crate::r#box::test_support::TraceBuilder;
+        use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
         // A simple trace: two INT_ADD with identical args. The Pure pass (CSE)
         // should eliminate the duplicate. The two IntAdd reference the SAME
@@ -5851,11 +6108,7 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(
-                &ops,
-                &mut majit_ir::VecAssoc::new(),
-                num_inputs,
-            )
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
@@ -5894,7 +6147,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -5946,7 +6199,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -5974,7 +6227,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
@@ -5996,7 +6249,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
@@ -6029,7 +6282,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         assert_eq!(result.len(), 1);
@@ -6051,7 +6304,7 @@ mod tests {
 
     #[test]
     fn test_get_count_of_ops_and_guards() {
-        use crate::r#box::test_support::TraceBuilder;
+        use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
         // This test only exercises the ops/guard counter; each inputarg
         // is read by at least one Int-shape consumer (GuardTrue, IntAdd).
@@ -6075,11 +6328,7 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(
-                &ops,
-                &mut majit_ir::VecAssoc::new(),
-                num_inputs,
-            )
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
@@ -6104,8 +6353,7 @@ mod tests {
 
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 0);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 0);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -6161,7 +6409,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
@@ -6260,7 +6508,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
@@ -6320,7 +6568,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
@@ -6394,7 +6642,7 @@ mod tests {
         }
 
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -6460,7 +6708,7 @@ mod tests {
             &[Operand::from_boxref(&rooted_resop_box(Type::Int, 50))],
         )));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, false)
             .expect("empty trace must not produce InvalidLoop");
@@ -6813,7 +7061,7 @@ mod tests {
 
     #[test]
     fn test_resumedata_memo_encodes_rd_numb_on_guard() {
-        use crate::r#box::test_support::TraceBuilder;
+        use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
         // OptIntBound (mod.rs:2624 getintbound) requires IntAdd's args to be
         // Type::Int — the two header inputs are Int.
@@ -6833,11 +7081,7 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(
-                &ops,
-                &mut majit_ir::VecAssoc::new(),
-                num_inputs,
-            )
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
 
         let guard = result
@@ -6914,7 +7158,7 @@ mod tests {
             fields: Vec::new(),
             field_descrs: Vec::new(),
         };
-        let mut walk_visited = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut walk_visited = majit_ir::VecMap::new();
         let mut label_slot = 0usize;
         let head = Optimizer::import_virtual_state_from_label_args(
             &info,

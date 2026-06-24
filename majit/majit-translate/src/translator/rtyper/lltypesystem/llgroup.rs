@@ -1,454 +1,380 @@
-//! RPython `rpython/rtyper/lltypesystem/llgroup.py`.
-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+//! Port of `rpython/rtyper/lltypesystem/llgroup.py`.
+//!
+//! RPython uses groups to pack raw static structs and refer to members through
+//! compact half-word offsets. Pyre does not use the C backend group layout at
+//! runtime, but the symbolic carriers are part of the lltypesystem surface and
+//! are referenced by `opimpl.py` parity.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+#![allow(non_camel_case_types, non_upper_case_globals)]
+
+use std::fmt;
+use std::ops::{Add, BitAnd, BitOr, Shr, Sub};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
-use crate::annotator::model::{KnownType, SomeInteger, SomeValue};
-use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
-use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, GcKind, LowLevelType, PtrTarget, parentlink, typeOf,
-};
-
-thread_local! {
-    /// RPython `_membership = weakref.WeakValueDictionary()` keyed by the
-    /// struct container object. The translator keeps low-level containers for
-    /// the process lifetime, so a strong map keyed by `_struct.identity()` is
-    /// the equivalent Rust carrier.
-    static MEMBERSHIP: RefCell<HashMap<usize, group>> = RefCell::new(HashMap::new());
-}
+use std::sync::{Mutex, OnceLock};
 
 /// RPython `GroupType(lltype.ContainerType)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct GroupType;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupType {
+    pub _gckind: &'static str,
+}
 
 /// RPython `Group = GroupType()`.
-pub const Group: GroupType = GroupType;
+pub const Group: GroupType = GroupType { _gckind: "raw" };
 
-/// RPython `LONG_BIT == 32 ? 16 : 32`.
 #[cfg(target_pointer_width = "32")]
 pub const HALFSHIFT: u32 = 16;
-
-/// RPython `LONG_BIT == 32 ? 16 : 32`.
 #[cfg(not(target_pointer_width = "32"))]
 pub const HALFSHIFT: u32 = 32;
 
-/// RPython `HALFWORD = rffi.USHORT` on 32-bit and `rffi.UINT` on 64-bit.
+#[cfg(target_pointer_width = "32")]
+pub type HALFWORD = u16;
+#[cfg(not(target_pointer_width = "32"))]
+pub type HALFWORD = u32;
+
+#[cfg(target_pointer_width = "32")]
+pub type r_halfword = u16;
+#[cfg(not(target_pointer_width = "32"))]
+pub type r_halfword = u32;
+
+static NEXT_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_MEMBER_ID: AtomicUsize = AtomicUsize::new(1);
+static MEMBERSHIP: OnceLock<Mutex<majit_ir::VecMap<usize, GroupPtr>>> = OnceLock::new();
+static OUTDATED: OnceLock<Mutex<majit_ir::VecMap<usize, String>>> = OnceLock::new();
+
+fn membership() -> &'static Mutex<majit_ir::VecMap<usize, GroupPtr>> {
+    MEMBERSHIP.get_or_init(|| Mutex::new(majit_ir::VecMap::new()))
+}
+
+fn outdated() -> &'static Mutex<majit_ir::VecMap<usize, String>> {
+    OUTDATED.get_or_init(|| Mutex::new(majit_ir::VecMap::new()))
+}
+
+/// Stand-in for a raw struct pointer inserted into an llgroup.
 ///
-/// Pyre's lltype surface does not currently distinguish `USHORT` from
-/// `UINT`; both flow as an unsigned primitive until the rffi scalar family is
-/// split into width-specific low-level types.
-pub fn HALFWORD() -> LowLevelType {
-    LowLevelType::Unsigned
+/// RPython stores the actual lltype struct object. At this translator layer the
+/// object identity is all the group operations need, so the carrier keeps a
+/// stable id and debug name.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct GroupMember {
+    pub id: usize,
+    pub name: String,
+    pub parent_structure: Option<String>,
 }
 
-fn fresh_group_identity() -> usize {
-    static NEXT_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
-    NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
-}
+impl GroupMember {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: NEXT_MEMBER_ID.fetch_add(1, Ordering::Relaxed),
+            name: name.into(),
+            parent_structure: None,
+        }
+    }
 
-fn fresh_symbolic_identity() -> usize {
-    static NEXT_SYMBOLIC_ID: AtomicUsize = AtomicUsize::new(1);
-    NEXT_SYMBOLIC_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-#[derive(Debug)]
-struct GroupCore {
-    identity: usize,
-    name: String,
-    members: Mutex<Vec<_ptr>>,
-    outdated: Mutex<Option<String>>,
+    pub fn with_parent_structure(
+        name: impl Into<String>,
+        parent_structure: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: NEXT_MEMBER_ID.fetch_add(1, Ordering::Relaxed),
+            name: name.into(),
+            parent_structure: Some(parent_structure.into()),
+        }
+    }
 }
 
 /// RPython `class group(lltype._container)`.
-#[derive(Clone, Debug)]
-pub struct group(Arc<GroupCore>);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct group {
+    pub name: String,
+    pub members: Vec<GroupMember>,
+    pub outdated: Option<String>,
+    id: usize,
+}
 
 impl group {
+    pub const _TYPE: GroupType = Group;
+
     pub fn new(name: impl Into<String>) -> Self {
-        group(Arc::new(GroupCore {
-            identity: fresh_group_identity(),
+        Self {
             name: name.into(),
-            members: Mutex::new(Vec::new()),
-            outdated: Mutex::new(None),
-        }))
-    }
-
-    pub fn _TYPE(&self) -> GroupType {
-        Group
-    }
-
-    pub fn identity(&self) -> usize {
-        self.0.identity
-    }
-
-    pub fn name(&self) -> String {
-        self.0.name.clone()
-    }
-
-    pub fn outdated(&self) -> Option<String> {
-        self.0.outdated.lock().unwrap().clone()
-    }
-
-    pub fn members(&self) -> Vec<_ptr> {
-        self.0.members.lock().unwrap().clone()
-    }
-
-    /// RPython `group.add_member(self, structptr)`.
-    pub fn add_member(&self, structptr: &_ptr) -> Result<GroupMemberOffset, String> {
-        let TYPE = typeOf(structptr);
-        let PtrTarget::Struct(struct_t) = &TYPE.TO else {
-            return Err("group.add_member: expected pointer to Struct".to_string());
-        };
-        if struct_t._gckind != GcKind::Raw {
-            return Err("group.add_member: expected raw Struct".to_string());
+            members: Vec::new(),
+            outdated: None,
+            id: NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed),
         }
-        let struct_obj = match structptr
-            ._obj()
-            .map_err(|_| "delayed pointer".to_string())?
-        {
-            _ptr_obj::Struct(s) => s,
-            other => {
-                return Err(format!(
-                    "group.add_member: expected struct object, got {other:?}"
-                ));
+    }
+
+    pub fn add_member(&mut self, structptr: GroupMember) -> GroupMemberOffset {
+        let previous_group = membership()
+            .lock()
+            .expect("llgroup membership lock poisoned")
+            .get(&structptr.id)
+            .copied();
+        if let Some(previous_group) = previous_group {
+            let message = format!("structure {:?} was inserted into another group", structptr);
+            outdated()
+                .lock()
+                .expect("llgroup outdated lock poisoned")
+                .insert(previous_group.id, message.clone());
+            if let Some(prevgroup) = group_by_ptr_mut(previous_group, self) {
+                prevgroup.outdated = Some(message);
             }
-        };
-
-        if let Some(prevgroup) =
-            MEMBERSHIP.with(|m| m.borrow().get(&struct_obj.identity()).cloned())
-        {
-            *prevgroup.0.outdated.lock().unwrap() = Some(format!(
-                "structure {:?} was inserted into another group",
-                struct_obj
-            ));
         }
+        assert!(
+            structptr.parent_structure.is_none(),
+            "llgroup.py: struct._parentstructure() is not None"
+        );
+        let index = self.members.len();
+        self.members.push(structptr.clone());
+        membership()
+            .lock()
+            .expect("llgroup membership lock poisoned")
+            .insert(structptr.id, self._as_ptr());
+        GroupMemberOffset::new(self, index, structptr)
+    }
 
-        let (parent, _) = parentlink(&_ptr_obj::Struct(struct_obj.clone()));
-        if parent.is_some() {
-            return Err("group.add_member: expected a top-level structure".to_string());
-        }
+    pub fn _as_ptr(&self) -> GroupPtr {
+        GroupPtr { id: self.id }
+    }
 
-        let index = {
-            let mut members = self.0.members.lock().unwrap();
-            let index = members.len();
-            members.push(structptr.clone());
-            index
-        };
-        MEMBERSHIP.with(|m| {
-            m.borrow_mut().insert(struct_obj.identity(), self.clone());
-        });
-        Ok(GroupMemberOffset::new(self, index))
+    pub fn current_outdated(&self) -> Option<String> {
+        self.outdated.clone().or_else(|| {
+            outdated()
+                .lock()
+                .expect("llgroup outdated lock poisoned")
+                .get(&self.id)
+                .cloned()
+        })
     }
 }
 
-impl PartialEq for group {
-    fn eq(&self, other: &Self) -> bool {
-        self.identity() == other.identity()
+fn group_by_ptr_mut<'a>(ptr: GroupPtr, current: &'a mut group) -> Option<&'a mut group> {
+    if current._as_ptr() == ptr {
+        Some(current)
+    } else {
+        None
     }
 }
 
-impl Eq for group {}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct GroupPtr {
+    pub id: usize,
+}
 
 /// RPython `member_of_group(structptr)`.
-pub fn member_of_group(structptr: &_ptr) -> Option<group> {
-    let Ok(_ptr_obj::Struct(s)) = structptr._obj() else {
-        return None;
-    };
-    MEMBERSHIP.with(|m| m.borrow().get(&s.identity()).cloned())
+///
+/// RPython stores `_membership = weakref.WeakValueDictionary()`. Group members
+/// here are stable symbolic carriers, so a `VecMap` keyed by member identity is
+/// the direct dict-shaped counterpart without introducing a separate
+/// Rust-native collection.
+pub fn member_of_group(structptr: &GroupMember) -> Option<GroupPtr> {
+    membership()
+        .lock()
+        .expect("llgroup membership lock poisoned")
+        .get(&structptr.id)
+        .copied()
 }
 
-/// RPython `class GroupMemberOffset(llmemory.Symbolic)`.
-#[derive(Clone, Debug)]
+/// RPython `GroupMemberOffset(llmemory.Symbolic)`.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct GroupMemberOffset {
-    identity: usize,
-    pub grpptr: group,
+    pub grpptr: GroupPtr,
     pub index: usize,
-    pub member: _ptr,
+    pub member: GroupMember,
 }
 
 impl GroupMemberOffset {
-    pub fn new(grp: &group, memberindex: usize) -> Self {
-        let members = grp.0.members.lock().unwrap();
-        let member = members
-            .get(memberindex)
-            .unwrap_or_else(|| panic!("group member index out of range: {memberindex}"))
-            .clone();
-        GroupMemberOffset {
-            identity: fresh_symbolic_identity(),
-            grpptr: grp.clone(),
+    pub fn new(grp: &group, memberindex: usize, member: GroupMember) -> Self {
+        assert_eq!(grp._as_ptr(), GroupPtr { id: grp.id });
+        Self {
+            grpptr: grp._as_ptr(),
             index: memberindex,
             member,
         }
     }
 
-    pub fn annotation(&self) -> SomeValue {
-        SomeValue::Integer(SomeInteger::new_with_knowntype(false, KnownType::Ruint))
+    pub fn annotation(&self) -> &'static str {
+        "SomeInteger(knowntype=r_halfword)"
     }
 
-    pub fn lltype(&self) -> LowLevelType {
-        HALFWORD()
+    pub fn lltype(&self) -> &'static str {
+        "HALFWORD"
     }
 
-    pub fn nonzero(&self) -> bool {
-        true
+    pub fn _get_group_member(&self, grpptr: GroupPtr) -> &GroupMember {
+        assert_eq!(grpptr, self.grpptr, "get_group_member: wrong group!");
+        &self.member
     }
 
-    pub fn identity(&self) -> usize {
-        self.identity
-    }
-
-    pub fn _get_group_member(&self, grpptr: &group) -> Result<_ptr, String> {
-        if grpptr != &self.grpptr {
-            return Err("get_group_member: wrong group!".to_string());
-        }
-        Ok(self.member.clone())
-    }
-
-    pub fn _get_next_group_member(
+    pub fn _get_next_group_member<'a>(
         &self,
-        grpptr: &group,
-        skipoffset: &AddressOffset,
-    ) -> Result<_ptr, String> {
-        if grpptr != &self.grpptr {
-            return Err("get_next_group_member: wrong group!".to_string());
-        }
-        let AddressOffset::ItemOffset { TYPE, repeat } = skipoffset else {
-            return Err("get_next_group_member: expected ItemOffset".to_string());
-        };
-        let member_type = typeOf(&self.member).TO.into();
-        if TYPE != &member_type || *repeat != 1 {
-            return Err("get_next_group_member: wrong skipoffset".to_string());
-        }
-        let members = self.grpptr.0.members.lock().unwrap();
-        members
-            .get(self.index + 1)
-            .cloned()
-            .ok_or_else(|| "get_next_group_member: no following member".to_string())
+        grpptr: GroupPtr,
+        members: &'a [GroupMember],
+    ) -> &'a GroupMember {
+        assert_eq!(grpptr, self.grpptr, "get_next_group_member: wrong group!");
+        &members[self.index + 1]
     }
 }
 
-impl PartialEq for GroupMemberOffset {
-    fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
+impl fmt::Display for GroupMemberOffset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GroupMemberOffset({:?}, {})", self.grpptr, self.index)
     }
 }
 
-impl Eq for GroupMemberOffset {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CombinedLowPart {
-    Int(u64),
-    GroupMemberOffset(GroupMemberOffset),
+/// RPython `CombinedSymbolic(llmemory.Symbolic)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CombinedSymbolic<L = GroupMemberOffset> {
+    pub lowpart: L,
+    pub rest: u64,
 }
 
-impl CombinedLowPart {
-    fn identity(&self) -> usize {
-        match self {
-            CombinedLowPart::Int(value) => *value as usize,
-            CombinedLowPart::GroupMemberOffset(offset) => offset.identity(),
-        }
-    }
-}
+impl<L> CombinedSymbolic<L> {
+    pub const MASK: u64 = (1u64 << HALFSHIFT) - 1;
 
-impl From<u64> for CombinedLowPart {
-    fn from(value: u64) -> Self {
-        CombinedLowPart::Int(value)
-    }
-}
-
-impl From<GroupMemberOffset> for CombinedLowPart {
-    fn from(value: GroupMemberOffset) -> Self {
-        CombinedLowPart::GroupMemberOffset(value)
-    }
-}
-
-/// RPython `class CombinedSymbolic(llmemory.Symbolic)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CombinedSymbolic {
-    pub lowpart: CombinedLowPart,
-    pub rest: i64,
-}
-
-impl CombinedSymbolic {
-    pub const MASK: i64 = (1_i64 << HALFSHIFT) - 1;
-
-    pub fn new(lowpart: impl Into<CombinedLowPart>, rest: i64) -> Self {
+    pub fn new(lowpart: L, rest: u64) -> Self {
         assert_eq!(rest & Self::MASK, 0);
-        CombinedSymbolic {
-            lowpart: lowpart.into(),
-            rest,
-        }
+        Self { lowpart, rest }
     }
 
-    pub fn annotation(&self) -> SomeValue {
-        SomeValue::Integer(SomeInteger::default())
+    pub fn annotation(&self) -> &'static str {
+        "SomeInteger()"
     }
 
-    pub fn lltype(&self) -> LowLevelType {
-        LowLevelType::Signed
+    pub fn lltype(&self) -> &'static str {
+        "Signed"
     }
+}
 
-    pub fn nonzero(&self) -> bool {
-        true
+impl<L: fmt::Debug> fmt::Display for CombinedSymbolic<L> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<CombinedSymbolic {:?}|{}>", self.lowpart, self.rest)
     }
+}
 
-    pub fn bitand(&self, other: i64) -> Result<CombinedAndResult, String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CombinedAnd<L = GroupMemberOffset> {
+    Rest(u64),
+    Combined(CombinedSymbolic<L>),
+}
+
+impl<L: Clone> BitAnd<u64> for CombinedSymbolic<L> {
+    type Output = CombinedAnd<L>;
+
+    fn bitand(self, other: u64) -> Self::Output {
         if (other & Self::MASK) == 0 {
-            return Ok(CombinedAndResult::Int(self.rest & other));
+            return CombinedAnd::Rest(self.rest & other);
         }
         if (other & Self::MASK) == Self::MASK {
-            return Ok(CombinedAndResult::Combined(CombinedSymbolic::new(
-                self.lowpart.clone(),
-                self.rest & other,
-            )));
+            return CombinedAnd::Combined(CombinedSymbolic::new(self.lowpart, self.rest & other));
         }
-        Err(format!("other=0x{other:x}"))
+        panic!("other=0x{other:x}");
     }
+}
 
-    pub fn bitor(&self, other: i64) -> Self {
+impl<L> BitOr<u64> for CombinedSymbolic<L> {
+    type Output = CombinedSymbolic<L>;
+
+    fn bitor(self, other: u64) -> Self::Output {
         assert_eq!(other & Self::MASK, 0);
-        CombinedSymbolic::new(self.lowpart.clone(), self.rest | other)
+        CombinedSymbolic::new(self.lowpart, self.rest | other)
     }
+}
 
-    pub fn add(&self, other: i64) -> Self {
+impl<L> Add<u64> for CombinedSymbolic<L> {
+    type Output = CombinedSymbolic<L>;
+
+    fn add(self, other: u64) -> Self::Output {
         assert_eq!(other & Self::MASK, 0);
-        CombinedSymbolic::new(self.lowpart.clone(), self.rest + other)
+        CombinedSymbolic::new(self.lowpart, self.rest + other)
     }
+}
 
-    pub fn sub(&self, other: i64) -> Self {
+impl<L> Sub<u64> for CombinedSymbolic<L> {
+    type Output = CombinedSymbolic<L>;
+
+    fn sub(self, other: u64) -> Self::Output {
         assert_eq!(other & Self::MASK, 0);
-        CombinedSymbolic::new(self.lowpart.clone(), self.rest - other)
+        CombinedSymbolic::new(self.lowpart, self.rest - other)
     }
+}
 
-    pub fn rshift(&self, other: u32) -> i64 {
+impl<L> Shr<u32> for CombinedSymbolic<L> {
+    type Output = u64;
+
+    fn shr(self, other: u32) -> Self::Output {
         assert!(other >= HALFSHIFT);
         self.rest >> other
     }
-
-    pub fn eq_same_lowpart(&self, other: &CombinedSymbolic) -> Option<bool> {
-        if self.lowpart.identity() == other.lowpart.identity() {
-            Some(self.rest == other.rest)
-        } else {
-            None
-        }
-    }
-
-    pub fn ne_same_lowpart(&self, other: &CombinedSymbolic) -> Option<bool> {
-        self.eq_same_lowpart(other).map(|same| !same)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CombinedAndResult {
-    Int(i64),
-    Combined(CombinedSymbolic),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::rtyper::lltypesystem::lltype::{
-        LowLevelType, MallocFlavor, StructType, malloc,
-    };
-
-    fn raw_struct_ptr(name: &str) -> _ptr {
-        malloc(
-            LowLevelType::Struct(Box::new(StructType::new(
-                name,
-                vec![("x".into(), LowLevelType::Signed)],
-            ))),
-            None,
-            MallocFlavor::Raw,
-            false,
-        )
-        .unwrap()
-    }
 
     #[test]
-    fn add_member_records_membership_and_offsets() {
-        let grp = group::new("test");
-        let first = raw_struct_ptr("A");
-        let second = raw_struct_ptr("B");
-
-        let first_offset = grp.add_member(&first).unwrap();
-        let second_offset = grp.add_member(&second).unwrap();
-
-        assert_eq!(first_offset.index, 0);
-        assert_eq!(second_offset.index, 1);
-        assert_eq!(member_of_group(&first), Some(grp.clone()));
-        assert_eq!(first_offset._get_group_member(&grp).unwrap(), first);
-
-        let skip = AddressOffset::ItemOffset {
-            TYPE: typeOf(&first).TO.into(),
-            repeat: 1,
-        };
+    fn test_group_member_offset() {
+        let mut grp = group::new("grp");
+        let first = GroupMember::new("first");
+        let second = GroupMember::new("second");
+        let offset = grp.add_member(first.clone());
+        grp.add_member(second.clone());
+        assert_eq!(member_of_group(&first), Some(grp._as_ptr()));
+        assert_eq!(offset._get_group_member(grp._as_ptr()), &first);
         assert_eq!(
-            first_offset._get_next_group_member(&grp, &skip).unwrap(),
-            second
+            offset._get_next_group_member(grp._as_ptr(), &grp.members),
+            &second
         );
     }
 
     #[test]
-    fn add_member_rejects_gc_structs() {
-        let grp = group::new("test");
-        let gc_ptr = malloc(
-            LowLevelType::Struct(Box::new(StructType::gc(
-                "G",
-                vec![("x".into(), LowLevelType::Signed)],
-            ))),
-            None,
-            MallocFlavor::Gc,
-            false,
-        )
-        .unwrap();
+    fn add_member_marks_previous_group_outdated() {
+        let mut grp1 = group::new("grp1");
+        let mut grp2 = group::new("grp2");
+        let member = GroupMember::new("moved-member");
 
-        let err = grp.add_member(&gc_ptr).unwrap_err();
-        assert!(err.contains("raw Struct"));
-    }
+        grp1.add_member(member.clone());
+        grp2.add_member(member.clone());
 
-    #[test]
-    fn reinserting_member_marks_previous_group_outdated() {
-        let first_group = group::new("first");
-        let second_group = group::new("second");
-        let ptr = raw_struct_ptr("A");
-
-        first_group.add_member(&ptr).unwrap();
-        second_group.add_member(&ptr).unwrap();
-
+        assert_eq!(member_of_group(&member), Some(grp2._as_ptr()));
         assert!(
-            first_group
-                .outdated()
-                .unwrap()
-                .contains("was inserted into another group")
+            grp1.current_outdated()
+                .expect("previous group should be marked outdated")
+                .contains("inserted into another group")
         );
-        assert_eq!(member_of_group(&ptr), Some(second_group));
     }
 
     #[test]
-    fn combined_symbolic_matches_upstream_operations() {
-        let grp = group::new("test");
-        let offset = grp.add_member(&raw_struct_ptr("A")).unwrap();
-        let symbolic = CombinedSymbolic::new(offset.clone(), 1_i64 << HALFSHIFT);
+    fn add_member_rejects_nested_struct_member() {
+        let mut grp = group::new("grp");
+        let nested = GroupMember::with_parent_structure("nested", "parent");
 
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            grp.add_member(nested);
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_combined_symbolic() {
+        let lowpart = GroupMemberOffset {
+            grpptr: GroupPtr { id: 1 },
+            index: 1,
+            member: GroupMember::new("member"),
+        };
+        let symbolic = CombinedSymbolic::new(lowpart.clone(), 0x45u64 << HALFSHIFT);
         assert_eq!(
-            symbolic.bitand(!CombinedSymbolic::MASK).unwrap(),
-            CombinedAndResult::Int(1_i64 << HALFSHIFT)
+            symbolic.clone() & CombinedSymbolic::<GroupMemberOffset>::MASK,
+            CombinedAnd::Combined(CombinedSymbolic::new(lowpart.clone(), 0))
         );
         assert_eq!(
-            symbolic.bitand(CombinedSymbolic::MASK).unwrap(),
-            CombinedAndResult::Combined(CombinedSymbolic::new(offset.clone(), 0))
+            symbolic.clone() & !CombinedSymbolic::<GroupMemberOffset>::MASK,
+            CombinedAnd::Rest(0x45u64 << HALFSHIFT)
         );
-        assert_eq!(symbolic.bitor(2_i64 << HALFSHIFT).rest, 3_i64 << HALFSHIFT);
-        assert_eq!(symbolic.add(2_i64 << HALFSHIFT).rest, 3_i64 << HALFSHIFT);
-        assert_eq!(symbolic.sub(1_i64 << HALFSHIFT).rest, 0);
-        assert_eq!(symbolic.rshift(HALFSHIFT), 1);
-
-        let same_lowpart = CombinedSymbolic::new(offset, 1_i64 << HALFSHIFT);
-        let other_lowpart = CombinedSymbolic::new(0_u64, 1_i64 << HALFSHIFT);
-        assert_eq!(symbolic.eq_same_lowpart(&same_lowpart), Some(true));
-        assert_eq!(symbolic.eq_same_lowpart(&other_lowpart), None);
+        assert_eq!(
+            (symbolic.clone() | (0x01u64 << HALFSHIFT)).rest,
+            0x45u64 << HALFSHIFT
+        );
+        assert_eq!((symbolic >> HALFSHIFT), 0x45);
     }
 }

@@ -88,9 +88,9 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// resume.py:137/370: RPython uses `dict` keyed by the actual Box object
 /// (object `is` identity). In Python 3 that dict is insertion-ordered, and
 /// `_number_virtuals` iterates it directly. #160/S11 keys this map by the
-/// canonical [`BoxRef`](crate::r#box::BoxRef) (`Rc::ptr_eq` = PyPy `box is
+/// canonical [`BoxRef`](majit_ir::box_ref::BoxRef) (`Rc::ptr_eq` = PyPy `box is
 /// box`), the faithful port of the dict-by-`is`; the no-HashMap house rule
-/// keeps the `VecAssoc` backing (linear scan, dict-assignment semantics,
+/// keeps the `VecMap` backing (linear scan, dict-assignment semantics,
 /// preserved insertion order). Two reaches of one logical box resolve to one
 /// memoized Rc (via `from_bound_op`/`from_bound_inputarg`) and collapse to one
 /// key; distinct boxes — e.g. an `InputArg` vs a `ResOp` result — stay
@@ -105,25 +105,25 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: majit_ir::vec_assoc::VecAssoc<majit_ir::operand::Operand, i16>,
+    entries: majit_ir::VecMap<majit_ir::operand::Operand, i16>,
 }
 
 impl LiveboxMap {
     pub fn new() -> Self {
         Self {
-            entries: majit_ir::vec_assoc::VecAssoc::new(),
+            entries: majit_ir::VecMap::new(),
         }
     }
 
     #[inline(always)]
-    pub fn get(&self, b: &crate::r#box::BoxRef) -> Option<i16> {
+    pub fn get(&self, b: &majit_ir::box_ref::BoxRef) -> Option<i16> {
         self.entries
             .get(&majit_ir::operand::Operand::from_boxref(b))
             .copied()
     }
 
     #[inline(always)]
-    pub fn insert(&mut self, b: crate::r#box::BoxRef, value: i16) {
+    pub fn insert(&mut self, b: majit_ir::box_ref::BoxRef, value: i16) {
         debug_assert!(
             b.const_value().is_none(),
             "LiveboxMap::insert: Const box {b:?} violates resume.py:204-223 \
@@ -135,14 +135,14 @@ impl LiveboxMap {
     }
 
     #[inline(always)]
-    pub fn contains_key(&self, b: &crate::r#box::BoxRef) -> bool {
+    pub fn contains_key(&self, b: &majit_ir::box_ref::BoxRef) -> bool {
         self.entries
             .contains_key(&majit_ir::operand::Operand::from_boxref(b))
     }
 
     /// Iterate over all (canonical box, tag) pairs in RPython dict insertion
     /// order (Rc::ptr_eq identity = PyPy `box is box`).
-    pub fn iter(&self) -> impl Iterator<Item = (crate::r#box::BoxRef, i16)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (majit_ir::box_ref::BoxRef, i16)> + '_ {
         self.entries.iter().map(|(op, v)| (op.to_boxref(), *v))
     }
 }
@@ -169,7 +169,7 @@ pub struct NumberingState {
     /// raw u32 — pyre's flat-OpRef stand-in for PyPy's `box is box`
     /// identity. See `LiveboxMap` (resume.rs:98) for the matching
     /// typed-key convention.
-    pub livebox_types: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::OpRef, majit_ir::Type>,
+    pub livebox_types: majit_ir::VecMap<majit_ir::OpRef, majit_ir::Type>,
 }
 
 impl NumberingState {
@@ -179,7 +179,7 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
-            livebox_types: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            livebox_types: majit_ir::VecMap::new(),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -408,28 +408,26 @@ pub use majit_ir::BoxEnv;
 /// Simple BoxEnv implementation backed by constant/type associative containers.
 /// Used in tests and for simple snapshot numbering.
 pub struct SimpleBoxEnv {
-    pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)>,
-    pub replacements: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::OpRef>,
-    pub types: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
+    pub constants: majit_ir::VecMap<u32, (i64, majit_ir::Type)>,
+    pub replacements: majit_ir::VecMap<u32, majit_ir::OpRef>,
+    pub types: majit_ir::VecMap<u32, majit_ir::Type>,
     pub virtuals: majit_ir::vec_set::VecSet<u32>,
-    pub virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::VirtualFieldsInfo>,
+    pub virtual_fields: majit_ir::VecMap<u32, majit_ir::VirtualFieldsInfo>,
     /// #160/S11: one canonical BoxRef per replacement-walked OpRef. This env
     /// holds no producer Ops, so it memoizes here to give `Rc::ptr_eq` dedup
     /// parity with production (where `from_bound_op` memoizes on the Op).
-    box_cache: std::cell::RefCell<
-        crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::OpRef, crate::r#box::BoxRef>,
-    >,
+    box_cache: std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, majit_ir::box_ref::BoxRef>>,
 }
 
 impl SimpleBoxEnv {
     pub fn new() -> Self {
         SimpleBoxEnv {
-            constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            replacements: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            types: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            constants: majit_ir::VecMap::new(),
+            replacements: majit_ir::VecMap::new(),
+            types: majit_ir::VecMap::new(),
             virtuals: majit_ir::vec_set::VecSet::new(),
-            virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            box_cache: std::cell::RefCell::new(crate::optimizeopt::vec_assoc::VecAssoc::new()),
+            virtual_fields: majit_ir::VecMap::new(),
+            box_cache: std::cell::RefCell::new(majit_ir::VecMap::new()),
         }
     }
 }
@@ -455,7 +453,7 @@ impl BoxEnv for SimpleBoxEnv {
         opref
     }
 
-    fn get_box_replacement_boxref(&self, opref: majit_ir::OpRef) -> crate::r#box::BoxRef {
+    fn get_box_replacement_boxref(&self, opref: majit_ir::OpRef) -> majit_ir::box_ref::BoxRef {
         // #160/S11: no producer Ops here, so memoize one BoxRef per
         // replacement-walked OpRef to mirror production's from_bound_op
         // memoization — two reaches of one logical box share an Rc (ptr_eq).
@@ -468,9 +466,9 @@ impl BoxEnv for SimpleBoxEnv {
         // keyed liveboxes/cached maps reject a position-only box). The method
         // is never reached in non-test builds, where `from_opref` is retained.
         #[cfg(test)]
-        let b = crate::r#box::test_support::rooted_box_from_opref(root);
+        let b = crate::history::test_support::rooted_box_from_opref(root);
         #[cfg(not(test))]
-        let b = crate::r#box::BoxRef::from_opref(root);
+        let b = majit_ir::box_ref::BoxRef::from_opref(root);
         self.box_cache.borrow_mut().insert(root, b.clone());
         b
     }
@@ -2003,8 +2001,7 @@ impl EncodedResumeData {
         let mut rd_numb = Vec::new();
         // resume.py:138 numb_state.liveboxes — compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut box_map: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
 
         // resume.py:234-235: reserve slots for items_resume_section and count.
         rd_numb.push(0); // [0] = items_resume_section (patched later)
@@ -3180,15 +3177,15 @@ pub struct ResumeDataLoopMemo {
     /// We store (value, type) pairs to preserve type information.
     consts: Vec<majit_ir::Const>,
     /// resume.py:148 — large integers (outside TAGINT range) → tagged const.
-    large_ints: crate::optimizeopt::vec_assoc::VecAssoc<i64, i16>,
+    large_ints: majit_ir::VecMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
-    refs: crate::optimizeopt::vec_assoc::VecAssoc<i64, i16>,
+    refs: majit_ir::VecMap<i64, i16>,
     /// resume.py:147 self.consts — constant pool for encode_shared.
     /// Becomes storage.rd_consts (resume.py:467).
     ///
     /// resume.py:150-151 — cached box/virtual numbering.
-    pub cached_boxes: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, i32>,
-    pub cached_virtuals: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, i32>,
+    pub cached_boxes: majit_ir::VecMap<majit_ir::operand::Operand, i32>,
+    pub cached_virtuals: majit_ir::VecMap<majit_ir::operand::Operand, i32>,
     /// resume.py:153-155 — statistics.
     pub nvirtuals: usize,
     pub nvholes: usize,
@@ -3199,10 +3196,10 @@ impl ResumeDataLoopMemo {
     pub fn new() -> Self {
         ResumeDataLoopMemo {
             consts: Vec::new(),
-            large_ints: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            cached_boxes: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            cached_virtuals: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            large_ints: majit_ir::VecMap::new(),
+            refs: majit_ir::VecMap::new(),
+            cached_boxes: majit_ir::VecMap::new(),
+            cached_virtuals: majit_ir::VecMap::new(),
             nvirtuals: 0,
             nvholes: 0,
             nvreused: 0,
@@ -3222,7 +3219,7 @@ impl ResumeDataLoopMemo {
         &mut self,
         source: &ResumeValueSource,
         liveboxes: &mut Vec<usize>,
-        box_map: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, usize>,
+        box_map: &mut majit_ir::VecMap<usize, usize>,
     ) -> i64 {
         match source {
             // resume.py:214-224: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
@@ -3370,7 +3367,7 @@ impl ResumeDataLoopMemo {
     /// - new: `boxes.append(box); num = -len(boxes)`
     pub fn assign_number_to_box(
         &mut self,
-        b: &crate::r#box::BoxRef,
+        b: &majit_ir::box_ref::BoxRef,
         boxes: &mut Vec<OpRef>,
     ) -> i32 {
         if let Some(&num) = self
@@ -3396,7 +3393,7 @@ impl ResumeDataLoopMemo {
     /// RPython's `new_liveboxes = [None] * memo.num_cached_boxes()`.
     pub fn assign_number_to_box_opt(
         &mut self,
-        b: &crate::r#box::BoxRef,
+        b: &majit_ir::box_ref::BoxRef,
         boxes: &mut Vec<Option<OpRef>>,
     ) -> i32 {
         if let Some(&num) = self
@@ -3417,7 +3414,7 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py:278 assign_number_to_virtual — returns a negative number.
-    pub fn assign_number_to_virtual(&mut self, b: &crate::r#box::BoxRef) -> i32 {
+    pub fn assign_number_to_virtual(&mut self, b: &majit_ir::box_ref::BoxRef) -> i32 {
         if let Some(&num) = self
             .cached_virtuals
             .get(&majit_ir::operand::Operand::from_boxref(b))
@@ -3538,10 +3535,7 @@ impl ResumeDataLoopMemo {
         &mut self,
         liveboxes: &mut Vec<Option<majit_ir::OpRef>>,
         new_liveboxes: &mut LiveboxMap,
-        virtual_fields: &crate::optimizeopt::vec_assoc::VecAssoc<
-            majit_ir::OpRef,
-            majit_ir::VirtualFieldsInfo,
-        >,
+        virtual_fields: &majit_ir::VecMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
         num_env_virtuals: usize,
         numb_state: &NumberingState,
         env: &dyn majit_ir::BoxEnv,
@@ -3554,7 +3548,7 @@ impl ResumeDataLoopMemo {
         // each entry was inserted with so virtual numbering preserves
         // `box.type` (history.py:220).
         // #160/S11: new_liveboxes.iter() yields the canonical box directly.
-        let keys: Vec<(crate::r#box::BoxRef, i16)> = new_liveboxes.iter().collect();
+        let keys: Vec<(majit_ir::box_ref::BoxRef, i16)> = new_liveboxes.iter().collect();
         for (box_id, tagged) in keys {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
@@ -4039,7 +4033,7 @@ impl ResumeDataLoopMemo {
         Vec<majit_ir::Const>,
         Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
         Vec<majit_ir::OpRef>,
-        crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::OpRef, majit_ir::Type>,
+        majit_ir::VecMap<majit_ir::OpRef, majit_ir::Type>,
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 
@@ -4052,7 +4046,7 @@ impl ResumeDataLoopMemo {
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual
         // fields. RPython walks the dict in insertion order; pyre's
-        // `LiveboxMap` is built on `VecAssoc` (resume.rs:98) so the
+        // `LiveboxMap` is built on `VecMap` (resume.rs:98) so the
         // `.iter()` sequence already matches that order, which the
         // virtual worklist drain below relies on for byte-identical
         // visitor_walk_recursive sequencing. Sorting by tag would
@@ -4070,10 +4064,8 @@ impl ResumeDataLoopMemo {
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
         // typed OpRef so the same_box (resoperation.py:38) identity is
         // preserved end-to-end through the worklist drain.
-        let mut virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc<
-            majit_ir::OpRef,
-            majit_ir::VirtualFieldsInfo,
-        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut virtual_fields: majit_ir::VecMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> =
+            majit_ir::VecMap::new();
 
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
         let mut virtual_worklist: Vec<majit_ir::OpRef> = Vec::new();
@@ -4318,8 +4310,7 @@ impl ResumeDataLoopMemo {
         let mut rd_numb = Vec::new();
         // resume.py:138 compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut box_map: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
 
         // resume.py:234-235: reserve slots
         rd_numb.push(0); // [0] = items_resume_section
@@ -4622,8 +4613,8 @@ mod tests {
         // Under ptr_eq keying they stay distinct keys (PyPy `box is box`),
         // never collapsed by a shared raw slot index.
         let input =
-            crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
-        let op = crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0));
+            crate::history::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
+        let op = crate::history::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0));
 
         liveboxes.insert(input.clone(), UNASSIGNED);
         liveboxes.insert(op.clone(), UNASSIGNEDVIRTUAL);
@@ -4950,28 +4941,24 @@ mod tests {
     fn test_number_boxes_uses_replacement_type_for_virtual_classification() {
         use majit_ir::OpRef;
         struct RefOnlyVirtualEnv {
-            constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)>,
-            replacements: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::OpRef>,
-            types: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
+            constants: majit_ir::VecMap<u32, (i64, majit_ir::Type)>,
+            replacements: majit_ir::VecMap<u32, majit_ir::OpRef>,
+            types: majit_ir::VecMap<u32, majit_ir::Type>,
             virtuals: majit_ir::vec_set::VecSet<u32>,
-            virtual_fields:
-                crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::VirtualFieldsInfo>,
-            box_cache: std::cell::RefCell<
-                crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::OpRef, crate::r#box::BoxRef>,
-            >,
+            virtual_fields: majit_ir::VecMap<u32, majit_ir::VirtualFieldsInfo>,
+            box_cache:
+                std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, majit_ir::box_ref::BoxRef>>,
         }
 
         impl RefOnlyVirtualEnv {
             fn new() -> Self {
                 Self {
-                    constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                    replacements: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                    types: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                    constants: majit_ir::VecMap::new(),
+                    replacements: majit_ir::VecMap::new(),
+                    types: majit_ir::VecMap::new(),
                     virtuals: majit_ir::vec_set::VecSet::new(),
-                    virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                    box_cache: std::cell::RefCell::new(
-                        crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                    ),
+                    virtual_fields: majit_ir::VecMap::new(),
+                    box_cache: std::cell::RefCell::new(majit_ir::VecMap::new()),
                 }
             }
         }
@@ -4984,7 +4971,10 @@ mod tests {
                     .unwrap_or(opref)
             }
 
-            fn get_box_replacement_boxref(&self, opref: majit_ir::OpRef) -> crate::r#box::BoxRef {
+            fn get_box_replacement_boxref(
+                &self,
+                opref: majit_ir::OpRef,
+            ) -> majit_ir::box_ref::BoxRef {
                 // #160/S11: memoize one BoxRef per replacement-walked OpRef.
                 let root = self.get_box_replacement(opref);
                 if let Some(b) = self.box_cache.borrow().get(&root) {
@@ -4992,7 +4982,7 @@ mod tests {
                 }
                 // Synthesize a rooted bound producer so the box sheds to
                 // `Operand::Op`/`InputArg` for the Operand-keyed liveboxes map.
-                let b = crate::r#box::test_support::rooted_box_from_opref(root);
+                let b = crate::history::test_support::rooted_box_from_opref(root);
                 self.box_cache.borrow_mut().insert(root, b.clone());
                 b
             }

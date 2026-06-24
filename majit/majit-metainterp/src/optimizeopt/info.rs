@@ -1,11 +1,13 @@
+use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
+pub use crate::optimizeopt::rawbuffer::{
+    InvalidRawOperation, InvalidRawRead, InvalidRawWrite, RawBuffer,
+};
 /// Abstract information attached to operations during optimization.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use crate::r#box::BoxRef;
-use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
-pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
+use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
@@ -14,7 +16,7 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 }
 
 pub use majit_ir::field_entry::{FieldEntry, PreambleOp};
-pub use majit_ir::op_info::OpInfo;
+pub use majit_ir::op_info::{EmptyInfo, FloatConstInfo, OpInfo};
 pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::ptr_info::{PtrInfo, StrPtrInfo};
 
@@ -59,7 +61,7 @@ pub enum EnsuredPtrInfo {
     /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
     /// `as_mut()` call re-borrows the inner `RefCell`. Produced when the
     /// opref resolves to a bound `Op`/`InputArg`.
-    ForwardedBox(crate::r#box::BoxRef),
+    ForwardedBox(majit_ir::box_ref::BoxRef),
 }
 
 impl EnsuredPtrInfo {
@@ -132,7 +134,7 @@ impl EnsuredPtrInfo {
     /// clone of the live `Rc<RefCell<PtrInfo>>` cell and an exclusive
     /// `RefCell` borrow — drop it before any sibling write to the same
     /// box's `_forwarded` slot.
-    pub fn as_mut(&mut self) -> Option<crate::r#box::PtrInfoBorrowMut> {
+    pub fn as_mut(&mut self) -> Option<majit_ir::box_ref::PtrInfoBorrowMut> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
             EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut(),
@@ -1337,7 +1339,7 @@ fn force_box_impl(
             // installs `nonnull()` instead — a PRE-EXISTING-ADAPTATION: the
             // RawSlice force keeps identity via a `parent = none` sentinel
             // (see below), but a non-virtual RawBuffer would need a size=-1
-            // sentinel on `VirtualRawBufferInfo` AND an `is_virtual()` gate at
+            // sentinel on `RawBufferPtrInfo` AND an `is_virtual()` gate at
             // every `matches!(PtrInfo::VirtualRawBuffer(_))` site in
             // virtualize.rs (1232/1261/1269/…), which currently assume virtual
             // and would re-virtualize a forced buffer. Raw buffers are absent
@@ -1404,7 +1406,7 @@ fn force_box_impl(
             // The info class stays RawSlicePtrInfo so subsequent
             // `getrawptrinfo` lookups still identify it as a raw slice.
             //
-            // pyre's `VirtualRawSliceInfo` stores `parent: OpRef`; the
+            // pyre's `RawSlicePtrInfo` stores `parent: OpRef`; the
             // `OpRef::NONE` sentinel plays the role of `None`, and
             // `PtrInfo::is_virtual` gates on `slice.parent.is_none()`.
             // Overwriting with `PtrInfo::nonnull()` would lose the
@@ -1430,7 +1432,7 @@ fn force_box_impl(
             if let Some(b) = ctx.get_box_replacement_box(new_ref) {
                 ctx.set_ptr_info(
                     &b,
-                    PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+                    PtrInfo::VirtualRawSlice(RawSlicePtrInfo {
                         offset: slice.offset,
                         parent: BoxRef::none(),
                         last_guard_pos: slice.last_guard_pos,
@@ -1638,9 +1640,9 @@ fn force_box_impl(
 /// mutability so the immutable-receiver accessor can populate the
 /// cache on first miss.
 pub use majit_ir::ptr_info::{
-    AbstractVirtualPtrInfo, ArrayPtrInfo, InstancePtrInfo, StructPtrInfo, VirtualArrayInfo,
-    VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo, VirtualRawSliceInfo,
-    VirtualStructInfo, VirtualizableFieldState,
+    AbstractVirtualPtrInfo, ArrayPtrInfo, ArrayStructInfo, InstancePtrInfo, RawBufferPtrInfo,
+    RawSlicePtrInfo, StructPtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
+    VirtualizableFieldState,
 };
 
 #[cfg(test)]
@@ -1975,7 +1977,7 @@ mod tests {
             OpCode::GetarrayitemGcI,
             &[
                 majit_ir::operand::Operand::from_boxref(
-                    &crate::r#box::test_support::rooted_resop_box(Type::Int, 10),
+                    &crate::history::test_support::rooted_resop_box(Type::Int, 10),
                 ),
                 majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(0))),
             ],
@@ -2010,7 +2012,7 @@ mod tests {
         let replay = Op::new(
             OpCode::GetfieldGcI,
             &[majit_ir::operand::Operand::from_boxref(
-                &crate::r#box::test_support::rooted_resop_box(Type::Int, 10),
+                &crate::history::test_support::rooted_resop_box(Type::Int, 10),
             )],
         );
         let pop = PreambleOp {
@@ -2061,7 +2063,7 @@ mod tests {
 
     #[test]
     fn test_opinfo_float_const() {
-        let info = OpInfo::FloatConst(3.14);
+        let info = OpInfo::FloatConstInfo(FloatConstInfo::new(3.14));
         assert!(info.is_constant());
         assert_eq!(info.get_constant_float(), Some(3.14));
     }

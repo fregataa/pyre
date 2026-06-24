@@ -306,7 +306,13 @@ def stamp_for(
 
 def extract(args: argparse.Namespace) -> None:
     root = repo_root()
-    cargo_features = os.environ.get("CARGO_FEATURES", "cranelift")
+    # Default to `dynasm`, matching the default binary backend (`pyrex`/
+    # `pyre-jit` both default to `dynasm`). The ULLBC that
+    # feeds trace codegen is backend-agnostic — `dynasm` and `cranelift`
+    # extraction of `pyre-interpreter` yield byte-identical generated code — so
+    # the lighter backend skips compiling the cranelift-codegen tree (~33
+    # crates) the dynasm build never needs.
+    cargo_features = os.environ.get("CARGO_FEATURES", "dynasm")
     platform_key, charon_dest, charon_bin = charon_paths(root)
 
     if not charon_bin.exists():
@@ -323,6 +329,13 @@ def extract(args: argparse.Namespace) -> None:
     crate_attr = "-Zcrate-attr=feature(cfg_select)"
     env["RUSTC_BOOTSTRAP"] = "1"
     env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " " + crate_attr).strip()
+    # Charon reads MIR straight from rustc; the compiled binary is discarded
+    # and only the `.ullbc` is kept, so debuginfo is dead weight here. Drop it
+    # to skip DWARF generation across the whole extraction graph. The nightly
+    # extraction build fingerprints separately from the stable build (distinct
+    # rustc), so this never thrashes the runtime build's cache, and the LLBC is
+    # independent of debuginfo so the artefact is byte-identical.
+    env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
     env["CARGO_UNSTABLE_HOST_CONFIG"] = "true"
     env["CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST"] = "true"
     host_config = [
@@ -423,7 +436,7 @@ def main() -> None:
 
     root = repo_root()
     crates = args.crates or DEFAULT_CRATES
-    cargo_features = os.environ.get("CARGO_FEATURES", "cranelift")
+    cargo_features = os.environ.get("CARGO_FEATURES", "dynasm")
     if args.list_inputs:
         for path in fingerprint_inputs(root, crates, cargo_features):
             print(path.as_posix())

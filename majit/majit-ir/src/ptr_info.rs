@@ -10,7 +10,7 @@
 use crate::box_ref::BoxRef;
 use crate::field_entry::{FieldEntry, PreambleOp};
 use crate::intbound::IntBound;
-use crate::rawbuffer::{RawBuffer, RawBufferError};
+use crate::rawbuffer::{InvalidRawOperation, RawBuffer};
 use crate::{DescrRef, GcRef, Op, OpCode, OpRef, RdVirtualInfo, Type};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
@@ -273,7 +273,7 @@ pub struct VirtualStructInfo {
 /// is a fixed-size struct with named fields. Used for RPython arrays
 /// with complex item types (e.g., hash table entries with key+value fields).
 #[derive(Clone, Debug)]
-pub struct VirtualArrayStructInfo {
+pub struct ArrayStructInfo {
     /// The array descriptor (arraydescr).
     pub descr: DescrRef,
     /// Per-element fields: outer Vec = elements, inner Vec = (field_descr_index, value_opref).
@@ -294,7 +294,7 @@ pub struct VirtualArrayStructInfo {
 /// Reads / writes through a slice add `offset` to the requested byte
 /// offset and forward to the parent buffer.
 #[derive(Clone, Debug)]
-pub struct VirtualRawSliceInfo {
+pub struct RawSlicePtrInfo {
     /// Slice offset relative to the parent buffer's base. Signed because
     /// `info.py:460 RawSlicePtrInfo.__init__(offset, parent)` accepts an
     /// unbounded RPython int — `optimize_INT_ADD` folds the addend as a
@@ -303,7 +303,7 @@ pub struct VirtualRawSliceInfo {
     pub offset: i64,
     /// OpRef of the parent VirtualRawBuffer (or another VirtualRawSlice
     /// — `optimize_int_add` flattens chained slices when the underlying
-    /// info is `VirtualRawBufferInfo`/`VirtualRawSliceInfo`).
+    /// info is `RawBufferPtrInfo`/`RawSlicePtrInfo`).
     pub parent: BoxRef,
     /// info.py:91-92
     pub last_guard_pos: i32,
@@ -318,7 +318,7 @@ pub struct VirtualRawSliceInfo {
 /// that by keeping the rawbuffer.py parallel-list state in `buffer`, while
 /// this struct owns the RawBufferPtrInfo metadata.
 #[derive(Clone, Debug)]
-pub struct VirtualRawBufferInfo {
+pub struct RawBufferPtrInfo {
     /// info.py:390 self.func — raw malloc function pointer.
     pub func: i64,
     /// info.py:391 self.size — size of the virtual raw buffer.
@@ -334,7 +334,7 @@ pub struct VirtualRawBufferInfo {
     pub avpi: AbstractVirtualPtrInfo,
 }
 
-impl VirtualRawBufferInfo {
+impl RawBufferPtrInfo {
     /// virtualize.py:52-58 creates RawBufferPtrInfo(cpu, func, size),
     /// whose constructor initializes `self.buffer = RawBuffer(cpu, None)`.
     pub fn new(func: i64, size: usize, calldescr: Option<DescrRef>) -> Self {
@@ -354,7 +354,7 @@ impl VirtualRawBufferInfo {
         offset: i64,
         length: usize,
         descr: &DescrRef,
-    ) -> Result<OpRef, RawBufferError> {
+    ) -> Result<OpRef, InvalidRawOperation> {
         self.buffer.read_value(offset, length, descr)
     }
 
@@ -365,7 +365,7 @@ impl VirtualRawBufferInfo {
         length: usize,
         descr: DescrRef,
         value: OpRef,
-    ) -> Result<(), RawBufferError> {
+    ) -> Result<(), InvalidRawOperation> {
         self.buffer.write_value(offset, length, descr, value)
     }
 }
@@ -437,13 +437,13 @@ pub enum PtrInfo {
     VirtualStruct(VirtualStructInfo),
     /// Virtual array of structs (interior field access).
     /// info.py: ArrayStructInfo
-    VirtualArrayStruct(VirtualArrayStructInfo),
+    VirtualArrayStruct(ArrayStructInfo),
     /// Virtual raw buffer.
     /// info.py: RawBufferPtrInfo
-    VirtualRawBuffer(VirtualRawBufferInfo),
+    VirtualRawBuffer(RawBufferPtrInfo),
     /// Virtual raw slice (offset alias into a parent raw buffer).
     /// info.py: RawSlicePtrInfo
-    VirtualRawSlice(VirtualRawSliceInfo),
+    VirtualRawSlice(RawSlicePtrInfo),
     /// Virtualizable object (interpreter frame).
     Virtualizable(VirtualizableFieldState),
     /// vstring.py:50: StrPtrInfo — string with known length bounds.
@@ -1027,7 +1027,7 @@ impl PtrInfo {
             PtrInfo::VirtualArrayStruct(v) => {
                 debug_assert!(
                     mode.is_none(),
-                    "VirtualArrayStructInfo.getlenbound: mode must be None"
+                    "ArrayStructInfo.getlenbound: mode must be None"
                 );
                 Some(IntBound::from_constant(v.element_fields.len() as i64))
             }

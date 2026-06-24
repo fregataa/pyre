@@ -6,9 +6,9 @@ use majit_ir::operand::Operand;
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Op, OpCode, OpRef, Value};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
+use majit_ir::box_ref::BoxRef;
 
 /// rewrite.py: loop_invariant_results value.
 /// RPython stores PreambleOp or regular Box (AbstractResOp) directly
@@ -64,22 +64,22 @@ pub struct OptRewrite {
     /// pure.rs:498/492) keyed off the pure-op table — coupled to the pure-optimizer
     /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to BoxRef
     /// would entrench a structure upstream does not have.
-    bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc<(OpCode, OpRef, OpRef), OpRef>,
+    bool_result_cache: majit_ir::VecMap<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
-    loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc<i64, LoopInvariantEntry>,
+    loop_invariant_results: majit_ir::VecMap<i64, LoopInvariantEntry>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py:45-47).
-    loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc<i64, Op>,
+    loop_invariant_producer: majit_ir::VecMap<i64, Op>,
 }
 
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            bool_result_cache: majit_ir::VecMap::new(),
+            loop_invariant_results: majit_ir::VecMap::new(),
+            loop_invariant_producer: majit_ir::VecMap::new(),
         }
     }
 
@@ -3540,7 +3540,7 @@ mod tests {
         // Bound oparser graph: i0/i1 are header InputArgs, v = IntGt(i0, i1)
         // a live producer, and GUARD_VALUE's expected operand is the literal
         // ConstInt(0) — so every arg sheds to Operand::{InputArg,Op,Const}.
-        use crate::r#box::test_support::bound_inputarg_box;
+        use crate::history::test_support::bound_inputarg_box;
         let (i0, _i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
         let (i1, _i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
         // A live producer for v (IntGt result) at int_op(2); the OpRc is held
@@ -3568,7 +3568,7 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -3582,7 +3582,7 @@ mod tests {
     #[test]
     fn test_int_mul_neg_one() {
         // x * (-1) → INT_NEG(x)
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Int, 0);
         let neg_one = b.const_int(-1);
         let prod = b.op(OpCode::IntMul, &[x, neg_one]);
@@ -3594,7 +3594,7 @@ mod tests {
         // mul_minus_one lives in OptIntBounds (autogenintrules.py).
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -3609,7 +3609,7 @@ mod tests {
     #[test]
     fn test_float_mul_neg_one() {
         // x * (-1.0) → FLOAT_NEG(x)
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Float, 0);
         let neg_one = BoxRef::new_const(Value::Float(-1.0));
         let prod = b.op(OpCode::FloatMul, &[x, neg_one]);
@@ -3619,7 +3619,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -3630,7 +3630,7 @@ mod tests {
     #[test]
     fn test_cond_call_n_zero_removes() {
         // COND_CALL_N(0, func, args...) → removed (condition is false)
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let cond = BoxRef::new_const(Value::Int(0));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
@@ -3640,7 +3640,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -3654,7 +3654,7 @@ mod tests {
     #[test]
     fn test_cond_call_n_nonzero_converts() {
         // COND_CALL_N(1, func, args...) → CALL_N(func, args...)
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let cond = BoxRef::new_const(Value::Int(1));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
@@ -3664,7 +3664,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)

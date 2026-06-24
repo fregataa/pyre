@@ -7,9 +7,9 @@ use majit_ir::operand::Operand;
 /// the cached result is returned instead of recomputing.
 use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use majit_ir::box_ref::BoxRef;
 
 /// pure.py:104,204-210: extra_call_pure entry.
 /// RPython stores AbstractResOp (or PreambleOp) directly in the list.
@@ -316,7 +316,7 @@ pub struct OptPure {
     /// is never bound by the emit path; capturing it here (where the op
     /// object is live) gives `make_equal_to` a bound receiver without an
     /// `materialize_box_at` round-trip through the opref.
-    postponed_box: Option<crate::r#box::BoxRef>,
+    postponed_box: Option<majit_ir::box_ref::BoxRef>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
@@ -339,7 +339,7 @@ pub struct OptPure {
     /// optimizer.py: call_pure_results passed into propagate_all_forward.
     /// RPython keys are lists of constant boxes (value-based equality).
     /// Keys are the constant Values that _can_optimize_call_pure builds.
-    call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
     /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
@@ -371,7 +371,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            call_pure_results: majit_ir::VecMap::new(),
             preamble_pure_ops: Vec::new(),
         }
     }
@@ -1062,7 +1062,7 @@ impl Optimization for OptPure {
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1073,7 +1073,7 @@ impl Optimization for OptPure {
 
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1120,7 +1120,7 @@ impl Optimization for OptPure {
                         ctx,
                     ) {
                         let cached_src = old_op.pos.get();
-                        let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                        let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement(cached_src);
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
@@ -1177,7 +1177,7 @@ impl Optimization for OptPure {
                         _ => unreachable!("non-preamble matched index must be Direct"),
                     }
                 };
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement(entry_result);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1185,7 +1185,7 @@ impl Optimization for OptPure {
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_result = ctx.get_box_replacement(result_ref);
                 ctx.make_equal_to(&b_old, &b_result);
                 self.last_emitted_was_removed = true;
@@ -1225,10 +1225,7 @@ impl Optimization for OptPure {
         // preamble_pure_ops also NOT cleared — populated during import.
     }
 
-    fn set_call_pure_results(
-        &mut self,
-        results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
-    ) {
+    fn set_call_pure_results(&mut self, results: &majit_ir::VecMap<Vec<Value>, Value>) {
         self.call_pure_results = results.clone();
     }
 
@@ -1328,7 +1325,7 @@ mod tests {
         };
         // Materialize the canonical ctx boxes for the short inputargs and the
         // entry res position, rather than minting position-only boxes.
-        let short_inputarg_boxes: Vec<crate::r#box::BoxRef> = short_inputargs
+        let short_inputarg_boxes: Vec<majit_ir::box_ref::BoxRef> = short_inputargs
             .iter()
             .map(|&a| ctx.materialize_box_at(a))
             .collect();
@@ -1458,7 +1455,7 @@ mod tests {
                         let slot = *idx as usize;
                         input_boxes[slot]
                             .get_or_insert_with(|| {
-                                crate::r#box::test_support::rooted_inputarg_box(Type::Int, *idx)
+                                crate::history::test_support::rooted_inputarg_box(Type::Int, *idx)
                             })
                             .clone()
                     }
@@ -1489,7 +1486,7 @@ mod tests {
     fn run_pure(
         num_inputs: u32,
         specs: &[OpSpec],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         extra_passes: &[fn() -> Box<dyn crate::optimizeopt::Optimization>],
         seed_guard_snapshots: bool,
     ) -> Vec<Op> {
@@ -1533,7 +1530,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1553,7 +1550,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(2)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1571,7 +1568,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1589,7 +1586,7 @@ mod tests {
                 op_spec(OpCode::IntSub, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntSub, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1607,7 +1604,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntMul, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1627,7 +1624,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1641,7 +1638,7 @@ mod tests {
         let result = run_pure(
             2,
             &[op_spec(OpCode::CallPureI, &[Arg::In(0), Arg::In(1)])],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1664,7 +1661,7 @@ mod tests {
         // CallPureR / CallR carry RPython `RefOp.type = 'r'` parity
         // (resoperation.py:638): the result is a Ref-typed Box, and
         // the function-pointer arg is also Ref-typed.
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let funcptr = b.input(Type::Ref, 0);
         b.op(OpCode::CallPureR, &[funcptr]);
         let (ops, inputs) = b.build();
@@ -1675,7 +1672,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1689,7 +1686,7 @@ mod tests {
     fn test_non_pure_op_passes_through() {
         // setfield_gc is not pure, should pass through unchanged.
         // struct is a Ref input, value an Int input.
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let struct_box = b.input(Type::Ref, 0);
         let value = b.input(Type::Int, 1);
         b.op(OpCode::SetfieldGc, &[struct_box, value]);
@@ -1701,7 +1698,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1720,7 +1717,7 @@ mod tests {
                 op_spec(OpCode::IntNeg, &[Arg::In(0)]),
                 op_spec(OpCode::IntNeg, &[Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1732,7 +1729,7 @@ mod tests {
     fn test_cse_float_ops() {
         // f2 = float_add(f0, f1)
         // f3 = float_add(f0, f1)  <- should be eliminated
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let f0 = b.input(Type::Float, 0);
         let f1 = b.input(Type::Float, 1);
         b.op(OpCode::FloatAdd, &[f0.clone(), f1.clone()]);
@@ -1745,7 +1742,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1778,13 +1775,13 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            call_pure_results: majit_ir::VecMap::new(),
             preamble_pure_ops: Vec::new(),
         }));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 num_inputs as usize,
             )
             .expect("test: unexpected InvalidLoop");
@@ -1803,8 +1800,8 @@ mod tests {
         // Production binds the input operands a, b before the int_add is
         // processed; bind bound InputArg boxes here and reuse them across both
         // ops so same_box resolves both ops' args to one shared identity.
-        let a = crate::r#box::test_support::rooted_inputarg_box(Type::Int, 0);
-        let b = crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1);
+        let a = crate::history::test_support::rooted_inputarg_box(Type::Int, 0);
+        let b = crate::history::test_support::rooted_inputarg_box(Type::Int, 1);
 
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(
@@ -1856,7 +1853,7 @@ mod tests {
                 op_spec(OpCode::IntXor, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntXor, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1872,7 +1869,7 @@ mod tests {
                 op_spec(OpCode::IntAnd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAnd, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1890,7 +1887,7 @@ mod tests {
                 op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1905,7 +1902,7 @@ mod tests {
         // `AbstractResOp.type = 'v'` (resoperation.py:260) — and pyre
         // mints them as `OpRef::VoidOp(pos)` whose `ty()` is
         // `Some(Type::Void)`.
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let f0 = b.input(Type::Float, 0);
         b.op(OpCode::CallPureF, &[f0.clone()]);
         b.op(OpCode::CallPureN, &[f0]);
@@ -1917,7 +1914,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1939,7 +1936,7 @@ mod tests {
                 op_spec(OpCode::SetfieldGc, &[Arg::In(0), Arg::In(1)]), // not pure, kept
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup, eliminated
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1964,7 +1961,7 @@ mod tests {
                 op_spec(OpCode::CallLoopinvariantI, &[func.clone(), Arg::In(0)]),
                 op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -1985,7 +1982,7 @@ mod tests {
                 op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(2)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2006,7 +2003,7 @@ mod tests {
             let result = run_pure(
                 1,
                 &[op_spec(loopinv_op, &[Arg::In(0)])],
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 &[rewrite_pass],
                 false,
             );
@@ -2037,7 +2034,7 @@ mod tests {
         let result = run_pure(
             1,
             &specs,
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2060,7 +2057,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup → removed
                 op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(2)]), // loopinv dup → removed
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2084,7 +2081,7 @@ mod tests {
                 // Use the result in a finish to prevent dead code elimination
                 op_spec(OpCode::Finish, &[Arg::Prod(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -2106,7 +2103,7 @@ mod tests {
                 ),
                 op_spec(OpCode::Finish, &[Arg::Prod(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -2127,7 +2124,7 @@ mod tests {
                 op_spec(OpCode::GuardNoOverflow, &[]),
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             true,
         );
@@ -2153,7 +2150,7 @@ mod tests {
                 op_spec(OpCode::GuardNoOverflow, &[]),
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             true,
         );
@@ -2347,7 +2344,7 @@ mod tests {
                 op_spec(OpCode::GuardNoException, &[]), // should be removed
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             true,
         );
@@ -2965,7 +2962,7 @@ mod tests {
                     &[Arg::In(1), Arg::In(2), Arg::In(3)],
                 ),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -2996,7 +2993,7 @@ mod tests {
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
             .expect("test: unexpected InvalidLoop");
@@ -3069,7 +3066,7 @@ mod tests {
         );
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
             .expect("test: unexpected InvalidLoop");

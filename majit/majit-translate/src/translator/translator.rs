@@ -169,14 +169,11 @@ pub struct FlowingFlags {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Platform;
 
-// RPython `self.exceptiontransformer = None` (translator.py:33) and
-// `TranslationContext.getexceptiontransformer()` (translator.py:86-92)
-// are intentionally NOT ported here. Upstream constructs an
-// `ExceptionTransformer(self)` lazily from
-// `rpython/translator/exceptiontransform.py`, which this tree has not
-// yet ported. Re-introduce the slot + accessor alongside the real
-// `exceptiontransform.py` port rather than carrying a placeholder
-// surface that diverges from upstream semantics.
+// RPython `exceptiontransform.py` is intentionally not ported as a
+// standalone module. Pyre lowers Rust `Result` / `?` into exceptional
+// graph exits directly, so exception-transform semantics should land in
+// that Rust lowering path instead of adding an `ExceptionTransformer`
+// placeholder surface.
 
 /// RPython `get_combined_translation_config(translating=True)`
 /// (translationoption.py:284-293). The Rust port exposes the
@@ -240,9 +237,8 @@ pub struct TranslationContext {
     /// RPython `translator.frozen`, set by `driver.task_database_c`
     /// before the C database builder walks annotated graphs.
     pub frozen: Cell<bool>,
-    // `self.exceptiontransformer = None` (translator.py:33) lands
-    // when `rpython/translator/exceptiontransform.py` is ported. See
-    // module header.
+    // `self.exceptiontransformer = None` (translator.py:33) stays absent:
+    // exception-transform behavior belongs in pyre's Rust lowering path.
     /// RPython `self.graphs = []` — every flow graph known to the
     /// translator. `RPythonAnnotator.complete()` iterates this to force
     /// annotation of each return variable.
@@ -463,13 +459,11 @@ impl TranslationContext {
     /// ```
     ///
     /// The `rtyper is None` guard at `:87-88` is mirrored exactly. The
-    /// lazy creation at `:91-92` (`ExceptionTransformer(self)`) is
-    /// TODO: pending the
-    /// `rpython/translator/exceptiontransform.py` port — for now the
-    /// method returns `Ok(None)` so callers see the
-    /// "rtyper-present-but-no-transformer-yet" shape and route the
-    /// `None` through to downstream consumers (`genc.py:92` already
-    /// stores the value verbatim).
+    /// lazy creation at `:91-92` (`ExceptionTransformer(self)`) stays
+    /// absent because pyre represents exception edges in the Rust lowering
+    /// pipeline. For now the method returns `Ok(None)` so callers route the
+    /// `None` through to downstream consumers (`genc.py:92` stores the
+    /// value verbatim).
     pub fn getexceptiontransformer(
         &self,
     ) -> Result<

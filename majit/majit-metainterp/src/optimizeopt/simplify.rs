@@ -93,8 +93,8 @@ impl Optimization for OptSimplify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::BoxRef;
-    use crate::r#box::test_support::TraceBuilder;
+    use crate::history::test_support::TraceBuilder;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{OpRc, OpRef, Type};
 
     /// Seed empty guard snapshots over the canonical `OpRc` slice in place
@@ -124,15 +124,11 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.snapshot_boxes = seed_oprc(&ops);
         let num_inputs = inputs.len();
-        opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            num_inputs,
-        )
-        .expect("test: unexpected InvalidLoop")
-        .into_iter()
-        .map(|rc| (*rc).clone())
-        .collect()
+        opt.optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
+            .expect("test: unexpected InvalidLoop")
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect()
     }
 
     /// The `OpRef`s a header-input slice of `n` `Type::Int` inputargs resolves

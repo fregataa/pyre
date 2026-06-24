@@ -1,7 +1,7 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
-use crate::r#box::BoxRef;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
 fn u16_to_opcode(v: u16) -> OpCode {
@@ -1375,14 +1375,14 @@ pub struct TraceRecordBuffer {
     shadow_stack_base: usize,
     /// opencoder.py:483 self._refs_dict — caches addr → index into
     /// `_refs`. Cleared by `tracing_done`.
-    pub _refs_dict: crate::optimizeopt::vec_assoc::VecAssoc<u64, u32>,
+    pub _refs_dict: majit_ir::VecMap<u64, u32>,
     /// opencoder.py:484 self._bigints — constant pool for big ints
     /// (> SMALL_INT_STOP). Indexed via `(idx << 1)` in TAGCONSTOTHER
     /// (bit 0 = 0 means bigint).
     pub _bigints: Vec<i64>,
     /// opencoder.py:485 self._bigints_dict — caches value → index.
     /// Cleared by `tracing_done`.
-    pub _bigints_dict: crate::optimizeopt::vec_assoc::VecAssoc<i64, u32>,
+    pub _bigints_dict: majit_ir::VecMap<i64, u32>,
     /// opencoder.py:486 self._floats — constant pool for floats. Indexed
     /// via `(idx << 1) | 1` in TAGCONSTOTHER (bit 0 = 1 means float).
     pub _floats: Vec<u64>,
@@ -1455,9 +1455,9 @@ impl TraceRecordBuffer {
             _refs: vec![0u64],
             rooted_ref_indices: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
-            _refs_dict: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            _refs_dict: majit_ir::VecMap::new(),
             _bigints: Vec::new(),
-            _bigints_dict: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            _bigints_dict: majit_ir::VecMap::new(),
             _floats: Vec::new(),
             _snapshot_data: Vec::new(),
             _snapshot_array_data: Vec::new(),
@@ -2890,7 +2890,7 @@ mod tests {
     /// the rooted drop-in (same `to_opref()`), constants shed to
     /// `Operand::Const`. Neither mints the position-only `Operand::Box`.
     fn box_arg(opref: OpRef) -> BoxRef {
-        use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+        use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
         use majit_ir::Type;
         match opref {
             OpRef::InputArgInt(x) => rooted_inputarg_box(Type::Int, x),

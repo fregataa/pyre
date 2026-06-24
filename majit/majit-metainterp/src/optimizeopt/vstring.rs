@@ -3,12 +3,13 @@
 use majit_ir::operand::Operand;
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
-use crate::r#box::BoxRef;
-use crate::optimizeopt::info::{
-    PtrInfo, PtrInfoExt, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
-    VStringVariant,
-};
+use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use majit_ir::box_ref::BoxRef;
+
+pub use crate::optimizeopt::info::{
+    StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
+};
 
 /// vstring.py:18 MAX_CONST_LEN
 const MAX_CONST_LEN: usize = 100;
@@ -16,6 +17,23 @@ const MAX_CONST_LEN: usize = 100;
 /// vstring.py mode_string / mode_unicode discriminators.
 pub const mode_string: u8 = 0;
 pub const mode_unicode: u8 = 1;
+
+/// vstring.py:21 `class StrOrUnicode`.
+///
+/// The optimizer currently stores the active mode as the compact
+/// `mode_string` / `mode_unicode` discriminator above, but the upstream
+/// type name belongs to this module and callers should not need to invent
+/// another name for mode metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrOrUnicode {
+    pub mode: u8,
+    pub newstr: OpCode,
+    pub strlen: OpCode,
+    pub strgetitem: OpCode,
+    pub strsetitem: OpCode,
+    pub copystrcontent: OpCode,
+    pub os_offset: i32,
+}
 
 /// history.py:377-387 get_const_ptr_for_string(s)
 ///
@@ -208,43 +226,12 @@ pub fn string_copy_parts(
     ctx: &mut OptContext,
 ) -> BoxRef {
     // Extract variant data without keeping PtrInfo borrow alive.
-    // RPython dispatches via subclass; we dispatch via enum variant.
-    enum Action {
-        /// vstring.py:194-205 VStringPlainInfo.initialize_forced_string
-        Plain(Vec<Option<BoxRef>>),
-        /// vstring.py:230-233 VStringSliceInfo.string_copy_parts
-        Slice {
-            s: BoxRef,
-            start: BoxRef,
-            lgtop: BoxRef,
-        },
-        /// vstring.py:309-317 VStringConcatInfo.string_copy_parts
-        Concat { vleft: BoxRef, vright: BoxRef },
-        /// vstring.py:132-140 StrPtrInfo.string_copy_parts (base class, non-virtual)
-        NonVirtual,
-    }
-
+    // RPython dispatches via subclass; pyre carries the same VString* cases in
+    // `VStringVariant`.
     let resolved_box = ctx.resolve_box_box_opt(opref);
-    let action = match resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
-        Some(info) => match info {
-            PtrInfo::Str(sinfo) if sinfo.is_virtual() => match &sinfo.variant {
-                VStringVariant::Plain(p) => {
-                    Action::Plain(p._chars.iter().map(|slot| slot.clone()).collect())
-                }
-                VStringVariant::Slice(s) => Action::Slice {
-                    s: s.s.clone(),
-                    start: s.start.clone(),
-                    lgtop: s.lgtop.clone(),
-                },
-                VStringVariant::Concat(c) => Action::Concat {
-                    vleft: c.vleft.clone(),
-                    vright: c.vright.clone(),
-                },
-                VStringVariant::Ptr => Action::NonVirtual,
-            },
-            _ => Action::NonVirtual,
-        },
-        None => Action::NonVirtual,
+    let variant = match resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
+        Some(PtrInfo::Str(sinfo)) if sinfo.is_virtual() => Some(sinfo.variant.clone()),
+        _ => None,
     };
 
     let set_opcode = if mode != 0 {
@@ -253,15 +240,15 @@ pub fn string_copy_parts(
         OpCode::Strsetitem
     };
 
-    match action {
-        Action::Plain(chars) => {
+    match variant {
+        Some(VStringVariant::Plain(info)) => {
             // vstring.py:194-205 VStringPlainInfo.initialize_forced_string
             let mut offset = offsetbox.clone();
             let one = {
                 let __one = ctx.emit_constant_int(1);
                 ctx.materialize_box_at(__one)
             };
-            for ch in &chars {
+            for ch in &info._chars {
                 if let Some(ch_ref) = ch {
                     let arg_char = ctx.resolve_box_box(ch_ref);
                     let arg_target = ctx.resolve_box_box(targetbox);
@@ -280,17 +267,26 @@ pub fn string_copy_parts(
             }
             offset
         }
-        Action::Slice { s, start, lgtop } => {
+        Some(VStringVariant::Slice(info)) => {
             // vstring.py:230-233 VStringSliceInfo.string_copy_parts
-            copy_str_content(ctx, &s, targetbox, &start, offsetbox, &lgtop, mode, true)
-                .expect("need_next_offset=true always returns the offset")
+            copy_str_content(
+                ctx,
+                &info.s,
+                targetbox,
+                &info.start,
+                offsetbox,
+                &info.lgtop,
+                mode,
+                true,
+            )
+            .expect("need_next_offset=true always returns the offset")
         }
-        Action::Concat { vleft, vright } => {
+        Some(VStringVariant::Concat(info)) => {
             // vstring.py:309-317 VStringConcatInfo.string_copy_parts
-            let offset = string_copy_parts(&vleft, targetbox, offsetbox, mode, ctx);
-            string_copy_parts(&vright, targetbox, &offset, mode, ctx)
+            let offset = string_copy_parts(&info.vleft, targetbox, offsetbox, mode, ctx);
+            string_copy_parts(&info.vright, targetbox, &offset, mode, ctx)
         }
-        Action::NonVirtual => {
+        Some(VStringVariant::Ptr) | None => {
             // vstring.py:132-140 StrPtrInfo.string_copy_parts (base class)
             // lengthbox = self.getstrlen(op, optstring, mode)
             // srcbox = self.force_box(op, optstring)  -- no-op for non-virtual
@@ -1729,7 +1725,7 @@ mod tests {
     //! that upstream usually exercises only through larger optimizer tests.
 
     use super::*;
-    use crate::r#box::test_support::rooted_resop_box;
+    use crate::history::test_support::rooted_resop_box;
     use crate::optimizeopt::info::{
         PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
     };

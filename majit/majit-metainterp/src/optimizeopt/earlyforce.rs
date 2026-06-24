@@ -123,7 +123,7 @@ impl Optimization for OptEarlyForce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::rooted_inputarg_box;
+    use crate::history::test_support::rooted_inputarg_box;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::OpRef;
     use majit_ir::Type;
@@ -150,7 +150,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallMayForceN);
@@ -170,7 +170,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -187,7 +187,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallAssemblerI);
@@ -206,7 +206,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::GuardNotForced);
@@ -230,7 +230,7 @@ mod tests {
             let mut opt = Optimizer::new();
             opt.add_pass(Box::new(OptEarlyForce::new()));
             let result =
-                opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+                opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
             assert_eq!(result.len(), 1, "{opcode:?} should be handled");
         }
     }
@@ -250,7 +250,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
