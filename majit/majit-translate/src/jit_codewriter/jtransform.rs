@@ -2611,6 +2611,26 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
+        // A zero-arg transparent `Tuple` constructor is the unit value `()` —
+        // the MIR return-place aggregate of a `-> ()` function (e.g.
+        // `w_list_append`).  It carries no payload and no runtime
+        // representation, so the residual `Call` to the synthetic ctor would
+        // mint a `symbolic_fnaddr` placeholder (absent from
+        // `jit_trace_fnaddrs()`) that the codewriter cannot lower — recording
+        // it bakes a 64-bit hash as a code address.  Emit a null-ref result
+        // placeholder instead; a unit has no fields for anything to read.
+        // (A non-empty `Tuple` is a real aggregate and a named unit *enum*
+        // variant carries a discriminant — both skip this arm.)
+        if let CallTarget::SyntheticTransparentCtor { name, .. } = target
+            && name == "Tuple"
+            && args.is_empty()
+            && matches!(result_ty, ValueType::Ref(_))
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ConstRefNull,
+            }]);
+        }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
         // (jtransform.py:254-257): the JIT does not distinguish a
         // down-cast pointer from its source, so the
@@ -2638,6 +2658,61 @@ impl<'a> Transformer<'a> {
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
+        }
+        // `<*mut T>::is_null` / `<*const T>::is_null` — the raw-pointer null
+        // test.  `front::mir`'s `impl_method_owner` routes it to
+        // `CallTarget::Method { name: "is_null", receiver_root }` through the
+        // `NON_ADT_OWNER_METHOD_ALLOWLIST` (Charon leaves the primitive `Self`
+        // unresolved, so the path stays method-shaped rather than surfacing a
+        // panicking `SomeInstance.getattr`).  `ptr_method_is_null`
+        // (`unaryop.rs`, shared by `const_ptr`/`mut_ptr` since mutability does
+        // not affect the null test) lowers the bound-method to `ptr_iszero`;
+        // the charon front-end skips the rtyper, so finish that lowering here
+        // the same way the `cast_pointer` family folds above — emit one
+        // `ptr_iszero/r>i` over the pointer operand instead of residualising
+        // the call to a symbolic helper fnaddr the executor cannot run.
+        if let CallTarget::Method {
+            name,
+            receiver_root: Some(receiver_root),
+            ..
+        } = target
+            && name == "is_null"
+            && matches!(receiver_root.as_str(), "mut_ptr" | "const_ptr")
+            && args.len() == 1
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::UnaryOp {
+                    op: "ptr_iszero".into(),
+                    operand: args[0].clone(),
+                    result_ty: ValueType::Int,
+                },
+            }]);
+        }
+        // `core::ptr::eq(a, b)` — raw-pointer identity comparison.  Like
+        // `is_null` above, `front::mir` leaves it as a `FunctionPath` residual
+        // because the charon front-end skips the rtyper lowering that turns a
+        // pointer `eq` into `ptr_eq` (`jtransform.py:1243-1255` routes `eq`
+        // over two Ref operands to `ptr_eq`).  Finish that lowering here: emit
+        // a `BinOp("eq")` over the two pointer operands — the assembler maps
+        // the `rr` operand shape to `ptr_eq` — instead of residualising the
+        // call to a symbolic helper fnaddr the executor cannot run.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.len() == 3
+            && segments[0] == "core"
+            && segments[1] == "ptr"
+            && segments[2] == "eq"
+            && args.len() == 2
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: args[0].clone(),
+                    rhs: args[1].clone(),
+                    result_ty: ValueType::Int,
+                },
+            }]);
         }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
