@@ -5422,6 +5422,26 @@ fn collect_outer_active_boxes(
             )
         }
     };
+    // #348: per-PC color→slot entries at the snapshot PC. Populated for every
+    // production jitcode (empty only under the `PYRE_PCDEP_RESUME_OFF` escape
+    // hatch); when present, the color→slot inversions below consult it instead
+    // of the flat maps, the same per-program-point color space the `-live-`
+    // markers carry.
+    let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode;
+            jc.payload
+                .metadata
+                .pcdep_color_slots
+                .get(entry_py_pc as usize)
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    let pcdep_opt: Option<&[(u16, u16)]> =
+        (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
     // jitcode's `num_regs_X`, which the codewriter co-publishes with the
     // liveness side-table, so every liveness index is in range by
@@ -5522,6 +5542,7 @@ fn collect_outer_active_boxes(
                         &local_color_map,
                         &stack_color_map,
                         &live_locals,
+                        pcdep_opt,
                         c as usize,
                     )?;
                     (s >= nlocals).then_some((s, c))
@@ -5565,6 +5586,7 @@ fn collect_outer_active_boxes(
                     &local_color_map,
                     &stack_color_map,
                     &live_locals,
+                    pcdep_opt,
                     c as usize,
                 ) else {
                     continue;
@@ -5622,6 +5644,7 @@ fn collect_outer_active_boxes(
                 &local_color_map,
                 &stack_color_map,
                 &live_locals,
+                pcdep_opt,
                 color,
             );
             match semantic_idx {
@@ -12350,12 +12373,23 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.box_value(code_opref),
             ) {
                 // Materialize the constant identically to the runtime
-                // `bh_load_const_fn` helper (call_jit.rs).
+                // `bh_load_const_fn` helper (call_jit.rs): a code constant reads
+                // the one shared wrapper off the virtualizable `pycode`'s
+                // `co_consts_w[index]`, other constants realize directly.
                 let w_const = unsafe {
-                    let code =
-                        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+                    let w_code = pyre_interpreter::pycode::w_code_co_const(
+                        w_code_ptr as pyre_object::PyObjectRef,
+                        consti as usize,
+                    );
+                    if !w_code.is_null() {
+                        w_code
+                    } else {
+                        let code = &*(pyre_interpreter::w_code_get_ptr(
+                            w_code_ptr as pyre_object::PyObjectRef,
+                        )
                             as *const pyre_interpreter::CodeObject);
-                    pyre_interpreter::pyframe::load_const_from_code(code, consti as usize)
+                        pyre_interpreter::pyframe::load_const_from_code(code, consti as usize)
+                    }
                 };
                 let const_box = ctx.trace_ctx.const_ref(w_const as i64);
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, const_box)?;

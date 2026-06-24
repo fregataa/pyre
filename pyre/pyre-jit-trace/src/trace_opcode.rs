@@ -1524,6 +1524,7 @@ impl MIFrame {
             stack_slot_color_map,
             live_local_indices,
             is_portal_bridge,
+            pcdep_entries,
         ) = {
             let s = self.sym();
             let (
@@ -1532,8 +1533,9 @@ impl MIFrame {
                 live_local_indices,
                 is_portal_bridge,
                 metadata_stack_depth,
+                pcdep_entries,
             ) = if s.jitcode.is_null() {
-                (Vec::new(), Vec::new(), Vec::new(), false, None)
+                (Vec::new(), Vec::new(), Vec::new(), false, None, Vec::new())
             } else {
                 unsafe {
                     let jc = &*s.jitcode;
@@ -1556,6 +1558,13 @@ impl MIFrame {
                             .get(live_pc)
                             .copied()
                             .map(|d| d as usize),
+                        // #348 Part (2): per-PC color→slot entries at live_pc.
+                        jc.payload
+                            .metadata
+                            .pcdep_color_slots
+                            .get(live_pc)
+                            .cloned()
+                            .unwrap_or_default(),
                     )
                 }
             };
@@ -1574,8 +1583,11 @@ impl MIFrame {
                 stack_slot_color_map,
                 live_local_indices,
                 is_portal_bridge,
+                pcdep_entries,
             )
         };
+        let pcdep_opt: Option<&[(u16, u16)]> =
+            (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
         // SSA-authoritative live_r: Ref bank entries go
         // through the read_live / lazy-fill / materialize pipeline to
         // populate registers_r[color].  Int/Float banks already live in
@@ -1605,6 +1617,7 @@ impl MIFrame {
                     &local_color_map,
                     &stack_slot_color_map,
                     &live_local_indices,
+                    pcdep_opt,
                     color_idx,
                 )
             }) else {
@@ -8058,6 +8071,35 @@ impl MIFrame {
         if let Instruction::LoadConst { consti } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             let const_idx = consti.get(op_arg);
+            // A code constant must bake the one shared `PyCode` the
+            // interpreter / blackhole resolve through `co_consts_w[index]`
+            // (off the enclosing `PyCode` carried by this jitcode), not a
+            // fresh `box_code_constant` clone — otherwise the compiled trace
+            // embeds a different code object than warmup and nested calls split
+            // their green keys after JIT compilation.
+            if matches!(
+                &code.constants[const_idx],
+                pyre_interpreter::bytecode::ConstantData::Code { .. }
+            ) {
+                let w_code = unsafe { (*self.sym().jitcode).code };
+                if !w_code.is_null() {
+                    let shared = unsafe {
+                        pyre_interpreter::pycode::w_code_co_const(
+                            w_code as pyre_object::PyObjectRef,
+                            usize::from(const_idx),
+                        )
+                    };
+                    if !shared.is_null() {
+                        let opref = self.with_trace_ctx(|ctx| ctx.const_ref(shared as i64));
+                        let op = crate::state::FrontendOp::new(
+                            opref,
+                            crate::state::ConcreteValue::Ref(shared),
+                        );
+                        SharedOpcodeHandler::push_value(self, op)?;
+                        return Ok(Some(pyre_interpreter::StepResult::Continue));
+                    }
+                }
+            }
             OpcodeStepExecutor::load_const(self, &code.constants[const_idx])?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
