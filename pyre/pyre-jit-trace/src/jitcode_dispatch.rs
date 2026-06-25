@@ -11883,9 +11883,10 @@ fn walker_guard_class(
 /// force-token store + `GUARD_NOT_FORCED` + `GUARD_NO_EXCEPTION` from
 /// bigint-heavy loops (e.g. `fib_loop`).
 ///
-/// Specialized for add/sub/mul/and/or/xor; every may-raise operator
-/// (floordiv/mod/pow/shift), true-divide, and any non-`W_LongObject` operand
-/// returns `Ok(None)` so the caller falls through to the generic record,
+/// Specialized for add/sub/mul/and/or/xor (cannot-raise) and floordiv/mod
+/// (`rbigint.divmod`, elidable-can-raise → trailing `GUARD_NO_EXCEPTION` for
+/// the divide-by-zero bail). pow/shift, true-divide, and any non-`W_LongObject`
+/// operand return `Ok(None)` so the caller falls through to the generic record,
 /// preserving the `__op__` semantics.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_specialize_binary_op_long(
@@ -11905,7 +11906,7 @@ fn try_walker_specialize_binary_op_long(
     {
         return Ok(None);
     }
-    let Some(raw_fn) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
+    let Some(spec) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
         .and_then(crate::trace_opcode::long_binop_raw_helper)
     else {
         return Ok(None);
@@ -11932,30 +11933,37 @@ fn try_walker_specialize_binary_op_long(
     // Pure `rbigint` payload op: read both W_LongObject payloads and return a
     // bare `*mut BigInt` (Int). The raw pointer is consumed only by the
     // residual box below — it is dead after it and never spans a guard, so it
-    // needs no blackhole reconstruction.
-    let raw_concrete = raw_fn(lhs_obj as i64, rhs_obj as i64);
-    let add_fn = raw_fn as *const ();
-    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+    // needs no blackhole reconstruction. Every op allocates
+    // (`EF_ELIDABLE_OR_MEMORYERROR`) or divides (`EF_ELIDABLE_CAN_RAISE`), so a
+    // trailing `GuardNoException` follows (`pyjitpl.py:2110-2112`).
+    // `walker_execute_may_force_boxed` above already executed the op
+    // authentically, so for the division helpers the divisor is guaranteed
+    // nonzero here (a zero divisor would have raised → `None` → generic defer);
+    // the guard still covers a divide-by-zero / OOM on a later replay.
+    let raw_concrete = (spec.raw_fn)(lhs_obj as i64, rhs_obj as i64);
+    let add_fn = spec.raw_fn as *const ();
+    let concrete_args = [
+        majit_ir::Value::Int(add_fn as usize as i64),
+        majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
+    ];
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
         OpCode::CallI,
         add_fn,
         &[lhs, rhs],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
         majit_ir::Type::Int,
-        majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
-        &[
-            majit_ir::Value::Int(add_fn as usize as i64),
-            majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
-            majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
-        ],
+        spec.effect,
+        &concrete_args,
         majit_ir::Value::Int(raw_concrete),
     );
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Int(raw_concrete));
-    // Residual `bigint_result` box/demote: wrap the bigint in a Python int,
-    // demoting to W_IntObject when it fits. Non-elidable (`dont_look_inside`),
-    // so the wrapper object is never pure-CSE'd — a distinct result per add,
-    // matching upstream's separate `NEW`; `EF_CANNOT_RAISE` ⇒ no
-    // GuardNoException and non-forcing.
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    // Residual `bigint_result` box: wrap the bigint in a Python int, demoting to
+    // W_IntObject when it fits. Non-elidable (`dont_look_inside`), so the wrapper
+    // object is never pure-CSE'd — a distinct result per op, matching upstream's
+    // separate `NEW`; `EF_CANNOT_RAISE` ⇒ no GuardNoException and non-forcing.
     let box_fn = pyre_object::longobject::jit_bigint_result_box as *const ();
     let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
@@ -11969,6 +11977,95 @@ fn try_walker_specialize_binary_op_long(
     // (via `concrete_from_recorded_opref`) propagates the authentic sum object
     // into the dst slot; the subsequent STORE_FAST then carries it. Without
     // this the dst shadow is Null and the local materializes unbound.
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
+/// W_LongObject true-divide specialization — the float analogue of
+/// [`try_walker_specialize_binary_op_long`].  Both operands are `int`-typed but
+/// bigint-stored: guard each against `LONG_TYPE`, then `CallPureF` the elidable
+/// `jit_w_long_truediv_raw` (correctly-rounded f64 quotient; raises
+/// ZeroDivision/Overflow → `EF_ELIDABLE_CAN_RAISE` ⇒ trailing `GuardNoException`)
+/// and box the f64 with `wrapfloat` (transparent `new_with_vtable` +
+/// `setfield_gc_f`, the trace analogue of `_truediv`'s `space.newfloat(f)`), so a
+/// downstream float op keeps the quotient unboxed.  Walker-only — the trait path
+/// defers true-divide to the generic residual.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_truediv_op_long(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || r_args.len() != 2
+        || dst_bank != 'r'
+    {
+        return Ok(None);
+    }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
+        Some(BinaryOperator::TrueDivide) | Some(BinaryOperator::InplaceTrueDivide) => {}
+        _ => return Ok(None),
+    }
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, lhs),
+        walker_concrete_ref_object(ctx, rhs),
+    ) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
+        return Ok(None);
+    }
+    // Authentic boxed float via the generic execute path; a NULL / raised result
+    // (zero divisor, float overflow) defers to the generic record.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
+    walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    // Pure `rbigint.truediv` → correctly-rounded f64 (CallPureF). The op already
+    // ran authentically above, so the divisor is nonzero / non-overflowing here;
+    // the trailing GuardNoException covers a divide-by-zero / overflow on replay.
+    let truediv_fn =
+        pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const ();
+    let f_concrete = pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw(
+        lhs_obj as i64,
+        rhs_obj as i64,
+    );
+    let concrete_args = [
+        majit_ir::Value::Int(truediv_fn as usize as i64),
+        majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
+    ];
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+        OpCode::CallF,
+        truediv_fn,
+        &[lhs, rhs],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Float,
+        majit_metainterp::ELIDABLE_EFFECT_INFO,
+        &concrete_args,
+        majit_ir::Value::Float(f_concrete),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(f_concrete));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    // Box the f64 with the transparent float NEW (`new_with_vtable` +
+    // `setfield_gc_f`), mirroring `space.newfloat(f)`.
+    let result = crate::state::wrapfloat(ctx.trace_ctx, raw);
     ctx.trace_ctx.set_opref_concrete(
         result,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
@@ -12442,6 +12539,107 @@ fn try_walker_fold_check_exc_match(
     let truth = ctx.trace_ctx.const_int(matched as i64);
     bool_box_truth_record(const_bool, truth);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)?;
+    Ok(Some(()))
+}
+
+/// W_LongObject (bigint) COMPARE_OP specialization — the long analogue of
+/// [`try_walker_specialize_compare_op_int`].  Both operands are `int`-typed but
+/// bigint-stored: guard each against `LONG_TYPE`, then `CallPure_I` the pure
+/// `jit_w_long_cmp` (sign of `a <=> b` in {-1,0,1}; a comparison neither
+/// allocates nor raises, so `EF_ELIDABLE_CANNOT_RAISE` and NO trailing guard)
+/// and turn the sign into the requested truth with `int_<cmp>(sign, 0)` before
+/// boxing to a `W_Bool` (same #62 dead-box elision as the int path).  Same gate
+/// + return contract as [`try_walker_specialize_binary_op_long`].
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_compare_op_long(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || r_args.len() != 2
+        || dst_bank != 'r'
+    {
+        return Ok(None);
+    }
+    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::ComparisonOperator;
+    // `a <cmp> b` ⟺ `sign(a <=> b) <cmp> 0`.
+    let cmp = match cmp_op {
+        ComparisonOperator::Less => OpCode::IntLt,
+        ComparisonOperator::LessOrEqual => OpCode::IntLe,
+        ComparisonOperator::Greater => OpCode::IntGt,
+        ComparisonOperator::GreaterOrEqual => OpCode::IntGe,
+        ComparisonOperator::Equal => OpCode::IntEq,
+        ComparisonOperator::NotEqual => OpCode::IntNe,
+    };
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, lhs),
+        walker_concrete_ref_object(ctx, rhs),
+    ) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
+        return Ok(None);
+    }
+    // Authentic boxed W_Bool via the same execute path the int leg uses; also
+    // advances the concrete VM state the downstream ops read.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
+    walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    // Pure `rbigint` comparison → sign in {-1,0,1}. Dead after the `int_<cmp>`
+    // below and never spans a guard, so it needs no blackhole reconstruction.
+    let cmp_fn = pyre_object::longobject::jit_w_long_cmp as *const ();
+    let sign_concrete = pyre_object::longobject::jit_w_long_cmp(lhs_obj as i64, rhs_obj as i64);
+    let concrete_args = [
+        majit_ir::Value::Int(cmp_fn as usize as i64),
+        majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
+    ];
+    let sign = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
+        cmp_fn,
+        &[lhs, rhs],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        &concrete_args,
+        majit_ir::Value::Int(sign_concrete),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(sign, majit_ir::Value::Int(sign_concrete));
+    let zero = ctx.trace_ctx.const_int(0);
+    let truth = ctx.trace_ctx.record_op(cmp, &[sign, zero]);
+    let folded = majit_metainterp::eval_binop_i(cmp, sign_concrete, 0);
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(folded));
+    // #62: elide the dead box when the boxed Ref is consumed solely by the
+    // following `is_true` (POP_JUMP_IF_*); else box the raw truth into a W_Bool.
+    if compare_box_provably_dead(ctx, op_pc, dst as u8) {
+        bool_box_truth_record(truth, truth);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
+        return Ok(Some(()));
+    }
+    let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    bool_box_truth_record(boxed, truth);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
 
@@ -14340,10 +14538,19 @@ fn dispatch_residual_call_iIRd_kind(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )? {
                                 Some(()) => Some(()),
-                                None => try_walker_specialize_binary_op_float(
+                                // Two-long true-divide → float fast path
+                                // (CallPureF + wrapfloat), before the generic
+                                // float leg which only handles float operands.
+                                None => match try_walker_specialize_truediv_op_long(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
-                                )?,
+                                )? {
+                                    Some(()) => Some(()),
+                                    None => try_walker_specialize_binary_op_float(
+                                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
+                                        dst_bank,
+                                    )?,
+                                },
                             },
                         }
                     }
@@ -14364,15 +14571,20 @@ fn dispatch_residual_call_iIRd_kind(
                     // not a valid exception class.
                     try_walker_fold_check_exc_match(ctx, op.pc, &r_args, dst, dst_bank)?
                 } else {
-                    // int compare first; float (incl. mixed int/float) as a
-                    // fallback so two-int operands keep int comparison.
+                    // int compare first; then long (two-bigint operands keep
+                    // bigint comparison); float (incl. mixed int/float) last.
                     match try_walker_specialize_compare_op_int(
                         ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                     )? {
                         Some(()) => Some(()),
-                        None => try_walker_specialize_compare_op_float(
+                        None => match try_walker_specialize_compare_op_long(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                        )?,
+                        )? {
+                            Some(()) => Some(()),
+                            None => try_walker_specialize_compare_op_float(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?,
+                        },
                     }
                 };
                 if specialized.is_some() {
