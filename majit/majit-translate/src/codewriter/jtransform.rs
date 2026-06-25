@@ -519,10 +519,19 @@ impl<'a> Transformer<'a> {
                 |b| b,
             )
         };
-        let block = &mut graph.blocks[block_idx];
-        block.operations = new_ops;
-        block.exitswitch = exitswitch;
-        block.exits = exits;
+        {
+            let block = &mut graph.blocks[block_idx];
+            block.operations = new_ops;
+            block.exitswitch = exitswitch;
+            block.exits = exits;
+        }
+
+        // `jtransform.py:123 self.optimize_goto_if_not(block)` — fuse a
+        // Bool-producing comparison into the exitswitch
+        // (`ExitSwitch::Fused`), eliding the standalone compare op.  Runs
+        // after the exitswitch/exits remap is committed; it never alters
+        // link targets, so the exceptblock note below is unaffected.
+        optimize_goto_if_not(graph, block_idx);
 
         // Upstream `rpython/translator/backendopt/canraise.py:25-47
         // analyze_exceptblock_in_graph` identifies raising blocks by the
@@ -531,6 +540,7 @@ impl<'a> Transformer<'a> {
         // such blocks so later phases (e.g. reporting) can surface
         // unconditional raise sites — the note mirrors the upstream signal
         // without the pyre-specific Terminator::Abort variant.
+        let block = &graph.blocks[block_idx];
         if block.exits.iter().any(|link| link.target == exceptblock) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -4317,6 +4327,209 @@ impl<'a> Transformer<'a> {
     }
 }
 
+/// `jtransform.py:196-234 Transformer.optimize_goto_if_not` — fuse a
+/// comparison op into the block's `exitswitch`.
+///
+/// Replaces `v = int_gt(x, y); exitswitch = v` with the fused
+/// `exitswitch = ('int_gt', x, y, '-live-before')`.  The `-live-before`
+/// marker is implicit in pyre's [`ExitSwitch::Fused`] (re-applied at
+/// emit time, `flatten.py:248-253`) so it is not stored in `args`.
+///
+/// Faithful port, line-for-line:
+/// ```python
+/// def optimize_goto_if_not(self, block):
+///     if len(block.exits) != 2:
+///         return False
+///     v = block.exitswitch
+///     if (block.canraise or isinstance(v, tuple)
+///             or v.concretetype != lltype.Bool):
+///         return False
+///     for op in block.operations[::-1]:
+///         for arg in op.args:
+///             if arg == v:
+///                 return False
+///             if isinstance(arg, ListOfKind) and v in arg.content:
+///                 return False
+///         if v is op.result:
+///             if op.opname not in (...comparison opnames...):
+///                 return False
+///             block.operations.remove(op)
+///             block.exitswitch = (op.opname,) + tuple(op.args)
+///             block.exitswitch += ('-live-before',)
+///             for link in block.exits:
+///                 while v in link.args:
+///                     index = link.args.index(v)
+///                     link.args[index] = Constant(link.llexitcase, lltype.Bool)
+///             return True
+///     return False
+/// ```
+///
+/// Notes on faithful adaptations to pyre's IR:
+/// - `isinstance(v, tuple)` (an already-fused switch) maps to "the
+///   `exitswitch` is not a plain [`ExitSwitch::Value`]" — i.e.
+///   `Fused` / `LastException` / `None` all return `false`, exactly as
+///   upstream skips a tuple / can-raise / unset switch.
+/// - `v.concretetype != lltype.Bool` reads the backing Variable's raw
+///   `LowLevelType` (`Variable::concretetype()`), checking
+///   [`LowLevelType::Bool`] directly.  Going through
+///   [`FunctionGraph::concretetype_of`] / [`ConcreteType`] would be
+///   wrong here because that projection collapses `Bool` into
+///   `ConcreteType::Signed` (`getkind`, `history.py:45-71`); the Bool
+///   distinction only survives on the raw lltype cell.
+/// - `for arg in op.args` (incl. the `ListOfKind` content scan) maps to
+///   [`crate::inline::op_variable_refs`], which already flattens every
+///   operand Variable of any op — including aggregate operands
+///   (`NewTuple`, `JitMergePoint`, ...) that are pyre's `ListOfKind`
+///   analogue — so the explicit `ListOfKind`/`v in arg.content` arm is
+///   subsumed.
+/// - `Constant(link.llexitcase, lltype.Bool)`: pyre's `link.llexitcase`
+///   may be `None` pre-rtyper, but the bool branch value is reliably in
+///   `link.exitcase` as [`ExitCase::Bool`] (the same source
+///   `with_llexitcase_from_exitcase` reads, `model.rs:1244-1252`); the
+///   substituted constant is
+///   `Constant::with_concretetype(ConstValue::Bool(b), lltype.Bool)`,
+///   carrying the `lltype.Bool` concretetype upstream stamps.
+//
+// gh #37: called from `optimize_block` (jtransform.py:123); the fused
+// `ExitSwitch::Fused` is lowered to `FlatOp::GotoIfNotOp` in flatten.
+fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
+    use crate::flowspace::model::{ConstValue, Constant};
+    use crate::model::{ExitCase, ExitSwitch};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+    // `if len(block.exits) != 2: return False`
+    if graph.blocks[block_idx].exits.len() != 2 {
+        return false;
+    }
+    // `v = block.exitswitch`
+    //
+    // `isinstance(v, tuple)` / can-raise (`LastException`) / unset
+    // switch all collapse to "not a plain `Value(v)`".
+    let v = match &graph.blocks[block_idx].exitswitch {
+        Some(ExitSwitch::Value(var)) => var.clone(),
+        _ => return false,
+    };
+    // `if block.canraise or ...: return False`
+    if graph.blocks[block_idx].canraise() {
+        return false;
+    }
+    // `or v.concretetype != lltype.Bool: return False`
+    if v.concretetype() != Some(LowLevelType::Bool) {
+        return false;
+    }
+
+    // `for op in block.operations[::-1]:`
+    let ops_len = graph.blocks[block_idx].operations.len();
+    for op_idx in (0..ops_len).rev() {
+        // `for arg in op.args: if arg == v (or v in ListOfKind): return False`
+        let reads =
+            crate::inline::op_variable_refs(&graph.blocks[block_idx].operations[op_idx].kind);
+        if reads.iter().any(|arg| *arg == v) {
+            return false;
+        }
+        // `if v is op.result:`
+        if graph.blocks[block_idx].operations[op_idx].result.as_ref() == Some(&v) {
+            // `if op.opname not in (...): return False` else fuse.
+            let Some((opname, args)) =
+                goto_if_not_fusable(&graph.blocks[block_idx].operations[op_idx].kind)
+            else {
+                return false;
+            };
+            // `block.operations.remove(op)`
+            graph.blocks[block_idx].operations.remove(op_idx);
+            // `block.exitswitch = (op.opname,) + tuple(op.args) + ('-live-before',)`
+            // (the `-live-before` marker is implicit in `Fused`).
+            graph.blocks[block_idx].exitswitch = Some(ExitSwitch::Fused { opname, args });
+            // `for link in block.exits:
+            //      while v in link.args:
+            //          link.args[index] = Constant(link.llexitcase, lltype.Bool)`
+            //
+            // The substitution only matters when the fused result `v`
+            // flows into a successor block (rare); links that do not
+            // carry `v` are left untouched.  The replacement bool is
+            // read `llexitcase`-first then `exitcase` — the same source
+            // order as `flatten.rs::bool_llexitcase` — so post-rtyper
+            // graphs (bool in `llexitcase`) and pre-rtyper semantic
+            // graphs (bool in `exitcase`) both resolve.
+            for link in graph.blocks[block_idx].exits.iter_mut() {
+                if !link.args.iter().any(|arg| arg.as_variable() == Some(&v)) {
+                    continue;
+                }
+                let bool_const = match &link.llexitcase {
+                    Some(ConstValue::Bool(b)) => *b,
+                    _ => match &link.exitcase {
+                        Some(ExitCase::Bool(b)) => *b,
+                        Some(ExitCase::Const(ConstValue::Bool(b))) => *b,
+                        other => panic!(
+                            "optimize_goto_if_not: fused bool branch link carrying the \
+                             result variable lacks a bool ll/exitcase \
+                             (jtransform.py:230 link.llexitcase), got {other:?}"
+                        ),
+                    },
+                };
+                for arg in link.args.iter_mut() {
+                    if arg.as_variable() == Some(&v) {
+                        // `Constant(link.llexitcase, lltype.Bool)` —
+                        // bool value carries the `lltype.Bool` concretetype.
+                        *arg = LinkArg::Const(Constant::with_concretetype(
+                            ConstValue::Bool(bool_const),
+                            LowLevelType::Bool,
+                        ));
+                    }
+                }
+            }
+            // `return True`
+            return true;
+        }
+    }
+    // `return False`
+    false
+}
+
+/// `jtransform.py:206-209` supported-opname gate for
+/// [`optimize_goto_if_not`].  Returns the RPython opname and the op's
+/// operand Variables (`tuple(op.args)`) when the op is one of the
+/// comparison / boolean-test opcodes that may be fused into a guard;
+/// `None` for any other op (upstream's `return False`).
+///
+/// The Bool-producing compares are pyre [`OpKind::BinOp`]s; the unary
+/// `int_is_zero` / `int_is_true` / `ptr_iszero` / `ptr_nonzero` tests
+/// are [`OpKind::UnaryOp`]s.
+fn goto_if_not_fusable(kind: &OpKind) -> Option<(String, Vec<crate::flowspace::model::Variable>)> {
+    match kind {
+        OpKind::BinOp { op, lhs, rhs, .. }
+            if matches!(
+                op.as_str(),
+                "int_lt"
+                    | "int_le"
+                    | "int_eq"
+                    | "int_ne"
+                    | "int_gt"
+                    | "int_ge"
+                    | "float_lt"
+                    | "float_le"
+                    | "float_eq"
+                    | "float_ne"
+                    | "float_gt"
+                    | "float_ge"
+                    | "ptr_eq"
+                    | "ptr_ne"
+            ) =>
+        {
+            Some((op.clone(), vec![lhs.clone(), rhs.clone()]))
+        }
+        OpKind::UnaryOp { op, operand, .. }
+            if matches!(
+                op.as_str(),
+                "int_is_zero" | "int_is_true" | "ptr_iszero" | "ptr_nonzero"
+            ) =>
+        {
+            Some((op.clone(), vec![operand.clone()]))
+        }
+        _ => None,
+    }
+}
+
 /// RPython: `getkind(concretetype)[0]` → 'i', 'r', 'f', or 'v'.
 ///
 /// RPython's rtyper resolves all types before jtransform runs, so
@@ -5095,6 +5308,133 @@ mod tests {
     use super::*;
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+
+    /// gh #37 Stage 1: `int_lt(a, b); exitswitch = t` fuses into a
+    /// `Fused { opname: "int_lt", args: [a, b] }` switch, the `int_lt`
+    /// op is removed, and the `t` riding a link's args is replaced by
+    /// that link's bool constant (`jtransform.py:196-234`).
+    #[test]
+    fn optimize_goto_if_not_fuses_int_lt_compare() {
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("goto_if_not_fuse");
+        let a = graph.alloc_value_var();
+        let b = graph.alloc_value_var();
+        // `t = int_lt(a, b)` — a Bool-producing comparison.
+        let t = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_lt".to_string(),
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        // `v.concretetype == lltype.Bool` — stamp the raw Bool lltype
+        // (`getkind`/`ConcreteType` would otherwise collapse it to int).
+        t.set_concretetype(Some(LowLevelType::Bool));
+
+        // Two destination blocks; the true arm carries `t` in its args.
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        let true_iarg = graph.alloc_value_var();
+        graph.push_inputarg_var(if_true, true_iarg);
+        let false_link = Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false)));
+        let true_link = Link::new_mixed(
+            vec![LinkArg::Value(t.clone())],
+            if_true,
+            Some(ExitCase::Bool(true)),
+        );
+        let start = graph.startblock.0;
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![false_link, true_link],
+        );
+
+        let fused = super::optimize_goto_if_not(&mut graph, start);
+        assert!(fused, "supported compare must fuse");
+
+        let block = &graph.blocks[start];
+        // The `int_lt` op was removed.
+        assert!(
+            !block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "int_lt")),
+            "fused int_lt op must be removed"
+        );
+        // exitswitch == Fused { opname: "int_lt", args: [a, b] }.
+        match &block.exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(opname, "int_lt");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0], a);
+                assert_eq!(args[1], b);
+            }
+            other => panic!("expected Fused exitswitch, got {other:?}"),
+        }
+        // The `t` riding the true arm became a Bool const(true).
+        let true_arm = &block.exits[1];
+        assert!(
+            matches!(
+                &true_arm.args[0],
+                LinkArg::Const(c) if c.value == ConstValue::Bool(true)
+            ),
+            "escaping v must be replaced with the link's bool constant, got {:?}",
+            true_arm.args[0],
+        );
+    }
+
+    /// gh #37 Stage 1: a non-supported result op (`int_add`) is NOT
+    /// fusable — `optimize_goto_if_not` returns false and leaves the
+    /// block untouched (`jtransform.py:206-209` opname gate).
+    #[test]
+    fn optimize_goto_if_not_rejects_unsupported_result_op() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("goto_if_not_reject");
+        let a = graph.alloc_value_var();
+        let b = graph.alloc_value_var();
+        let t = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_add".to_string(),
+                    lhs: a,
+                    rhs: b,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        t.set_concretetype(Some(LowLevelType::Bool));
+
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        let false_link = Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false)));
+        let true_link = Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true)));
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![false_link, true_link],
+        );
+
+        let start = graph.startblock.0;
+        let before = graph.blocks[start].clone();
+        let fused = super::optimize_goto_if_not(&mut graph, start);
+        assert!(!fused, "unsupported int_add result op must not fuse");
+        // Block unchanged: op kept, exitswitch still Value(t).
+        let after = &graph.blocks[start];
+        assert_eq!(after.operations.len(), before.operations.len());
+        assert!(matches!(&after.exitswitch, Some(ExitSwitch::Value(_))));
+    }
 
     #[test]
     fn rewrite_graph_canonicalizes_frontend_bitops() {
