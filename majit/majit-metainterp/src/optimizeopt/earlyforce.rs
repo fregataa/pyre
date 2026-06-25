@@ -8,6 +8,7 @@
 /// earlyforce.py:32: self.optimizer.optearlyforce = self
 /// The pass registers itself so force_at_the_end_of_preamble can route
 /// forced operations starting from earlyforce.next (= heap).
+use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode};
 
 use crate::optimizeopt::info::PtrInfoExt;
@@ -76,7 +77,7 @@ impl Optimization for OptEarlyForce {
             // which uses ctx.current_pass_idx (== earlyforce_idx) for
             // emit_extra routing. This matches RPython's optforce=self.
             for i in 0..op.num_args() {
-                let arg_box = ctx.resolve_box_box_opt(&op.arg(i).to_boxref());
+                let arg_box = ctx.resolve_operand_box_opt(&op.arg(i));
                 let arg = arg_box
                     .as_ref()
                     .map(|b| b.to_opref())
@@ -99,14 +100,16 @@ impl Optimization for OptEarlyForce {
                 }
                 // optimizer.py:363-366: if the arg carries a virtual PtrInfo,
                 // force it into the trace.
-                let arg_is_virtual = arg_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
+                let arg_is_virtual = arg_box
+                    .as_ref()
+                    .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
                 if arg_is_virtual {
                     // `arg_box` is the box-native resolution of `op.arg(i)`
                     // (resolve_box_box_opt), already a chain terminal, and
                     // `arg_is_virtual` is only set when it is `Some` and virtual,
                     // so re-walking its OpRef would return the same info-host.
                     let arg_box = arg_box.expect("arg_is_virtual implies a resolved box");
-                    let mut info = ctx.take_ptr_info(&arg_box).unwrap();
+                    let mut info = ctx.take_ptr_info(&Operand::from_boxref(&arg_box)).unwrap();
                     let _forced = info.force_box(arg_box, ctx);
                 }
             }
@@ -123,11 +126,10 @@ impl Optimization for OptEarlyForce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_inputarg_box;
+    use crate::history::test_support::rooted_inputarg_operand;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::OpRef;
     use majit_ir::Type;
-    use majit_ir::operand::Operand;
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
@@ -141,8 +143,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::CallMayForceN,
             &[
-                Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                rooted_inputarg_operand(Type::Ref, 100),
+                rooted_inputarg_operand(Type::Ref, 101),
             ],
         )];
         assign_positions(&mut ops);
@@ -161,8 +163,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&rooted_inputarg_box(Type::Int, 100)),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                rooted_inputarg_operand(Type::Int, 100),
+                rooted_inputarg_operand(Type::Int, 101),
             ],
         )];
         assign_positions(&mut ops);
@@ -180,7 +182,7 @@ mod tests {
     fn test_earlyforce_call_assembler_handled() {
         let mut ops = vec![Op::new(
             OpCode::CallAssemblerI,
-            &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            &[rooted_inputarg_operand(Type::Ref, 100)],
         )];
         assign_positions(&mut ops);
 
@@ -221,10 +223,7 @@ mod tests {
             OpCode::CallMayForceF,
             OpCode::CallMayForceN,
         ] {
-            let mut ops = vec![Op::new(
-                opcode,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
-            )];
+            let mut ops = vec![Op::new(opcode, &[rooted_inputarg_operand(Type::Ref, 100)])];
             assign_positions(&mut ops);
 
             let mut opt = Optimizer::new();
@@ -241,8 +240,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::SetfieldGc,
             &[
-                Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                rooted_inputarg_operand(Type::Ref, 100),
+                rooted_inputarg_operand(Type::Int, 101),
             ],
         )];
         assign_positions(&mut ops);

@@ -2120,7 +2120,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 item_opcode,
                 &[
                     Operand::from_boxref(&item_base),
-                    Operand::from_boxref(&BoxRef::from_opref(const_opref)),
+                    Operand::from_opref(const_opref),
                 ],
             );
             elem_op.pos.set(new_opref);
@@ -2626,6 +2626,7 @@ mod tests {
     use super::*;
     use crate::compile::make_fail_descr_with_index;
     use crate::history::test_support::rooted_inputarg_box;
+    use crate::history::test_support::rooted_inputarg_operand;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
@@ -2662,12 +2663,7 @@ mod tests {
         let rd_consts = memo.consts().to_vec();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[majit_ir::operand::Operand::from_boxref(
-                &rooted_inputarg_box(Type::Int, 1),
-            )],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb(Some(rd_numb));
@@ -2714,12 +2710,7 @@ mod tests {
             InputArg::new_ref(2),
             InputArg::new_ref(3),
         ];
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[majit_ir::operand::Operand::from_boxref(
-                &rooted_inputarg_box(Type::Ref, 0),
-            )],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Ref, 0)]);
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
         let descr = make_fail_descr_with_index(0, fail_arg_types.len());
         descr
@@ -2754,12 +2745,7 @@ mod tests {
         // consumers bind that result (from_bound_op) instead of a position-only
         // box, so patch_new_loop's forwarding rewrites them through op identity.
         let op0: majit_ir::OpRc = {
-            let mut op = Op::new(
-                OpCode::SameAsR,
-                &[majit_ir::operand::Operand::from_boxref(
-                    &rooted_inputarg_box(Type::Ref, 1),
-                )],
-            );
+            let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 1)]);
             op.pos.set(OpRef::ref_op(10));
             std::rc::Rc::new(op)
         };
@@ -2767,7 +2753,7 @@ mod tests {
         let op1: majit_ir::OpRc = std::rc::Rc::new(Op::new(
             OpCode::Label,
             &[
-                majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 0)),
+                rooted_inputarg_operand(Type::Ref, 0),
                 majit_ir::operand::Operand::from_boxref(&op0_result),
             ],
         ));
@@ -2854,9 +2840,9 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::Label,
             &[
-                majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 0)),
-                majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 1)),
-                majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 2)),
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
             ],
         )];
         let mut inputargs = vec![
