@@ -1806,6 +1806,22 @@ pub fn blackhole_resume_via_rd_numb(
     loop {
         if let Some(args) = bh.run() {
             // blackhole.py:1068: raise ContinueRunningNormally(*args)
+            //
+            // The blackhole reached a merge point with no pending exception
+            // (an unhandled raise would have propagated through the exception
+            // path above, not reached `run()`'s ContinueRunningNormally).  A
+            // residual call that raised AND was caught in-frame
+            // (`check_residual_call_exception_after` → `route_to_catch`) cleared
+            // only `BH_LAST_EXC_VALUE`; the backend `_store_exception` cells
+            // (`store_jit_exception` writes BOTH — see
+            // `publish_residual_call_exception`) keep the consumed exception.
+            // Re-entering compiled code via this ContinueRunningNormally would
+            // then have its first `GUARD_NO_EXCEPTION` read the stale cell as a
+            // spurious pending exception and deopt at a coordinate with no
+            // handler (the loop header), escaping the original try-block.  Drain
+            // the backend cells here so the re-entry starts pristine, mirroring
+            // the walker's `execute_raised` drain (`drain_backend_jit_exc`).
+            drain_backend_jit_exc();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
 
             let mut red_ref: Vec<PyObjectRef> =
@@ -2346,10 +2362,36 @@ pub fn trace_and_compile_from_bridge(
             false
         }
     };
-    if pending_exc && !last_bridge_is_exception_guard {
+    // A pending exception at an EXCEPTION guard (GUARD_NO_EXCEPTION /
+    // GUARD_EXCEPTION) whose raising op sits inside an in-frame try is the
+    // bridge-side analogue of the same fallthrough-not-catch resume gap.
+    // pyre encodes the guard's resume_pc as the no-exception semantic
+    // fallthrough (the next opcode after the call), NOT the `except`
+    // handler.  The blackhole compensates at runtime — `resume_in_blackhole`
+    // hands the pending exception to `handle_exception_in_frame`, which
+    // `find_catch_before_resume_live`-routes to the handler and runs it
+    // (e.g. `return -1`).  The bridge tracer has no such routing: it walks
+    // from the fallthrough resume_pc and records the RETURN of the (NULL)
+    // raised-call result — `Finish(<unbound box>)` — so the compiled bridge
+    // hands a NULL up to the caller ("call failed" / a corrupted kept value
+    // / a fault).  Detect the caught-in-frame case with the exact mechanism
+    // the interpreter's `handle_exception` uses — an exception-table lookup
+    // at the raising op (`last_instr` == resume_pc-1) — and decline so the
+    // always-correct blackhole resume handles it.  (Routing the bridge walk
+    // to the handler is the orthodox follow-up, gated on the in-try
+    // residual-call resume-PC epic; declining is correctness-first.)
+    let caught_in_frame = pending_exc && last_bridge_is_exception_guard && {
+        let off = if frame.last_instr < 0 {
+            0u32
+        } else {
+            (frame.last_instr as u32) * 2
+        };
+        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
+    };
+    if pending_exc && (!last_bridge_is_exception_guard || caught_in_frame) {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] decline (pending exc at non-exception guard) key={} trace={} fail={} resume_pc={}",
+                "[jit][bridge-trace] decline (pending exc, caught_in_frame={caught_in_frame}) key={} trace={} fail={} resume_pc={}",
                 green_key, trace_id, fail_index, resume_pc
             );
         }
