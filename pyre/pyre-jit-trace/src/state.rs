@@ -1564,6 +1564,42 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
     })
 }
 
+/// Depth-based `valuestackdepth` for `w_code` at `py_pc`:
+/// `nlocals + ncells + depth_at_py_pc[py_pc]`.  Mirrors the encoder's
+/// published vsd (the `jitcode_dispatch` valuestackdepth publish).  The
+/// stack base is `varnames + ncells` (`pyframe.py:111 valuestackdepth =
+/// co_nlocals + ncellvars + nfreevars`), not `varnames` alone, so a code
+/// object with cells/freevars (a closure/nested function) is not
+/// under-counted — see `concrete_nlocals`.
+///
+/// A multi-frame (inlined-callee) guard restores the whole virtualizable
+/// positionally via `write_from_resume_data_partial`, which writes the
+/// CHAIN frame's `valuestackdepth` — the OUTER section's depth.  When the
+/// resume pc is then overridden to the innermost section's `py_pc`, the
+/// physical frame's vsd must be corrected to that section's depth, else
+/// the interpreter resumes at the inner pc carrying the outer depth (an
+/// over-count that materializes a stray operand slot).  Returns `None`
+/// when the code or the liveness entry for `py_pc` is missing.
+pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
+    if w_code == 0 {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return None;
+    }
+    let code = unsafe { &*raw_code };
+    let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+    let depth = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(py_pc)
+        .copied()?;
+    Some(stack_base + depth as usize)
+}
+
 /// Return the per-semantic-local Ref-bank color assigned by regalloc for
 /// the registered jitcode at `jitcode_index`.  Forward map: local index
 /// `i` → post-rename color holding that local's Variable at trace-recorder
@@ -3451,6 +3487,37 @@ pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef>
     arr.as_slice().get(abs_idx).copied()
 }
 
+/// Read up to `max_len` slots of the GC-rooted live virtualizable frame's
+/// `locals_cells_stack_w` as concrete `Ref` values.  The live frame
+/// (`sym.concrete_vable_ptr`) sits on the CURRENT_FRAME chain, so
+/// `walk_pyframe_roots` forwards its slots on every collection — reading
+/// them here is GC-safe.  This is the source the bridge concrete shadow
+/// must use instead of the off-heap resume-decoded array, whose `Ref`
+/// entries dangle once a minor collection (residual virtual materialization
+/// during bridge setup) moves the referent but cannot forward the decode
+/// `Vec`.  Falls back to `fallback` (the decoded values) when no live
+/// frame/array is bound (unit-test / init-before-run path, no GC hazard).
+fn live_frame_array_values(
+    vable_ptr: usize,
+    max_len: usize,
+    fallback: &[majit_ir::Value],
+) -> Vec<majit_ir::Value> {
+    if vable_ptr == 0 {
+        return fallback.to_vec();
+    }
+    let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let lp = f.locals_cells_stack_w;
+    if lp.is_null() {
+        return fallback.to_vec();
+    }
+    let arr = unsafe { &*lp };
+    let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
+    let n = max_len.min(arr.len());
+    (0..n)
+        .map(|i| majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize)))
+        .collect()
+}
+
 /// pyframe.py:107-110: `locals_cells_stack_w` length =
 /// `co_nlocals + ncellvars + nfreevars + co_stacksize`. Returns the
 /// full heap-side array length (matching `virtualizable.py:86-99
@@ -4350,9 +4417,23 @@ impl PyreSym {
                 while values.len() < num_vable_scalars + array_len {
                     values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
                 }
+                // gap 10 slice 2b: bake the virtualizable identity against the
+                // LIVE interpreter frame (the frame the compiled loop runs on),
+                // not the discarded `snapshot_for_tracing` copy.  At root entry
+                // the snapshot is a fresh copy so its field VALUES equal the
+                // live frame's (read_all_boxes above); only the identity ADDRESS
+                // must be the live one, matching the SYM_FRAME_IDX input arg's
+                // runtime value (the live frame supplied by extract_live_values).
+                // Falls back to the snapshot address when no live frame was
+                // threaded (unit-test / init-before-run path).
+                let vable_identity_addr = if self.live_vable_frame_addr != 0 {
+                    self.live_vable_frame_addr
+                } else {
+                    concrete_frame
+                };
                 (
                     values,
-                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame)),
+                    majit_ir::Value::Ref(majit_ir::GcRef(vable_identity_addr)),
                 )
             } else {
                 (Vec::new(), majit_ir::Value::Void)
@@ -4899,6 +4980,19 @@ impl PyreJitState {
         );
     }
 
+    /// Null the locals_cells_stack slots at and above `depth`, the
+    /// fresh-frame parity clear (`write_from_resume_data_partial` does not
+    /// trim).  Used after a vsd correction so a GC scan before the next
+    /// push does not observe a stale operand pointer above the live depth.
+    pub fn clear_stack_above(&mut self, depth: usize) {
+        if let Some(arr) = self.locals_cells_stack_array_mut() {
+            let slice = arr.as_mut_slice();
+            for slot in slice.iter_mut().skip(depth) {
+                *slot = pyre_object::PY_NULL;
+            }
+        }
+    }
+
     /// Read the code pointer (pycode) from the heap frame.
     pub fn pycode_as_usize(&self) -> usize {
         self.read_frame_usize(PYFRAME_PYCODE_OFFSET)
@@ -5293,6 +5387,55 @@ fn reconstruct_inline_recipe(
     // the single-frame bridge rather than synthesize an unboxed local.
     if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
         return None;
+    }
+
+    // The recipe banks are written and read by the register COLOR reported in
+    // the liveness stream (`registers_r[reg_idx]` below), but every consumer
+    // indexes by the SEMANTIC `locals_cells_stack_w` slot: the trait re-trace's
+    // `load_local_value` reads `registers_r[local_idx]` (trace_opcode.rs:2360)
+    // and `stack_slot_reg_idx` reads `registers_r[nlocals + stack_idx]`
+    // (trace_opcode.rs:628), and `assemble_bridge_inline_pending` reads
+    // `concrete_r[k]` by semantic slot k. This recipe is therefore only valid
+    // when each live color equals the semantic slot it denotes (color ==
+    // semantic). Regalloc pins that identity at call-boundary resume pcs (a
+    // straight-line callee resumes after its CALL with locals at colors
+    // `0..nlocals`), but a MID-BODY resume — e.g. a guard fired inside a
+    // callee branch (`goto_if_not` target) — coalesces colors so the live
+    // stack value sits at a renamed color the static `stack_slot_color_map`
+    // no longer matches. Faithfully rebuilding that frame needs a per-pc
+    // color→semantic map the metadata does not carry, so decline to the
+    // single-frame bridge (whose vable payload IS semantic-ordered) rather
+    // than rebuild the frame with mis-slotted boxes. Identity is checked via
+    // the same `semantic_ref_slot_for_reg_color` rule the encoder mirrors.
+    let local_color_map = local_slot_color_map_at(frame.jitcode_index);
+    let stack_color_map = stack_slot_color_map_at(frame.jitcode_index);
+    let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize)
+    {
+        Some(d) => d,
+        None => return None,
+    };
+    let live_local_indices: Vec<usize> = (0..nlocals)
+        .filter(|&idx| {
+            crate::liveness::liveness_for(raw_code).is_local_live(frame.pc as usize, idx)
+        })
+        .collect();
+    for &color in &reg_indices.ref_ {
+        match semantic_ref_slot_for_reg_color(
+            nlocals,
+            stack_only,
+            &local_color_map,
+            &stack_color_map,
+            &live_local_indices,
+            None,
+            color as usize,
+        ) {
+            // color == semantic slot: the recipe's color-indexed fill is
+            // also the correct semantic fill.
+            Some(semantic_idx) if semantic_idx == color as usize => {}
+            // A live color whose semantic slot differs (or is unmappable):
+            // the color-indexed recipe would mis-slot it. Decline.
+            _ => return None,
+        }
     }
 
     let mut registers_i: Vec<OpRef> = Vec::new();
@@ -7414,10 +7557,28 @@ impl JitState for PyreJitState {
             frame0.values.len(),
             frame0.pc,
         );
+        // gap-10 GotoIfNotValueNotConcrete (bridge sub-class): the resume
+        // data carries the concrete runtime value for every live frame
+        // register, but the consume_boxes loops below keep only the OpRef
+        // and DROP the concrete — so a bridge resume leaves loop-carried
+        // locals symbolic and a data-dependent branch derived from one
+        // (`(i%7) and ...` → TO_BOOL → goto_if_not) can't fold its
+        // direction, declining to the trait leg.  Stamp each decoded
+        // concrete onto its OpRef so the symbolic walk folds the branch
+        // per the actual failing-iteration path (the same path the trait
+        // tracer's owned_concrete_frame would execute), emitting a real
+        // GuardTrue/GuardFalse — orthodox meta-tracing ("trace the
+        // concrete path, guard it"; the IR keeps the symbolic InputArg,
+        // the concrete is a trace-time shadow only, so the optimizer does
+        // NOT const-fold the loop-variant value).  Default-ON (`=0` opts
+        // out) once validated, mirroring the LoadGlobal-fold / multiframe
+        // gap-10 flips; the opt-out keeps the prior symbolic-bridge
+        // behavior available for A/B.
+        let seed_bridge_locals = std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
         let mut value_cursor = 0usize;
         for &reg_idx in &reg_indices.int {
             let value = &frame0.values[value_cursor];
-            let (resolved, _) = bridge_decode_box(
+            let (resolved, concrete_val) = bridge_decode_box(
                 ctx,
                 value,
                 Type::Int,
@@ -7428,6 +7589,9 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
+                ctx.try_set_opref_concrete(resolved, concrete_val);
+            }
             let reg_idx = reg_idx as usize;
             if reg_idx >= sym.registers_i.len() {
                 sym.registers_i.resize(reg_idx + 1, OpRef::NONE);
@@ -7437,7 +7601,7 @@ impl JitState for PyreJitState {
         }
         for &reg_idx in &reg_indices.ref_ {
             let value = &frame0.values[value_cursor];
-            let (resolved, _) = bridge_decode_box(
+            let (resolved, concrete_val) = bridge_decode_box(
                 ctx,
                 value,
                 Type::Ref,
@@ -7448,6 +7612,9 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
+                ctx.try_set_opref_concrete(resolved, concrete_val);
+            }
             let reg_idx = reg_idx as usize;
             if reg_idx >= bridge_registers_r.len() {
                 bridge_registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -7457,7 +7624,7 @@ impl JitState for PyreJitState {
         }
         for &reg_idx in &reg_indices.float {
             let value = &frame0.values[value_cursor];
-            let (resolved, _) = bridge_decode_box(
+            let (resolved, concrete_val) = bridge_decode_box(
                 ctx,
                 value,
                 Type::Float,
@@ -7468,6 +7635,9 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
+                ctx.try_set_opref_concrete(resolved, concrete_val);
+            }
             let reg_idx = reg_idx as usize;
             if reg_idx >= sym.registers_f.len() {
                 sym.registers_f.resize(reg_idx + 1, OpRef::NONE);
@@ -7499,12 +7669,37 @@ impl JitState for PyreJitState {
         // local slots prefer the vable array item over a NONE/null-const value.
         // Stack slots keep the NONE-only fallback (a real stack value must not
         // be overwritten).
-        let overlay_local = |slot: &mut OpRef, s: usize| {
+        //
+        // GC-rooted concrete source for the per-local stamp below: read the
+        // live virtualizable frame's slots directly (post the ref/int/float
+        // decode loops above, which allocate and may trigger a minor GC) so
+        // the stamp never points at a stale off-heap `vable_array_values`
+        // copy whose `Ref`s a collection has since moved.  See
+        // `live_frame_array_values`.
+        let live_local_values = live_frame_array_values(
+            sym.concrete_vable_ptr as usize,
+            usize::MAX,
+            &vable_array_values,
+        );
+        let mut overlay_local = |slot: &mut OpRef, s: usize| {
             let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
             if slot.is_none() || slot_is_null_const {
                 if let Some(v) = vable_array_items.get(s).copied() {
                     if !v.is_none() {
                         *slot = v;
+                        // A local resolved from the vable image: stamp its
+                        // concrete from the GC-rooted live frame slot
+                        // (`live_local_values`, not the off-heap decoded
+                        // array) so the seeded bridge walk can fold a branch
+                        // derived from it without risking a moved-pointer
+                        // stamp (gap-10 bridge sub-class; see seed note above).
+                        if seed_bridge_locals {
+                            if let Some(&cv) = live_local_values.get(s) {
+                                if !matches!(cv, majit_ir::Value::Void) {
+                                    ctx.try_set_opref_concrete(v, cv);
+                                }
+                            }
+                        }
                     } else if slot.is_none() {
                         *slot = OpRef::NONE;
                     }
@@ -7767,25 +7962,11 @@ impl JitState for PyreJitState {
         // init-before-run). The seed helper pads short arrays with const-NULL
         // OpRef; match that here by padding concrete values with
         // Value::Ref(GcRef::NULL) to the same length.
-        let live_array_values: Vec<majit_ir::Value> = if sym.concrete_vable_ptr.is_null() {
-            vable_array_values.clone()
-        } else {
-            let f =
-                unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
-            let lp = f.locals_cells_stack_w;
-            if lp.is_null() {
-                vable_array_values.clone()
-            } else {
-                let arr = unsafe { &*lp };
-                let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
-                let n = bridge_array_len.min(arr.len());
-                (0..n)
-                    .map(|i| {
-                        majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize))
-                    })
-                    .collect()
-            }
-        };
+        let live_array_values = live_frame_array_values(
+            sym.concrete_vable_ptr as usize,
+            bridge_array_len,
+            &vable_array_values,
+        );
         let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
         concrete_values.extend_from_slice(&vable_scalar_values);
         let taken_concrete = live_array_values.len().min(bridge_array_len);
@@ -11757,6 +11938,21 @@ pub(crate) fn assemble_bridge_inline_pending(
         .collect();
     sym.concrete_namespace = w_globals;
     sym.concrete_execution_context = execution_context;
+    // perform_call threads the caller's `ec` down to every inlined callee
+    // (reds=['frame','ec'], interp_jit.py:67), so the callee shares the
+    // caller's ExecutionContext OpRef. Seed `sym.execution_context` from the
+    // immediate parent's symbolic ec (the root caller's `setup_bridge_sym`
+    // resolved it from `portal_ec_reg`, state.rs:7399) so an in-callee
+    // `ensure_execution_context` returns it directly. `sym.frame` is NONE for
+    // a reconstructed inline frame, so without this seed the recovery path
+    // would emit `GetfieldGcR(NONE)` (an unbacked VoidOp arg) and fail
+    // bridge regalloc.
+    if let Some(parent) = parent_frames.first() {
+        let parent_ec = unsafe { (*parent.sym).execution_context };
+        if !parent_ec.is_none() {
+            sym.execution_context = parent_ec;
+        }
+    }
     // pyjitpl.py:74-90 MIFrame.setup: size the per-kind banks + copy_constants.
     // The constant tail lands at `[num_regs_X..]`, beyond the live
     // valuestackdepth prefix (`num_regs_r` is the full Ref register file),
