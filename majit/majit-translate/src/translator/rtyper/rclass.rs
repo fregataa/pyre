@@ -60,7 +60,7 @@ use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variabl
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, StructType,
+    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
@@ -200,7 +200,7 @@ static OBJECT_FAMILY: LazyLock<ObjectFamilyTypes> = LazyLock::new(|| {
     // Step 3a — OBJECT = GcStruct('object', ('typeptr', CLASSTYPE),
     // rtti=True). Same body as before, but built from the local
     // `classtype` rather than the static singleton.
-    let object = LowLevelType::Struct(Box::new(StructType::gc_rtti_with_hints(
+    let object = LowLevelType::Struct(Box::new(Struct::gc_rtti_with_hints(
         "object",
         vec![("typeptr".into(), classtype.clone())],
         vec![
@@ -235,7 +235,7 @@ static OBJECT_FAMILY: LazyLock<ObjectFamilyTypes> = LazyLock::new(|| {
             result: objectptr.clone(),
         }),
     }));
-    let body = StructType::with_hints(
+    let body = Struct::with_hints(
         "object_vtable",
         vec![
             ("subclassrange_min".into(), LowLevelType::Signed),
@@ -294,7 +294,7 @@ pub static OBJECTPTR: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.ob
 /// RPython `NONGCOBJECT = Struct('nongcobject', ('typeptr', CLASSTYPE))`
 /// (rclass.py:176).
 pub static NONGCOBJECT: LazyLock<LowLevelType> = LazyLock::new(|| {
-    LowLevelType::Struct(Box::new(StructType::new(
+    LowLevelType::Struct(Box::new(Struct::new(
         "nongcobject",
         vec![("typeptr".into(), CLASSTYPE.clone())],
     )))
@@ -438,7 +438,7 @@ fn lowleveltype_size_hint(lltype: &LowLevelType) -> Option<usize> {
     }
 }
 
-fn attr_reverse_size((_, lltype): &(String, LowLevelType)) -> Option<i64> {
+pub fn attr_reverse_size((_, lltype): &(String, LowLevelType)) -> Option<i64> {
     lowleveltype_size_hint(lltype).map(|size| -(size as i64))
 }
 
@@ -538,6 +538,19 @@ pub fn ll_inst_type(obj: Option<&_ptr>) -> Result<Option<_ptr>, TyperError> {
     match obj {
         Some(ptr) if ptr.nonzero() => ll_type(ptr).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// RPython `ll_issubclass_const(subcls, minid, maxid)`.
+pub fn ll_issubclass_const(subcls: &_ptr, minid: i64, maxid: i64) -> Result<bool, TyperError> {
+    let subcls_min = subcls
+        .getattr("subclassrange_min")
+        .map_err(TyperError::message)?;
+    match subcls_min {
+        lltype::LowLevelValue::Signed(n) => Ok(minid <= n && n < maxid),
+        other => Err(TyperError::message(format!(
+            "ll_issubclass_const: subclassrange_min not Signed, got {other:?}"
+        ))),
     }
 }
 
@@ -1702,7 +1715,7 @@ impl Repr for ClassRepr {
         let mut fields = Vec::with_capacity(1 + llfields.len());
         fields.push(("super".into(), super_field_type));
         fields.extend(llfields);
-        let vtable_body = StructType::with_hints(
+        let vtable_body = Struct::with_hints(
             &format!("{name}_vtable"),
             fields,
             vec![
@@ -3816,8 +3829,8 @@ impl Repr for InstanceRepr {
         struct_fields.push(("super".into(), rbase.object_type().clone()));
         struct_fields.extend(myllfields);
         let body = match self.gcflavor {
-            Flavor::Gc => StructType::gc_rtti(&name, struct_fields),
-            Flavor::Raw => StructType::with_hints(&name, struct_fields, vec![]),
+            Flavor::Gc => Struct::gc_rtti(&name, struct_fields),
+            Flavor::Raw => Struct::with_hints(&name, struct_fields, vec![]),
         };
         let LowLevelType::ForwardReference(fwd) = &self.object_type else {
             return Err(TyperError::message(
@@ -4335,7 +4348,7 @@ mod tests {
         let null_object = nullptr(OBJECT.clone()).expect("nullptr object");
         assert_eq!(ll_inst_hash(Some(&null_object)), 0);
 
-        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(
+        let struct_t = LowLevelType::Struct(Box::new(Struct::gc(
             "pkg.C",
             vec![("inst_x".into(), LowLevelType::Signed)],
         )));
@@ -4350,6 +4363,22 @@ mod tests {
             LowLevelValue::Signed(7)
         );
         assert_eq!(ll_inst_type(None).expect("None type"), None);
+
+        let mut subcls = malloc(
+            LowLevelType::Struct(Box::new(Struct::gc(
+                "vtable",
+                vec![("subclassrange_min".into(), LowLevelType::Signed)],
+            ))),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("malloc vtable");
+        subcls
+            .setattr("subclassrange_min", LowLevelValue::Signed(7))
+            .expect("set subclassrange_min");
+        assert!(ll_issubclass_const(&subcls, 3, 9).expect("inside range"));
+        assert!(!ll_issubclass_const(&subcls, 8, 12).expect("outside range"));
 
         let err = declare_type_for_typeptr(&ptr, &OBJECT.clone()).expect_err("deferred");
         assert!(err.is_missing_rtype_operation());
@@ -6133,13 +6162,13 @@ mod tests {
 
         // LLPtr case — forge a _ptr via malloc and verify the adapter returns
         // a Ptr variant carrying the exact same _ptr identity.
-        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(
+        let struct_t = LowLevelType::Struct(Box::new(Struct::gc(
             "pkg.P",
             vec![("x".into(), LowLevelType::Signed)],
         )));
         let ptr = malloc(struct_t.clone(), None, MallocFlavor::Gc, true).unwrap();
         let ptr_t = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
+            TO: PtrTarget::Struct(Struct::gc(
                 "pkg.P",
                 vec![("x".into(), LowLevelType::Signed)],
             )),

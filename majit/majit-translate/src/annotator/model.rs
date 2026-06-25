@@ -193,6 +193,22 @@ impl fmt::Display for KnownType {
     }
 }
 
+/// RPython `commonbase(cls1, cls2)` (model.py:818-826), specialized to
+/// the Rust port's [`KnownType`] carrier for live Python type objects.
+pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
+    if cls1 == cls2 {
+        return cls1;
+    }
+    match (cls1, cls2) {
+        // Python `bool` subclasses `int`.
+        (KnownType::Bool, KnownType::Int) | (KnownType::Int, KnownType::Bool) => KnownType::Int,
+        // `Other` means the Rust port has not yet carried the concrete
+        // host type into KnownType. Two equal `Other`s are handled above;
+        // otherwise the nearest known common base is `object`.
+        _ => KnownType::Object,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SomeObject base — RPython `model.py:51-125`.
 // ---------------------------------------------------------------------------
@@ -202,10 +218,10 @@ impl fmt::Display for KnownType {
 /// Acts both as the "universal" annotation (`object`) and as the
 /// shared base-state carried by every subclass via composition. The
 /// `SomeValue::Object` enum variant wraps this struct directly; every
-/// other `SomeXxx` struct embeds it as `pub base: SomeObjectBase` so
+/// other `SomeXxx` struct embeds it as `pub base: SomeObject` so
 /// upstream's `super().__init__()` behaviour is preserved.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SomeObjectBase {
+pub struct SomeObject {
     /// RPython `self.const_box`. Populated via the
     /// `ConstAccessDelegator` when `self.const = xyz` is assigned;
     /// `is_constant()` returns true whenever this is `Some`.
@@ -218,9 +234,9 @@ pub struct SomeObjectBase {
     pub immutable: bool,
 }
 
-impl SomeObjectBase {
+impl SomeObject {
     pub fn new(knowntype: KnownType, immutable: bool) -> Self {
-        SomeObjectBase {
+        SomeObject {
             const_box: None,
             knowntype,
             immutable,
@@ -228,11 +244,11 @@ impl SomeObjectBase {
     }
 }
 
-impl Default for SomeObjectBase {
+impl Default for SomeObject {
     fn default() -> Self {
         // RPython `SomeObject` defaults: `knowntype = object`,
         // `immutable = False`, no const box.
-        SomeObjectBase::new(KnownType::Object, false)
+        SomeObject::new(KnownType::Object, false)
     }
 }
 
@@ -273,13 +289,13 @@ pub trait SomeObjectTrait {
 /// Stands for a `type` value; upstream sets `can_be_none = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeType {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeType {
     pub fn new() -> Self {
         SomeType {
-            base: SomeObjectBase::new(KnownType::Type, true),
+            base: SomeObject::new(KnownType::Type, true),
         }
     }
 }
@@ -310,13 +326,13 @@ impl SomeObjectTrait for SomeType {
 /// promoted to float).
 #[derive(Clone, Debug)]
 pub struct SomeFloat {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeFloat {
     pub fn new() -> Self {
         SomeFloat {
-            base: SomeObjectBase::new(KnownType::Float, true),
+            base: SomeObject::new(KnownType::Float, true),
         }
     }
 
@@ -372,13 +388,13 @@ impl SomeObjectTrait for SomeFloat {
 /// RPython `class SomeSingleFloat(SomeObject)` (model.py:186-193).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeSingleFloat {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeSingleFloat {
     pub fn new() -> Self {
         SomeSingleFloat {
-            base: SomeObjectBase::new(KnownType::Singlefloat, true),
+            base: SomeObject::new(KnownType::Singlefloat, true),
         }
     }
 }
@@ -407,13 +423,13 @@ impl SomeObjectTrait for SomeSingleFloat {
 /// RPython `class SomeLongFloat(SomeObject)` (model.py:196-203).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeLongFloat {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeLongFloat {
     pub fn new() -> Self {
         SomeLongFloat {
-            base: SomeObjectBase::new(KnownType::Longfloat, true),
+            base: SomeObject::new(KnownType::Longfloat, true),
         }
     }
 }
@@ -447,7 +463,7 @@ impl SomeObjectTrait for SomeLongFloat {
 /// `base_int` subclass hierarchy lands with the rlib/rarithmetic port.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeInteger {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// RPython `self.nonneg` — known to be ≥ 0.
     pub nonneg: bool,
     /// RPython `self.unsigned` — `knowntype is r_uint`.
@@ -473,7 +489,7 @@ impl SomeInteger {
             KnownType::Int
         };
         SomeInteger {
-            base: SomeObjectBase::new(knowntype, true),
+            base: SomeObject::new(knowntype, true),
             // upstream: `self.nonneg = unsigned or nonneg`.
             nonneg: unsigned || nonneg,
             unsigned,
@@ -501,7 +517,7 @@ impl SomeInteger {
             KnownType::Ruint | KnownType::ULongLong | KnownType::ULongLongLong
         );
         SomeInteger {
-            base: SomeObjectBase::new(knowntype, true),
+            base: SomeObject::new(knowntype, true),
             nonneg: unsigned || nonneg,
             unsigned,
             knowntypedata: None,
@@ -574,7 +590,7 @@ pub type KnownTypeData =
 /// narrowed (and what to narrow to) in that branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeBool {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// RPython `self.knowntypedata` (model.py:236-242). Absent when
     /// `set_knowntypedata` was never called or when all branches were
     /// pruned. Upstream uses a `defaultdict(dict)` keyed by `bool`;
@@ -586,7 +602,7 @@ pub struct SomeBool {
 impl SomeBool {
     pub fn new() -> Self {
         SomeBool {
-            base: SomeObjectBase::new(KnownType::Bool, true),
+            base: SomeObject::new(KnownType::Bool, true),
             knowntypedata: None,
         }
     }
@@ -636,18 +652,18 @@ impl SomeObjectTrait for SomeBool {
 /// A4.1 stores the two flag bits directly; the full `nonnulify` /
 /// `nonnoneify` transformer methods land with A4.4.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StringCommon {
-    pub base: SomeObjectBase,
+pub struct SomeStringOrUnicode {
+    pub base: SomeObject,
     /// RPython `self.can_be_None`.
     pub can_be_none: bool,
     /// RPython `self.no_nul`.
     pub no_nul: bool,
 }
 
-impl StringCommon {
+impl SomeStringOrUnicode {
     pub fn new(knowntype: KnownType, immutable: bool, can_be_none: bool, no_nul: bool) -> Self {
-        StringCommon {
-            base: SomeObjectBase::new(knowntype, immutable),
+        SomeStringOrUnicode {
+            base: SomeObject::new(knowntype, immutable),
             can_be_none,
             no_nul,
         }
@@ -657,13 +673,13 @@ impl StringCommon {
 /// RPython `class SomeString(SomeStringOrUnicode)` (model.py:288-294).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeString {
-    pub inner: StringCommon,
+    pub inner: SomeStringOrUnicode,
 }
 
 impl SomeString {
     pub fn new(can_be_none: bool, no_nul: bool) -> Self {
         SomeString {
-            inner: StringCommon::new(KnownType::Str, true, can_be_none, no_nul),
+            inner: SomeStringOrUnicode::new(KnownType::Str, true, can_be_none, no_nul),
         }
     }
 }
@@ -693,13 +709,13 @@ impl SomeObjectTrait for SomeString {
 /// (model.py:296-302).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeUnicodeString {
-    pub inner: StringCommon,
+    pub inner: SomeStringOrUnicode,
 }
 
 impl SomeUnicodeString {
     pub fn new(can_be_none: bool, no_nul: bool) -> Self {
         SomeUnicodeString {
-            inner: StringCommon::new(KnownType::Unicode, true, can_be_none, no_nul),
+            inner: SomeStringOrUnicode::new(KnownType::Unicode, true, can_be_none, no_nul),
         }
     }
 }
@@ -729,7 +745,7 @@ impl SomeObjectTrait for SomeUnicodeString {
 /// (model.py:304-306). Differs from its siblings in `immutable = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeByteArray {
-    pub inner: StringCommon,
+    pub inner: SomeStringOrUnicode,
 }
 
 impl SomeByteArray {
@@ -737,7 +753,7 @@ impl SomeByteArray {
         SomeByteArray {
             // `no_nul` is asserted to require `immutable`; bytearray
             // is mutable, so `no_nul` is always False here.
-            inner: StringCommon::new(KnownType::Bytearray, false, can_be_none, false),
+            inner: SomeStringOrUnicode::new(KnownType::Bytearray, false, can_be_none, false),
         }
     }
 }
@@ -768,13 +784,13 @@ impl SomeObjectTrait for SomeByteArray {
 /// A character is a length-1 string with `can_be_None = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeChar {
-    pub inner: StringCommon,
+    pub inner: SomeStringOrUnicode,
 }
 
 impl SomeChar {
     pub fn new(no_nul: bool) -> Self {
         SomeChar {
-            inner: StringCommon::new(KnownType::Str, true, false, no_nul),
+            inner: SomeStringOrUnicode::new(KnownType::Str, true, false, no_nul),
         }
     }
 }
@@ -804,13 +820,13 @@ impl SomeObjectTrait for SomeChar {
 /// (model.py:318-324).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeUnicodeCodePoint {
-    pub inner: StringCommon,
+    pub inner: SomeStringOrUnicode,
 }
 
 impl SomeUnicodeCodePoint {
     pub fn new(no_nul: bool) -> Self {
         SomeUnicodeCodePoint {
-            inner: StringCommon::new(KnownType::Unicode, true, false, no_nul),
+            inner: SomeStringOrUnicode::new(KnownType::Unicode, true, false, no_nul),
         }
     }
 }
@@ -864,14 +880,14 @@ pub use super::dictdef::DictDef;
 /// Homogeneous list of unknown length.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeList {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub listdef: ListDef,
 }
 
 impl SomeList {
     pub fn new(listdef: ListDef) -> Self {
         SomeList {
-            base: SomeObjectBase::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::Other, false),
             listdef,
         }
     }
@@ -898,10 +914,10 @@ impl SomeObjectTrait for SomeList {
 /// (model.py:357-371). Fixed-length tuple; when every element is
 /// constant, `self.const` becomes the tuple of constants. We track
 /// elements directly; the `self.const` shortcut is computed on demand
-/// via `is_constant()` + `SomeObjectBase.const_box`.
+/// via `is_constant()` + `SomeObject.const_box`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeTuple {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub items: Vec<SomeValue>,
 }
 
@@ -927,7 +943,7 @@ impl SomeTuple {
             Some(ConstValue::Tuple(out))
         }
 
-        let mut base = SomeObjectBase::new(KnownType::Other, true);
+        let mut base = SomeObject::new(KnownType::Other, true);
         if let Some(value) = tuple_const_value(&items) {
             base.const_box = Some(Constant::new(value));
         }
@@ -959,14 +975,14 @@ impl SomeObjectTrait for SomeTuple {
 /// variant per CLAUDE.md parity rule #1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeDict {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub dictdef: DictDef,
 }
 
 impl SomeDict {
     pub fn new(dictdef: DictDef) -> Self {
         SomeDict {
-            base: SomeObjectBase::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::Other, false),
             dictdef,
         }
     }
@@ -987,13 +1003,16 @@ impl SomeObjectTrait for SomeDict {
     }
 }
 
+/// RPython `SomeDict = SomeOrderedDict` (model.py:416).
+pub type SomeOrderedDict = SomeDict;
+
 /// RPython `class SomeIterator(SomeObject)` (model.py:419-428).
 /// Wraps a container's element annotation; `variant` captures the
 /// upstream `*variant` tuple (e.g. `"items"`, `"keys"`, `"values"`
 /// for dict iterators).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeIterator {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub s_container: Box<SomeValue>,
     pub variant: Vec<String>,
     /// Upstream `SomeIterator(self, "enumerate", const)` carries the
@@ -1015,7 +1034,7 @@ impl SomeIterator {
         enumerate_start: Option<crate::flowspace::model::ConstValue>,
     ) -> Self {
         SomeIterator {
-            base: SomeObjectBase::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::Other, false),
             s_container: Box::new(s_container),
             variant,
             enumerate_start,
@@ -1097,7 +1116,7 @@ pub enum DescKind {
 /// impl below routes the field through [`classdef_opt_eq`].
 #[derive(Clone, Debug)]
 pub struct SomeInstance {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// RPython `self.classdef`. `None` denotes `object`-only instances
     /// (upstream: `SomeInstance(classdef=None)`).
     pub classdef: Option<Rc<RefCell<ClassDef>>>,
@@ -1124,7 +1143,7 @@ impl SomeInstance {
         flags: std::collections::BTreeMap<String, bool>,
     ) -> Self {
         SomeInstance {
-            base: SomeObjectBase::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::Other, false),
             classdef,
             can_be_none,
             flags,
@@ -1169,7 +1188,7 @@ impl SomeObjectTrait for SomeInstance {
 /// [`classdef_vec_contains`].
 #[derive(Clone, Debug)]
 pub struct SomeException {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub classdefs: Vec<Rc<RefCell<ClassDef>>>,
 }
 
@@ -1182,7 +1201,7 @@ impl SomeException {
             }
         }
         SomeException {
-            base: SomeObjectBase::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::Other, false),
             classdefs: unique,
         }
     }
@@ -1248,7 +1267,7 @@ impl SomeObjectTrait for SomeException {
 /// enforcement branches (ClassDesc / MethodOfFrozenDesc).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomePBC {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// RPython `self.descriptions` (model.py:522): a Python set of
     /// [`DescEntry`] objects. The Rust port uses
     /// `BTreeMap<DescKey, DescEntry>` — keyed by pointer identity to
@@ -1286,7 +1305,7 @@ impl SomePBC {
             .collect();
         assert!(!map.is_empty(), "SomePBC must be non-empty");
         let mut pbc = SomePBC {
-            base: SomeObjectBase::new(KnownType::Other, true),
+            base: SomeObject::new(KnownType::Other, true),
             descriptions: map,
             can_be_none,
             subset_of,
@@ -1303,15 +1322,16 @@ impl SomePBC {
         // (Ok) path.
         let _ = pbc.simplify();
         // upstream model.py:527-531 — `knowntype = reduce(commonbase,
-        // [x.knowntype for x in descriptions])`. Full `commonbase`
-        // folding depends on Python `type` objects; the current Rust
-        // lattice promotes a class-homogeneous PBC to `KnownType::Type`
-        // (upstream `knowntype == type`) and leaves others as `Object`.
-        if let Ok(kind) = pbc.get_kind() {
-            if matches!(kind, DescKind::Class) {
-                pbc.base.knowntype = KnownType::Type;
-            }
-        }
+        // [x.knowntype for x in descriptions])`.
+        pbc.base.knowntype = pbc
+            .descriptions
+            .values()
+            .map(|desc| match desc.kind() {
+                DescKind::Class => KnownType::Type,
+                _ => KnownType::Other,
+            })
+            .reduce(commonbase)
+            .unwrap_or(KnownType::Object);
         // upstream model.py:532-537 — single-desc pyobj const hack:
         //     if len(descriptions) == 1 and not can_be_None:
         //         desc, = descriptions
@@ -1514,9 +1534,16 @@ impl SomePBC {
     }
 }
 
+/// RPython `class SomeConstantType(SomePBC)` (model.py:620-626).
+///
+/// The Rust representation uses `SomePBC` plus `const_box` for this
+/// subclass state; exposing the upstream name keeps the annotator and
+/// binaryop surfaces aligned.
+pub type SomeConstantType = SomePBC;
+
 impl SomeObjectTrait for SomePBC {
     fn knowntype(&self) -> KnownType {
-        KnownType::Other
+        self.base.knowntype
     }
     fn immutable(&self) -> bool {
         true
@@ -1539,12 +1566,12 @@ impl SomeObjectTrait for SomePBC {
 /// `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeNone {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeNone {
     pub fn new() -> Self {
-        let mut base = SomeObjectBase::new(KnownType::NoneType, true);
+        let mut base = SomeObject::new(KnownType::NoneType, true);
         base.const_box = Some(Constant::new(
             super::super::flowspace::model::ConstValue::None,
         ));
@@ -1579,7 +1606,7 @@ impl SomeObjectTrait for SomeNone {
 /// descriptors returned by `bookkeeper.immutablevalue`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeProperty {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub fget: Option<HostObject>,
     pub fset: Option<HostObject>,
 }
@@ -1587,7 +1614,7 @@ pub struct SomeProperty {
 impl SomeProperty {
     pub fn new(prop: &HostObject) -> Self {
         SomeProperty {
-            base: SomeObjectBase::new(KnownType::PropertyType, true),
+            base: SomeObject::new(KnownType::PropertyType, true),
             fget: prop.property_fget().cloned(),
             fset: prop.property_fset().cloned(),
         }
@@ -1646,7 +1673,7 @@ pub struct SandboxingPayload {
 /// first-class Rust closures don't round-trip through `==` / `Debug`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeBuiltin {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// Opaque name identifying the special-cased analyser
     /// (e.g. `"getattr"`, `"isinstance"`, `"len"`). Populated from
     /// specialcase.rs when the bookkeeper is wired in.
@@ -1669,7 +1696,7 @@ impl SomeBuiltin {
         methodname: Option<String>,
     ) -> Self {
         SomeBuiltin {
-            base: SomeObjectBase::new(KnownType::BuiltinFunctionOrMethod, true),
+            base: SomeObject::new(KnownType::BuiltinFunctionOrMethod, true),
             analyser_name: analyser_name.into(),
             s_self: s_self.map(Box::new),
             methodname,
@@ -1701,7 +1728,7 @@ impl SomeObjectTrait for SomeBuiltin {
 /// `SomeBuiltin` with additional ad-hoc flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeBuiltinMethod {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// Opaque identifier for the special-cased analyser hook.
     pub analyser_name: String,
     /// Bound-method receiver annotation (`self.s_self` upstream).
@@ -1723,7 +1750,7 @@ impl SomeBuiltinMethod {
         methodname: impl Into<String>,
     ) -> Self {
         SomeBuiltinMethod {
-            base: SomeObjectBase::new(KnownType::BuiltinFunctionOrMethod, true),
+            base: SomeObject::new(KnownType::BuiltinFunctionOrMethod, true),
             analyser_name: analyser_name.into(),
             s_self: Rc::new(s_self),
             methodname: methodname.into(),
@@ -1766,13 +1793,13 @@ impl SomeObjectTrait for SomeBuiltinMethod {
 /// `SomeValue::Impossible` remains as a zero-state convenience alias.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeImpossibleValue {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeImpossibleValue {
     pub fn new() -> Self {
         SomeImpossibleValue {
-            base: SomeObjectBase::new(KnownType::Object, true),
+            base: SomeObject::new(KnownType::Object, true),
         }
     }
 }
@@ -1804,7 +1831,7 @@ impl SomeObjectTrait for SomeImpossibleValue {
 /// Equality on `classdef` is identity-based (`Rc::ptr_eq`).
 #[derive(Clone, Debug)]
 pub struct SomeWeakRef {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// RPython `self.classdef` — `None` for known-dead weakrefs.
     pub classdef: Option<Rc<RefCell<ClassDef>>>,
 }
@@ -1812,7 +1839,7 @@ pub struct SomeWeakRef {
 impl SomeWeakRef {
     pub fn new(classdef: Option<Rc<RefCell<ClassDef>>>) -> Self {
         SomeWeakRef {
-            base: SomeObjectBase::new(KnownType::WeakrefReference, true),
+            base: SomeObject::new(KnownType::WeakrefReference, true),
             classdef,
         }
     }
@@ -1852,7 +1879,7 @@ impl SomeObjectTrait for SomeWeakRef {
 /// port matches: `is_type_of: Vec<Rc<Variable>>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeTypeOf {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     /// RPython `self.is_type_of` — the `args_v` list.
     pub is_type_of: Vec<Rc<Variable>>,
 }
@@ -1860,7 +1887,7 @@ pub struct SomeTypeOf {
 impl SomeTypeOf {
     pub fn new(is_type_of: Vec<Rc<Variable>>) -> Self {
         SomeTypeOf {
-            base: SomeObjectBase::new(KnownType::Type, true),
+            base: SomeObject::new(KnownType::Type, true),
             is_type_of,
         }
     }
@@ -1897,7 +1924,7 @@ pub enum SomeValue {
     /// RPython `class SomeImpossibleValue(SomeObject)` (model.py:627 —
     /// lands fully in A4.5). Placeholder until then; no state.
     Impossible,
-    Object(SomeObjectBase),
+    Object(SomeObject),
     Type(SomeType),
     Float(SomeFloat),
     SingleFloat(SomeSingleFloat),
@@ -1991,7 +2018,7 @@ impl SomeValueTag {
             // Type chain: SomeTypeOf < SomeType < SomeObject (model.py:146-149).
             T::TypeOf => &[T::TypeOf, T::Type, T::Object],
             T::Type => &[T::Type, T::Object],
-            // String family shares a StringCommon base upstream; dispatch
+            // String family shares a SomeStringOrUnicode base upstream; dispatch
             // is flat — each tag resolves to itself then Object.
             T::String => &[T::String, T::Object],
             T::UnicodeString => &[T::UnicodeString, T::Object],
@@ -2081,10 +2108,10 @@ impl SomeValue {
         }
     }
 
-    /// Shorthand for [`SomeValue::Object`] with `SomeObjectBase::default()`
+    /// Shorthand for [`SomeValue::Object`] with `SomeObject::default()`
     /// — the upstream `SomeObject()` constructor.
     pub fn object() -> Self {
-        SomeValue::Object(SomeObjectBase::default())
+        SomeValue::Object(SomeObject::default())
     }
 
     /// RPython `s.contains(other)` (model.py:94-100). Delegates to the
@@ -2221,7 +2248,7 @@ impl SomeValue {
     /// Upstream wraps the assignment in `try/except` because some
     /// `SomeXXX` subclasses define `const` as a property without a
     /// setter (raising `AttributeError`). The Rust port routes every
-    /// variant to its `SomeObjectBase.const_box`; the few variants
+    /// variant to its `SomeObject.const_box`; the few variants
     /// upstream rejects (`SomeImpossibleValue`) match `Impossible` here
     /// and silently no-op, matching the AttributeError swallow.
     pub fn set_const_box(&mut self, c: Constant) {
@@ -3167,7 +3194,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
 ///     return s_obj
 /// ```
 ///
-/// Rust port clears `SomeObjectBase.const_box` on the cloned variant;
+/// Rust port clears `SomeObject.const_box` on the cloned variant;
 /// `SomePBC` / `SomeNone` are explicitly excluded (upstream's constancy
 /// on these is structural, not stored in `const_box`).
 pub fn not_const(s: &SomeValue) -> SomeValue {
@@ -3264,73 +3291,13 @@ pub(crate) fn contains(a: &SomeValue, b: &SomeValue) -> bool {
 pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
     match (s_obj1, s_obj2) {
         // @intersection.register(SomeInstance, SomeInstance) — model.py:464-472.
-        //
-        // can_be_None = s_inst1.can_be_None and s_inst2.can_be_None
-        // if s_inst1.classdef.issubclass(s_inst2.classdef):
-        //     return SomeInstance(s_inst1.classdef, can_be_None=can_be_None)
-        // elif s_inst2.classdef.issubclass(s_inst1.classdef):
-        //     return SomeInstance(s_inst2.classdef, can_be_None=can_be_None)
-        // else:
-        //     return s_ImpossibleValue
         (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
-            let can_be_none = s_inst1.can_be_none && s_inst2.can_be_none;
-            let (cd1, cd2) = match (&s_inst1.classdef, &s_inst2.classdef) {
-                (Some(a), Some(b)) => (a, b),
-                _ => {
-                    // upstream treats None classdef (the "generic SomeInstance")
-                    // as the top — intersect returns the more specific side.
-                    let classdef = s_inst1
-                        .classdef
-                        .clone()
-                        .or_else(|| s_inst2.classdef.clone());
-                    return SomeValue::Instance(SomeInstance::new(
-                        classdef,
-                        can_be_none,
-                        std::collections::BTreeMap::new(),
-                    ));
-                }
-            };
-            if cd1.borrow().issubclass(cd2) {
-                SomeValue::Instance(SomeInstance::new(
-                    Some(Rc::clone(cd1)),
-                    can_be_none,
-                    std::collections::BTreeMap::new(),
-                ))
-            } else if cd2.borrow().issubclass(cd1) {
-                SomeValue::Instance(SomeInstance::new(
-                    Some(Rc::clone(cd2)),
-                    can_be_none,
-                    std::collections::BTreeMap::new(),
-                ))
-            } else {
-                s_impossible_value()
-            }
+            intersection_Instance(s_inst1, s_inst2)
         }
 
         // @intersection.register(SomeException, SomeInstance) — model.py:493-499.
-        //
-        // classdefs = {c for c in s_exc.classdefs if c.issubclass(s_inst.classdef)}
-        // if classdefs:
-        //     return SomeException(classdefs)
-        // else:
-        //     return s_ImpossibleValue
         (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
-            let Some(target) = &s_inst.classdef else {
-                // Upstream's classdef is always populated for exception exits;
-                // an unclassified SomeInstance degrades to the full set.
-                return SomeValue::Exception(s_exc.clone());
-            };
-            let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
-                .classdefs
-                .iter()
-                .filter(|c| c.borrow().issubclass(target))
-                .cloned()
-                .collect();
-            if classdefs.is_empty() {
-                s_impossible_value()
-            } else {
-                SomeValue::Exception(SomeException::new(classdefs))
-            }
+            intersection_Exception_Instance(s_exc, s_inst)
         }
 
         // @intersection.register(SomeInstance, SomeException) — model.py:501-503.
@@ -3360,42 +3327,13 @@ pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
 pub fn difference(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
     match (s_obj1, s_obj2) {
         // @difference.register(SomeInstance, SomeInstance) — model.py:474-479.
-        //
-        // if s_inst1.classdef.issubclass(s_inst2.classdef):
-        //     return s_ImpossibleValue
-        // else:
-        //     return s_inst1
         (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
-            match (&s_inst1.classdef, &s_inst2.classdef) {
-                (Some(cd1), Some(cd2)) if cd1.borrow().issubclass(cd2) => s_impossible_value(),
-                _ => SomeValue::Instance(s_inst1.clone()),
-            }
+            difference_Instance_Instance(s_inst1, s_inst2)
         }
 
         // @difference.register(SomeException, SomeInstance) — model.py:505-512.
-        //
-        // classdefs = {c for c in s_exc.classdefs
-        //     if not c.issubclass(s_inst.classdef)}
-        // if classdefs:
-        //     return SomeException(classdefs)
-        // else:
-        //     return s_ImpossibleValue
         (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
-            let Some(target) = &s_inst.classdef else {
-                // With no concrete classdef, the exclusion matches nothing.
-                return SomeValue::Exception(s_exc.clone());
-            };
-            let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
-                .classdefs
-                .iter()
-                .filter(|c| !c.borrow().issubclass(target))
-                .cloned()
-                .collect();
-            if classdefs.is_empty() {
-                s_impossible_value()
-            } else {
-                SomeValue::Exception(SomeException::new(classdefs))
-            }
+            difference_Exception_Instance(s_exc, s_inst)
         }
 
         _ => panic!(
@@ -3403,6 +3341,97 @@ pub fn difference(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
             s_obj1.knowntype(),
             s_obj2.knowntype()
         ),
+    }
+}
+
+/// RPython `intersection_Instance` registered for
+/// `(SomeInstance, SomeInstance)` (model.py:464-472).
+#[allow(non_snake_case)]
+pub fn intersection_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstance) -> SomeValue {
+    let can_be_none = s_inst1.can_be_none && s_inst2.can_be_none;
+    let (cd1, cd2) = match (&s_inst1.classdef, &s_inst2.classdef) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            // upstream treats None classdef (the "generic SomeInstance")
+            // as the top — intersect returns the more specific side.
+            let classdef = s_inst1
+                .classdef
+                .clone()
+                .or_else(|| s_inst2.classdef.clone());
+            return SomeValue::Instance(SomeInstance::new(
+                classdef,
+                can_be_none,
+                std::collections::BTreeMap::new(),
+            ));
+        }
+    };
+    if cd1.borrow().issubclass(cd2) {
+        SomeValue::Instance(SomeInstance::new(
+            Some(Rc::clone(cd1)),
+            can_be_none,
+            std::collections::BTreeMap::new(),
+        ))
+    } else if cd2.borrow().issubclass(cd1) {
+        SomeValue::Instance(SomeInstance::new(
+            Some(Rc::clone(cd2)),
+            can_be_none,
+            std::collections::BTreeMap::new(),
+        ))
+    } else {
+        s_impossible_value()
+    }
+}
+
+/// RPython `difference_Instance_Instance` registered for
+/// `(SomeInstance, SomeInstance)` (model.py:474-479).
+#[allow(non_snake_case)]
+pub fn difference_Instance_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstance) -> SomeValue {
+    match (&s_inst1.classdef, &s_inst2.classdef) {
+        (Some(cd1), Some(cd2)) if cd1.borrow().issubclass(cd2) => s_impossible_value(),
+        _ => SomeValue::Instance(s_inst1.clone()),
+    }
+}
+
+/// RPython `intersection_Exception_Instance` registered for
+/// `(SomeException, SomeInstance)` (model.py:493-499).
+#[allow(non_snake_case)]
+pub fn intersection_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInstance) -> SomeValue {
+    let Some(target) = &s_inst.classdef else {
+        // Upstream's classdef is always populated for exception exits;
+        // an unclassified SomeInstance degrades to the full set.
+        return SomeValue::Exception(s_exc.clone());
+    };
+    let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
+        .classdefs
+        .iter()
+        .filter(|c| c.borrow().issubclass(target))
+        .cloned()
+        .collect();
+    if classdefs.is_empty() {
+        s_impossible_value()
+    } else {
+        SomeValue::Exception(SomeException::new(classdefs))
+    }
+}
+
+/// RPython `difference_Exception_Instance` registered for
+/// `(SomeException, SomeInstance)` (model.py:505-512).
+#[allow(non_snake_case)]
+pub fn difference_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInstance) -> SomeValue {
+    let Some(target) = &s_inst.classdef else {
+        // With no concrete classdef, the exclusion matches nothing.
+        return SomeValue::Exception(s_exc.clone());
+    };
+    let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
+        .classdefs
+        .iter()
+        .filter(|c| !c.borrow().issubclass(target))
+        .cloned()
+        .collect();
+    if classdefs.is_empty() {
+        s_impossible_value()
+    } else {
+        SomeValue::Exception(SomeException::new(classdefs))
     }
 }
 
@@ -3478,7 +3507,7 @@ impl std::error::Error for AnnotatorException {}
 ///         return can_only_throw
 ///     return can_only_throw(*args)
 /// ```
-pub fn read_can_only_throw(
+pub(crate) fn read_can_only_throw(
     can_only_throw: &crate::flowspace::operation::CanOnlyThrow,
     args_s: &[SomeValue],
 ) -> Option<Vec<crate::flowspace::operation::BuiltinException>> {
@@ -3534,7 +3563,7 @@ pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownT
 /// Builds a [`SomeTypeOf`] carrying the provided variables, with a
 /// fast path that pins `.const` when the single argument is a
 /// `SomeException` whose classdefs singleton identifies the type.
-pub(crate) fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
+pub fn r#typeof(args_v: &[Rc<Variable>]) -> SomeValue {
     if args_v.is_empty() {
         return SomeValue::Type(SomeType::new());
     }
@@ -3638,6 +3667,17 @@ mod tests {
         assert!(!s.immutable());
         assert!(!s.is_constant());
         assert!(s.can_be_none());
+    }
+
+    #[test]
+    fn commonbase_matches_known_type_subset() {
+        assert_eq!(commonbase(KnownType::Bool, KnownType::Int), KnownType::Int);
+        assert_eq!(commonbase(KnownType::Int, KnownType::Bool), KnownType::Int);
+        assert_eq!(commonbase(KnownType::Str, KnownType::Str), KnownType::Str);
+        assert_eq!(
+            commonbase(KnownType::Int, KnownType::Float),
+            KnownType::Object
+        );
     }
 
     #[test]
@@ -4209,14 +4249,11 @@ mod tests {
     #[test]
     fn someptr_getattr_reads_struct_field_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, Ptr, PtrTarget, StructType,
+            LowLevelType, Ptr, PtrTarget, Struct,
         };
 
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         });
         let mut s_attr = SomeString::new(false, false);
         s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
@@ -4230,14 +4267,11 @@ mod tests {
     #[test]
     fn someptr_setattr_checks_struct_field_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, Ptr, PtrTarget, StructType,
+            LowLevelType, Ptr, PtrTarget, Struct,
         };
 
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         });
         let mut s_attr = SomeString::new(false, false);
         s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
@@ -4253,10 +4287,10 @@ mod tests {
 
     #[test]
     fn someptr_getattr_wraps_struct_adtmethod_as_lladtmeth() {
-        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, StructType};
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
 
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::with_adtmeths(
+            TO: PtrTarget::Struct(Struct::with_adtmeths(
                 "S",
                 vec![],
                 vec![(
@@ -4280,12 +4314,12 @@ mod tests {
     #[test]
     fn someptr_getattr_exposes_nested_struct_field_as_someptr() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, Ptr, PtrTarget, StructType,
+            LowLevelType, Ptr, PtrTarget, Struct,
         };
 
-        let inner = StructType::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::new(
+            TO: PtrTarget::Struct(Struct::new(
                 "Outer",
                 vec![("x".into(), LowLevelType::Struct(Box::new(inner)))],
             )),
@@ -4302,13 +4336,13 @@ mod tests {
     #[test]
     fn someptr_len_returns_constant_for_fixedsize_array_pointer() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            FixedSizeArrayType, LowLevelType, Ptr, PtrTarget,
+            FixedSizeArray, LowLevelType, Ptr, PtrTarget,
         };
 
         let ann = super::super::annrpython::RPythonAnnotator::new(None, None, None, false);
         let _guard = ann.bookkeeper.at_position(None);
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 3)),
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 3)),
         });
         let result = s_ptr
             .len()
@@ -4583,6 +4617,40 @@ mod tests {
     }
 
     #[test]
+    fn intersection_and_difference_wrappers_match_pypy_registrations() {
+        let base = ClassDef::new_standalone("pkg.Base", None);
+        let sub = ClassDef::new_standalone("pkg.Sub", Some(&base));
+        let base_inst =
+            SomeInstance::new(Some(base.clone()), true, std::collections::BTreeMap::new());
+        let sub_inst =
+            SomeInstance::new(Some(sub.clone()), false, std::collections::BTreeMap::new());
+
+        let inter = intersection_Instance(&base_inst, &sub_inst);
+        let SomeValue::Instance(inter_inst) = inter else {
+            panic!("expected SomeInstance");
+        };
+        assert!(classdef_opt_eq(&inter_inst.classdef, &Some(sub.clone())));
+        assert!(!inter_inst.can_be_none);
+
+        assert!(matches!(
+            difference_Instance_Instance(&sub_inst, &base_inst),
+            SomeValue::Impossible
+        ));
+
+        let exc = SomeException::new(vec![base.clone(), sub.clone()]);
+        let inter_exc = intersection_Exception_Instance(&exc, &base_inst);
+        let SomeValue::Exception(inter_exc) = inter_exc else {
+            panic!("expected SomeException");
+        };
+        assert_eq!(inter_exc.classdefs.len(), 2);
+
+        assert!(matches!(
+            difference_Exception_Instance(&exc, &base_inst),
+            SomeValue::Impossible
+        ));
+    }
+
+    #[test]
     fn union_object_and_classed_instance_widens_to_object() {
         let a = SomeValue::Instance(SomeInstance::new(
             None,
@@ -4657,6 +4725,16 @@ mod tests {
         };
         assert_eq!(pbc.descriptions.len(), 2);
         assert!(pbc.can_be_none);
+    }
+
+    #[test]
+    fn somepbc_knowntype_uses_commonbase_fold() {
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let function_pbc = SomePBC::new(vec![fake_function_entry(&bk, "f")], false);
+        assert_eq!(function_pbc.knowntype(), KnownType::Other);
+
+        let class_pbc = SomePBC::new(vec![fake_class_entry(&bk, "C")], false);
+        assert_eq!(class_pbc.knowntype(), KnownType::Type);
     }
 
     #[test]

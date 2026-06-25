@@ -154,6 +154,7 @@ INTENTIONAL_EXTRA: dict[str, dict[str, str]] = {
         "type_state": "local concretetype projection boundary during rtyper cutover",
     },
     "rpython/jit/metainterp": {
+        "box_trace": "boxed primitive trace helper shared by pyre-jit and pyre-jit-trace",
         "call_descr": "runtime call-descr boundary for codewriter/backend descriptor surfaces",
         "io_buffer": "compiled-loop stdout buffer; RPython interpreter writes directly",
         "jit": "runtime half of rpython/rlib/jit.py; translator half lives under rlib",
@@ -195,6 +196,132 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "detect_pax_with_path": "test fixture injection for upstream's /proc/self/status read",
         },
     },
+    ("rpython/annotator", "description"): {
+        "types": {
+            "CallTableRow": "Rust alias for upstream's Desc-identity-keyed calltable row dict",
+            "DescEntry": "Rust discriminated carrier for upstream Desc subclass instances",
+            "DescKey": "Rust identity handle for upstream's Desc object keys",
+            "FuncDescEntry": "Rust carrier preserving FunctionDesc/MemoDesc identity under one Desc entry",
+            "SpecializeResult": "Rust typed carrier for upstream specializers returning graph-or-annotation",
+        },
+    },
+    ("rpython/annotator", "bookkeeper"): {
+        "types": {
+            "PositionKey": "Rust identity carrier for upstream's position_key tuple",
+        },
+    },
+    ("rpython/annotator", "builtin"): {
+        "types": {
+            "BuiltinAnalyzer": "Rust function-pointer carrier for upstream analyzer_for registry entries",
+        },
+    },
+    ("rpython/annotator", "model"): {
+        "types": {
+            "AnnotatorException": "Rust enum carrier for upstream AnnotatorError/UnionError/HarmlesslyBlocked exception variants",
+            "DescKind": "Rust enum for upstream Desc subclass identity returned by SomePBC.getKind()",
+            "ExitCaseKey": "Rust map key for upstream knowntypedata exit-case tuples",
+            "KnownType": "Rust enum carrier for upstream live Python type objects stored in knowntype",
+            "KnownTypeData": "Rust alias for upstream knowntypedata nested dict shape",
+            "SandboxingPayload": "Rust typed payload carried by SomeBuiltin in place of a dynamic analyser attribute",
+            "SomeObjectTrait": "Rust trait surface for methods inherited from upstream SomeObject through Python MRO",
+            "SomeValue": "Rust closed enum for the upstream SomeObject subclass lattice",
+            "SomeValueTag": "Rust discriminant helper for the upstream SomeObject subclass lattice",
+        },
+    },
+    ("rpython/annotator", "policy"): {
+        "types": {
+            "PolicyError": "Rust error carrier for upstream get_specializer AttributeError/Exception paths",
+            "PolicyHandle": "Rust trait-object handle for upstream policy instances and subclass dispatch",
+            "PolicyOps": "Rust trait carrier for upstream policy instance methods overridden by subclasses",
+            "Specializer": "Rust enum carrier for upstream specialize.py function objects returned by get_specializer",
+        },
+    },
+    ("rpython/annotator", "signature"): {
+        "types": {
+            "AnnotationSpec": "Rust enum carrier for upstream annotation(t)'s polymorphic Python input value",
+            "ParamType": "Rust enum carrier for upstream enforce_signature_args paramtype shapes",
+            "SigArgType": "Rust enum carrier for upstream Sig.argtypes dynamic callable/None/Void/NOT_CONSTANT/type cases",
+            "TypeMarker": "Rust enum carrier for upstream rlib.types SelfTypeMarker/AnyTypeMarker classes",
+        },
+    },
+    ("rpython/flowspace", "argument"): {
+        "types": {
+            "CallShape": "Rust carrier for upstream CallSpec._rawshape()'s anonymous (shape_cnt, shape_keys, shape_star) tuple",
+        },
+    },
+    ("rpython/flowspace", "framestate"): {
+        "types": {
+            "MergeCell": "Rust carrier for upstream FrameState.mergeable cells, which may be Variable, Constant, or None",
+            "StackElem": "Rust carrier for upstream FrameState.stack cells, which may be Variable, Constant, or FlowSignal",
+        },
+    },
+    ("rpython/flowspace", "flowcontext"): {
+        "types": {
+            "FlowContextError": "Rust error carrier for upstream FlowingError/StopFlowing/FlowSignal/BytecodeCorruption exception unwinds",
+            "FlowSignalTag": "Rust discriminant for upstream FlowSignal subclass identity used by rebuild_with_args",
+            "FrameBlockKind": "Rust discriminant for upstream FrameBlock subclass identity stored on FrameBlock",
+            "PendingBlock": "Rust carrier for upstream pendingblocks list containing SpamBlock or EggBlock instances",
+        },
+    },
+    ("rpython/flowspace", "operation"): {
+        "types": {
+            "OpKind": "Rust enum replacing upstream's op namespace plus HLOperationMeta-generated per-op classes",
+        },
+    },
+    ("rpython/annotator", "specialize"): {
+        "types": {
+            "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "lltype"): {
+        "types": {
+            "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "llheap"): {
+        "functions": {
+            "_is_pinned": "Rust public testable surface for upstream's private `_is_pinned` helper",
+            "free": "Rust function surface for upstream's `from lltype import free` alias",
+            "setfield": "Rust function surface for upstream's `setfield = setattr` alias",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "rbuilder"): {
+        "functions": {
+            "_ll_append": "Rust public placeholder for upstream's private `_ll_append` helper",
+            "_ll_append_multiple_char": "Rust public placeholder for upstream's private `_ll_append_multiple_char` helper",
+            "stringbuilder_repr": "Rust accessor for upstream's `stringbuilder_repr = StringBuilderRepr()` singleton",
+            "unicodebuilder_repr": "Rust accessor for upstream's `unicodebuilder_repr = UnicodeBuilderRepr()` singleton",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "rbytearray"): {
+        "functions": {
+            "_empty_bytearray": "Rust public surface for upstream's private `_empty_bytearray` helper",
+            "bytearray_repr": "Rust accessor for upstream's `bytearray_repr = ByteArrayRepr()` singleton",
+            "empty": "Rust accessor for upstream's `empty = lltype.malloc(BYTEARRAY, 0, immortal=True)` singleton",
+        },
+    },
+    ("rpython/translator", "simplify"): {
+        "types": {
+            "GraphKeyForSeen": "Rust graph-identity carrier for upstream's seen dict keys",
+        },
+    },
+    ("rpython/tool/algo", "graphlib"): {
+        "types": {
+            "DfsEvent": "Rust enum carrier for upstream depth_first_search ('start'/'stop') event strings",
+            "EdgeDict": "Rust alias for upstream's official edges dict shape",
+            "VertexSet": "Rust trait carrier for upstream's set-or-dict vertices protocol",
+        },
+    },
+    ("rpython/tool/algo", "sparsemat"): {
+        "types": {
+            "SparseMatError": "Rust error carrier for upstream sparse matrix ValueError/IndexError paths",
+        },
+    },
+    ("rpython/tool/algo", "unionfind"): {
+        "types": {
+            "UnionFindInfo": "Rust trait carrier for upstream dynamic info.absorb(other_info) root payloads",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
@@ -226,6 +353,116 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         "functions": {
             "get_platform": "deferred with translator.platform pick_platform until platform compile integration is ported",
             "set_platform": "deferred with translator.platform set_platform until platform compile integration is ported",
+        },
+    },
+    ("rpython/annotator", "specialize"): {
+        "types": {
+            "AccessDirect": "represented by GraphCacheKey::AccessDirect instead of a standalone marker class",
+        },
+    },
+    ("rpython/flowspace", "flowcontext"): {
+        "types": {
+            "Break": "represented by FlowSignal::Break rather than a standalone subclass",
+            "Continue": "represented by FlowSignal::Continue rather than a standalone subclass",
+            "ExceptBlock": "represented by FrameBlockKind::Except on FrameBlock rather than a standalone subclass",
+            "FinallyBlock": "represented by FrameBlockKind::Finally on FrameBlock rather than a standalone subclass",
+            "IterBlock": "represented by FrameBlockKind::Iter on FrameBlock rather than a standalone subclass",
+            "LoopBlock": "represented by FrameBlockKind::Loop on FrameBlock rather than a standalone subclass",
+            "Raise": "represented by FlowSignal::Raise rather than a standalone subclass",
+            "RaiseImplicit": "represented by FlowSignal::RaiseImplicit rather than a standalone subclass",
+            "Return": "represented by FlowSignal::Return rather than a standalone subclass",
+            "WithBlock": "represented by FrameBlockKind::With on FrameBlock rather than a standalone subclass",
+        },
+        "functions": {
+            "binaryoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
+            "unaryoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
+            "unsupportedoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
+        },
+    },
+    ("rpython/flowspace", "model"): {
+        "types": {
+            "ConstException": "represented by FSException carrying Constant-wrapped type/value rather than Python multiple inheritance",
+            "UnwrapException": "Rust typed Hlvalue APIs do not unwrap Variables through Python exceptions",
+            "WrapException": "Rust constant wrapping returns typed Result/Option fallbacks at the call sites instead of raising a marker exception",
+        },
+        "functions": {
+            "flattenobj": "Python dynamic recursive tuple/list flattener is unnecessary because Rust graph walkers traverse typed fields directly",
+        },
+    },
+    ("rpython/flowspace", "operation"): {
+        "types": {
+            "CallArgs": "represented by OpKind::CallArgs and HLOperation dispatch rather than a standalone Rust subclass",
+            "CallOp": "represented by OpKind call-family canraise logic instead of a standalone base class",
+            "Contains": "represented by OpKind::Contains and unaryop contains registrations rather than a standalone Rust subclass",
+            "DoubleDispatchMixin": "represented by OpKind::dispatch plus the crate-local _REGISTRY_DOUBLE table",
+            "GetAttr": "represented by OpKind::GetAttr plus HLOperation::constfold_getattr",
+            "HLOperationMeta": "represented by the static OpKind enum and registry tables instead of a runtime metaclass",
+            "Iter": "represented by OpKind::Iter and HLOperation constfold/eval dispatch",
+            "NewDict": "represented by OpKind::NewDict and HLOperation::consider",
+            "NewList": "represented by OpKind::NewList and HLOperation::consider",
+            "NewSlice": "represented by OpKind::NewSlice and HLOperation::consider",
+            "NewTuple": "represented by OpKind::NewTuple, pyfunc tuple folding, and HLOperation::consider",
+            "Next": "represented by OpKind::Next and flowcontext next handling",
+            "OverflowingOperation": "represented by OpKind::can_overflow and OpKind::ovf_variant",
+            "Pow": "represented by OpKind::Pow and pyfunc pow folding",
+            "PureOperation": "represented by OpKind::pure and HLOperation::constfold",
+            "PureOperation1": "represented by OpKind::arity plus HLOperation::constfold",
+            "PureOperation2": "represented by OpKind::arity plus HLOperation::constfold",
+            "SimpleCall": "represented by OpKind::SimpleCall and specialcase lookup in flowcontext",
+            "SingleDispatchMixin": "represented by OpKind::dispatch plus the crate-local _REGISTRY_SINGLE table",
+        },
+        "functions": {
+            "add_operator": "upstream dynamic class factory is represented by the static OpKind table",
+            "delete": "represented by OpKind::Delete pyfunc/canraise metadata",
+            "do_delslice": "represented by OpKind::DelSlice pyfunc/canraise metadata",
+            "do_float": "represented by OpKind::Float pyfunc folding",
+            "do_getslice": "represented by OpKind::GetSlice pyfunc/canraise metadata",
+            "do_index": "represented by OpKind::Index pyfunc folding",
+            "do_int": "represented by OpKind::Int pyfunc folding",
+            "do_long": "represented by OpKind::Long pyfunc folding",
+            "do_setslice": "represented by OpKind::SetSlice pyfunc/canraise metadata",
+            "get": "represented by OpKind::Get pyfunc/canraise metadata",
+            "inplace_add": "represented by OpKind::InplaceAdd metadata",
+            "inplace_and": "represented by OpKind::InplaceAnd metadata",
+            "inplace_div": "represented by OpKind::InplaceDiv metadata",
+            "inplace_floordiv": "represented by OpKind::InplaceFloorDiv metadata",
+            "inplace_lshift": "represented by OpKind::InplaceLShift metadata",
+            "inplace_mod": "represented by OpKind::InplaceMod metadata",
+            "inplace_mul": "represented by OpKind::InplaceMul metadata",
+            "inplace_or": "represented by OpKind::InplaceOr metadata",
+            "inplace_pow": "represented by OpKind::InplacePow metadata",
+            "inplace_rshift": "represented by OpKind::InplaceRShift metadata",
+            "inplace_sub": "represented by OpKind::InplaceSub metadata",
+            "inplace_truediv": "represented by OpKind::InplaceTrueDiv metadata",
+            "inplace_xor": "represented by OpKind::InplaceXor metadata",
+            "new_style_type": "represented by OpKind::Type pyfunc folding",
+            "next": "represented by OpKind::Next and flowcontext next handling",
+            "set": "represented by OpKind::Set pyfunc/canraise metadata",
+            "unsupported": "represented by OpKind::Format/Trunc/Buffer fallback metadata",
+            "userdel": "represented by OpKind::UserDel metadata",
+        },
+    },
+    ("rpython/flowspace", "specialcase"): {
+        "types": {
+            "StdOutBuffer": "Pyre records rpython_print_* as HostObject call targets and does not execute the print buffer in flowspace",
+        },
+        "functions": {
+            "redirect_function": "Python import-time registry mutator is represented by the static SPECIAL_CASES LazyLock table",
+            "register_flow_sc": "Python decorator registry mutator is represented by the static SPECIAL_CASES LazyLock table",
+            "rpython_print_end": "represented as a HOST_ENV builtin call target emitted by FlowContext::handle_print_function",
+            "rpython_print_item": "represented as a HOST_ENV builtin call target emitted by FlowContext::handle_print_function",
+            "rpython_print_newline": "represented as a HOST_ENV builtin call target emitted by FlowContext::handle_print_function",
+        },
+    },
+    ("rpython/jit/codewriter", "format"): {
+        "functions": {
+            "unformat_assembler": "reverse text-to-SSA test parser is deferred until Rust SSARepr stores parseable FlatOp operands instead of typed pipeline-only SpaceOperations",
+        },
+    },
+    ("rpython/tool/algo", "graphlib"): {
+        "functions": {
+            "break_cycles": "upstream immediately skips this obsolete edge-cutting helper; pyre keeps break_cycles_v only",
+            "show_graph": "GraphPage/DotGen GUI debug helper with no pyre translation-time consumer",
         },
     },
 }
@@ -342,11 +579,11 @@ def python_top_level_symbols(path: Path) -> dict[str, set[str]]:
 
 RUST_PUB_ITEM = re.compile(
     r"^pub\s+(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
-    r"(struct|enum|trait|type|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+    r"(struct|enum|trait|type|fn)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
 )
 RUST_TOP_LEVEL_ITEM = re.compile(
     r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
-    r"(struct|enum|trait|type|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+    r"(struct|enum|trait|type|fn)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
 )
 RUST_PUB_REEXPORT = re.compile(r"^pub\s+use\s+")
 RUST_ITEM_START = re.compile(

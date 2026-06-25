@@ -6,11 +6,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
+use crate::annotator::model::{KnownType, SomeObject, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, ArrayContainer, ArrayType, GCREF,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, Array, ArrayContainer, GCREF,
     GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
     cast_opaque_ptr, cast_pointer, cast_ptr_to_int as lltype_cast_ptr_to_int,
     container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
@@ -61,7 +61,7 @@ pub static supported_access_types: LazyLock<HashMap<&'static str, LowLevelType>>
     });
 
 fn gcarray_of_ptr_type() -> LowLevelType {
-    LowLevelType::Array(Box::new(ArrayType::gc_with_hints(
+    LowLevelType::Array(Box::new(Array::gc_with_hints(
         (*GCREF).clone(),
         vec![("placeholder".into(), ConstValue::Bool(true))],
     )))
@@ -70,20 +70,21 @@ fn gcarray_of_ptr_type() -> LowLevelType {
 /// RPython `gcarrayofptr_lengthoffset` (`llmemory.py:659`).
 #[allow(non_upper_case_globals)]
 pub static gcarrayofptr_lengthoffset: LazyLock<AddressOffset> =
-    LazyLock::new(|| AddressOffset::ArrayLengthOffset(gcarray_of_ptr_type()));
+    LazyLock::new(|| AddressOffset::ArrayLengthOffset(ArrayLengthOffset(gcarray_of_ptr_type())));
 
 /// RPython `gcarrayofptr_itemsoffset` (`llmemory.py:660`).
 #[allow(non_upper_case_globals)]
 pub static gcarrayofptr_itemsoffset: LazyLock<AddressOffset> =
-    LazyLock::new(|| AddressOffset::ArrayItemsOffset(gcarray_of_ptr_type()));
+    LazyLock::new(|| AddressOffset::ArrayItemsOffset(ArrayItemsOffset(gcarray_of_ptr_type())));
 
 /// RPython `gcarrayofptr_singleitemoffset` (`llmemory.py:661`).
 #[allow(non_upper_case_globals)]
-pub static gcarrayofptr_singleitemoffset: LazyLock<AddressOffset> =
-    LazyLock::new(|| AddressOffset::ItemOffset {
+pub static gcarrayofptr_singleitemoffset: LazyLock<AddressOffset> = LazyLock::new(|| {
+    AddressOffset::ItemOffset(ItemOffset {
         TYPE: (*GCREF).clone(),
         repeat: 1,
-    });
+    })
+});
 
 /// RPython `RawMemmoveEntry(ExtRegistryEntry)` (`llmemory.py:1025`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -123,12 +124,24 @@ pub fn ann_weakref_deref() -> Result<(), TyperError> {
     Err(deferred("ann_weakref_deref"))
 }
 
+pub fn cast_ptr_to_weakrefptr() -> Result<(), TyperError> {
+    Err(deferred("cast_ptr_to_weakrefptr"))
+}
+
 pub fn llcast_ptr_to_weakrefptr() -> Result<(), TyperError> {
     Err(deferred("llcast_ptr_to_weakrefptr"))
 }
 
+pub fn cast_weakrefptr_to_ptr() -> Result<(), TyperError> {
+    Err(deferred("cast_weakrefptr_to_ptr"))
+}
+
 pub fn llcast_weakrefptr_to_ptr() -> Result<(), TyperError> {
     Err(deferred("llcast_weakrefptr_to_ptr"))
+}
+
+pub fn raw_malloc() -> Result<(), TyperError> {
+    Err(deferred("raw_malloc"))
 }
 
 pub fn ann_raw_malloc() -> Result<(), TyperError> {
@@ -159,6 +172,10 @@ pub fn ann_raw_memclear() -> Result<(), TyperError> {
     Err(deferred("ann_raw_memclear"))
 }
 
+pub fn raw_memcopy() -> Result<(), TyperError> {
+    Err(deferred("raw_memcopy"))
+}
+
 pub fn ann_raw_memcopy() -> Result<(), TyperError> {
     Err(deferred("ann_raw_memcopy"))
 }
@@ -183,13 +200,13 @@ pub fn _reccopy() -> Result<(), TyperError> {
 /// Annotation for low-level Address values. `immutable = True`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeAddress {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeAddress {
     pub fn new() -> Self {
         SomeAddress {
-            base: SomeObjectBase::new(KnownType::Address, true),
+            base: SomeObject::new(KnownType::Address, true),
         }
     }
 
@@ -252,14 +269,14 @@ pub fn supported_access_type(name: &str) -> Option<LowLevelType> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeTypedAddressAccess {
     pub access_type: LowLevelType,
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeTypedAddressAccess {
     pub fn new(access_type: LowLevelType) -> Self {
         SomeTypedAddressAccess {
             access_type,
-            base: SomeObjectBase::new(KnownType::Object, false),
+            base: SomeObject::new(KnownType::Object, false),
         }
     }
 }
@@ -295,17 +312,40 @@ impl SomeObjectTrait for SomeTypedAddressAccess {
 /// the `gcheaderbuilder` (`header_of_object` / `object_from_header`)
 /// becomes the real dependency to port first.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ItemOffset {
+    pub TYPE: LowLevelType,
+    pub repeat: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FieldOffset {
+    pub TYPE: LowLevelType,
+    pub fldname: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CompositeOffset {
+    pub offsets: Vec<AddressOffset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ArrayItemsOffset(pub LowLevelType);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ArrayLengthOffset(pub LowLevelType);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AddressOffset {
     /// llmemory.py:58 `class ItemOffset(AddressOffset)`.
-    ItemOffset { TYPE: LowLevelType, repeat: i64 },
+    ItemOffset(ItemOffset),
     /// llmemory.py:186 `class FieldOffset(AddressOffset)`.
-    FieldOffset { TYPE: LowLevelType, fldname: String },
+    FieldOffset(FieldOffset),
     /// llmemory.py:225 `class CompositeOffset(AddressOffset)`.
-    CompositeOffset(Vec<AddressOffset>),
+    CompositeOffset(CompositeOffset),
     /// llmemory.py:278 `class ArrayItemsOffset(AddressOffset)`.
-    ArrayItemsOffset(LowLevelType),
+    ArrayItemsOffset(ArrayItemsOffset),
     /// llmemory.py:325 `class ArrayLengthOffset(AddressOffset)`.
-    ArrayLengthOffset(LowLevelType),
+    ArrayLengthOffset(ArrayLengthOffset),
 }
 
 impl AddressOffset {
@@ -317,11 +357,13 @@ impl AddressOffset {
     /// llmemory.py:48/77/195/255/286/333 `known_nonneg`.
     pub fn known_nonneg(&self) -> bool {
         match self {
-            AddressOffset::ItemOffset { repeat, .. } => *repeat >= 0,
-            AddressOffset::FieldOffset { .. } => true,
+            AddressOffset::ItemOffset(offset) => offset.repeat >= 0,
+            AddressOffset::FieldOffset(_) => true,
             AddressOffset::ArrayItemsOffset(_) => true,
             AddressOffset::ArrayLengthOffset(_) => true,
-            AddressOffset::CompositeOffset(offsets) => offsets.iter().all(|o| o.known_nonneg()),
+            AddressOffset::CompositeOffset(offset) => {
+                offset.offsets.iter().all(|o| o.known_nonneg())
+            }
         }
     }
 
@@ -335,10 +377,10 @@ impl AddressOffset {
     /// Non-`ItemOffset` returns `NotImplemented` upstream → `None` here.
     pub fn mul(self, other: i64) -> Option<AddressOffset> {
         match self {
-            AddressOffset::ItemOffset { TYPE, repeat } => Some(AddressOffset::ItemOffset {
-                TYPE,
-                repeat: repeat * other,
-            }),
+            AddressOffset::ItemOffset(offset) => Some(AddressOffset::ItemOffset(ItemOffset {
+                TYPE: offset.TYPE,
+                repeat: offset.repeat * other,
+            })),
             _ => None,
         }
     }
@@ -348,10 +390,10 @@ impl AddressOffset {
     /// variants `-offset` raises `TypeError` (no `__neg__`), so `None`.
     pub fn neg(self) -> Option<AddressOffset> {
         match self {
-            AddressOffset::ItemOffset { TYPE, repeat } => Some(AddressOffset::ItemOffset {
-                TYPE,
-                repeat: -repeat,
-            }),
+            AddressOffset::ItemOffset(offset) => Some(AddressOffset::ItemOffset(ItemOffset {
+                TYPE: offset.TYPE,
+                repeat: -offset.repeat,
+            })),
             // llmemory.py:250-253 `ofs = [-item for item in self.offsets];
             // ofs.reverse(); return CompositeOffset(*ofs)`. The list
             // comprehension negates every element — if any `-item` raises
@@ -359,8 +401,9 @@ impl AddressOffset {
             // `__neg__`), the whole `__neg__` raises. `collect::<Option<_>>`
             // short-circuits to `None` so a non-negatable element is not
             // silently dropped.
-            AddressOffset::CompositeOffset(offsets) => {
-                let mut ofs = offsets
+            AddressOffset::CompositeOffset(offset) => {
+                let mut ofs = offset
+                    .offsets
                     .into_iter()
                     .map(|o| o.neg())
                     .collect::<Option<Vec<AddressOffset>>>()?;
@@ -378,28 +421,20 @@ impl AddressOffset {
         let mut lst: Vec<AddressOffset> = Vec::new();
         for item in offsets {
             match item {
-                AddressOffset::CompositeOffset(inner) => lst.extend(inner),
+                AddressOffset::CompositeOffset(inner) => lst.extend(inner.offsets),
                 other => lst.push(other),
             }
         }
         let mut i = lst.len().wrapping_sub(2);
         while (i as isize) >= 0 {
-            if let (
-                AddressOffset::ItemOffset {
-                    TYPE: t0,
-                    repeat: r0,
-                },
-                AddressOffset::ItemOffset {
-                    TYPE: t1,
-                    repeat: r1,
-                },
-            ) = (&lst[i], &lst[i + 1])
+            if let (AddressOffset::ItemOffset(left), AddressOffset::ItemOffset(right)) =
+                (&lst[i], &lst[i + 1])
             {
-                if t0 == t1 {
-                    let merged = AddressOffset::ItemOffset {
-                        TYPE: t0.clone(),
-                        repeat: r0 + r1,
-                    };
+                if left.TYPE == right.TYPE {
+                    let merged = AddressOffset::ItemOffset(ItemOffset {
+                        TYPE: left.TYPE.clone(),
+                        repeat: left.repeat + right.repeat,
+                    });
                     lst.splice(i..i + 2, std::iter::once(merged));
                 }
             }
@@ -408,7 +443,7 @@ impl AddressOffset {
         if lst.len() == 1 {
             lst.pop().unwrap()
         } else {
-            AddressOffset::CompositeOffset(lst)
+            AddressOffset::CompositeOffset(CompositeOffset { offsets: lst })
         }
     }
 
@@ -423,24 +458,26 @@ impl AddressOffset {
     /// directly.
     pub fn byte_size(&self, layout: &dyn OffsetLayout) -> Result<i64, String> {
         match self {
-            AddressOffset::ItemOffset { TYPE, repeat } => {
-                Ok(item_byte_size(TYPE, layout)? * repeat)
+            AddressOffset::ItemOffset(offset) => {
+                Ok(item_byte_size(&offset.TYPE, layout)? * offset.repeat)
             }
             // `symbolic.get_field_token(STRUCT, fldname)[0]`.
-            AddressOffset::FieldOffset { TYPE, fldname } => {
-                let LowLevelType::Struct(st) = TYPE else {
-                    return Err(format!("FieldOffset on non-struct {TYPE:?}"));
+            AddressOffset::FieldOffset(offset) => {
+                let LowLevelType::Struct(st) = &offset.TYPE else {
+                    return Err(format!("FieldOffset on non-struct {:?}", offset.TYPE));
                 };
-                layout.field_offset(&st._name, fldname).ok_or_else(|| {
-                    format!(
-                        "no field offset for {}.{} (get_field_token)",
-                        st._name, fldname
-                    )
-                })
+                layout
+                    .field_offset(&st._name, &offset.fldname)
+                    .ok_or_else(|| {
+                        format!(
+                            "no field offset for {}.{} (get_field_token)",
+                            st._name, offset.fldname
+                        )
+                    })
             }
-            AddressOffset::CompositeOffset(offsets) => {
+            AddressOffset::CompositeOffset(offset) => {
                 let mut total = 0;
-                for o in offsets {
+                for o in &offset.offsets {
                     total += o.byte_size(layout)?;
                 }
                 Ok(total)
@@ -449,8 +486,8 @@ impl AddressOffset {
             // after the length field for a standard length-prefixed array,
             // or at offset 0 for a `nolength` array (symbolic.py:39-42,
             // which sets `ofs_length = -1` and the items at the base).
-            AddressOffset::ArrayItemsOffset(arr_ty) => {
-                if array_is_nolength(arr_ty) {
+            AddressOffset::ArrayItemsOffset(offset) => {
+                if array_is_nolength(&offset.0) {
                     Ok(0)
                 } else {
                     Ok(WORD)
@@ -475,18 +512,20 @@ impl AddressOffset {
     /// container does not model.
     pub fn r#ref(&self, ptr: &_ptr) -> Result<_ptr, String> {
         match self {
-            AddressOffset::ItemOffset { TYPE, repeat } => item_offset_ref(TYPE, *repeat, ptr),
-            AddressOffset::FieldOffset { TYPE, fldname } => field_offset_ref(TYPE, fldname, ptr),
-            AddressOffset::ArrayItemsOffset(TYPE) => array_items_offset_ref(TYPE, ptr),
+            AddressOffset::ItemOffset(offset) => item_offset_ref(&offset.TYPE, offset.repeat, ptr),
+            AddressOffset::FieldOffset(offset) => {
+                field_offset_ref(&offset.TYPE, &offset.fldname, ptr)
+            }
+            AddressOffset::ArrayItemsOffset(offset) => array_items_offset_ref(&offset.0, ptr),
             // llmemory.py:261-264 `for item in self.offsets: ptr = item.ref(ptr)`.
-            AddressOffset::CompositeOffset(offsets) => {
+            AddressOffset::CompositeOffset(offset) => {
                 let mut p = ptr.clone();
-                for o in offsets {
+                for o in &offset.offsets {
                     p = o.r#ref(&p)?;
                 }
                 Ok(p)
             }
-            AddressOffset::ArrayLengthOffset(TYPE) => array_length_offset_ref(TYPE, ptr),
+            AddressOffset::ArrayLengthOffset(offset) => array_length_offset_ref(&offset.0, ptr),
         }
     }
 }
@@ -679,16 +718,23 @@ fn array_of_type(ty: &LowLevelType) -> Result<LowLevelType, String> {
 /// self.TYPE)` (llmemory.py:104-107) — the predicate routing `ItemOffset.ref`
 /// to `direct_ptradd`. A `direct_arrayitems`-derived pointer is always a
 /// `FixedSizeArray(ITEM, 1)`, so that is the live arm; the nolength-`Array`
-/// arm covers bare C-like arrays. `array_item_type_match` is modelled by
-/// item-type equality.
+/// arm covers bare C-like arrays.
 fn primitive_array_matches_item(a: &LowLevelType, ty: &LowLevelType) -> bool {
     match a {
-        LowLevelType::FixedSizeArray(t) => &t.OF == ty,
+        LowLevelType::FixedSizeArray(t) => array_item_type_match(&t.OF, ty),
         LowLevelType::Array(t) => {
-            matches!(t._hints.get("nolength"), Some(ConstValue::Bool(true))) && &t.OF == ty
+            matches!(t._hints.get("nolength"), Some(ConstValue::Bool(true)))
+                && array_item_type_match(&t.OF, ty)
         }
         _ => false,
     }
+}
+
+/// `array_item_type_match(T1, T2)` (llmemory.py:667-668): exact item-type
+/// equality, or a concrete pointer item accepted by the generic `GCREF`
+/// placeholder item type.
+pub fn array_item_type_match(t1: &LowLevelType, t2: &LowLevelType) -> bool {
+    t1 == t2 || (t2 == &*GCREF && matches!(t1, LowLevelType::Ptr(_)))
 }
 
 /// `array_type_match(A1, A2)` (llmemory.py:662-666): the offset's stored array
@@ -699,7 +745,7 @@ fn primitive_array_matches_item(a: &LowLevelType, ty: &LowLevelType) -> bool {
 /// placeholder arm is unreachable here; it is modelled for completeness. `A2`
 /// must match `GCARRAY_OF_PTR` exactly — a gc array of [`GCREF`] carrying the
 /// `placeholder` hint — not merely any placeholder gc array of pointers.
-fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
+pub fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
     if a1 == a2 {
         return true;
     }
@@ -805,7 +851,7 @@ fn array_is_nolength(array_ty: &LowLevelType) -> bool {
 
 /// `llmemory.extra_item_after_alloc(ARRAY)` (llmemory.py:407-409) — the
 /// `'extra_item_after_alloc'` array hint, `0` when absent.
-fn extra_item_after_alloc(array_ty: &LowLevelType) -> i64 {
+pub fn extra_item_after_alloc(array_ty: &LowLevelType) -> i64 {
     match array_ty {
         LowLevelType::Array(arr) => match arr._hints.get("extra_item_after_alloc") {
             Some(ConstValue::Int(n)) => *n,
@@ -830,10 +876,10 @@ fn sizeof_none(ty: &LowLevelType) -> Result<AddressOffset, String> {
     if ty._is_varsize() {
         return Err(format!("sizeof: {ty:?} is varsize, pass n"));
     }
-    Ok(AddressOffset::ItemOffset {
+    Ok(AddressOffset::ItemOffset(ItemOffset {
         TYPE: ty.clone(),
         repeat: 1,
-    })
+    }))
 }
 
 /// `llmemory.offsetof(TYPE, fldname)` (llmemory.py:426-429) —
@@ -845,22 +891,22 @@ pub fn offsetof(struct_ty: &LowLevelType, fldname: &str) -> Result<AddressOffset
     if st._flds.get(fldname).is_none() {
         return Err(format!("offsetof: {} has no field {fldname}", st._name));
     }
-    Ok(AddressOffset::FieldOffset {
+    Ok(AddressOffset::FieldOffset(FieldOffset {
         TYPE: struct_ty.clone(),
         fldname: fldname.to_string(),
-    })
+    }))
 }
 
 /// `llmemory.itemoffsetof(TYPE, n=0)` (llmemory.py:438-442) —
 /// `ArrayItemsOffset(TYPE)`, plus `ItemOffset(TYPE.OF) * n` when `n != 0`.
 pub fn itemoffsetof(array_ty: &LowLevelType, n: i64) -> Result<AddressOffset, String> {
-    let result = AddressOffset::ArrayItemsOffset(array_ty.clone());
+    let result = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ty.clone()));
     if n != 0 {
         let of = array_of(array_ty)?;
-        let item = AddressOffset::ItemOffset {
+        let item = AddressOffset::ItemOffset(ItemOffset {
             TYPE: of,
             repeat: 1,
-        }
+        })
         .mul(n)
         .expect("ItemOffset.mul is always Some");
         Ok(result.add(item))
@@ -872,7 +918,7 @@ pub fn itemoffsetof(array_ty: &LowLevelType, n: i64) -> Result<AddressOffset, St
 /// `llmemory.arraylengthoffset(TYPE)` (llmemory.py:445-447) —
 /// `ArrayLengthOffset(TYPE)`.
 pub fn arraylengthoffset(array_ty: &LowLevelType) -> AddressOffset {
-    AddressOffset::ArrayLengthOffset(array_ty.clone())
+    AddressOffset::ArrayLengthOffset(ArrayLengthOffset(array_ty.clone()))
 }
 
 /// `llmemory._sizeof_int(TYPE, n)` (llmemory.py:400-405) — for a varsize
@@ -1150,7 +1196,26 @@ mod tests {
     use super::*;
 
     fn item(ty: LowLevelType, repeat: i64) -> AddressOffset {
-        AddressOffset::ItemOffset { TYPE: ty, repeat }
+        AddressOffset::ItemOffset(ItemOffset { TYPE: ty, repeat })
+    }
+
+    fn field(ty: LowLevelType, fldname: &str) -> AddressOffset {
+        AddressOffset::FieldOffset(FieldOffset {
+            TYPE: ty,
+            fldname: fldname.into(),
+        })
+    }
+
+    fn composite(offsets: Vec<AddressOffset>) -> AddressOffset {
+        AddressOffset::CompositeOffset(CompositeOffset { offsets })
+    }
+
+    fn array_items(ty: LowLevelType) -> AddressOffset {
+        AddressOffset::ArrayItemsOffset(ArrayItemsOffset(ty))
+    }
+
+    fn array_length(ty: LowLevelType) -> AddressOffset {
+        AddressOffset::ArrayLengthOffset(ArrayLengthOffset(ty))
     }
 
     #[test]
@@ -1173,13 +1238,7 @@ mod tests {
             &*gcarrayofptr_itemsoffset,
             AddressOffset::ArrayItemsOffset(_)
         ));
-        assert_eq!(
-            *gcarrayofptr_singleitemoffset,
-            AddressOffset::ItemOffset {
-                TYPE: (*GCREF).clone(),
-                repeat: 1
-            }
-        );
+        assert_eq!(*gcarrayofptr_singleitemoffset, item((*GCREF).clone(), 1));
 
         let accessor = _fakeaccessor {
             addr: _address::Null,
@@ -1210,7 +1269,7 @@ mod tests {
     #[test]
     fn cast_address_to_int_uses_existing_pointer_cast_rules() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            MallocFlavor, StructType, cast_int_to_ptr, malloc,
+            MallocFlavor, Struct, cast_int_to_ptr, malloc,
         };
 
         assert_eq!(cast_adr_to_int(&_address::Null, None), Ok(0));
@@ -1220,7 +1279,7 @@ mod tests {
         );
         assert!(cast_adr_to_int(&_address::Null, Some("symbolic")).is_err());
 
-        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::new("thing", vec![("x".into(), LowLevelType::Signed)]);
         let live = malloc(
             LowLevelType::Struct(Box::new(s.clone())),
             None,
@@ -1246,11 +1305,7 @@ mod tests {
         // llmemory.py:25-26 `def lltype(self): return lltype.Signed`.
         assert_eq!(item(LowLevelType::Signed, 1).lltype(), LowLevelType::Signed);
         assert_eq!(
-            AddressOffset::FieldOffset {
-                TYPE: LowLevelType::Signed,
-                fldname: "x".into()
-            }
-            .lltype(),
+            field(LowLevelType::Signed, "x").lltype(),
             LowLevelType::Signed
         );
     }
@@ -1267,15 +1322,9 @@ mod tests {
     fn field_and_array_offsets_are_known_nonneg() {
         // llmemory.py:195/286/333 — FieldOffset/ArrayItemsOffset/
         // ArrayLengthOffset all `known_nonneg() -> True`.
-        assert!(
-            AddressOffset::FieldOffset {
-                TYPE: LowLevelType::Signed,
-                fldname: "f".into()
-            }
-            .known_nonneg()
-        );
-        assert!(AddressOffset::ArrayItemsOffset(LowLevelType::Signed).known_nonneg());
-        assert!(AddressOffset::ArrayLengthOffset(LowLevelType::Signed).known_nonneg());
+        assert!(field(LowLevelType::Signed, "f").known_nonneg());
+        assert!(array_items(LowLevelType::Signed).known_nonneg());
+        assert!(array_length(LowLevelType::Signed).known_nonneg());
     }
 
     #[test]
@@ -1286,10 +1335,7 @@ mod tests {
             Some(item(LowLevelType::Signed, 6))
         );
         // Non-ItemOffset `__mul__` returns NotImplemented upstream → None.
-        assert_eq!(
-            AddressOffset::ArrayItemsOffset(LowLevelType::Signed).mul(3),
-            None
-        );
+        assert_eq!(array_items(LowLevelType::Signed).mul(3), None);
     }
 
     #[test]
@@ -1304,19 +1350,13 @@ mod tests {
     #[test]
     fn composite_flattens_nested_composites() {
         // llmemory.py:229-233 — nested CompositeOffset is spliced inline.
-        let inner = AddressOffset::CompositeOffset(vec![
-            AddressOffset::FieldOffset {
-                TYPE: LowLevelType::Signed,
-                fldname: "a".into(),
-            },
-            AddressOffset::ArrayItemsOffset(LowLevelType::Char),
+        let inner = composite(vec![
+            field(LowLevelType::Signed, "a"),
+            array_items(LowLevelType::Char),
         ]);
-        let outer = AddressOffset::composite(vec![
-            inner,
-            AddressOffset::ArrayLengthOffset(LowLevelType::Char),
-        ]);
+        let outer = AddressOffset::composite(vec![inner, array_length(LowLevelType::Char)]);
         match outer {
-            AddressOffset::CompositeOffset(offsets) => assert_eq!(offsets.len(), 3),
+            AddressOffset::CompositeOffset(offset) => assert_eq!(offset.offsets.len(), 3),
             other => panic!("expected CompositeOffset, got {other:?}"),
         }
     }
@@ -1334,13 +1374,13 @@ mod tests {
 
     #[test]
     fn composite_keeps_distinct_type_item_offsets_separate() {
-        let composite = AddressOffset::composite(vec![
+        let offset = AddressOffset::composite(vec![
             item(LowLevelType::Signed, 2),
             item(LowLevelType::Char, 3),
         ]);
         assert_eq!(
-            composite,
-            AddressOffset::CompositeOffset(vec![
+            offset,
+            composite(vec![
                 item(LowLevelType::Signed, 2),
                 item(LowLevelType::Char, 3),
             ])
@@ -1350,13 +1390,13 @@ mod tests {
     #[test]
     fn composite_neg_negates_and_reverses() {
         // llmemory.py:250-253 `CompositeOffset.__neg__`.
-        let composite = AddressOffset::CompositeOffset(vec![
+        let offset = composite(vec![
             item(LowLevelType::Signed, 2),
             item(LowLevelType::Char, 3),
         ]);
         assert_eq!(
-            composite.neg(),
-            Some(AddressOffset::CompositeOffset(vec![
+            offset.neg(),
+            Some(composite(vec![
                 item(LowLevelType::Char, -3),
                 item(LowLevelType::Signed, -2),
             ]))
@@ -1367,12 +1407,9 @@ mod tests {
     fn composite_neg_fails_when_an_element_is_not_negatable() {
         // llmemory.py:250 `[-item for item in self.offsets]` raises when an
         // element has no `__neg__` (FieldOffset here) — not silently dropped.
-        let composite = AddressOffset::CompositeOffset(vec![
+        let composite = composite(vec![
             item(LowLevelType::Signed, 2),
-            AddressOffset::FieldOffset {
-                TYPE: LowLevelType::Signed,
-                fldname: "f".into(),
-            },
+            field(LowLevelType::Signed, "f"),
         ]);
         assert_eq!(composite.neg(), None);
     }
@@ -1390,17 +1427,14 @@ mod tests {
     fn composite_known_nonneg_requires_all_parts() {
         // llmemory.py:255-259.
         assert!(
-            AddressOffset::CompositeOffset(vec![
+            composite(vec![
                 item(LowLevelType::Signed, 1),
-                AddressOffset::FieldOffset {
-                    TYPE: LowLevelType::Signed,
-                    fldname: "f".into()
-                },
+                field(LowLevelType::Signed, "f"),
             ])
             .known_nonneg()
         );
         assert!(
-            !AddressOffset::CompositeOffset(vec![
+            !composite(vec![
                 item(LowLevelType::Signed, 1),
                 item(LowLevelType::Signed, -1),
             ])
@@ -1435,8 +1469,8 @@ mod tests {
     }
 
     fn struct_ty(name: &str) -> LowLevelType {
-        use crate::translator::rtyper::lltypesystem::lltype::StructType;
-        LowLevelType::Struct(Box::new(StructType::new(
+        use crate::translator::rtyper::lltypesystem::lltype::Struct;
+        LowLevelType::Struct(Box::new(Struct::new(
             name,
             vec![("f".to_string(), LowLevelType::Signed)],
         )))
@@ -1446,7 +1480,7 @@ mod tests {
     fn byte_size_resolves_primitives_and_sums_composites() {
         assert_eq!(item(LowLevelType::Signed, 3).byte_size(&NoLayout), Ok(24));
         assert_eq!(item(LowLevelType::Char, 4).byte_size(&NoLayout), Ok(4));
-        let composite = AddressOffset::CompositeOffset(vec![
+        let composite = composite(vec![
             item(LowLevelType::Signed, 1),
             item(LowLevelType::Char, 2),
         ]);
@@ -1458,11 +1492,11 @@ mod tests {
         // Standard length-prefixed array: items one word past the header,
         // length field at offset 0.
         assert_eq!(
-            AddressOffset::ArrayItemsOffset(LowLevelType::Signed).byte_size(&NoLayout),
+            array_items(LowLevelType::Signed).byte_size(&NoLayout),
             Ok(WORD)
         );
         assert_eq!(
-            AddressOffset::ArrayLengthOffset(LowLevelType::Signed).byte_size(&NoLayout),
+            array_length(LowLevelType::Signed).byte_size(&NoLayout),
             Ok(0)
         );
     }
@@ -1470,10 +1504,7 @@ mod tests {
     #[test]
     fn byte_size_field_and_struct_item_use_layout() {
         let s = struct_ty("S");
-        let fo = AddressOffset::FieldOffset {
-            TYPE: s.clone(),
-            fldname: "f".into(),
-        };
+        let fo = field(s.clone(), "f");
         // No layout → get_field_token / get_size unavailable.
         assert!(fo.byte_size(&NoLayout).is_err());
         assert!(item(s.clone(), 2).byte_size(&NoLayout).is_err());
@@ -1490,12 +1521,9 @@ mod tests {
     #[test]
     fn byte_size_field_offset_on_non_struct_errors() {
         assert!(
-            AddressOffset::FieldOffset {
-                TYPE: LowLevelType::Signed,
-                fldname: "f".into()
-            }
-            .byte_size(&NoLayout)
-            .is_err()
+            field(LowLevelType::Signed, "f")
+                .byte_size(&NoLayout)
+                .is_err()
         );
     }
 
@@ -1510,16 +1538,16 @@ mod tests {
 
     #[test]
     fn sizeof_array_is_items_offset_plus_n_items() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, FrozenDict, GcKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, frozendict};
         // llmemory.py:421-423 `sizeof(ARRAY, n) -> itemoffsetof(ARRAY) +
         // sizeof(ARRAY.OF) * n`.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType {
+        let array_ty = LowLevelType::Array(Box::new(Array {
             OF: LowLevelType::Signed,
-            _hints: FrozenDict::from(Vec::new()),
+            _hints: frozendict::from(Vec::new()),
             _gckind: GcKind::Gc,
         }));
-        let expected = AddressOffset::CompositeOffset(vec![
-            AddressOffset::ArrayItemsOffset(array_ty.clone()),
+        let expected = composite(vec![
+            array_items(array_ty.clone()),
             item(LowLevelType::Signed, 3),
         ]);
         assert_eq!(
@@ -1577,10 +1605,10 @@ mod tests {
     }
 
     fn array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, FrozenDict, GcKind};
-        LowLevelType::Array(Box::new(ArrayType {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, frozendict};
+        LowLevelType::Array(Box::new(Array {
             OF: of,
-            _hints: FrozenDict::from(hints),
+            _hints: frozendict::from(hints),
             _gckind: GcKind::Gc,
         }))
     }
@@ -1600,8 +1628,8 @@ mod tests {
             LowLevelType::Char,
             vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
         );
-        let expected = AddressOffset::CompositeOffset(vec![
-            AddressOffset::ArrayItemsOffset(chars.clone()),
+        let expected = composite(vec![
+            array_items(chars.clone()),
             item(LowLevelType::Char, 4),
         ]);
         assert_eq!(
@@ -1618,26 +1646,20 @@ mod tests {
             LowLevelType::Signed,
             vec![("nolength".into(), ConstValue::Bool(true))],
         );
-        assert_eq!(
-            AddressOffset::ArrayItemsOffset(nolength).byte_size(&NoLayout),
-            Ok(0)
-        );
+        assert_eq!(array_items(nolength).byte_size(&NoLayout), Ok(0));
         let plain = array(LowLevelType::Signed, Vec::new());
-        assert_eq!(
-            AddressOffset::ArrayItemsOffset(plain).byte_size(&NoLayout),
-            Ok(WORD)
-        );
+        assert_eq!(array_items(plain).byte_size(&NoLayout), Ok(WORD));
     }
 
     #[test]
     fn cast_any_ptr_concrete_to_opaque_hides_the_container() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            MallocFlavor, OpaqueType, Ptr, StructType, malloc,
+            MallocFlavor, OpaqueType, Ptr, Struct, malloc,
         };
         // llmemory.py:1048 — a concrete gc referent cast to a gc opaque
         // (GCREF-style) PTRTYPE takes the `cast_opaque_ptr` concrete→opaque
         // branch and yields a non-null opaque pointer of the requested type.
-        let st = LowLevelType::Struct(Box::new(StructType::gc_with_hints(
+        let st = LowLevelType::Struct(Box::new(Struct::gc_with_hints(
             "GcThing",
             vec![("x".into(), LowLevelType::Signed)],
             vec![],
@@ -1656,18 +1678,16 @@ mod tests {
     #[test]
     fn array_length_offset_ref_reads_array_length() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, LowLevelValue, MallocFlavor, malloc,
+            Array, LowLevelValue, MallocFlavor, malloc,
         };
 
         // `GcArray(Signed)` of length 3.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
 
         // `ArrayLengthOffset(ARRAY).ref(arrayptr)` → a `_arraylenref` pointer
         // whose only item is the array length.
-        let lenptr = AddressOffset::ArrayLengthOffset(array_ty)
-            .r#ref(&arrayptr)
-            .unwrap();
+        let lenptr = array_length(array_ty).r#ref(&arrayptr).unwrap();
         let _ptr_obj::ArrayLenRef(lenref) = lenptr._obj().unwrap() else {
             panic!("ArrayLengthOffset::ref must yield an _arraylenref");
         };
@@ -1677,53 +1697,54 @@ mod tests {
 
     #[test]
     fn array_items_offset_ref_rejects_mismatched_array_type() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, MallocFlavor, malloc};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, MallocFlavor, malloc};
         // `ArrayItemsOffset(A2).ref(arrayptr)` asserts `array_type_match(A1, A2)`
         // (llmemory.py:286-290) where `A1 = typeOf(arrayptr).TO`. A matching
         // element type folds; a mismatched one fails the assert (the over-fold
         // guard), so the fold declines instead of producing a wrong pointer.
-        let signed_arr = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let signed_arr = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(signed_arr.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
-        assert!(
-            AddressOffset::ArrayItemsOffset(signed_arr)
-                .r#ref(&arrayptr)
-                .is_ok()
-        );
-        let float_arr = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Float)));
-        assert!(
-            AddressOffset::ArrayItemsOffset(float_arr)
-                .r#ref(&arrayptr)
-                .is_err()
-        );
+        assert!(array_items(signed_arr).r#ref(&arrayptr).is_ok());
+        let float_arr = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Float)));
+        assert!(array_items(float_arr).r#ref(&arrayptr).is_err());
+    }
+
+    #[test]
+    fn array_item_type_match_accepts_gcref_placeholder_items() {
+        use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, PtrTarget};
+        // llmemory.py:667-668: exact type equality, or `T2 == GCREF` and
+        // `T1` is any lltype.Ptr.
+        let concrete_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Opaque(OpaqueType::gc("Thing")),
+        }));
+        assert!(array_item_type_match(
+            &LowLevelType::Signed,
+            &LowLevelType::Signed
+        ));
+        assert!(array_item_type_match(&concrete_ptr, &*GCREF));
+        assert!(!array_item_type_match(&LowLevelType::Signed, &*GCREF));
     }
 
     #[test]
     fn item_offset_ref_to_array_end_yields_endmarker() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, MallocFlavor, StructType, malloc,
+            Array, MallocFlavor, Struct, malloc,
         };
 
         // `GcArray(Struct('Item', ('x', Signed)))` of length 1 — an inlined
         // (non-gc) item struct, as required for an array of containers.
-        let item_ty = LowLevelType::Struct(Box::new(StructType::new(
+        let item_ty = LowLevelType::Struct(Box::new(Struct::new(
             "Item",
             vec![("x".into(), LowLevelType::Signed)],
         )));
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(item_ty.clone())));
         let arrayptr = malloc(array_ty.clone(), Some(1), MallocFlavor::Gc, true).unwrap();
 
         // `ArrayItemsOffset(ARRAY).ref` → item-0 struct pointer.
-        let item0 = AddressOffset::ArrayItemsOffset(array_ty)
-            .r#ref(&arrayptr)
-            .unwrap();
+        let item0 = array_items(array_ty).r#ref(&arrayptr).unwrap();
         // `item0 + ItemOffset(Item, 1)` lands exactly at the array end (index
         // 1 == length 1) → the `_endmarker_struct` sentinel, typed `Ptr(Item)`.
-        let endptr = AddressOffset::ItemOffset {
-            TYPE: item_ty.clone(),
-            repeat: 1,
-        }
-        .r#ref(&item0)
-        .unwrap();
+        let endptr = item(item_ty.clone(), 1).r#ref(&item0).unwrap();
         let _ptr_obj::EndMarker(end) = endptr._obj().unwrap() else {
             panic!("an end-of-array reference must yield an _endmarker");
         };
@@ -1734,29 +1755,22 @@ mod tests {
     #[test]
     fn item_offset_ref_memoizes_end_marker_per_array() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, MallocFlavor, StructType, malloc,
+            Array, MallocFlavor, Struct, malloc,
         };
 
         // `_end_markers[parent]` (llmemory.py:96-100): two references exactly
         // to one array's end yield the same `_endmarker` container, so the two
         // fakeaddresses would compare equal.
-        let item_ty = LowLevelType::Struct(Box::new(StructType::new(
+        let item_ty = LowLevelType::Struct(Box::new(Struct::new(
             "Item",
             vec![("x".into(), LowLevelType::Signed)],
         )));
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(item_ty.clone())));
         let arrayptr = malloc(array_ty.clone(), Some(1), MallocFlavor::Gc, true).unwrap();
 
         let end_ptr = || {
-            let item0 = AddressOffset::ArrayItemsOffset(array_ty.clone())
-                .r#ref(&arrayptr)
-                .unwrap();
-            AddressOffset::ItemOffset {
-                TYPE: item_ty.clone(),
-                repeat: 1,
-            }
-            .r#ref(&item0)
-            .unwrap()
+            let item0 = array_items(array_ty.clone()).r#ref(&arrayptr).unwrap();
+            item(item_ty.clone(), 1).r#ref(&item0).unwrap()
         };
         assert_eq!(end_ptr()._obj().unwrap(), end_ptr()._obj().unwrap());
     }

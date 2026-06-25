@@ -78,7 +78,7 @@ use crate::tool::algo::unionfind::UnionFind;
 /// indistinguishable (mirroring upstream's Python tuple equality via
 /// `id()`).
 #[derive(Clone, Debug)]
-pub(crate) struct PositionKey {
+pub struct PositionKey {
     /// Identity hash of the enclosing `FunctionGraph` — upstream
     /// `position_key[0]`.
     pub(crate) graph_id: usize,
@@ -115,7 +115,7 @@ impl std::hash::Hash for PositionKey {
 }
 
 /// Upstream `analyzer_for(func)` decorator (bookkeeper.py:34-38).
-pub(crate) fn analyzer_for(
+pub fn analyzer_for(
     reg: &mut HashMap<String, super::builtin::BuiltinAnalyzer>,
     qualname: &str,
     analyser: super::builtin::BuiltinAnalyzer,
@@ -3590,7 +3590,7 @@ pub fn immutablevalue(x: &ConstValue) -> Result<SomeValue, AnnotatorError> {
 }
 
 /// RPython `origin_of_meth(boundmeth)` (bookkeeper.py:583-593).
-fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), AnnotatorError> {
+pub fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), AnnotatorError> {
     let origin_class = boundmeth.bound_method_origin_class().ok_or_else(|| {
         AnnotatorError::new(format!(
             "could not match bound-method to attribute name: {boundmeth:?}"
@@ -3605,7 +3605,7 @@ fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), Annot
 }
 
 /// RPython `ishashable(x)` (bookkeeper.py:595-601).
-fn ishashable(_x: &HostObject) -> bool {
+pub fn ishashable(_x: &HostObject) -> bool {
     true
 }
 

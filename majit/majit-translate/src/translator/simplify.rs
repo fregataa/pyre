@@ -418,7 +418,7 @@ pub fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Opt
 /// `newlist` / `contains` / `simple_call`, for instance — therefore
 /// still flow through here and must be treated **conservatively
 /// as having side effects** instead of panicking.
-fn op_has_side_effects(op: &SpaceOperation) -> bool {
+pub fn op_has_side_effects(op: &SpaceOperation) -> bool {
     lloperation::ll_operations()
         .get(op.opname.as_str())
         .map(|entry| entry.sideeffects)
@@ -452,7 +452,7 @@ fn op_has_side_effects(op: &SpaceOperation) -> bool {
 ///         return op_has_side_effects(op)
 /// ```
 ///
-fn rec_op_has_side_effects(
+pub fn rec_op_has_side_effects(
     translator: &TranslationContext,
     op: &SpaceOperation,
     seen: Option<&HashSet<GraphKeyForSeen>>,
@@ -512,7 +512,7 @@ fn resolve_graph_family(
 /// identities as dict keys; Rust uses [`GraphKey`] plus a thin wrapper
 /// so the set's type is local to this module.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct GraphKeyForSeen(usize);
+pub struct GraphKeyForSeen(usize);
 
 impl GraphKeyForSeen {
     fn of(g: &GraphRef) -> Self {
@@ -550,7 +550,7 @@ impl GraphKeyForSeen {
 /// field, so this function follows the same branch structure. Full
 /// post-rtyper equivalence still depends on the lloperation table and
 /// call→graph resolution.
-fn has_no_side_effects(
+pub fn has_no_side_effects(
     translator: &TranslationContext,
     graph: &GraphRef,
     seen: Option<&HashSet<GraphKeyForSeen>>,
@@ -910,7 +910,7 @@ fn all_equal_hl(lst: &[Hlvalue]) -> bool {
 }
 
 /// RPython `isspecialvar(v)` (simplify.py:537-538).
-fn isspecialvar(v: &Hlvalue) -> bool {
+pub fn isspecialvar(v: &Hlvalue) -> bool {
     match v {
         Hlvalue::Variable(var) => {
             let p = var.name_prefix();

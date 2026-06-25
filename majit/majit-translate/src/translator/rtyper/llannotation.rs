@@ -29,7 +29,7 @@ use crate::annotator::argument::ArgumentsForTranslation;
 use crate::annotator::bookkeeper;
 use crate::annotator::model::{
     AnnotatorError, KnownType, SomeAddress, SomeBool, SomeChar, SomeFloat, SomeInteger,
-    SomeLongFloat, SomeObjectBase, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint,
+    SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint,
     SomeValue, SomeValueTag, s_bool, s_none,
 };
 use crate::flowspace::model::{ConstValue, Constant};
@@ -326,14 +326,14 @@ impl SomePtr {
 /// RPython `class SomeInteriorPtr(SomePtr)` (llannotation.py:67-70).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeInteriorPtr {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub ll_ptrtype: lltype::InteriorPtr,
 }
 
 impl SomeInteriorPtr {
     pub fn new(ll_ptrtype: lltype::InteriorPtr) -> Self {
         SomeInteriorPtr {
-            base: SomeObjectBase::new(KnownType::LlPtr, true),
+            base: SomeObject::new(KnownType::LlPtr, true),
             ll_ptrtype,
         }
     }
@@ -466,7 +466,7 @@ impl SomeObjectTrait for SomeInteriorPtr {
 /// RPython `class SomeLLADTMeth(SomeObject)` (llannotation.py:72-83).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeLLADTMeth {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub ll_ptrtype: lltype::LowLevelPointerType,
     pub func: ConstValue,
 }
@@ -474,7 +474,7 @@ pub struct SomeLLADTMeth {
 impl SomeLLADTMeth {
     pub fn new(ll_ptrtype: lltype::LowLevelPointerType, func: ConstValue) -> Self {
         SomeLLADTMeth {
-            base: SomeObjectBase::new(KnownType::Object, true),
+            base: SomeObject::new(KnownType::Object, true),
             ll_ptrtype,
             func,
         }
@@ -516,7 +516,7 @@ impl SomeObjectTrait for SomeLLADTMeth {
 /// pair dispatch tables. Invoked from `annotator::binaryop::init` at
 /// `_REGISTRY_DOUBLE` construction time; upstream runs as the `class
 /// __extend__(pairtype(...))` module-import side effect.
-pub fn init_pairtypes(
+pub(crate) fn init_pairtypes(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
     init_ptr_integer_pairtype(reg);
@@ -916,9 +916,10 @@ mod tests {
         );
 
         let s_interior = SomeValue::InteriorPtr(SomeInteriorPtr::new(lltype::InteriorPtr {
-            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(
-                lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)]),
-            ))),
+            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )))),
             TO: Box::new(lltype::LowLevelType::Signed),
             offsets: vec![lltype::InteriorOffset::Field("x".into())],
         }));
@@ -974,9 +975,10 @@ mod tests {
         assert_eq!(s_ptr.ll_ptrtype, ptr);
 
         let interior = lltype::InteriorPtr {
-            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(
-                lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)]),
-            ))),
+            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )))),
             TO: Box::new(lltype::LowLevelType::Signed),
             offsets: vec![lltype::InteriorOffset::Field("x".into())],
         };
@@ -995,9 +997,10 @@ mod tests {
         // whose __init__ asserts T is a Ptr. A bare Struct therefore
         // trips the SomePtr assertion; the Rust port surfaces this as
         // an explicit panic at the dispatch site.
-        let _ = lltype_to_annotation(lltype::LowLevelType::Struct(Box::new(
-            lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)]),
-        )));
+        let _ = lltype_to_annotation(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+            "S",
+            vec![("x".into(), lltype::LowLevelType::Signed)],
+        ))));
     }
 
     #[test]
@@ -1012,9 +1015,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be wrapped in Ptr(T)")]
     fn lltype_to_annotation_rejects_bare_array() {
-        let _ = lltype_to_annotation(lltype::LowLevelType::Array(Box::new(
-            lltype::ArrayType::new(lltype::LowLevelType::Signed),
-        )));
+        let _ = lltype_to_annotation(lltype::LowLevelType::Array(Box::new(lltype::Array::new(
+            lltype::LowLevelType::Signed,
+        ))));
     }
 
     #[test]
@@ -1039,7 +1042,7 @@ mod tests {
         let interior = lltype::_interior_ptr {
             _T: lltype::LowLevelType::Signed,
             _parent: lltype::LowLevelValue::Struct(Box::new(
-                lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
+                lltype::Struct::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
                     ._container_example(),
             )),
             _offsets: vec![lltype::InteriorOffset::Field("x".into())],
@@ -1054,7 +1057,7 @@ mod tests {
     #[should_panic(expected = "must be wrapped in Ptr(T)")]
     fn ll_to_annotation_rejects_bare_struct_value() {
         let value = lltype::LowLevelValue::Struct(Box::new(
-            lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
+            lltype::Struct::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
                 ._container_example(),
         ));
         let _ = ll_to_annotation(value);

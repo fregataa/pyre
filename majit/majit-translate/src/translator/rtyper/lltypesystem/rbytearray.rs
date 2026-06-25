@@ -14,8 +14,8 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, ArrayType, ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, Ptr,
-    PtrTarget, StructType, malloc, nullptr,
+    _ptr, _ptr_obj, Array, ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, Ptr,
+    PtrTarget, Struct, malloc, nullptr,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, chars_array_ptr_lltype_from_strptr};
 use crate::translator::rtyper::rmodel::{Repr, ReprState, gc_flavor_const, lowlevel_type_const};
@@ -27,11 +27,11 @@ use crate::translator::rtyper::rtyper::{
 /// `BYTEARRAY.become(GcStruct('rpy_bytearray', ('chars', Array(Char)),
 /// adtmeths={...}))`.
 pub static BYTEARRAY: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let body = StructType::gc(
+    let body = Struct::gc(
         "rpy_bytearray",
         vec![(
             "chars".to_string(),
-            LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char))),
+            LowLevelType::Array(Box::new(Array::new(LowLevelType::Char))),
         )],
     );
     let fwd = ForwardReference::gc();
@@ -83,11 +83,6 @@ fn chars_array_ptr_lltype_from_bytearrayptr() -> Result<LowLevelType, TyperError
 pub fn mallocbytearray(size: usize) -> Result<_ptr, String> {
     let body = bytearray_struct_lltype().map_err(|e| e.to_string())?;
     malloc(body, Some(size), MallocFlavor::Gc, false)
-}
-
-/// `nullptr(BYTEARRAY)` for `ByteArrayRepr.convert_const(None)`.
-pub fn null_bytearray_ptr() -> _ptr {
-    nullptr(BYTEARRAY.clone()).expect("nullptr(BYTEARRAY) must succeed")
 }
 
 /// RPython `empty = lltype.malloc(BYTEARRAY, 0, immortal=True)`.
@@ -161,7 +156,9 @@ impl Repr for ByteArrayRepr {
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         match value {
             ConstValue::None => Ok(Constant::with_concretetype(
-                ConstValue::LLPtr(Box::new(null_bytearray_ptr())),
+                ConstValue::LLPtr(Box::new(
+                    nullptr(BYTEARRAY.clone()).expect("nullptr(BYTEARRAY) must succeed"),
+                )),
                 self.lltype.clone(),
             )),
             ConstValue::ByteStr(bytes) => {
