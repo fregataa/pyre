@@ -3321,6 +3321,11 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
+    // Bump the monotonic frame eval-loop entry odometer (mirrors the plain
+    // `eval_loop` entry): a user Python frame is about to run bytecode.  The
+    // FBW FOR_ITER Option-C guard snapshots this around a residual call to
+    // detect a body effect that ran through user code.
+    pyre_interpreter::call::bump_frame_entry_count();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
@@ -3683,6 +3688,110 @@ pub(crate) fn dm143_advance_live_locals(
     }
 }
 
+/// #57 Option C (deliver): on a FOR_ITER trace abort, deliver the in-flight
+/// iteration to the live frame instead of dropping it.
+///
+/// The aborted walk advanced the real shared heap iterator once (an
+/// irreversible side effect with no journal undo) and the recording was
+/// discarded, leaving the live frame parked at the FOR_ITER loop header with
+/// the iterator on TOS but the consumed item neither pushed nor its body run
+/// — the legacy `walker_dispatched_this_opcode` bypass would then skip past
+/// FOR_ITER and lose that item.  Instead reconstruct the interpreter resume
+/// state at the point AFTER the consume: push the already-consumed item onto
+/// the live value stack (above the kept iterator, the FOR_ITER continue-arm
+/// shape) and reposition the frame at the loop BODY (`body_pc`, the FOR_ITER
+/// fallthrough).  The `ContinueRunningNormally` re-entry then runs the body
+/// exactly once for that item and continues the loop from the already-
+/// advanced iterator — the `_copy_data_from_miframe` continue-forward analog
+/// (blackhole.py:1711), no drop and no double.
+///
+/// The repositioning is the load-bearing effect, encoded in the frame itself
+/// (its value stack and pc), not in the return value: on delivery the frame is
+/// moved to `body_pc` with the item pushed, so the caller's
+/// `ContinueRunningNormally` re-entry runs the body once; on refusal or no
+/// in-flight item the frame is left untouched, so the SAME
+/// `ContinueRunningNormally` re-entry takes the legacy drop-on-abort (the
+/// conservative never-double fallback).  Both call sites therefore continue
+/// identically and need not branch on the result — `true` (delivered /
+/// repositioned-to-body) vs `false` (refused or empty → frame unchanged) is
+/// informational (the debug log distinguishes the two `false` cases).  The R1
+/// double-apply guard lives in `fbw_foriter_inflight_take`.
+fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
+    let Some((item, body_pc)) = pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take()
+    else {
+        return false;
+    };
+    // #57 Option C (Finding #3, loud-failure assert): the R1 guard in
+    // `fbw_foriter_inflight_take` returns `Some` (delivers) ONLY when no body
+    // effect committed for the in-flight iteration, so re-running the body
+    // cannot double.  With Finding #1's inverted predicate this is unreachable;
+    // the assert turns any future regression (a missed mutator that lets a
+    // delivery slip past a standing body-effect signal) into a loud debug
+    // abort instead of a silent double-apply.  `take` leaves the signals
+    // intact, so `fbw_foriter_any_body_effect_signal()` reads the same state
+    // the guard just checked.
+    debug_assert!(
+        !pyre_jit_trace::jitcode_dispatch::fbw_foriter_any_body_effect_signal(),
+        "Option C delivered an in-flight FOR_ITER item while a body-effect \
+         signal stands (body_pc={body_pc}) — re-running the body would double \
+         a committed effect (R1 guard regression)"
+    );
+    // #57 Option C (header-state guard): the push+reposition below assumes the
+    // live frame is parked at the loop-header FOR_ITER state for `body_pc` —
+    // the iterator on TOS, the body's STORE_FAST expecting `item` one slot
+    // above.  `body_pc` is nested-aware (derived from the consumed FOR_ITER
+    // op's own pc), so it can name an INNER FOR_ITER reached deeper in a
+    // traced body.  For such an inner consume the live frame is parked at the
+    // OUTER loop header (the walk-entry / jit_merge_point pc), NOT at the
+    // inner header — its value stack carries the outer body state and the
+    // outer iterator, not the inner iterator on TOS.  Pushing there and
+    // jumping to the inner `body_pc` corrupts the operand stack (a later
+    // FOR_ITER/GET_ITER then reads a wrong slot as an iterator).  Deliver only
+    // when the frame is PROVABLY at the header for `body_pc`: it is parked at
+    // the FOR_ITER opcode whose fallthrough is `body_pc`
+    // (`next_instr() == body_pc - 1`) and that opcode really is a `FOR_ITER`.
+    // The walk parks the live frame at the loop header it entered, so a
+    // header-entry consume satisfies this and still DELIVERS; a non-header
+    // inner consume fails it and is REFUSED — the stash is dropped (already
+    // taken above) and the legacy bypass keeps the conservative drop-on-abort,
+    // never a stack-corrupting push.  This is the `fbw_foriter_inflight_take`
+    // refuse-when-not-provably-safe model applied to the stack-state axis.
+    // `body_pc` is the FOR_ITER `orgpc + 1`, so it is always >= 1; the header
+    // pc is one before it.  A `body_pc == 0` (impossible) wraps to `usize::MAX`
+    // and fails the `next_instr()` match, so the guard stays safe without a
+    // separate zero check.
+    let header_pc = body_pc.wrapping_sub(1);
+    let at_loop_header = frame.next_instr() == header_pc && {
+        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+        matches!(
+            pyre_interpreter::decode_instruction_at(code, header_pc),
+            Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+        )
+    };
+    if !at_loop_header {
+        if pyre_jit_trace::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-foriter] deliver REFUSED (live frame not at the loop header for \
+                 body_pc={body_pc}) frame.next_instr()={} — keeping legacy drop-on-abort \
+                 to avoid a non-header stack-corrupting push",
+                frame.next_instr()
+            );
+        }
+        return false;
+    }
+    // The continue arm keeps the iterator on the stack and pushes `next`
+    // above it (codewriter.rs FOR_ITER continue arm; opcode_for_iter never
+    // pops the iterator).  The live frame is still at the loop-header state
+    // with the iterator on TOS, so a single push lands `item` exactly where
+    // the body's STORE_FAST expects TOS.
+    frame.push(item);
+    // Resume at the FOR_ITER fallthrough body opcode.  `next_instr` /
+    // `last_instr` are Python bytecode coordinates, matching `body_pc`
+    // (the FOR_ITER `orgpc + 1`).
+    frame.set_last_instr_from_next_instr(body_pc);
+    true
+}
+
 /// RPython jit_merge_point slow path — only called when tracing is active.
 #[cold]
 #[inline(never)]
@@ -3839,6 +3948,13 @@ fn jit_merge_point_hook(
         // after trace compilation, restart so maybe_compile_and_run
         // (try_function_entry_jit) dispatches to compiled code.
         if was_tracing {
+            // #57 Option C (deliver): a FOR_ITER trace that aborted advanced
+            // the real iterator once but discarded its recording.  Deliver
+            // the in-flight item to the live frame (push + reposition at the
+            // body) so the ContinueRunningNormally re-entry runs the body
+            // once for it, instead of bypassing past the now-orphaned
+            // FOR_ITER and dropping the iteration.
+            deliver_inflight_foriter_item(frame);
             // No-replay portal exit for a loop-free function trace: when the
             // walk captured its concrete return (the `run_perfn_walk`
             // epilogue kept the stash only when the walk's eager side
@@ -4563,6 +4679,14 @@ fn bound_reached(
                 // directly, mirroring the `jit_merge_point_hook` tracing
                 // site (which carries the same no-replay logic for the
                 // merge-point-driven trace path).
+                // #57 Option C (deliver): a FOR_ITER trace that aborted on
+                // the back-edge `can_enter_jit` path advanced the real
+                // iterator once but discarded its recording.  Deliver the
+                // in-flight item to the live frame so the
+                // ContinueRunningNormally re-entry runs the body once for it
+                // (the same continuation as the `jit_merge_point_hook`
+                // tracing site).
+                deliver_inflight_foriter_item(frame);
                 if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
                     let result = match cv {
                         // A void return stashes `Null`, i.e. Python `None`.

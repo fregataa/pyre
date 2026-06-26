@@ -595,6 +595,23 @@ pub enum PyreHelperKind {
     /// same descr-identity field, a balanced never-read save/restore is
     /// dead-store-eliminated so the virtual exception de-escapes and DCEs.
     SetCurrentException,
+    /// `for_iter_next(iter)` — the FOR_ITER advance residual the codewriter
+    /// emits for the continue arm (`jit_next` via `cpu.for_iter_next_fn`).
+    /// It advances the real shared heap iterator concretely during the
+    /// authoritative walk and returns the consumed item (`Ref`, or null at
+    /// exhaustion).  The full-body walker recognises this tag to stash the
+    /// consumed item + the FOR_ITER body pc so an aborting walk can DELIVER
+    /// the in-flight iteration to the live frame instead of dropping it (the
+    /// iterator advance is an irreversible side effect with no journal undo).
+    ForIterNext,
+    /// `store_deref_value(cell, value)` — the STORE_DEREF residual
+    /// (`bh_store_deref_value_fn` via `cpu.store_deref_value_fn`).  It mutates
+    /// the cell's contents in place and RETURNS the slot value (`Ref`), so it
+    /// is a value-returning heap write the #57 Option C body-effect guard's
+    /// `Void`-result write proxy cannot see; the tag lets that guard flag it
+    /// (Finding #1) so an aborting FOR_ITER walk refuses delivery rather than
+    /// re-running the body and doubling the cell write.
+    StoreDeref,
 }
 
 impl EffectInfo {

@@ -2301,8 +2301,13 @@ pub fn dispatch_via_miframe(
     // Phase 7: this IS the full-body walk over the outer `sym.jitcode`,
     // so guard snapshots can resolve a per-guard resume coordinate from
     // `op_pc`.  Mark the thread-local for the walk's lifetime;
-    // `walker_capture_snapshot_for_last_guard` reads it.  Reached only
-    // under `PYRE_FULL_BODY_WALK`, so production default-off is unchanged.
+    // `walker_capture_snapshot_for_last_guard` and
+    // `fbw_foriter_body_pc_from_op_pc` read it.  This is the PRODUCTION
+    // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
+    // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
+    // so `FULL_BODY_SNAPSHOT_SYM` is non-null on every default-JIT and
+    // `PYRE_57_INLINE_NEXT=1` run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
+    // (the transitional trait leg), which leaves the pointer null.
     let _full_body_guard = FullBodySnapshotSymGuard::set(sym_ptr);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
@@ -5131,6 +5136,84 @@ fn try_execute_residual_call_via_executor(
     // subsequent vable token protocol / field reads see the frame being
     // traced, mirroring RPython's separate-state isolation.
     let saved_vable_heap_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
+    // #57 Option C (Finding #1, R1 double-apply guard): whether THIS residual
+    // could commit an irreversible heap mutation the journals do not cover,
+    // while an in-flight FOR_ITER item is already captured (a consume ran
+    // earlier this iteration).  The journaled list ops (setitem / append) run
+    // OUTSIDE this executor (`try_walker_store_subscr_specialization` /
+    // `try_walker_orthodox_list_append`) and roll back on abort, so they are
+    // not body-effect candidates here.
+    //
+    // The OLD allow-list (`StoreSubscr` / `CallFn` / `SetCurrentException`
+    // only) MISSED the many statement-level mutators that reach this executor
+    // concretely, succeed, and carry `PyreHelperKind::None` (`store_attr_fn` /
+    // `delete_subscr_fn` / `delete_attr_fn` / `list_extend_fn` / `store_name_fn`
+    // / `store_global` / `store_slice` …): a missed mutator is a silent double
+    // on a body re-run (correctness-FATAL).  Flag any residual that WRITES live
+    // heap state outside the journals.
+    //
+    // The write discriminator is the residual's RESULT TYPE plus the
+    // value-returning-mutator helper tags — NOT `extraeffect`, which cannot
+    // separate a write from a read: `getattr_fn` (a pure `.append` bound-method
+    // lookup) and `store_attr_fn` are BOTH `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+    // (the analyzer is stubbed, so `write_descrs_*` are empty for both).  A
+    // `Void`-result residual produces no value, so it is executed solely for
+    // its heap side effect → a write.  Every statement-level mutator above
+    // lowers to a `residual_call_*_v` (Void); the benign reads (`getattr`,
+    // `load_global`, `load_name`, `load_deref` …) all RETURN a value, so a
+    // Void result is a clean write proxy that does not over-refuse a read.
+    //
+    // The few VALUE-returning writes the Void test cannot see are caught by
+    // helper tag: `CallFn` (an opaque Python call returning its None ref may
+    // mutate arbitrary state), `StoreSubscr` (a dict/object `o[k]=v` returning
+    // the stored value), `SetCurrentException` (the TLS exc-slot write), and
+    // `StoreDeref` (an in-place closure-cell write returning the slot value —
+    // `nonlocal n; n += 1`).  Over-refusing only these (never a benign read)
+    // keeps the journaled-append body (`for_mutate`) delivering, since its
+    // `getattr`/append residuals return `Ref` and carry no write tag.
+    //
+    // Provably read-only/elidable residuals are exempt up front: `@jit.elidable`-
+    // class (`check_is_elidable`: `EF_ELIDABLE_*`, the pure executor folds
+    // these) or `EF_LOOPINVARIANT` (loop-hoisted).  The `for_iter_next` consume
+    // itself ([`PyreHelperKind::ForIterNext`]) is excluded — it is the SOURCE of
+    // the capture (it runs while the PRIOR iteration's item is still in flight),
+    // not a body effect for that prior iteration.  Sampled BEFORE the call so
+    // the success arm can flag an effect that committed AFTER the in-flight
+    // consume.
+    let ei = call_descr.get_extra_info();
+    let helper = ei.pyre_helper;
+    let provably_side_effect_free = ei.check_is_elidable()
+        || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant
+        || helper == majit_ir::PyreHelperKind::ForIterNext;
+    let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
+        || matches!(
+            helper,
+            majit_ir::PyreHelperKind::CallFn
+                | majit_ir::PyreHelperKind::StoreSubscr
+                | majit_ir::PyreHelperKind::SetCurrentException
+                | majit_ir::PyreHelperKind::StoreDeref
+        );
+    let body_effect_candidate =
+        !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
+    // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
+    // discriminator above cannot see a body effect committed through USER
+    // PYTHON CODE by a value-returning (`Ref`), `PyreHelperKind::None`,
+    // `MayForce` residual: `obj.prop` (a `@property` getter / `__getattr__` /
+    // descriptor `__get__`), `a + b` / `a == b` (user `__add__` / `__eq__`),
+    // `iter(obj)` (user `__iter__`), `str(obj)` / `f"{obj}"` (user `__str__` /
+    // `__format__`), `import name`.  Each RETURNS a value (so the Void proxy
+    // misses it) and carries no write tag, yet its getter/dunder/module body
+    // may mutate live heap.  Those mutations all run a USER PYTHON FRAME (the
+    // getter's bytecode); a pure builtin path (`seen.append`'s C-level
+    // bound-method lookup, `int.__add__`) does NOT.  Snapshot the monotonic
+    // frame eval-loop entry odometer before the call; if it advanced while an
+    // in-flight FOR_ITER item is active, the residual ran user bytecode that
+    // could have committed an irreversible body effect → flag it (the success
+    // arm compares post-call).  Sampled only when an item is in flight and the
+    // residual is not provably read-only (an elidable / loop-invariant fold or
+    // the `for_iter_next` consume itself never counts).
+    let user_frame_snapshot = (!provably_side_effect_free && fbw_foriter_inflight_active())
+        .then(pyre_interpreter::call::frame_entry_count);
     let exec_result = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
@@ -5153,6 +5236,53 @@ fn try_execute_residual_call_via_executor(
         if forced {
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
+    }
+    // #57 Option C (Finding #1, R1): a residual that is not provably
+    // side-effect-free has now EXECUTED AFTER the in-flight FOR_ITER consume —
+    // whether it returned a value (Ok) or raised (Err).  The store/append
+    // journals roll their entries back on abort (so a body re-run re-applies
+    // them once), but a mutation outside those journals (a dict
+    // `store_subscr_fn`, an `obj.attr = …` `store_attr_fn`, a `list.extend`,
+    // a `del o[k]`, a name/global/deref store …) cannot be undone — delivering
+    // the in-flight item and re-running the body would double it.  Flag it so
+    // `fbw_foriter_inflight_take` refuses delivery (the legacy drop-on-abort
+    // fallback) instead of doubling.
+    // The user-frame signal: the residual's concrete execution entered a user
+    // Python frame (the odometer advanced), so a value-returning
+    // getter/dunder/module body may have mutated live heap outside the
+    // journals — a body effect the Void/helper-tag discriminator misses.
+    // `for_mutate`'s `seen.append` resolves its bound method at the C level (no
+    // user frame), so its snapshot is unchanged and it still DELIVERS.
+    //
+    // The marking runs on BOTH arms.  A getter that mutates and THEN raises
+    // (`for_prop_raise_abort`: `Obj.hits += 1; raise`, caught locally, walk
+    // continues, later abort) takes the Err arm but still committed the
+    // irreversible effect and still bumped the eval-loop entry odometer; if it
+    // marked only on Ok, `fbw_foriter_inflight_take` would see no signal and
+    // DELIVER, re-running the getter and DOUBLING `Obj.hits`.  The
+    // `for_iter_next` consume itself is exempt (`provably_side_effect_free`
+    // leaves both `body_effect_candidate` false and `user_frame_snapshot`
+    // None), so a raising `__next__` never self-flags.
+    //
+    // The odometer bumps at frame ENTRY, so `entered_user_frame` cannot tell a
+    // user frame that raised AFTER mutating from one that raised BEFORE: a
+    // getter that raises before committing anything is also refused here.  That
+    // is a harmless conservative DROP (the legacy bypass still runs the
+    // iteration once), never a double — refusing a non-mutating raise costs
+    // nothing but the never-double guarantee.
+    let entered_user_frame = user_frame_snapshot
+        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
+    if body_effect_candidate || entered_user_frame {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-foriter] body effect committed since consume (helper={helper:?} \
+                 extraeffect={:?} result_type={:?} write_discriminator={body_effect_candidate} \
+                 entered_user_frame={entered_user_frame})",
+                ei.extraeffect,
+                call_descr.result_type(),
+            );
+        }
+        fbw_mark_foriter_body_effect_since_consume();
     }
     match exec_result {
         Ok(result_i64) => {
@@ -5194,6 +5324,55 @@ fn try_execute_residual_call_via_executor(
                     );
                 }
                 majit_ir::Type::Void => {}
+            }
+            // #57 Option C (capture): this residual is the FOR_ITER advance
+            // (`for_iter_next`) — it just advanced the real shared heap
+            // iterator (an irreversible side effect with no journal undo).
+            // Stash the consumed item + the FOR_ITER body pc (the continue
+            // arm's `py_pc + 1` fallthrough) so an aborting walk can DELIVER
+            // the in-flight iteration to the live frame instead of dropping
+            // it.  A null result is the exhaustion arm (no item, no body
+            // runs) — nothing to deliver, leave the stash empty.
+            if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ForIterNext
+                && result_i64 != 0
+            {
+                // The body pc is the FOR_ITER continue-arm fallthrough — the
+                // Python bytecode pc of the FOR_ITER opcode plus one (matching
+                // `opcode_for_iter`'s `next_instr() == opcode_pc + 1`).
+                //
+                // Finding #2: derive it from the residual op's OWN JitCode pc
+                // (`op_pc`) mapped to its containing Python opcode, NOT the
+                // walk-ENTRY coordinate (`entry_py_pc + 1`).  The entry
+                // coordinate equals the FOR_ITER fallthrough only when FOR_ITER
+                // is the loop-header / walk-entry opcode; a second/nested
+                // FOR_ITER reached deeper in a traced body has its own
+                // `op_pc`, so the entry coordinate would point at the WRONG
+                // body and deliver to the wrong pc.  The fallback (no outer
+                // full-body sym / metadata) keeps the entry coordinate, which
+                // is correct for the loop-header FOR_ITER.
+                let body_pc =
+                    fbw_foriter_body_pc_from_op_pc(op_pc).unwrap_or(ctx.entry_py_pc as usize + 1);
+                fbw_foriter_inflight_capture(
+                    result_i64 as usize as pyre_object::PyObjectRef,
+                    body_pc,
+                );
+                if fbw_debug_abort_enabled() {
+                    let item = result_i64 as usize as pyre_object::PyObjectRef;
+                    let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
+                        Some(unsafe { pyre_object::w_int_get_value(item) })
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[fbw-foriter] capture item=0x{:x} intval={intval:?} foriter_pc={} body_pc={body_pc} \
+                         store_journal_len={} append_journal_len={} unjournaled={}",
+                        result_i64 as usize,
+                        ctx.entry_py_pc,
+                        fbw_store_journal_len(),
+                        FBW_APPEND_JOURNAL.with(|j| j.borrow().len()),
+                        fbw_has_unjournaled_effect(),
+                    );
+                }
             }
         }
         Err(bh_exc) => {
@@ -6138,6 +6317,21 @@ thread_local! {
     static INLINE_SUBWALK_CAPTURE_BOUNDARY: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 
+    /// Set (`true`) only for the duration of the
+    /// `walker_capture_snapshot_for_last_guard` call that records a
+    /// FOR_ITER-next residual's `GUARD_NO_EXCEPTION`.  Tells the snapshot
+    /// helper to fold the bit-14 after-residual-call marker onto the
+    /// FOR_ITER CALL pc so a deopt resumes at the call's OWN post-call
+    /// `catch_exception` (emitted by the codewriter when the FOR_ITER sits
+    /// in a try-block) — the blackhole's `handle_exception_in_frame` then
+    /// routes the raise to the enclosing handler instead of escaping the
+    /// frame.  A FOR_ITER-next's fallthrough is the continue-arm body
+    /// (reached only on a non-null item), which carries no catch for the
+    /// call's own raise, so the generic fallthrough resume the other
+    /// residual calls use cannot find one.  Off for every other residual.
+    static FBW_FORITER_NEXT_CATCH_RESUME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// Set (to the branch guard's own jitcode `op.pc`) only for the
     /// duration of the `walker_capture_snapshot_for_last_guard` call a
     /// kept-stack branch guard makes (#124).  The
@@ -6587,7 +6781,7 @@ pub(crate) fn fbw_no_replay_exit_enabled() -> bool {
 /// "abort trace at key={} (permanent={})" log (`pyjitpl.rs:6348`) only
 /// reports the key and permanence; the walker-side reason is otherwise
 /// swallowed.  Default OFF → no output, zero production effect.
-pub(crate) fn fbw_debug_abort_enabled() -> bool {
+pub fn fbw_debug_abort_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some())
 }
@@ -6684,6 +6878,52 @@ thread_local! {
     static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
+    /// body_pc)` stashed when the FOR_ITER `for_iter_next` residual
+    /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
+    /// authoritative walk and advances the real shared heap iterator.  The
+    /// advance is an irreversible side effect with no journal undo
+    /// (`functional.rs` `current += step`); on a successful CloseLoop commit
+    /// the walk-end flush adopts the advanced state, so the stash is dropped
+    /// ([`fbw_store_journal_commit`]).  On a trace ABORT the walk discards
+    /// its recording but the iterator stays advanced — so the stash is
+    /// DELIVERED to the live frame (the consumed item pushed, the frame
+    /// repositioned at `body_pc`) instead of dropping the iteration, the
+    /// `_copy_data_from_miframe` continue-forward analog (blackhole.py:1711).
+    /// `body_pc` is the FOR_ITER continue-arm fallthrough (`py_pc + 1`,
+    /// codewriter.rs continue arm).  The item ref is a GC root via
+    /// [`fbw_store_journal_root_walker`].  Cleared at walk start
+    /// ([`fbw_store_journal_reset`]).
+    static FBW_FORITER_INFLIGHT: std::cell::RefCell<Option<(pyre_object::PyObjectRef, usize)>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// #57 Option C (Finding #1, R1 double-apply guard): set when a residual
+    /// that WRITES live heap state succeeded AFTER the in-flight FOR_ITER
+    /// consume ([`FBW_FORITER_INFLIGHT`]) was captured — a body effect the
+    /// store/append journals do NOT cover.  The executor flags by a write
+    /// discriminator (not `extraeffect`, which cannot tell a write from a read
+    /// since `getattr_fn` and `store_attr_fn` are both
+    /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`): a `Void`-result residual is a
+    /// statement run for effect, PLUS the value-returning-write helper tags
+    /// (`CallFn` / `StoreSubscr` / `SetCurrentException` / `StoreDeref`).
+    /// Provably read-only/elidable residuals (`check_is_elidable` /
+    /// `EF_LOOPINVARIANT`) and the FOR_ITER `for_iter_next` consume itself (the
+    /// SOURCE of the capture) are exempt.  This catches the many
+    /// `PyreHelperKind::None` Void mutators (`store_attr_fn` /
+    /// `delete_subscr_fn` / `delete_attr_fn` / `list_extend_fn` /
+    /// `store_name_fn` / `store_global` / `store_slice` …) the OLD three-tag
+    /// allow-list missed.  Unlike the journaled list ops (rolled back on abort, so a body
+    /// re-run re-applies them once) and the symbolic-decline flag
+    /// ([`FBW_UNJOURNALED_EFFECT`], applied only by the legacy replay), this
+    /// mutation already stands on the live heap and is not reversible, so
+    /// delivering the in-flight item and re-running the body would DOUBLE it.
+    /// `fbw_foriter_inflight_take` refuses delivery when this is set.  Reset
+    /// at walk start ([`fbw_store_journal_reset`]) and at every new consume
+    /// ([`fbw_foriter_inflight_capture`]) so it reflects only effects
+    /// committed since the MOST-RECENT in-flight consume.
+    static FBW_FORITER_BODY_EFFECT_SINCE_CONSUME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// Set when the walk records a side effect that was neither executed
     /// at walk time nor undo-logged: a void residual call recorded
     /// symbolically (the `try_execute_residual_call_via_executor` void
@@ -6749,6 +6989,13 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
+    // #57 Option C: drop any in-flight FOR_ITER item a prior aborted walk
+    // left undelivered (its live frame already consumed the delivery), so a
+    // stale item cannot be re-delivered by this walk's abort.
+    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = None);
+    // #57 Option C (Finding #1): clear the body-effect-since-consume signal so
+    // a prior walk's committed mutation cannot block this walk's delivery.
+    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(false));
     // B3 (`PYRE_FBW_RAISE`): drop any inline-built-exception OpRef keys a
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
@@ -6786,6 +7033,119 @@ pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_bef
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    // #57 Option C: a committed walk's end-flush adopts the advanced
+    // iterator + the body that consumed it (counted once), so the in-flight
+    // item must NOT also be delivered — drop the stash.
+    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = None);
+    // #57 Option C (Finding #1): the stash is gone, so the body-effect signal
+    // is moot for this walk — clear it alongside.
+    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(false));
+}
+
+/// Record the in-flight FOR_ITER continuation (#57 Option C): the consumed
+/// item the `for_iter_next` residual produced and the FOR_ITER body pc
+/// (`py_pc + 1`, the continue-arm fallthrough).  Called from the residual
+/// executor's success arm when the helper is [`PyreHelperKind::ForIterNext`]
+/// and it produced a non-null item (a null item is the exhaustion arm — no
+/// body runs, nothing to deliver).  Overwrites any prior stash: only the
+/// MOST-RECENT consume is in flight at the abort point.
+pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_pc: usize) {
+    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = Some((item, body_pc)));
+    // The "body effect since consume" window restarts at each consume: only
+    // effects committed after THIS (most-recent) consume can double on a
+    // re-run of THIS iteration's body (Finding #1).
+    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(false));
+}
+
+/// Whether an in-flight FOR_ITER item is currently captured (a consume ran
+/// this iteration and no commit/abort has cleared it yet).  Sampled by the
+/// residual executor to decide whether a non-elidable concrete mutation
+/// counts as a body effect committed after the consume (Finding #1).
+pub(crate) fn fbw_foriter_inflight_active() -> bool {
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow().is_some())
+}
+
+/// Flag that a non-elidable concrete residual committed an irreversible heap
+/// mutation after the in-flight FOR_ITER consume (Finding #1, R1).
+pub(crate) fn fbw_mark_foriter_body_effect_since_consume() {
+    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(true));
+}
+
+/// Whether a body effect committed since the most-recent in-flight FOR_ITER
+/// consume (Finding #1, R1).
+pub(crate) fn fbw_foriter_body_effect_since_consume() -> bool {
+    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.get())
+}
+
+/// Whether ANY of the three R1 body-effect signals is currently present:
+/// the body-effect-since-consume flag, either journal non-empty, or the
+/// unjournaled-effect flag.  These are the exact signals
+/// [`fbw_foriter_inflight_take`] consults to REFUSE delivery, and `take`
+/// leaves them untouched.  Exposed for the deliver-path loud-failure
+/// debug-assert (#57 Finding #3): a successful take (delivery) while any
+/// signal stands would be a silent double, so the deliver site asserts this
+/// is `false` in debug builds.
+pub fn fbw_foriter_any_body_effect_signal() -> bool {
+    fbw_foriter_body_effect_since_consume()
+        || fbw_store_journal_len() != 0
+        || FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) != 0
+        || fbw_has_unjournaled_effect()
+}
+
+/// Take the in-flight FOR_ITER continuation for delivery on a trace abort
+/// (#57 Option C).  Returns `(consumed_item, body_pc)` and clears the stash
+/// so it is delivered at most once.
+///
+/// R1 (double-apply guard): delivery resumes the live frame at the FOR_ITER
+/// body, so any body op that ALREADY ran concretely during the aborted walk
+/// would be re-applied.  C may DELIVER only when it can PROVE no body effect
+/// committed for the in-flight iteration — then re-running the body cannot
+/// double.  Three signals together cover every committed body effect:
+///
+/// * `fbw_foriter_body_effect_since_consume()` — a non-elidable concrete
+///   residual mutated the heap OUTSIDE the journals after the consume (a dict
+///   `store_subscr_fn`, an unmodeled container method).  Irreversible: the
+///   mutation already stands on the live heap, so a body re-run would double
+///   it (Finding #1).
+/// * either journal non-empty (`FBW_STORE_JOURNAL` list setitem /
+///   `FBW_APPEND_JOURNAL` list append).  On the production abort path
+///   `fbw_store_journal_rollback` empties these BEFORE this take, so this is
+///   normally false here; the check is a belt-and-suspenders refusal in case
+///   a future caller takes before the rollback.
+/// * `fbw_has_unjournaled_effect()` — a void/symbolic residual only the
+///   legacy replay applies, which the rollback cannot undo.
+///
+/// Any signal set → refuse delivery (drop the stash → the legacy bypass keeps
+/// the prior drop-on-abort behaviour for that shape, never a double).
+/// `for_mutate` aborts BEFORE the append's effect, so all three signals are
+/// clear at the abort point — the clean continuation case.
+pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> {
+    let stash = FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().take());
+    let stash = stash?;
+    let body_effect = fbw_foriter_body_effect_since_consume();
+    let store_len = fbw_store_journal_len();
+    let append_len = FBW_APPEND_JOURNAL.with(|j| j.borrow().len());
+    let unjournaled = fbw_has_unjournaled_effect();
+    if body_effect || store_len != 0 || append_len != 0 || unjournaled {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-foriter] deliver REFUSED (body effect committed since consume) body_pc={} \
+                 body_effect={body_effect} store_journal_len={store_len} \
+                 append_journal_len={append_len} unjournaled={unjournaled} \
+                 — keeping legacy drop-on-abort to avoid a double-apply (R1)",
+                stash.1
+            );
+        }
+        return None;
+    }
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={store_len} \
+             unjournaled={unjournaled}",
+            stash.0 as usize, stash.1,
+        );
+    }
+    Some(stash)
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -6892,6 +7252,16 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
             // SAFETY: as above — only the `PyObjectRef` slot is a root; the
             // `usize` length is a plain scalar.
             visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+        }
+    });
+    // #57 Option C: the captured in-flight FOR_ITER item is nursery-resident
+    // across the rest of the walk (subsequent residual calls allocate and a
+    // minor collection moves nursery objects), so forward it as a root.
+    FBW_FORITER_INFLIGHT.with(|c| {
+        if let Some((item, _body_pc)) = c.borrow_mut().as_mut() {
+            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
+            // `usize` body pc is a plain scalar.
+            visitor(unsafe { &mut *(item as *mut pyre_object::PyObjectRef).cast() });
         }
     });
 }
@@ -7462,6 +7832,42 @@ fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) 
         }
     }
     best_py
+}
+
+/// #57 Option C (Finding #2): derive the FOR_ITER body pc — the continue-arm
+/// fallthrough — from the `for_iter_next` residual op's OWN JitCode pc.
+///
+/// `op_pc` is the JitCode byte offset of the `for_iter_next` residual; its
+/// containing Python opcode is the FOR_ITER itself (the codewriter emits the
+/// residual at `py_pc as i64`, codewriter.rs:9066), so the FOR_ITER body is
+/// `python_pc_for_jitcode_pc(op_pc) + 1` (the continue-arm fallthrough,
+/// `opcode_for_iter`'s `next_instr() == opcode_pc + 1`).
+///
+/// Deriving from the op's own pc — instead of the walk-ENTRY coordinate
+/// (`entry_py_pc + 1`) — keeps the body pc correct for a FOR_ITER that is NOT
+/// the walk entry (a second/nested FOR_ITER reached deeper in a traced body):
+/// the entry coordinate equals the FOR_ITER fallthrough only when FOR_ITER is
+/// the loop-header / walk-entry opcode.
+///
+/// Returns `None` when the outer full-body-walk sym / metadata is unavailable
+/// (per-opcode arm walk, test fixture); the caller then keeps the legacy
+/// walk-entry coordinate, which is correct for the loop-header FOR_ITER.
+fn fbw_foriter_body_pc_from_op_pc(op_pc: usize) -> Option<usize> {
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer is live for the full-body walk's lifetime
+    // (`FullBodySnapshotSymGuard`); only its `jitcode` metadata is read.
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    let foriter_py_pc = unsafe {
+        let jc = &*sym.jitcode;
+        python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc) as usize
+    };
+    Some(foriter_py_pc + 1)
 }
 
 /// Forward-skip Python trivia (`Cache` / `ExtendedArg` / `Resume` / `Nop`
@@ -8137,6 +8543,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
         // (fresh `top_regs`), not in `sym.registers_*`.
         let sym = unsafe { &*full_body_sym };
         if !sym.jitcode.is_null() {
+            // Set to `Some(call_py_pc)` when an after-residual-call guard's
+            // residual call sits inside a try-block (its per-CodeObject jitcode
+            // emitted a post-call catch); the snapshot resume pc is then the
+            // bit-14-marked CALL pc so the blackhole resumes at that catch.
+            let mut marker_call_py_pc: Option<u32> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
                 let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
@@ -8157,12 +8568,37 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // after_residual_call=True (`pyjitpl.py:2599-2603`): the
                     // may-force call already executed in compiled code and
                     // consumed its Python stack operands.  Resume at the NEXT
-                    // executable opcode so the blackhole continues past the
-                    // call instead of re-executing it from a coordinate whose
-                    // stack no longer holds those operands (which drops/dups
-                    // the side effect, e.g. an in-place list swap store).
+                    // executable opcode so the blackhole continues past the call
+                    // (re-executing from the call's coordinate would drop/dup the
+                    // side effect, e.g. an in-place list swap store).  The
+                    // fallthrough resume routes a raise through the next opcode's
+                    // own `catch_exception` (still inside the same try-block) and
+                    // the bridge-decline path, which handles every sequential
+                    // residual call.
+                    //
+                    // FOR_ITER-next is the exception: its fallthrough is the
+                    // continue-arm body (reached only on a NON-null item), which
+                    // carries no catch for the call's OWN raise.  When the
+                    // FOR_ITER-next residual guard is being captured
+                    // (`FBW_FORITER_NEXT_CATCH_RESUME`) and the call's CALL pc has
+                    // a post-call catch, fold the bit-14 marker onto the CALL pc
+                    // (handled at `resume_py_pc` below) so the blackhole resumes
+                    // at the call's OWN catch and routes the raise to the
+                    // enclosing handler instead of escaping the frame.
                     if after_residual_call {
+                        let call_py_pc = py;
                         py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
+                        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32;
+                        let foriter_catch = FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.get());
+                        if foriter_catch
+                            && call_py_pc < flag
+                            && jc
+                                .payload
+                                .after_residual_call_resume_pc_for(call_py_pc as usize)
+                                .is_some()
+                        {
+                            marker_call_py_pc = Some(call_py_pc);
+                        }
                     }
                 }
                 (py, jc.index as u32, jc.payload.metadata.pc_map.len())
@@ -8446,10 +8882,25 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // — the kept operand stack is naturally live at the guard pc, so
             // the positional `kept_stack_subst` recovery (gpc == entry_py_pc)
             // is skipped.  Flag-off, `resume_py_pc` stays `py_pc`.
-            let resume_py_pc = if crate::pyjitcode::m3_jitcode_pc_enabled() {
+            let liveness_py_pc = if crate::pyjitcode::m3_jitcode_pc_enabled() {
                 guard_py_pc.unwrap_or(py_pc)
             } else {
                 py_pc
+            };
+            // The snapshot resume pc folds in the bit-14 marker for a try-block
+            // residual call so the decode routes through
+            // `after_residual_call_resume_pc_for` (the call's OWN post-call
+            // `-live-`/catch), mirroring the trait leg's `marker_aware_resume_pc`.
+            // Liveness / depth / `last_instr` (above) and `collect_outer_active_boxes`
+            // (below) keep the plain (fallthrough) `liveness_py_pc` — the same
+            // split the trait leg keeps between `snapshot_live_pc` (marked) and
+            // `saved_orgpc` (plain) — so the active-box layout stays consistent
+            // with what the decoder reads.
+            let resume_py_pc = match marker_call_py_pc {
+                Some(call_py_pc) => {
+                    majit_ir::resumedata::encode_after_residual_call_pc(call_py_pc as i32) as u32
+                }
+                None => liveness_py_pc,
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -8458,7 +8909,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 ctx.registers_r,
                 ctx.registers_f,
                 jitcode_index,
-                resume_py_pc,
+                liveness_py_pc,
                 guard_py_pc,
                 guard_jitcode_pc,
             );
@@ -11248,7 +11699,20 @@ fn dispatch_residual_call_iRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                // FOR_ITER-next routes its no-exception-guard resume through
+                // the call's OWN post-call catch (`FBW_FORITER_NEXT_CATCH_RESUME`);
+                // every other residual keeps the fallthrough resume.  See the
+                // thread-local's doc and the marker handling in
+                // `walker_capture_snapshot_for_last_guard_impl`.
+                let is_for_iter_next = ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+                if is_for_iter_next {
+                    FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.set(true));
+                }
+                let cap = walker_capture_snapshot_for_last_guard(ctx, op.pc);
+                if is_for_iter_next {
+                    FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.set(false));
+                }
+                cap?;
             }
         }
 
