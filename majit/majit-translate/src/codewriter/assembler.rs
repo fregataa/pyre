@@ -1463,6 +1463,69 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
+            // tracer oracle (`box_trace.rs trace_box_float`): a `new_with_vtable`
+            // carrying ONLY a size descriptor and a fresh ref-kind result, no
+            // register operands.  `bh_size_spec_from_callcontrol` resolves the
+            // struct size / gc type-id from `owner` via the runtime `gc_cache`
+            // Arc (`path_hash(owner)` keys `_cache_size`).  The `vtable` (type
+            // pointer) is NOT in that Arc — `_cache_size` carries struct size
+            // only — so it travels on the op (captured by `fuse_boxing_alloc`
+            // from the dropped `ob_header.ob_type` store) and is what the
+            // runtime stamps into the new object's `ob_type` / `w_class`
+            // (`state.rs materialize_virtual_object`, `runner.rs
+            // bh_new_with_vtable`: both write the type word only when vtable
+            // != 0).  A zero vtable would silently leave `ob_type` null, so it
+            // fails loud here.
+            OpKind::NewWithVtable { owner, vtable } => {
+                let spec = bh_size_spec_from_callcontrol(
+                    callcontrol.expect("new_with_vtable assembly requires a CallControl"),
+                    owner,
+                )
+                .unwrap_or_else(|| {
+                    panic!("new_with_vtable: no struct layout registered for owner {owner:?}")
+                });
+                if *vtable == 0 {
+                    panic!(
+                        "new_with_vtable: boxing owner {owner:?} has no resolved type pointer \
+                         (fuse_boxing_alloc could not capture the ob_type address); refusing to \
+                         emit a null-ob_type allocation"
+                    );
+                }
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
+                    size: spec.size,
+                    type_id: spec.type_id,
+                    vtable: *vtable as usize,
+                    // `STRUCT._name` identity is left empty for the transient
+                    // `bh_new_with_vtable` size descr; the gc_cache hit keys on
+                    // `type_id` (`path_hash(owner)`), not this field.
+                    owner: String::new(),
+                    all_fielddescrs: spec.all_fielddescrs,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // The allocation result is ALWAYS a fresh GC ref ('r').  #314:
+                // assert the regalloc result kind structurally (mirror the
+                // getarrayitem invariant), so an Int-banked result fails loud at
+                // emit time instead of silently miscompiling.
+                let result = op
+                    .result
+                    .as_ref()
+                    .expect("new_with_vtable must produce a result register");
+                argcodes.push('>');
+                let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "new_with_vtable result must be ref-kind ('r'), got '{kc}' for owner {owner:?}"
+                );
+                argcodes.push(kc);
+                state.code.push(reg);
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             // RPython `rpython/jit/codewriter/jtransform.py:546` emits
             // `int_guard_value(op.args[0])` where `op.args[0]` is already a
             // `Ptr(FuncType)` integer after rtype.  Rust `&dyn Trait` is a
@@ -2370,6 +2433,7 @@ impl Assembler {
                 OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
+                OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
             }
@@ -3538,6 +3602,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             opname
         }
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
+        OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {
             format!("getarrayitem_gc_{}", value_type_to_kind(item_ty))

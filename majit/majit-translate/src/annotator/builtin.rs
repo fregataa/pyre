@@ -291,6 +291,15 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // keyed under the `HostObject::new_builtin_callable` qualname the
     // lltype HOST_ENV module assigns (`flowspace/model.rs:1795`).
     analyzer_for(&mut reg, "lltype.cast_pointer", lltype_cast_pointer);
+    // `pyre_object::lltype::malloc_typed` — the GC allocation intrinsic.
+    // Keyed by the qualname the HOST_ENV `pyre_object.lltype` module assigns
+    // (`flowspace/model.rs`); recognising it as a builtin keeps its body out
+    // of the looked-inside set (the `<T as GcType>::type_id()` accessor wall).
+    analyzer_for(
+        &mut reg,
+        "pyre_object.lltype.malloc_typed",
+        malloc_typed_alloc,
+    );
     // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
     // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
     // (`flowspace/model.rs:1910`).  Lowers identity checks in
@@ -1555,6 +1564,51 @@ fn lltype_cast_pointer(
     )))
 }
 
+/// Analyzer for `pyre_object::lltype::malloc_typed::<T>(value: T) -> *mut T`
+/// — the GC allocation intrinsic (`lltype.malloc(STRUCT, flavor='gc')`
+/// parity).  Registered as a builtin so the body is NEVER looked-inside:
+/// it calls `<T as GcType>::type_id()`, a trait accessor that lowers to the
+/// unregistered bare-leaf path `["GcType","type_id"]` (no flowable graph),
+/// which would poison every boxing caller's lift.  A successful malloc
+/// returns a non-null heap pointer to the same struct the argument
+/// constructs, so the result is `SomeInstance(T)` with `can_be_none =
+/// false` (OOM takes the MemoryError exception edge, not a null result).
+/// The single argument is the constructed struct value (a `SomeInstance`
+/// produced by the `SyntheticTransparentCtor`).
+pub fn malloc_typed_alloc(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "malloc_typed() expects a single (value) positional argument",
+        ));
+    }
+    match arg_at(args_s, 0, "malloc_typed") {
+        SomeValue::Instance(inst) => {
+            // lltype.py:2202-2209 `malloc(T)`: only `isinstance(T, Struct)`
+            // is mallocable; everything else falls to
+            // `raise TypeError("malloc: unmallocable type")`. A classdef-less
+            // `SomeInstance` (object-only; `SomeInstance(classdef=None)`)
+            // carries no concrete struct, so it is that `else` arm — reject
+            // it here instead of boxing a typeless value the downstream
+            // `NewWithVtable` cannot stamp a vtable for.
+            if inst.classdef.is_none() {
+                return Err(AnnotatorError::new("malloc: unmallocable type"));
+            }
+            Ok(SomeValue::Instance(SomeInstance::new(
+                inst.classdef.clone(),
+                false,
+                Default::default(),
+            )))
+        }
+        other => Err(AnnotatorError::new(format!(
+            "malloc_typed(): expected a struct value to box, got {other:?}"
+        ))),
+    }
+}
+
 /// Upstream `robjmodel_r_dict(...)` (builtin.py:244-246).
 pub fn robjmodel_r_dict(
     bk: &Rc<Bookkeeper>,
@@ -1903,6 +1957,22 @@ mod tests {
 
     fn no_kwds() -> HashMap<String, Option<SomeValue>> {
         HashMap::new()
+    }
+
+    #[test]
+    fn malloc_typed_rejects_classdef_less_instance() {
+        // lltype.py:2202-2209 `malloc(T)`: only `isinstance(T, Struct)` is
+        // mallocable. A classdef-less `SomeInstance` (object-only) carries
+        // no concrete struct, so it takes the `else: raise
+        // TypeError("malloc: unmallocable type")` arm.
+        let bk = bk();
+        let obj_only = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let err = malloc_typed_alloc(&bk, &[Some(obj_only)], &no_kwds())
+            .expect_err("classdef-less instance must be rejected");
+        assert!(
+            format!("{err:?}").contains("unmallocable type"),
+            "expected unmallocable-type error, got {err:?}"
+        );
     }
 
     #[test]
