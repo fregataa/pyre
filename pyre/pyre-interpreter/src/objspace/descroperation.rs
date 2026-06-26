@@ -130,10 +130,6 @@ fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
     a % b
 }
 
-/// longobject.py:62-70 `_truediv` → rbigint.truediv parity.
-/// Produces the correctly-rounded IEEE 754 double for a/b.
-/// Port of CPython `Objects/longobject.c long_true_divide`.
-#[majit_macros::elidable]
 /// `m * 2^exp`, splitting the power-of-two factor so neither side over- nor
 /// under-flows before a single correctly-rounded final multiply. A lone
 /// `2f64.powi(exp)` would flush to zero in the subnormal range and lose the
@@ -151,6 +147,10 @@ fn ldexp_pow2(m: f64, mut exp: i64) -> f64 {
     x * 2.0_f64.powi(exp as i32)
 }
 
+/// longobject.py:62-70 `_truediv` → rbigint.truediv parity.
+/// Produces the correctly-rounded IEEE 754 double for a/b.
+/// Port of CPython `Objects/longobject.c long_true_divide`.
+#[majit_macros::elidable]
 fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
     use malachite_bigint::Sign;
 
@@ -302,7 +302,9 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb == 0 {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        // `%` alone reports "integer modulo by zero"; only `//`/divmod say
+        // "integer division or modulo by zero".
+        return Err(PyError::zero_division("integer modulo by zero"));
     }
     // Python modulo: result has the same sign as the divisor.
     let r = va % vb;
@@ -327,17 +329,24 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
+        // 3.x reports "integer division or modulo by zero" for every int; the
+        // int path raises the same. PyPy's `_floordiv` still carries the 2.x
+        // "long ..." wording (longobject.py:409), which a 3.x runtime does not.
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
-    Ok(bigint_result(as_bigint(a).div_floor(&vb)))
+    // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
+    Ok(bigint_result(as_bigint(a).div_mod_floor(&vb).0))
 }
 
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        // `%` alone reports "integer modulo by zero" (not the floordiv/divmod
+        // "division or modulo" wording).
+        return Err(PyError::zero_division("integer modulo by zero"));
     }
-    Ok(bigint_result(as_bigint(a).mod_floor(&vb)))
+    // rbigint.mod → _divmod, returning the remainder half (rbigint.py:1001).
+    Ok(bigint_result(as_bigint(a).div_mod_floor(&vb).1))
 }
 
 /// `rbigint.floordiv` payload half (`longobject.py:409 _floordiv` →
@@ -358,7 +367,8 @@ pub extern "C" fn jit_w_long_floordiv_raw(a: i64, b: i64) -> i64 {
             );
             return 0;
         }
-        pyre_object::lltype::malloc_raw(w_long_get_value(a).div_floor(vb)) as i64
+        // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
+        pyre_object::lltype::malloc_raw(w_long_get_value(a).div_mod_floor(vb).0) as i64
     }
 }
 
@@ -372,12 +382,14 @@ pub extern "C" fn jit_w_long_mod_raw(a: i64, b: i64) -> i64 {
     unsafe {
         let vb = w_long_get_value(b);
         if vb.sign() == malachite_bigint::Sign::NoSign {
+            // `%` alone reports "integer modulo by zero".
             crate::runtime_ops::jit_publish_exception(
-                PyError::zero_division("integer division or modulo by zero").to_exc_object(),
+                PyError::zero_division("integer modulo by zero").to_exc_object(),
             );
             return 0;
         }
-        pyre_object::lltype::malloc_raw(w_long_get_value(a).mod_floor(vb)) as i64
+        // rbigint.mod → _divmod, returning the remainder half (rbigint.py:1001).
+        pyre_object::lltype::malloc_raw(w_long_get_value(a).div_mod_floor(vb).1) as i64
     }
 }
 
