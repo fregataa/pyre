@@ -1877,6 +1877,31 @@ fn read_ref_var_list_concrete(
         .collect()
 }
 
+/// Read concrete shadow values for an Int-bank variadic operand list.
+/// Int twin of [`read_ref_var_list_concrete`] — same byte indices,
+/// resolved through `ctx.concrete_registers_i`.  Used by `inline_call_*`
+/// to propagate each int arg's concrete shadow into the callee's fresh
+/// shadow Vec (`setup_call` int-bank parity), so a callee body can fold
+/// a `goto_if_not/iL` / `switch/id` over a concrete primitive-int arg.
+fn read_int_var_list_concrete(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> Vec<ConcreteValue> {
+    let len_pc = op.pc + 1 + operand_offset;
+    let len = code[len_pc] as usize;
+    (0..len)
+        .map(|i| {
+            let reg = code[len_pc + 1 + i] as usize;
+            ctx.concrete_registers_i
+                .get(reg)
+                .copied()
+                .unwrap_or(ConcreteValue::Null)
+        })
+        .collect()
+}
+
 /// Read an Int-bank variadic operand list (`I` argcode). Same shape as
 /// [`read_ref_var_list`] but indexes into `registers_i`. RPython
 /// `assembler.py:write_varlist` emits a single shape regardless of
@@ -10957,24 +10982,26 @@ fn dispatch_residual_call_iRd_kind(
     // An inlined append falls back to the generic residual, which resumes
     // *past* the call (after_residual_call) and so re-runs nothing extra.
     //
-    // Also restrict to loop traces (`header_pc != 0`): in a function-entry
-    // trace (a no-loop helper compiled from entry, e.g. `def push(a, v):
-    // a.append(v)` called in a hot loop) the spare-capacity guard's
-    // blackhole resume reconstructs the re-executed append's receiver from a
-    // wrong box and re-runs `LOAD_METHOD` on a garbage pointer — the
-    // function-entry exit-layout numbering does not preserve the receiver
-    // local across the fold's mid-statement guards.  Loop traces resume
-    // through the loop-header pc_map coordinate and reconstruct it correctly
-    // (a no-loop helper's append falls back to the generic residual).
+    // Both loop and function-entry (no-loop) traces are eligible.  A
+    // no-loop helper compiled from entry (e.g. `def push(a, v): a.append(v)`
+    // called in a hot loop) traces with `header_pc == 0`; its spare-capacity
+    // guard's resume reconstructs the receiver from the call-site coordinate
+    // published below (`collect_outer_active_boxes` at the CALL py_pc), which
+    // preserves the receiver local across the fold's mid-statement guards in
+    // both trace kinds.  The earlier loop-only restriction was a carryover
+    // from the retired hand-rolled fold (#227), whose function-entry exit
+    // layout dropped the receiver; the orthodox descent's resume coordinate
+    // does not, verified by a two-list alternating-receiver append stress
+    // (any wrong receiver box corrupts the cross-checked lists) and the
+    // parity suite folding function-entry helper appends on both backends.
     // #171 ORTHODOX descent (default ON — `PYRE_171_ORTHODOX=0` opts out):
     // descend the real `w_list_append` body, recording its array ops native.
     // A decline (`None`) falls through to the generic residual below; an
     // un-lowered in-body helper aborts the trace (graceful interpreter
-    // fallback).  Gated to loop full-body frames, not inside a sub-walk.
+    // fallback).  Gated to top full-body frames, not inside a sub-walk.
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
-        && ctx.trace_ctx.header_pc != 0
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && pyre_171_orthodox_enabled()
@@ -13035,6 +13062,23 @@ fn try_walker_specialize_subscr(
         return Ok(None);
     };
 
+    // #171/#11 Approach C: canonical array-backed `W_TupleObject[i]`.  A
+    // canonical tuple is gated on `ob_type == &TUPLE_TYPE` (tupleobject.py
+    // / tupleobject.rs:222) — NOT `is_tuple()` (which accepts the three
+    // SPECIALISED_TUPLE_{II,FF,OO} variants) and NOT a `w_class` compare
+    // (specialised tuples carry the canonical tuple `w_class`).  Specialised
+    // tuples store `value0`/`value1` inline with no `wrappeditems` block, so
+    // a `getfield(wrappeditems)` on one yields garbage — they MUST fall to
+    // the generic residual.  The runtime `guard_class(&TUPLE_TYPE)` deopts
+    // any later non-canonical tuple flowing in.
+    let tuple_canonical =
+        unsafe { std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE) };
+    if tuple_canonical {
+        return try_walker_specialize_subscr_tuple(
+            ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
+        );
+    }
+
     // Gate: list[int], non-negative index in bounds, int- or float-storage.
     // A bool index (`is_int` accepts `W_BoolObject`) is fine: bool shares
     // int's `intval`, so it unboxes through its own &BOOL_TYPE guard below.
@@ -13102,15 +13146,24 @@ fn try_walker_specialize_subscr(
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
-    // Bounds guard (non-negative index path): IntLt(raw_index, len).
-    // Object storage keeps the inline `length` field (rlist.py:116); int/float
-    // storage read the typed items-array length field.
+    // Two-sided bounds guard `0 <= raw_index < len`.  Object storage keeps the
+    // inline `length` field (rlist.py:116); int/float storage read the typed
+    // items-array length field.  The trace is recorded from a non-negative
+    // observed index, but a later NEGATIVE index would still satisfy
+    // `raw_index < len` and reach the element load out of range; `space.getitem`
+    // treats a negative index as `index + len` (listobject.py), so the
+    // lower-bound guard deopts to re-execute that remap generically.
     let len_descr = match sid {
         0 => crate::descr::list_length_descr(),
         1 => crate::descr::list_int_items_len_descr(),
         _ => crate::descr::list_float_items_len_descr(),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
     let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
     ctx.trace_ctx.set_opref_concrete(
         in_bounds,
@@ -13160,6 +13213,123 @@ fn try_walker_specialize_subscr(
             crate::state::wrapfloat(ctx.trace_ctx, raw)
         }
     };
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #171/#11 Approach C, SUBSCRIPT slice: walker-native PURE element load
+/// for a canonical array-backed `W_TupleObject[i]` (the tuple analogue of
+/// the object-storage list arm of [`try_walker_specialize_subscr`]).
+///
+/// Recognition (caller already verified `ob_type == &TUPLE_TYPE`): a
+/// non-negative int (or bool, which shares `intval`) index in bounds.
+/// Specialised tuples never reach here — the caller gates them out — so
+/// reading `wrappeditems` is always sound.
+///
+/// IR shape: `guard_class(&TUPLE_TYPE)` → `getfield(wrappeditems)` →
+/// `arraylen_gc(wrappeditems)` for the bounds length → `IntLt` +
+/// `GuardTrue` (NON-pure, so an out-of-range deopt still fires) →
+/// `getarrayitem_gc_pure_r(wrappeditems, idx)` (the ONLY pure op; the
+/// body is immutable per `_immutable_fields_ = ['wrappeditems[*]']`).
+/// Object storage → the element is a boxed Ref read directly (no
+/// unbox/rebox).  The authentic boxed result is taken from the same
+/// `execute_may_force` path the generic leg uses.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_subscr_tuple(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    list_op: OpRef,
+    key_op: OpRef,
+    tuple_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    // Gate: non-negative int index in bounds.  `w_tuple_len` reads the
+    // GcArray header of `wrappeditems` (no inline length field).
+    let (index, concrete_len) = unsafe {
+        if !pyre_object::is_int(key_obj) {
+            return Ok(None);
+        }
+        let index = pyre_object::w_int_get_value(key_obj);
+        if index < 0 {
+            return Ok(None);
+        }
+        let concrete_len = pyre_object::w_tuple_len(tuple_obj);
+        if index as usize >= concrete_len {
+            return Ok(None);
+        }
+        (index, concrete_len)
+    };
+
+    // Authentic boxed result from the same may-force path the generic leg uses.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // guard_class TUPLE (skip when class already known / operand is constant).
+    let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
+    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
+        let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(list_op, tuple_type_addr);
+
+    // Unbox the index operand (guard_class + getfield intval).  bool shares
+    // int's `intval`, so a bool index guards its own &BOOL_TYPE.
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
+
+    // getfield(wrappeditems): Ptr(GcArray(OBJECTPTR)) body.
+    let items_block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::tuple_wrappeditems_descr(),
+    );
+
+    // Bounds length: arraylen_gc against the wrappeditems GcArray header
+    // (no inline length cache).  NON-pure (G2): an out-of-range index must
+    // still deopt.
+    let lenbox = crate::state::opimpl_arraylen_gc(
+        ctx.trace_ctx,
+        items_block,
+        crate::state::pyobject_gcarray_descr(),
+    );
+    // Two-sided bounds guard `0 <= raw_index < len`.  The trace is recorded
+    // from a non-negative observed index, but a later NEGATIVE index would
+    // still satisfy `raw_index < len` and reach the PURE element load out of
+    // range.  `space.getitem` treats a negative index as `index + len`
+    // (tupleobject.py:468); the lower-bound guard deopts so that remap
+    // re-executes generically instead of reading before the array.
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
+    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
+    ctx.trace_ctx.set_opref_concrete(
+        in_bounds,
+        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+
+    // PURE element load.  Object storage reads the boxed Ref directly from
+    // the immutable `Ptr(GcArray(OBJECTPTR))` body (no unbox/rebox).
+    let boxed =
+        crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items_block, raw_index);
     ctx.trace_ctx.set_opref_concrete(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
@@ -13258,6 +13428,16 @@ fn try_walker_orthodox_list_append(
         if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
             return Ok(None);
         }
+        // `is_plain_int1` accepts a fits-int `W_LongObject` (it implies
+        // `_fits_int()`), but a long is declined here: the commit path pins
+        // `guard_class(value, INT_TYPE)` and a long has `ob_type == LONG_TYPE`,
+        // so supporting it needs the trait-path `unbox_long` machinery
+        // (guard_class LONG_TYPE + `_fits_int` residual guard + long
+        // extraction) threaded through the sub-walk (PR248 §2). Empirically a
+        // fits-int `W_LongObject` does not reach this append: pyre normalizes
+        // fits-int results to `W_IntObject` across arithmetic / `int(str)` /
+        // literals, so the long arm is an unreachable optimization and the
+        // decline is correctness-safe (the generic residual handles it).
         if !pyre_object::pyobject::is_list(inner_self)
             || !pyre_object::w_list_uses_int_storage(inner_self)
             || !pyre_object::is_plain_int1(value)
@@ -13423,6 +13603,7 @@ fn try_walker_orthodox_list_append(
             ctx,
             op.pc,
             &sub_body,
+            &[],
             &[],
             &[self_ref, value_op],
             &[self_concrete, value_concrete],
@@ -15160,6 +15341,7 @@ fn run_sub_jitcode_walk(
     pc: usize,
     sub_body: &SubJitCodeBody,
     int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
     ref_args: &[OpRef],
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
@@ -15201,6 +15383,15 @@ fn run_sub_jitcode_walk(
     }
     for (i, arg) in float_args.iter().enumerate() {
         callee_regs_f[i] = *arg;
+    }
+    // Seed the callee's concrete shadows from the caller's per-arg
+    // shadows (`setup_call` parity for the Int + Ref banks; the Float
+    // bank has no concrete shadow companion).  A callee body folds a
+    // `goto_if_not/iL` / `switch/id` over a concrete int arg, or a
+    // `guard_class` over a concrete ref arg, only when its shadow is
+    // seeded here.
+    for (i, concrete) in int_arg_concretes.iter().enumerate() {
+        callee_concrete_i[i] = *concrete;
     }
     for (i, concrete) in ref_arg_concretes.iter().enumerate() {
         callee_concrete_r[i] = *concrete;
@@ -15286,7 +15477,7 @@ fn dispatch_inline_call_dr_kind(
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
     let callee_outcome =
-        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &args, &arg_concretes, &[])?;
+        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &[], &args, &arg_concretes, &[])?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -15428,6 +15619,7 @@ fn dispatch_inline_call_dir_kind(
         })?;
     // I-list at offset 2 (skip descr).
     let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
+    let int_arg_concretes = read_int_var_list_concrete(code, op, 2, ctx);
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
@@ -15437,6 +15629,7 @@ fn dispatch_inline_call_dir_kind(
         op.pc,
         &sub_body,
         &int_args,
+        &int_arg_concretes,
         &ref_args,
         &ref_arg_concretes,
         &[],
@@ -15567,6 +15760,7 @@ fn dispatch_inline_call_dirf_kind(
             jitcode_index: sub_index,
         })?;
     let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
+    let int_arg_concretes = read_int_var_list_concrete(code, op, 2, ctx);
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
@@ -15576,6 +15770,7 @@ fn dispatch_inline_call_dirf_kind(
         op.pc,
         &sub_body,
         &int_args,
+        &int_arg_concretes,
         &ref_args,
         &ref_arg_concretes,
         &float_args,

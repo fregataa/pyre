@@ -831,6 +831,17 @@ fn derive_program_metadata(
                 // payload, which is not the tag width, so keep the wide
                 // `i64` model there (the tag still sits in the low bytes; a
                 // switch key compares equal under the wide read).
+                // The fieldless tag is modeled at an UNSIGNED width (u8/u16/u32).
+                // This is correct only while every variant discriminant is
+                // non-negative: a signed-repr / negative-discriminant enum would
+                // zero-extend the tag on read (e.g. `-1` → `255`) while Charon's
+                // variant key stays the negative `discriminant_i64()`, so the
+                // JIT switch/guard would take the wrong arm. All fieldless enums
+                // lowered here today (ListStrategy / ArrayKind / DictViewKind /
+                // StrategyKind / ExcKind …) use the default non-negative
+                // discriminants, so unsigned is exact. A negative-discriminant
+                // enum would need a signed width here AND a sign-extending field
+                // read; revisit if one is introduced.
                 let disc_ty = if variants.iter().all(|v| v.fields.is_empty()) {
                     match td.layout_for_target(&target).and_then(|l| l.size) {
                         Some(1) => "u8",
@@ -3576,6 +3587,7 @@ impl<'a> Lowering<'a> {
                             item_ty: tyref_to_value_type(&place_ty, self.llbc),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     return Ok(res);
@@ -4656,6 +4668,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.index_elem_alias.insert(
@@ -4707,6 +4720,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.index_elem_alias.insert(
@@ -4752,6 +4766,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -4762,6 +4777,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
