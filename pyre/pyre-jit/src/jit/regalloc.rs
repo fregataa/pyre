@@ -211,10 +211,13 @@ impl<'a> RegAllocator<'a> {
             for (i, &v) in livevar_reps.iter().enumerate() {
                 self._depgraph.add_node(v);
                 for j in 0..i {
-                    // `add_edge` is a no-op for self-edges, so distinct
-                    // inputargs that pre-merge into the same rep don't
-                    // trigger a phantom interference.
-                    self._depgraph.add_edge(livevar_reps[j], v);
+                    // Pre-merged inputargs can collapse to the same
+                    // representative.  RPython's DependencyGraph asserts
+                    // against self-edges, so skip the edge here instead
+                    // of weakening the shared color.py port.
+                    if livevar_reps[j] != v {
+                        self._depgraph.add_edge(livevar_reps[j], v);
+                    }
                 }
             }
             // upstream: `livevars = set(livevars)` — shadow the list
@@ -232,10 +235,14 @@ impl<'a> RegAllocator<'a> {
                         self._depgraph.add_node(rep);
                         // upstream (`regalloc.py:73`): add an edge from
                         // every live var to `result`.  `result` is added
-                        // to `livevars` only *after* the loop, so no
-                        // self-edge guard is needed.
+                        // to `livevars` only *after* the loop upstream.
+                        // Pyre's pin pre-merge can make an already-live
+                        // inputarg and this result share a representative,
+                        // so keep the RPython add_edge invariant locally.
                         for &v in &livevars {
-                            self._depgraph.add_edge(v, rep);
+                            if v != rep {
+                                self._depgraph.add_edge(v, rep);
+                            }
                         }
                         livevars.insert(rep);
                     }
@@ -285,9 +292,11 @@ impl<'a> RegAllocator<'a> {
 
     /// `rpython/tool/algo/regalloc.py:98-112 _try_coalesce` — kind
     /// check + identity short-circuit + interference check + union.
-    /// Both endpoints are assumed to be in `_depgraph` already because
+    /// Both endpoints are normally in `_depgraph` already because
     /// `make_dependencies` registered every op result, inputarg, and
-    /// link-arg-derived Variable; upstream does no `add_node` here.
+    /// link-arg-derived Variable.  Pyre's external pin pre-merge can make
+    /// `find_rep()` return a different surviving id, so seed the reps before
+    /// calling `DependencyGraph.coalesce`.
     fn try_coalesce(&mut self, v: Variable, w: Variable) {
         if v.kind != Some(self.kind) || w.kind != Some(self.kind) {
             return;
@@ -297,6 +306,8 @@ impl<'a> RegAllocator<'a> {
         }
         let v0 = self._unionfind.find_rep(v.id);
         let w0 = self._unionfind.find_rep(w.id);
+        self._depgraph.add_node(v0);
+        self._depgraph.add_node(w0);
         if v0 == w0 {
             return;
         }
@@ -336,10 +347,10 @@ impl<'a> RegAllocator<'a> {
         if v_id == w_id {
             return;
         }
-        self._depgraph.add_node(v_id);
-        self._depgraph.add_node(w_id);
         let v0 = self._unionfind.find_rep(v_id);
         let w0 = self._unionfind.find_rep(w_id);
+        self._depgraph.add_node(v0);
+        self._depgraph.add_node(w0);
         if v0 == w0 {
             return;
         }
@@ -367,11 +378,10 @@ impl<'a> RegAllocator<'a> {
     /// per-slot resume reverse map is injective.  Both endpoints are
     /// projected through `_unionfind.find_rep`, so a slot whose Variables
     /// were already coalesced into one rep (by the same-slot coalesce
-    /// pairs) contributes a single node; `add_edge` is a no-op for
-    /// self-edges, so two reps that happen to coincide do not trigger a
-    /// phantom interference.  `add_node` registers each rep in
-    /// `_depgraph.all_nodes` so `find_node_coloring`'s `getnodes` filter
-    /// keeps it (matching `try_coalesce_pin_ids`).
+    /// pairs) contributes a single node; self-edges are skipped before
+    /// calling the shared RPython `DependencyGraph`.  `add_node` registers
+    /// each rep in `_depgraph.all_nodes` so `find_node_coloring`'s
+    /// `getnodes` filter keeps it (matching `try_coalesce_pin_ids`).
     fn add_interference_pin_ids(
         &mut self,
         v_id: super::flow::VariableId,
@@ -381,7 +391,9 @@ impl<'a> RegAllocator<'a> {
         let w0 = self._unionfind.find_rep(w_id);
         self._depgraph.add_node(v0);
         self._depgraph.add_node(w0);
-        self._depgraph.add_edge(v0, w0);
+        if v0 != w0 {
+            self._depgraph.add_edge(v0, w0);
+        }
     }
 
     fn find_node_coloring(&mut self) {
@@ -633,6 +645,12 @@ pub fn filter_coalesce_pairs_by_interference(
             kept.push((v_id, w_id));
             continue;
         }
+        // `DependencyGraph.coalesce` requires both endpoints to be present
+        // in the graph, matching `try_coalesce_pin_ids`.  Some external pin
+        // pairs name slot representatives that have not appeared in ordinary
+        // SSA liveness yet, so seed them before replaying `_try_coalesce`.
+        allocator._depgraph.add_node(v0);
+        allocator._depgraph.add_node(w0);
         if allocator._depgraph.has_edge(&v0, &w0) {
             // `regalloc.py:105` rejects an interfering pair.
             continue;

@@ -203,6 +203,15 @@ pub trait Optimization {
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
 
+/// optimizer.py:58-59 `have_postprocess(cls)`.
+///
+/// RPython asks the class object whether `propagate_postprocess` was
+/// overridden. In Rust each pass exposes the same answer through the
+/// `Optimization::have_postprocess` method.
+pub fn have_postprocess<T: Optimization + ?Sized>(opt: &T) -> bool {
+    opt.have_postprocess()
+}
+
 /// optimizer.py:900-909 `CantReplaceGuards`.
 ///
 /// PyPy stores the optimizer reference on the context manager.  Pyre cannot
@@ -345,7 +354,7 @@ pub struct Optimizer {
     /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
-    pub imported_virtuals: Vec<ImportedVirtual>,
+    pub(crate) imported_virtuals: Vec<ImportedVirtual>,
     /// optimizer.py:34 `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs (InputArgInt/InputArgRef/InputArgFloat)
     /// carrying `box.type` (history.py:220) intrinsically via variant tag.
@@ -610,25 +619,25 @@ pub(crate) fn merge_backend_constants_from_ctx(
 /// RPython unroll.py: import_state virtual info for Phase 2.
 /// Tells OptVirtualize that an inputarg is a virtual object.
 #[derive(Clone, Debug)]
-pub struct ImportedVirtual {
+pub(crate) struct ImportedVirtual {
     /// Inputarg index that holds this virtual.
-    pub inputarg_index: usize,
+    pub(crate) inputarg_index: usize,
     /// Size descriptor for the virtual's New().
-    pub size_descr: majit_ir::DescrRef,
+    pub(crate) size_descr: majit_ir::DescrRef,
     /// Whether this imported virtual is an instance or a plain struct.
-    pub kind: ImportedVirtualKind,
+    pub(crate) kind: ImportedVirtualKind,
     /// Fields: (field_descr, exported abstract info for the field value).
-    pub fields: Vec<(
+    pub(crate) fields: Vec<(
         majit_ir::DescrRef,
         crate::optimizeopt::virtualstate::VirtualStateInfo,
     )>,
     /// Descr index of the GetfieldGcR(pool) that loads this head.
     /// OptVirtualize forwards this load result to the virtual head.
-    pub head_load_descr_index: Option<u32>,
+    pub(crate) head_load_descr_index: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
-pub enum ImportedVirtualKind {
+pub(crate) enum ImportedVirtualKind {
     Instance { known_class: Option<i64> },
     Struct,
 }
@@ -3884,7 +3893,7 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
-        front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
+        front_target_tokens: &mut Vec<crate::history::TargetToken>,
         runtime_boxes: &[OpRef],
         inline_short_preamble: bool,
         retraced_count: u32,
@@ -4235,7 +4244,7 @@ impl Optimizer {
     fn try_jump_to_existing_trace(
         opt_unroll: &crate::optimizeopt::unroll::OptUnroll,
         jump_args: &[OpRef],
-        front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
+        front_target_tokens: &mut Vec<crate::history::TargetToken>,
         optimizer: &mut Self,
         ctx: &mut OptContext,
         force_boxes: bool,
@@ -5305,7 +5314,7 @@ impl Optimizer {
     }
 
     /// Create an optimizer with virtualizable config for frame field tracking.
-    pub fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
+    pub(crate) fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
         let mut opt = Self::new();
         opt.add_pass(Box::new(OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));

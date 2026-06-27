@@ -16,6 +16,21 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
 };
 
+/// RPython `class fakeaddress(object)` (llmemory.py:450).
+pub type fakeaddress = _address;
+
+/// RPython `class fakeaddressEntry(ExtRegistryEntry)` (llmemory.py:566).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct fakeaddressEntry;
+
+/// RPython `class NullAddressError(Exception)` (llmemory.py:643).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NullAddressError;
+
+/// RPython `class DanglingPointerError(Exception)` (llmemory.py:646).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DanglingPointerError;
+
 thread_local! {
     /// `_end_markers` (llmemory.py:167) — `<array of STRUCT>` identity →
     /// its `_endmarker`. `ItemOffset.ref` memoizes the sentinel per parent

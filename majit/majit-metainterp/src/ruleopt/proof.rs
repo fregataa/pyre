@@ -110,7 +110,9 @@ pub struct Z3Formula {
 }
 
 impl Z3Formula {
-    fn new(expr: impl Into<String>, valid: impl Into<String>) -> Self {
+    /// pyre intentionally introduces `Z3Formula` as the Rust carrier for a
+    /// generated Z3 expression plus its validity condition.
+    pub fn new(expr: impl Into<String>, valid: impl Into<String>) -> Self {
         Self {
             expr: expr.into(),
             valid: valid.into(),

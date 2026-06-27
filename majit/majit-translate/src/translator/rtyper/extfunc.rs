@@ -23,7 +23,7 @@ pub enum ExternalAnnotation {
 }
 
 impl ExternalAnnotation {
-    pub fn annotation(&self) -> SomeValue {
+    pub(crate) fn annotation(&self) -> SomeValue {
         match self {
             ExternalAnnotation::Float => s_float(),
             ExternalAnnotation::Int => s_int(),
@@ -216,8 +216,8 @@ impl Repr for ExternalFunctionRepr {
 pub struct ExtFuncEntry {
     pub function: HostObject,
     pub safe_not_sandboxed: bool,
-    pub signature_args: Vec<ExternalAnnotation>,
-    pub signature_result: ExternalAnnotation,
+    pub(crate) signature_args: Vec<ExternalAnnotation>,
+    pub(crate) signature_result: ExternalAnnotation,
     pub name: String,
     pub lltypeimpl: Option<_ptr>,
     pub lltypefakeimpl: Option<HostObject>,
@@ -282,19 +282,19 @@ pub fn is_external(func: &ConstValue) -> bool {
     }
 }
 
-pub fn s_float() -> SomeValue {
+fn s_float() -> SomeValue {
     SomeValue::Float(SomeFloat::new())
 }
 
-pub fn s_int() -> SomeValue {
+fn s_int() -> SomeValue {
     SomeValue::Integer(SomeInteger::new(false, false))
 }
 
-pub fn s_bool() -> SomeValue {
+fn s_bool() -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
-pub fn s_tuple(items: Vec<SomeValue>) -> SomeValue {
+fn s_tuple(items: Vec<SomeValue>) -> SomeValue {
     SomeValue::Tuple(SomeTuple::new(items))
 }
 

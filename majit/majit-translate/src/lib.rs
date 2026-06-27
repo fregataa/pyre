@@ -19,9 +19,9 @@ pub mod config;
 pub mod flowspace;
 pub mod tool;
 pub use codewriter::{
-    assembler, call, flatten, format, insns, jitcode, jtransform, liveness, policy, regalloc,
-    support,
+    assembler, call, flatten, format, insns, jitcode, jtransform, liveness, policy, support,
 };
+pub use tool::algo::regalloc;
 
 mod codegen;
 pub mod front;
@@ -53,7 +53,7 @@ pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten_graph
 pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram};
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,
-    VirtualizableFieldDescriptor, rewrite_graph,
+    VirtualizableFieldDescriptor, transform_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};

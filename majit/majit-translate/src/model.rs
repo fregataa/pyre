@@ -1313,7 +1313,7 @@ pub fn exception_exitcase() -> ExitCase {
 /// (concretetype on the struct field) so type-sensitive renaming /
 /// Void filtering at link sites can read kinds off either arm without
 /// projecting through a side table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LinkArg {
     Value(crate::flowspace::model::Variable),
     Const(crate::flowspace::model::Constant),
@@ -2479,8 +2479,17 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
                     }
                 }
             }
-            if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
-                real_read.insert(var.clone());
+            match &block.exitswitch {
+                Some(ExitSwitch::Value(var)) => {
+                    real_read.insert(var.clone());
+                }
+                // A fused comparison reads its operands at the branch.
+                Some(ExitSwitch::Fused { args, .. }) => {
+                    for arg in args {
+                        real_read.insert(arg.clone());
+                    }
+                }
+                Some(ExitSwitch::LastException) | None => {}
             }
             for link in &block.exits {
                 for arg in &link.args {
@@ -2932,8 +2941,17 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
                 kind => read_vars.extend(crate::inline::op_variable_refs(kind)),
             }
         }
-        if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
-            read_vars.insert(var.clone());
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                read_vars.insert(var.clone());
+            }
+            // A fused comparison reads its operands at the branch.
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    read_vars.insert(arg.clone());
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
         }
         // Terminal blocks implicitly read every inputarg (`simplify.py:459-462`).
         if block.exits.is_empty() {
@@ -3252,8 +3270,17 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 }
             }
         }
-        if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
-            read_vars.insert(var.clone());
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                read_vars.insert(var.clone());
+            }
+            // A fused comparison reads its operands at the branch.
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    read_vars.insert(arg.clone());
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
         }
         // `simplify.py:459-462`: terminal blocks (no exits)
         // implicitly use every inputarg.
@@ -3419,6 +3446,269 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(iarg)
             }) {
                 graph.blocks[block_idx].operations.remove(op_idx);
+            }
+        }
+    }
+
+    remove_duplicate_inputargs(graph);
+}
+
+/// Crate-local [`FunctionGraph`] port of RPython
+/// `translator/simplify.py:540-590 remove_identical_vars_SSA`.
+///
+/// The earlier subset only removed literally duplicated `inputargs`, which
+/// missed upstream's phi-tuple equivalence pass and left codewriter graphs
+/// with self-conflicting register-allocation inputs.  Keep the same shape as
+/// upstream: collect each block's incoming phi columns, union equivalent
+/// variables, rebuild input/link arg lists, then rename the remaining block
+/// body references.
+pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
+    use crate::tool::algo::unionfind::{UnionFind, UnionFindInfo};
+    use std::collections::HashMap;
+
+    let start = graph.startblock;
+    let return_block = graph.returnblock;
+    let except_block = graph.exceptblock;
+
+    #[derive(Clone)]
+    struct Representative {
+        rep: LinkArg,
+    }
+
+    impl UnionFindInfo for Representative {
+        fn absorb(&mut self, _other: Self) {}
+    }
+
+    fn all_equal(args: &[LinkArg]) -> bool {
+        args.first()
+            .is_none_or(|first| args.iter().skip(1).all(|arg| arg == first))
+    }
+
+    fn isspecialvar(arg: &LinkArg) -> bool {
+        // simplify.py:538 `v._name in ('last_exception_', 'last_exc_value_')` —
+        // compare the bare `_name` prefix, not the suffix-appended `name()`.
+        matches!(
+            arg,
+            LinkArg::Value(var)
+                if matches!(var.name_prefix().as_str(), "last_exception_" | "last_exc_value_")
+        )
+    }
+
+    let mut uf: UnionFind<LinkArg, Representative> =
+        UnionFind::new(|arg: &LinkArg| Representative { rep: arg.clone() });
+
+    let mut entries: HashMap<BlockId, Vec<(usize, usize)>> = HashMap::new();
+    for (pred_idx, block) in graph.blocks.iter().enumerate() {
+        for (link_idx, link) in block.exits.iter().enumerate() {
+            if link.target == start || link.target == return_block || link.target == except_block {
+                continue;
+            }
+            entries
+                .entry(link.target)
+                .or_default()
+                .push((pred_idx, link_idx));
+        }
+    }
+
+    let mut inputs: HashMap<BlockId, Vec<(crate::flowspace::model::Variable, Vec<LinkArg>)>> =
+        HashMap::new();
+    for (&block_id, links) in &entries {
+        let inputargs = graph.block(block_id).inputargs.clone();
+        let mut phis = Vec::with_capacity(inputargs.len());
+        for (arg_i, input) in inputargs.into_iter().enumerate() {
+            let mut phi_args = Vec::with_capacity(links.len());
+            for (pred_idx, link_idx) in links {
+                let link = &graph.blocks[*pred_idx].exits[*link_idx];
+                let arg = link.args.get(arg_i).unwrap_or_else(|| {
+                    panic!(
+                        "remove_identical_vars_SSA: link.args[{arg_i}] missing \
+                         (graph {}, target {:?})",
+                        graph.name, block_id,
+                    )
+                });
+                phi_args.push(arg.clone());
+            }
+            phis.push((input, phi_args));
+        }
+        inputs.insert(block_id, phis);
+    }
+
+    fn simplify_phis(
+        uf: &mut UnionFind<LinkArg, Representative>,
+        phis: &mut Vec<(crate::flowspace::model::Variable, Vec<LinkArg>)>,
+    ) -> bool {
+        let mut to_remove: Vec<usize> = Vec::new();
+        let mut unique_phis: HashMap<Vec<LinkArg>, crate::flowspace::model::Variable> =
+            HashMap::new();
+        for (i, (input, phi_args)) in phis.iter().enumerate() {
+            let new_args: Vec<LinkArg> = phi_args
+                .iter()
+                .map(|arg| uf.find_rep(arg.clone()))
+                .collect();
+            if all_equal(&new_args) && !isspecialvar(&new_args[0]) {
+                // The current model IR can only rename operation operands to
+                // Variables.  Leave all-constant phis alone until model ops
+                // can carry Constants in the same slots as flowspace Hlvalue.
+                if matches!(&new_args[0], LinkArg::Value(_)) {
+                    uf.union(new_args[0].clone(), LinkArg::Value(input.clone()));
+                    to_remove.push(i);
+                    continue;
+                }
+            }
+            if let Some(existing) = unique_phis.get(&new_args).cloned() {
+                uf.union(LinkArg::Value(existing), LinkArg::Value(input.clone()));
+                to_remove.push(i);
+            } else {
+                unique_phis.insert(new_args, input.clone());
+            }
+        }
+        for i in to_remove.iter().rev() {
+            phis.remove(*i);
+        }
+        !to_remove.is_empty()
+    }
+
+    let block_ids: Vec<BlockId> = inputs.keys().copied().collect();
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for block_id in &block_ids {
+            if simplify_phis(&mut uf, inputs.get_mut(block_id).expect("inputs block")) {
+                progress = true;
+            }
+        }
+    }
+
+    let keys: Vec<LinkArg> = uf.keys().cloned().collect();
+    let mut renaming: HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    > = HashMap::new();
+    for key in keys {
+        let LinkArg::Value(src) = key.clone() else {
+            continue;
+        };
+        if let Some(info) = uf.get(&key) {
+            if let LinkArg::Value(dst) = &info.rep {
+                if src != *dst {
+                    renaming.insert(src, dst.clone());
+                }
+            }
+        }
+    }
+
+    for (&block_id, phis) in &inputs {
+        let surviving: Vec<crate::flowspace::model::Variable> =
+            phis.iter().map(|(input, _)| input.clone()).collect();
+        {
+            // simplify.py drops the phi slot from `block.inputargs` and the
+            // predecessor `link.args`.  Pyre phi blocks also carry a matching
+            // `OpKind::Input` op per slot, so remove the Input ops whose result
+            // is a dropped slot — otherwise the later rename leaves a spurious
+            // in-block definition for a value no predecessor supplies.
+            let surviving_set: std::collections::HashSet<&crate::flowspace::model::Variable> =
+                surviving.iter().collect();
+            let block = graph.block_mut(block_id);
+            let dropped: Vec<crate::flowspace::model::Variable> = block
+                .inputargs
+                .iter()
+                .filter(|v| !surviving_set.contains(*v))
+                .cloned()
+                .collect();
+            block.inputargs = surviving;
+            for slot in &dropped {
+                if let Some(op_idx) = block.operations.iter().position(|op| {
+                    matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(slot)
+                }) {
+                    block.operations.remove(op_idx);
+                }
+            }
+        }
+        let links = entries
+            .get(&block_id)
+            .expect("entry list for input block")
+            .clone();
+        for (link_pos, (pred_idx, link_idx)) in links.into_iter().enumerate() {
+            graph.blocks[pred_idx].exits[link_idx].args = phis
+                .iter()
+                .map(|(_, phi_args)| phi_args[link_pos].clone())
+                .collect();
+        }
+    }
+
+    if renaming.is_empty() {
+        return;
+    }
+
+    let remap_var = |var: &crate::flowspace::model::Variable| {
+        renaming.get(var).cloned().unwrap_or_else(|| var.clone())
+    };
+    for block in &mut graph.blocks {
+        for inputarg in &mut block.inputargs {
+            *inputarg = remap_var(inputarg);
+        }
+        for op in &mut block.operations {
+            op.result = op.result.as_ref().map(&remap_var);
+            op.kind = crate::inline::remap_op_kind(&op.kind, &remap_var);
+        }
+        let (exitswitch, exits) = remap_control_flow_metadata_var(
+            &block.exitswitch,
+            &block.exits,
+            &remap_var,
+            |block_id| block_id,
+        );
+        block.exitswitch = exitswitch;
+        block.exits = exits;
+    }
+
+    // A second sweep removes any same-Variable inputargs created by the final
+    // rename.  This is the same fixed-point effect as upstream's loop.
+    for block_idx in 0..graph.blocks.len() {
+        let block_id = graph.blocks[block_idx].id;
+        if block_id == start || block_id == return_block || block_id == except_block {
+            continue;
+        }
+        let mut first_seen: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
+        let mut duplicate_slots: Vec<(usize, usize)> = Vec::new();
+        for (i, inputarg) in graph.blocks[block_idx].inputargs.iter().enumerate() {
+            if let Some(first_i) = first_seen.get(inputarg).copied() {
+                duplicate_slots.push((i, first_i));
+            } else {
+                first_seen.insert(inputarg.clone(), i);
+            }
+        }
+        if duplicate_slots.is_empty() {
+            continue;
+        }
+        let mut removable_slots: Vec<(usize, usize)> = Vec::new();
+        for (dup_i, first_i) in duplicate_slots {
+            let mut removable = true;
+            for pred_idx in 0..graph.blocks.len() {
+                for link in &graph.blocks[pred_idx].exits {
+                    if link.target != block_id {
+                        continue;
+                    }
+                    if link.args.get(dup_i) != link.args.get(first_i) {
+                        removable = false;
+                        break;
+                    }
+                }
+                if !removable {
+                    break;
+                }
+            }
+            if removable {
+                removable_slots.push((dup_i, first_i));
+            }
+        }
+        for (dup_i, _) in removable_slots.into_iter().rev() {
+            graph.blocks[block_idx].inputargs.remove(dup_i);
+            for pred_idx in 0..graph.blocks.len() {
+                for link in &mut graph.blocks[pred_idx].exits {
+                    if link.target == block_id {
+                        link.args.remove(dup_i);
+                    }
+                }
             }
         }
     }
@@ -4729,7 +5019,7 @@ impl FunctionGraph {
     /// unconditional single exit.
     ///
     /// The `_reason` string is retained for optional GraphTransformNote
-    /// annotations (see `jtransform.rs::rewrite_graph`'s abort note);
+    /// annotations (see `jtransform.rs::transform_graph`'s abort note);
     /// pass `""` when not applicable.
     ///
     /// Used only where no concrete exception payload is available at
@@ -5245,7 +5535,7 @@ mod tests {
             .unwrap();
         let merge = graph.create_block();
         install_phi(&mut graph, merge, "x");
-        graph.set_goto(entry, merge, vec![const_v_var]);
+        graph.set_goto(entry, merge, vec![const_v_var.clone()]);
         graph.set_return(merge, None);
 
         prune_dead_phis(&mut graph);
@@ -5268,19 +5558,18 @@ mod tests {
     }
 
     #[test]
-    fn prune_dead_phis_keeps_phi_with_reader() {
-        // entry → merge(phi 'x' read by a BinOp whose result is the
-        // function return value) → returnblock(reads return value).
-        // The BinOp's result is genuinely live — it flows through the
-        // returnblock's terminal-inputarg pin — so backward dataflow
-        // marks it `read_vars`, then propagates back through the
-        // pure-op dependencies entry to phi_x, keeping phi_x alive.
+    fn prune_dead_phis_collapses_single_source_phi_with_reader() {
+        // entry -> merge(phi 'x' read by a BinOp whose result is the
+        // function return value) -> returnblock(reads return value).
+        // RPython `remove_identical_vars_SSA` removes a phi when all incoming
+        // args are the same value and renames downstream readers to that
+        // representative, even when the reader itself is live.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let const_v_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         let merge = graph.create_block();
         let phi_x_var = install_phi(&mut graph, merge, "x");
-        graph.set_goto(entry, merge, vec![const_v_var]);
+        graph.set_goto(entry, merge, vec![const_v_var.clone()]);
         // BinOp whose result IS read (by `set_return`).  Backward
         // dataflow needs a live consumer of the BinOp result for the
         // pure-op-args→dependencies routing to keep phi_x alive.
@@ -5296,20 +5585,33 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(merge, Some(doubled_var));
+        graph.set_return(merge, Some(doubled_var.clone()));
 
         prune_dead_phis(&mut graph);
 
         assert_eq!(
             graph.block(merge).inputargs,
-            vec![phi_x_var],
-            "phi with a live downstream reader must stay"
+            Vec::<crate::flowspace::model::Variable>::new(),
+            "single-source phi is removed and live readers are renamed"
         );
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
             entry_exit.args.len(),
-            1,
-            "predecessor link arg matching a kept phi must stay"
+            0,
+            "predecessor link arg matching the removed phi must be removed"
+        );
+        let binop = graph
+            .block(merge)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&doubled_var))
+            .expect("live BinOp remains");
+        assert!(
+            matches!(
+                &binop.kind,
+                OpKind::BinOp { lhs, rhs, .. } if lhs == &const_v_var && rhs == &const_v_var
+            ),
+            "live reader must be renamed to the surviving representative"
         );
     }
 

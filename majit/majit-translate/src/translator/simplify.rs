@@ -368,7 +368,7 @@ fn can_remove_builtins() -> Vec<HostObject> {
 ///         return None
 /// ```
 ///
-pub fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
+pub fn get_graph(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
     // upstream: `if isinstance(arg, Variable): return None`.
     let Hlvalue::Constant(c) = arg else {
         return None;
@@ -461,7 +461,7 @@ pub fn rec_op_has_side_effects(
         let Some(callee_arg) = op.args.first() else {
             return true;
         };
-        let g = get_graph_for_call(callee_arg, translator);
+        let g = get_graph(callee_arg, translator);
         let Some(g) = g else {
             return true;
         };
@@ -825,7 +825,7 @@ pub fn transform_dead_op_vars_in_blocks(
                     let Some(callee_arg) = op.args.first() else {
                         continue;
                     };
-                    if let Some(graph) = get_graph_for_call(callee_arg, trans) {
+                    if let Some(graph) = get_graph(callee_arg, trans) {
                         // upstream: `op is not block.raising_op` —
                         // positional identity matches upstream object
                         // identity because `raising_op` is
@@ -893,7 +893,7 @@ pub fn transform_dead_op_vars_in_blocks(
 /// "representative" value; `absorb` is a no-op so the info that wins
 /// the weighted union keeps its `rep`.
 #[derive(Clone, Debug)]
-struct Representative {
+pub struct Representative {
     rep: Hlvalue,
 }
 
@@ -902,7 +902,7 @@ impl crate::tool::algo::unionfind::UnionFindInfo for Representative {
 }
 
 /// RPython `all_equal(lst)` (simplify.py:533-535).
-fn all_equal_hl(lst: &[Hlvalue]) -> bool {
+pub fn all_equal(lst: &[Hlvalue]) -> bool {
     match lst.first() {
         None => true,
         Some(first) => lst.iter().skip(1).all(|x| x == first),
@@ -1089,7 +1089,7 @@ fn simplify_phis_inner(
         // upstream: `if all_equal(new_args) and not isspecialvar(new_args[0]):`
         let first = new_args.first().cloned();
         if let Some(first) = first {
-            if all_equal_hl(&new_args) && !isspecialvar(&first) {
+            if all_equal(&new_args) && !isspecialvar(&first) {
                 uf.union(first, Hlvalue::Variable(input.clone()));
                 to_remove.push(i);
                 continue;
@@ -2008,7 +2008,23 @@ fn is_stop_iteration_exitcase(exitcase: Option<&Hlvalue>) -> bool {
     )
 }
 
-struct ListComprehensionDetector<'a> {
+/// RPython `class DetectorFailed` (simplify.py:788).
+///
+/// The Rust detector routes failure through `Option`/early returns, but the
+/// upstream exception name is part of the public parity surface for this
+/// module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DetectorFailed;
+
+impl std::fmt::Display for DetectorFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DetectorFailed")
+    }
+}
+
+impl std::error::Error for DetectorFailed {}
+
+pub struct ListComprehensionDetector<'a> {
     graph: &'a FunctionGraph,
     loops: Vec<(BlockRef, BlockRef, Hlvalue)>,
     newlist_v: HashMap<Hlvalue, BlockRef>,
@@ -2518,22 +2534,21 @@ pub fn detect_list_comprehension(graph: &FunctionGraph) {
 /// `SSA_to_SSI(graph, annotator=None)` are wrapped to match — both
 /// accept `translator=None` / `annotator=None` by default and the
 /// Rust wrappers pass `None`.
-pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
-    &[
-        dead_op_vars_shim,
-        eliminate_empty_blocks,
-        remove_assertion_errors,
-        remove_identical_vars_SSA,
-        constfold_exitswitch,
-        remove_trivial_links,
-        ssa_to_ssi_shim,
-        coalesce_bool,
-        transform_ovfcheck,
-        simplify_exceptions,
-        transform_xxxitem,
-        remove_dead_exceptions,
-    ]
-}
+#[allow(non_upper_case_globals)]
+pub const all_passes: &[fn(&FunctionGraph)] = &[
+    dead_op_vars_shim,
+    eliminate_empty_blocks,
+    remove_assertion_errors,
+    remove_identical_vars_SSA,
+    constfold_exitswitch,
+    remove_trivial_links,
+    ssa_to_ssi_shim,
+    coalesce_bool,
+    transform_ovfcheck,
+    simplify_exceptions,
+    transform_xxxitem,
+    remove_dead_exceptions,
+];
 
 fn dead_op_vars_shim(graph: &FunctionGraph) {
     transform_dead_op_vars(graph, None);
@@ -2554,7 +2569,7 @@ fn ssa_to_ssi_shim(graph: &FunctionGraph) {
 ///     checkgraph(graph)
 /// ```
 pub fn simplify_graph(graph: &FunctionGraph, passes: Option<&[fn(&FunctionGraph)]>) {
-    let default_passes = all_passes();
+    let default_passes = all_passes;
     let passes = passes.unwrap_or(default_passes);
     for pass_ in passes {
         pass_(graph);
@@ -2930,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn get_graph_for_call_reads_llptr_funcobj_graph() {
+    fn get_graph_reads_llptr_funcobj_graph() {
         let start = Block::shared(vec![]);
         let ret = Variable::new();
         ret.set_concretetype(Some(lltype::LowLevelType::Void));
@@ -2946,12 +2961,12 @@ mod tests {
             test_functionptr_void(&graph),
         ))));
 
-        let got = get_graph_for_call(&arg, &translator).expect("expected graph");
+        let got = get_graph(&arg, &translator).expect("expected graph");
         assert_eq!(GraphKey::of(&got), GraphKey::of(&graph));
     }
 
     #[test]
-    fn get_graph_for_call_returns_none_for_delayed_pointer() {
+    fn get_graph_returns_none_for_delayed_pointer() {
         let translator = TranslationContext::new();
         let arg = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(
             lltype::_ptr::new(
@@ -2965,7 +2980,7 @@ mod tests {
             ),
         ))));
 
-        assert!(get_graph_for_call(&arg, &translator).is_none());
+        assert!(get_graph(&arg, &translator).is_none());
     }
 
     #[test]

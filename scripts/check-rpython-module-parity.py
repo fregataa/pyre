@@ -202,6 +202,8 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "DescEntry": "Rust discriminated carrier for upstream Desc subclass instances",
             "DescKey": "Rust identity handle for upstream's Desc object keys",
             "FuncDescEntry": "Rust carrier preserving FunctionDesc/MemoDesc identity under one Desc entry",
+            "GraphBuilder": "Rust closure carrier for upstream cachedgraph builder callables",
+            "GraphCacheKey": "Rust structured carrier for upstream specialization cache keys",
             "SpecializeResult": "Rust typed carrier for upstream specializers returning graph-or-annotation",
         },
     },
@@ -265,12 +267,155 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     },
     ("rpython/flowspace", "operation"): {
         "types": {
+            "BuiltinException": "Rust carrier for upstream operation.py exception-class objects stored in canraise/can_only_throw tables",
+            "CanOnlyThrow": "Rust carrier for upstream dynamic `can_only_throw` attribute values consumed by annotator.model.read_can_only_throw",
             "OpKind": "Rust enum replacing upstream's op namespace plus HLOperationMeta-generated per-op classes",
+        },
+    },
+    ("rpython/flowspace", "model"): {
+        "functions": {
+            "c_last_exception": "Rust accessor for upstream's `c_last_exception = Constant(last_exception)` module-global sentinel",
+        },
+        "types": {
+            "BlockKey": "Rust identity key for upstream dicts keyed by Block object identity, e.g. mkentrymap/copygraph blockmap",
+            "BlockRef": "Rust shared mutable reference carrier for upstream Block object references held by FunctionGraph and Link.target",
+            "BlockRefExt": "Rust trait surface for Block methods that must be callable on shared BlockRef handles",
+            "ConcretetypePlaceholder": "Rust alias for upstream Variable/Constant.concretetype LowLevelType values assigned by the rtyper",
+            "ConstValue": "Rust explicit carrier for upstream Constant.value's arbitrary Python object stored via Hashable",
+            "GraphFunc": "Rust stand-in for the live Python function object attached to upstream FunctionGraph.func",
+            "GraphKey": "Rust identity key for upstream dicts/sets keyed by FunctionGraph object identity",
+            "GraphRef": "Rust shared mutable reference carrier for upstream FunctionGraph objects passed by identity",
+            "Hlvalue": "Rust enum for upstream mixed Variable-or-Constant cells in args/results/inputargs",
+            "HostCall": "Rust callable carrier for upstream memo-specialized Python function invocation",
+            "HostCallError": "Rust explicit error channel for upstream host Python callable invocation exceptions",
+            "HostCallableFn": "Rust native-closure type for host-level Python callables executed during annotation",
+            "HostEnv": "Rust host namespace carrier for upstream live __builtin__/module lookup during flowspace execution",
+            "HostGetAttrError": "Rust explicit error channel for upstream Python getattr/descriptor lookup during flowspace execution",
+            "HostObject": "Rust identity carrier for upstream arbitrary Python objects stored in Constant.value",
+            "LinkArg": "Rust Option wrapper for upstream Link.args cells that may be None during transient frame-state merges",
+            "LinkKey": "Rust identity key for upstream sets/dicts keyed by Link object identity",
+            "LinkRef": "Rust shared mutable reference carrier for upstream Link object references held by Blocks",
+            "VariableInner": "Rust heap object backing Variable identity and mutable slots that upstream stores directly on the Python object",
+        },
+    },
+    ("rpython/jit/codewriter", "heaptracker"): {
+        "types": {
+            "GcStructVTableCache": "Rust carrier for upstream's dynamic gccache._cache_gcstruct2vtable attribute plus testing_gcstruct2vtable module dict",
+        },
+    },
+    ("rpython/jit/codewriter", "flatten"): {
+        "types": {
+            "FlatOp": "Rust enum carrier for upstream SSARepr instruction tuples emitted by GraphFlattener.emitline",
+            "IntOvfOp": "Rust discriminant for upstream int_{add,sub,mul}_jump_if_ovf opname strings",
+            "RegKind": "Rust enum replacing upstream Register.kind string literals ('int', 'ref', 'float')",
+            "RegOrConst": "Rust enum for upstream getcolor's Variable-to-Register or Constant passthrough union",
+        },
+    },
+    ("rpython/jit/codewriter", "jtransform"): {
+        "types": {
+            "CallEffectKind": "Rust enum carrier for upstream EffectInfo extraeffect classifications during call rewrite",
+            "CallEffectOverride": "Rust typed carrier for upstream callcontrol/cpu calldescr effect overrides",
+            "GraphTransformConfig": "Rust explicit configuration carrier for upstream Transformer constructor/context fields",
+            "GraphTransformNote": "Rust diagnostic note emitted by the graph transform pass; upstream logs through policy.log",
+            "GraphTransformResult": "Rust result carrier for upstream in-place Transformer.transform side effects",
+            "VableFlag": "Rust enum carrier for upstream Transformer.vable_flags marker values",
+            "VirtualizableFieldDescriptor": "Rust typed descriptor for upstream virtualizable field and array field metadata",
+        },
+    },
+    ("rpython/jit/codewriter", "call"): {
+        "functions": {
+            "effectinfo_from_writeanalyze": "implementation lives beside CallControl's WriteAnalysis in Rust and is re-exported from effectinfo for the upstream public module surface",
+        },
+        "types": {
+            "AnalysisCache": "Rust carrier for upstream per-analyzer DependencyTracker fields seen_rw/seen_gc and raise/effect caches",
+            "CallDescriptor": "Rust typed calldescr carrier for upstream cpu.calldescrof(..., EffectInfo) results",
+            "CallKind": "Rust enum for upstream guess_call_kind string results regular/residual/builtin/recursive",
+            "CanRaise": "Rust enum for upstream RaiseAnalyzer result values True/False/'mem'",
+            "DefaultVirtualRefInfoHandle": "Rust zero-sized handle for upstream CallControl.virtualref_info default state",
+            "DescrIndexRegistry": "Rust descriptor-index cache replacing upstream cpu descriptor identity side effects",
+            "GreenFieldInfoHandle": "Rust typed handle for upstream green-field info stored on JitDriverStaticData",
+            "JitDriverStaticData": "Rust typed carrier for upstream jitdrivers_sd entries threaded through CallControl",
+            "StaticGreenFieldInfoHandle": "Rust typed handle for upstream static green-field metadata",
+            "StructFieldLayout": "Rust carrier for upstream lltype field layout queried through cpu.fielddescrof",
+            "StructLayout": "Rust carrier for upstream lltype struct layout queried by descriptor construction",
+            "VirtualRefInfoHandle": "Rust typed handle for upstream virtualref_info object",
+            "VirtualizableInfoHandle": "Rust typed handle for upstream VirtualizableInfo referenced by callcontrol",
+            "WriteAnalysis": "Rust typed carrier for upstream ReadWriteAnalyzer tuple-set output",
         },
     },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
+        },
+    },
+    ("rpython/rtyper", "extfunc"): {
+        "types": {
+            "ExternalAnnotation": "Rust carrier for upstream annotator.signature.annotation(...) inputs passed to register_external",
+        },
+    },
+    ("rpython/rtyper", "rbuiltin"): {
+        "types": {
+            "BuiltinTyperFn": "Rust function-pointer carrier for upstream rtype_builtin_* callables stored by typer_for",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "opimpl"): {
+        "types": {
+            "FoldFn": "Rust function-pointer carrier for upstream opimpl fold callables returned by get_op_impl",
+        },
+    },
+    ("rpython/jit/metainterp/optimizeopt", "vstring"): {
+        "functions": {
+            "_int_add": "Rust public helper for upstream's private `_int_add` used by vstring copy paths",
+            "string_copy_parts": "Rust public helper for upstream's per-class `string_copy_parts` method dispatch",
+        },
+    },
+    ("rpython/jit/metainterp/ruleopt", "generate"): {
+        "functions": {
+            "def_file": "Rust accessor for upstream's `def_file = os.path.join(here, 'real.rules')` local path",
+            "generate_mixin": "Rust public helper for the codegen half inside upstream `main(argv)`",
+            "generate_real_rules": "Rust public helper for generating from the vendored upstream `real.rules` source",
+            "generate_source": "Rust public helper for parse-plus-codegen over caller-provided rule source",
+            "out_file": "Rust accessor for upstream's `out_file = os.path.join(..., 'autogenintrules.py')` local path",
+        },
+    },
+    ("rpython/jit/metainterp/ruleopt", "codegen"): {
+        "types": {
+            "Path": "Rust structured carrier for upstream create_matcher name_paths tuple/list entries",
+            "PathElement": "Rust enum for upstream name_paths tuple elements: op/index pairs and constant markers",
+        },
+    },
+    ("rpython/jit/metainterp/ruleopt", "proof"): {
+        "types": {
+            "Z3Formula": "pyre intentionally introduces this Rust carrier for a Z3 expression plus its validity condition",
+        },
+    },
+    ("rpython/jit/metainterp/ruleopt", "parse"): {
+        "types": {
+            "Element": "Rust enum carrier for upstream rule element lists containing Compute or Check instances",
+            "ParseError": "Rust error carrier for upstream rply LexingError/ParsingError paths",
+            "RuleParseError": "Rust parse-plus-typecheck error carrier for caller-facing parse() failures",
+            "RuleType": "Rust enum carrier for upstream expression typ values int/bool/IntBound",
+            "SourcePos": "Rust source-position carrier for upstream rply token/sourcepos objects",
+        },
+    },
+    ("rpython/jit/metainterp", "virtualizable"): {
+        "functions": {
+            "item_size_for_type": "Rust cross-crate layout helper used by majit-macros and compile.rs; upstream resolves this through symbolic.py/llmemory descriptor APIs",
+        },
+    },
+    ("rpython/jit/metainterp", "virtualref"): {
+        "types": {
+            "JitVirtualRef": "Rust concrete layout for upstream lltype.GcStruct('JitVirtualRef') allocated in VirtualRefInfo.__init__",
+            "ObjectHeader": "Rust concrete layout for upstream rclass.OBJECT super field embedded in JitVirtualRef",
+        },
+        "functions": {
+            "set_vref_gc_type_id": "Rust startup hook for pyre-jit's GC type registration; upstream stores the vref type identity on the lltype/GC object model",
+        },
+    },
+    ("rpython/jit/metainterp", "support"): {
+        "types": {
+            "Address": "Rust alias for upstream llmemory.Address values crossing the metainterp support.py helper boundary",
+            "AddressAsInt": "Rust alias for upstream llmemory.AddressAsInt results returned by support.adr2int/ptr2int",
         },
     },
     ("rpython/rtyper/lltypesystem", "lltype"): {
@@ -283,6 +428,53 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "_is_pinned": "Rust public testable surface for upstream's private `_is_pinned` helper",
             "free": "Rust function surface for upstream's `from lltype import free` alias",
             "setfield": "Rust function surface for upstream's `setfield = setattr` alias",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "llmemory"): {
+        "types": {
+            "OffsetLayout": "Rust trait carrier for byte-size queries that upstream resolves through runtime/fake memory layout objects",
+            "_address_fakeaccessor": "Rust public carrier for upstream's private `_address_fakeaccessor` address property helper",
+            "_char_fakeaccessor": "Rust public carrier for upstream's private `_char_fakeaccessor` address property helper",
+            "_fakeaccessor": "Rust public carrier for upstream's private `_fakeaccessor` base helper",
+            "_float_fakeaccessor": "Rust public carrier for upstream's private `_float_fakeaccessor` address property helper",
+            "_signed_fakeaccessor": "Rust public carrier for upstream's private `_signed_fakeaccessor` address property helper",
+            "_unsigned_fakeaccessor": "Rust public carrier for upstream's private `_unsigned_fakeaccessor` address property helper",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "lloperation"): {
+        "types": {
+            "_LLOP": "Rust public carrier for upstream's private `_LLOP` class backing the `llop` singleton",
+        },
+        "functions": {
+            "ll_operations": "Rust accessor for upstream's `LL_OPERATIONS` module-global operation table",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "rdict"): {
+        "functions": {
+            "_ll_dict_del": "Rust public placeholder for upstream's private `_ll_dict_del` helper",
+            "_ll_dict_resize_to": "Rust public placeholder for upstream's private `_ll_dict_resize_to` helper",
+            "_ll_dict_setitem_lookup_done": "Rust public placeholder for upstream's private `_ll_dict_setitem_lookup_done` helper",
+            "_ll_dictnext": "Rust public placeholder for upstream's private `_ll_dictnext` helper",
+            "_ll_free_entries": "Rust public placeholder for upstream's private `_ll_free_entries` helper",
+            "_ll_getnextitem": "Rust public placeholder for upstream's private `_ll_getnextitem` helper",
+            "_ll_malloc_dict": "Rust public placeholder for upstream's private `_ll_malloc_dict` helper",
+            "_ll_malloc_entries": "Rust public placeholder for upstream's private `_ll_malloc_entries` helper",
+            "_make_ll_keys_values_items": "Rust public placeholder for upstream's private `_make_ll_keys_values_items` helper",
+            "ll_dict_items": "Rust public placeholder for upstream's `ll_dict_items = _make_ll_keys_values_items('items')` module-global callable",
+            "ll_dict_keys": "Rust public placeholder for upstream's `ll_dict_keys = _make_ll_keys_values_items('keys')` module-global callable",
+            "ll_dict_values": "Rust public placeholder for upstream's `ll_dict_values = _make_ll_keys_values_items('values')` module-global callable",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "rlist"): {
+        "functions": {
+            "_ll_list_resize": "Rust public placeholder for upstream's private `_ll_list_resize` helper",
+            "_ll_list_resize_ge": "Rust public placeholder for upstream's private `_ll_list_resize_ge` helper",
+            "_ll_list_resize_hint": "Rust public placeholder for upstream's private `_ll_list_resize_hint` helper",
+            "_ll_list_resize_hint_really": "Rust public placeholder for upstream's private `_ll_list_resize_hint_really` helper",
+            "_ll_list_resize_le": "Rust public placeholder for upstream's private `_ll_list_resize_le` helper",
+            "_ll_list_resize_really": "Rust public placeholder for upstream's private `_ll_list_resize_really` helper",
+            "_ll_new_empty_item_array": "Rust public placeholder for upstream's private `_ll_new_empty_item_array` helper",
+            "_ll_prebuilt_empty_array": "Rust public placeholder for upstream's private `_ll_prebuilt_empty_array` helper",
         },
     },
     ("rpython/rtyper/lltypesystem", "rbuilder"): {
@@ -298,6 +490,148 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "_empty_bytearray": "Rust public surface for upstream's private `_empty_bytearray` helper",
             "bytearray_repr": "Rust accessor for upstream's `bytearray_repr = ByteArrayRepr()` singleton",
             "empty": "Rust accessor for upstream's `empty = lltype.malloc(BYTEARRAY, 0, immortal=True)` singleton",
+        },
+    },
+    ("rpython/rtyper", "controllerentry"): {
+        "types": {
+            "ControlledBox": "Rust value carrier for upstream's controlled_instance_* functions that are XXX sentinels special-cased by ExtRegistryEntry",
+        },
+    },
+    ("rpython/rtyper", "error"): {
+        "types": {
+            "TyperWhere": "Rust structured carrier for upstream's dynamic TyperError.where tuple",
+        },
+    },
+    ("rpython/rtyper", "rmodel"): {
+        "types": {
+            "AddressRepr": "Rust home for upstream raddress.py AddressRepr while module parity keeps raddress folded into rmodel",
+            "BuiltinConstKey": "Rust key carrier for upstream rtyper_makekey builtin const identity cases",
+            "DescOrConst": "Rust enum carrier for upstream convert_desc_or_const's Desc-or-Constant dynamic union",
+            "InteriorPtrRepr": "Rust home for upstream rptr.py InteriorPtrRepr while module parity keeps rptr folded into rmodel",
+            "LLADTMethRepr": "Rust home for upstream rptr.py LLADTMethRepr while module parity keeps rptr folded into rmodel",
+            "PtrRepr": "Rust home for upstream rptr.py PtrRepr while module parity keeps rptr folded into rmodel",
+            "RTypeResult": "Rust result alias for upstream rtype_* methods returning value-or-None or raising TyperError",
+            "ReprKey": "Rust structured key for upstream SomeValue.rtyper_makekey dynamic tuple/list keys",
+            "ReprState": "Rust carrier for upstream Repr._initialized plus setup owner state",
+            "TypedAddressAccessRepr": "Rust home for upstream raddress.py TypedAddressAccessRepr while module parity keeps raddress folded into rmodel",
+        },
+    },
+    ("rpython/rtyper", "rrange"): {
+        "types": {
+            "RangeIter": "Rust carrier for upstream lltypesystem.rrange RANGEITER/RANGESTITER low-level structs used by ll_rangenext_* helpers",
+        },
+    },
+    ("rpython/rtyper", "annlowlevel"): {
+        "types": {
+            "DelayedConst": "Rust carrier for upstream MixLevelHelperAnnotator.delayedconsts tuple entries",
+            "DelayedFunc": "Rust carrier for upstream MixLevelHelperAnnotator.delayedfuncs tuple entries",
+            "HLStrEntry": "Rust public carrier for upstream generated hlstr ExtRegistryEntry helper",
+            "KeyCompValue": "Rust enum for upstream KeyComp.val's LowLevelType-or-constant dynamic union",
+            "LLStrEntry": "Rust public carrier for upstream generated llstr ExtRegistryEntry helper",
+            "PendingHelper": "Rust carrier for upstream MixLevelHelperAnnotator.pending tuple entries",
+            "StringEntryDirection": "Rust enum for upstream make_string_entries hl/ll helper direction",
+            "StringEntryHelper": "Rust callable carrier for upstream make_string_entries generated helpers",
+            "StringEntryType": "Rust enum for upstream make_string_entries str/unicode helper family",
+        },
+    },
+    ("rpython/rtyper", "rbool"): {
+        "functions": {
+            "bool_repr": "Rust accessor for upstream's `bool_repr = BoolRepr()` singleton",
+            "pair_bool_float_convert_from_to": "Rust public helper for upstream's `pairtype(BoolRepr, FloatRepr).convert_from_to`",
+            "pair_bool_integer_convert_from_to": "Rust public helper for upstream's `pairtype(BoolRepr, IntegerRepr).convert_from_to`",
+            "pair_float_bool_convert_from_to": "Rust public helper for upstream's `pairtype(FloatRepr, BoolRepr).convert_from_to`",
+            "pair_integer_bool_convert_from_to": "Rust public helper for upstream's `pairtype(IntegerRepr, BoolRepr).convert_from_to`",
+        },
+    },
+    ("rpython/rtyper", "rfloat"): {
+        "functions": {
+            "float_repr": "Rust accessor for upstream's `float_repr = FloatRepr()` singleton",
+            "rtype_compare_template": "Rust public helper for upstream's private `_rtype_compare_template` used by pairtype dispatch",
+            "rtype_template": "Rust public helper for upstream's private `_rtype_template` used by pairtype dispatch",
+        },
+    },
+    ("rpython/rtyper", "rtuple"): {
+        "functions": {
+            "ll_equal": "Rust public helper for upstream's private `_ll_equal` fallback comparator",
+            "pair_tuple_int_rtype_getitem": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, IntegerRepr)).rtype_getitem`",
+            "pair_tuple_repr_rtype_contains": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, Repr)).rtype_contains`",
+            "pair_tuple_tuple_convert_from_to": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).convert_from_to`",
+            "pair_tuple_tuple_rtype_add": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_add`",
+            "pair_tuple_tuple_rtype_eq": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_eq`",
+            "pair_tuple_tuple_rtype_is_": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_is_`",
+            "pair_tuple_tuple_rtype_ne": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_ne`",
+        },
+    },
+    ("rpython/rtyper", "rint"): {
+        "functions": {
+            "pair_float_integer_convert_from_to": "Rust public helper for upstream's `pairtype(FloatRepr, IntegerRepr).convert_from_to`",
+            "pair_integer_float_convert_from_to": "Rust public helper for upstream's `pairtype(IntegerRepr, FloatRepr).convert_from_to`",
+            "pair_integer_integer_convert_from_to": "Rust public helper for upstream's `pairtype(IntegerRepr, IntegerRepr).convert_from_to`",
+            "rtype_add_ovf": "Rust public helper for upstream's `pairtype(IntegerRepr, IntegerRepr).rtype_add_ovf` method",
+            "rtype_call_helper": "Rust public helper for upstream's private `_rtype_call_helper` used by pairtype dispatch",
+            "rtype_compare_template": "Rust public helper for upstream's private `_rtype_compare_template` used by pairtype dispatch",
+            "rtype_template": "Rust public helper for upstream's private `_rtype_template` used by pairtype dispatch",
+            "signed_repr": "Rust accessor for upstream's `signed_repr = getintegerrepr(...)` singleton",
+            "signedlonglong_repr": "Rust accessor for upstream's `signedlonglong_repr = getintegerrepr(...)` singleton",
+            "signedlonglonglong_repr": "Rust accessor for upstream's `signedlonglonglong_repr = getintegerrepr(...)` singleton",
+            "unsigned_repr": "Rust accessor for upstream's `unsigned_repr = getintegerrepr(...)` singleton",
+            "unsignedlonglong_repr": "Rust accessor for upstream's `unsignedlonglong_repr = getintegerrepr(...)` singleton",
+            "unsignedlonglonglong_repr": "Rust accessor for upstream's `unsignedlonglonglong_repr = getintegerrepr(...)` singleton",
+        },
+    },
+    ("rpython/rtyper", "rnone"): {
+        "functions": {
+            "none_repr": "Rust accessor for upstream's `none_repr = NoneRepr()` singleton",
+            "pair_any_none_convert_from_to": "Rust public helper for upstream's `pairtype(Repr, NoneRepr).convert_from_to`",
+            "pair_any_none_rtype_is_": "Rust public helper for upstream's `pairtype(Repr, NoneRepr).rtype_is_`",
+            "pair_none_any_convert_from_to": "Rust public helper for upstream's `pairtype(NoneRepr, Repr).convert_from_to`",
+            "pair_none_any_rtype_is_": "Rust public helper for upstream's `pairtype(NoneRepr, Repr).rtype_is_`",
+        },
+    },
+    ("rpython/rtyper", "raddress"): {
+        "types": {
+            "Address": "Rust type alias exposing upstream's imported llmemory.Address surface",
+            "fakeaddress": "Rust type alias exposing upstream's imported llmemory.fakeaddress surface",
+        },
+    },
+    ("rpython/rtyper/tool", "mkrffi"): {
+        "types": {
+            "CType": "Rust explicit carrier for upstream live ctypes type objects passed to RffiSource.proc_tp",
+            "FunctionDecl": "Rust explicit carrier for upstream ctypes._CFuncPtr entries consumed by proc_func/proc_namespace",
+            "MkrffiError": "Rust error carrier for upstream NotImplementedError paths in ctypes-to-rffi conversion",
+            "SimpleCType": "Rust enum for upstream SIMPLE_TYPE_MAPPING ctypes keys",
+            "StructDecl": "Rust explicit carrier for upstream ctypes.Structure classes and _fields_",
+        },
+    },
+    ("rpython/rtyper/tool", "rfficache"): {
+        "functions": {
+            "ask_gcc_source": "Rust deterministic source-construction half of upstream ask_gcc without invoking a C compiler",
+            "default_includes": "Rust helper for upstream ask_gcc's platform-dependent include list",
+            "parse_signof_c_type": "Rust deterministic parser half of upstream signof_c_type after ask_gcc output exists",
+            "parse_sizeof_c_type": "Rust deterministic parser half of upstream sizeof_c_type after ask_gcc output exists",
+            "parse_sizeof_c_types": "Rust deterministic parser half of upstream sizeof_c_types after ask_gcc output exists",
+            "signof_question": "Rust deterministic question-construction half of upstream signof_c_type",
+            "sizeof_question": "Rust deterministic question-construction half of upstream sizeof_c_types",
+        },
+        "types": {
+            "IntTypeDecl": "Rust explicit carrier for upstream populate_inttypes (name, c_name, signed) tuple rows",
+            "NumberType": "Rust carrier for upstream lltype.build_number plus rarithmetic.build_int registry entries",
+            "RffiCacheError": "Rust error carrier for upstream assert/ValueError failures while parsing compiler answers",
+        },
+    },
+    ("rpython/translator", "timing"): {
+        "types": {
+            "SystemClock": "Rust default clock implementing upstream Timer(timer=time.time) injection",
+            "TimeSource": "Rust trait carrier for upstream Timer(timer=callable) clock injection",
+        },
+    },
+    ("rpython/translator", "platform"): {
+        "functions": {
+            "execute": "Rust free-function helper for the upstream Platform.execute method slice used without a platform object",
+        },
+        "types": {
+            "CompilationInfo": "Rust minimal carrier for upstream ExternalCompilationInfo.library_dirs consumed by Platform.execute",
+            "EnvMapping": "Rust alias for upstream env dict copied by Platform.execute",
         },
     },
     ("rpython/translator", "simplify"): {
@@ -320,6 +654,55 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/tool/algo", "unionfind"): {
         "types": {
             "UnionFindInfo": "Rust trait carrier for upstream dynamic info.absorb(other_info) root payloads",
+        },
+    },
+    ("rpython/jit/codewriter", "codewriter"): {
+        "types": {
+            "AllJitCodes": "Rust carrier pairing upstream CallControl.jitcodes and CallControl.all_jitcodes for generated::with_all_jitcodes test-fixture access",
+        },
+    },
+    ("rpython/jit/codewriter", "jitcode"): {
+        "functions": {
+            "bh_field_specs_from_size_descr": "Rust cross-crate helper for pyre-jit-trace to serialize SizeDescr.all_fielddescrs into BhFieldSpec values",
+        },
+        "types": {
+            "BhCallDescr": "Rust serializable mirror of upstream backend CallDescr for blackhole/runtime descriptor tables",
+            "BhDescr": "Rust enum carrier for upstream heterogeneous AbstractDescr subclasses in assembler descr lists",
+            "BhFieldSpec": "Rust serializable mirror of upstream FieldDescr metadata consumed by blackhole/runtime code",
+            "BhInteriorFieldSpec": "Rust serializable mirror of upstream InteriorFieldDescr metadata",
+            "BhSizeSpec": "Rust serializable mirror of upstream SizeDescr metadata including all_fielddescrs",
+            "CallResultErasedKey": "Rust enum for upstream descr.py RESULT_ERASED cache-key component",
+            "JitCodeBody": "Rust OnceLock payload for upstream JitCode.setup(...) fields after Arc shell creation",
+            "JitCodeHandle": "Rust identity wrapper for Arc<JitCode>, matching upstream object-identity keyed JitCode sets/lists",
+            "StrConstDescriptor": "Rust load-time descriptor for prebuilt string constants that upstream materializes through lltype constants",
+        },
+    },
+    ("rpython/jit/codewriter", "support"): {
+        "types": {
+            "BuiltinFuncSpec": "Rust typed carrier for upstream builtin_func_for_spec's dynamic (c_func, LIST_OR_DICT) tuple plus fnaddr metadata",
+            "BuiltinFuncSpecCacheKey": "Rust structured cache key for upstream rtyper._builtin_func_for_spec_cache tuple keys",
+            "NeedResultType": "Rust enum carrier for upstream helper.need_result_type attribute values",
+            "NormalizeSlot": "Rust enum carrier for upstream parse_oopspec argtuple entries including Index and constants",
+            "NormalizedArg": "Rust enum carrier for upstream normalize_opargs outputs, distinguishing passthrough Variables from materialized Constants",
+        },
+    },
+    ("rpython/jit/codewriter", "longlong"): {
+        "functions": {
+            "extract_bits": "upstream public binding is assigned as `extract_bits = longlong2float.float2longlong`/`lambda x: x`, not parsed as a `def`",
+            "getfloatstorage": "upstream public binding is assigned as `getfloatstorage = lambda x: x`/`longlong2float.float2longlong`, not parsed as a `def`",
+            "gethash": "upstream public binding is assigned as `gethash = compute_hash`/`lambda xll: ...`, not parsed as a `def`",
+            "gethash_fast": "upstream public binding is assigned as `gethash_fast = longlong2float.float2longlong`/`gethash`, not parsed as a `def`",
+            "getrealfloat": "upstream public binding is assigned as `getrealfloat = lambda x: x`/`longlong2float.longlong2float`, not parsed as a `def`",
+            "is_longlong": "upstream public binding is assigned as `is_longlong = lambda TYPE: ...`, not parsed as a `def`",
+        },
+        "types": {
+            "r_float_storage": "Rust type alias for upstream's platform-selected `r_float_storage = float/r_longlong` binding",
+        },
+    },
+    ("rpython/jit/codewriter", "policy"): {
+        "types": {
+            "DefaultJitPolicy": "Rust concrete default implementor for upstream's instantiable `JitPolicy` base class",
+            "JitPolicyState": "Rust shared state carrier for fields stored directly on upstream `JitPolicy` instances",
         },
     },
 }
@@ -387,6 +770,100 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         },
         "functions": {
             "flattenobj": "Python dynamic recursive tuple/list flattener is unnecessary because Rust graph walkers traverse typed fields directly",
+        },
+    },
+    ("rpython/jit/metainterp/ruleopt", "parse"): {
+        "functions": {
+            "addkeyword": "upstream rply lexer table builder; Rust lex() encodes the fixed keyword table directly",
+            "addtok": "upstream rply lexer table builder; Rust lex() encodes the fixed token table directly",
+            "args": "upstream rply production callback; Rust ExprParser::parse_args implements the grammar privately",
+            "attr_or_method": "upstream rply production callback; Rust ExprParser parses dotted attribute/method calls privately",
+            "check": "upstream rply production callback; Rust parse_rule_element builds Element::Check privately",
+            "compute_element": "upstream rply production callback; Rust parse_rule_element builds Element::Compute privately",
+            "elements": "upstream rply production callback; Rust parse() accumulates rule elements line-by-line",
+            "expression_binop": "upstream rply production callback; Rust ExprParser::parse_expression implements precedence privately",
+            "expression_name": "upstream rply production callback; Rust ExprParser::parse_prefix builds Name privately",
+            "expression_number": "upstream rply production callback; Rust ExprParser::parse_prefix builds Number privately",
+            "expression_parens": "upstream rply production callback; Rust ExprParser::parse_prefix handles parenthesized expressions privately",
+            "expression_unary": "upstream rply production callback; Rust ExprParser::parse_prefix builds Invert privately",
+            "file": "upstream rply production callback; Rust parse() builds File directly",
+            "funccall": "upstream rply production callback; Rust ExprParser::parse_prefix builds FuncCall privately",
+            "maybesorry": "upstream rply production callback; Rust parse_rule_element handles SORRY_Z3 directly",
+            "methodcall": "upstream rply production callback; Rust ExprParser parses method calls privately",
+            "newlines": "upstream rply production callback for line separators; Rust parse() consumes source line structure directly",
+            "pattern_const": "upstream rply production callback; Rust PatternParser::parse_pattern builds PatternConst privately",
+            "pattern_op": "upstream rply production callback; Rust PatternParser::parse_pattern builds PatternOp privately",
+            "pattern_var": "upstream rply production callback; Rust PatternParser::parse_pattern builds PatternVar privately",
+            "patternargs": "upstream rply production callback; Rust PatternParser::parse_patternargs implements it privately",
+            "print_conflicts": "upstream rply parser-conflict debug hook; Rust hand parser has no generated LR table to inspect",
+            "production": "upstream decorator wrapping rply production callbacks with source positions; Rust parsers attach SourcePos directly",
+            "rule": "upstream rply production callback; Rust parse_rule_header plus PartialRule::finish builds Rule privately",
+        },
+    },
+    ("rpython/rtyper", "error"): {
+        "types": {
+            "MissingRTypeOperation": "represented by TyperError::MissingRTypeOperation enum variant",
+        },
+    },
+    ("rpython/rtyper", "rmodel"): {
+        "types": {
+            "BrokenReprTyperError": "represented by TyperError::BrokenRepr enum variant",
+        },
+    },
+    ("rpython/rtyper", "debug"): {
+        "types": {
+            "Entry": "two upstream ExtRegistryEntry subclasses are represented by debug_assert/debug_assert_not_none llops and rtyper lowering, not standalone Rust public classes",
+        },
+    },
+    ("rpython/rtyper", "annlowlevel"): {
+        "types": {
+            "cachedtype": "Python metaclass cache is represented by explicit Rust Lazy/LazyLock/cache maps at each call site",
+        },
+    },
+    ("rpython/rtyper/tool", "rfficache"): {
+        "functions": {
+            "ask_gcc": "permanently unused C probing boundary; pyre keeps source construction/parsing helpers but does not invoke a C compiler here",
+            "signof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_signof_c_type once external answers are supplied",
+            "sizeof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_type once external answers are supplied",
+            "sizeof_c_types": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_types once external answers are supplied",
+        },
+    },
+    ("rpython/translator", "platform"): {
+        "functions": {
+            "is_host_build": "deferred with platform factory/global platform selection; current Rust port only preserves Platform.execute",
+            "pick_platform": "deferred with platform factory/global platform selection and C backend compile integration",
+            "set_platform": "deferred with platform factory/global platform selection and C backend compile integration",
+        },
+    },
+    ("rpython/translator", "transform"): {
+        "functions": {
+            "insert_ll_stackcheck": "deferred rtyper-phase stack-check insertion; transform.rs currently ports the annotator-phase graph transforms only",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "llmemory"): {
+        "types": {
+            "AddressAsInt": "symbolic address-int carrier is intentionally absent; pyre cast_adr_to_int supports emulated/forced numeric folds only",
+            "GCHeaderAntiOffset": "GC-transform-only offset; pyre does not run the RPython GC transformer",
+            "GCHeaderOffset": "GC-transform-only offset; pyre does not run the RPython GC transformer",
+        },
+    },
+    ("rpython/jit/metainterp/optimizeopt", "rewrite"): {
+        "types": {
+            "CallLoopinvariantOptimizationResult": "callback object is represented inline by the CALL_LOOPINVARIANT optimization arm updating loop_invariant_results/producers",
+        },
+    },
+    ("rpython/jit/metainterp/optimizeopt", "pure"): {
+        "types": {
+            "CallPureOptimizationResult": "callback object is represented inline by OptPure's CALL_PURE demotion/emission path recording call_pure_positions",
+            "DefaultOptimizationResult": "callback object is represented inline by OptPure optimize_default and OptimizationResult emission handling",
+        },
+    },
+    ("rpython/jit/metainterp", "heapcache"): {
+        "functions": {
+            "add_flags": "requires HeapCache-owned heapc_flags storage in pyre; represented by HeapCache::_set_flag",
+            "maybe_replace_with_const": "requires HeapCache-owned const replacement storage in pyre; represented by HeapCache::maybe_replace_with_const",
+            "remove_flags": "requires HeapCache-owned heapc_flags storage in pyre; represented by HeapCache::_remove_flag",
+            "test_flags": "requires HeapCache-owned heapc_flags storage in pyre; represented by HeapCache::_check_flag",
         },
     },
     ("rpython/flowspace", "operation"): {
@@ -457,6 +934,39 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/jit/codewriter", "format"): {
         "functions": {
             "unformat_assembler": "reverse text-to-SSA test parser is deferred until Rust SSARepr stores parseable FlatOp operands instead of typed pipeline-only SpaceOperations",
+        },
+    },
+    ("rpython/jit/codewriter", "jtransform"): {
+        "types": {
+            "NotSupported": "represented by Rust typed RewriteResult fallthroughs and explicit panic/error paths instead of a Python control-flow exception",
+            "UnsupportedMallocFlags": "represented by Rust typed malloc lowering branches instead of a standalone Python exception class",
+            "VirtualizableArrayField": "represented by Transformer.vable_array_vars metadata plus assertion diagnostics rather than a standalone exception payload",
+        },
+        "functions": {
+            "constant_fold_ll_issubclass": "Pyre has no cpu.rtyper.exceptiondata ll_issubclass direct-call shape in this transform pass; exception matching is lowered through typed Rust paths",
+            "is_test_calldescr": "Rust tests use typed CallDescriptor values, not upstream's string/_for_tests_only calldescr sentinel",
+        },
+    },
+    ("rpython/jit/codewriter", "support"): {
+        "types": {
+            "Entry": "RPython ExtRegistryEntry for maybe_on_top_of_llinterp; pyre does not specialize Python ExtRegistry entries",
+            "Index": "represented by NormalizeSlot::Index rather than a standalone placeholder class",
+            "LLtypeHelpers": "upstream helper-method namespace is flattened into CallControl fnaddr/oopspec registries in Rust",
+        },
+        "functions": {
+            "annotate": "RPython test helper that builds annotator/rtyper graphs for a Python function; pyre translates Rust source through front/flowspace/annotator/rtyper instead",
+            "autodetect_jit_markers_redvars": "upstream reds='auto' graph mutation over jit_marker ops; pyre carries JitDriver red/green metadata explicitly",
+            "decode_hp_hint_args": "upstream decodes jit_marker SpaceOperation args; pyre markers are typed call targets lowered by jtransform",
+            "get_call_oopspec_opargs": "folded into decode_builtin_call via CallControl oopspec registries and parse_oopspec/normalize_opargs",
+            "get_gcid_oopspec": "gc_id op variant is not emitted by pyre's current typed graph pipeline",
+            "get_identityhash_oopspec": "gc_identityhash op variant is not emitted by pyre's current typed graph pipeline",
+            "get_send_oopspec": "OO/ADT send oopspec name synthesis has no pyre consumer; Rust call targets carry the resolved oopspec registry entry",
+            "getargtypes": "RPython annotate() helper for Python value samples; pyre uses typed Rust source and lltype lowering instead",
+            "getgraph": "RPython test helper built on annotate(); pyre graph construction is source-translation based",
+            "maybe_on_top_of_llinterp": "RPython untranslated-test wrapper around LLInterpreter; pyre has no llinterp execution layer for generated graphs",
+            "sort_vars": "upstream Variable sort by getkind for jit_marker arg lists; pyre keeps red/green groups typed by RegKind during lowering",
+            "split_before_jit_merge_point": "upstream mutates flow blocks around jit_merge_point; pyre marker lowering does not split Python flowspace blocks this way",
+            "u_to_longlong": "longlong helper is represented by Rust integer casts at concrete helper sites rather than a public support.py function",
         },
     },
     ("rpython/tool/algo", "graphlib"): {
@@ -590,6 +1100,11 @@ RUST_ITEM_START = re.compile(
     r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
     r"(struct|enum|trait|type|fn|const|static|impl|mod)\b"
 )
+RUST_TYPE_MACRO_INVOCATION = re.compile(
+    r"^(?P<macro>[A-Za-z_][A-Za-z0-9_]*)!\s*\(\s*(?:r#)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:,|\))"
+)
+RUST_TYPE_MACRO_NAMES = {"binop_struct"}
 
 
 def _strip_rust_line(line: str) -> str:
@@ -711,6 +1226,10 @@ def rust_top_level_symbols(
                 else:
                     reexport_lines = [candidate]
                 continue
+            elif macro_match := RUST_TYPE_MACRO_INVOCATION.match(candidate):
+                if macro_match.group("macro") in RUST_TYPE_MACRO_NAMES:
+                    symbols["types"].add(macro_match.group("name"))
+                    has_direct_item = True
             elif RUST_ITEM_START.match(candidate):
                 if not re.match(r"mod\s+tests\b", candidate):
                     has_direct_item = True

@@ -25,6 +25,7 @@
 //! `analyze_simple_operation` is always `False` (random effects arise
 //! only from external calls).
 
+pub use super::call::effectinfo_from_writeanalyze;
 use crate::flowspace::model::SpaceOperation;
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{
@@ -32,6 +33,11 @@ use crate::translator::backendopt::graphanalyze::{
 };
 use crate::translator::rtyper::lltypesystem::lltype::_func;
 use crate::translator::translator::TranslationContext;
+pub use majit_ir::effectinfo::compute_bitstrings;
+pub use majit_ir::{
+    CallInfoCollection, EffectInfo, UnsupportedFieldExc, consider_array, consider_struct,
+    frozenset_or_none,
+};
 
 /// `class VirtualizableAnalyzer(BoolGraphAnalyzer)` at
 /// `effectinfo.py:401-404`.

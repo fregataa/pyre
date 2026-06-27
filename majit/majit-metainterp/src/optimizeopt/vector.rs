@@ -18,17 +18,17 @@ use majit_ir::vec_set::VecSet;
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef};
 
-use crate::optimizeopt::dependency::DependencyGraph;
+use crate::optimizeopt::dependency::{DependencyGraph, schedule_operations};
 use crate::optimizeopt::renamer::Renamer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::VecMap;
 use majit_ir::box_ref::BoxRef;
 
 pub use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
-pub use crate::optimizeopt::dependency::{Node, schedule_operations};
+pub use crate::optimizeopt::dependency::Node;
 pub use crate::optimizeopt::schedule::{
-    AccumEntry, AccumPack, GuardAnalysis, Pack, VecScheduleState, VectorizeError,
-    are_adjacent_memory_refs, turn_into_vector, unpack_from_vector,
+    AccumEntry, AccumPack, GuardAnalysis, Pack, VecScheduleState, VectorizeError, turn_into_vector,
+    unpack_from_vector,
 };
 
 // ── vector.py:601-668: Cost models ────────────────────────────────────
@@ -791,8 +791,7 @@ impl VectorLoop {
         if let Some(jcell) = jitcell_token {
             // vector.py:64-72
             if reset_label_token {
-                let token =
-                    std::sync::Arc::new(crate::optimizeopt::unroll::TargetToken::new_loop(0));
+                let token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let descr = token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(descr.clone());
                 self.label.setdescr(descr);
@@ -804,8 +803,7 @@ impl VectorLoop {
             // vector.py:73-77: prefix_label gets its own TargetToken, and
             // the jump is rebound to point at it.
             if let Some(ref prefix_label) = self.prefix_label {
-                let pre_token =
-                    std::sync::Arc::new(crate::optimizeopt::unroll::TargetToken::new_loop(0));
+                let pre_token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let pre_descr = pre_token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(pre_descr.clone());
                 prefix_label.setdescr(pre_descr.clone());
@@ -985,7 +983,7 @@ pub fn optimize_vector(
 /// which are likewise above the prefix. The gso index constants are inline
 /// `OpRef::const_int` (guard.rs:614) carrying their value on the OpRef, so
 /// nothing needs registering in the constant pool.
-pub fn apply_loop_vectorization(
+pub(crate) fn apply_loop_vectorization(
     optimized_ops: Vec<Op>,
     vec_size: usize,
     cost_threshold: i32,

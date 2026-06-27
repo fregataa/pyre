@@ -112,7 +112,7 @@ pub fn fully_annotated_blocks(ann: &RPythonAnnotator) -> Vec<BlockRef> {
 /// `block_subset` is a Python dict keyed by Block; the Rust port takes
 /// a `&[BlockRef]` slice since the callers only iterate it (no dict
 /// lookups downstream).
-pub type TransformPass = fn(&RPythonAnnotator, &[BlockRef]);
+pub(crate) type TransformPass = fn(&RPythonAnnotator, &[BlockRef]);
 
 /// RPython `transform.py:246-251` — `default_extra_passes = [...]`.
 ///
@@ -129,7 +129,7 @@ pub type TransformPass = fn(&RPythonAnnotator, &[BlockRef]);
 /// after annotation completed, so `transform_graph` must not silently
 /// drop them just because later phases have not yet ported the lowered
 /// opnames.
-pub const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[
+pub(crate) const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[
     transform_allocate,
     transform_extend_with_str_slice,
     transform_extend_with_char_count,

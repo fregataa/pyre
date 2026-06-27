@@ -7,8 +7,21 @@
 //! `AbstractStringBuilderRepr` method names first. That keeps callers
 //! and future ports using the upstream names instead of inventing local
 //! aliases.
+//!
+//! Deferred port: upstream `AbstractStringBuilderRepr` carries method
+//! *bodies* (`rtyper_new`, `rtype_method_append`, `rtype_method_build`,
+//! `rtype_bool`, `convert_const`, …) that `hop.gendirectcall` into
+//! `self.ll_new` / `self.ll_append` / `self.ll_build` / `self.ll_bool`.
+//! Those low-level helpers are the explicitly-deferred stubs in
+//! `lltypesystem/rbuilder.rs` (`builder_runtime_deferred`), so the method
+//! bodies cannot be ported faithfully yet. Converge by landing the
+//! `lltypesystem/rbuilder.rs` runtime helpers, then porting the
+//! `rtype_method_*` bodies onto this repr.
 
+use crate::flowspace::model::{ConstValue, Constant};
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::rmodel::RTypeResult;
+use crate::translator::rtyper::rtyper::HighLevelOp;
 
 /// RPython `rpython.rlib.rstring.INIT_SIZE`.
 ///
@@ -26,8 +39,9 @@ pub const INIT_SIZE: i64 = 100;
 pub struct AbstractStringBuilderRepr;
 
 /// Upstream method names on `AbstractStringBuilderRepr`.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StringBuilderMethod {
+enum StringBuilderMethod {
     /// `rtyper_new`
     RtyperNew,
     /// `rtype_method_append`
@@ -48,6 +62,7 @@ pub enum StringBuilderMethod {
     ConvertConst,
 }
 
+#[allow(dead_code)]
 impl StringBuilderMethod {
     /// RPython method suffix used by `BuiltinMethodRepr`.
     pub const fn as_method_name(self) -> Option<&'static str> {
@@ -86,7 +101,8 @@ impl StringBuilderMethod {
 }
 
 /// Upstream method table from `rbuilder.py:7-58`.
-pub const STRING_BUILDER_METHODS: [StringBuilderMethod; 9] = [
+#[allow(dead_code)]
+const STRING_BUILDER_METHODS: [StringBuilderMethod; 9] = [
     StringBuilderMethod::RtyperNew,
     StringBuilderMethod::Append,
     StringBuilderMethod::AppendSlice,
@@ -99,9 +115,64 @@ pub const STRING_BUILDER_METHODS: [StringBuilderMethod; 9] = [
 ];
 
 impl AbstractStringBuilderRepr {
+    fn deferred_method(name: &str) -> TyperError {
+        TyperError::missing_rtype_operation(format!(
+            "rbuilder.AbstractStringBuilderRepr.{name} deferred until \
+             lltypesystem/rbuilder runtime helpers land"
+        ))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`.
+    pub fn rtyper_new(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtyper_new"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_append(self, hop)`.
+    pub fn rtype_method_append(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_append_slice(self, hop)`.
+    pub fn rtype_method_append_slice(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append_slice"))
+    }
+
+    /// RPython
+    /// `AbstractStringBuilderRepr.rtype_method_append_multiple_char(self, hop)`.
+    pub fn rtype_method_append_multiple_char(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append_multiple_char"))
+    }
+
+    /// RPython
+    /// `AbstractStringBuilderRepr.rtype_method_append_charpsize(self, hop)`.
+    pub fn rtype_method_append_charpsize(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append_charpsize"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_getlength(self, hop)`.
+    pub fn rtype_method_getlength(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_getlength"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_build(self, hop)`.
+    pub fn rtype_method_build(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_build"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_bool(self, hop)`.
+    pub fn rtype_bool(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_bool"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.convert_const(self, value)`.
+    pub fn convert_const(&self, _value: &ConstValue) -> Result<Constant, TyperError> {
+        Err(Self::deferred_method("convert_const"))
+    }
+
     /// Resolve either an exact upstream method name or a
     /// `BuiltinMethodRepr.methodname` suffix to the upstream method arm.
-    pub fn method_from_name(method_name: &str) -> Result<StringBuilderMethod, TyperError> {
+    #[allow(dead_code)]
+    fn method_from_name(method_name: &str) -> Result<StringBuilderMethod, TyperError> {
         STRING_BUILDER_METHODS
             .iter()
             .copied()

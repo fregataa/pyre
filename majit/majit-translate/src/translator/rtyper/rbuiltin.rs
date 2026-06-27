@@ -563,7 +563,7 @@ impl BuiltinFunctionRepr {
     /// registered variant today) yield the upstream `AttributeError`
     /// surface as a `TyperError`. `ExtRegistryEntry` (extregistry.py:33-72)
     /// defines no base `specialize_call`, so this is a per-arm decision.
-    pub fn findbltintyper(&self) -> Result<BuiltinTyperFn, TyperError> {
+    pub(crate) fn findbltintyper(&self) -> Result<BuiltinTyperFn, TyperError> {
         if let Some(f) = lookup_typer(&self.builtinfunc) {
             return Ok(f);
         }

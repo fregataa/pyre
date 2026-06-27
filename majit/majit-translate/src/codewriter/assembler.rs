@@ -10,7 +10,7 @@
 //! subset. Descriptor operands are deduplicated through the RPython
 //! `_descr_dict` shape before bytecode emission.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use vecset::VecSet;
 
@@ -99,7 +99,31 @@ fn use_c_form(opname: &str) -> bool {
 // `Register(kind, index)` invariant from `flatten.py:28-33`.
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody, StrConstDescriptor};
-use crate::regalloc::RegAllocResult;
+use crate::regalloc::RegAllocator;
+
+/// RPython `class AssemblerError(Exception)` (assembler.py:15-16).
+///
+/// Upstream raises this for unsupported constant kinds while assembling
+/// SSARepr (`assembler.py:124-126`). Most Rust assembler paths currently
+/// fail through panics because they are internal translation invariants,
+/// but this carrier keeps the public codewriter surface aligned for
+/// call sites that need a typed assembler diagnostic.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AssemblerError(pub String);
+
+impl AssemblerError {
+    pub fn message<S: Into<String>>(message: S) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for AssemblerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AssemblerError {}
 
 /// Assembler — converts SSARepr to JitCode.
 ///
@@ -298,7 +322,7 @@ impl Assembler {
     pub fn assemble(
         &mut self,
         ssarepr: &mut SSARepr,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
     ) -> JitCodeBody {
         self.assemble_with_callcontrol(ssarepr, regallocs, None)
     }
@@ -309,7 +333,7 @@ impl Assembler {
     pub fn assemble_with_callcontrol(
         &mut self,
         ssarepr: &mut SSARepr,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         callcontrol: Option<&CallControl>,
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
@@ -471,7 +495,7 @@ impl Assembler {
     fn write_insn(
         &mut self,
         op: &FlatOp,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
     ) {
@@ -1062,7 +1086,7 @@ impl Assembler {
     fn encode_op(
         &mut self,
         op: &crate::model::SpaceOperation,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
     ) {
@@ -2085,7 +2109,7 @@ impl Assembler {
         &self,
         args: &[crate::flowspace::model::Variable],
         kind: RegKind,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
     ) {
         // RPython `assembler.py` writes the count as a single byte and
@@ -2150,7 +2174,7 @@ impl Assembler {
         &self,
         result: Option<&crate::flowspace::model::Variable>,
         declared_result_kind: char,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
         argcodes: &mut String,
     ) -> char {
@@ -2273,7 +2297,7 @@ impl Assembler {
     fn lookup_coloring_var(
         &self,
         var: &crate::flowspace::model::Variable,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
     ) -> (u8, RegKind) {
         // Strict path: `regallocs[kind]` supplies the color when
         // `Variable.concretetype` declares a non-Void/Unknown kind
@@ -2356,7 +2380,7 @@ impl Assembler {
     fn lookup_reg_with_kind_var(
         &self,
         var: &crate::flowspace::model::Variable,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
     ) -> (u8, char) {
         let (color, kind) = self.lookup_coloring_var(var, regallocs);
         let kind_char = match kind {
@@ -2383,7 +2407,7 @@ impl Assembler {
     ///
     /// Output goes through `cargo:warning=` so the build script
     /// runner (`build.rs`) surfaces each line to the user.
-    fn run_coverage_audit(&self, ssarepr: &SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
+    fn run_coverage_audit(&self, ssarepr: &SSARepr, regallocs: &HashMap<RegKind, RegAllocator>) {
         // For each Variable, track: has a def site (result of some op),
         // count of direct operand uses, count of Live markers mentioning
         // it.  Live-only gaps (no def, no operand use) point at backward
@@ -2573,7 +2597,9 @@ impl Assembler {
             'i' => self.emit_const_i_from_const(value, state, callcontrol),
             'r' => self.emit_const_r(value, state),
             'f' => self.emit_const_f(value, state),
-            other => panic!("unknown constant kind {other:?} for {value:?}"),
+            other => std::panic::panic_any(AssemblerError::message(format!(
+                "unknown constant kind {other:?} for {value:?}"
+            ))),
         }
     }
 
@@ -2609,7 +2635,9 @@ impl Assembler {
                 };
                 resolved.unwrap_or_else(|err| panic!("emit_const_i: {err}"))
             }
-            other => panic!("integer-kind constant not supported by emit_const_i: {other:?}"),
+            other => std::panic::panic_any(AssemblerError::message(format!(
+                "integer-kind constant not supported by emit_const_i: {other:?}"
+            ))),
         }
     }
 
@@ -4184,25 +4212,62 @@ mod tests {
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
 
-    fn empty_regallocs() -> HashMap<RegKind, regalloc::RegAllocResult> {
+    #[test]
+    fn assembler_error_message_matches_exception_payload() {
+        let err = AssemblerError::message("unimplemented const in graph");
+        assert_eq!(err.to_string(), "unimplemented const in graph");
+    }
+
+    #[test]
+    fn emit_const_unknown_kind_raises_assembler_error() {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut asm = Assembler::new();
+            let mut state = empty_state();
+            let _ = asm.emit_const(&ConstValue::Int(1), 'x', &mut state, None);
+        }))
+        .expect_err("unsupported constant kind must raise");
+
+        let err = panic
+            .downcast_ref::<AssemblerError>()
+            .expect("panic payload must be AssemblerError");
+        assert!(err.to_string().contains("unknown constant kind"));
+    }
+
+    #[test]
+    fn emit_const_i_unsupported_value_raises_assembler_error() {
+        let panic = std::panic::catch_unwind(|| {
+            let _ = Assembler::resolve_const_i_value(&ConstValue::byte_str("nope"), None);
+        })
+        .expect_err("unsupported int constant must raise");
+
+        let err = panic
+            .downcast_ref::<AssemblerError>()
+            .expect("panic payload must be AssemblerError");
+        assert!(
+            err.to_string()
+                .contains("integer-kind constant not supported")
+        );
+    }
+
+    fn empty_regallocs() -> HashMap<RegKind, regalloc::RegAllocator> {
         let mut regallocs = HashMap::new();
         regallocs.insert(
             RegKind::Int,
-            regalloc::RegAllocResult {
+            regalloc::RegAllocator {
                 coloring: HashMap::new(),
                 num_regs: 0,
             },
         );
         regallocs.insert(
             RegKind::Ref,
-            regalloc::RegAllocResult {
+            regalloc::RegAllocator {
                 coloring: HashMap::new(),
                 num_regs: 0,
             },
         );
         regallocs.insert(
             RegKind::Float,
-            regalloc::RegAllocResult {
+            regalloc::RegAllocator {
                 coloring: HashMap::new(),
                 num_regs: 0,
             },
@@ -4226,6 +4291,27 @@ mod tests {
             alllabels: majit_ir::vec_set::VecSet::new(),
             resulttypes: majit_ir::VecMap::new(),
         }
+    }
+
+    fn push_input_var(
+        graph: &mut crate::model::FunctionGraph,
+        name: &str,
+        ty: crate::model::ValueType,
+    ) -> crate::flowspace::model::Variable {
+        let block = graph.startblock;
+        let var = graph
+            .push_op_var(
+                block,
+                crate::model::OpKind::Input {
+                    name: name.into(),
+                    ty,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(block, var.clone());
+        var
     }
 
     #[test]
@@ -4697,17 +4783,7 @@ mod tests {
         // Build graph for regalloc (regalloc operates on graph, not SSARepr)
         let mut graph = FunctionGraph::new("add");
         let entry = graph.startblock;
-        let v0_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "a".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let v0_var = push_input_var(&mut graph, "a", ValueType::Int);
         let v1_var = graph
             .push_op_var(
                 entry,
@@ -4720,17 +4796,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        let v2_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "r".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let v2_var = push_input_var(&mut graph, "r", ValueType::Ref(None));
         graph.set_return(entry, Some(v1_var.clone()));
 
         FunctionGraph::set_concretetype_of_inline(&v0_var, crate::model::ConcreteType::Signed);
@@ -4773,17 +4839,7 @@ mod tests {
         );
 
         let mut graph = FunctionGraph::new("read_cell");
-        let base_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "cell".to_string(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let base_var = push_input_var(&mut graph, "cell", ValueType::Ref(None));
         let result_var = graph
             .push_op_var(
                 graph.startblock,
@@ -4860,39 +4916,9 @@ mod tests {
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("typed_writes");
-        let base_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "obj".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let index_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "i".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let value_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "v".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Ref(None));
+        let index_var = push_input_var(&mut graph, "i", ValueType::Int);
+        let value_var = push_input_var(&mut graph, "v", ValueType::Int);
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldWrite {
@@ -4992,17 +5018,7 @@ mod tests {
         // ∈ USE_C_FORM, `assembler.py:99-107,312`.
         let build = |value: i64| -> Assembler {
             let mut graph = FunctionGraph::new("const_setfield");
-            let base_var = graph
-                .push_op_var(
-                    graph.startblock,
-                    OpKind::Input {
-                        name: "obj".into(),
-                        ty: ValueType::Ref(None),
-                        class_root: None,
-                    },
-                    true,
-                )
-                .unwrap();
+            let base_var = push_input_var(&mut graph, "obj", ValueType::Ref(None));
             graph.push_op_var(
                 graph.startblock,
                 OpKind::FieldWrite {
@@ -5068,17 +5084,7 @@ mod tests {
         // it fits a signed byte.
         let build = |value: i64| -> Assembler {
             let mut graph = FunctionGraph::new("const_setfield_vable");
-            let base_var = graph
-                .push_op_var(
-                    graph.startblock,
-                    OpKind::Input {
-                        name: "frame".into(),
-                        ty: ValueType::Ref(None),
-                        class_root: None,
-                    },
-                    true,
-                )
-                .unwrap();
+            let base_var = push_input_var(&mut graph, "frame", ValueType::Ref(None));
             graph.push_op_var(
                 graph.startblock,
                 OpKind::FieldWrite {
@@ -5133,28 +5139,8 @@ mod tests {
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("typed_reads");
-        let base_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "obj".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let index_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "i".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Ref(None));
+        let index_var = push_input_var(&mut graph, "i", ValueType::Int);
         let field_result_var = graph
             .push_op_var(
                 graph.startblock,
@@ -5362,28 +5348,8 @@ mod tests {
         use crate::model::{FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("input_free_bytecode");
-        let lhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "lhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "rhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let lhs_var = push_input_var(&mut graph, "lhs", ValueType::Int);
+        let rhs_var = push_input_var(&mut graph, "rhs", ValueType::Int);
         let sum_var = graph
             .push_op_var(
                 graph.startblock,

@@ -6,23 +6,19 @@
 //! names, routing every descriptor operation through those existing caches
 //! instead of adding a side table.
 
-use std::collections::HashMap;
-
 use crate::codewriter::call::{CallControl, extract_element_type_from_str, get_type_flag};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsupportedFieldExc(pub String);
-
 #[derive(Debug, Clone, Default)]
 pub struct GcStructVTableCache<V> {
-    cache_gcstruct2vtable: HashMap<String, V>,
-    testing_gcstruct2vtable: HashMap<String, V>,
+    cache_gcstruct2vtable: std::collections::HashMap<String, V>,
+    testing_gcstruct2vtable: std::collections::HashMap<String, V>,
 }
 
 impl<V> GcStructVTableCache<V> {
-    pub fn insert_rtyper_vtable(&mut self, gcstruct: &Struct, vtable: V) {
+    #[cfg(test)]
+    pub(crate) fn insert_rtyper_vtable(&mut self, gcstruct: &Struct, vtable: V) {
         self.cache_gcstruct2vtable
             .insert(gcstruct._name.clone(), vtable);
     }
@@ -95,7 +91,7 @@ pub fn all_fielddescrs(
 pub fn all_interiorfielddescrs(
     gccache: &CallControl,
     array_type_id: &str,
-) -> Result<Vec<majit_ir::descr::DescrRef>, UnsupportedFieldExc> {
+) -> Result<Vec<majit_ir::descr::DescrRef>, majit_ir::UnsupportedFieldExc> {
     let elem_name =
         extract_element_type_from_str(array_type_id).unwrap_or_else(|| array_type_id.to_string());
     if let Some(layout) = gccache.struct_layout_for(&elem_name) {
@@ -104,7 +100,7 @@ pub fn all_interiorfielddescrs(
                 continue;
             }
             if field.flag == majit_ir::descr::ArrayFlag::Struct {
-                return Err(UnsupportedFieldExc(
+                return Err(majit_ir::UnsupportedFieldExc(
                     "unexpected array(struct(struct))".to_string(),
                 ));
             }
@@ -119,7 +115,7 @@ pub fn all_interiorfielddescrs(
                 continue;
             }
             if gccache.is_known_struct(field_type) {
-                return Err(UnsupportedFieldExc(
+                return Err(majit_ir::UnsupportedFieldExc(
                     "unexpected array(struct(struct))".to_string(),
                 ));
             }

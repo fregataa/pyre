@@ -14,7 +14,7 @@ use md5::{Digest, Md5};
 
 use crate::flowspace::bytecode::HostCode;
 use crate::flowspace::model::{ConstValue, GraphKey, GraphRef, Hlvalue};
-use crate::translator::simplify::get_graph_for_call;
+use crate::translator::simplify::get_graph;
 use crate::translator::translator::TranslationContext;
 
 /// RPython `get_statistics(graph, translator,
@@ -73,10 +73,8 @@ pub fn get_statistics(
                         // of `op.args[0]`. None for indirect/delayed
                         // pointers, the `ll_stack_check` filter when
                         // `ignore_stack_checks` is set.
-                        if let Some(callee) = op
-                            .args
-                            .first()
-                            .and_then(|arg| get_graph_for_call(arg, translator))
+                        if let Some(callee) =
+                            op.args.first().and_then(|arg| get_graph(arg, translator))
                         {
                             let stack_check = ignore_stack_checks
                                 && callee.borrow().name.starts_with("ll_stack_check");

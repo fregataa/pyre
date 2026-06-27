@@ -35,38 +35,12 @@ pub struct StrOrUnicode {
     pub os_offset: i32,
 }
 
-/// history.py:377-387 get_const_ptr_for_string(s)
-///
-/// Creates a constant GcRef from byte-string character values.
-/// Returns None when the runtime hook is not installed.
-pub fn get_const_ptr_for_string(chars: &[i64], ctx: &OptContext) -> Option<majit_ir::GcRef> {
-    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
-    let gcref = alloc_fn(chars, false);
-    if gcref.is_null() { None } else { Some(gcref) }
-}
-
-/// history.py:390-402 get_const_ptr_for_unicode(s)
-///
-/// Creates a constant GcRef from unicode character values.
-/// Returns None when the runtime hook is not installed.
-pub fn get_const_ptr_for_unicode(chars: &[i64], ctx: &OptContext) -> Option<majit_ir::GcRef> {
-    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
-    let gcref = alloc_fn(chars, true);
-    if gcref.is_null() { None } else { Some(gcref) }
-}
 /// vstring.py:371-381 _int_add(optstring, box1, box2)
 ///
 /// Constant-folding INT_ADD: folds add-0 and const+const at the optimizer
-/// level. Non-constant adds emit an INT_ADD operation.
-///
-/// PRE-EXISTING DIVERGENCE: vstring.py:380 routes the new op through
-/// `optstring.optimizer.send_extra_operation(op)`, which re-dispatches from
-/// `first_optimization` (optimizer.py:594, default `opt=None`) — so OptIntBounds
-/// (a pass BEFORE OptString) computes the result bound. `emit_for_force` routes
-/// from the pass AFTER the current one (emit_extra(current_pass_idx)), skipping
-/// the earlier passes. Strict parity needs an inline full-chain re-dispatch hook
-/// on OptContext; `Optimizer::send_extra_operation` exists but is unreachable
-/// from inside a pass, which only holds `&mut OptContext`.
+/// level. Non-constant adds emit an INT_ADD operation that is re-dispatched
+/// from `first_optimization` via `send_extra_operation` (vstring.py:380), so
+/// OptIntBounds — a pass BEFORE OptString — computes the result bound.
 pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand {
     if let Some(v1) = ctx
         .resolve_operand_operand_opt(box1)
@@ -92,7 +66,8 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
     let arg1 = ctx.resolve_operand_operand(box1);
     let arg2 = ctx.resolve_operand_operand(box2);
     let op = Op::new(OpCode::IntAdd, &[arg1, arg2]);
-    let __r = ctx.emit_for_force(op);
+    // vstring.py:380 optstring.optimizer.send_extra_operation(op).
+    let __r = ctx.send_extra_operation(op);
     ctx.materialize_operand_at(__r)
 }
 

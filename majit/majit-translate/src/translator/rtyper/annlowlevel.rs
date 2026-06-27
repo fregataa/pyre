@@ -33,22 +33,24 @@
 //! skeleton exists so each method can be swapped in against its
 //! upstream counterpart without call-site churn.
 //!
-//! The items intentionally **not** included in the first skeleton
-//! (scheduled as their own follow-ups):
+//! The items whose callable bodies are still scheduled as follow-ups:
 //!
 //! * `PseudoHighLevelCallable` + `PseudoHighLevelCallableEntry`
-//!   (annlowlevel.py:286-320) — depends on
+//!   (annlowlevel.py:286-320) — the type surface is present; call
+//!   specialization depends on
 //!   [`crate::translator::rtyper::extregistry::ExtRegistryEntry`] and
 //!   `hop.genop('direct_call', …)` wiring.
-//! * `llhelper` / `llhelper_args` + `LLHelperEntry` (annlowlevel.py:
-//!   :325-376) — depends on `r.get_unique_llfn()` on
+//! * `llhelper` / `llhelper_args` + `LLHelperEntry`
+//!   (annlowlevel.py:325-376) — the entry type is present; helper
+//!   specialization depends on `r.get_unique_llfn()` on
 //!   `FunctionsPBCRepr` (unported).
 //! * The `hlstr` / `llstr` / `hlunicode` / `llunicode` and pointer-cast
 //!   helper surfaces are present below, but their bodies still return
 //!   structured pending errors until the corresponding `rstr`, `llmemory`,
 //!   and cast specialization paths land.
 //! * `placeholder_sigarg` / `typemeth_placeholder_sigarg` /
-//!   `ADTInterface` (annlowlevel.py:573-640) — depend on
+//!   `ADTInterface` (annlowlevel.py:573-640) — the type surface is
+//!   present; signature expansion depends on
 //!   `rpython/annotator/signature.py::Sig` wiring and the `adtmeths`
 //!   attribute of low-level types.
 //! * `cachedtype` metaclass (annlowlevel.py:644-668) — metaclass
@@ -96,6 +98,7 @@ use crate::annotator::policy::{
     AnnotatorPolicy, PolicyError, PolicyHandle, PolicyOps, Specializer,
     parse_specializer_directive, specializer_from_normalized,
 };
+use crate::annotator::signature::{Sig, SigArgType};
 use crate::flowspace::model::{BlockKey, ConstValue, Constant, GraphKey, GraphRef, HostObject};
 use crate::flowspace::pygraph::PyGraph;
 
@@ -104,10 +107,41 @@ use super::llannotation::{annotation_to_lltype, lltype_to_annotation};
 use super::lltypesystem::lltype::{
     self, _ptr, DelayedPointer, ForwardReference, FuncType, LowLevelType, Ptr,
 };
+use super::rmodel::RTypeResult;
 use super::rmodel::Repr;
-use super::rtyper::RPythonTyper;
+use super::rtyper::{HighLevelOp, RPythonTyper};
 
 use crate::tool::sourcetools::valid_identifier;
+
+fn annlowlevel_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!("annlowlevel.{name} helper surface deferred"))
+}
+
+fn placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
+    match s {
+        "self" => Ok(SigArgType::PassThrough),
+        "SELF" => Err(annlowlevel_deferred("placeholder_sigarg('SELF')")),
+        _ if s.chars().all(|c| c.is_ascii_lowercase()) => Err(annlowlevel_deferred(
+            format!("placeholder_sigarg({s:?})").as_str(),
+        )),
+        _ => Err(TyperError::message(format!(
+            "placeholder_sigarg expected lowercase placeholder, got {s:?}"
+        ))),
+    }
+}
+
+fn typemeth_placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
+    match s {
+        "SELF" => Ok(SigArgType::PassThrough),
+        "self" => Err(annlowlevel_deferred("typemeth_placeholder_sigarg('self')")),
+        _ if s.chars().all(|c| c.is_ascii_lowercase()) => Err(annlowlevel_deferred(
+            format!("typemeth_placeholder_sigarg({s:?})").as_str(),
+        )),
+        _ => Err(TyperError::message(format!(
+            "typemeth_placeholder_sigarg expected lowercase placeholder, got {s:?}"
+        ))),
+    }
+}
 
 // ---------------------------------------------------------------------
 // annlowlevel.py:20-41 — KeyComp
@@ -623,6 +657,160 @@ pub struct DelayedConst {
 pub struct DelayedFunc {
     pub delayedptr: _ptr,
     pub graph: Rc<PyGraph>,
+}
+
+/// RPython `class PseudoHighLevelCallable(object)`
+/// (annlowlevel.py:288-300).
+#[derive(Debug, Clone)]
+pub struct PseudoHighLevelCallable {
+    pub llfnptr: _ptr,
+    pub args_s: Vec<Option<SomeValue>>,
+    pub s_result: SomeValue,
+}
+
+impl PseudoHighLevelCallable {
+    pub fn new(llfnptr: _ptr, args_s: Vec<Option<SomeValue>>, s_result: SomeValue) -> Self {
+        Self {
+            llfnptr,
+            args_s,
+            s_result,
+        }
+    }
+
+    /// RPython `PseudoHighLevelCallable.__call__` (annlowlevel.py:298-300).
+    #[allow(non_snake_case)]
+    pub fn __call__(&self, _args: &[SomeValue]) -> Result<SomeValue, TyperError> {
+        Err(TyperError::message(
+            "PseudoHighLevelCallable objects are not really callable directly",
+        ))
+    }
+}
+
+/// RPython `class PseudoHighLevelCallableEntry(ExtRegistryEntry)`
+/// (annlowlevel.py:302-320).
+#[derive(Debug, Clone, Default)]
+pub struct PseudoHighLevelCallableEntry;
+
+impl PseudoHighLevelCallableEntry {
+    /// RPython `compute_result_annotation(self, *args_s)`
+    /// (annlowlevel.py:305-306).
+    pub fn compute_result_annotation(
+        &self,
+        instance: &PseudoHighLevelCallable,
+        _args_s: &[SomeValue],
+    ) -> SomeValue {
+        instance.s_result.clone()
+    }
+
+    /// RPython `specialize_call(self, hop)` (annlowlevel.py:308-320).
+    pub fn specialize_call(
+        &self,
+        _instance: &PseudoHighLevelCallable,
+        _hop: &HighLevelOp,
+    ) -> RTypeResult {
+        Err(annlowlevel_deferred(
+            "PseudoHighLevelCallableEntry.specialize_call",
+        ))
+    }
+}
+
+/// RPython `class LLHelperEntry(ExtRegistryEntry)` (annlowlevel.py:349-376).
+#[derive(Debug, Clone, Default)]
+pub struct LLHelperEntry;
+
+impl LLHelperEntry {
+    /// RPython `compute_result_annotation(self, s_F, s_callable)`
+    /// (annlowlevel.py:352-368).
+    pub fn compute_result_annotation(
+        &self,
+        _s_f: &SomeValue,
+        _s_callable: &SomeValue,
+    ) -> Result<SomeValue, TyperError> {
+        Err(annlowlevel_deferred(
+            "LLHelperEntry.compute_result_annotation",
+        ))
+    }
+
+    /// RPython `specialize_call(self, hop)` (annlowlevel.py:370-376).
+    pub fn specialize_call(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(annlowlevel_deferred("LLHelperEntry.specialize_call"))
+    }
+}
+
+/// One argument item in an `ADTInterface` signature template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ADTSigArg {
+    Placeholder(String),
+    Explicit(SigArgType),
+}
+
+/// RPython `sigtemplates` value: `name -> (args, result)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ADTSigTemplate {
+    pub args: Vec<ADTSigArg>,
+    pub result: SigArgType,
+}
+
+/// RPython `class ADTInterface(object)` (annlowlevel.py:607-640).
+#[derive(Debug, Clone)]
+pub struct ADTInterface {
+    pub sigtemplates: HashMap<String, ADTSigTemplate>,
+    pub base: Option<Rc<ADTInterface>>,
+    pub sigs: HashMap<String, Sig>,
+}
+
+impl ADTInterface {
+    /// RPython `ADTInterface.__init__(self, base, sigtemplates)`
+    /// (annlowlevel.py:609-630).
+    pub fn new(
+        base: Option<Rc<ADTInterface>>,
+        sigtemplates: HashMap<String, ADTSigTemplate>,
+    ) -> Result<Self, TyperError> {
+        let mut sigs = base
+            .as_ref()
+            .map(|base| base.sigs.clone())
+            .unwrap_or_default();
+        for (name, template) in &sigtemplates {
+            let first = template.args.first().ok_or_else(|| {
+                TyperError::message("ADTInterface signature must have at least one argument")
+            })?;
+            let make_expand: fn(&str) -> Result<SigArgType, TyperError> = match first {
+                ADTSigArg::Placeholder(s) if s == "self" => placeholder_sigarg,
+                ADTSigArg::Placeholder(s) if s == "SELF" => typemeth_placeholder_sigarg,
+                _ => {
+                    return Err(TyperError::message(
+                        "ADTInterface signature should start with 'SELF' or 'self'",
+                    ));
+                }
+            };
+            let mut sigargs = Vec::with_capacity(template.args.len());
+            for arg in &template.args {
+                match arg {
+                    ADTSigArg::Placeholder(s) => sigargs.push(make_expand(s)?),
+                    ADTSigArg::Explicit(arg) => sigargs.push(arg.clone()),
+                }
+            }
+            sigs.insert(name.clone(), Sig::new(sigargs));
+        }
+        Ok(Self {
+            sigtemplates,
+            base,
+            sigs,
+        })
+    }
+
+    /// RPython `ADTInterface.__call__(self, adtmeths)` (annlowlevel.py:632-639).
+    ///
+    /// `adtmeths` is the method mapping (`name -> ll function`, stored as
+    /// `lltype.Struct._adtmeths`); upstream installs each `sig` as the
+    /// method's `_annenforceargs_` and returns the mapping. Body deferred
+    /// until the mix-level helper surface lands; arity preserved.
+    pub fn __call__(
+        &self,
+        _adtmeths: HashMap<String, ConstValue>,
+    ) -> Result<HashMap<String, ConstValue>, TyperError> {
+        Err(annlowlevel_deferred("ADTInterface.__call__"))
+    }
 }
 
 /// RPython `class MixLevelHelperAnnotator(object)` (annlowlevel.py:

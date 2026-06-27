@@ -98,7 +98,7 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 /// virtualizable shadow, and the frontend object's `value` field in one
 /// call.  No separate side table.
 #[derive(Debug, Default)]
-pub(crate) struct CacheEntry {
+pub struct CacheEntry {
     cache_anything: vecset::VecMap<OpRef, BoxRef>,
     cache_seen_allocation: vecset::VecMap<OpRef, BoxRef>,
     quasiimmut_seen: Option<VecSet<OpRef>>,
