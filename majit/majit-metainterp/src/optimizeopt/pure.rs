@@ -9,7 +9,6 @@ use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
-use majit_ir::box_ref::BoxRef;
 
 /// pure.py:104,204-210: extra_call_pure entry.
 /// RPython stores AbstractResOp (or PreambleOp) directly in the list.
@@ -804,10 +803,7 @@ impl OptPure {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(&resolved_box, ctx);
-            return ctx
-                .get_box_replacement_box(forced)
-                .map(|b| b.to_opref())
-                .unwrap_or(forced);
+            return ctx.get_replacement_opref(forced);
         }
         resolved
     }
@@ -1074,10 +1070,9 @@ impl Optimization for OptPure {
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = {
-                    let __t = ctx.get_box_replacement(cached_ref);
-                    ctx.operand_of_box(&__t)
-                };
+                let b_cached = ctx
+                    .get_box_replacement_operand_opt(cached_ref)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(cached_ref));
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1309,6 +1304,7 @@ impl Optimization for OptPure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::box_ref::BoxRef;
 
     fn initialize_imported_short_pure_builder(
         ctx: &mut OptContext,
@@ -2700,8 +2696,8 @@ mod tests {
         let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .map(|b| b.to_opref()),
+            ctx.get_box_replacement_operand_opt(OpRef::int_op(2))
+                .map(|o| o.to_opref()),
             Some(OpRef::int_op(1))
         );
     }

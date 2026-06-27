@@ -22,7 +22,6 @@ use crate::optimizeopt::dependency::{DependencyGraph, schedule_operations};
 use crate::optimizeopt::renamer::Renamer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::VecMap;
-use majit_ir::box_ref::BoxRef;
 
 pub use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 pub use crate::optimizeopt::dependency::Node;
@@ -1550,10 +1549,21 @@ impl VectorizingOptimizer {
     fn copy_guard_descr(renamer: &Renamer, copied_op: &mut Op) {
         // vector.py:349-350: descr.clone() — already cloned by copy_resop
         // vector.py:351: failargs = renamer.rename_failargs(copied_op, clone=True)
+        // renamer.py:40: args[i] = rename_map.get(arg, arg) — a hit installs the
+        // BOUND renamed box, a miss KEEPS the original box object. lookup_box
+        // returns the bound Operand on a hit (Some) and None on a miss; the miss
+        // arm keeps `orig`'s live-producer Operand. No `from_opref`, so no
+        // position-only fabrication / panic on a live producer.
         if let Some(fail_args) = copied_op.getfailargs() {
-            let fail_args_oprefs: Vec<OpRef> = fail_args.iter().map(|a| a.to_opref()).collect();
-            let renamed = renamer.rename_failargs(&fail_args_oprefs);
-            copied_op.setfailargs(renamed.iter().map(|r| BoxRef::from_opref(*r)).collect());
+            let renamed: smallvec::SmallVec<[Operand; 3]> = fail_args
+                .iter()
+                .map(|orig| {
+                    renamer
+                        .lookup_box(orig.to_opref())
+                        .unwrap_or_else(|| orig.clone())
+                })
+                .collect();
+            copied_op.setfailargs(renamed);
         }
     }
 
@@ -2122,7 +2132,7 @@ impl VectorLoop {
         // vector.py:284 — bump count once for the alignment pass.
         let unroll_count = if align_unroll_once { count + 1 } else { count };
         let original_body = self.operations.clone();
-        let label_args = self.label.getarglist_copy();
+        let label_args = self.label.getarglist_operand();
         let jump_args = self.jump.getarglist_copy();
 
         // vector.py:281-283: prohibited opcodes — not duplicated during unroll
@@ -2156,13 +2166,13 @@ impl VectorLoop {
             original_body: &[OpRc],
             renamer: &mut Renamer,
             renamed: OpRef,
-        ) -> BoxRef {
+        ) -> Operand {
             if let Some(rc) = produced.get(&renamed) {
-                return BoxRef::from_bound_op(rc);
+                return Operand::from_bound_op(rc);
             }
             if !renamed.is_constant() && !renamed.is_none() {
                 if let Some(rc) = original_body.iter().find(|op| op.pos.get() == renamed) {
-                    return BoxRef::from_bound_op(rc);
+                    return Operand::from_bound_op(rc);
                 }
             }
             renamer.bound_box(renamed)
@@ -2210,12 +2220,7 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
                     copied_op.setarg(
                         i,
-                        Operand::from_boxref(&bind_unroll(
-                            &produced,
-                            &original_body,
-                            &mut renamer,
-                            renamed,
-                        )),
+                        bind_unroll(&produced, &original_body, &mut renamer, renamed),
                     );
                 }
 
@@ -2239,8 +2244,7 @@ impl VectorLoop {
             // as the original label, then run the renamer over it so its
             // args track the rename state at this point.
             if align_unroll_once && u == 0 {
-                let label_args_ops: Vec<Operand> =
-                    label_args.iter().map(Operand::from_boxref).collect();
+                let label_args_ops: Vec<Operand> = label_args.iter().cloned().collect();
                 let mut minted = Op::new(OpCode::Label, &label_args_ops);
                 if let Some(descr) = self.label.getdescr() {
                     minted.setdescr(descr);
@@ -2249,12 +2253,7 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(minted.arg(i).to_opref());
                     minted.setarg(
                         i,
-                        Operand::from_boxref(&bind_unroll(
-                            &produced,
-                            &original_body,
-                            &mut renamer,
-                            renamed,
-                        )),
+                        bind_unroll(&produced, &original_body, &mut renamer, renamed),
                     );
                 }
                 new_label = minted;
@@ -2266,12 +2265,7 @@ impl VectorLoop {
             let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
             self.jump.setarg(
                 i,
-                Operand::from_boxref(&bind_unroll(
-                    &produced,
-                    &original_body,
-                    &mut renamer,
-                    renamed,
-                )),
+                bind_unroll(&produced, &original_body, &mut renamer, renamed),
             );
         }
 
@@ -2322,7 +2316,16 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                         });
                     }
                 }
-                *arg = BoxRef::from_opref(entry.seed);
+                // schedule.py:656-657: failargs[i] = renamer.rename_map.get(seed,
+                // seed) — a rename hit installs the bound renamed producer, a miss
+                // keeps the seed box. lookup_box returns the bound renamed Operand
+                // (Some) or None; on a miss bind the seed to a producer-carrying
+                // Operand (to_opref() == seed) instead of fabricating a
+                // position-only operand that would panic on a live producer.
+                *arg = state
+                    .renamer
+                    .lookup_box(entry.seed)
+                    .unwrap_or_else(|| Operand::bound_from_opref(entry.seed));
             }
         }
         op.setfailargs(new_fa);
@@ -2358,7 +2361,7 @@ pub(crate) fn ensure_args_unpacked(
             seen.insert(unpacked);
             // The VecUnpack producer was just appended to `oplist`; bind the
             // arg to it (no position-only mint).
-            op.setarg(j, Operand::from_boxref(&state.bound_arg_boxref(unpacked)));
+            op.setarg(j, state.bound_arg_boxref(unpacked));
         }
     }
     // schedule.py:708-716: unpack guard failargs

@@ -18,7 +18,6 @@ use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
-use majit_ir::box_ref::BoxRef;
 
 /// optimizer.py:47-54 OptimizationResult: result of an optimization pass.
 #[derive(Debug)]
@@ -1795,7 +1794,10 @@ impl Optimizer {
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
-                let resolved_for_pop = ctx.resolve_box_box(&preamble_op.op);
+                let resolved_for_pop = ctx
+                    .get_box_replacement_operand_opt(preamble_op.op.to_opref())
+                    .map(|o| o.to_boxref())
+                    .unwrap_or_else(|| preamble_op.op.clone());
                 if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
                 } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
@@ -2794,7 +2796,7 @@ impl Optimizer {
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
                 .iter()
-                .map(|arg| ctx.resolve_box_box(arg).to_opref())
+                .map(|arg| ctx.get_replacement_opref(arg.to_opref()))
                 .collect();
             for &resolved in &resolved_args {
                 self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2806,7 +2808,7 @@ impl Optimizer {
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.resolve_operand_box(&arg).to_opref();
+                let resolved = ctx.get_replacement_opref(arg.to_opref());
                 let expected_ref =
                     i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
@@ -2977,7 +2979,7 @@ impl Optimizer {
                     .unwrap_or_else(|| {
                         jump.getarglist()
                             .iter()
-                            .map(|a| ctx.resolve_box_box(a).to_opref())
+                            .map(|a| ctx.get_replacement_opref(a.to_opref()))
                             .collect()
                     });
                 let mut resolved_args = original_jump_args.clone();
@@ -4953,8 +4955,8 @@ impl Optimizer {
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
                             item_index,
-                            target: ctx.resolve_operand_box(&target).to_opref(),
-                            value: ctx.resolve_operand_box(&value).to_opref(),
+                            target: ctx.get_replacement_opref(target.to_opref()),
+                            value: ctx.get_replacement_opref(value.to_opref()),
                             target_tagged: majit_ir::resumedata::UNASSIGNED,
                             value_tagged: majit_ir::resumedata::UNASSIGNED,
                         }
@@ -5930,13 +5932,13 @@ mod tests {
         );
         guard_a.setfailargs(
             vec![
-                rooted_resop_box(Type::Int, 0),
-                rooted_resop_box(Type::Int, 2000),
-                rooted_resop_box(Type::Int, 2001),
-                rooted_resop_box(Type::Int, 3),
-                rooted_resop_box(Type::Int, 3000),
-                rooted_resop_box(Type::Int, 3001),
-                rooted_resop_box(Type::Int, 4),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 2000),
+                rooted_resop_operand(Type::Int, 2001),
+                rooted_resop_operand(Type::Int, 3),
+                rooted_resop_operand(Type::Int, 3000),
+                rooted_resop_operand(Type::Int, 3001),
+                rooted_resop_operand(Type::Int, 4),
             ]
             .into(),
         );
@@ -5966,14 +5968,14 @@ mod tests {
         );
         guard_b.setfailargs(
             vec![
-                rooted_resop_box(Type::Int, 0),
-                rooted_resop_box(Type::Int, 2002),
-                rooted_resop_box(Type::Int, 2003),
-                rooted_resop_box(Type::Int, 3),
-                rooted_resop_box(Type::Int, 6),
-                rooted_resop_box(Type::Int, 3002),
-                rooted_resop_box(Type::Int, 3003),
-                rooted_resop_box(Type::Int, 7),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 2002),
+                rooted_resop_operand(Type::Int, 2003),
+                rooted_resop_operand(Type::Int, 3),
+                rooted_resop_operand(Type::Int, 6),
+                rooted_resop_operand(Type::Int, 3002),
+                rooted_resop_operand(Type::Int, 3003),
+                rooted_resop_operand(Type::Int, 7),
             ]
             .into(),
         );
@@ -6550,7 +6552,7 @@ mod tests {
         let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 10)]);
-        guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into());
+        guard.setfailargs(vec![rooted_resop_operand(Type::Int, 0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr),
             Op::with_descr(
@@ -6996,7 +6998,7 @@ mod tests {
         let (ops, inputs) = b.build();
         // The GuardTrue (ops[1]) keeps both header inputs as fail args; bind
         // them to the same canonical InputArg boxes the header threads.
-        ops[1].setfailargs(vec![x, y].into());
+        ops[1].setfailargs(vec![Operand::from_boxref(&x), Operand::from_boxref(&y)].into());
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);

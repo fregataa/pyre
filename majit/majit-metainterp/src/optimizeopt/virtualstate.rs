@@ -26,7 +26,6 @@ use std::rc::Rc;
 use majit_ir::vec_set::VecSet;
 
 use majit_ir::descr::descr_identity;
-use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
@@ -2551,21 +2550,18 @@ fn export_single_value(
     // onto the same VirtualStateInfo. Key the DAG cache by the resolved box's
     // identity (`Rc::ptr_eq`, const by value) — the bound producer's one
     // canonical `Rc`.
-    let box_ = ctx.get_box_replacement(opref);
+    let box_ = ctx.get_box_replacement_operand(opref);
     // bind-at-alloc invariant (see ExportCache): every position reaching
     // export resolves to a bound box, so `box_` is a stable canonical `Rc`
     // rather than a fresh `from_opref` placeholder that would split the cache.
     debug_assert!(
-        ctx.get_box_replacement_box(opref).is_some(),
+        ctx.get_box_replacement_operand_opt(opref).is_some(),
         "export_single_value: unbound position {opref:?} reached export — \
          bind-at-alloc invariant violated (every value reaching create_state \
          must be a bound box; virtualstate.py:711-720)"
     );
     // virtualstate.py:714-716: cache hit returns the cached state directly.
-    if let Some(cached) = cache
-        .finished
-        .get(&majit_ir::operand::Operand::from_boxref(&box_))
-    {
+    if let Some(cached) = cache.finished.get(&box_) {
         return Rc::clone(cached);
     }
     // Cycle: this opref is currently being exported on the parent stack.
@@ -2579,10 +2575,7 @@ fn export_single_value(
     // spectral_norm, inline_helper). The cyclic-virtual-graph regression
     // (RPython parity gap documented above) is therefore latent — no
     // benchmark constructs the necessary self-referential structures.
-    if cache
-        .in_progress
-        .contains(&majit_ir::operand::Operand::from_boxref(&box_))
-    {
+    if cache.in_progress.contains(&box_) {
         // Fallback to Ref for the cycle leaf: pyre's virtual DAGs only
         // form through ptr fields, so the only reachable cycles are on
         // Ref-typed nodes. Matches `not_virtual(cpu, 'r', None)` in
@@ -2590,7 +2583,7 @@ fn export_single_value(
         // with LEVEL_UNKNOWN.
         return VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Ref));
     }
-    let key = majit_ir::operand::Operand::from_boxref(&box_);
+    let key = box_.clone();
     cache.in_progress.insert(key.clone());
 
     let info = export_single_value_inner(box_.to_opref(), ctx, cache);
@@ -2790,6 +2783,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::info::VirtualStructInfo;
     use majit_ir::box_ref::BoxRef;
+    use majit_ir::operand::Operand;
     use majit_ir::{Descr, FieldDescr, GcRef, Type};
     use std::sync::Arc;
 
@@ -3082,7 +3076,7 @@ mod tests {
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
         assert_eq!(
-            ctx.get_box_replacement_box(guard.arg(1).to_opref())
+            ctx.get_box_replacement_operand_opt(guard.arg(1).to_opref())
                 .and_then(|cb| cb.const_value()),
             Some(Value::Ref(expected))
         );
@@ -3359,10 +3353,7 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        assert_eq!(
-            inputargs[0],
-            ctx.get_box_replacement(virtual_ref).to_opref()
-        );
+        assert_eq!(inputargs[0], ctx.get_replacement_opref(virtual_ref));
         assert!(virtuals.is_empty());
     }
 }

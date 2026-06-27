@@ -1389,7 +1389,7 @@ pub(crate) fn classify_short_arg(
     // unit-test consumer ctxs without pre-seeded const pool), then consumer
     // ctx (production: pre-seeded at optimizer.rs:1927).
     if let Some(value) = short_box_const_values.get(&arg).cloned().or_else(|| {
-        ctx.get_box_replacement_box(arg)
+        ctx.get_box_replacement_operand_opt(arg)
             .and_then(|cb| cb.const_value())
     }) {
         let const_opref = imported_const_opref(imported_constants, arg, &value);
@@ -1870,16 +1870,17 @@ impl ProducedShortOp {
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
         };
-        let obj_box = ctx.get_box_replacement_box(obj_resolved);
+        let obj_box = ctx.get_box_replacement_operand_opt(obj_resolved);
         if obj_resolved.is_constant()
             || obj_box
                 .as_ref()
-                .and_then(|b| ctx.get_constant_box(&Operand::from_boxref(b)))
+                .and_then(|b| ctx.get_constant_box(b))
                 .is_some()
         {
-            if let Some(info) = obj_box.as_ref().and_then(|b| {
-                ctx.get_const_info_array_mut_box(&Operand::from_boxref(b), descr.clone())
-            }) {
+            if let Some(info) = obj_box
+                .as_ref()
+                .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+            {
                 info.set_preamble_item(index as usize, pop.clone());
             }
         } else {
@@ -2733,7 +2734,8 @@ impl ExtendedShortPreambleBuilder {
                         // producer-less position-only box. Mirrors the mapped
                         // arm, which binds via `materialize_box_at`; falls back
                         // to a position-only box only if no producer exists.
-                        ctx.get_box_replacement_box(arg.to_opref())
+                        ctx.get_box_replacement_operand_opt(arg.to_opref())
+                            .map(|o| o.to_boxref())
                             .unwrap_or_else(|| BoxRef::from_opref(arg.to_opref()))
                     })
             })
@@ -3456,7 +3458,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rop(Type::Int, 100)]),
         ];
         assign_positions(&mut ops, 0);
-        ops[1].setfailargs(vec![rooted_resop_box(Type::Int, 100)].into());
+        ops[1].setfailargs(vec![rooted_resop_operand(Type::Int, 100)].into());
         let sp = extract_short_preamble(&ops);
 
         assert_eq!(sp.len(), 2);
@@ -3476,7 +3478,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rop(Type::Int, 100)]),
         ];
         assign_positions(&mut ops, 0);
-        ops[1].setfailargs(vec![rooted_resop_box(Type::Int, 100)].into());
+        ops[1].setfailargs(vec![rooted_resop_operand(Type::Int, 100)].into());
         let sp = extract_short_preamble(&ops);
 
         assert!(sp.is_empty());

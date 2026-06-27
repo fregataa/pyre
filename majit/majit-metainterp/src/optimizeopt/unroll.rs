@@ -1346,10 +1346,10 @@ impl UnrollOptimizer {
                 // Phase-2 info of the original box this short inputarg renames.
                 let original = slot_to_original[i];
                 let info = original
-                    .and_then(|o| final_ctx.get_box_replacement_box(o))
-                    .or_else(|| final_ctx.resolve_box_box_opt(inputarg))
+                    .and_then(|o| final_ctx.get_box_replacement_operand_opt(o))
+                    .or_else(|| final_ctx.get_box_replacement_operand_opt(inputarg.to_opref()))
                     .as_ref()
-                    .and_then(|b| final_ctx.peek_ptr_info(&Operand::from_boxref(b)));
+                    .and_then(|o| final_ctx.peek_ptr_info(o));
                 infos.push(info);
             }
             initial_sp.inputarg_infos = infos;
@@ -2752,8 +2752,8 @@ impl OptUnroll {
         // Const box per call, so two calls would NOT be ptr_eq.
         let end_arg_boxes: Vec<BoxRef> = end_args
             .iter()
-            .map(|&a| match ctx.get_box_replacement_box(a) {
-                Some(b) => b,
+            .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
+                Some(o) => o.to_boxref(),
                 // The None arm fires only for an unregistered ResOp position
                 // (Const / InputArg always resolve); #157 drained those fires
                 // to zero. materialize_box_at mints+registers a canonical
@@ -2773,8 +2773,8 @@ impl OptUnroll {
             .expect("export_state make_inputargs_and_virtuals failed");
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
-            let arg_box = match ctx.get_box_replacement_box(arg) {
-                Some(b) => b,
+            let arg_box = match ctx.get_box_replacement_operand_opt(arg) {
+                Some(o) => o.to_boxref(),
                 // Same canonical-key fallback as end_arg_boxes above: an
                 // unregistered ResOp position (drained to zero by #157) mints a
                 // canonical synthetic instead of a producer-less from_opref box,
@@ -3009,7 +3009,7 @@ impl OptUnroll {
                     continue;
                 }
                 if let Some(value) = ctx
-                    .get_box_replacement_box(arg)
+                    .get_box_replacement_operand_opt(arg)
                     .and_then(|cb| cb.const_value())
                 {
                     state.short_box_const_values.insert(arg, value);
@@ -3084,7 +3084,7 @@ impl OptUnroll {
         >,
         infos: &mut majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
     ) {
-        let opref_box = ctx.get_box_replacement_box(opref);
+        let opref_box = ctx.get_box_replacement_operand_opt(opref);
         // unroll.py:445-450 `_expand_infos_from_virtual`:
         //     items = info.all_items()
         //     for item in items:
@@ -3304,7 +3304,7 @@ impl OptUnroll {
                                 let arg = arg.to_opref();
                                 (
                                     arg,
-                                    ctx.get_box_replacement_box(arg)
+                                    ctx.get_box_replacement_operand_opt(arg)
                                         .and_then(|cb| cb.const_value()),
                                 )
                             })
@@ -4082,7 +4082,7 @@ impl OptUnroll {
                 // resolves them instead of fabricating a position-only box.
                 // Slot-mapped results (`short_args[slot]`) are already bound
                 // inputargs and resolve without minting.
-                if ctx.get_box_replacement_box(result).is_none() {
+                if ctx.get_box_replacement_operand_opt(result).is_none() {
                     ctx.mint_box_at(result);
                 }
                 result_map.insert(*source, result);
@@ -4193,7 +4193,7 @@ impl OptUnroll {
         };
         if resolved.is_constant() {
             if let Some(value) = ctx
-                .get_box_replacement_box(resolved)
+                .get_box_replacement_operand_opt(resolved)
                 .and_then(|cb| cb.const_value())
             {
                 return synthesize_const_info(value);
@@ -4202,7 +4202,7 @@ impl OptUnroll {
         // make_constant mirrors optimizer.py:432 as `Forwarded::Const(constval)`.
         // The walker has advanced to the constbox terminal — surface RPython's
         // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
-        let resolved_box = ctx.get_box_replacement_box(opref);
+        let resolved_box = ctx.get_box_replacement_operand_opt(opref);
         if let Some(b) = resolved_box.as_ref() {
             if b.is_constant() {
                 if let Some(value) = b.const_value() {
@@ -6112,7 +6112,7 @@ mod tests {
             ),
             {
                 let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 100)]);
-                guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into()); // refs op0
+                guard.setfailargs(vec![rooted_resop_operand(Type::Int, 0)].into()); // refs op0
                 guard
             },
             Op::new(OpCode::Jump, &[]),
@@ -7015,10 +7015,9 @@ mod tests {
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
         let b_src = ctx.materialize_box_at(OpRef::ref_op(19));
-        let b_tgt = {
-            let __t = ctx.get_box_replacement(OpRef::ref_op(14));
-            ctx.operand_of_box(&__t)
-        };
+        let b_tgt = ctx
+            .get_box_replacement_operand_opt(OpRef::ref_op(14))
+            .unwrap_or_else(|| ctx.materialize_operand_at(OpRef::ref_op(14)));
         ctx.make_equal_to(&Operand::from_boxref(&b_src), &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),
@@ -7464,7 +7463,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(2)),
                     ],
                 );
-                op.setfailargs(vec![rooted_resop_box(Type::Void, 857)].into());
+                op.setfailargs(vec![rooted_resop_operand(Type::Void, 857)].into());
                 op
             },
             Op::new(
@@ -7629,7 +7628,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 64)]);
-                op.setfailargs(vec![rooted_resop_box(Type::Int, 64)].into());
+                op.setfailargs(vec![rooted_resop_operand(Type::Int, 64)].into());
                 op
             },
             {
@@ -8046,7 +8045,7 @@ mod tests {
         let redirected_tail = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Void, 3)]);
-                op.setfailargs(vec![rooted_resop_box(Type::Void, 3)].into());
+                op.setfailargs(vec![rooted_resop_operand(Type::Void, 3)].into());
                 op
             },
             Op::new(

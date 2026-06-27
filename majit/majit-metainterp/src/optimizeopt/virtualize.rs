@@ -8,7 +8,6 @@
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
 use std::sync::Arc;
 
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
@@ -678,7 +677,7 @@ impl OptVirtualize {
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+        let value_ref = ctx.get_replacement_opref(op.arg(1).to_opref());
         let setfield_descr_arc = op
             .getdescr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
@@ -907,10 +906,9 @@ impl OptVirtualize {
             };
             if let Some(val_ref) = field_val {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_val = {
-                    let __t = ctx.get_box_replacement(val_ref);
-                    ctx.operand_of_box(&__t)
-                };
+                let b_val = ctx
+                    .get_box_replacement_operand_opt(val_ref)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(val_ref));
                 ctx.make_equal_to(&b_old, &b_val);
                 return OptimizationResult::Remove;
             }
@@ -959,7 +957,7 @@ impl OptVirtualize {
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.resolve_operand_box(&op.arg(2)).to_opref();
+        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
@@ -1041,10 +1039,9 @@ impl OptVirtualize {
                         );
                     }
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_item = {
-                        let __t = ctx.get_box_replacement(item_ref);
-                        ctx.operand_of_box(&__t)
-                    };
+                    let b_item = ctx
+                        .get_box_replacement_operand_opt(item_ref)
+                        .unwrap_or_else(|| ctx.materialize_operand_at(item_ref));
                     ctx.make_equal_to(&b_old, &b_item);
                     return OptimizationResult::Remove;
                 }
@@ -1146,10 +1143,9 @@ impl OptVirtualize {
                 }
                 let fld = fld.unwrap();
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_fld = {
-                    let __t = ctx.get_box_replacement(fld);
-                    ctx.operand_of_box(&__t)
-                };
+                let b_fld = ctx
+                    .get_box_replacement_operand_opt(fld)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(fld));
                 ctx.make_equal_to(&b_old, &b_fld);
                 return OptimizationResult::Remove;
             }
@@ -1170,7 +1166,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.resolve_operand_box(&op.arg(2)).to_opref();
+        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
         // `info.py:583-594 setinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Same shape as the GET
         // counterpart — strip the outer `InteriorFieldDescr` first.
@@ -1249,7 +1245,7 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
-        let arg0 = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+        let arg0 = ctx.get_replacement_opref(op.arg(0).to_opref());
         let Some(offset) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b| ctx.get_constant_int_box(&b))
@@ -1314,10 +1310,9 @@ impl OptVirtualize {
                 // rawbuffer.py:120: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_val = {
-                        let __t = ctx.get_box_replacement(val_ref);
-                        ctx.operand_of_box(&__t)
-                    };
+                    let b_val = ctx
+                        .get_box_replacement_operand_opt(val_ref)
+                        .unwrap_or_else(|| ctx.materialize_operand_at(val_ref));
                     ctx.make_equal_to(&b_old, &b_val);
                     return OptimizationResult::Remove;
                 }
@@ -1327,9 +1322,9 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+        let buf_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
         let offset_ref = op.arg(1).to_opref();
-        let value_ref = ctx.resolve_operand_box(&op.arg(2)).to_opref();
+        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
 
         if let Some(offset) = ctx
             .get_box_replacement_operand_opt(offset_ref)
@@ -1418,7 +1413,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_ref = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+        let array_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
@@ -1549,8 +1544,8 @@ impl OptVirtualize {
     ///     return self.emit(op)
     /// ```
     fn optimize_setarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.resolve_operand_box(&op.arg(0)).to_opref();
-        let value_ref = ctx.resolve_operand_box(&op.arg(2)).to_opref();
+        let array_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
+        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
@@ -1753,8 +1748,8 @@ impl OptVirtualize {
     /// here on the VirtualStruct half and the setfield_gc emit path is
     /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_ref = ctx.resolve_operand_box(&op.arg(0)).to_opref();
-        let obj_ref = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+        let vref_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
+        let obj_ref = ctx.get_replacement_opref(op.arg(1).to_opref());
 
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
@@ -1762,10 +1757,9 @@ impl OptVirtualize {
         // on-demand `BoxRef::new_const` and walks the chain terminal;
         // `is_const_null` reads `const_value()` and tolerates an unbound
         // terminal (non-const -> false), so the null check is read-only.
-        let obj_box = {
-            let __t = ctx.get_box_replacement(obj_ref);
-            ctx.operand_of_box(&__t)
-        };
+        let obj_box = ctx
+            .get_box_replacement_operand_opt(obj_ref)
+            .unwrap_or_else(|| ctx.materialize_operand_at(obj_ref));
         let obj_is_null = ctx.is_const_null(&obj_box);
 
         // If vref is still virtual, update the virtual struct fields directly
@@ -5684,8 +5678,13 @@ mod tests {
                 20,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_box(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::with_descr(
@@ -5772,9 +5771,9 @@ mod tests {
         );
         guard.setfailargs(
             vec![
-                crate::history::test_support::rooted_inputarg_box(Type::Int, 30),
-                crate::history::test_support::rooted_resop_box(Type::Ref, 0),
-                crate::history::test_support::rooted_inputarg_box(Type::Int, 40),
+                crate::history::test_support::rooted_inputarg_operand(Type::Int, 30),
+                crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                crate::history::test_support::rooted_inputarg_operand(Type::Int, 40),
             ]
             .into(),
         );
@@ -5856,8 +5855,8 @@ mod tests {
         );
         guard.setfailargs(
             vec![
-                crate::history::test_support::rooted_inputarg_box(Type::Int, 20),
-                crate::history::test_support::rooted_inputarg_box(Type::Int, 30),
+                crate::history::test_support::rooted_inputarg_operand(Type::Int, 20),
+                crate::history::test_support::rooted_inputarg_operand(Type::Int, 30),
             ]
             .into(),
         );
@@ -5894,8 +5893,13 @@ mod tests {
                 20,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_box(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
@@ -5963,8 +5967,13 @@ mod tests {
                 30,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_box(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
@@ -6047,8 +6056,13 @@ mod tests {
                 30,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_box(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
             Op::with_descr(OpCode::New, &[], inner_sd),
@@ -6130,8 +6144,13 @@ mod tests {
                 20,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_box(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArray,

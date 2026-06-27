@@ -23,7 +23,6 @@ use majit_backend::{
     Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, ExitFrameLayout,
     ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{
     AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
@@ -450,7 +449,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // class, not by per-arg inference.
             // history.py:220/261/307 — type is intrinsic on the Box; read it
             // off the OpRef variant tag (`ty()`).
-            let finish_arg_type = |b: &BoxRef| -> Type { b.to_opref().ty().unwrap_or(Type::Int) };
+            let finish_arg_type = |b: &Operand| -> Type { b.to_opref().ty().unwrap_or(Type::Int) };
             if let Some(types) = descr_types {
                 if types.len() == op.num_args() {
                     types.to_vec()
@@ -459,11 +458,17 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     // type-shaped descr): reconstruct per-arg from the
                     // failarg variant tag (`opref.ty()`). Production FINISH
                     // always matches the descr arity.
-                    op.getarglist().iter().map(finish_arg_type).collect()
+                    op.getarglist_operand()
+                        .iter()
+                        .map(finish_arg_type)
+                        .collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.getarglist().iter().map(finish_arg_type).collect()
+                op.getarglist_operand()
+                    .iter()
+                    .map(finish_arg_type)
+                    .collect()
             }
         } else if let Some(fail_args) = op.getfailargs() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
@@ -1700,7 +1705,7 @@ pub(crate) fn normalize_closing_jump_args(
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| op.getarglist_copy())
+        .map(|op| op.getarglist_operand())
     else {
         return ops;
     };
@@ -1735,7 +1740,7 @@ pub(crate) fn normalize_closing_jump_args(
         if defined.contains(&arg.to_opref()) {
             continue;
         }
-        jump.setarg(idx, Operand::from_boxref(&label_args[idx]));
+        jump.setarg(idx, label_args[idx].clone());
     }
 
     ops
@@ -1827,7 +1832,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // discarded when the function returns; its lifetime mirrors the
     // single in-place loop rewrite that RPython's `_forwarded` model
     // accomplishes via Box mutation. No semantic divergence.
-    fn set_local_forwarded(forwarding: &mut Vec<Option<BoxRef>>, source: OpRef, target: BoxRef) {
+    fn set_local_forwarded(forwarding: &mut Vec<Option<Operand>>, source: OpRef, target: Operand) {
         if source.is_none() || source.is_constant() {
             return;
         }
@@ -1839,9 +1844,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     }
 
     fn get_local_box_replacement(
-        forwarding: &[Option<BoxRef>],
+        forwarding: &[Option<Operand>],
         mut opref: OpRef,
-    ) -> Option<BoxRef> {
+    ) -> Option<Operand> {
         if opref.is_none() || opref.is_constant() {
             return None;
         }
@@ -1861,7 +1866,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     fn emit_forwarded_patch_op(
         extra_ops: &mut Vec<majit_ir::OpRc>,
         op: &Op,
-        forwarding: &mut Vec<Option<BoxRef>>,
+        forwarding: &mut Vec<Option<Operand>>,
         next_opref: &mut u32,
     ) {
         let mut emitted = op.clone();
@@ -1884,7 +1889,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                     }
                     replaced = true;
                 }
-                emitted.setarg(i, Operand::from_boxref(&bound));
+                emitted.setarg(i, bound);
             }
         }
 
@@ -1895,7 +1900,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             if let Some(fail_args) = emitted.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
                     if let Some(bound) = get_local_box_replacement(forwarding, arg.to_opref()) {
-                        *arg = majit_ir::operand::Operand::from_boxref(&bound);
+                        *arg = bound;
                     }
                 }
             }
@@ -1903,7 +1908,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
 
         let emitted = std::rc::Rc::new(emitted);
         if let Some(source) = forwarded_source {
-            set_local_forwarded(forwarding, source, BoxRef::from_bound_op(&emitted));
+            set_local_forwarded(forwarding, source, Operand::from_bound_op(&emitted));
         }
         extra_ops.push(emitted);
     }
@@ -1923,7 +1928,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .collect();
 
     // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
-    let vable_box = BoxRef::from_bound_inputarg(&expanded_inputargs[index_of_virtualizable]);
+    let vable_box = Operand::from_bound_inputarg(&expanded_inputargs[index_of_virtualizable]);
 
     // compile.py keeps Box identities disjoint automatically; in the flat
     // OpRef model we must allocate above every runtime ref already reachable
@@ -1954,7 +1959,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .map(|m| m + 1)
         .unwrap_or(0);
 
-    let mut forwarding: Vec<Option<BoxRef>> =
+    let mut forwarding: Vec<Option<Operand>> =
         vec![None; (max_runtime_ref as usize).saturating_add(1)];
     let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
     let mut i = num_red_args;
@@ -1985,11 +1990,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
         let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
-        let mut op = Op::new(opcode, &[Operand::from_boxref(&vable_box)]);
+        let mut op = Op::new(opcode, &[vable_box.clone()]);
         op.pos.set(new_opref);
         op.setdescr(descr);
         let op = std::rc::Rc::new(op);
-        set_local_forwarded(&mut forwarding, old_opref, BoxRef::from_bound_op(&op));
+        set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&op));
         extra_ops.push(op);
         i += 1;
     }
@@ -2006,11 +2011,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer (Ref-typed).
         let array_opref = OpRef::ref_op(next_opref);
         next_opref += 1;
-        let mut arr_load = Op::new(OpCode::GetfieldGcR, &[Operand::from_boxref(&vable_box)]);
+        let mut arr_load = Op::new(OpCode::GetfieldGcR, &[vable_box.clone()]);
         arr_load.pos.set(array_opref);
         arr_load.setdescr(array_field_descr.clone());
         let arr_load = std::rc::Rc::new(arr_load);
-        let array_box = BoxRef::from_bound_op(&arr_load);
+        let array_box = Operand::from_bound_op(&arr_load);
         extra_ops.push(arr_load);
 
         let array_descr = vinfo
@@ -2080,8 +2085,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 // RPython's flat GC-array layout — out of scope.
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
-                let mut ptr_load =
-                    Op::new(OpCode::GetfieldGcI, &[Operand::from_boxref(&array_box)]);
+                let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_box.clone()]);
                 ptr_load.pos.set(ptr_opref);
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
@@ -2090,7 +2094,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                     ArrayFlag::Unsigned,
                 ));
                 let ptr_load = std::rc::Rc::new(ptr_load);
-                let ptr_box = BoxRef::from_bound_op(&ptr_load);
+                let ptr_box = Operand::from_bound_op(&ptr_load);
                 extra_ops.push(ptr_load);
 
                 let raw_opcode = match array_info.item_type {
@@ -2118,15 +2122,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             next_opref += 1;
             let mut elem_op = Op::new(
                 item_opcode,
-                &[
-                    Operand::from_boxref(&item_base),
-                    Operand::from_opref(const_opref),
-                ],
+                &[item_base.clone(), Operand::from_opref(const_opref)],
             );
             elem_op.pos.set(new_opref);
             elem_op.setdescr(item_descr.clone());
             let elem_op = std::rc::Rc::new(elem_op);
-            set_local_forwarded(&mut forwarding, old_opref, BoxRef::from_bound_op(&elem_op));
+            set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&elem_op));
             extra_ops.push(elem_op);
             i += 1;
         }
@@ -2495,8 +2496,8 @@ pub fn compile_tmp_callback(
     // inline, carried directly on the OpRef variant.
     let funcbox_ref = OpRef::const_int(jitdriver_sd.portal_runner_adr);
     // Green boxes follow in declaration order.
-    let mut callargs_box: Vec<BoxRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
-    callargs_box.push(BoxRef::from_opref(funcbox_ref));
+    let mut callargs_box: Vec<Operand> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
+    callargs_box.push(Operand::from_opref(funcbox_ref));
     for gb in greenboxes.iter() {
         // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
         let g_ref = match *gb {
@@ -2505,12 +2506,12 @@ pub fn compile_tmp_callback(
             Value::Float(f) => OpRef::const_float(f),
             Value::Void => panic!("compile_tmp_callback: void greenbox"),
         };
-        callargs_box.push(BoxRef::from_opref(g_ref));
+        callargs_box.push(Operand::from_opref(g_ref));
     }
     // Red args — bound to the inputarg objects themselves
     // (resoperation.py:719/727/739 InputArg{Int,Float,Ref}).
     for ia in inputargs.iter() {
-        callargs_box.push(BoxRef::from_bound_inputarg(ia));
+        callargs_box.push(Operand::from_bound_inputarg(ia));
     }
     //
     let portal_calldescr = jitdriver_sd
@@ -2534,14 +2535,7 @@ pub fn compile_tmp_callback(
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
-    let call_op = std::rc::Rc::new(Op::with_descr(
-        call_opcode,
-        &callargs_box
-            .iter()
-            .map(Operand::from_boxref)
-            .collect::<Vec<_>>(),
-        portal_calldescr,
-    ));
+    let call_op = std::rc::Rc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
     //
     // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
@@ -2550,7 +2544,7 @@ pub fn compile_tmp_callback(
     // `OpRef::NONE` so dynasm/cranelift backends that only emit a store
     // when `op.pos != NONE` (e.g. `x86/assembler.rs` CALL handler) don't
     // produce a bogus result slot.
-    let finishargs_box: Vec<BoxRef> = if jitdriver_sd.result_type == Type::Void {
+    let finishargs_box: Vec<Operand> = if jitdriver_sd.result_type == Type::Void {
         Vec::new()
     } else {
         // The CALL writes to the first free OpRef after inputargs.
@@ -2558,7 +2552,7 @@ pub fn compile_tmp_callback(
         // box of a typed CALL is a typed ResOp variant.
         let call_result_ref = OpRef::op_typed(num_inputs, jitdriver_sd.result_type);
         call_op.pos.set(call_result_ref);
-        vec![BoxRef::from_bound_op(&call_op)]
+        vec![Operand::from_bound_op(&call_op)]
     };
     //
     // `compile.py:1138-1144` operations = [call_op,
@@ -2567,14 +2561,7 @@ pub fn compile_tmp_callback(
     let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
     // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
-    let finish_op = Op::with_descr(
-        OpCode::Finish,
-        &finishargs_box
-            .iter()
-            .map(Operand::from_boxref)
-            .collect::<Vec<_>>(),
-        portal_finishtoken,
-    );
+    let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box, portal_finishtoken);
     let operations: Vec<majit_ir::OpRc> = vec![
         call_op,
         std::rc::Rc::new(guard_op),
@@ -2671,8 +2658,8 @@ mod tests {
         }
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            rooted_inputarg_box(Type::Ref, 0),
-            rooted_inputarg_box(Type::Int, 1)
+            rooted_inputarg_operand(Type::Ref, 0),
+            rooted_inputarg_operand(Type::Int, 1)
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
@@ -2719,10 +2706,10 @@ mod tests {
             .set_fail_arg_types(fail_arg_types.clone());
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            rooted_inputarg_box(Type::Ref, 0),
-            rooted_inputarg_box(Type::Ref, 1),
-            rooted_inputarg_box(Type::Ref, 2),
-            rooted_inputarg_box(Type::Ref, 3)
+            rooted_inputarg_operand(Type::Ref, 0),
+            rooted_inputarg_operand(Type::Ref, 1),
+            rooted_inputarg_operand(Type::Ref, 2),
+            rooted_inputarg_operand(Type::Ref, 3)
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 

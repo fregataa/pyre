@@ -7,7 +7,6 @@ pub use crate::optimizeopt::rawbuffer::{
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
@@ -1480,10 +1479,7 @@ fn force_box_impl(
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {
                             let ch_ref = ch_ref.to_opref();
-                            let ch_resolved = ctx
-                                .get_box_replacement_box(ch_ref)
-                                .map(|b| b.to_opref())
-                                .unwrap_or(ch_ref);
+                            let ch_resolved = ctx.get_replacement_opref(ch_ref);
                             let arg_newop = ctx.materialize_operand_at(newop);
                             let arg_offset = ctx.resolve_operand_operand(&offset);
                             let arg_ch = ctx.materialize_operand_at(ch_resolved);
@@ -1578,6 +1574,7 @@ pub use majit_ir::ptr_info::{
 mod tests {
     use super::*;
     use crate::optimizeopt::OptContext;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{Descr, OpCode, Value};
     use std::sync::Arc;
 

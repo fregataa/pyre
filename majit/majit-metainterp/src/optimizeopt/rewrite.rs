@@ -8,7 +8,6 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
-use majit_ir::box_ref::BoxRef;
 
 /// rewrite.py: loop_invariant_results value.
 /// RPython stores PreambleOp or regular Box (AbstractResOp) directly
@@ -435,8 +434,8 @@ impl OptRewrite {
         }
 
         // rewrite.py:528-531: null checks — fall back to OpRef for downstream
-        let arg0 = ctx.resolve_operand_box(&op.arg(0)).to_opref();
-        let arg1 = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+        let arg0 = ctx.get_replacement_opref(op.arg(0).to_opref());
+        let arg1 = ctx.get_replacement_opref(op.arg(1).to_opref());
         if info1.as_ref().is_some_and(|i| i.is_null()) {
             return self.optimize_nullness(op, arg0, expect_isnot, ctx);
         }
@@ -828,7 +827,7 @@ impl OptRewrite {
         // EnsuredPtrInfo borrow; downstream lookups re-acquire via
         // `getptrinfo` / `get_ptr_info` against the resolved OpRef.
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let obj = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+        let obj = ctx.get_replacement_opref(op.arg(0).to_opref());
         // rewrite.py:397-407: ensure_ptr_info_arg0 → info.py:880 getptrinfo.
         // `getptrinfo(ConstPtr)` returns a synthesized ConstPtrInfo, so a
         // constant Ref arg0 is handled uniformly with virtual / instance
@@ -1124,7 +1123,7 @@ impl OptRewrite {
                     && shift_op.num_args() >= 2
                     && shift_op.arg(0).get_box_replacement(false).const_int() == Some(1)
                 {
-                    let shiftvar = ctx.resolve_operand_box(&shift_op.arg(1)).to_opref();
+                    let shiftvar = ctx.get_replacement_opref(shift_op.arg(1).to_opref());
                     let shiftbound = {
                         let b = ctx.get_box_replacement_operand(shiftvar);
                         ctx.getintbound_handle(&b).borrow().clone()
@@ -1763,7 +1762,7 @@ impl Optimization for OptRewrite {
                 //         if info.is_null(): return
                 //         elif info.is_nonnull(): raise InvalidLoop(...)
                 //     return self.emit(op)
-                let obj = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+                let obj = ctx.get_replacement_opref(op.arg(0).to_opref());
                 let obj_box = ctx.resolve_operand_operand_opt(&op.arg(0));
                 if let Some(info) = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
                     if info.is_null() {
@@ -1904,8 +1903,8 @@ impl Optimization for OptRewrite {
                     //     arg0 = get_box_replacement(op.getarg(0))
                     //     arg1 = get_box_replacement(op.getarg(1))
                     //     self.pure_from_args2(rop.INSTANCE_PTR_EQ, arg1, arg0, op)
-                    let arg0 = ctx.resolve_operand_box(&op.arg(0)).to_opref();
-                    let arg1 = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+                    let arg0 = ctx.get_replacement_opref(op.arg(0).to_opref());
+                    let arg1 = ctx.get_replacement_opref(op.arg(1).to_opref());
                     ctx.register_pure_from_args2(OpCode::InstancePtrEq, op.pos.get(), arg1, arg0);
                 }
                 return self.optimize_oois_ooisnot(op, false, instance, ctx);
@@ -1914,8 +1913,8 @@ impl Optimization for OptRewrite {
                 let instance = matches!(op.opcode, OpCode::InstancePtrNe);
                 if instance {
                     // rewrite.py:568-571 optimize_INSTANCE_PTR_NE: same swap.
-                    let arg0 = ctx.resolve_operand_box(&op.arg(0)).to_opref();
-                    let arg1 = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+                    let arg0 = ctx.get_replacement_opref(op.arg(0).to_opref());
+                    let arg1 = ctx.get_replacement_opref(op.arg(1).to_opref());
                     ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos.get(), arg1, arg0);
                 }
                 return self.optimize_oois_ooisnot(op, true, instance, ctx);
@@ -2339,6 +2338,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
+    use majit_ir::box_ref::BoxRef;
 
     /// Producer-position trace spec. A consumer's `args` name the result
     /// positions of earlier producers in the same spec slice, so no op-arg
@@ -2522,7 +2522,7 @@ mod tests {
     }
 
     fn assert_forward(ctx: &OptContext, from: OpRef, to: OpRef) {
-        assert_eq!(ctx.get_box_replacement(from).to_opref(), to);
+        assert_eq!(ctx.get_replacement_opref(from), to);
     }
 
     /// Run the rewrite pass on a sequence of ops and return the optimized ops.
@@ -2927,7 +2927,7 @@ mod tests {
         // op0 is emitted, op1 is emitted (just a constant), op2 is removed.
         // After forwarding, any reference to op2 should resolve to op0.
         assert_eq!(
-            ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
+            ctx.get_replacement_opref(OpRef::int_op(2)),
             OpRef::int_op(0)
         );
     }
@@ -3164,7 +3164,7 @@ mod tests {
         let result2 = pass.propagate_forward(&resolved2, &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
+            ctx.get_replacement_opref(OpRef::float_op(2)),
             OpRef::float_op(0)
         );
     }
@@ -3250,7 +3250,7 @@ mod tests {
             &[(OpRef::int_op(0), Value::Int(42))],
         );
         assert_remove(&result);
-        let resolved = ctx.get_box_replacement(OpRef::int_op(3)).to_opref();
+        let resolved = ctx.get_replacement_opref(OpRef::int_op(3));
         assert!(resolved.is_constant());
         assert_eq!(
             ctx.get_box_replacement_operand_opt(resolved)

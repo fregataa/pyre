@@ -4776,7 +4776,7 @@ fn build_ref_root_slots(
     // Build the set of inputarg OpRef raw values actually used in ops.
     let mut used_inputargs: VecSet<u32> = VecSet::new();
     for op in ops.iter() {
-        for arg in op.getarglist().iter().chain(
+        for arg in op.getarglist_operand().iter().chain(
             op.getfailargs()
                 .into_iter()
                 .flatten()
@@ -5439,7 +5439,7 @@ fn ref_root_slots_with_future_regular_uses(
                     .iter()
                     .skip(position + 1)
                     .flat_map(|op| {
-                        op.getarglist_copy()
+                        op.getarglist_operand()
                             .into_iter()
                             .chain(op.getfailargs().into_iter().flatten())
                     })
@@ -8252,7 +8252,7 @@ impl CraneliftBackend {
         let longevity: VecMap<u32, usize> = {
             let mut m: VecMap<u32, usize> = VecMap::new();
             for (i, op) in ops.iter().enumerate() {
-                for arg in op.getarglist().iter().chain(
+                for arg in op.getarglist_operand().iter().chain(
                     op.getfailargs()
                         .into_iter()
                         .flatten()
@@ -8516,7 +8516,7 @@ impl CraneliftBackend {
                 var_types.insert(vi as u32, cl_type);
             }
             // Declare ALL referenced OpRefs: fail_args, op args, etc.
-            for arg in op.getarglist().iter().chain(
+            for arg in op.getarglist_operand().iter().chain(
                 op.getfailargs()
                     .into_iter()
                     .flatten()
@@ -16353,13 +16353,13 @@ mod tests {
     use majit_ir::operand::Operand;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
-        let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+        let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::new(opcode, &bx);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
     }
 
-    use majit_ir::box_ref::bound_box_from_opref as rb;
+    use majit_ir::box_ref::bound_operand_from_opref as rb;
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr
@@ -16388,7 +16388,7 @@ mod tests {
         pos: u32,
         descr: majit_ir::DescrRef,
     ) -> majit_ir::OpRc {
-        let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+        let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::with_descr(opcode, &bx, descr);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
@@ -22842,7 +22842,7 @@ mod tests {
         // Ref-typed OpRef variant.
         let str0 = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22894,7 +22894,7 @@ mod tests {
         let src = OpRef::ref_op(0);
         let dst = OpRef::ref_op(3);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22948,7 +22948,7 @@ mod tests {
         // pointer use the Ref-typed OpRef variant.
         let buf = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22982,7 +22982,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -23028,7 +23028,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
