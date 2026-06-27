@@ -109,6 +109,109 @@ pub fn try_gc_collect() {
     });
 }
 
+/// Signature of the host-side non-moving old-gen-only major callback.
+/// Reclaims stable-allocated interp int/float without moving the nursery, so
+/// the interpreter safepoint can drive it under an active JIT (non-empty
+/// nursery) — unlike [`try_gc_collect`], whose embedded minor would relocate a
+/// Rust-stack nursery `PyObjectRef` that has no shadowstack root.
+pub type GcCollectOldgenHookFn = fn();
+
+thread_local! {
+    static GC_COLLECT_OLDGEN_HOOK: Cell<Option<GcCollectOldgenHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the non-moving-major callback for this thread.
+pub fn register_gc_collect_oldgen_hook(hook: GcCollectOldgenHookFn) {
+    GC_COLLECT_OLDGEN_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the non-moving-major callback on this thread.
+pub fn clear_gc_collect_oldgen_hook() {
+    GC_COLLECT_OLDGEN_HOOK.with(|cell| cell.set(None));
+}
+
+/// Trigger a non-moving old-gen-only major collection via the installed hook.
+/// No-op when no hook is installed on this thread.
+#[inline]
+pub fn try_gc_collect_oldgen() {
+    GC_COLLECT_OLDGEN_HOOK.with(|cell| {
+        if let Some(f) = cell.get() {
+            f();
+        }
+    });
+}
+
+/// Signature of the host-side heap-stats callback returning
+/// `(oldgen_total, nursery_used)`. Used by the interpreter GC safepoint
+/// (`crate::gc_interp`) to gate a collection on an empty nursery.
+pub type GcHeapStatsHookFn = fn() -> (usize, usize);
+
+thread_local! {
+    static GC_HEAP_STATS_HOOK: Cell<Option<GcHeapStatsHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the heap-stats callback for this thread.
+pub fn register_gc_heap_stats_hook(hook: GcHeapStatsHookFn) {
+    GC_HEAP_STATS_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the heap-stats callback on this thread.
+pub fn clear_gc_heap_stats_hook() {
+    GC_HEAP_STATS_HOOK.with(|cell| cell.set(None));
+}
+
+/// Bytes currently used in the active GC's nursery, via the installed
+/// hook. `0` when no hook is installed (treated as "nursery empty").
+#[inline]
+pub fn try_gc_nursery_used() -> usize {
+    GC_HEAP_STATS_HOOK.with(|cell| match cell.get() {
+        Some(f) => f().1,
+        None => 0,
+    })
+}
+
+/// Bytes currently held in the active GC's old generation, via the installed
+/// heap-stats hook. `0` when no hook is installed. The interpreter safepoint
+/// reads this to gate a non-moving major on old-gen growth.
+#[inline]
+pub fn try_gc_oldgen_total() -> usize {
+    GC_HEAP_STATS_HOOK.with(|cell| match cell.get() {
+        Some(f) => f().0,
+        None => 0,
+    })
+}
+
+/// Signature of the host-side "is the JIT-frame shadow stack empty"
+/// callback. Used by the interpreter GC safepoint to avoid collecting
+/// while a compiled trace is suspended (its jitframe roots can be
+/// mis-mapped from a nested interpreter collection).
+pub type GcJitframeEmptyHookFn = fn() -> bool;
+
+thread_local! {
+    static GC_JITFRAME_EMPTY_HOOK: Cell<Option<GcJitframeEmptyHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the jitframe-shadow-stack-empty callback for this thread.
+pub fn register_gc_jitframe_empty_hook(hook: GcJitframeEmptyHookFn) {
+    GC_JITFRAME_EMPTY_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the jitframe-shadow-stack-empty callback on this thread.
+pub fn clear_gc_jitframe_empty_hook() {
+    GC_JITFRAME_EMPTY_HOOK.with(|cell| cell.set(None));
+}
+
+/// Whether no compiled trace is suspended (jitframe shadow stack empty),
+/// via the installed hook. `true` when no hook is installed (no JIT →
+/// no jitframes).
+#[inline]
+pub fn try_gc_jitframe_empty() -> bool {
+    GC_JITFRAME_EMPTY_HOOK.with(|cell| match cell.get() {
+        Some(f) => f(),
+        None => true,
+    })
+}
+
 /// Signature of the host-side root-register callbacks.
 /// `slot` is a pointer to a slot holding a `PyObjectRef`
 /// (equivalently `*mut u8`); the GC treats it as a live root until

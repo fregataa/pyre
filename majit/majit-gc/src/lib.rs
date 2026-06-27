@@ -226,6 +226,11 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// Trigger a non-moving old-gen-only major collection (sweep dead old-gen
+    /// objects without moving the nursery). The default no-ops so a backend
+    /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
+    fn collect_oldgen_nonmoving(&mut self) {}
+
     /// minimark.py:1900-1915 `id_or_identityhash(gcobj)`.
     /// Return a stable address for the object that does not change
     /// across GC moves.  For nursery objects, allocates a shadow in
@@ -337,6 +342,16 @@ pub trait GcAllocator: Send {
     /// Number of registered GC types.
     fn type_count(&self) -> usize {
         0
+    }
+
+    /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)`.
+    /// `oldgen_total_bytes` is `get_total_memory_used` (promoted + raw/large
+    /// old-gen objects, NOT the nursery); `nursery_used_bytes` is the current
+    /// nursery bump-pointer fill. Used to split GC-retained memory from
+    /// host-heap allocations when diagnosing growth. Default `(0, 0)` for stub
+    /// allocators with no byte accounting.
+    fn heap_byte_stats(&self) -> (usize, usize) {
+        (0, 0)
     }
 
     /// Look up the fixed-object size for a registered GC type.
@@ -878,6 +893,69 @@ pub fn collect_full() {
             f();
         }
     });
+}
+
+/// Thread-local callback running a non-moving old-gen-only major collection
+/// (`GcAllocator::collect_oldgen_nonmoving`). The interpreter GC safepoint
+/// reaches it to reclaim stable-allocated interp int/float without moving the
+/// nursery — so it can fire under an active JIT (nursery non-empty), unlike
+/// the moving `collect_full`. No-op when no backend is installed.
+pub type CollectOldgenFn = fn();
+
+thread_local! {
+    static ACTIVE_COLLECT_OLDGEN: Cell<Option<CollectOldgenFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's non-moving-major trampoline. Pass `None` to
+/// clear.
+pub fn set_active_collect_oldgen(hook: Option<CollectOldgenFn>) {
+    ACTIVE_COLLECT_OLDGEN.with(|c| c.set(hook));
+}
+
+/// Trigger a non-moving old-gen-only major collection on the active backend's
+/// GC. No-op when no backend is installed on this thread.
+pub fn collect_oldgen_nonmoving() {
+    ACTIVE_COLLECT_OLDGEN.with(|c| {
+        if let Some(f) = c.get() {
+            f();
+        }
+    });
+}
+
+/// Thread-local callback reporting the active GC's `heap_byte_stats`
+/// (`(oldgen_total, nursery_used)`). Lets the interpreter safepoint
+/// (`pyre_object::gc_interp`) gate a collection on an empty nursery,
+/// where the embedded minor cycle moves nothing and is therefore safe
+/// even without a shadowstack pass over Rust-stack temporaries.
+pub type HeapStatsFn = fn() -> (usize, usize);
+
+thread_local! {
+    static ACTIVE_HEAP_STATS: Cell<Option<HeapStatsFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's `heap_byte_stats` trampoline.
+pub fn set_active_heap_stats(hook: Option<HeapStatsFn>) {
+    ACTIVE_HEAP_STATS.with(|c| c.set(hook));
+}
+
+/// Report `(oldgen_total, nursery_used)` from the active backend's GC.
+/// `(0, 0)` when no backend is installed on this thread.
+pub fn active_heap_stats() -> (usize, usize) {
+    ACTIVE_HEAP_STATS.with(|c| match c.get() {
+        Some(f) => f(),
+        None => (0, 0),
+    })
+}
+
+/// Whether the JIT-frame shadow stack is empty — i.e. no compiled trace
+/// is suspended on this thread. The interpreter GC safepoint only
+/// collects when this holds: a suspended jitframe's gcmap describes its
+/// own suspension PC, and a collection driven from the nested interpreter
+/// (not from compiled code at a real safepoint) can mis-root it. The
+/// JIT's own nursery-full collections are safe; this gate keeps the
+/// interpreter-driven one out of the trace-suspended window.
+pub fn jitframe_shadow_stack_empty() -> bool {
+    shadow_stack::jf_top_ptr().is_null()
 }
 
 /// Thread-local callback that reports whether a raw address is owned

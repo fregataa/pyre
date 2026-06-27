@@ -206,6 +206,39 @@ unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut m
     }
 }
 
+/// Mark the GC-managed children of an immortal `W_BaseException`.
+///
+/// Exceptions are `malloc_typed`-immortal (`interp_exceptions.rs` `new_exception`
+/// / "lives forever"), so the collector never traces them — the root visitor's
+/// `is_managed_heap_object` guard short-circuits on the immortal exception, and
+/// `mark_object` is never reached for it (it is not an old-gen object). Its
+/// `args_w` tuple, `w_errno` / `w_strerror` / `w_filename` ints/strings,
+/// `w_traceback` / `w_context` / `w_cause`, `w_dict`, … are ordinary GC-managed
+/// objects, so when an exception is the only holder of those children (a caught
+/// `except X as e` bound to a frame local) a major collection sweeps them and a
+/// later `e.args` / `e.errno` reads freed memory. Visit every
+/// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
+/// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`
+/// -held children. No-op for non-exception values.
+unsafe fn walk_raw_exception_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        // Positive predicate (see `walk_raw_getset_roots`): `!is_exception`
+        // over a cross-crate bool is `UnaryNotUnknownOperand` to the annotator.
+        if pyre_object::interp_exceptions::is_exception(value) {
+            for &offset in pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS.iter() {
+                let slot = (value as usize + offset) as *mut PyObjectRef;
+                visitor(&mut *(slot as *mut majit_ir::GcRef));
+            }
+        }
+    }
+}
+
 /// Mark the GC-reachable children of a `getset_descriptor`
 /// (`GetSetProperty`).  The descriptor itself is Box-immortal
 /// (`pyre_class` `allocate` → `malloc_typed`), so its `W_TYPE_GC_TYPE_ID`
@@ -570,6 +603,15 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     // stores back a `GcRef` (same layout as
                     // `*mut PyObject`).
                     visitor(unsafe { &mut *slot_ptr });
+                    // A caught exception bound to a local (`except X as e`) is
+                    // `malloc_typed`-immortal, so the visitor above is a no-op
+                    // for it and its GC-managed children (`args_w`, `w_errno`,
+                    // …) are never traced. Forward them in place. Read the slot
+                    // AFTER the visitor so a relocated value is the live one.
+                    unsafe {
+                        let value = (*slot_ptr).0 as PyObjectRef;
+                        walk_raw_exception_roots(value, visitor);
+                    }
                 }
             }
             frame = next_frame;
@@ -1251,6 +1293,11 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     // this around a residual call to detect a body effect that ran through
     // user code (a side-effecting getter / dunder / module top level).
     crate::call::bump_frame_entry_count();
+    // Count this interpreter activation so the JIT eval loop's GC safepoint
+    // fires only at the outermost activation (PYRE_GC_INTERP root-completeness):
+    // a nested `eval_loop_jit` running under this one observes depth > 1 and
+    // skips collection. No-op when the flag is off.
+    let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let _current_frame_guard = if frame.execution_context.is_null() {
         install_current_frame(frame)
     } else {
@@ -1455,15 +1502,26 @@ impl NamespaceOpcodeHandler for PyFrame {
     fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
         let w_locals = self.get_w_locals();
         if !w_locals.is_null() {
-            let key = unsafe { pyre_object::w_str_new(name) };
-            match crate::baseobjspace::getitem(w_locals, key) {
-                Ok(value) => return Ok(value),
-                Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
-                    // pyopcode.py:LOAD_NAME `if not w_value: w_value =
-                    // ec.space.finditem_str(self.w_globals, name)` —
-                    // a missing locals entry falls through to globals.
+            // At module scope `initialize_frame_scopes` binds `w_locals` to the
+            // very same object as `w_globals`, so the locals probe here is a
+            // redundant copy of the globals lookup `load_global_value` runs
+            // next: same dict, same builtins fallback, identical result. Skip
+            // it when they are identical — both to avoid the double lookup and,
+            // critically, to avoid materializing a throwaway `w_str` key on
+            // every module-loop LOAD_NAME (`load_global_value` already probes
+            // the globals dict borrow-based via `getitem_str` + the cell cache).
+            let w_globals = self.get_w_globals();
+            if !std::ptr::eq(w_locals, w_globals) {
+                let key = unsafe { pyre_object::w_str_new(name) };
+                match crate::baseobjspace::getitem(w_locals, key) {
+                    Ok(value) => return Ok(value),
+                    Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
+                        // pyopcode.py:LOAD_NAME `if not w_value: w_value =
+                        // ec.space.finditem_str(self.w_globals, name)` —
+                        // a missing locals entry falls through to globals.
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
             return self.load_global_value(name, nameindex);
         }
@@ -1486,6 +1544,19 @@ impl NamespaceOpcodeHandler for PyFrame {
         value: Self::Value,
     ) -> Result<(), PyError> {
         let w_locals = self.get_or_create_w_locals();
+        // pyopcode.py:855-859 `space.setitem_str(w_locals, varname, w_value)`:
+        // a plain dict stores by str key through its strategy without
+        // materializing a throwaway `w_str` (an overwrite reuses the stored
+        // key; only a new name allocates one). This is the raw mapping store,
+        // not `__setitem__`, exactly as the object-keyed `setitem` resolves a
+        // dict below. A non-dict mapping (`exec(src, g, mapping)`) keeps the
+        // object-keyed path.
+        if unsafe { pyre_object::is_dict(w_locals) } {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(w_locals, name, value);
+            }
+            return Ok(());
+        }
         let key = unsafe { pyre_object::w_str_new(name) };
         crate::baseobjspace::setitem(w_locals, key, value)?;
         Ok(())

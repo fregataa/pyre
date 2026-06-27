@@ -82,6 +82,31 @@ fn pyre_object_gc_collect_trampoline() {
     majit_gc::collect_full();
 }
 
+/// Non-moving old-gen-only major trampoline for the interpreter GC safepoint.
+/// Bridges pyre-object's `try_gc_collect_oldgen` to
+/// `majit_gc::collect_oldgen_nonmoving`. Unlike the full-collect trampoline it
+/// runs no minor, so it reclaims stable-allocated interp int/float without
+/// moving the nursery — safe to fire under an active JIT.
+fn pyre_object_gc_collect_oldgen_trampoline() {
+    majit_gc::collect_oldgen_nonmoving();
+}
+
+/// Heap-stats trampoline for the interpreter GC safepoint
+/// (`pyre_object::gc_interp`). Bridges pyre-object's heap-stats hook to
+/// `majit_gc::active_heap_stats`, so the safepoint can gate its
+/// collection on an empty nursery (where the embedded minor cycle moves
+/// nothing and is safe without a shadowstack pass).
+fn pyre_object_gc_heap_stats_trampoline() -> (usize, usize) {
+    majit_gc::active_heap_stats()
+}
+
+/// Jitframe-empty trampoline for the interpreter GC safepoint. Bridges
+/// pyre-object's hook to `majit_gc::jitframe_shadow_stack_empty`, so the
+/// safepoint can skip collecting while a compiled trace is suspended.
+fn pyre_object_gc_jitframe_empty_trampoline() -> bool {
+    majit_gc::jitframe_shadow_stack_empty()
+}
+
 /// Trampoline: register a caller-owned slot as
 /// a GC root with the active backend. Bridges `*mut *mut u8` (the
 /// pyre-object-facing shape that does not depend on majit-gc) to
@@ -189,6 +214,15 @@ unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
             0
         }
     }
+}
+
+/// `space.hash_w` for a `str` straight from its WTF-8 bytes — the str-keyed
+/// `getitem_str` companion to [`pyre_object_hash_w_trampoline`], so a str-key
+/// dict probe lands in the same bucket without building a `W_UnicodeObject`.
+/// `ptr`/`len` describe a valid WTF-8 range for the duration of the call.
+unsafe fn pyre_object_hash_str_trampoline(ptr: *const u8, len: usize) -> i64 {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    pyre_interpreter::builtins::hash_str_bytes(bytes)
 }
 
 /// `pypy/objspace/std/typeobject.py:353-371
@@ -1920,6 +1954,18 @@ thread_local! {
         // `majit_metainterp::MetaInterp::walk_active_trace_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(active_trace_root_walker);
         majit_gc::shadow_stack::register_extra_root_walker(compile_snapshot_root_walker);
+        // framework.py `root_walker.walk_roots` parity for the boxed `Ref`
+        // constants in every live jitcode's `constants_r` pool. RPython
+        // traces these through the `JitCode` GC object; pyre's jitcodes
+        // live in Rust `Arc` memory, so a constant boxed object reachable
+        // only from `jitcode.constants_r` (copied into the blackhole
+        // register file at `init_register_files_from_runtime_jitcode`) is
+        // swept by a major collection unless walked here, and the next
+        // guard-failure resume dereferences the freed pointer. See
+        // `pyre_jit_trace::state::walk_jitcode_constants_refs`.
+        majit_gc::shadow_stack::register_extra_root_walker(
+            pyre_jit_trace::state::walk_jitcode_constants_refs,
+        );
         // framework.py `root_walker.walk_roots` parity for the full-body
         // walk's store-undo journal: the `(list, key, displaced)` triples
         // hold nursery refs across the rest of the walk (residual calls
@@ -1957,6 +2003,13 @@ thread_local! {
         pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
         pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
         pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
+        pyre_object::gc_hook::register_gc_collect_oldgen_hook(
+            pyre_object_gc_collect_oldgen_trampoline,
+        );
+        pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
+        pyre_object::gc_hook::register_gc_jitframe_empty_hook(
+            pyre_object_gc_jitframe_empty_trampoline,
+        );
         pyre_object::register_gc_root_hooks(
             pyre_object_gc_add_root_trampoline,
             pyre_object_gc_remove_root_trampoline,
@@ -1973,6 +2026,7 @@ thread_local! {
         // register the `space.eq_w` trampoline so `dict_keys_equal`
         // honours user-defined `__eq__`.
         pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
+        pyre_object::dict_eq_hook::register_hash_str_hook(pyre_object_hash_str_trampoline);
         // Companion `space.hash_w` hook so
         // `dict_keys_equal` enforces the r_dict bucket invariant
         // (eq_w + matching hash_w → same key; different hash_w → distinct).
@@ -2954,6 +3008,7 @@ pub fn init_jit_hooks() {
     // the GC allocator nor the JIT driver — safe to install this early.
     pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
     pyre_object::dict_eq_hook::register_hash_w_hook(pyre_object_hash_w_trampoline);
+    pyre_object::dict_eq_hook::register_hash_str_hook(pyre_object_hash_str_trampoline);
     pyre_object::dict_eq_hook::register_compares_by_identity_hook(
         pyre_object_compares_by_identity_trampoline,
     );
@@ -3326,6 +3381,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
+    // Count this interpreter activation so the GC safepoint below fires only at
+    // the outermost eval loop (PYRE_GC_INTERP root-completeness). No-op when the
+    // flag is off.
+    let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
@@ -3370,6 +3429,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
+        // Interpreter-path GC safepoint (PYRE_GC_INTERP). Between opcodes the
+        // only live refs are in the frame, reachable through the registered
+        // pyframe root walker; no bytecode handler holds a Rust-stack temporary
+        // here. A no-op unless the flag is on and enough interpreter objects
+        // have accumulated to warrant a collection.
+        pyre_object::gc_interp::safepoint();
+
         if frame.next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
         }
@@ -3566,6 +3632,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 /// eval_loop_jit, but always calls jit_merge_point_hook since tracing
 /// is already active from start_bridge_tracing.
 pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
+    // Count this interpreter activation alongside eval_loop / eval_loop_jit so
+    // the safepoint's outermost-activation gate accounts for a bridge loop on
+    // the stack. No-op when the flag is off.
+    let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
