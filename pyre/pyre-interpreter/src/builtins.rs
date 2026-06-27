@@ -4855,7 +4855,14 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "id() takes exactly one argument");
-    Ok(w_int_new(args[0] as i64))
+    // `space.id` (baseobjspace.py:843-854): a plain `int` yields its
+    // value-derived `immutable_unique_id`; every other object falls back
+    // to `compute_unique_id` — its address.
+    let obj = args[0];
+    Ok(match crate::function::immutable_unique_id(obj) {
+        Some(w_id) => w_id,
+        None => w_int_new(obj as usize as i64),
+    })
 }
 
 /// `hash(obj)` — PyPy: `descroperation.py:1006 hash`.
