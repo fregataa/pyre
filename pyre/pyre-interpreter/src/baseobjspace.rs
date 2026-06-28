@@ -1653,10 +1653,16 @@ fn builtin_callable(name: &str) -> PyObjectRef {
 }
 
 /// `sequenceiterator.__reduce__()` — `iterobject.py
-/// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)`.
+/// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)` for a live
+/// sequence; an exhausted iterator (`w_seq is None`) pickles to `_empty_iterable`
+/// (`iterobject.py:251-253`) = `(iter, ((),))` so it restores empty.
 fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
+        if seq.is_null() {
+            let empty_state = w_tuple_new(vec![w_tuple_new(vec![])]);
+            return Ok(w_tuple_new(vec![builtin_callable("iter"), empty_state]));
+        }
         let index = pyre_object::w_seq_iter_index(args[0]);
         let state = w_tuple_new(vec![seq]);
         Ok(w_tuple_new(vec![
@@ -1667,27 +1673,40 @@ fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-/// `sequenceiterator.__setstate__(index)` — clamp the cursor into
-/// `[0, length]` (`iterobject.py descr_setstate`).
+/// `sequenceiterator.__setstate__(index)` — `iterobject.py:40-45
+/// W_AbstractSeqIterObject.descr_setstate`: restore the cursor only while the
+/// sequence is live, clamping a negative index to 0.  There is no upper clamp —
+/// an out-of-range cursor is absorbed by `next` raising StopIteration on the
+/// IndexError.
 fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
     unsafe {
-        let length = pyre_object::w_seq_iter_length(args[0]);
+        if pyre_object::w_seq_iter_seq(args[0]).is_null() {
+            return Ok(w_none());
+        }
         if index < 0 {
             index = 0;
-        } else if index > length {
-            index = length;
         }
         pyre_object::w_seq_iter_set_index(args[0], index);
     }
     Ok(w_none())
 }
 
-/// `sequenceiterator.__length_hint__()` — elements not yet produced.
+/// `sequenceiterator.__length_hint__()` — `W_AbstractSeqIterObject.getlength`
+/// (iterobject.py:16-24): `len(seq) - index` recomputed from the LIVE sequence
+/// — `space.len(w_seq)`, so a subclass `__len__` override or a mutation made
+/// mid-iteration is reflected — clamped to 0.  An exhausted (cleared) sequence
+/// reports 0.  A missing or raising `__len__` propagates as a real error;
+/// `operator.length_hint` then maps a TypeError to its default, exactly as a
+/// direct `space.len` would.
 fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let remaining =
-            pyre_object::w_seq_iter_length(args[0]) - pyre_object::w_seq_iter_index(args[0]);
+        let seq = pyre_object::w_seq_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_int_new(0));
+        }
+        let length = len_w(seq)?;
+        let remaining = length - pyre_object::w_seq_iter_index(args[0]);
         Ok(w_int_new(remaining.max(0)))
     }
 }
@@ -7823,8 +7842,14 @@ fn generator_unpack_into(
                 // finished.  Pyre's inline `frame.execute_frame` path
                 // skips that finally block, so mirror it explicitly.
                 Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                    // generator.py:131-138 — `_invoke_execute_frame` applies
+                    // `_leak_stopiteration` (PEP 479) BEFORE unpack_into's
+                    // `if e.match(StopIteration): break`, so a StopIteration
+                    // leaked from the body becomes RuntimeError and propagates;
+                    // it is not the normal-exhaustion path (which is the
+                    // `Ok`/`frame_finished_execution` arm below).
                     w_generator_set_exhausted(gen_obj);
-                    break;
+                    return Err(leak_stopiteration(e));
                 }
                 Err(e) => {
                     w_generator_set_exhausted(gen_obj);
@@ -7913,16 +7938,40 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
         Err(e) => return Err(e),
     }
     // baseobjspace.py:1093 `w_descr = space.lookup(w_obj, '__length_hint__')`
-    // — generic class-MRO lookup, not instance-restricted.
-    let w_descr = match unsafe { lookup(w_obj, "__length_hint__") } {
-        Some(descr) => descr,
-        None => return Ok(default),
+    // — a type-MRO special-method lookup, NOT full attribute access: an
+    // instance-dict or `__getattr__`-synthesized `__length_hint__` is not
+    // consulted.  pyre's builtin iterators carry `__length_hint__` in the
+    // getattr_str method tables rather than the type dict, so a type miss on a
+    // non-user object falls back to the bare `__getattribute__` form of
+    // getattr_str (`call_getattr = false`): it still reaches the builtin
+    // method-table `__length_hint__`, but never fires a module/metaclass
+    // `__getattr__` hook, so the lookup stays type-MRO-faithful.  A user-class
+    // instance (is_instance) is excluded entirely so its instance dict is
+    // never consulted; a type miss there takes the default.
+    let w_type = crate::typedef::r#type(w_obj).unwrap_or(std::ptr::null_mut());
+    let w_descr = if w_type.is_null() {
+        None
+    } else {
+        unsafe { lookup_in_type_where(w_type, "__length_hint__") }
     };
-    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` —
-    // pyre's `call_function_impl_result` returns a Result directly,
-    // matching the upstream raise/return discipline without going through
-    // the legacy `take_call_error` pending-error stash.
-    let w_hint = match crate::call::call_function_impl_result(w_descr, &[w_obj]) {
+    let self_args = [w_obj];
+    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` — a
+    // type-MRO descriptor is called with the object as self; the builtin
+    // method-table result is already bound and called with no extra args.
+    let (callable, args): (PyObjectRef, &[PyObjectRef]) = match w_descr {
+        Some(descr) => (descr, &self_args),
+        None => {
+            if unsafe { is_instance(w_obj) } {
+                return Ok(default);
+            }
+            match getattr_str_impl(w_obj, "__length_hint__", false) {
+                Ok(m) => (m, &[]),
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let w_hint = match crate::call::call_function_impl_result(callable, args) {
         Ok(v) => v,
         Err(err) => {
             if err.kind == crate::PyErrorKind::TypeError
@@ -8815,6 +8864,46 @@ pub fn fixedview(
     unpackiterable(w_iterable, expected_length)
 }
 
+/// descroperation.py:343-345 — `iter()` requires the object returned by a
+/// dispatched `__iter__` to itself be an iterator (`space.lookup(w_iterator,
+/// '__next__') is not None`), raising TypeError otherwise.  `space.lookup` is
+/// a type-MRO lookup: a `__next__` reachable only via `__getattr__` or the
+/// instance dict does NOT qualify.  pyre's builtin iterators carry `__next__`
+/// in the getattr_str method tables rather than the type dict, so a type miss
+/// on a non-user object falls back to the bare `__getattribute__` form of
+/// getattr_str (`call_getattr = false`): it reaches the builtin method-table
+/// `__next__` but fires no `__getattr__` hook.  A user-class instance
+/// (is_instance) is excluded so its instance dict is never consulted; a type
+/// miss there is not an iterator.
+/// The user-visible Python type name (`type(obj).__name__`) for error
+/// messages — the `w_class` name rather than the shared builtin vtable name,
+/// so a heap subclass reports its own name.
+unsafe fn obj_type_name(obj: PyObjectRef) -> &'static str {
+    match crate::typedef::r#type(obj) {
+        Some(tp) => pyre_object::typeobject::w_type_get_name(tp),
+        None => (*(*obj).ob_type).name,
+    }
+}
+
+unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
+    let w_type = crate::typedef::r#type(w_iterator).unwrap_or(std::ptr::null_mut());
+    let has_next = if !w_type.is_null() && lookup_in_type_where(w_type, "__next__").is_some() {
+        true
+    } else if is_instance(w_iterator) {
+        false
+    } else {
+        getattr_str_impl(w_iterator, "__next__", false).is_ok()
+    };
+    if has_next {
+        Ok(w_iterator)
+    } else {
+        Err(PyError::type_error(format!(
+            "iter() returned non-iterator of type '{}'",
+            obj_type_name(w_iterator)
+        )))
+    }
+}
+
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
 pub fn iter(obj: PyObjectRef) -> PyResult {
@@ -8862,10 +8951,18 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_list(obj) {
             if !pyre_object::is_exact_list(obj) {
                 if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE))
-                        && !is_none(method)
-                    {
-                        return crate::call::call_function_impl_result(method, &[obj]);
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE)) {
+                        // descroperation.py:339-341 — an explicit
+                        // `__iter__ = None` override marks the subclass
+                        // non-iterable even though the lookup succeeds.
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
                     }
                 }
             }
@@ -8874,10 +8971,18 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_tuple(obj) {
             if !pyre_object::is_exact_tuple(obj) {
                 if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE))
-                        && !is_none(method)
-                    {
-                        return crate::call::call_function_impl_result(method, &[obj]);
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE)) {
+                        // descroperation.py:339-341 — an explicit
+                        // `__iter__ = None` override marks the subclass
+                        // non-iterable even though the lookup succeeds.
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
                     }
                 }
             }
@@ -9029,21 +9134,23 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         (*(*obj).ob_type).name
                     )));
                 }
-                return crate::call::call_function_impl_result(method, &[obj]);
+                let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                return iter_check_is_iterator(w_iter);
             }
             // descroperation.py:333-334 — `__getitem__` fallback only when
             // `space.type(w_obj).flag_map_or_seq != 'M'`.  Mapping types
             // without `__iter__` are reported as non-iterable.  Read off
             // the user `W_TypeObject` (typeobject.py:169) so heap-type
             // dict/list/tuple subclasses inherit the marker — see
-            // `is_iterable` at baseobjspace.rs:5343 for the same pattern.
+            // `is_iterable` (this file) for the same pattern.
             let w_user_type = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
             let is_mapping =
                 pyre_object::typeobject::w_type_get_flag_map_or_seq(w_user_type) == b'M';
-            if !is_mapping
-                && (lookup_in_type_where(w_type, "__getitem__").is_some()
-                    || getattr_str(obj, "__getitem__").is_ok())
-            {
+            // descroperation.py:333-334 — `space.lookup(w_obj, '__getitem__')`
+            // is a type-MRO lookup; special-method resolution never consults
+            // the instance dict, so an `obj.__getitem__ = f` instance attribute
+            // does not enable sequence iteration.
+            if !is_mapping && lookup_in_type_where(w_type, "__getitem__").is_some() {
                 // descroperation.py:334 — `space.newseqiter(w_obj)` wraps the
                 // live object in an index cursor (iterobject.py
                 // W_SeqIterObject) that fetches each item lazily through
@@ -9071,14 +9178,16 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             };
             if let Some(w_metaclass) = w_metaclass {
                 if let Some(method) = lookup_in_type_where(w_metaclass, "__iter__") {
-                    return Ok(crate::call_function(method, &[obj]));
+                    let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                    return iter_check_is_iterator(w_iter);
                 }
             }
             // Fallback: check type type's MRO
             if let Some(w_type_type) = crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE)
             {
                 if let Some(method) = lookup_in_type_where(w_type_type, "__iter__") {
-                    return Ok(crate::call_function(method, &[obj]));
+                    let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                    return iter_check_is_iterator(w_iter);
                 }
             }
         }
@@ -9135,11 +9244,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
             } else {
                 // Generic sequence-protocol object: fetch lazily through
-                // `space.getitem`.  The sequence iterator's `iter_iternext`
-                // treats IndexError or StopIteration as exhaustion (clearing
-                // w_seq so a later next() short-circuits without re-invoking
-                // __getitem__) and propagates every other error with w_seq
-                // left intact.
+                // `space.getitem`.  `iterobject.c iter_iternext` treats BOTH
+                // IndexError and StopIteration as exhaustion (clearing the
+                // sequence so a later next() short-circuits without
+                // re-invoking __getitem__), and propagates any OTHER error
+                // WITHOUT clearing the sequence, leaving the iterator
+                // retryable.  This intentionally differs from PyPy's
+                // `W_SeqIterObject.descr_next` (iterobject.py:75-79), which
+                // catches only IndexError and clears `w_seq` on every error;
+                // the observable behaviour target is 3.14.
                 match getitem(seq, w_int_new(idx)) {
                     Ok(v) => Some(v),
                     Err(e)
@@ -9156,6 +9269,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 iter.index += 1;
                 return Ok(v);
             }
+            // iterobject.py:90-98 — an exhausted cursor clears its sequence ref
+            // (the generic arm above already did so on IndexError); the builtin
+            // arms clear it here so a held iterator reports as exhausted.
+            iter.seq = std::ptr::null_mut();
             return Err(PyError::stop_iteration());
         }
         // Range iterator
@@ -9917,7 +10034,16 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
             }
             Err(e) => {
                 w_generator_set_exhausted(gen_obj);
-                Err(e)
+                // generator.py `_leak_stopiteration` (PEP 479) — a
+                // StopIteration that escaped the body becomes RuntimeError;
+                // any other error propagates unchanged.  The normal-return
+                // StopIteration is built in the `Ok`/`frame_finished_execution`
+                // arm above and never reaches here.
+                if e.kind == crate::PyErrorKind::StopIteration {
+                    Err(leak_stopiteration(e))
+                } else {
+                    Err(e)
+                }
             }
         }
     }
@@ -9940,6 +10066,26 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
         }
     }
     unsafe { PyError::from_exc_object(exc) }
+}
+
+/// generator.py:131-138 `_invoke_execute_frame` / `_leak_stopiteration`
+/// (PEP 479): a `StopIteration` that escapes the generator body — whether
+/// raised explicitly or leaked from a `next()` inside the body — is replaced
+/// by `RuntimeError("generator raised StopIteration")` chained from it
+/// (`__cause__` and `__context__` both point at the leaked exception, and the
+/// cause suppresses the context in display, mirroring
+/// `chain_exceptions_from_cause`).  This is distinct from a normal generator
+/// return, which surfaces through the `Ok`/`frame_finished_execution` path.
+unsafe fn leak_stopiteration(e: PyError) -> PyError {
+    use pyre_object::interp_exceptions::*;
+    let w_stopiter = e.to_exc_object();
+    let rt = w_exception_new(ExcKind::RuntimeError, "generator raised StopIteration");
+    if pyre_object::is_exception(rt) && !w_stopiter.is_null() {
+        w_exception_set_context(rt, w_stopiter);
+        w_exception_set_cause(rt, w_stopiter);
+        w_exception_set_suppress_context(rt, true);
+    }
+    PyError::from_exc_object(rt)
 }
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
