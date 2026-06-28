@@ -1747,7 +1747,7 @@ impl OptContext {
     /// gets a fresh one (bound here) carrying the position's type. Stashing
     /// the strong ref in `inputarg_refs` keeps each bound `Weak<InputArg>`
     /// upgradable for the OptContext's lifetime AND gives the canonical-host
-    /// readers (`resolve_to_boxref` / `read_forwarded` / `clear_forwarded`)
+    /// readers (`resolve_to_operand` / `read_forwarded` / `clear_forwarded`)
     /// a live `InputArg.forwarded` host to resolve to.
     ///
     /// Phase 2 enters with a fresh per-iteration inputarg set whose earlier
@@ -1768,7 +1768,7 @@ impl OptContext {
         // `self.inputargs` because Phase 2 walks the body half with the same
         // per-arg types). Pre-populating `inputarg_refs` for both subsets makes
         // every InputArg OpRef resolve through `inputarg_refs` (read path:
-        // `resolve_to_boxref` / `read_forwarded`; write path: `materialize_box_at`'s
+        // `resolve_to_operand` / `read_forwarded`; write path: `materialize_box_at`'s
         // InputArg branch). `materialize_box_at` type-repairs any position this derive
         // misses. Both loops no-op when `self.inputargs` is empty
         // (`seed_boxes_canonical` fixtures populate `inputarg_refs` directly).
@@ -1796,7 +1796,7 @@ impl OptContext {
     }
 
     /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
-    /// `tp` (the `_forwarded` host that `resolve_to_boxref` / `read_forwarded`
+    /// `tp` (the `_forwarded` host that `resolve_to_operand` / `read_forwarded`
     /// / `clear_forwarded` / `materialize_box_at` route the matching InputArg OpRef
     /// through). Idempotent: keeps an existing same-shape host (preserving any
     /// `_forwarded` chain / live `Weak<InputArg>` chain targets on it) and only
@@ -2008,70 +2008,16 @@ impl OptContext {
         }
     }
 
-    /// Resolve `opref` to a `BoxRef` bound to its canonical
-    /// `_forwarded` host (`Op` / `InputArg`). Materialises a fresh
-    /// `BoxRef::from_bound_op` / `from_bound_inputarg` per call; the
-    /// bound handle ensures every `set_forwarded_*` / `get_forwarded`
-    /// routes through the same `Op.forwarded` / `InputArg.forwarded`
-    /// slot, so two calls for the same `opref` observe each other's
-    /// writes via the canonical host even though the `BoxRef` wrapper
-    /// identities differ.
-    /// Const variants return `BoxRef::new_const`. Returns
-    /// `None` for sentinel `OpRef::none()` and for ResOp positions
-    /// without a producer in any canonical store.
-    ///
-    /// Production paths populate `inputarg_refs` via `bind_input_resops`
-    /// plus emit-time `bind_op`, so every
-    /// chain-walker-reachable position resolves to its bound `BoxRef`.
-    pub(crate) fn resolve_to_boxref(&self, opref: OpRef) -> Option<majit_ir::box_ref::BoxRef> {
-        if opref.is_none() {
-            return None;
-        }
-        if opref.is_constant() {
-            // history.py:227/268/314 — Const variants carry the value on the
-            // OpRef directly; mint a fresh inline-Const BoxRef so the chain
-            // round-trip (`box_to_opref`) reconstructs it from the value.
-            return match opref {
-                OpRef::ConstInt(v) => Some(majit_ir::box_ref::BoxRef::new_const(Value::Int(v))),
-                OpRef::ConstFloat(v) => Some(majit_ir::box_ref::BoxRef::new_const(Value::Float(v))),
-                OpRef::ConstPtr(v) => Some(majit_ir::box_ref::BoxRef::new_const(Value::Ref(v))),
-                _ => None,
-            };
-        }
-        if let Some(op) = self.find_producer_op(opref) {
-            return Some(majit_ir::box_ref::BoxRef::from_bound_op(&op));
-        }
-        let idx = opref.raw() as usize;
-        // InputArg variants resolve through the canonical `inputarg_refs`
-        // store — symmetric with the `clear_forwarded` write path
-        // (`inputarg_refs[idx].forwarded`). `ensure_inputarg_bindings`
-        // populates `inputarg_refs[idx]` with the canonical `InputArgRc`, so
-        // this returns the `InputArg.forwarded` host every other reader and
-        // writer observes.
-        match opref {
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                if let Some(ia) = self.inputarg_refs.get(idx) {
-                    return Some(majit_ir::box_ref::BoxRef::from_bound_inputarg(ia));
-                }
-            }
-            _ => {}
-        }
-        // A ResOp position with no producer in any canonical store resolves
-        // to `None`: the caller's `materialize_box_at` mints a `SameAs*` synthetic
-        // into `resop_refs[opref]` and binds it, so the next `find_producer_op`
-        // (and hence the next `resolve_to_boxref` / `make_constant` chain)
-        // reaches that same `_forwarded` host. Routing a ResOp OpRef to
-        // `inputarg_refs[idx]` here would re-introduce the raw-position
-        // collapse (`int_op(p)` aliasing `input_arg_int(p)`) the
-        // `find_producer_op` / `inputarg_refs` split exists to eliminate.
-        None
-    }
-
-    /// [`Operand`]-yielding sibling of [`resolve_to_boxref`](Self::resolve_to_boxref):
-    /// resolve a position to its canonical producer as an `Operand`
-    /// (`Op` / `InputArg` host, or inline-`Const`) without minting a `BoxRef`.
-    /// 1:1 mirror — `BoxRef::new_const`/`from_bound_op`/`from_bound_inputarg`
-    /// become `Operand::const_from_value`/`from_bound_op`/`from_bound_inputarg`.
+    /// Resolve a position to its canonical producer as an [`Operand`]
+    /// (`Op` / `InputArg` `_forwarded` host, or inline-`Const`). The bound
+    /// handle ensures every `set_forwarded_*` / `get_forwarded` routes
+    /// through the same `Op.forwarded` / `InputArg.forwarded` slot, so two
+    /// calls for the same `opref` observe each other's writes via the
+    /// canonical host. Const variants return `Operand::const_from_value`;
+    /// returns `None` for sentinel `OpRef::none()` and for ResOp positions
+    /// without a producer in any canonical store. Production paths populate
+    /// `inputarg_refs` via `bind_input_resops` plus emit-time `bind_op`, so
+    /// every chain-walker-reachable position resolves to its bound producer.
     pub(crate) fn resolve_to_operand(&self, opref: OpRef) -> Option<Operand> {
         if opref.is_none() {
             return None;
@@ -2129,7 +2075,7 @@ impl OptContext {
     /// is distributed by its bound identity: InputArg boxes land in
     /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos]`. This
     /// replaces the retired `ctx.box_pool = vec![..]` fixture pattern so
-    /// `resolve_to_boxref` / `materialize_box_at` / `find_producer_op` resolve each
+    /// `resolve_to_operand` / `materialize_box_at` / `find_producer_op` resolve each
     /// OpRef through the same canonical hosts production uses, returning a
     /// fresh `BoxRef` bound to the seeded `Op` / `InputArg`.
     #[cfg(test)]
@@ -2317,15 +2263,15 @@ impl OptContext {
     /// the `None` arm of `get_box_replacement_box`; an already-minted or
     /// producer-backed opref resolves there. Mirrors `materialize_box_at`'s resop
     /// lazy-alloc arm (`mint_synthetic_resop` + bind).
-    pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> majit_ir::box_ref::BoxRef {
+    pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> Operand {
         let tp = opref.ty().unwrap_or(majit_ir::Type::Void);
         let synthetic = self.mint_synthetic_resop(opref, tp);
-        majit_ir::box_ref::BoxRef::from_bound_op(&synthetic)
+        Operand::from_bound_op(&synthetic)
     }
 
     pub(crate) fn reserve_virtual_box(&mut self, tp: majit_ir::Type) -> (OpRef, Operand) {
         let opref = self.reserve_pos_typed(tp);
-        let b = Operand::from_boxref(&self.mint_box_at(opref));
+        let b = self.mint_box_at(opref);
         (opref, b)
     }
 
@@ -2583,7 +2529,7 @@ impl OptContext {
         let raw = self.allocate_next_pos_raw();
         // The position's canonical host is materialized lazily on first
         // *write* access (`materialize_box_at` mints a `SameAs*` synthetic
-        // into `resop_refs[raw]` keyed by the full OpRef; `resolve_to_boxref`
+        // into `resop_refs[raw]` keyed by the full OpRef; `resolve_to_operand`
         // is `&self` and returns `None` until then). No eager pre-mint here:
         // an eager synthetic for a position that is reserved but never
         // emitted (label / jump positions on an empty trace) would leak into
@@ -3431,13 +3377,13 @@ impl OptContext {
         // body-visible OpRef. Non-invented Pure has no forwarding installed,
         // so `get_box_replacement(source) == source` and the body references
         // source directly (RPython parity for non-invented `op = self.res`).
-        let resolved = self.get_box_replacement_operand_opt(preamble_op.op.to_opref());
-        let result = resolved
-            .as_ref()
-            .map(|o| o.to_opref())
-            .unwrap_or_else(|| preamble_op.op.to_opref());
+        // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()` —
+        // walk the box's own `_forwarded` chain (total; identity on a miss),
+        // object-native rather than positional.
+        let resolved = preamble_op.op.get_box_replacement(false);
+        let result = resolved.to_opref();
         let result_type = preamble_op.preamble_op.result_type();
-        let is_constant = resolved.and_then(|o| o.const_value()).is_some();
+        let is_constant = resolved.const_value().is_some();
         let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
         if first_use {
             self.imported_short_preamble_used.push(preamble_source);
@@ -4488,43 +4434,42 @@ impl OptContext {
         if opref.is_constant() || opref.is_none() {
             return opref;
         }
-        let Some(start) = self.resolve_to_boxref(opref) else {
+        let Some(start) = self.resolve_to_operand(opref) else {
             return opref;
         };
-        // resoperation.py:57-68: walk box._forwarded on the box itself.
+        // resoperation.py:57-68: walk the operand's `_forwarded` chain.
         let terminal = start.get_box_replacement(not_const);
         // When the walker did not advance — chain root has Forwarded::None,
         // Forwarded::Info(_), or (not_const=true and the immediate target
-        // is Const) — return the source OpRef variant unchanged. The
-        // original walker terminated before reading position()/type_(),
-        // so callers expect the OpRef shape they passed in.
+        // is Const) — return the source OpRef variant unchanged. The walker
+        // terminated before reading position()/type_(), so callers expect
+        // the OpRef shape they passed in.
         if start == terminal {
             return opref;
         }
-        // Const targets reconstruct their `source_opref` from the inline
-        // value (history.py:227/268/314), so `box_to_opref` reconstruction
-        // is direct — every `BoxRef::new_const(value)` reconstructs an
-        // inline-Const source_opref via `source_opref()`'s value arm.
-        self.box_to_opref(&terminal, opref)
+        // Const targets reconstruct their inline source OpRef from the value
+        // (history.py:227/268/314), so `operand_to_opref` reconstruction is
+        // direct — `Operand::Const::to_opref` rebuilds the inline-Const OpRef.
+        self.operand_to_opref(&terminal, opref)
     }
 
-    /// Convert a chain-walk terminal `BoxRef` back into an `OpRef`. This
-    /// is the OpRef-side glue around `BoxRef::get_box_replacement`; PyPy
-    /// callers hold the box directly and skip this step.
+    /// Convert a chain-walk terminal [`Operand`] back into an `OpRef` — the
+    /// OpRef-side glue around [`Operand::get_box_replacement`]; PyPy callers
+    /// hold the operand directly and skip this step.
     ///
-    /// `BoxKind::Const` carries its `source_opref` (the OpRef the Box was
-    /// minted from), so reconstruction is direct — mirrors RPython where
-    /// the Box object IS the reference.
-    fn box_to_opref(&self, terminal: &majit_ir::box_ref::BoxRef, source: OpRef) -> OpRef {
-        if let Some(src) = terminal.source_opref() {
-            return src;
+    /// A `Const` terminal reconstructs its inline source OpRef from the value
+    /// (`history.py:227/268/314`); a position-bearing terminal rebuilds
+    /// `input_arg_typed` / `op_typed` from its `position()` + `type_()`. A
+    /// `Type::Void` phantom is a lazy-allocated placeholder (the
+    /// `bound_from_opref` fallback for OpRef variants with no `ty()`) carrying
+    /// no type information, so it preserves the `source` variant via `with_raw`
+    /// instead of promoting to `void_op` / `input_arg_typed(_, Void)`.
+    fn operand_to_opref(&self, terminal: &Operand, source: OpRef) -> OpRef {
+        if terminal.const_value().is_some() {
+            return terminal.to_opref();
         }
         if let Some(pos) = terminal.position() {
             let tp = terminal.type_();
-            // `Type::Void` targets are lazy-allocated phantom placeholders
-            // (`materialize_box_at` fallback for OpRef variants with no `ty()`); the
-            // placeholder carries no type information, so preserve the source variant via `with_raw`
-            // instead of promoting to `void_op` / `input_arg_typed(_, Void)`.
             if matches!(tp, majit_ir::Type::Void) {
                 return source.with_raw(pos);
             }
@@ -4544,13 +4489,17 @@ impl OptContext {
     /// `BoxRef`. Walks the chain via [`resolve_to_operand`](Self::resolve_to_operand)
     /// + [`Operand::get_box_replacement`].
     ///
-    /// The fallback arm differs from the `BoxRef` sibling by design: a position
-    /// that resolves to neither a producer `Op`, an `inputarg_refs` slot, nor a
-    /// Const has no `Operand` representation (E3 removed the position-only
-    /// `Operand::Box` variant), so `Operand::from_opref` PANICS there — the
-    /// armed hazard-5 tripwire. Every value-bearing op-arg position has a
-    /// findable producer, so the panic arm is unreachable for arg-resolution
-    /// callers (a fire signals an unbound operand fed as an op arg).
+    /// Total, like the `BoxRef` sibling [`BoxRef::get_box_replacement`]
+    /// (box_ref.rs:937 returns the position-only box on a miss) and
+    /// `get_box_replacement` (resoperation.py:57-68 returns `op` itself when the
+    /// `_forwarded` chain is empty). A position that resolves to neither a
+    /// producer `Op`, an `inputarg_refs` slot, nor a Const falls back to
+    /// [`Operand::bound_from_opref`], which mints a synthetic producer carrying
+    /// the same `pos` (`to_opref` byte-identical) rather than panicking. Every
+    /// value-bearing op-arg position has a findable producer, so the fallback
+    /// is unreachable for arg-resolution callers; `s9_probe_fire` records any
+    /// fire as an early warning (a fire signals an unbound operand fed as an op
+    /// arg, and would split the `Rc::ptr_eq` ExportCache rather than abort).
     pub(crate) fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
         if opref.is_none() {
             return Operand::None;
@@ -4559,7 +4508,7 @@ impl OptContext {
             return start.get_box_replacement(false);
         }
         self.s9_probe_fire(opref);
-        Operand::from_opref(opref)
+        Operand::bound_from_opref(opref)
     }
 
     /// Operand-yielding sibling of [`materialize_box_at`](Self::materialize_box_at):
@@ -4591,7 +4540,7 @@ impl OptContext {
     ///
     /// Precondition: `find_producer_op` already missed (full type-tagged
     /// `OpRef` match across `new_operations` / `phase1_emit_ops` / `resop_refs`
-    /// / `input_ops`) and `resolve_to_boxref` returned `None`; `opref` is
+    /// / `input_ops`) and `resolve_to_operand` returned `None`; `opref` is
     /// non-`none`, non-`Const`.
     ///
     /// - `b-inputarg`: an InputArg position whose `inputarg_refs` slot is unbound.
@@ -4694,13 +4643,11 @@ impl OptContext {
     /// bound / const operand walks its own chain and defers to the store only
     /// when it self-resolves; an unbound operand resolves positionally.
     ///
-    /// The heal still keys on the bound `Op` host, so it is driven through a
-    /// transient `to_boxref()` (heal re-homes onto Op/InputArg in a later slice);
-    /// `BoxRef::get_box_replacement` delegates to the `Operand` walk
-    /// (`box.rs`), so the native walk is byte-identical to the legacy
+    /// The heal keys on the bound `Op` host directly off the `Operand`; the
+    /// native walk (`arg.get_box_replacement`) is byte-identical to the legacy
     /// resolve-then-rewrap, asserted below.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
-        self.heal_arg_to_canonical(&arg.to_boxref());
+        self.heal_arg_to_canonical(arg);
         let native = if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             // Self-resolved box-native: the canonical forwarding for this
@@ -4723,7 +4670,7 @@ impl OptContext {
     /// `materialize_*` mint) instead of tripping the position-only panic in the
     /// total [`get_box_replacement_operand`](Self::get_box_replacement_operand).
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
-        self.heal_arg_to_canonical(&arg.to_boxref());
+        self.heal_arg_to_canonical(arg);
         let native = if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             if resolved.same_box(arg) {
@@ -4765,14 +4712,16 @@ impl OptContext {
     /// this same-position duplication, leaving the operand's box-native walk
     /// stranded on the info-less input op while the OpRef store path reaches the
     /// info-bearing canonical. Linking those two distinct ops is the whole point
-    /// of the heal. But `get_box_replacement_box` can also re-mint a DIFFERENT
-    /// `BoxRef` wrapping the SAME bound `Op` as `arg` (a store wrapper vs the
-    /// memoized operand box); `same_box` (an `Rc::ptr_eq` on the boxes) misses
-    /// that, so an explicit `Rc::ptr_eq` on the bound ops is needed — without it
-    /// `set_forwarded_op` self-cycles (`arg.op -> arg.op`). The canonical is a
-    /// `get_box_replacement_box` terminal (`Forwarded::None`/`Info`, never a
-    /// `Box`), so once a genuinely distinct op is linked no chain cycle forms.
-    fn heal_arg_to_canonical(&self, arg: &majit_ir::box_ref::BoxRef) {
+    /// of the heal. But `get_box_replacement_operand_opt` can also re-resolve a
+    /// DIFFERENT `Operand` wrapping the SAME bound `Op` as `arg` (a store wrapper
+    /// vs the memoized operand); `same_box` (an `Rc::ptr_eq` on the producers)
+    /// catches that for an identical `Rc<Op>`, but the explicit `Rc::ptr_eq` on
+    /// the bound ops is kept as the cycle guard — without it `set_forwarded_op`
+    /// self-cycles (`arg.op -> arg.op`). The canonical is a
+    /// `get_box_replacement_operand` terminal (`Forwarded::None`/`Info`, never a
+    /// bound op chained on), so once a genuinely distinct op is linked no chain
+    /// cycle forms.
+    fn heal_arg_to_canonical(&self, arg: &Operand) {
         if arg.bound_op().is_none() {
             return;
         }
@@ -4782,8 +4731,7 @@ impl OptContext {
         let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref()) else {
             return;
         };
-        // `arg` is bound (checked above), so its `Operand` lowering is panic-free.
-        if Operand::from_boxref(arg).same_box(&canon) {
+        if arg.same_box(&canon) {
             return;
         }
         // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
@@ -4870,11 +4818,11 @@ impl OptContext {
     /// lazy-alloc arm). For a const-namespace OpRef returns a fresh
     /// `BoxRef::new_const` (`history.py:220` no-dedup; Const boxes have no
     /// `_forwarded`, so any write the caller attempts is a no-op). Unlike
-    /// `resolve_to_boxref` it never returns `None` for a value-bearing OpRef
+    /// `resolve_to_operand` it never returns `None` for a value-bearing OpRef
     /// — the explicit-mint endpoint (#47) at find-or-create write sites whose
     /// receiver may be unbound (test fixtures, short-preamble replay slots).
     /// The sentinel `OpRef::none()` has no box (debug-asserted); resolve it
-    /// with `resolve_to_boxref` / `get_box_replacement_box` instead.
+    /// with `resolve_to_operand` / `get_box_replacement_operand` instead.
     pub(crate) fn materialize_box_at(&mut self, opref: OpRef) -> majit_ir::box_ref::BoxRef {
         debug_assert!(
             !opref.is_none(),
@@ -4890,7 +4838,7 @@ impl OptContext {
             });
             return majit_ir::box_ref::BoxRef::new_const(value);
         }
-        // Align the write-path host with `resolve_to_boxref`
+        // Align the write-path host with `resolve_to_operand`
         // (the read path behind `get_box_replacement_box`). For ResOp
         // variants, resolve to the producing `Op`'s canonical `_forwarded`
         // host first. `find_producer_op` distinguishes the ResOp namespace
@@ -4905,10 +4853,10 @@ impl OptContext {
             return majit_ir::box_ref::BoxRef::from_bound_op(&op_rc);
         }
         // InputArg write path: route through the canonical `inputarg_refs`
-        // host (symmetric with `resolve_to_boxref`'s InputArg branch and the
+        // host (symmetric with `resolve_to_operand`'s InputArg branch and the
         // `read_forwarded` / `clear_forwarded` writers). The returned BoxRef is
         // bound to `inputarg_refs[idx]`, so a `set_forwarded_*` write lands the
-        // same `InputArg.forwarded` slot a later `resolve_to_boxref` read
+        // same `InputArg.forwarded` slot a later `resolve_to_operand` read
         // observes — without returning a position-collapsed InputArg slot
         // whose write would silently vanish in a release build where the
         // `BoxRef::write_forwarded` bound-precondition assert is off.
@@ -5529,8 +5477,8 @@ impl OptContext {
         // optimizer.py:432: box.set_forwarded(constbox). Terminate the
         // chain in an inline value-typed Const payload (history.py:227/
         // 268/314) — no separate BoxKind::Const carrier and no pool index.
-        // `get_box_replacement` rematerializes the const and `box_to_opref`
-        // recovers the inline-Const OpRef via `source_opref()`'s
+        // `get_box_replacement` rematerializes the const and `operand_to_opref`
+        // recovers the inline-Const OpRef via `Operand::Const::to_opref`'s
         // value-derived branch.
         if matches!(value, Value::Void) {
             panic!("make_constant: Value::Void has no ConstVoid upstream (history.py:220/261/307)");
@@ -5740,7 +5688,7 @@ impl OptContext {
     /// box object itself: `getint`/`getref_base` (resoperation.py:691) return
     /// `_resint`/`_resref` — the box's own value slot, set when the box was
     /// created — and never walk `_forwarded`. This resolves the box at
-    /// `opref`'s own position (`resolve_to_boxref`, the canonical host WITHOUT
+    /// `opref`'s own position (`resolve_to_operand`, the canonical host WITHOUT
     /// the `get_box_replacement` chain walk) and reads its value directly; an
     /// optimizer forwarding (`make_equal_to` / `make_constant`) never takes
     /// precedence over the box's own observed value.
@@ -5755,7 +5703,7 @@ impl OptContext {
     /// producing ops carry their own observed values, so this reads the real
     /// runtime value without consulting `_forwarded`.
     pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
-        let own = self.resolve_to_boxref(opref)?;
+        let own = self.resolve_to_operand(opref)?;
         own.const_value().or_else(|| own.get_value())
     }
 
@@ -6047,7 +5995,7 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
-        let arg0_resolved = self.get_replacement_opref(arg0.to_opref());
+        let arg0_resolved = self.resolve_operand_operand(&arg0).to_opref();
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
@@ -6102,10 +6050,10 @@ impl OptContext {
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
-                let resolved_for_pop = self
-                    .get_box_replacement_operand_opt(preamble_op.op.to_opref())
-                    .map(|o| o.to_boxref())
-                    .unwrap_or_else(|| preamble_op.op.clone());
+                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
+                // — walk the box's own `_forwarded` chain (total; identity on a
+                // miss), object-native rather than positional.
+                let resolved_for_pop = preamble_op.op.get_box_replacement(false);
                 if let Some(builder) = self.active_short_preamble_producer_mut() {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
                 } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
@@ -6398,17 +6346,20 @@ impl OptContext {
 
         // optimizer.py:712 liveboxes are the canonical Box objects returned
         // by `resumedata.finish()`; resolve each numbering position to its
-        // canonical (possibly producer-bound) box so `store_final_boxes`
-        // can shed to a live-tracking operand. NONE holes and positions
-        // with no canonical box stay position-only.
-        let liveboxes_b: Vec<majit_ir::box_ref::BoxRef> = liveboxes
+        // canonical (possibly producer-bound) operand so `store_final_boxes`
+        // sheds straight to a live-tracking operand. A NONE hole resolves to
+        // `Operand::None`, a Const to `Operand::Const`; a producerless,
+        // non-Const position has no operand to bind and panics at
+        // `Operand::from_opref` — the same contract `store_final_boxes`'
+        // former `Operand::from_boxref` step enforced (#9).
+        let final_operands: Vec<Operand> = liveboxes
             .iter()
             .map(|a| {
-                self.resolve_to_boxref(*a)
-                    .unwrap_or_else(|| majit_ir::box_ref::BoxRef::from_opref(*a))
+                self.resolve_to_operand(*a)
+                    .unwrap_or_else(|| Operand::from_opref(*a))
             })
             .collect();
-        op.store_final_boxes(liveboxes_b);
+        op.store_final_boxes(final_operands);
         op.set_fail_arg_types(new_types.clone());
         // optimizer.py:722-730 `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
@@ -8034,7 +7985,7 @@ impl OptContext {
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
         let value = self.materialize_operand_at(value);
-        let arg0 = self.get_replacement_opref(op.arg(0).to_opref());
+        let arg0 = self.resolve_operand_operand(&op.arg(0)).to_opref();
         if arg0.is_constant()
             || self
                 .get_box_replacement_operand_opt(arg0)
@@ -8175,7 +8126,7 @@ impl OptContext {
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
         // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
-        let arg0 = self.get_replacement_opref(op.arg(0).to_opref());
+        let arg0 = self.resolve_operand_operand(&op.arg(0)).to_opref();
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
         //
         // PyPy's `info.ConstPtrInfo(arg0)` wraps the constant box itself,
