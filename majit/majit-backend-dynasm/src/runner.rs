@@ -639,6 +639,24 @@ fn dynasm_raw_fixedsize_alloc_typed(type_id: u32, size: usize) -> u64 {
     }
 }
 
+fn dynasm_alloc_oldgen_varsize_typed_and_set_len(
+    type_id: u32,
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> u64 {
+    let payload_size = base_size + item_size * length;
+    let obj = dynasm_alloc_oldgen_typed(type_id, payload_size);
+    let ptr = obj.0;
+    if ptr != 0 {
+        unsafe {
+            *((ptr as *mut u8).add(length_ofs) as *mut usize) = length;
+        }
+    }
+    ptr as u64
+}
+
 fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     let result = DYNASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -2747,10 +2765,31 @@ impl Backend for DynasmBackend {
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
-        let ptr = unsafe { libc::malloc(size) };
+        // A GC-managed struct (real `type_id`) MUST be allocated through the GC
+        // so the collector can trace its pointer fields: a resume-materialized
+        // virtual (e.g. an inlined-callee `PyFrame`) holds a `locals_cells_stack`
+        // ref to its arrays, and a raw `libc::malloc` block is invisible to the
+        // GC, so a minor collection during the blackhole forward run frees those
+        // arrays out from under the frame.  Allocate in the non-moving old
+        // generation (mark-sweep), mirroring `w_int_new`/`w_float_new`: the
+        // blackhole register file and the deep forward recursion capture raw
+        // pointers to the materialized struct that the resume path does not
+        // re-root across the minor collections it triggers, so a moving nursery
+        // object would leave those captures stale.  Old-gen keeps every
+        // materialized pointer stable for the lifetime of the resume.  Non-GC
+        // descrs (`type_id == 0`, raw buffers) keep the plain malloc.
+        let type_id = sizedescr.get_type_id() as u32;
+        let ptr = if type_id != 0 {
+            dynasm_alloc_oldgen_typed(type_id, size).0 as *mut libc::c_void
+        } else {
+            let ptr = unsafe { libc::malloc(size) };
+            if !ptr.is_null() {
+                unsafe { libc::memset(ptr, 0, size) };
+            }
+            ptr
+        };
         if !ptr.is_null() {
             unsafe {
-                libc::memset(ptr, 0, size);
                 // llmodel.py:780-782: if self.vtable_offset is not None:
                 //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
                 if let Some(vt_off) = self.vtable_offset {
@@ -2782,8 +2821,15 @@ impl Backend for DynasmBackend {
             type_id != 0,
             "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
         );
-        dynasm_alloc_varsize_typed_and_set_len(type_id, base_size, itemsize, len_offset, length)
-            as i64
+        // Old-gen for the same reason as `bh_new_with_vtable`: a resume
+        // materializes the inlined frame's `locals_cells_stack` array and the
+        // blackhole holds it (via the frame) across the minor collections the
+        // deep forward recursion triggers.  A non-moving array keeps the frame's
+        // field valid without a cross-generation write barrier, and keeps the
+        // whole materialized graph in one generation.
+        dynasm_alloc_oldgen_varsize_typed_and_set_len(
+            type_id, base_size, itemsize, len_offset, length,
+        ) as i64
     }
 
     /// llmodel.py:790 bh_new_array_clear = bh_new_array.
