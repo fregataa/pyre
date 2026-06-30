@@ -190,26 +190,32 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
     // collapsing to `stack_base + 0`. The contract is documented at
     // `PyreJitCode::stack_slot_color_map`. With no regalloc the color of each slot is
     // its own pre-color, hence the identity fill.
-    let (stack_base, depth_at_py_pc, stack_slot_color_map, pyre_color_for_semantic_local) =
-        if code_ptr.is_null() {
-            (0, Vec::new(), Vec::new(), Vec::new())
-        } else {
-            let code = unsafe { &*code_ptr };
-            let nlocals = code.varnames.len();
-            let stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
-            let depth_at_py_pc = crate::liveness::liveness_for(code_ptr).depth_at_py_pc();
-            let max_stackdepth = code.max_stackdepth as usize;
-            let stack_slot_color_map: Vec<u16> = (0..max_stackdepth as u16)
-                .map(|d| stack_base as u16 + d)
-                .collect();
-            let pyre_color_for_semantic_local: Vec<u16> = (0..nlocals as u16).collect();
-            (
-                stack_base,
-                depth_at_py_pc,
-                stack_slot_color_map,
-                pyre_color_for_semantic_local,
-            )
-        };
+    let (
+        stack_base,
+        depth_at_py_pc,
+        stack_slot_color_map,
+        pyre_color_for_semantic_local,
+        max_stackdepth,
+    ) = if code_ptr.is_null() {
+        (0, Vec::new(), Vec::new(), Vec::new(), 0)
+    } else {
+        let code = unsafe { &*code_ptr };
+        let nlocals = code.varnames.len();
+        let stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
+        let depth_at_py_pc = crate::liveness::liveness_for(code_ptr).depth_at_py_pc();
+        let max_stackdepth = code.max_stackdepth as usize;
+        let stack_slot_color_map: Vec<u16> = (0..max_stackdepth as u16)
+            .map(|d| stack_base as u16 + d)
+            .collect();
+        let pyre_color_for_semantic_local: Vec<u16> = (0..nlocals as u16).collect();
+        (
+            stack_base,
+            depth_at_py_pc,
+            stack_slot_color_map,
+            pyre_color_for_semantic_local,
+            max_stackdepth,
+        )
+    };
 
     Arc::new(PyJitCode::from_parts(
         runtime,
@@ -218,10 +224,14 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
             after_residual_call_resume_pc: Vec::new(),
             first_jit_pc_by_py_pc: Vec::new(),
             depth_at_py_pc,
+            // Portal bridges have an empty pc_map, so the inline multiframe
+            // capture declines before it reads this; keep it empty.
+            result_color_at_pc: Vec::new(),
             portal_frame_reg,
             portal_ec_reg,
             built_as_portal: true,
             stack_base,
+            max_stackdepth,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
             pcdep_color_slots: Vec::new(),
@@ -410,10 +420,12 @@ def f(x, y):
                 after_residual_call_resume_pc: vec![None],
                 first_jit_pc_by_py_pc: vec![0],
                 depth_at_py_pc: Vec::new(),
+                result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 built_as_portal: true,
                 stack_base: 0,
+                max_stackdepth: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),

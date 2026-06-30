@@ -100,6 +100,18 @@ pub struct PyJitCodeMetadata {
     pub first_jit_pc_by_py_pc: Vec<usize>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
+    /// Post-regalloc Ref-bank color of the call-result operand-stack slot
+    /// (top of stack) at each Python PC: `result_color_at_pc[pc]` =
+    /// `stack_slot_color_map[depth_at_py_pc[pc] - 1]`, or `u16::MAX` where the
+    /// stack is empty. The inline multiframe capture
+    /// (`jitcode_dispatch::compute_inline_caller_frame` /
+    /// `compute_nested_inline_caller_frame`) nulls the not-yet-produced result
+    /// register before serializing the paused caller frame; that slot is not a
+    /// live Variable at the return PC, so it carries no `pcdep_color_slots`
+    /// entry. This precomputed table supplies its color so the capture no
+    /// longer reads the flat `stack_slot_color_map` at runtime. Same length as
+    /// `depth_at_py_pc`; empty for non-compiled skeleton metadata.
+    pub result_color_at_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
     /// argument (`frame`).  RPython parity: `pypy/module/pypyjit/
     /// interp_jit.py:67 reds = ['frame', 'ec']` declares the portal
@@ -129,6 +141,13 @@ pub struct PyJitCodeMetadata {
     pub built_as_portal: bool,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
+    /// Maximum operand-stack depth (`code.max_stackdepth` = CPython
+    /// `co_stacksize`). Equals `stack_slot_color_map.len()` for a compiled
+    /// jitcode (the length invariant documented on that field) and `0` for
+    /// non-compiled skeleton metadata. Carries the operand-stack dimension so
+    /// the bridge frame-array sizing (`state.rs::setup_bridge_sym`) reads the
+    /// depth directly instead of `stack_slot_color_map.len()`.
+    pub max_stackdepth: usize,
     /// Post-regalloc
     /// color of each Python-semantic stack slot.
     /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, nlocals + d)`
@@ -598,6 +617,7 @@ impl PyJitCode {
                 after_residual_call_resume_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
+                result_color_at_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
                 // (canonical_bridge.rs:165-166). Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
@@ -609,6 +629,7 @@ impl PyJitCode {
                 portal_ec_reg: u16::MAX,
                 built_as_portal: false,
                 stack_base: 0,
+                max_stackdepth: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),

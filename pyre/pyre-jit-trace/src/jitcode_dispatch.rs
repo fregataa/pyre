@@ -5780,8 +5780,8 @@ fn collect_outer_active_boxes(
         valid_stack_only,
         owns_vable,
         local_color_map,
-        stack_color_map,
-        live_locals,
+        portal_stack_color_map,
+        portal_live_locals,
         portal_frame_reg,
         portal_ec_reg,
     ) = if sym.jitcode.is_null() {
@@ -5799,50 +5799,84 @@ fn collect_outer_active_boxes(
         unsafe {
             let jc = &*sym.jitcode;
             let payload = &jc.payload;
-            let (live_locals, stack_depth_at_pc) = if payload.code_ptr.is_null() {
-                (Vec::new(), 0usize)
-            } else {
-                let live_vars = crate::liveness::liveness_for(payload.code_ptr);
-                let live_locals = (0..sym.nlocals)
-                    .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
-                    .collect::<Vec<usize>>();
-                // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
-                // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
-                // are read at that py_pc, so the stack-slot classification
-                // window must be the depth at that py_pc too — NOT
-                // `sym.valuestackdepth` (the walker's *current* position).
-                // For the per-opcode entry caller the two coincide, but a
-                // guard resuming at a not-taken branch target with a kept
-                // operand-stack temp (conditional expr / short-circuit /
-                // chained compare, #124/#281) resumes at a py_pc whose
-                // depth `> 0` while the walker stands at depth 0 — using
-                // the current depth there truncates `stack_color_map` and
-                // drops the kept temp's semantic slot, corrupting the
-                // resumed frame.
-                let depth = live_vars
-                    .depth_at_py_pc()
-                    .get(entry_py_pc as usize)
-                    .copied()
-                    .unwrap_or(0) as usize;
-                (live_locals, depth)
-            };
+            // A portal-bridge install leaves `pcdep_color_slots` empty by
+            // design (keyed off by `is_portal_bridge()`), so its color→slot
+            // inversion has no per-PC source and must keep flowing through the
+            // flat identity maps — the pre-#348 path. The non-portal common
+            // case is covered by `pcdep_opt` below, so its flat-map inputs stay
+            // empty (the #348 drain). Computing the liveness-derived
+            // `live_locals` only for portals preserves that drain.
+            let is_portal = payload.is_portal_bridge();
+            let (portal_stack_color_map, portal_live_locals, stack_depth_at_pc) =
+                if payload.code_ptr.is_null() {
+                    (Vec::new(), Vec::new(), 0usize)
+                } else {
+                    let live_vars = crate::liveness::liveness_for(payload.code_ptr);
+                    // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
+                    // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
+                    // are read at that py_pc, so the per-PC color→slot window
+                    // (`pcdep_opt`'s stack clamp below) must be the depth at
+                    // that py_pc too — NOT `sym.valuestackdepth` (the walker's
+                    // *current* position).  For the per-opcode entry caller the
+                    // two coincide, but a guard resuming at a not-taken branch
+                    // target with a kept operand-stack temp (conditional expr /
+                    // short-circuit / chained compare, #124/#281) resumes at a
+                    // py_pc whose depth `> 0` while the walker stands at depth
+                    // 0 — using the current depth there drops the kept temp's
+                    // semantic slot, corrupting the resumed frame.
+                    let depth = live_vars
+                        .depth_at_py_pc()
+                        .get(entry_py_pc as usize)
+                        .copied()
+                        .unwrap_or(0) as usize;
+                    let (stack_color_map, live_locals) = if is_portal {
+                        let live_locals = (0..sym.nlocals)
+                            .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
+                            .collect::<Vec<usize>>();
+                        // #73: recompute the portal stack color map from its
+                        // defining formula instead of reading the flat
+                        // `stack_slot_color_map` field. A portal install
+                        // (`install_portal_for`) runs no regalloc, so the color
+                        // of stack slot `d` is its own PyFrame index
+                        // `stack_base + d` (`stack_base = nlocals + ncells`) —
+                        // byte-identical to the stored map. Draining this reader
+                        // moves the field one step closer to removal.
+                        let code = &*payload.code_ptr;
+                        let stack_base =
+                            code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+                        let scm: Vec<u16> = (0..code.max_stackdepth as u16)
+                            .map(|d| stack_base as u16 + d)
+                            .collect();
+                        (scm, live_locals)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    (stack_color_map, live_locals, depth)
+                };
             (
                 sym.nlocals,
                 stack_depth_at_pc,
                 sym.owns_virtualizable_shadow(),
                 payload.metadata.pyre_color_for_semantic_local.clone(),
-                payload.metadata.stack_slot_color_map.clone(),
-                live_locals,
+                portal_stack_color_map,
+                portal_live_locals,
                 payload.metadata.portal_frame_reg,
                 payload.metadata.portal_ec_reg,
             )
         }
     };
-    // #348: per-PC color→slot entries at the snapshot PC. Populated for every
-    // production jitcode (empty only under the `PYRE_PCDEP_RESUME_OFF` escape
-    // hatch); when present, the color→slot inversions below consult it instead
-    // of the flat maps, the same per-program-point color space the `-live-`
-    // markers carry.
+    // #348: per-PC color→slot entries at the snapshot PC — the color→slot source
+    // the inversions below consult for every drained (non-portal) jitcode, the
+    // per-program-point color space the `-live-` markers carry. Branch-guard
+    // resumes (`guard_py_pc.is_some()`) are fully covered here; a per-opcode-entry
+    // resume whose live Ref colors are all constants/leaked carries no entry (the
+    // resume snapshot records Variables only), so `semantic_ref_slot_for_reg_color`
+    // returns `None` and the live color falls to the `regs_r[color]` walk-bank
+    // read below. Portal-bridge frames carry no `pcdep` entry (empty by install),
+    // so for them `pcdep_opt` is `None` and the flat identity
+    // `portal_stack_color_map` / `portal_live_locals` (empty for non-portal) carry
+    // the inversion instead; `local_color_map` (`pyre_color_for_semantic_local`)
+    // backs the function's local-position scan on that path.
     let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
         Vec::new()
     } else {
@@ -5956,8 +5990,8 @@ fn collect_outer_active_boxes(
                         nlocals,
                         valid_stack_only,
                         &local_color_map,
-                        &stack_color_map,
-                        &live_locals,
+                        &portal_stack_color_map,
+                        &portal_live_locals,
                         pcdep_opt,
                         c as usize,
                     )?;
@@ -6000,8 +6034,8 @@ fn collect_outer_active_boxes(
                     nlocals,
                     valid_stack_only,
                     &local_color_map,
-                    &stack_color_map,
-                    &live_locals,
+                    &portal_stack_color_map,
+                    &portal_live_locals,
                     pcdep_opt,
                     c as usize,
                 ) else {
@@ -6049,8 +6083,8 @@ fn collect_outer_active_boxes(
                 nlocals,
                 valid_stack_only,
                 &local_color_map,
-                &stack_color_map,
-                &live_locals,
+                &portal_stack_color_map,
+                &portal_live_locals,
                 pcdep_opt,
                 color,
             ) {
@@ -6094,8 +6128,8 @@ fn collect_outer_active_boxes(
                 nlocals,
                 valid_stack_only,
                 &local_color_map,
-                &stack_color_map,
-                &live_locals,
+                &portal_stack_color_map,
+                &portal_live_locals,
                 pcdep_opt,
                 color,
             );
@@ -8170,10 +8204,10 @@ fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option
 }
 
 /// The frame whose JitCode byte offsets the branch-resume gate readers
-/// ([`branch_resume_target_stack_depth`] / [`branch_resume_stack_colors`])
+/// ([`branch_resume_target_stack_depth`] and the kept-slot hazard checks)
 /// resolve through.  Holds the frame's `PyJitCode` payload — its `metadata`
-/// (`pc_map` for the jitcode-pc → Python-pc inversion, `stack_slot_color_map`
-/// for the kept-slot resume colors) and `code_ptr` (the liveness key).
+/// (`pc_map` for the jitcode-pc → Python-pc inversion) and `code_ptr` (the
+/// liveness key).
 ///
 /// Two constructors mark the frame model: the gate must read the frame whose
 /// jitcode the `target` offset indexes, NOT a single global.
@@ -8254,44 +8288,6 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
             .depth_at_py_pc()
             .get(py)
             .copied()
-    }
-}
-
-/// The resume-merge Ref colors of a branch guard's kept operand-stack
-/// slots (`#420`): `stack_slot_color_map[0 .. depth_at_py_pc[resume]]`,
-/// the colors `collect_outer_active_boxes` / `stack_sync` look the kept
-/// values up by.  Used to decide whether the not-taken edge's decoded
-/// `ref_copy` moves cover *every* kept slot — only then is the depth > 1
-/// recovery complete and the guard safe to compile.  A slot the edge does
-/// not rename is "live-across"; its value sits at the possibly-collapsed
-/// `stack_slot_color_map[s]` color, unproven for depth > 1, so an
-/// uncovered slot keeps the conservative decline.  Same `frame` contract as
-/// `branch_resume_target_stack_depth`.
-fn branch_resume_stack_colors(frame: &ActiveResumeFrame, target: usize) -> Option<Vec<u16>> {
-    let pjc = &frame.0;
-    if pjc.code_ptr.is_null() {
-        return None;
-    }
-    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields;
-    // the frame holds an `Arc<PyJitCode>` keeping them alive for this read.
-    unsafe {
-        let code = &*pjc.code_ptr;
-        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
-        let depth = crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(py)
-            .copied()? as usize;
-        let scm = &pjc.metadata.stack_slot_color_map;
-        // Defensive: a map shorter than the resume depth (only possible if
-        // stack_slot_color_map were under-sized below co_stacksize, the
-        // regression pyjitcode.rs warns about) must DECLINE, not silently
-        // truncate the kept-slot color list — a truncated list would let
-        // recovery_complete pass without checking every kept slot.
-        if depth > scm.len() {
-            return None;
-        }
-        Some((0..depth).map(|s| scm[s]).collect())
     }
 }
 
@@ -8389,7 +8385,8 @@ fn kept_stack_has_boxed_int_hazard(
 /// (`collect_outer_active_boxes` → `frame_liveness_reg_indices_by_bank_at`)
 /// plus the const-window registers at index `>= num_regs_r` (auto-loaded
 /// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
-/// Same `FULL_BODY_SNAPSHOT_SYM` contract as [`branch_resume_stack_colors`].
+/// Same `FULL_BODY_SNAPSHOT_SYM` contract as
+/// [`branch_resume_target_stack_depth`].
 fn branch_arm_resume_ref_liveness(
     target: usize,
     outer_jitcode_index: u32,
@@ -9246,9 +9243,12 @@ fn compute_inline_caller_frame(
     if depth == 0 {
         return None;
     }
-    let result_idx = depth - 1;
-    let stack_color_map = crate::state::stack_slot_color_map_at(jitcode_index as i32);
-    let result_color = *stack_color_map.get(result_idx)? as usize;
+    // #73: the result slot's color comes from the codewriter-precomputed
+    // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
+    // `stack_slot_color_map` — the result is not a live Variable here, so it
+    // carries no pcdep entry.
+    let result_color =
+        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume).
@@ -9317,9 +9317,10 @@ fn compute_nested_inline_caller_frame(
     if depth == 0 {
         return None;
     }
-    let result_idx = depth - 1;
-    let stack_color_map = crate::state::stack_slot_color_map_at(jitcode_index as i32);
-    let result_color = *stack_color_map.get(result_idx)? as usize;
+    // #73: result slot color from the precomputed `result_color_at_pc`, not
+    // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
+    let result_color =
+        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume) — same as the top-level
@@ -16998,19 +16999,17 @@ fn handle(
                     );
                 }
                 // Resolve each `(dst, src)` move to `(dst, live guard value)`
-                // against the guard-state register file NOW — before gating.
-                // A move whose `src` is out of range or holds `OpRef::NONE`
-                // recovers no live kept value, so it must not count toward
-                // coverage; basing `recovery_complete` on the raw `dst` set
-                // would let such a move pass the gate and then silently drop
-                // at the snapshot step, leaving a kept slot unrecovered (a
-                // depth > 1 miscompile).  A const-source `ref_copy` patches
-                // `src` into the constants window of `registers_r`, so this
-                // one read covers register and const sources alike.  The same
-                // resolved set both gates and feeds the snapshot encoder
-                // (single source of truth); `record_guard` below records into
-                // the trace history only and does not mutate `registers_r`,
-                // so reading it here is identical to reading it post-guard.
+                // against the guard-state register file NOW, before recording
+                // the guard.  A move whose `src` is out of range or holds
+                // `OpRef::NONE` recovers no live kept value and is dropped so the
+                // snapshot encoder never records a dead kept slot.  A const-source
+                // `ref_copy` patches `src` into the constants window of
+                // `registers_r`, so this one read covers register and const
+                // sources alike.  This resolved set is the single source of truth
+                // the snapshot encoder reads (`BRANCH_GUARD_KEPT_RECOVERED_RESOLVED`
+                // below); `record_guard` records into the trace history only and
+                // does not mutate `registers_r`, so reading it here is identical
+                // to reading it post-guard.
                 let resolved_recovered: Option<Vec<(u16, OpRef)>> =
                     kept_recovered.as_ref().map(|mv| {
                         mv.iter()
@@ -17020,62 +17019,6 @@ fn handle(
                             })
                             .collect()
                     });
-                // Recover depth > 1 only when the decoded edge moves cover
-                // EVERY kept resume stack slot.  A slot the not-taken edge
-                // does not rename ("live-across") would fall through to the
-                // possibly-collapsed `stack_slot_color_map[s]` read — the
-                // original depth > 1 decline reason — so an uncovered slot,
-                // a cyclic `*_push`/`*_pop` (decodes to `None`), or unknown
-                // liveness keeps the conservative decline.  Depth-1 is handled
-                // by the positional heuristic below and is not gated here.
-                // `PYRE_RELAX_124` forces depth > 1 through for diagnosis.
-                let recovery_complete = match (
-                    resolved_recovered.as_ref(),
-                    gate_frame
-                        .as_ref()
-                        .and_then(|f| branch_resume_stack_colors(f, other_target)),
-                ) {
-                    (Some(resolved), Some(cols)) => {
-                        // Every kept slot's resume color must be DISTINCT — a
-                        // collapsed `stack_slot_color_map` aliasing two slots
-                        // onto one color would feed both the same recovered
-                        // value.
-                        let distinct = cols.iter().enumerate().all(|(i, c)| !cols[..i].contains(c));
-                        // Whether the not-taken edge renames at all: a non-empty
-                        // decoded `ref_copy` trampoline means a real merge that
-                        // moves SOME kept slots into fresh colors.
-                        let edge_renames = kept_recovered.as_ref().is_some_and(|m| !m.is_empty());
-                        let all_recoverable = if edge_renames {
-                            // Renaming edge: every kept color must be covered by
-                            // an explicit decoded move (#420).  An UNcovered slot
-                            // reads its (unwritten/stale) merge color — it is NOT
-                            // live-across, since the edge renamed siblings — so
-                            // keep the conservative decline.
-                            cols.iter()
-                                .all(|c| resolved.iter().any(|&(dst, _)| dst == *c))
-                        } else {
-                            // Empty trampoline: the not-taken edge does NO
-                            // renaming (an exception-handler / non-merge resume).
-                            // Every kept slot stays at the SAME color the walk
-                            // wrote — "live-across" — recovered from the guard-pc
-                            // register file at its own color (the snapshot
-                            // fallback, `walker_capture_snapshot_for_last_guard_impl`
-                            // :5471).  Exact iff distinct (no collapse) AND each
-                            // color holds a live value there; verify
-                            // `registers_r[color]` is in range and non-`NONE` (the
-                            // same file the snapshot reads; `record_guard` below
-                            // does not mutate it).
-                            cols.iter().all(|c| {
-                                ctx.registers_r
-                                    .get(*c as usize)
-                                    .copied()
-                                    .is_some_and(|v| v != OpRef::NONE)
-                            })
-                        };
-                        distinct && all_recoverable
-                    }
-                    _ => false,
-                };
                 // PARITY DEVIATION (converges at the symbolic-valuestack
                 // capture, #73/#423): `opimpl_goto_if_not` (pyjitpl.py:511/520)
                 // always records GUARD_TRUE/FALSE for a non-constant condition
@@ -17172,7 +17115,13 @@ fn handle(
                         });
                     }
                 }
-                if depth_gt_1 && !recovery_complete && !relax_124 && !mirror_covers_kept {
+                // A depth > 1 kept operand stack is recoverable on resume only
+                // from the symbolic-valuestack mirror (`mirror_covers_kept`).  When
+                // the mirror is invalid (an undermodeled walk: inline sub-walk /
+                // Unmodeled opcode), the kept slots have no reliable per-slot
+                // source, so decline → interpreter (correct).  `PYRE_RELAX_124`
+                // forces depth > 1 through for diagnosis.
+                if depth_gt_1 && !relax_124 && !mirror_covers_kept {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
