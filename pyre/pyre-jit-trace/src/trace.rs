@@ -413,12 +413,41 @@ fn dispatch_perfn_frame(
 /// frame), log the outcome, discard the trace, and abort — validates the
 /// reconstructed-frame walk plumbing before result-threading + the root walk
 /// are wired.  Gated behind `PYRE_P2_DRAIN` (default off → unchanged behavior).
+/// Thread a reconstructed callee's `SubReturn` value into the root portal's
+/// operand-stack result slot so the subsequent root walk (`run_perfn_walk`'s
+/// `bridge_stack_oprefs` seeding) reads it as the call result at `root_pc`.
+///
+/// The result lands at the codewriter-precomputed result color for the call's
+/// return pc (`result_color_at_pc_at`), mapped to its `bridge_stack_oprefs`
+/// stack slot (`color - nlocals`).  Returns `false` (caller declines the
+/// compile) when the color is unresolved or sits below the operand stack.
+fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
+    if sym.jitcode.is_null() {
+        return false;
+    }
+    let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
+    let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index, root_pc) else {
+        return false;
+    };
+    let nlocals = sym.nlocals;
+    if result_color < nlocals {
+        return false;
+    }
+    let slot = result_color - nlocals;
+    let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
+    if bridge.len() <= slot {
+        bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+    }
+    bridge[slot] = result;
+    true
+}
+
 fn drive_bridge_carrier_walk(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
-    _w_code: *const (),
+    w_code: *const (),
     root_pc: usize,
-    _cf_addr: usize,
+    cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
 ) -> TraceAction {
     crate::jitcode_dispatch::bool_box_truth_reset();
@@ -426,6 +455,13 @@ fn drive_bridge_carrier_walk(
     crate::jitcode_dispatch::fbw_store_journal_reset();
 
     let root_ec = sym.concrete_execution_context;
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        let pcs: Vec<usize> = carrier.recipes.iter().map(|r| r.pc).collect();
+        eprintln!(
+            "[p2-shape] root_pc={root_pc} n_recipes={} recipe_pcs={pcs:?}",
+            carrier.recipes.len()
+        );
+    }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
         return TraceAction::Abort;
@@ -477,6 +513,29 @@ fn drive_bridge_carrier_walk(
         &argboxes_r,
         local_concretes,
     );
+    // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
+    // into the root's operand-stack result slot and walk the ROOT top-level to
+    // compile the bridge (the recorded callee continuation + the root
+    // continuation form one bridge body).  Gated on `PYRE_P2_COMPILE` (requires
+    // the authoritative sub-walk that produced the `SubReturn`); other shapes /
+    // outcomes log + abort (trace discarded).
+    let subwalk_result = match &walk {
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) },
+            _,
+        ))) => Some(*r),
+        _ => None,
+    };
+    if let Some(result) = subwalk_result {
+        if carrier.recipes.len() == 1 && std::env::var_os("PYRE_P2_COMPILE").is_some() {
+            if inject_root_call_result(sym, root_pc, result) {
+                crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
+                return full_body_walk_trace(ctx, sym, w_code, root_pc, cf_addr);
+            }
+            crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
+        }
+    }
+
     match &walk {
         Some(Ok((outcome, end_pc))) => {
             eprintln!(
