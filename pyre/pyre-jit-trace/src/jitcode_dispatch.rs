@@ -2602,6 +2602,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     callee_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
+    local_concretes: &[majit_ir::Value],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
@@ -2719,9 +2720,13 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             concrete_registers_i: &mut concrete_i,
             descr_refs: &perfn_descr_refs,
             raw_descrs: RawDescrPool::PerFn(perfn_descrs),
-            // Diagnostic (2b-i): the trace is discarded, so the sub-walk must
-            // NOT execute may-force residual calls concretely.
-            is_authoritative_executor: false,
+            // 2b-i diagnostic discards the trace, so the sub-walk must NOT
+            // execute may-force residual calls concretely (default).  The inline
+            // / recursive-CALL_ASSEMBLER machinery is gated on
+            // `is_authoritative_executor`, so the 2b-ii experiment
+            // (`PYRE_P2_AUTHORITATIVE`) flips this to drive the nested
+            // self-recursive fold.
+            is_authoritative_executor: std::env::var_os("PYRE_P2_AUTHORITATIVE").is_some(),
             is_full_body_walk: true,
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
@@ -2749,6 +2754,22 @@ pub(crate) fn drive_bridge_carrier_subwalk(
         let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
         let _callee_consts = InlineCalleeConstsGuard::enter(consts);
         let _parent_frame_guard = InlineParentFrameGuard::enter(root_frame);
+        // Nested self-recursive calls inside the resumed callee fold straight to
+        // a recursive-portal CALL_ASSEMBLER (the bridge is the deopt
+        // continuation, not a fresh unroll).
+        let _carrier_resume = CarrierResumeGuard::enter();
+        // Seed the reconstructed callee's local slot concretes into the (now
+        // innermost) `FBW_CALLEE_LOCALS_CONCRETE` map.  The resume is mid-body,
+        // so the locals were stored to the frame vable before the guard fired;
+        // the map is empty until seeded.  A concrete local lets a callee
+        // `getarrayitem_vable(frame, slot)` read fold to its value, so a nested
+        // self-recursive call's int arg is known (`arg_is_int`) and the call
+        // folds to `CALL_ASSEMBLER` instead of declining.
+        for (slot, &v) in local_concretes.iter().enumerate() {
+            if !matches!(v, majit_ir::Value::Void) {
+                fbw_callee_local_set_concrete(slot as i64, v);
+            }
+        }
         walk(callee_code, entry, &mut sub_wc)
     };
     Some(outcome)
@@ -6681,6 +6702,38 @@ thread_local! {
     /// `trace_opcode.rs:5604-5652`).
     static FBW_INLINE_CODE_STACK: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Set for the lifetime of a multi-frame bridge-carrier callee sub-walk
+    /// (`drive_bridge_carrier_subwalk`, #215 item 2 / P2 drain).  The bridge is
+    /// the unroll-budget-exhausted deopt continuation of an already-compiled
+    /// recursive portal, so a nested self-recursive call inside the resumed
+    /// callee must fold straight to a recursive-portal `CALL_ASSEMBLER`
+    /// (`opimpl_recursive_call_assembler`) rather than re-unroll the call tree
+    /// at trace time (which would bottom out at the multiframe depth cap).
+    static FBW_CARRIER_RESUME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the walker is inside a bridge-carrier callee sub-walk.
+fn fbw_carrier_resume() -> bool {
+    FBW_CARRIER_RESUME.with(|c| c.get())
+}
+
+/// RAII guard: mark the carrier-resume sub-walk for its lifetime, restore the
+/// prior value on drop (so nesting unwinds to the parent's setting).
+struct CarrierResumeGuard(bool);
+
+impl CarrierResumeGuard {
+    fn enter() -> Self {
+        CarrierResumeGuard(FBW_CARRIER_RESUME.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for CarrierResumeGuard {
+    fn drop(&mut self) {
+        FBW_CARRIER_RESUME.with(|c| c.set(self.0));
+    }
 }
 
 /// `rlib/jit.py:601` `max_unroll_recursion` default (= warmstate
@@ -11470,7 +11523,22 @@ fn try_walker_inline_user_call(
             arg_concretes.get(2),
             Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }
         );
+        if fbw_carrier_resume() && std::env::var_os("PYRE_P2_DIAG").is_some() {
+            eprintln!(
+                "[p2-diag] nested call pc={} self_recursive={self_recursive} arg_is_int={arg_is_int} strict_inlinable={strict_inlinable} recursion_count={}",
+                op.pc,
+                fbw_inline_recursion_count(callee_code_key)
+            );
+        }
         if self_recursive && arg_is_int {
+            // A bridge-carrier resume is the deopt continuation of an
+            // already-compiled recursive portal, so a nested self-recursive
+            // call folds straight to the recursive-portal `CALL_ASSEMBLER`
+            // rather than re-unrolling the call tree (which would bottom out at
+            // the multiframe depth cap).
+            if fbw_carrier_resume() {
+                return Ok(None);
+            }
             // Bounded unroll (`pyjitpl.py:1389-1416`): inline the first `n`
             // recursion levels into the trace, folding to the recursive-portal
             // `CALL_ASSEMBLER` tail only once this callee is already `n` deep on

@@ -455,6 +455,12 @@ fn drive_bridge_carrier_walk(
         return TraceAction::Abort;
     };
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
+    // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
+    // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
+    // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
+    // is known.
+    let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
+    let local_concretes = &recipe.concrete_r[..nlocals];
 
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
@@ -469,6 +475,7 @@ fn drive_bridge_carrier_walk(
         callee_w_globals,
         entry,
         &argboxes_r,
+        local_concretes,
     );
     match &walk {
         Some(Ok((outcome, end_pc))) => {
