@@ -41,20 +41,19 @@ pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 /// offset 8 = items[0..capacity]. Total allocation size =
 /// `ITEMS_BLOCK_ITEMS_OFFSET + capacity * sizeof(PyObjectRef)`.
 ///
-/// STEPPING-STONE (metadata precedes runtime, Phase L2 pending).
-/// The header layout already matches upstream but the allocator
-/// does NOT: `alloc_items_block` / `grow_items_block` below still
-/// use `std::alloc::alloc`, not
-/// `MiniMarkGC::alloc_varsize_typed(PY_OBJECT_ARRAY_GC_TYPE_ID,
-/// cap)`. Until Phase L2 cuts the allocator over (blocked on
-/// GC-root infrastructure + Drop source-of-truth
-/// decision), the matching `PY_OBJECT_ARRAY_GC_TYPE_ID` and
-/// `W_LIST_GC_TYPE_ID.gc_ptr_offsets = [offset_of!(items)]` are
-/// inactive at collection time — the walker rejects the
-/// non-nursery block pointer (collector.rs:377). Phase L1 of the
-/// epic already landed: `W_ListObject` / `W_TupleObject` hold
-/// `{length: usize, items: *mut ItemsBlock}` fields directly
-/// (no more `PyObjectArray` fat wrapper for list/tuple).
+/// The header layout matches upstream and, by default, the allocator
+/// now routes object-strategy blocks through the moving nursery
+/// (`alloc_list_items_block_gc` / `alloc_tuple_items_block_gc` /
+/// `grow_list_items_block_gc` → `try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID,
+/// cap)`), so `PY_OBJECT_ARRAY_GC_TYPE_ID` and the list/tuple custom
+/// traces that forward the block-pointer field (eval.rs
+/// `list_object_custom_trace` / `tuple_object_custom_trace`) are live at
+/// collection time. `W_ListObject` / `W_TupleObject` hold
+/// `{length: usize, items: *mut ItemsBlock}` fields directly (no
+/// `PyObjectArray` fat wrapper for list/tuple). The `std::alloc`
+/// `alloc_items_block` / `grow_items_block` below are the
+/// `PYRE_GC_ITEMSBLOCK=0` fallback (provably identical pre-migration
+/// behaviour).
 #[repr(C)]
 pub struct ItemsBlock {
     /// Allocated capacity — treated as the GcArray-length header
@@ -163,15 +162,22 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
 
-/// Phase L2 gate: route object-strategy `ItemsBlock` allocations through
-/// the moving nursery (`PY_OBJECT_ARRAY_GC_TYPE_ID`) instead of
-/// `std::alloc`. Read once; default off keeps the std::alloc stepping
-/// stone provably identical to pre-L2 behaviour, so the nursery path can
-/// be validated under GC stress before it becomes the default.
+/// Route object-strategy `ItemsBlock` allocations through the moving
+/// nursery (`PY_OBJECT_ARRAY_GC_TYPE_ID`) instead of `std::alloc`. Read
+/// once; default ON — the nursery path mirrors RPython's
+/// `GcArray(OBJECTPTR)` (rlist.py:84) and is validated identical to the
+/// `std::alloc` fallback (check.py 158 both backends, both gate states;
+/// fannkuch/nbody/spectral_norm timings unchanged). `PYRE_GC_ITEMSBLOCK=0`
+/// (or `off`/`false`) restores the `std::alloc` fallback to bisect a
+/// suspected block-GC regression.
 fn itemsblock_gc_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_GC_ITEMSBLOCK").is_some())
+    *ENABLED.get_or_init(|| {
+        std::env::var("PYRE_GC_ITEMSBLOCK")
+            .map(|v| !matches!(v.trim(), "0" | "off" | "false" | ""))
+            .unwrap_or(true)
+    })
 }
 
 /// Phase L2 nursery allocation of a fresh `ItemsBlock` with `cap` slots,
@@ -222,6 +228,12 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     for i in len..cap {
         unsafe { *base.add(i) = PY_NULL };
     }
+    // Old→young barrier if the block landed in old-gen (see
+    // alloc_tuple_items_block_gc): registers an old-gen block holding young
+    // elements onto the remembered set, no-op for a nursery block.
+    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+    }
     block
 }
 
@@ -254,6 +266,11 @@ pub unsafe fn grow_list_items_block_gc(
     for i in live_len..new_cap {
         unsafe { *new_base.add(i) = PY_NULL };
     }
+    // Old→young barrier if the grown block landed in old-gen (see
+    // alloc_tuple_items_block_gc).
+    if crate::gc_hook::try_gc_owns_object(new_block as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
+    }
     unsafe { dealloc_list_items_block(old) };
     new_block
 }
@@ -279,22 +296,58 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     for i in 0..cap {
         unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
     }
+    // The block may have landed in old-gen (nursery-full fallback) while its
+    // elements are still young. That old→young edge is invisible to a minor
+    // collection unless the block is on the remembered set, so write-barrier
+    // it here. A nursery block carries no TRACK_YOUNG_PTRS and the barrier is
+    // a no-op; an old-gen block is registered so the next minor collection
+    // walks its items (write_barrier_from_array, incminimark.py:1495). Guard
+    // on GC ownership exactly like `list_write_barrier`.
+    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+    }
     block
 }
 
-/// Allocate a fresh `ItemsBlock` with the given capacity.
-///
-/// STEPPING-STONE: still uses `std::alloc::alloc`. The
-/// `try_gc_alloc_stable` migration was attempted but routes the
-/// per-iteration list allocations through MiniMark's old-gen
-/// (mark-sweep, non-moving), which regresses bench (cranelift
-/// fannkuch timeout, dynasm nbody timeout) — old-gen-only
-/// containers accumulate until major GC fires. The correct
-/// long-term path is a nursery allocation behind caller-side
-/// root tracking; the `try_gc_owns_object` infra in
-/// `gc_hook.rs` is in place to support that follow-up. See
-/// `40d4a041d7` docstring for the same finding on `w_int_new`/
-/// `w_float_new`.
+/// Allocate an exact-`cap` NULL-filled GC-managed `ItemsBlock` of refs for
+/// the walker's recording-time materialization of a virtual
+/// `NEW_ARRAY_CLEAR` (BUILD_LIST / BUILD_TUPLE). Returns `None` when the gate
+/// is off or no GC hook is installed, so the caller declines materialization
+/// rather than handing back a `std::alloc` block that would never be freed.
+/// The block is a `PY_OBJECT_ARRAY_GC_TYPE_ID` varsize array, so its items are
+/// GC-traced and the NULL prefix is benign until the caller fills slots via
+/// `setarrayitem_ref` + a block write barrier. No `std::alloc` fallback here
+/// (unlike [`alloc_items_block_gc`]): the materialization requires a GC-traced
+/// block whose escaping young element refs are forwarded by a collection.
+pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
+    if !itemsblock_gc_enabled() {
+        return None;
+    }
+    let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
+    let raw = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)?;
+    if raw.is_null() {
+        return None;
+    }
+    let block = raw as *mut ItemsBlock;
+    unsafe {
+        (*block).capacity = cap;
+        let base = items_block_items_base(block);
+        for i in 0..cap {
+            *base.add(i) = PY_NULL;
+        }
+    }
+    Some(block)
+}
+
+/// Allocate a fresh `ItemsBlock` with the given capacity via
+/// `std::alloc::alloc`. This is the `PYRE_GC_ITEMSBLOCK=0` fallback;
+/// the default path is the moving-nursery `alloc_items_block_gc` above
+/// (`try_gc_alloc`, caller-side root tracking via `gc_roots::pin_root` +
+/// the block write-barrier). An earlier `try_gc_alloc_stable` attempt was
+/// abandoned because old-gen (non-moving) allocation accumulates
+/// per-iteration containers until a major GC; the nursery path avoids that
+/// (minor GC reclaims short-lived blocks) and is perf-neutral on
+/// fannkuch/nbody.
 ///
 /// The capacity header is initialized; items are left uninitialized —
 /// the caller must write all `capacity` slots before exposing the
@@ -433,12 +486,41 @@ fn typed_items_block_layout(cap: usize) -> Layout {
         .expect("TypedItemsBlock layout")
 }
 
-/// Allocate a fresh zero-filled `TypedItemsBlock` with the given capacity.
-/// Zero-fill matches `gc_malloc_array` (rlist.py:262-267 `_ll_list_resize_really`)
-/// and the Float/Int strategy `_none_value` (0.0 / 0). `cap` is clamped to at
-/// least 1 (rlist.py:251 overallocation policy keeps a slot for in-place growth).
-pub unsafe fn alloc_typed_items_block(cap: usize) -> *mut TypedItemsBlock {
+/// Allocate a fresh zero-filled `TypedItemsBlock` with the given capacity, as a
+/// `tid` (`GC_INT_ARRAY` / `GC_FLOAT_ARRAY`) varsize GcArray. Zero-fill matches
+/// `gc_malloc_array` (rlist.py:262-267 `_ll_list_resize_really`) and the
+/// Float/Int strategy `_none_value` (0.0 / 0); `try_gc_alloc_stable` memory is
+/// not guaranteed zeroed, so the items are cleared explicitly. `cap` is clamped
+/// to at least 1 (rlist.py:251 overallocation policy). Falls back to
+/// `std::alloc::alloc_zeroed` when the gate is off or no GC hook is installed
+/// (pure interpreter / early startup).
+///
+/// The block is allocated `stable` (old-gen, mark-sweep, non-moving) — the same
+/// tier as its `W_ListObject` owner (`listobject.rs` `try_gc_alloc_stable`).
+/// The items are plain scalars (no GC pointers), so the block is a varsize leaf
+/// the collector marks (it never relocates and never holds a young pointer, so
+/// the owning list needs no remembered-set barrier when the block changes); its
+/// `int_items.block` / `float_items.block` owner slot is marked-live by
+/// `list_object_custom_trace`.
+pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBlock {
     let cap = cap.max(1);
+    if itemsblock_gc_enabled() {
+        let payload = TYPED_ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<u64>();
+        if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(tid, payload) {
+            if !raw.is_null() {
+                let block = raw as *mut TypedItemsBlock;
+                unsafe {
+                    (*block).capacity = cap;
+                    std::ptr::write_bytes(
+                        typed_items_block_items_base(block),
+                        0,
+                        cap * std::mem::size_of::<u64>(),
+                    );
+                }
+                return block;
+            }
+        }
+    }
     let layout = typed_items_block_layout(cap);
     unsafe {
         let raw = alloc_zeroed(layout);
@@ -453,14 +535,17 @@ pub unsafe fn alloc_typed_items_block(cap: usize) -> *mut TypedItemsBlock {
 
 /// Grow a `TypedItemsBlock` to `new_cap`, copying `live_len` words from `old`,
 /// zero-filling the rest, and deallocating `old`. `old` may be null.
-/// rlist.py:262-267 parity.
+/// rlist.py:262-267 parity. `old` is allocated `stable` (old-gen, non-moving),
+/// so it keeps its address across the (possibly collecting) allocation of
+/// `fresh` and the live words are copied directly.
 pub unsafe fn grow_typed_items_block(
     old: *mut TypedItemsBlock,
     new_cap: usize,
     live_len: usize,
+    tid: u32,
 ) -> *mut TypedItemsBlock {
     unsafe {
-        let fresh = alloc_typed_items_block(new_cap);
+        let fresh = alloc_typed_items_block(new_cap, tid);
         if !old.is_null() && live_len > 0 {
             std::ptr::copy_nonoverlapping(
                 typed_items_block_items_base(old),
@@ -475,9 +560,15 @@ pub unsafe fn grow_typed_items_block(
     }
 }
 
-/// Deallocate a `TypedItemsBlock`. No-op on null.
+/// Deallocate a `TypedItemsBlock`. No-op on null. A GC-managed block is reclaimed
+/// by the collector and must never be freed here — its allocation is prefixed by
+/// a `GcHeader` the `std::alloc` layout knows nothing about. `try_gc_owns_object`
+/// gates the `std::alloc` free to the gate-off / no-hook fallback blocks.
 pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
     if block.is_null() {
+        return;
+    }
+    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
         return;
     }
     unsafe {

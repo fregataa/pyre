@@ -663,54 +663,32 @@ fn list_len_descr_for_strategy(strategy_id: i64) -> majit_ir::DescrRef {
 
 #[inline]
 fn list_heap_capacity_for_strategy(
-    frame: &mut crate::state::MIFrame,
+    _frame: &mut crate::state::MIFrame,
     ctx: &mut majit_metainterp::TraceCtx,
     list: majit_ir::OpRef,
     strategy_id: i64,
-    is_inline: bool,
+    _is_inline: bool,
 ) -> majit_ir::OpRef {
-    use majit_ir::OpCode;
-
-    match strategy_id {
-        0 => {
-            let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());
-            crate::state::opimpl_arraylen_gc(
-                ctx,
-                items_block,
-                crate::state::pyobject_gcarray_descr(),
-            )
-        }
-        1 | 2 => {
-            let heap_cap_descr = match strategy_id {
-                1 => crate::descr::list_int_items_heap_cap_descr(),
-                2 => crate::descr::list_float_items_heap_cap_descr(),
-                _ => unreachable!(),
-            };
-            let heap_cap = crate::state::opimpl_getfield_gc_i(ctx, list, heap_cap_descr);
-            if is_inline {
-                // Pyre-only typed-list storage adaptation: inline arrays
-                // encode capacity as `heap_cap == 0`; the backing pointer is
-                // the fixed inline buffer. Guard that shape before using the
-                // compile-time inline capacity constant.
-                frame.implement_guard_value(ctx, heap_cap, 0);
-                let inline_cap = match strategy_id {
-                    1 => pyre_object::INT_ARRAY_INLINE_CAP,
-                    2 => pyre_object::FLOAT_ARRAY_INLINE_CAP,
-                    _ => unreachable!(),
-                };
-                ctx.const_int(inline_cap as i64)
-            } else {
-                let zero = ctx.const_int(0);
-                let heap_storage = ctx.record_op(OpCode::IntGt, &[heap_cap, zero]);
-                if let Some(majit_ir::Value::Int(c)) = ctx.box_value(heap_cap) {
-                    ctx.set_opref_concrete(heap_storage, majit_ir::Value::Int((c > 0) as i64));
-                }
-                frame.generate_guard(ctx, OpCode::GuardTrue, &[heap_storage]);
-                heap_cap
-            }
-        }
+    // Capacity is `len(l.items)` (rlist.py:251) — the GcArray length header of
+    // the backing block, read with `ArraylenGc`. Identical shape for every
+    // strategy; only the block field descr + array descr differ.
+    let (block_descr, gcarray_descr) = match strategy_id {
+        0 => (
+            crate::descr::list_items_descr(),
+            crate::state::pyobject_gcarray_descr(),
+        ),
+        1 => (
+            crate::descr::list_int_items_block_descr(),
+            crate::state::int_gcarray_descr(),
+        ),
+        2 => (
+            crate::descr::list_float_items_block_descr(),
+            crate::state::float_gcarray_descr(),
+        ),
         _ => unreachable!(),
-    }
+    };
+    let block = load_items_block(ctx, list, block_descr);
+    crate::state::opimpl_arraylen_gc(ctx, block, gcarray_descr)
 }
 
 #[inline]
@@ -846,19 +824,19 @@ pub fn generated_list_setitem_by_strategy<F: pyre_jit_trace::walker_frame_ops::W
             );
         }
         1 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 frame.ctx_mut(),
                 obj,
-                crate::descr::list_int_items_ptr_descr(),
+                crate::descr::list_int_items_block_descr(),
             );
             let raw = unbox_int_or_long_for_int_strategy(frame, value, unbox_long);
-            crate::state::trace_raw_int_array_setitem_value(frame.ctx_mut(), items_ptr, index, raw);
+            crate::state::trace_int_block_setitem_value(frame.ctx_mut(), block, index, raw);
         }
         2 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 frame.ctx_mut(),
                 obj,
-                crate::descr::list_float_items_ptr_descr(),
+                crate::descr::list_float_items_block_descr(),
             );
             let raw = if frame.value_type(value) == majit_ir::Type::Float {
                 value
@@ -866,12 +844,7 @@ pub fn generated_list_setitem_by_strategy<F: pyre_jit_trace::walker_frame_ops::W
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
                 crate::state::trace_unbox_float_with_resume(frame, value, float_type_addr)
             };
-            crate::state::trace_raw_float_array_setitem_value(
-                frame.ctx_mut(),
-                items_ptr,
-                index,
-                raw,
-            );
+            crate::state::trace_float_block_setitem_value(frame.ctx_mut(), block, index, raw);
         }
         _ => unreachable!(),
     }
@@ -959,54 +932,54 @@ pub fn generated_list_setslice_same_len_by_strategy<
             }
         }
         1 => {
-            let dst_items = crate::state::opimpl_getfield_gc_i(
+            let dst_block = crate::state::opimpl_getfield_gc_r(
                 frame.ctx_mut(),
                 obj,
-                crate::descr::list_int_items_ptr_descr(),
+                crate::descr::list_int_items_block_descr(),
             );
-            let src_items = crate::state::opimpl_getfield_gc_i(
+            let src_block = crate::state::opimpl_getfield_gc_r(
                 frame.ctx_mut(),
                 value,
-                crate::descr::list_int_items_ptr_descr(),
+                crate::descr::list_int_items_block_descr(),
             );
             for i in 0..value_len {
                 let src_idx = frame.ctx_mut().const_int(i as i64);
                 let dst_idx = frame.ctx_mut().const_int(start + i as i64);
-                let item = crate::state::trace_raw_int_array_getitem_value(
+                let item = crate::state::trace_int_block_getitem_value(
                     frame.ctx_mut(),
-                    src_items,
+                    src_block,
                     src_idx,
                 );
-                crate::state::trace_raw_int_array_setitem_value(
+                crate::state::trace_int_block_setitem_value(
                     frame.ctx_mut(),
-                    dst_items,
+                    dst_block,
                     dst_idx,
                     item,
                 );
             }
         }
         2 => {
-            let dst_items = crate::state::opimpl_getfield_gc_i(
+            let dst_block = crate::state::opimpl_getfield_gc_r(
                 frame.ctx_mut(),
                 obj,
-                crate::descr::list_float_items_ptr_descr(),
+                crate::descr::list_float_items_block_descr(),
             );
-            let src_items = crate::state::opimpl_getfield_gc_i(
+            let src_block = crate::state::opimpl_getfield_gc_r(
                 frame.ctx_mut(),
                 value,
-                crate::descr::list_float_items_ptr_descr(),
+                crate::descr::list_float_items_block_descr(),
             );
             for i in 0..value_len {
                 let src_idx = frame.ctx_mut().const_int(i as i64);
                 let dst_idx = frame.ctx_mut().const_int(start + i as i64);
-                let item = crate::state::trace_raw_float_array_getitem_value(
+                let item = crate::state::trace_float_block_getitem_value(
                     frame.ctx_mut(),
-                    src_items,
+                    src_block,
                     src_idx,
                 );
-                crate::state::trace_raw_float_array_setitem_value(
+                crate::state::trace_float_block_setitem_value(
                     frame.ctx_mut(),
-                    dst_items,
+                    dst_block,
                     dst_idx,
                     item,
                 );
@@ -1316,19 +1289,19 @@ pub fn generated_list_append_by_strategy(
             crate::state::trace_items_block_setitem_value(ctx, items_block, len, value);
         }
         1 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx,
                 list,
-                crate::descr::list_int_items_ptr_descr(),
+                crate::descr::list_int_items_block_descr(),
             );
             let raw = unbox_int_or_long_for_int_strategy(frame, value, unbox_long);
-            crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, len, raw);
+            crate::state::trace_int_block_setitem_value(ctx, block, len, raw);
         }
         2 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx,
                 list,
-                crate::descr::list_float_items_ptr_descr(),
+                crate::descr::list_float_items_block_descr(),
             );
             let raw = if frame.value_type(value) == majit_ir::Type::Float {
                 value
@@ -1336,7 +1309,7 @@ pub fn generated_list_append_by_strategy(
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
                 crate::state::trace_unbox_float_with_resume(frame, value, float_type_addr)
             };
-            crate::state::trace_raw_float_array_setitem_value(ctx, items_ptr, len, raw);
+            crate::state::trace_float_block_setitem_value(ctx, block, len, raw);
         }
         _ => unreachable!(),
     }
@@ -1470,12 +1443,12 @@ pub fn generated_list_pop_by_strategy(
             item
         }
         1 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx,
                 list,
-                crate::descr::list_int_items_ptr_descr(),
+                crate::descr::list_int_items_block_descr(),
             );
-            let raw = crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, last_index);
+            let raw = crate::state::trace_int_block_getitem_value(ctx, block, last_index);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
             ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -1489,12 +1462,12 @@ pub fn generated_list_pop_by_strategy(
             )
         }
         2 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx,
                 list,
-                crate::descr::list_float_items_ptr_descr(),
+                crate::descr::list_float_items_block_descr(),
             );
-            let raw = crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, last_index);
+            let raw = crate::state::trace_float_block_getitem_value(ctx, block, last_index);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
             ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
@@ -2205,20 +2178,20 @@ pub fn generated_list_getitem_by_strategy(
             crate::state::trace_items_block_getitem_value(ctx, items_block, index)
         }
         1 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx,
                 obj,
-                crate::descr::list_int_items_ptr_descr(),
+                crate::descr::list_int_items_block_descr(),
             );
-            crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, index)
+            crate::state::trace_int_block_getitem_value(ctx, block, index)
         }
         2 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx,
                 obj,
-                crate::descr::list_float_items_ptr_descr(),
+                crate::descr::list_float_items_block_descr(),
             );
-            crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, index)
+            crate::state::trace_float_block_getitem_value(ctx, block, index)
         }
         _ => unreachable!(),
     }
