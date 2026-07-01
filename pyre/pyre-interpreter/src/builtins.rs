@@ -9,31 +9,62 @@ use crate::{
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
-/// The full byte storage of a memoryview backing, selecting the layout
-/// accessor by concrete kind so a bytes / bytearray / array *subclass*
-/// backing is read through its own fields — `bytes_like_data` exact-branches
-/// on the type and would mis-read a subclass.
-unsafe fn memoryview_backing_slice(backing: PyObjectRef) -> &'static [u8] {
+/// `buffer_w` — select the byte-storage `Buffer` variant for a memoryview
+/// backing by concrete kind, so a bytes / bytearray / array *subclass* backing
+/// is tagged for its own fields (`bytes_like_data` exact-branches on the type
+/// and would mis-read a subclass).  Construction lives here, not in
+/// pyre-object's `Buffer`, because the subclass fallback needs `isinstance_w`.
+unsafe fn memoryview_backing_buffer(backing: PyObjectRef) -> pyre_object::buffer::Buffer {
+    use pyre_object::buffer::Buffer;
     unsafe {
         if pyre_object::interp_array::is_array(backing) {
-            pyre_object::interp_array::w_array_bytes(backing)
+            Buffer::Array { w_obj: backing }
         } else if pyre_object::bytearrayobject::is_bytearray(backing) {
-            pyre_object::bytearrayobject::w_bytearray_data(backing)
+            Buffer::Byte { w_obj: backing }
         } else if pyre_object::bytesobject::is_bytes(backing) {
-            pyre_object::bytesobject::w_bytes_data(backing)
+            Buffer::String { w_obj: backing }
         } else if crate::baseobjspace::isinstance_w(
             backing,
             crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
         ) {
-            pyre_object::interp_array::w_array_bytes(backing)
+            Buffer::Array { w_obj: backing }
         } else if crate::baseobjspace::isinstance_w(
             backing,
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
         ) {
-            pyre_object::bytearrayobject::w_bytearray_data(backing)
+            Buffer::Byte { w_obj: backing }
         } else {
-            pyre_object::bytesobject::w_bytes_data(backing)
+            Buffer::String { w_obj: backing }
         }
+    }
+}
+
+/// The full byte storage of a memoryview backing, read through its tagged
+/// `Buffer` variant.
+unsafe fn memoryview_backing_slice(backing: PyObjectRef) -> &'static [u8] {
+    unsafe { memoryview_backing_buffer(backing).as_bytes() }
+}
+
+/// Mutable raw byte storage of a writable memoryview backing — `bytearray`
+/// or `array.array`, the two mutable buffer exporters.  `None` for a
+/// read-only exporter (`bytes`) or one without in-place byte storage, so a
+/// write assignment reports "cannot modify read-only memory".
+unsafe fn memoryview_backing_bytes_mut(backing: PyObjectRef) -> Option<&'static mut [u8]> {
+    unsafe {
+        let bytearray_ty =
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
+        if pyre_object::bytearrayobject::is_bytearray(backing)
+            || crate::baseobjspace::isinstance_w(backing, bytearray_ty)
+        {
+            return Some(pyre_object::bytearrayobject::w_bytearray_data_mut(backing));
+        }
+        let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+        if pyre_object::interp_array::is_array(backing)
+            || crate::baseobjspace::isinstance_w(backing, array_ty)
+        {
+            return Some(pyre_object::interp_array::w_array_vec_mut(backing).as_mut_slice());
+        }
+        None
     }
 }
 
@@ -46,86 +77,71 @@ unsafe fn memoryview_dim_value(tuple: PyObjectRef, i: i64) -> i64 {
     }
 }
 
-/// `_copy_base` — push one `isz`-wide element at byte offset `base`, dropping
-/// it when the address falls outside the backing (a reversed / strided slice
-/// past the end), so the gather never panics.
-fn memoryview_copy_base(full: &[u8], base: i64, isz: usize, out: &mut Vec<u8>) {
-    if isz > 0 && base >= 0 && base as usize + isz <= full.len() {
-        let b = base as usize;
-        out.extend_from_slice(&full[b..b + isz]);
-    }
-}
-
-/// `_copy_rec` — recursive C-order copy of dimension `idim`.  The innermost
-/// dimension walks `shape[ndim-1]` elements by `strides[ndim-1]`; an outer
-/// dimension recurses `shape[idim]` times, advancing `off` by `strides[idim]`.
-unsafe fn memoryview_copy_rec(
-    full: &[u8],
-    shape: PyObjectRef,
-    strides: PyObjectRef,
+/// Allocate a `W_MemoryView` over a freshly built off-heap `BufferView`.
+/// Selects the backing `Buffer` variant (needs `isinstance_w`, hence here and
+/// not in pyre-object) and pins every ref across the allocation — building the
+/// box and allocating the object can trigger a collection before the new
+/// memoryview roots them.
+#[allow(clippy::too_many_arguments)]
+unsafe fn w_memoryview_alloc(
+    w_obj: PyObjectRef,
+    w_backing: PyObjectRef,
+    w_format: PyObjectRef,
+    w_shape: PyObjectRef,
+    w_strides: PyObjectRef,
+    itemsize: i64,
     ndim: i64,
-    idim: i64,
-    mut off: i64,
-    isz: usize,
-    out: &mut Vec<u8>,
-) {
+    offset: i64,
+    length: i64,
+    readonly: bool,
+    released: bool,
+) -> PyObjectRef {
     unsafe {
-        let dimshape = memoryview_dim_value(shape, idim);
-        let dimstride = memoryview_dim_value(strides, idim);
-        if idim == ndim - 1 {
-            if dimstride == 0 {
-                return;
-            }
-            for _ in 0..dimshape {
-                memoryview_copy_base(full, off, isz, out);
-                off += dimstride;
-            }
-        } else {
-            for _ in 0..dimshape {
-                memoryview_copy_rec(full, shape, strides, ndim, idim + 1, off, isz, out);
-                off += dimstride;
-            }
-        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        pyre_object::gc_roots::pin_root(w_backing);
+        pyre_object::gc_roots::pin_root(w_format);
+        pyre_object::gc_roots::pin_root(w_shape);
+        pyre_object::gc_roots::pin_root(w_strides);
+        // Allocate the managed header first; old-gen allocation may trigger a
+        // moving collection, so read the relocated refs back from the shadow
+        // stack before building the off-heap view (mirrors `W_TupleObject`
+        // filling its items block from the `pop_roots`-relocated slots).
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(released);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let r_backing = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let r_format = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+        let r_strides = pyre_object::gc_roots::shadow_stack_get(sp + 4);
+        let view = pyre_object::bufferview::BufferView::Strided {
+            backing: memoryview_backing_buffer(r_backing),
+            w_obj: r_obj,
+            w_format: r_format,
+            w_shape: r_shape,
+            w_strides: r_strides,
+            itemsize,
+            ndim,
+            offset,
+            length,
+            readonly,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
     }
 }
 
 /// The LIVE logical bytes of a view, honouring `offset`/strides/shape so a
 /// strided slice (`m[::2]`, `m[::-1]`) or an N-D view gathers the right
-/// elements in C order (`buffer.py as_str` → `_copy_rec` / `_copy_base`).
-/// Reads the backing object's own storage — no detached copy — so the view
-/// observes later mutation of a bytearray / array source.
+/// elements in C order (`buffer.py as_str`).  Reads the backing object's own
+/// storage — no detached copy — so the view observes later mutation of a
+/// bytearray / array source.
 ///
 /// # Safety
 /// `mv` must point to a valid `W_MemoryView` with a live backing.
 pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
-    use pyre_object::memoryview::*;
-    unsafe {
-        let backing = w_memoryview_backing(mv);
-        let off = w_memoryview_offset(mv);
-        let itemsize = w_memoryview_itemsize(mv);
-        let length = w_memoryview_length(mv);
-        let ndim = w_memoryview_ndim(mv);
-        let isz = itemsize.max(0) as usize;
-        let full = memoryview_backing_slice(backing);
-        if ndim == 0 {
-            let mut out = Vec::with_capacity(isz);
-            memoryview_copy_base(full, off, isz, &mut out);
-            return out;
-        }
-        let count = if itemsize > 0 { length / itemsize } else { 0 };
-        let mut out = Vec::with_capacity(count.max(0) as usize * isz);
-        memoryview_copy_rec(
-            full,
-            w_memoryview_shape(mv),
-            w_memoryview_strides(mv),
-            ndim,
-            0,
-            off,
-            isz,
-            &mut out,
-        );
-        out
-    }
+    unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather() }
 }
 
 /// Buffer-acquisition parameters `(format, itemsize, readonly, total_bytes)`
@@ -669,11 +685,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
         let backing = w_memoryview_backing(mv);
-        let bytearray_ty =
-            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
-        if !(pyre_object::bytearrayobject::is_bytearray(backing)
-            || crate::baseobjspace::isinstance_w(backing, bytearray_ty))
-        {
+        if memoryview_backing_bytes_mut(backing).is_none() {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
         let itemsize = w_memoryview_itemsize(mv);
@@ -709,7 +721,8 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     "cannot modify size of memoryview object",
                 ));
             }
-            let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+            let full =
+                memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
             for (k, &idx) in indices.iter().enumerate() {
                 let dst = (offset + idx * stride0) as usize;
                 full[dst..dst + isz].copy_from_slice(&src[k * isz..k * isz + isz]);
@@ -743,7 +756,8 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             let packed = memoryview_pack_value(&fmt, isz, value)?;
             let start = memoryview_start_from_tuple(mv, index)?;
             let addr = (offset + start) as usize;
-            let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+            let full =
+                memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
             full[addr..addr + isz].copy_from_slice(&packed);
             return Ok(w_none());
         }
@@ -761,7 +775,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         }
         let packed = memoryview_pack_value(&fmt, isz, value)?;
         let addr = (offset + i * stride0) as usize;
-        let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+        let full = memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
         full[addr..addr + isz].copy_from_slice(&packed);
         Ok(w_none())
     }
@@ -1191,6 +1205,11 @@ fn memoryview_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     unsafe {
         if pyre_object::memoryview::is_w_memoryview(obj) {
+            // A released view has no buffer to gather (its box is dropped);
+            // `descr__cmp` falls through to identity, so report no bytes.
+            if pyre_object::memoryview::w_memoryview_released(obj) {
+                return None;
+            }
             return Some(memoryview_gather_bytes(obj));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {

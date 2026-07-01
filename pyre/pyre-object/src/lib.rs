@@ -10,6 +10,8 @@ pub use pyre_macros::pyre_class;
 
 pub mod _pypy_generic_alias;
 pub mod boolobject;
+pub mod buffer;
+pub mod bufferview;
 pub mod bytearrayobject;
 pub mod bytesobject;
 pub mod celldict;

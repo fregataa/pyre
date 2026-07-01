@@ -1090,6 +1090,29 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // registering it as a user function: with no registry entry, callsites
         // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
         // this failed user-graph entry (Layer-1 `call_registry.lookup`).
+        //
+        // NARROW-LOWERING HAZARD — the HOST_ENV resolution is faithful ONLY for
+        // the three numeric boxing structs (`W_FloatObject`/`W_IntObject`/
+        // `W_ComplexObject`) that `fuse_boxing_alloc` rewrites to a native
+        // `NewWithVtable` during MIR `simplify_lowered_graph`
+        // (`front/mir.rs:1409`, `model.rs` `payload_fields`) — *before* the
+        // rtyper runs, so a numeric `malloc_typed` never reaches Layer-3b.
+        // Upstream `jtransform.rewrite_op_malloc` (`jtransform.py:1012`) lowers
+        // EVERY mallocable GC struct to `new`/`new_with_vtable`; pyre has not
+        // ported that general path. So an UNFUSED `malloc_typed` (any non-numeric
+        // struct — `W_BytesObject`, `W_UnicodeObject`, the dict family, …)
+        // survives to Layer-3b and resolves to a residual `simple_call` carrying
+        // a symbolic fnaddr the executor cannot run. This is currently LATENT,
+        // not a live miscompile: the production tracer is FBW (non-numeric boxes
+        // run the genuine runtime `malloc_typed` GC helper), and the rtyper op
+        // stream is Path-2 census-only, never the assembled stream. Before any
+        // non-numeric box constructor is promoted toward Path-2 codegen, a
+        // fail-closed guard (the finding's "option (b)") must land FIRST in
+        // `flowspace_adapter::translate_op` — reject a surviving `[.., "lltype",
+        // "malloc_typed"]` `FunctionPath` with a `TyperError` (classified in
+        // `is_known_unported`) so the graph census-Skips to the legacy walker
+        // instead of silently matching a wrong residual call. Tracked by the
+        // boxing-lowering epic (#134/#142).
         if canonical_strip == ["lltype", "malloc_typed"] {
             continue;
         }
@@ -1204,21 +1227,29 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // lift failure would poison every caller.  Prefill the same
         // signature-only stub pygraph `register_unsafe_fn_stubs` uses
         // (the `ExtRegistryEntry.compute_result_annotation` shape) so
-        // callers annotate the declared unit/bool result and the
-        // codewriter emits the residual call via the fn's registered
-        // C ABI address (`pyre/jit_fnaddr.rs`).  The object-pointer
-        // marker (`OBJECTPTR_RETURN_TYPE`, stamped by the front-end on a
-        // `*mut PyObject`-returning opaque callee) projects to
-        // `OBJECTPTR` — the `default_someshell_for_lltype` →
-        // `lltype_to_annotation` path already covers `Ptr(_)`.  Other
-        // non-scalar returns fall through to the normal lift — no
-        // current marker needs them, and the stub builder's coverage is
-        // unaudited for that case.
+        // callers annotate the declared result and the codewriter emits
+        // the residual call via the fn's registered C ABI address
+        // (`pyre/jit_fnaddr.rs`).  The FUNC.RESULT token is the
+        // canonical spelling `front::mir::dont_look_inside_return_token`
+        // stamps from the callee's return `ValueType`, so each token
+        // decodes to the lltype whose `getkind` equals the legacy
+        // walker's `valuetype_to_concrete(result_ty)`: scalar tokens to
+        // their primitive lltype, `ref` to the generic `GCREF` Ptr
+        // (`getkind = 'ref'`).  The object-pointer marker
+        // (`OBJECTPTR_RETURN_TYPE`, stamped by `merge_hints_from_llbcs`
+        // for a `*mut PyObject`-returning opaque callee the front-end
+        // left untokened) projects to the typed `OBJECTPTR` — the
+        // `default_someshell_for_lltype` → `lltype_to_annotation` path
+        // already covers `Ptr(_)`.  An unrecognized token (none
+        // currently emitted) falls through to the normal lift.
         if graph.hints.iter().any(|h| h == "dont_look_inside") {
             let return_lltype = match graph.return_type.as_deref() {
                 None | Some("()") => Some(LowLevelType::Void),
                 Some("bool") => Some(LowLevelType::Bool),
                 Some("i64") => Some(LowLevelType::Signed),
+                Some("u64") => Some(LowLevelType::Unsigned),
+                Some("f64") => Some(LowLevelType::Float),
+                Some("ref") => Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()),
                 Some(s) if s == OBJECTPTR_RETURN_TYPE => {
                     Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
                 }
