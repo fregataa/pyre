@@ -1580,6 +1580,35 @@ impl TraceCtx {
         self.recorder.num_ops()
     }
 
+    /// Diagnostic: dump every recorded op (result OpRef = pos, opcode, args)
+    /// to stderr.  Used by the P2 carrier investigation to inspect the
+    /// def-use of the fused (callee continuation + root) bridge trace —
+    /// specifically whether the injected result OpRef has a reachable
+    /// def-chain bottoming in trace input args.
+    pub fn dump_trace_ops_diag(&self, label: &str) {
+        use majit_ir::operand::Operand;
+        eprintln!("[p2-ir] {label} num_ops={}", self.recorder.num_ops());
+        for op in self.recorder.ops() {
+            let args: Vec<String> = op
+                .args
+                .borrow()
+                .iter()
+                .map(|a| match a {
+                    Operand::Op(o) => format!("{:?}", o.pos.get()),
+                    Operand::InputArg(ia) => format!("IA{}", ia.index),
+                    Operand::Const(c) => format!("C{:?}", c.get()),
+                    Operand::None => "_".to_string(),
+                })
+                .collect();
+            eprintln!(
+                "[p2-ir]   {:?} = {:?} [{}]",
+                op.pos.get(),
+                op.opcode,
+                args.join(" ")
+            );
+        }
+    }
+
     /// Number of guard operations recorded so far.  The walker compares
     /// this across a `vable_getfield_*` / `vable_setfield` call to detect
     /// the `_nonstandard_virtualizable` PTR_EQ promote guard those helpers

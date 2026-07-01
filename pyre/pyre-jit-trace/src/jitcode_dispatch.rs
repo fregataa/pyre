@@ -6722,10 +6722,10 @@ fn fbw_carrier_resume() -> bool {
 
 /// RAII guard: mark the carrier-resume sub-walk for its lifetime, restore the
 /// prior value on drop (so nesting unwinds to the parent's setting).
-struct CarrierResumeGuard(bool);
+pub(crate) struct CarrierResumeGuard(bool);
 
 impl CarrierResumeGuard {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         CarrierResumeGuard(FBW_CARRIER_RESUME.with(|c| c.replace(true)))
     }
 }
@@ -11073,8 +11073,14 @@ fn try_walker_call_assembler_self_recursive(
         .get_loop_token_number(callee_key)
         .or_else(|| driver.get_pending_token_number(callee_key))
     else {
+        if std::env::var_os("PYRE_P2_DIAG").is_some() {
+            eprintln!("[p2-ca] decline pc={} reason=no-token", op.pc);
+        }
         return Ok(None);
     };
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        eprintln!("[p2-ca] EMIT pc={} token={token_number}", op.pc);
+    }
 
     // ---- emission (mirror of `trace_opcode.rs:6146-6204`) ----
     // Past this point every step records IR; `?` propagation aborts the

@@ -149,6 +149,13 @@ pub fn trace_bytecode(
     // callee framestack + walk innermost-first) instead of aborting to a no-JIT
     // re-interpret below.  Default off → the carrier abort path is unchanged.
     if let Some(ref carrier) = carrier {
+        // Shape A (`PYRE_P2_FRAMESTACK`): the orthodox driver-trampoline resume
+        // takes precedence over the `PYRE_P2_DRAIN` sub-walk+inject deviation.
+        if crate::state::p2_framestack_enabled() {
+            let action =
+                drive_bridge_framestack_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+            return (action, concrete_frame);
+        }
         if crate::state::p2_drain_enabled() {
             let action =
                 drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
@@ -560,6 +567,158 @@ fn drive_bridge_carrier_walk(
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
+    TraceAction::Abort
+}
+
+/// Shape A orthodox multi-frame bridge resume (`PYRE_P2_FRAMESTACK`).
+///
+/// Replaces the [`drive_bridge_carrier_walk`] sub-walk+inject deviation with a
+/// driver-managed framestack trampoline that mirrors RPython's
+/// `rebuild_from_resumedata` (resume.py:1042-1057) + continuous interpret loop:
+///
+///   1. The reconstructed callee framestack is held in the DRIVER (owned
+///      register banks per frame), not in `WalkContext` — the walker's register
+///      banks are borrowed slices (`&'frame mut [OpRef]`), so a `Vec<Frame>`
+///      field is borrow-check infeasible; the framestack lives here.
+///   2. Each frame is driven FORWARD from its resume pc via a single-frame
+///      `walk()` (`drive_bridge_carrier_subwalk` shape). Because the frame
+///      traces forward, its own recursive calls fold to a live `CALL_ASSEMBLER`
+///      (the self-recursive fold, `try_walker_call_assembler_self_recursive`) —
+///      NOT unrolled into frame reconstruction. `PYRE_P2_FRAMESTACK` therefore
+///      supersedes bounded unroll for the resumed recursion.
+///   3. A frame's `SubReturn` is delivered into its PARENT frame's dst register
+///      via `make_result_of_lastop` (`pyjitpl.py:258-275`) — the parent then
+///      resumes forward from its own resume pc with the child result live in
+///      its register. Innermost→outermost; the outermost callee's result lands
+///      in the ROOT portal frame, which resumes at `root_pc`.
+///
+/// This dissolves the (n-1)-vs-`fib(n-1)` provenance bug (the return is a live
+/// `CALL_ASSEMBLER` result, not a reconstructed-frame arg slot) and the
+/// missing-`CALL_ASSEMBLER` bug (recursion stays a call boundary).
+///
+/// **Build status**: gated OFF by default, and SAFE to enable. This slice wires
+/// the gate, reconstructs the deepest callee frame, and sub-walks it, then
+/// aborts the trace cleanly rather than compiling the reconstruction bridge:
+/// the sub-walk specializes the recursion to the captured base-case instance
+/// and the reconstructed-frame dst delivery does not line up with
+/// `make_result_of_lastop`, so compiling the bridge is unsound (SEGV / wrong
+/// value). A sound compiled multi-frame bridge needs the register-based
+/// `rebuild_from_resumedata` + continuous cross-frame forward walk described
+/// above (steps 1-3), which is a walker-architecture rework. Until that lands
+/// the clean abort degrades a multi-frame resume to a no-JIT re-interpret with
+/// the correct result, so `PYRE_P2_FRAMESTACK=1` is safe (no SEGV).
+fn drive_bridge_framestack_walk(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    w_code: *const (),
+    root_pc: usize,
+    cf_addr: usize,
+    carrier: &majit_metainterp::BridgeInlineCarrier,
+) -> TraceAction {
+    crate::jitcode_dispatch::bool_box_truth_reset();
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::fbw_store_journal_reset();
+
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        let pcs: Vec<usize> = carrier.recipes.iter().map(|r| r.pc).collect();
+        eprintln!(
+            "[p2-framestack] root_pc={root_pc} n_recipes={} recipe_pcs={pcs:?}",
+            carrier.recipes.len()
+        );
+    }
+
+    let Some(recipe) = carrier.recipes.last() else {
+        crate::jitcode_dispatch::census_record("P2Framestack::NoRecipes");
+        return TraceAction::Abort;
+    };
+
+    let root_ec = sym.concrete_execution_context;
+    let pre_pos = ctx.get_trace_position();
+    // Reconstruct the deepest resumed callee frame vable + its `argboxes_r`
+    // portal reds (mirror of the `drive_bridge_carrier_walk` setup).
+    let Some((_pending, argboxes_r)) =
+        crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())
+    else {
+        ctx.cut_trace(pre_pos);
+        crate::jitcode_dispatch::census_record("P2Framestack::SetupFailed");
+        return TraceAction::Abort;
+    };
+    let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.w_code) else {
+        ctx.cut_trace(pre_pos);
+        crate::jitcode_dispatch::census_record("P2Framestack::NoCalleePjc");
+        return TraceAction::Abort;
+    };
+    let Some(entry) = callee_pjc.resume_jitcode_pc_for(recipe.pc) else {
+        ctx.cut_trace(pre_pos);
+        crate::jitcode_dispatch::census_record("P2Framestack::NoCalleeEntry");
+        return TraceAction::Abort;
+    };
+    let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.w_code) as usize;
+    let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
+    let local_concretes = &recipe.concrete_r[..nlocals];
+
+    let pos_after_setup = ctx.get_trace_position();
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        let root_entry = crate::state::pyjitcode_for_code(w_code)
+            .and_then(|pjc| pjc.resume_jitcode_pc_for(root_pc));
+        eprintln!(
+            "[p2-fs] callee_entry(jit)={entry} callee.pc(py)={} root_pc(py)={root_pc} root_entry(jit)={root_entry:?} pos_pre={pre_pos:?} pos_after_setup={pos_after_setup:?}",
+            recipe.pc
+        );
+    }
+
+    // Drive the deepest reconstructed callee FORWARD from its resume pc. The
+    // sub-walk holds `CarrierResumeGuard` for its lifetime, so a nested
+    // self-recursive call folds to a live `CALL_ASSEMBLER` instead of
+    // re-unrolling the call tree.
+    let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
+        ctx,
+        sym,
+        root_pc,
+        &callee_pjc,
+        recipe.w_code as usize,
+        callee_w_globals,
+        entry,
+        &argboxes_r,
+        local_concretes,
+    );
+    let subwalk_result = match &walk {
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) },
+            _,
+        ))) => Some(*r),
+        _ => None,
+    };
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        let pos_after_subwalk = ctx.get_trace_position();
+        eprintln!(
+            "[p2-fs] subwalk outcome={:?} result={subwalk_result:?} pos_after_subwalk={pos_after_subwalk:?}",
+            walk.as_ref().map(|r| r.as_ref().map(|(o, pc)| (format!("{o:?}"), *pc)))
+        );
+    }
+
+    // SAFE ON: do NOT compile the sub-walk+inject+root-walk bridge. Under
+    // `PYRE_FBW_REC_UNROLL` the root walk re-materialises the resumed recursion
+    // as inline reconstructed frames (verified: final bridge has ZERO
+    // `CALL_ASSEMBLER`; the `IntAddOvf` addends are `GetarrayitemGcR` reads of
+    // the reconstructed callee `localsplus[0]` = the arg-box `n-1`/`n-2`, not the
+    // recursive results — the SEGV). The sub-walk DOES emit live `CALL_ASSEMBLER`
+    // ops ([p2-ca] EMIT), but they are dropped when the authoritative concrete
+    // execution folds the callee return chain back through the reconstructed
+    // frame slot. A correct compiled multiframe bridge needs the register-based
+    // continuous-walk rebuild (resume.py:1042 `rebuild_from_resumedata`:
+    // `consume_boxes` into register banks + one forward walk, NO frame-vable
+    // reconstruction) so the callee's live `CALL_ASSEMBLER` results are the
+    // bridge values — a deeper slice. Until then, abort cleanly: the guard
+    // failure re-interprets and yields the correct result, so `PYRE_P2_FRAMESTACK`
+    // is safe to enable (no SEGV, correct output) instead of compiling a
+    // malformed bridge.
+    let _ = subwalk_result;
+    ctx.cut_trace(pre_pos);
+    crate::jitcode_dispatch::bool_box_truth_reset();
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::fbw_store_journal_reset();
+    crate::jitcode_dispatch::census_record("P2Framestack::SafeAbortReconstruction");
     TraceAction::Abort
 }
 
@@ -1107,6 +1266,9 @@ fn full_body_walk_trace(
             );
         }
         return TraceAction::Abort;
+    }
+    if ctx.is_bridge_trace && std::env::var_os("PYRE_P2_DIAG").is_some() {
+        ctx.dump_trace_ops_diag("carrier-root-walk-end");
     }
     match walk_result {
         Some((_entry, _code_len, Ok((outcome, _end_pc)))) => match outcome {
