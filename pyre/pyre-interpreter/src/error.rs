@@ -658,6 +658,16 @@ impl PyError {
             let msg = pyre_object::w_str_new(&self.message);
             let args_list = pyre_object::w_list_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+            // `ImportError` / `ModuleNotFoundError` expose the message through a
+            // dedicated `msg` slot (`ImportError.__init__` stores `args[0]`
+            // there). The raw-message raise path bypasses `__init__`, so stamp
+            // `msg` here too — otherwise `e.msg` reads back `None`.
+            if matches!(
+                self.kind,
+                PyErrorKind::ImportError | PyErrorKind::ModuleNotFoundError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc, msg) };
+            }
         }
         // Stamp the deferred `name` / `obj` context onto the freshly
         // materialised NameError / AttributeError instance, the lazy
@@ -801,9 +811,9 @@ impl PyError {
             return self.message.clone();
         }
         // Infallible Display-side context: a raising `__str__` degrades to
-        // the placeholder rather than propagating.
-        unsafe { crate::display::py_str(self.exc_object) }
-            .unwrap_or_else(|_| "<unprintable>".to_string())
+        // the placeholder rather than propagating, and a lone surrogate is
+        // backslash-escaped rather than panicking.
+        unsafe { crate::display::py_str_display(self.exc_object) }
     }
 
     pub fn render_exception(&self) -> String {
@@ -964,7 +974,7 @@ fn render_exc_object(exc: PyObjectRef) -> String {
                 if first.is_null() {
                     String::new()
                 } else {
-                    crate::display::py_str(first).unwrap_or_else(|_| "<unprintable>".to_string())
+                    crate::display::py_str_display(first)
                 }
             } else {
                 // Multi-arg exceptions render as tuple repr — matches

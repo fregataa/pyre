@@ -2053,6 +2053,34 @@ fn print_sep_check(
     )))
 }
 
+/// Render `str(obj)` for writing to the (utf-8, strict) stdout stream.  The
+/// common all-UTF-8 result is returned directly; a lone surrogate is routed
+/// through `encode_object`'s strict handler, raising `UnicodeEncodeError`
+/// rather than panicking in `w_str_get_value`.
+unsafe fn print_render(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let w = unsafe { crate::py_str_wtf8(obj)? };
+    if let Ok(s) = w.as_str() {
+        return Ok(s.to_owned());
+    }
+    let s_obj = pyre_object::w_str_from_wtf8(w);
+    let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
+    Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"))
+}
+
+/// A text stream's `encoding`/`errors` (defaults `utf-8`/`strict`), read so a
+/// `str` write encodes through `encode_object` — routing a lone surrogate to
+/// the error handler instead of panicking in `w_str_get_value`.
+unsafe fn stream_encoding_errors(stream: PyObjectRef) -> (String, String) {
+    let attr = |name: &str, default: &str| -> String {
+        crate::baseobjspace::getattr_str(stream, name)
+            .ok()
+            .filter(|v| !v.is_null() && unsafe { pyre_object::is_str(*v) })
+            .map(|v| unsafe { pyre_object::w_str_get_value(v) }.to_string())
+            .unwrap_or_else(|| default.to_string())
+    };
+    (attr("encoding", "utf-8"), attr("errors", "strict"))
+}
+
 /// `print(*args)` — write space-separated str representations to stdout.
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
@@ -2083,14 +2111,14 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     for (i, &obj) in positional.iter().enumerate() {
         if i > 0 {
             match sep {
-                Some(s) => crate::print_output(&unsafe { crate::py_str(s)? }),
+                Some(s) => crate::print_output(&unsafe { print_render(s)? }),
                 None => crate::print_output(" "),
             }
         }
-        crate::print_output(&unsafe { crate::py_str(obj)? });
+        crate::print_output(&unsafe { print_render(obj)? });
     }
     match end {
-        Some(e) => crate::print_output(&unsafe { crate::py_str(e)? }),
+        Some(e) => crate::print_output(&unsafe { print_render(e)? }),
         None => crate::print_output("\n"),
     }
     Ok(w_none())
@@ -2888,7 +2916,12 @@ fn type_descr_new_with_metaclass(
 /// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py
 /// `app_isinstance` → `abstract_isinstance_w(allow_override=True)`.
 fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "isinstance() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "isinstance() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_bool_from(crate::baseobjspace::isinstance(
         args[0], args[1],
     )?))
@@ -2911,7 +2944,12 @@ pub fn call_isinstance(obj: PyObjectRef, cls: PyObjectRef) -> Option<bool> {
 /// `issubclass(cls, classinfo)` — pypy/module/__builtin__/abstractinst.py
 /// `app_issubclass` → `abstract_issubclass_w(allow_override=True)`.
 fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "issubclass() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "issubclass() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_bool_from(crate::baseobjspace::issubclass(
         args[0], args[1],
     )?))
@@ -4347,7 +4385,12 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// `repr(obj)` → string representation
 fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "repr() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "repr() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let s = unsafe { crate::py_repr(args[0])? };
     Ok(w_str_new(&s))
 }
@@ -4377,7 +4420,12 @@ pub(crate) fn py_ascii(obj: PyObjectRef) -> Result<String, crate::PyError> {
 /// `bltinmodule.c:builtin_ascii` — like `repr`, but escape every
 /// non-ASCII code point in the repr as `\xXX` / `\uXXXX` / `\UXXXXXXXX`.
 fn builtin_ascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "ascii() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "ascii() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_str_new(&py_ascii(args[0])?))
 }
 
@@ -4756,7 +4804,12 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
 fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "hasattr() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "hasattr() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     Ok(w_bool_from(
         crate::baseobjspace::getattr(obj, args[1]).is_ok(),
@@ -4765,7 +4818,12 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "getattr() takes at least two arguments");
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "getattr() takes at least two arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     match crate::baseobjspace::getattr(obj, args[1]) {
         Ok(val) => Ok(val),
@@ -4792,7 +4850,12 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// descriptors, TypeError on wrong-type values, etc.) and PyPy
 /// propagates those errors — they are NOT swallowed here.
 fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 3, "setattr() takes exactly three arguments");
+    if args.len() != 3 {
+        return Err(crate::PyError::type_error(format!(
+            "setattr() takes exactly three arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     crate::baseobjspace::setattr(obj, args[1], args[2])?;
     Ok(w_none())
@@ -4800,7 +4863,12 @@ fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `delattr(obj, name)` — PyPy: baseobjspace.py delattr
 fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "delattr() takes exactly 2 arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "delattr() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     crate::baseobjspace::delattr(obj, args[1])?;
     Ok(w_none())
@@ -5153,7 +5221,11 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let mode_obj = args[2];
     let source_str = unsafe {
         if pyre_object::is_str(source) {
-            pyre_object::w_str_get_value(source).to_string()
+            // The source is decoded to UTF-8 for the tokenizer; a lone
+            // surrogate raises `UnicodeEncodeError` (strict) rather than
+            // panicking in `w_str_get_value`.
+            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
+            String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8")
         } else if pyre_object::bytesobject::is_bytes_like(source) {
             String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(source)).into_owned()
         } else {
@@ -5845,7 +5917,12 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "id() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "id() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     // `space.id` (baseobjspace.py:843-854): a plain `int` yields its
     // value-derived `immutable_unique_id`; every other object falls back
     // to `compute_unique_id` — its address.
@@ -5867,7 +5944,12 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// unhashables, recurses through tuple/frozenset contents, and
 /// propagates user `__hash__` errors.
 pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "hash() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "hash() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_int_new(try_hash_value(args[0])?))
 }
 
@@ -6493,7 +6575,12 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `chr(i)` — PyPy: operation.py chr
 fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "chr() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "chr() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     // operation.py:28 — space.int_w unwraps to int
     let val = if unsafe { is_int(obj) } {
@@ -6899,7 +6986,12 @@ pub fn builtin_any_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_any(args)
 }
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "any() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "any() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let items = collect_iterable(args[0])?;
     for item in items {
         if crate::baseobjspace::is_true(item)? {
@@ -7135,12 +7227,17 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
     );
 }
 
-fn file_get_data(self_obj: PyObjectRef) -> String {
+/// The path-backed file object's buffered contents as raw bytes.  Binary and
+/// text streams both hold the exact file bytes here; text reads decode on the
+/// way out (`fd_bytes_to_obj`), so non-UTF-8 content survives a round trip.
+fn file_get_data(self_obj: PyObjectRef) -> Vec<u8> {
     crate::baseobjspace::getattr_str(self_obj, "__file_data__")
         .ok()
         .and_then(|d| unsafe {
-            if pyre_object::is_str(d) {
-                Some(pyre_object::w_str_get_value(d).to_string())
+            if pyre_object::bytesobject::is_bytes_like(d) {
+                Some(pyre_object::bytesobject::bytes_like_data(d).to_vec())
+            } else if pyre_object::is_str(d) {
+                Some(pyre_object::w_str_get_wtf8(d).as_bytes().to_vec())
             } else {
                 None
             }
@@ -7268,9 +7365,8 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         }
     }
     let data = file_get_data(args[0]);
-    let bytes = data.as_bytes();
-    let pos = file_get_pos(args[0]).min(bytes.len());
-    let remaining = &bytes[pos..];
+    let pos = file_get_pos(args[0]).min(data.len());
+    let remaining = &data[pos..];
     let n = if args.len() >= 2 {
         let n_val = unsafe { pyre_object::w_int_get_value(args[1]) };
         if n_val < 0 {
@@ -7333,12 +7429,11 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
     }
     let data = file_get_data(args[0]);
-    let bytes = data.as_bytes();
     let pos = file_get_pos(args[0]);
-    if pos >= bytes.len() {
+    if pos >= data.len() {
         return Ok(fd_bytes_to_obj(args[0], Vec::new()));
     }
-    let rest = &bytes[pos..];
+    let rest = &data[pos..];
     let mut end = rest
         .iter()
         .position(|&b| b == b'\n')
@@ -7383,7 +7478,12 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if let Some(fd) = file_get_fd(args[0]) {
         let bytes: Vec<u8> = unsafe {
             if pyre_object::is_str(args[1]) {
-                pyre_object::w_str_get_value(args[1]).as_bytes().to_vec()
+                // Encode through the stream's codec + error handler; a lone
+                // surrogate is routed to the handler (`strict` →
+                // UnicodeEncodeError) rather than panicking in
+                // `w_str_get_value`.
+                let (encoding, errors) = stream_encoding_errors(args[0]);
+                crate::type_methods::encode_object(args[1], &encoding, &errors)?
             } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
                 pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
             } else {
@@ -7410,18 +7510,27 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     // Append to __file_data__ and update on close.
     unsafe {
-        let prev = file_get_data(args[0]);
-        let s = if pyre_object::is_str(args[1]) {
-            pyre_object::w_str_get_value(args[1]).to_string()
+        let mut prev = file_get_data(args[0]);
+        let (bytes, len) = if pyre_object::is_str(args[1]) {
+            // Encode through the stream's codec + error handler so a lone
+            // surrogate raises (`strict`) instead of panicking in
+            // `w_str_get_value`. The reported count is characters written.
+            let (encoding, errors) = stream_encoding_errors(args[0]);
+            let bytes = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
+            (bytes, pyre_object::w_str_len(args[1]))
         } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
-            let data = pyre_object::bytesobject::bytes_like_data(args[1]);
-            String::from_utf8_lossy(data).into_owned()
+            let data = pyre_object::bytesobject::bytes_like_data(args[1]).to_vec();
+            let len = data.len();
+            (data, len)
         } else {
             return Err(crate::PyError::type_error("write() expects str or bytes"));
         };
-        let new_data = format!("{prev}{s}");
-        let len = s.len();
-        let _ = crate::baseobjspace::setattr_str(args[0], "__file_data__", w_str_new(&new_data));
+        prev.extend_from_slice(&bytes);
+        let _ = crate::baseobjspace::setattr_str(
+            args[0],
+            "__file_data__",
+            pyre_object::bytesobject::w_bytes_from_bytes(&prev),
+        );
         let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(true));
         Ok(w_int_new(len as i64))
     }
@@ -7476,9 +7585,9 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
                 .append(true)
                 .create(true)
                 .open(&name_s)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, data.as_bytes()))
+                .and_then(|mut f| std::io::Write::write_all(&mut f, &data))
         } else {
-            std::fs::write(&name_s, data.as_bytes())
+            std::fs::write(&name_s, &data)
         };
         if let Err(e) = write_res {
             return Err(crate::PyError::os_error_with_errno(
@@ -7633,7 +7742,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         }
     }
 
-    let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
+    let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             // Sandbox-intentional: with the host_env feature off the
@@ -7650,18 +7759,10 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         let read_result = rustpython_host_env::fs::read(&path);
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         match read_result {
-            Ok(bytes) => {
-                if binary {
-                    // Store bytes-as-string for now; we only support ASCII binary.
-                    String::from_utf8_lossy(&bytes).into_owned()
-                } else {
-                    match String::from_utf8(bytes) {
-                        Ok(s) => s,
-                        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-                    }
-                }
-            }
-            Err(_e) if writing => String::new(),
+            // Hold the exact file bytes; text-mode reads decode on the way
+            // out (`fd_bytes_to_obj`), so non-UTF-8 content is preserved.
+            Ok(bytes) => bytes,
+            Err(_e) if writing => Vec::new(),
             Err(e) => {
                 return Err(crate::PyError::os_error_with_errno(
                     e.raw_os_error().unwrap_or(2),
@@ -7670,11 +7771,15 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             }
         }
     } else {
-        String::new()
+        Vec::new()
     };
 
     let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_data__", w_str_new(&data));
+    let _ = crate::baseobjspace::setattr_str(
+        wrapper,
+        "__file_data__",
+        pyre_object::bytesobject::w_bytes_from_bytes(&data),
+    );
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_pos__", w_int_new(0));
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_name__", w_str_new(&path));
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
@@ -7843,16 +7948,18 @@ fn textio_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if args.len() < 2 {
         return Err(crate::PyError::type_error("write() requires (self, data)"));
     }
-    let s = unsafe {
-        if pyre_object::is_str(args[1]) {
-            pyre_object::w_str_get_value(args[1]).to_string()
-        } else {
-            return Err(crate::PyError::type_error("write() expects str"));
-        }
-    };
-    let bytes = pyre_object::bytesobject::w_bytes_from_bytes(s.as_bytes());
+    if unsafe { !pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error("write() expects str"));
+    }
+    // Encode through the stream's codec + error handler so a lone surrogate is
+    // routed to the handler (`strict` → UnicodeEncodeError) instead of
+    // panicking in `w_str_get_value`.
+    let (encoding, errors) = unsafe { stream_encoding_errors(args[0]) };
+    let encoded = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
+    let nchars = unsafe { pyre_object::w_str_len(args[1]) };
+    let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&encoded);
     textio_call_buffer(args[0], "write", &[bytes])?;
-    Ok(w_int_new(s.chars().count() as i64))
+    Ok(w_int_new(nchars as i64))
 }
 
 fn textio_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -8009,7 +8116,12 @@ pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_all(args)
 }
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "all() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "all() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let items = collect_iterable(args[0])?;
     for item in items {
         if !crate::baseobjspace::is_true(item)? {
@@ -8198,13 +8310,23 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// `divmod(a, b)` — pypy/interpreter/baseobjspace.py:2159 divmod row.
 fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "divmod() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "divmod() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     crate::baseobjspace::divmod(args[0], args[1])
 }
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py:2160 pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "pow() takes at least two arguments");
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "pow() takes at least two arguments ({} given)",
+            args.len()
+        )));
+    }
     if args.len() >= 3 && !unsafe { is_none(args[2]) } {
         crate::baseobjspace::pow3(args[0], args[1], args[2])
     } else {
@@ -8214,7 +8336,12 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `hex(x)` — PyPy: operation.py hex
 fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "hex() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "hex() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
         format!("-0x{:x}", -v)
@@ -8226,7 +8353,12 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `oct(x)` — PyPy: operation.py oct
 fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "oct() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "oct() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
         format!("-0o{:o}", -v)
@@ -8238,7 +8370,12 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `bin(x)` — PyPy: operation.py bin
 fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "bin() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "bin() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
         format!("-0b{:b}", -v)
@@ -8404,7 +8541,12 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// `format(value, format_spec='')` — operation.py format → space.format
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "format() takes at least one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "format() takes at least one argument ({} given)",
+            args.len()
+        )));
+    }
     let value = args[0];
     // `builtin_format_impl`: the `format_spec` must be a `str` — validated
     // here, before dispatch, so `format(value, 34)` reports `format()

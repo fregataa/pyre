@@ -54,7 +54,9 @@ fn make_sys_namespace_instance() -> PyObjectRef {
 /// allocation per live frame on every `_getframe` call; an
 /// acceptable price for stack-walking parity until the proper
 /// PyFrame typedef port lands.
-fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
+fn build_frame_stub_chain(
+    top: *mut crate::pyframe::PyFrame,
+) -> Result<PyObjectRef, crate::PyError> {
     let mut frames: Vec<*mut crate::pyframe::PyFrame> = Vec::new();
     let mut cursor = top;
     while !cursor.is_null() {
@@ -71,8 +73,10 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         let frame_ref = unsafe { &mut *frame_ptr };
         // `pyframe.py:540-545 getdictscope`: PyPy materialises
         // `f_locals` by running `fast2locals()` and exposing the
-        // resulting `debugdata.w_locals` dict.
-        let w_locals_obj = frame_ref.getdictscope().unwrap_or(pyre_object::PY_NULL);
+        // resulting `debugdata.w_locals` dict.  `fast2locals` writes through
+        // the live locals mapping and can raise, so propagate the error rather
+        // than masking it as an empty `f_locals`.
+        let w_locals_obj = frame_ref.getdictscope()?;
         // pyframe.py:128 get_w_globals_storage returns the globals dict object.  The
         // canonical `w_globals` is seeded by every frame constructor and
         // is the source of truth for the frame's globals.
@@ -103,7 +107,7 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         prev_stub = stub;
         top_stub = stub;
     }
-    top_stub
+    Ok(top_stub)
 }
 
 /// Build a `sys.namespace` frame stub for `traceback.tb_frame`
@@ -389,7 +393,7 @@ pub fn register_module(ns: &mut DictStorage) {
             // greedily so each stub's `f_back` points to the next
             // stub instead of `None`, otherwise traversal patterns
             // (`while f: f = f.f_back`) terminate at depth 1.
-            Ok(build_frame_stub_chain(current))
+            build_frame_stub_chain(current)
         }),
     );
     // sys.exc_info() → (type, value, traceback)
@@ -430,7 +434,12 @@ pub fn register_module(ns: &mut DictStorage) {
             dict_storage_store(fns, "optimize", w_int_new(0));
             dict_storage_store(fns, "dont_write_bytecode", w_int_new(0));
             dict_storage_store(fns, "no_user_site", w_int_new(0));
-            dict_storage_store(fns, "no_site", w_int_new(0));
+            // `-S` (skip `import site`) is recorded by the launcher.
+            dict_storage_store(
+                fns,
+                "no_site",
+                w_int_new(i64::from(crate::importing::no_site_flag())),
+            );
             dict_storage_store(fns, "ignore_environment", w_int_new(0));
             dict_storage_store(fns, "verbose", w_int_new(0));
             dict_storage_store(fns, "bytes_warning", w_int_new(0));
@@ -1021,7 +1030,14 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let stream = pyre_object::w_instance_new(crate::builtins::text_io_wrapper_type());
     let _ = crate::baseobjspace::setattr_str(stream, "name", w_str_new(name));
     let _ = crate::baseobjspace::setattr_str(stream, "encoding", w_str_new("utf-8"));
-    let _ = crate::baseobjspace::setattr_str(stream, "errors", w_str_new("strict"));
+    // `pylifecycle.c init_set_builtins_open`/`init_sys_streams`: stderr uses the
+    // `backslashreplace` handler so traceback printing never fails on a lone
+    // surrogate; stdout/stdin default to `strict`.
+    let _ = crate::baseobjspace::setattr_str(
+        stream,
+        "errors",
+        w_str_new(if to_stderr { "backslashreplace" } else { "strict" }),
+    );
     let _ = crate::baseobjspace::setattr_str(
         stream,
         "mode",
@@ -1032,29 +1048,34 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // Instance-stored builtin methods do not get `self` prepended (see
     // pyopcode load_method dispatch), so the first arg may be the string
     // directly. Pick whichever element is a real str.
-    fn pick_str(args: &[PyObjectRef]) -> Option<&str> {
+    fn pick_str(args: &[PyObjectRef]) -> Option<PyObjectRef> {
         for &a in args {
             if !a.is_null() && unsafe { is_str(a) } {
-                return Some(unsafe { w_str_get_value(a) });
+                return Some(a);
             }
         }
         None
     }
+    // Encode through `encode_object` with the stream's error handler so a lone
+    // surrogate is routed there (stdout `strict` → UnicodeEncodeError; stderr
+    // `backslashreplace` → escaped) instead of panicking in `w_str_get_value`.
     let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
             use std::io::Write;
-            if let Some(text) = pick_str(args) {
-                let _ = std::io::stderr().write_all(text.as_bytes());
-                return Ok(w_int_new(text.len() as i64));
+            if let Some(s_obj) = pick_str(args) {
+                let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")?;
+                let _ = std::io::stderr().write_all(&bytes);
+                return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
         })
     } else {
         crate::make_builtin_function("write", |args| {
             use std::io::Write;
-            if let Some(text) = pick_str(args) {
-                let _ = std::io::stdout().write_all(text.as_bytes());
-                return Ok(w_int_new(text.len() as i64));
+            if let Some(s_obj) = pick_str(args) {
+                let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
+                let _ = std::io::stdout().write_all(&bytes);
+                return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
         })

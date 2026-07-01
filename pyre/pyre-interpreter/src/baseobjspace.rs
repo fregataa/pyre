@@ -996,6 +996,26 @@ fn is_coroutine(w_obj: PyObjectRef) -> bool {
     }
 }
 
+/// True only for a native `async def` coroutine (`CO_COROUTINE`), excluding
+/// `@types.coroutine`-wrapped generators (`CO_ITERABLE_COROUTINE`).  Mirrors
+/// `PyCoro_CheckExact`, which gates the GET_AWAITABLE already-awaited guard.
+fn is_native_coroutine(w_obj: PyObjectRef) -> bool {
+    unsafe {
+        if !pyre_object::generator::is_generator(w_obj) {
+            return false;
+        }
+        let frame_ptr =
+            pyre_object::generator::w_generator_get_frame(w_obj) as *const crate::pyframe::PyFrame;
+        if frame_ptr.is_null() {
+            return false;
+        }
+        (*frame_ptr)
+            .code()
+            .flags
+            .contains(crate::CodeFlags::COROUTINE)
+    }
+}
+
 /// `generator.py:563 get_awaitable_iter` — return the iterator implementing the
 /// awaitable protocol for `w_obj`:
 ///   - `w_obj` itself when it is a coroutine (or `@types.coroutine` generator);
@@ -1005,6 +1025,19 @@ fn is_coroutine(w_obj: PyObjectRef) -> bool {
 /// missing-`__await__` error message differs.
 pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
     if is_coroutine(w_obj) {
+        // GET_AWAITABLE: re-awaiting a native coroutine that is already
+        // suspended at an `await` raises (`_PyGen_yf(coro) != NULL`). A native
+        // coroutine only ever suspends at an `await`, so "started, not
+        // exhausted, not currently running" is exactly that delegating state.
+        if is_native_coroutine(w_obj)
+            && unsafe {
+                pyre_object::generator::w_generator_is_started(w_obj)
+                    && !pyre_object::generator::w_generator_is_exhausted(w_obj)
+                    && !pyre_object::generator::w_generator_is_running(w_obj)
+            }
+        {
+            return Err(PyError::runtime_error("coroutine is being awaited already"));
+        }
         return Ok(w_obj);
     }
     let w_await = crate::typedef::r#type(w_obj)
@@ -4248,6 +4281,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 if !mro_ptr.is_null() {
                     return Ok(w_tuple_new((*mro_ptr).clone()));
                 }
+            }
+            if name == "__flags__" {
+                // typeobject.py:1237 descr__flags — the `tp_flags` bitmask.
+                // A getset on `type`, so a metaclass (a `type` subclass) carries
+                // it in its own MRO; without this short-circuit the type's-own-MRO
+                // path below would bind it with `obj=None` and yield the raw
+                // descriptor instead of the bitmask.
+                return Ok(w_int_new(w_type_get_flags(obj)));
             }
             if name == "__dict__" {
                 // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
@@ -9286,14 +9327,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
         // Seq iterator
         if is_seq_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::W_SeqIterObject);
-            let seq = iter.seq;
+            // Read through a raw pointer rather than a long-lived `&mut`: the
+            // generic branch below runs Python (which can relocate `obj`), so
+            // its writes go through a re-read pointer instead.
+            let iter_ptr = obj as *mut pyre_object::W_SeqIterObject;
+            let seq = (*iter_ptr).seq;
             // iterobject.py W_SeqIterObject.descr_next — a None (null) seq
             // marks an iterator already exhausted by an earlier IndexError.
             if seq.is_null() {
                 return Err(PyError::stop_iteration());
             }
-            let idx = iter.index;
+            let idx = (*iter_ptr).index;
             let item = if is_list(seq) {
                 pyre_object::w_list_getitem(seq, idx)
             } else if is_tuple(seq) {
@@ -9335,26 +9379,40 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // `W_SeqIterObject.descr_next` (iterobject.py:75-79), which
                 // catches only IndexError and clears `w_seq` on every error;
                 // the observable behaviour target is 3.14.
+                //
+                // `getitem` runs Python (`__getitem__`), which can relocate
+                // `obj`, so pin it and read the iterator state back through the
+                // re-read pointer rather than the now-stale `iter` reference.
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(obj);
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 match getitem(seq, w_int_new(idx)) {
-                    Ok(v) => Some(v),
+                    Ok(v) => {
+                        let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                            as *mut pyre_object::W_SeqIterObject;
+                        (*p).index += 1;
+                        return Ok(v);
+                    }
                     Err(e)
                         if e.kind == crate::PyErrorKind::IndexError
                             || e.kind == crate::PyErrorKind::StopIteration =>
                     {
-                        iter.seq = std::ptr::null_mut();
-                        None
+                        let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                            as *mut pyre_object::W_SeqIterObject;
+                        (*p).seq = std::ptr::null_mut();
+                        return Err(PyError::stop_iteration());
                     }
                     Err(e) => return Err(e),
                 }
             };
             if let Some(v) = item {
-                iter.index += 1;
+                (*iter_ptr).index += 1;
                 return Ok(v);
             }
             // iterobject.py:90-98 — an exhausted cursor clears its sequence ref
             // (the generic arm above already did so on IndexError); the builtin
             // arms clear it here so a held iterator reports as exhausted.
-            iter.seq = std::ptr::null_mut();
+            (*iter_ptr).seq = std::ptr::null_mut();
             return Err(PyError::stop_iteration());
         }
         // Range iterator

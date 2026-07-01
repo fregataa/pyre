@@ -28,10 +28,13 @@ A (module, backend) result is classified as:
   IMPORTERROR module could not even be imported (an interpreter/stdlib gap;
               this is the Phase-0 backlog the suite self-populates)
 
-Gating (default): a module recorded PASS in the baseline that no longer
-passes is a REGRESSION and makes the run exit nonzero. A module that newly
-passes is reported as an improvement but does not fail the run (run with
-`--update-baseline` to record it). `SKIP` baseline entries are not run.
+Gating (default): the run executes only the baseline-PASS subset — the
+non-PASS modules carry no gate signal and running the whole suite at the
+per-module timeout overruns the CI budget. A module recorded PASS that no
+longer passes is a REGRESSION and makes the run exit nonzero. Newly-passing
+modules surface only when the non-PASS modules are actually run, so use
+`--strict-baseline` (gates on unrecorded improvements), `--full`, or
+`--update-baseline` to detect them. `SKIP` baseline entries are not run.
 
 Usage:
     python3 pyre/cpython_tests/run.py [--backend dynasm|cranelift]
@@ -93,6 +96,7 @@ KNOWN_SKIPS = {
     "test.test_zipfile64": "demands too many resources",
     "test.test_largefile": "demands too many resources",
     "test.test_embed": "needs embedded CPython",
+    "test.test_xpickle": "spawns per-version pythonX.Y subprocesses (PATH-dependent, can deadlock)",
 }
 
 # ── classification ───────────────────────────────────────────────────

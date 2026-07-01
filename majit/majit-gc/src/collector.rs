@@ -842,12 +842,23 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
-        // A destructor-bearing object that never passes through the
-        // nursery (large object, or nursery-full fallback) is recorded
-        // straight onto the old-destructor list so a later major
-        // collection runs its destructor when it dies.
-        if (type_id as usize) < self.types.len() && self.types.get(type_id).destructor.is_some() {
-            self.old_objects_with_destructors.push(obj_addr);
+        if (type_id as usize) < self.types.len() {
+            let info = self.types.get(type_id);
+            // A destructor-bearing object that never passes through the
+            // nursery (large object, or nursery-full fallback) is recorded
+            // straight onto the old-destructor list so a later major
+            // collection runs its destructor when it dies.
+            if info.destructor.is_some() {
+                self.old_objects_with_destructors.push(obj_addr);
+            }
+            // A weakref born directly in the old generation (large object or
+            // nursery-full fallback) skips the young registration path, so
+            // record it straight onto the old-weakref list. Without this its
+            // `weakptr` is never invalidated and `weakref()` returns a
+            // dangling pointer once the target dies.
+            if info.is_weakref {
+                self.old_objects_with_weakrefs.push(obj_addr);
+            }
         }
         GcRef(obj_addr)
     }
@@ -1833,9 +1844,19 @@ impl MiniMarkGC {
             if pointing_to == 0 {
                 continue;
             }
-            // Minor collection only adds oldgen-resident targets here; the
-            // foreign-address path is filtered upstream. If the
-            // target's header reports VISITED, the weakref survives.
+            // A target that is not an old-gen object is immortal
+            // (`malloc_typed`): it carries no GcHeader to read a VISITED bit
+            // from and never dies, so the weakref stays valid. Keep tracking
+            // it with the slot intact, mirroring the foreign-target handling
+            // in `invalidate_young_weakrefs`. `alloc_in_oldgen` registers
+            // born-old weakrefs whose target may be such an immortal object
+            // (e.g. a weakref to a type), so this is reachable; the nursery is
+            // empty at this point, so any non-old-gen target is immortal.
+            if !self.oldgen.contains(pointing_to) {
+                new_with_weakref.push(obj_addr);
+                continue;
+            }
+            // The target's header reports VISITED → the weakref survives.
             let target_hdr = (pointing_to - GcHeader::SIZE) as *const GcHeader;
             if unsafe { (*target_hdr).has_flag(flags::VISITED) } {
                 new_with_weakref.push(obj_addr);
@@ -5795,11 +5816,11 @@ mod tests {
         // n: nursery-resident weakref target, kept live by a root.
         let n = gc.alloc_with_type(target_tid, 16);
         assert!(gc.is_in_nursery(n.0));
-        // w: old-gen weakref pointing at n; registered as an old weakref
-        // (what `invalidate_young_weakrefs` would do for an oldgen survivor).
+        // w: weakref born directly in the old generation, pointing at n.
+        // `alloc_in_oldgen` records born-old weakrefs onto
+        // `old_objects_with_weakrefs`, so no manual registration is needed.
         let w = gc.alloc_in_oldgen(wref_tid, GcHeader::SIZE + crate::weakref::SIZEOF_WEAKREF);
         unsafe { *((w.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = n };
-        gc.old_objects_with_weakrefs.push(w.0);
 
         let mut w_root = w;
         let mut n_root = n;

@@ -278,6 +278,20 @@ pub(crate) unsafe fn builtin_subclass_dunder(
     name: &str,
 ) -> Result<Option<String>, crate::PyError> {
     unsafe {
+        Ok(builtin_subclass_dunder_obj(obj, tp, name)?
+            .map(|r| pyre_object::w_str_get_value(r).to_string()))
+    }
+}
+
+/// `builtin_subclass_dunder` returning the raw `str` result object so a
+/// WTF-8-preserving caller (`py_str_wtf8`) can read a lone-surrogate result
+/// via `w_str_get_wtf8` instead of the panicking `w_str_get_value`.
+pub(crate) unsafe fn builtin_subclass_dunder_obj(
+    obj: PyObjectRef,
+    tp: *const PyType,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
         let is_leaf = std::ptr::eq(tp, &INT_TYPE as *const PyType)
             || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
             || std::ptr::eq(tp, &FLOAT_TYPE as *const PyType)
@@ -305,7 +319,7 @@ pub(crate) unsafe fn builtin_subclass_dunder(
         // A raising override propagates; a non-string return is a TypeError.
         let r = crate::builtins::call_and_check(found, &[obj])?;
         if pyre_object::is_str(r) {
-            return Ok(Some(pyre_object::w_str_get_value(r).to_string()));
+            return Ok(Some(r));
         }
         Err(dunder_returned_non_string(name, r))
     }
@@ -929,6 +943,13 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         if !obj.is_null() {
             let tp = (*obj).ob_type;
             if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
+                // A `str` subclass's `__str__` override wins over the raw value,
+                // mirroring `py_str`'s STR_TYPE branch. Read the result via
+                // `w_str_get_wtf8` so a lone-surrogate return is preserved
+                // rather than panicking in `w_str_get_value`.
+                if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {
+                    return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+                }
                 return Ok(pyre_object::w_str_get_wtf8(obj).to_wtf8_buf());
             }
             if pyre_object::is_exception(obj) {
@@ -949,6 +970,30 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
             }
         }
         Ok(Wtf8Buf::from_string(py_str(obj)?))
+    }
+}
+
+/// `str(obj)` for diagnostic display (traceback headers / messages written to
+/// stderr): like [`py_str`], but a lone surrogate is backslash-escaped
+/// (`\udcXX`, the `backslashreplace` handler stderr uses) and a raising
+/// `__str__` degrades to a placeholder, so rendering a diagnostic never panics.
+///
+/// # Safety
+/// `obj` must be a valid object.
+pub unsafe fn py_str_display(obj: PyObjectRef) -> String {
+    unsafe {
+        let w = match py_str_wtf8(obj) {
+            Ok(w) => w,
+            Err(_) => return "<unprintable>".to_string(),
+        };
+        if let Ok(s) = w.as_str() {
+            return s.to_owned();
+        }
+        let s_obj = pyre_object::w_str_from_wtf8(w);
+        crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| "<unprintable>".to_string())
     }
 }
 

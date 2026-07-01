@@ -166,6 +166,10 @@ fn real_main(binary_name: &str) {
     // user statement, not only after the first JIT-traced bytecode.
     pyre_jit::eval::init_jit_hooks();
 
+    // Record `-S` before the first `import sys` so `sys.flags.no_site`
+    // reflects whether site initialization was skipped.
+    importing::set_no_site(no_site);
+
     match mode {
         RunMode::Command(cmd) => {
             // Initialize sys.path with CWD for -c mode.
@@ -470,6 +474,13 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             pyre_object::w_none(),
         );
     }
+
+    // `sys.path` is created as an empty placeholder; mirror the native search
+    // path into it before `site` and user code read it (run_module does the
+    // same after its importlib bootstrap). `sync_python_sys_path` needs `sys`
+    // loaded, so import it first.
+    let _ = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr);
+    importing::sync_python_sys_path();
 
     import_site(no_site, canonical, ec_ptr);
 

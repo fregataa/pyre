@@ -2060,6 +2060,24 @@ thread_local! {
         // normally traced by the translated GC. Walk its value slots
         // explicitly until the table is folded into the object layout.
         majit_gc::shadow_stack::register_extra_root_walker(pyre_interpreter_side_table_root_walker);
+        // The signal-handler table (`signal.interp_signal::HANDLERS`) is an
+        // immortal dict, so the collector does not trace its heap handler
+        // callables. Walk its value slots as roots so a handler reachable
+        // only through it survives `gc.collect`. The `signal` module is not
+        // built for wasm, so there is no handler table to walk there.
+        #[cfg(not(target_arch = "wasm32"))]
+        majit_gc::shadow_stack::register_extra_root_walker(signal_handler_root_walker);
+        // `GcWeakrefBox` instances are immortal, so the collector never
+        // relocates / retains their inline `inner` Weakref pointer. Walk
+        // those slots as roots so a cached weakref's boxed Weakref stays
+        // coherent across collections (otherwise `get_or_make_weakref`'s
+        // cache returns a dangling pointer after a minor cycle).
+        majit_gc::shadow_stack::register_extra_root_walker(weakref_box_inner_root_walker);
+        // `W_SRE_Pattern` instances are immortal, so the collector never
+        // traces their GC-heap `w_pattern` / `w_groupindex` / `w_indexgroup`
+        // slots. Walk them as roots so a compiled pattern's named-group dict
+        // stays live (otherwise `groupdict()` iterates a reclaimed dict).
+        majit_gc::shadow_stack::register_extra_root_walker(sre_pattern_root_walker);
         // JIT-created callee frames (frame arena + heap fallbacks) hold
         // GC refs in their locals arrays but sit on no
         // `CURRENT_FRAME`/`f_backref` chain while compiled code runs,
@@ -2267,6 +2285,25 @@ fn visit_pyobject_root(
 
 fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
+    });
+}
+
+fn weakref_box_inner_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_object::weakref::walk_gc_weakref_box_inner_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
+    });
+}
+
+fn sre_pattern_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_object::interp_sre::walk_sre_pattern_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }

@@ -1102,13 +1102,16 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         }
     }
     if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+        // `exception_trace` fabricates an `OperationError` whose
+        // `normalize_exception` follows the `raise inst` shape
+        // (error.py:238-245): the raised instance must sit in the
+        // `w_type` slot with a null value so the `(inst, None)` path
+        // derives the class.  Passing the instance as `w_value` with a
+        // null `w_type` makes `normalize_exception` take `w_inst = w_type`
+        // (null) and raise "exceptions must derive from BaseException".
+        let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_obj) };
         if let Err(trace_err) = unsafe {
-            (*ec).exception_trace(
-                frame as *mut PyFrame,
-                pyre_object::PY_NULL,
-                exc_obj,
-                pyre_object::PY_NULL,
-            )
+            (*ec).exception_trace(frame as *mut PyFrame, exc_obj, pyre_object::PY_NULL, w_tb)
         } {
             // pyopcode.py:148 `ec.exception_trace(self, operr)` is
             // outside the except-block; a raise here propagates past
@@ -1325,12 +1328,33 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // no-tracer hot path is a single null-check + ticker decrement.
         let ec = frame.execution_context as *mut crate::PyExecutionContext;
         if !ec.is_null() {
-            unsafe {
+            let trace_result = unsafe {
                 (*ec).bytecode_trace(
                     frame as *mut PyFrame,
                     crate::executioncontext::TICK_COUNTER_STEP,
-                )?
+                )
             };
+            // pypy/interpreter/pyopcode.py:71-97 `handle_bytecode` wraps
+            // `dispatch_bytecode` (which runs `bytecode_trace` at :203) in the
+            // same `except OperationError`/`KeyboardInterrupt` that routes an
+            // opcode error through `handle_operation_error`.  An exception a
+            // signal handler delivers from `bytecode_trace` (e.g.
+            // `CheckSignalAction` raising `KeyboardInterrupt`) must therefore
+            // search this frame's exception blocks at `last_instr`, exactly
+            // like the opcode error path below — not unwind the frame.
+            // Propagating with `?` skipped that block search, so a `try`
+            // around the interrupted instruction was bypassed and the
+            // exception surfaced one frame up.
+            if let Err(mut err) = trace_result {
+                if err.kind == crate::PyErrorKind::GeneratorReturn {
+                    let gen_ptr = err.message.parse::<usize>().unwrap_or(0);
+                    return Ok(gen_ptr as pyre_object::PyObjectRef);
+                }
+                if handle_exception(frame, &mut err, &mut next_instr) {
+                    continue;
+                }
+                return Err(err);
+            }
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_for_dispatch(code, pc)?;
         let fallthrough = opcode_pc + 1;
