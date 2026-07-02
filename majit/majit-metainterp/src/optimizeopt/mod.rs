@@ -500,10 +500,10 @@ impl PartialEq for ImportedShortPureOp {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportedShortAlias {
     pub result: OpRef,
-    /// MIGRATION (#9): the canonical box of the SameAs source operand,
-    /// carried directly off `extra_same_as` instead of a positional
-    /// round-trip.
-    pub same_as_source: majit_ir::box_ref::BoxRef,
+    /// The canonical operand of the SameAs source, carried directly off
+    /// `extra_same_as` (already an `Operand` op-arg) instead of round-tripping
+    /// through a positional box.
+    pub same_as_source: majit_ir::operand::Operand,
     pub same_as_opcode: OpCode,
 }
 
@@ -651,21 +651,17 @@ pub struct OptContext {
     /// the exported loop-header inputargs.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
     /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
-    /// + virtuals)` — the ShortBoxes-stored renamed inputarg boxes
+    /// + virtuals)` — the ShortBoxes-stored renamed inputarg positions
     /// themselves, carried from the preview pass (optimizer.rs, where the
     /// ShortBoxes object lives) to `export_state_with_bounds` through the
-    /// same channel as `exported_short_boxes`. Position projection equals
-    /// the export-site `label_args + virtuals` recompute (measured
-    /// identical across the corpus, 2026-06-11).
-    pub exported_short_inputargs: Vec<majit_ir::box_ref::BoxRef>,
+    /// same channel as `exported_short_boxes` (measured identical to the
+    /// export-site `label_args + virtuals` recompute across the corpus,
+    /// 2026-06-11).
+    pub exported_short_inputargs: Vec<OpRef>,
     /// Rooted `InputArgRc` carriers for `exported_short_inputargs`, index-
-    /// aligned with that vector. Each renamed short-preamble input box
-    /// (`exported_short_inputargs[i]`) holds a WEAK handle to
-    /// `exported_short_inputarg_refs[i]`; keeping the strong Rc alive here
-    /// lets the box resolve to a real bound `InputArg` (so the operand binds
-    /// to `Operand::InputArg` instead of an unbound position-only box, which
-    /// `from_boxref` now rejects). Carried alongside `exported_short_inputargs`
-    /// through the same export channel.
+    /// aligned with that vector. Keeping the strong Rc alive here preserves
+    /// the renamed inputarg producer across the export boundary; consumers
+    /// that need an operand bind the stored position directly.
     pub exported_short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
@@ -2919,11 +2915,11 @@ impl OptContext {
     pub fn initialize_imported_short_preamble_builder(
         &mut self,
         label_args: &[OpRef],
-        short_inputargs: &[majit_ir::box_ref::BoxRef],
+        short_inputargs: &[OpRef],
         exported_short_boxes: &[crate::optimizeopt::shortpreamble::PreambleOp],
     ) {
         let produced: Vec<(
-            majit_ir::box_ref::BoxRef,
+            majit_ir::operand::Operand,
             crate::optimizeopt::shortpreamble::ProducedShortOp,
         )> = exported_short_boxes
             .iter()
@@ -2942,7 +2938,7 @@ impl OptContext {
                 // synthetic and the second (stable) box is the real key.
                 let pos = entry.op.pos.get();
                 let _ = self.materialize_box_at(pos);
-                let res = self.materialize_box_at(pos);
+                let res = self.materialize_operand_at(pos);
                 (
                     res.clone(),
                     crate::optimizeopt::shortpreamble::ProducedShortOp {
@@ -2987,7 +2983,7 @@ impl OptContext {
     pub fn initialize_imported_short_preamble_builder_from_short_boxes(
         &mut self,
         short_args: &[OpRef],
-        short_inputargs: &[majit_ir::box_ref::BoxRef],
+        short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
         short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
@@ -3084,7 +3080,7 @@ impl OptContext {
             if produced_op.res.to_opref().is_constant() {
                 continue;
             }
-            if let Some(info) = exported_infos.get(&produced_op.res) {
+            if let Some(info) = exported_infos.get(&produced_op.res.to_boxref()) {
                 self.set_preamble_forwarded_info(replay_pos(*source, produced_op), info);
             }
         }
@@ -3098,7 +3094,7 @@ impl OptContext {
         // invented-name replay-position aliasing the dual key compensates for,
         // so the builder map collapses to a single box-identity key.
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
-        let mut builder_entries: Vec<(majit_ir::box_ref::BoxRef, ProducedShortOp)> =
+        let mut builder_entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
         let mut produced_results: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
@@ -3209,7 +3205,7 @@ impl OptContext {
                     if let Some(d) = produced_op.preamble_op.getdescr() {
                         op.setdescr(d);
                     }
-                    let res = self.materialize_box_at(op.pos.get());
+                    let res = self.materialize_operand_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         res,
@@ -3252,7 +3248,7 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[obj_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_box_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
@@ -3293,7 +3289,7 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_box_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
@@ -3332,7 +3328,7 @@ impl OptContext {
                     let func_b = dep_or_materialize(self, &produced, func_opref);
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos.set(replay_pos(*source, produced_op));
-                    let res = self.materialize_box_at(op.pos.get());
+                    let res = self.materialize_operand_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         res,
@@ -4183,7 +4179,7 @@ impl OptContext {
                     .iter()
                     .map(|op| ImportedShortAlias {
                         result: op.pos.get(),
-                        same_as_source: op.arg(0).to_boxref(),
+                        same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
                     .collect()
@@ -10455,10 +10451,7 @@ mod imported_short_preamble_fallback_tests {
             OptContext::with_inputarg_types(16, &[majit_ir::Type::Ref, majit_ir::Type::Ref]);
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
-            &[
-                majit_ir::box_ref::BoxRef::from_opref(OpRef::int_op(7)),
-                majit_ir::box_ref::BoxRef::from_opref(OpRef::int_op(8)),
-            ],
+            &[OpRef::int_op(7), OpRef::int_op(8)],
             &[],
         );
 

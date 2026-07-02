@@ -3325,10 +3325,10 @@ impl Optimizer {
                         };
                         Some(crate::optimizeopt::shortpreamble::PreambleOp {
                             op: preamble_op,
-                            // short_op.res travels with the entry — the SAME
-                            // box object the preview ProducedShortOp carries,
-                            // so the export/re-import round trip preserves
-                            // upstream Box identity.
+                            // short_op.res travels with the entry as the
+                            // exported `PreambleOp.res` operand; the preview
+                            // ProducedShortOp already carries the bound producer
+                            // / const operand, so it moves across unchanged.
                             res: produced.res.clone(),
                             kind: produced.kind,
                             label_arg_idx,
@@ -3703,22 +3703,13 @@ impl Optimizer {
                     arg.set_position(opref.raw());
                 }
                 for arg in &mut state.end_args {
-                    remap_boxref(arg);
+                    remap_opref(arg);
                 }
                 for arg in &mut state.renamed_inputargs {
-                    remap_boxref(arg);
+                    remap_opref(arg);
                 }
-                for arg in &state.short_inputargs {
-                    // A bound short inputarg live-tracks its producer's
-                    // `op.pos`, already remapped by the main loop, so it needs
-                    // no rewrite. Only position-only boxes (test fixtures) carry
-                    // a pre-remap position the table must rewrite.
-                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
-                        continue;
-                    }
-                    let mut opref = arg.to_opref();
-                    remap_opref(&mut opref);
-                    arg.set_position(opref.raw());
+                for arg in &mut state.short_inputargs {
+                    remap_opref(arg);
                 }
                 // exported_infos is keyed by box identity (Rc::ptr_eq), so its keys
                 // need NO position remap — the lookup matches by Rc, not OpRef. The
@@ -3779,32 +3770,16 @@ impl Optimizer {
                             );
                         }
                     }
-                    // same_as_source: same rule as res below — the stored
-                    // box object is shared with the preview ProducedShortOp,
-                    // so rewrite its position Cell in place instead of
-                    // replacing it with a fresh position-only mint.
-                    if let Some(ref src) = entry.same_as_source {
-                        if let Some(op) = src.bound_op() {
-                            src.set_position(op.pos.get().raw());
-                        } else {
-                            let mut src_opref = src.to_opref();
-                            remap_opref(&mut src_opref);
-                            src.set_position(src_opref.raw());
-                        }
-                    }
-                    // res: a bound box live-tracks its producer through the
-                    // op handle — the producer's `Op.pos` was already
-                    // remapped above, so refreshing the position Cell from
-                    // it is idempotent (no double-map). Position-only mints
-                    // (test fixtures) go through the remap table instead;
-                    // `set_position` is a no-op for InputArg/Const kinds.
-                    if let Some(op) = entry.res.bound_op() {
-                        entry.res.set_position(op.pos.get().raw());
-                    } else {
-                        let mut res_opref = entry.res.to_opref();
-                        remap_opref(&mut res_opref);
-                        entry.res.set_position(res_opref.raw());
-                    }
+                    // same_as_source is a producer-bound operand (or None):
+                    // it live-tracks its producer's already-remapped `Op.pos`
+                    // through the carried `Rc<Op>`, so there is no separate
+                    // position Cell to rewrite. The former bound-box refresh
+                    // copied that same `op.pos`; the position-only else-branch
+                    // was dead since #173 roots the producer.
+                    // res: a producer-bound / const operand live-tracks its
+                    // producer through the carried handle — the producer's
+                    // `Op.pos` was already remapped above, so there is no
+                    // separate position to rewrite (same as `same_as_source`).
                 }
             }
         }
@@ -6928,10 +6903,10 @@ mod tests {
         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],
-            &[rooted_resop_box(Type::Int, 0)],
+            &[OpRef::int_op(0)],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op.clone()),
-                res: rooted_resop_box(Type::Int, 14),
+                res: rooted_resop_operand(Type::Int, 14),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -6965,20 +6940,8 @@ mod tests {
         let sp = ctx
             .build_imported_short_preamble()
             .expect("forcing imported short guard arg should build short preamble");
-        assert_eq!(
-            sp.used_boxes
-                .iter()
-                .map(|b| b.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::int_op(14)]
-        );
-        assert_eq!(
-            sp.jump_args
-                .iter()
-                .map(|b| b.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::int_op(14)]
-        );
+        assert_eq!(sp.used_boxes, vec![OpRef::int_op(14)]);
+        assert_eq!(sp.jump_args, vec![OpRef::int_op(14)]);
     }
 
     #[test]

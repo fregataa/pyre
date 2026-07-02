@@ -4072,13 +4072,10 @@ mod tests {
         preamble_op.pos.set(source);
         ctx.initialize_imported_short_preamble_builder(
             &[object, resolved],
-            &[
-                bound_arg(object).to_boxref(),
-                bound_arg(resolved).to_boxref(),
-            ],
+            &[object, resolved],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op.clone()),
-                res: bound_arg(source).to_boxref(),
+                res: bound_arg(source),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,
