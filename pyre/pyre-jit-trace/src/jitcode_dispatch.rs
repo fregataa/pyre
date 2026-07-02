@@ -7719,8 +7719,8 @@ pub(crate) fn fbw_store_journal_rollback() {
     // (allocation-free length set; the journal records only spare-capacity
     // appends, so there is no realloc to undo and the strategy at rollback
     // equals the strategy at push). Dispatch the rewind to the strategy's
-    // length field: Object rewinds the `W_ListObject.length` header, Integer
-    // the `int_items` vec length.
+    // length field: Object rewinds the `W_ListObject.length` header,
+    // Integer/Float the `int_items`/`float_items` length.
     FBW_APPEND_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some((list, length_before)) = entries.pop() {
@@ -7743,10 +7743,15 @@ pub(crate) fn fbw_store_journal_rollback() {
                     pyre_object::listobject::ListStrategy::Integer => {
                         pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
                     }
-                    // Empty/Float never enter the append journal (no
-                    // spare-capacity fold path records them); nothing to rewind.
-                    pyre_object::listobject::ListStrategy::Empty
-                    | pyre_object::listobject::ListStrategy::Float => {}
+                    // Float items are non-ptr f64 scalars (no stale GC ref to
+                    // clear, unlike the Object slot), so rewinding the length
+                    // field suffices.
+                    pyre_object::listobject::ListStrategy::Float => {
+                        pyre_object::listobject::ll_list_float_set_len(list_ref, length_before);
+                    }
+                    // Empty never enters the append journal (no spare-capacity
+                    // fold path records it); nothing to rewind.
+                    pyre_object::listobject::ListStrategy::Empty => {}
                 }
             }
         }
@@ -12362,6 +12367,27 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // #171 ORTHODOX descent for the LIST_APPEND opcode (comprehension append,
+    // e.g. `[f(x) for x in xs]`).  The codewriter lowers LIST_APPEND to a void
+    // `jit_list_append(list, value)` residual tagged `ListAppendValue` (the
+    // list is the peeked receiver, the value the popped operand — no
+    // bound-method callable), so it arrives with `dst_bank == 'v'`.  Fold it
+    // through the same `w_list_append` descent as the CallFn method-call form;
+    // a decline falls through to the generic residual (SAFE — identical to the
+    // trait tracer's `jit_list_append`).  Gated to top full-body frames, not
+    // inside a sub-walk (same caller-side-effect doubling concern as the CallFn
+    // form).  Default ON (`PYRE_171_ORTHODOX=0` opts out).
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && dst_bank == 'v'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::ListAppendValue
+        && pyre_171_orthodox_enabled()
+        && try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // B3 (`PYRE_FBW_RAISE`, default OFF): a `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
     // constructs the exception, and a `RaiseVarargs`
@@ -14895,8 +14921,8 @@ fn try_walker_orthodox_list_append(
         return Ok(None);
     }
 
-    // Recognition: bound builtin `list.append` + Integer-storage list +
-    // plain-int value + spare capacity (mirror the fold's gate).
+    // Recognition: the callable must be the bound builtin `list.append`; the
+    // receiver + value then pass the shared storage/spare-capacity gate.
     let (inner_func, inner_self, len_before) = unsafe {
         if !pyre_object::function::is_method(callable) {
             return Ok(None);
@@ -14910,55 +14936,21 @@ fn try_walker_orthodox_list_append(
         if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
             return Ok(None);
         }
-        // `is_plain_int1` accepts a fits-int `W_LongObject` (it implies
-        // `_fits_int()`), but a long is declined here: the commit path pins
-        // `guard_class(value, INT_TYPE)` and a long has `ob_type == LONG_TYPE`,
-        // so supporting it needs the trait-path `unbox_long` machinery
-        // (guard_class LONG_TYPE + `_fits_int` residual guard + long
-        // extraction) threaded through the sub-walk (PR248 §2). Empirically a
-        // fits-int `W_LongObject` does not reach this append: pyre normalizes
-        // fits-int results to `W_IntObject` across arithmetic / `int(str)` /
-        // literals, so the long arm is an unreachable optimization and the
-        // decline is correctness-safe (the generic residual handles it).
-        if !pyre_object::pyobject::is_list(inner_self)
-            || !pyre_object::w_list_can_append_without_realloc(inner_self)
-        {
+        let Some(len_before) = orthodox_list_append_recognize(inner_self, value) else {
             return Ok(None);
-        }
-        // Int-storage specialization: plain-int value stored unboxed (a
-        // fits-int `W_LongObject` is declined, see note above).
-        let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
-            && pyre_object::is_plain_int1(value)
-            && !pyre_object::pyobject::is_long(value);
-        // Object-storage extension (default ON, `PYRE_171_OBJ_APPEND=0` opts
-        // out): any non-null `Ref` value stored into the object items block —
-        // no unboxing, so the value carries no type precondition.
-        let obj_ok = pyre_171_obj_append_enabled()
-            && pyre_object::w_list_uses_object_storage(inner_self)
-            && !value.is_null();
-        if !int_ok && !obj_ok {
-            return Ok(None);
-        }
-        (inner_func, inner_self, pyre_object::w_list_len(inner_self))
+        };
+        (inner_func, inner_self, len_before)
     };
 
     // Resolve the compiled `w_list_append` body + the full-body sym (the
-    // resume-coordinate source).  Both absent ⇒ decline (no IR emitted yet).
-    let Some(jc_arc) = crate::jitcode_runtime::list_append_jitcode() else {
+    // resume-coordinate source) BEFORE emitting any guard — a decline must
+    // leave the trace untouched.
+    let Some((sub_body, sym_ptr)) = orthodox_list_append_body_and_sym() else {
         return Ok(None);
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: set for the lifetime of the enclosing full-body walk.
+    // SAFETY: `sym_ptr` is non-null with a set `jitcode` (checked in the
+    // resolver) and stays live for the enclosing full-body walk.
     let sym = unsafe { &*sym_ptr };
-    if sym.jitcode.is_null() {
-        return Ok(None);
-    }
 
     // ── commit (record IR; no further declines) ──
     let callable_op = r_args[0];
@@ -14990,13 +14982,122 @@ fn try_walker_orthodox_list_append(
         .heap_cache_mut()
         .replace_box(func_ref, func_const);
 
-    // Recover the receiver list OpRef + stamp it concrete (the sub-walk reads
-    // it as ref-arg 0; its strategy switch needs the concrete receiver).
+    // Recover the receiver list OpRef (the sub-walk reads it as ref-arg 0);
+    // `orthodox_list_append_commit` stamps it concrete.
     let self_ref = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         callable_op,
         crate::descr::method_w_self_descr(),
     );
+
+    orthodox_list_append_commit(
+        ctx, op, sym, &sub_body, self_ref, value_op, inner_self, value, len_before,
+    )?;
+
+    // The `list.append(x)` call's `None` return (the residual's Ref dst).
+    let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+    Ok(Some(()))
+}
+
+/// Shared recognition for the #171 orthodox list-append fold: the receiver
+/// must be a list with spare capacity whose storage strategy matches the
+/// value's strict type predicate (Integer / Object / Float).  Returns the
+/// list length before the append (the journal rewind point) on a match, or
+/// `None` (decline) otherwise.  No IR is emitted.
+///
+/// # Safety
+/// `inner_self` / `value` must be live `PyObjectRef`s.
+unsafe fn orthodox_list_append_recognize(
+    inner_self: pyre_object::PyObjectRef,
+    value: pyre_object::PyObjectRef,
+) -> Option<usize> {
+    // `is_plain_int1` accepts a fits-int `W_LongObject` (it implies
+    // `_fits_int()`), but a long is declined here: the commit path pins
+    // `guard_class(value, INT_TYPE)` and a long has `ob_type == LONG_TYPE`,
+    // so supporting it needs the trait-path `unbox_long` machinery
+    // (guard_class LONG_TYPE + `_fits_int` residual guard + long
+    // extraction) threaded through the sub-walk (PR248 §2). Empirically a
+    // fits-int `W_LongObject` does not reach this append: pyre normalizes
+    // fits-int results to `W_IntObject` across arithmetic / `int(str)` /
+    // literals, so the long arm is an unreachable optimization and the
+    // decline is correctness-safe (the generic residual handles it).
+    if !pyre_object::pyobject::is_list(inner_self)
+        || !pyre_object::w_list_can_append_without_realloc(inner_self)
+    {
+        return None;
+    }
+    // Int-storage specialization: plain-int value stored unboxed (a
+    // fits-int `W_LongObject` is declined, see note above).
+    let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
+        && pyre_object::is_plain_int1(value)
+        && !pyre_object::pyobject::is_long(value);
+    // Object-storage extension (default ON, `PYRE_171_OBJ_APPEND=0` opts
+    // out): any non-null `Ref` value stored into the object items block —
+    // no unboxing, so the value carries no type precondition.
+    let obj_ok = pyre_171_obj_append_enabled()
+        && pyre_object::w_list_uses_object_storage(inner_self)
+        && !value.is_null();
+    // Float-storage specialization: a strict `W_FloatObject` stored
+    // unboxed. `FloatListStrategy.is_correct_type` (listobject.py:2061) is
+    // `type(w_obj) is W_FloatObject`, the strict predicate the body's Float
+    // arm also uses. No fits-* long analogue (a float is never re-boxed
+    // across arithmetic, unlike a fits-int W_LongObject).
+    let float_ok = pyre_object::w_list_uses_float_storage(inner_self)
+        && !value.is_null()
+        && pyre_object::is_plain_float_strict(value);
+    if !int_ok && !obj_ok && !float_ok {
+        return None;
+    }
+    Some(pyre_object::w_list_len(inner_self))
+}
+
+/// Resolve the compiled `w_list_append` body + the full-body snapshot sym
+/// (the resume-coordinate source) shared by both list-append fold forms.
+/// Returns `None` (decline — no IR emitted yet) when the body jitcode is not
+/// compiled or the snapshot sym is absent.  The returned `sym_ptr` is
+/// non-null with a set `jitcode` field.
+fn orthodox_list_append_body_and_sym() -> Option<(SubJitCodeBody, *const crate::state::PyreSym)> {
+    let jc_arc = crate::jitcode_runtime::list_append_jitcode()?;
+    let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
+    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if sym_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: set for the lifetime of the enclosing full-body walk.
+    if unsafe { &*sym_ptr }.jitcode.is_null() {
+        return None;
+    }
+    Some((sub_body, sym_ptr))
+}
+
+/// Commit core of the #171 orthodox list-append fold, shared by the
+/// method-call (`try_walker_orthodox_list_append`) and LIST_APPEND-opcode
+/// (`try_walker_orthodox_list_append_opcode`) forms.  Stamps the receiver
+/// concrete, pins the value's class (Integer/Float storage), publishes the
+/// single append-site resume coordinate, descends the real `w_list_append`
+/// body as a sub-jitcode walk recording its native array store, then journals
+/// + applies the concrete append.  `self_ref` is the receiver list OpRef the
+/// caller supplies (the bound method's `w_self` field, or the opcode's list
+/// operand); `sym` / `sub_body` are the pre-resolved resume source + callee
+/// body.  The caller writes any residual result (the method form's `None`; the
+/// opcode form is void).  Records IR unconditionally — a body sub-walk abort
+/// propagates as `DispatchError` (graceful interpreter fallback), never a wrong
+/// trace.
+#[allow(clippy::too_many_arguments)]
+fn orthodox_list_append_commit(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    sym: &crate::state::PyreSym,
+    sub_body: &SubJitCodeBody,
+    self_ref: OpRef,
+    value_op: OpRef,
+    inner_self: pyre_object::PyObjectRef,
+    value: pyre_object::PyObjectRef,
+    len_before: usize,
+) -> Result<(), DispatchError> {
+    // Stamp the receiver concrete (the sub-walk reads it as ref-arg 0; its
+    // strategy switch needs the concrete receiver).
     ctx.trace_ctx.set_opref_concrete(
         self_ref,
         majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
@@ -15016,27 +15117,35 @@ fn try_walker_orthodox_list_append(
     // not read the value's class).
     let is_obj_storage = unsafe { pyre_object::w_list_uses_object_storage(inner_self) };
     if !is_obj_storage {
-        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        // Integer and Float storage both pin the value's class so the body's
+        // strict type test folds during the sub-walk; only the ob_type const
+        // differs (INT_TYPE vs FLOAT_TYPE).
+        let is_float_storage = unsafe { pyre_object::w_list_uses_float_storage(inner_self) };
+        let value_type_addr = if is_float_storage {
+            &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64
+        } else {
+            &pyre_object::pyobject::INT_TYPE as *const _ as i64
+        };
         if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
-            let type_const = ctx.trace_ctx.const_int(int_type_addr);
+            let type_const = ctx.trace_ctx.const_int(value_type_addr);
             ctx.trace_ctx
                 .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(value_op, int_type_addr);
-        // `is_plain_int1` rejects int subclasses by reading `value.w_class`
-        // and requiring it null or == `get_instantiate(INT_TYPE)` (the exact
-        // int test, listobject.rs). The ob_type pin above only folds the
-        // `is_int`/`is_bool` typeptr reads; the w_class compare stays
-        // symbolic, so the inlined `is_plain_int1` result is non-concrete and
-        // the Integer-arm `if is_plain_int1(value)` branch cannot fold — the
-        // sub-walk then descends the dead else-leg `switch_to_object_strategy`,
-        // whose `ListStrategy::Object` unit-variant ctor is a symbolic fnaddr
-        // the descent declines (`OrthodoxSubWalkTraceUnsupported`). Pin
-        // w_class to the concrete value's field so the subclass test folds
-        // too (the recognition gate already proved `is_plain_int1(value)`).
+            .class_now_known(value_op, value_type_addr);
+        // The strict predicate (`is_plain_int1` / `is_plain_float_strict`)
+        // rejects subclasses by reading `value.w_class` and requiring it null
+        // or == `get_instantiate(<type>)`. The ob_type pin above only folds the
+        // `is_int`/`is_float` typeptr reads; the w_class compare stays symbolic,
+        // so the inlined predicate is non-concrete and the strategy arm's
+        // `if <pred>(value)` branch cannot fold — the sub-walk then descends the
+        // dead else-leg `switch_to_object_strategy`, whose `ListStrategy::Object`
+        // unit-variant ctor is a symbolic fnaddr the descent declines
+        // (`OrthodoxSubWalkTraceUnsupported`). Pin w_class to the concrete
+        // value's field so the subclass test folds too (the recognition gate
+        // already proved the strict predicate).
         let concrete_w_class = unsafe { (*value).w_class } as i64;
         let w_class_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -15052,9 +15161,10 @@ fn try_walker_orthodox_list_append(
             .replace_box(w_class_ref, w_class_const);
     }
 
-    // Pre-publish the ONE call-site resume coordinate the sub-walk's guards
+    // Pre-publish the ONE append-site resume coordinate the sub-walk's guards
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
-    // publication, keyed to the CALL op's py_pc).
+    // publication, keyed to the append op's py_pc — the CALL for the method
+    // form, the LIST_APPEND for the opcode form).
     let (call_site_py_pc, vsd_value, outer_jitcode_index) = unsafe {
         let jc = &*sym.jitcode;
         let jc_index = jc.index as u32;
@@ -15128,7 +15238,7 @@ fn try_walker_orthodox_list_append(
         run_sub_jitcode_walk(
             ctx,
             op.pc,
-            &sub_body,
+            sub_body,
             &[],
             &[],
             &[self_ref, value_op],
@@ -15151,10 +15261,12 @@ fn try_walker_orthodox_list_append(
 
     // Reaching here means the body sub-walk completed without hitting an
     // un-lowered helper: the strategy switch folded over the concrete
-    // receiver, the `is_plain_int1` leaves recursed, the `ll_list_int_*`
-    // leaves lowered to getfield/setfield/setarrayitem, and the unit-`()`
-    // return aggregate (`SyntheticTransparentCtor "Tuple"`) was elided to
-    // `ConstRefNull` at build time.  Any residual that does NOT lower —
+    // receiver, the strict type-predicate leaves recursed (`is_plain_int1`
+    // for Integer / `is_plain_float_strict` for Float; Object stores with no
+    // type test), the `ll_list_{int,float,obj}_*` leaves lowered to
+    // getfield/setfield/setarrayitem, and the unit-`()` return aggregate
+    // (`SyntheticTransparentCtor "Tuple"`) was elided to `ConstRefNull` at
+    // build time.  Any residual that does NOT lower —
     // e.g. a stale build-time jitcode whose tuple ctor kept a symbolic
     // `>>47` funcbox — is declined by `try_execute_residual_call_via_executor`
     // (`OrthodoxSubWalkTraceUnsupported`) and `walk_result?` propagates that
@@ -15164,14 +15276,63 @@ fn try_walker_orthodox_list_append(
 
     // Tracing is execution: apply the append + journal the rewind (the walker
     // recorded the IR but did not mutate the concrete list).
-    {
-        fbw_append_journal_push(inner_self, len_before);
-        unsafe { pyre_object::w_list_append(inner_self, value) };
+    fbw_append_journal_push(inner_self, len_before);
+    unsafe { pyre_object::w_list_append(inner_self, value) };
+    Ok(())
+}
 
-        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
-        Ok(Some(()))
+/// LIST_APPEND-opcode form of the #171 orthodox list-append fold (comprehension
+/// append, e.g. `[f(x) for x in xs]` inlines LIST_APPEND into the enclosing
+/// function).  The codewriter lowers LIST_APPEND to a void
+/// `jit_list_append(list, value)` residual tagged `ListAppendValue`; here
+/// `r_args = [list, value]` (the peeked receiver + the popped value — no
+/// bound-method callable).  Recognises the receiver/value against the shared
+/// gate and descends the same `w_list_append` body as the method-call form
+/// ([`try_walker_orthodox_list_append`]).  Returns `None` (fall through to the
+/// generic residual, SAFE — identical to the trait tracer's `jit_list_append`)
+/// for any non-matching shape; the residual is void so no result is written.
+fn try_walker_orthodox_list_append_opcode(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let _ = dst; // LIST_APPEND residual is void — no result to write.
+    if r_args.len() != 2 {
+        return Ok(None);
     }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(list), ConcreteValue::Ref(value)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    if list.is_null() || value.is_null() {
+        return Ok(None);
+    }
+
+    // Recognition: no bound-method callable to pin — the list and value are the
+    // residual's two Ref operands directly.
+    let Some(len_before) = (unsafe { orthodox_list_append_recognize(list, value) }) else {
+        return Ok(None);
+    };
+
+    // Resolve the compiled body BEFORE emitting any IR — the opcode form emits
+    // no guard before the commit, so this is the only decline point.
+    let Some((sub_body, sym_ptr)) = orthodox_list_append_body_and_sym() else {
+        return Ok(None);
+    };
+    // SAFETY: `sym_ptr` is non-null with a set `jitcode` (checked in the
+    // resolver) and stays live for the enclosing full-body walk.
+    let sym = unsafe { &*sym_ptr };
+
+    // ── commit (record IR; no further declines) ──
+    // The receiver list OpRef + value OpRef are the residual's Ref operands.
+    orthodox_list_append_commit(
+        ctx, op, sym, &sub_body, r_args[0], r_args[1], list, value, len_before,
+    )?;
+    Ok(Some(()))
 }
 
 /// B3 (`PYRE_FBW_RAISE`): walker-native port of the trait's
