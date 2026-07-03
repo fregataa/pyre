@@ -20,10 +20,11 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
 };
+use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, exception_args,
+    ConvertedTo, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype, exception_args,
     helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
@@ -172,6 +173,831 @@ impl OrderedDictRepr {
             lowleveltype,
         })
     }
+
+    /// RPython `OrderedDictRepr.ll_newdict = staticmethod(ll_newdict)`
+    /// (`rordereddict.py:1169`), reached from `rdict.rtype_newdict`
+    /// (`rdict.py:60-65`):
+    ///
+    /// ```python
+    /// def rtype_newdict(hop):
+    ///     hop.inputargs()    # no arguments expected
+    ///     r_dict = hop.r_result
+    ///     cDICT = hop.inputconst(lltype.Void, r_dict.DICT)
+    ///     v_result = hop.gendirectcall(r_dict.ll_newdict, cDICT)
+    ///     return v_result
+    /// ```
+    ///
+    /// The `cDICT` argument carries no runtime value (`Void`), so instead of
+    /// threading it through `gendirectcall` the dict specialization is baked
+    /// into the cached helper via `lowleveltype`/`DICT`/`DICTENTRYARRAY` —
+    /// same shape as [`crate::translator::rtyper::rlist::rtype_newlist`]
+    /// baking its item type into the `ll_newlist` helper closure.
+    pub fn ll_newdict(&self, hop: &HighLevelOp) -> RTypeResult {
+        let ptr_lltype = self.lowleveltype.clone();
+        let dict_struct = self.DICT.clone();
+        let entryarray = self.DICTENTRYARRAY.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newdict".to_string(),
+            vec![],
+            ptr_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_dict_newdict_helper_graph(
+                    "ll_newdict",
+                    ptr_lltype.clone(),
+                    dict_struct.clone(),
+                    entryarray.clone(),
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, vec![])
+    }
+
+    fn entries_ptr_lltype(&self) -> LowLevelType {
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(self.DICTENTRYARRAY.clone()),
+        }))
+    }
+
+    /// Fail-closed gate for the landmine `build_ll_dict_lookup_helper_graph`'s
+    /// doc comment flags: `direct_compare_op` hardcodes `ptr_eq` for every
+    /// `Ptr(_)` key lltype, which is wrong for keys whose repr defines a real
+    /// structural equality (`get_ll_eq_function` returning `Some`, e.g.
+    /// `StringRepr::ll_streq`). int/bool/char/unichar keys return `None`
+    /// (direct-compare is correct for them) and proceed; every other key
+    /// repr fails closed here instead of silently miscompiling to
+    /// pointer-identity comparison.
+    fn require_direct_compare_key(&self, hop: &HighLevelOp) -> Result<(), TyperError> {
+        if self
+            .base
+            .key_repr
+            .get_ll_eq_function(&hop.rtyper)?
+            .is_some()
+        {
+            return Err(TyperError::message(format!(
+                "OrderedDictRepr: dict key eq function not wired into \
+                 build_ll_dict_lookup_helper_graph's direct_compare (key repr {} \
+                 defines a custom get_ll_eq_function — str/instance keys need the \
+                 call-based keyeq branch, not yet ported)",
+                self.base.key_repr.class_name()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Mint the shared lookup chain (`ll_dict_lookup` ->
+    /// `ll_malloc_indexes_and_choose_lookup` -> `ll_dict_create_initial_index`
+    /// -> `ll_ensure_indexes` -> `ll_call_lookup_function`) plus the key
+    /// repr's hash helper, returning both as callable `direct_call` funcptr
+    /// constants for [`Repr::rtype_getitem`] / [`pair_ordereddict_repr_rtype_contains`]
+    /// to bake into their own getitem/contains helper graphs.
+    fn lookup_chain_helpers(&self, hop: &HighLevelOp) -> Result<(Constant, Constant), TyperError> {
+        self.require_direct_compare_key(hop)?;
+        let rtyper = &hop.rtyper;
+
+        let hash_fn: LowLevelFunction = self
+            .base
+            .key_repr
+            .get_ll_hash_function(rtyper)?
+            .ok_or_else(|| {
+                TyperError::message(
+                    "OrderedDictRepr: key repr has no ll hash function — dict key eq function not wired",
+                )
+            })?;
+        let hash_fn_const = sub_helper_funcptr_constant(rtyper, &hash_fn)?;
+
+        let dict_ptr = self.lowleveltype.clone();
+        let entries_ptr = self.entries_ptr_lltype();
+        let key_lltype = self.DICTKEY.clone();
+
+        let lookup_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let key_lltype = key_lltype.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_lookup",
+                vec![
+                    dict_ptr.clone(),
+                    key_lltype.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Signed,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_lookup_helper_graph(
+                        "ll_dict_lookup",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        LowLevelType::Unsigned,
+                        key_lltype.clone(),
+                    )
+                },
+            )?
+        };
+        let lookup_fn_const = sub_helper_funcptr_constant(rtyper, &lookup_fn)?;
+
+        let malloc_choose_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_malloc_indexes_and_choose_lookup",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_malloc_indexes_and_choose_lookup_helper_graph(
+                        "ll_malloc_indexes_and_choose_lookup",
+                        dict_ptr.clone(),
+                    )
+                },
+            )?
+        };
+        let malloc_choose_const = sub_helper_funcptr_constant(rtyper, &malloc_choose_fn)?;
+
+        let create_initial_index_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_create_initial_index",
+                vec![dict_ptr.clone()],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_create_initial_index_helper_graph(
+                        "ll_dict_create_initial_index",
+                        dict_ptr.clone(),
+                        malloc_choose_const.clone(),
+                    )
+                },
+            )?
+        };
+        let create_initial_index_const =
+            sub_helper_funcptr_constant(rtyper, &create_initial_index_fn)?;
+
+        let ensure_indexes_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_ensure_indexes",
+                vec![dict_ptr.clone()],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_ensure_indexes_helper_graph(
+                        "ll_ensure_indexes",
+                        dict_ptr.clone(),
+                        create_initial_index_const.clone(),
+                    )
+                },
+            )?
+        };
+        let ensure_indexes_const = sub_helper_funcptr_constant(rtyper, &ensure_indexes_fn)?;
+
+        let call_lookup_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let key_lltype = key_lltype.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_call_lookup_function",
+                vec![
+                    dict_ptr.clone(),
+                    key_lltype.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Signed,
+                move |_rtyper, _args, _result| {
+                    build_ll_call_lookup_function_helper_graph(
+                        "ll_call_lookup_function",
+                        dict_ptr.clone(),
+                        key_lltype.clone(),
+                        ensure_indexes_const.clone(),
+                        lookup_fn_const.clone(),
+                    )
+                },
+            )?
+        };
+        let call_lookup_const = sub_helper_funcptr_constant(rtyper, &call_lookup_fn)?;
+
+        Ok((hash_fn_const, call_lookup_const))
+    }
+
+    /// Mint the shared setitem insert/overwrite tail:
+    /// `_ll_dict_setitem_lookup_done` -> `ll_dict_grow` / `ll_dict_resize` ->
+    /// `ll_dict_reindex` -> `ll_call_insert_clean_function` ->
+    /// `ll_dict_store_clean` -> `_ll_write_indexes`. `ll_dict_setitem` and
+    /// `ll_dict_setdefault` both reuse this tail after their lookup.
+    fn ll_dict_setitem_lookup_done_helper(
+        &self,
+        hop: &HighLevelOp,
+    ) -> Result<LowLevelFunction, TyperError> {
+        let rtyper = &hop.rtyper;
+        let dict_ptr = self.lowleveltype.clone();
+        let entries_ptr = self.entries_ptr_lltype();
+        let key_lltype = self.DICTKEY.clone();
+        let value_lltype = self.DICTVALUE.clone();
+        let entries_array_ty = LowLevelType::Array(Box::new(self.DICTENTRYARRAY.clone()));
+
+        // _ll_write_indexes(d, i, value) (rordereddict.py:558-563) — the real
+        // helper landed in Slice 2 for `build_ll_dict_lookup_helper_graph`'s
+        // inlined store path; mint it here as a callable funcptr for the
+        // non-inlined callers (`ll_dict_store_clean`).
+        let write_indexes_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "_ll_write_indexes",
+                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_write_indexes_helper_graph(
+                        "_ll_write_indexes",
+                        dict_ptr.clone(),
+                        LowLevelType::Unsigned,
+                    )
+                },
+            )?
+        };
+        let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
+
+        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py:1108-1125).
+        let store_clean_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_store_clean",
+                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_store_clean_helper_graph(
+                        "ll_dict_store_clean",
+                        dict_ptr.clone(),
+                        write_indexes_const.clone(),
+                    )
+                },
+            )?
+        };
+        let store_clean_const = sub_helper_funcptr_constant(rtyper, &store_clean_fn)?;
+
+        // ll_call_insert_clean_function(d, hash, i) (rordereddict.py:565-580)
+        // — FUNC_* dispatch collapses to a single `ll_dict_store_clean` call,
+        // same shape as `ll_call_lookup_function` (Slice 2).
+        let insert_clean_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let store_clean_const = store_clean_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_call_insert_clean_function",
+                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_call_insert_clean_function_helper_graph(
+                        "ll_call_insert_clean_function",
+                        dict_ptr.clone(),
+                        store_clean_const.clone(),
+                    )
+                },
+            )?
+        };
+        let insert_clean_const = sub_helper_funcptr_constant(rtyper, &insert_clean_fn)?;
+
+        // ll_malloc_indexes_and_choose_lookup — same (name, args, result) key
+        // as `lookup_chain_helpers`'s own mint, so this hits the memoized
+        // cache rather than rebuilding a second copy of the graph.
+        let malloc_choose_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_malloc_indexes_and_choose_lookup",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_malloc_indexes_and_choose_lookup_helper_graph(
+                        "ll_malloc_indexes_and_choose_lookup",
+                        dict_ptr.clone(),
+                    )
+                },
+            )?
+        };
+        let malloc_choose_const = sub_helper_funcptr_constant(rtyper, &malloc_choose_fn)?;
+
+        // ll_dict_reindex(d, new_size) (rordereddict.py:979-1019) — always
+        // re-mallocs the index array; see build_ll_dict_reindex_helper_graph
+        // for why the "reuse + ll_clear_indexes" branch is skipped.
+        let reindex_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let malloc_choose_const = malloc_choose_const.clone();
+            let store_clean_const = store_clean_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_reindex",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_reindex_helper_graph(
+                        "ll_dict_reindex",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        malloc_choose_const.clone(),
+                        store_clean_const.clone(),
+                    )
+                },
+            )?
+        };
+        let reindex_const = sub_helper_funcptr_constant(rtyper, &reindex_fn)?;
+
+        // ll_dict_remove_deleted_items(d) (rordereddict.py:802-851).
+        let remove_deleted_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let entries_array_ty = entries_array_ty.clone();
+            let key_lltype = key_lltype.clone();
+            let value_lltype = value_lltype.clone();
+            let reindex_const = reindex_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_remove_deleted_items",
+                vec![dict_ptr.clone()],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_remove_deleted_items_helper_graph(
+                        "ll_dict_remove_deleted_items",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        entries_array_ty.clone(),
+                        key_lltype.clone(),
+                        value_lltype.clone(),
+                        reindex_const.clone(),
+                    )
+                },
+            )?
+        };
+        let remove_deleted_const = sub_helper_funcptr_constant(rtyper, &remove_deleted_fn)?;
+
+        // _ll_dict_resize_to(d, num_extra) (rordereddict.py:923-932).
+        let resize_to_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let reindex_const = reindex_const.clone();
+            let remove_deleted_const = remove_deleted_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "_ll_dict_resize_to",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_resize_to_helper_graph(
+                        "_ll_dict_resize_to",
+                        dict_ptr.clone(),
+                        remove_deleted_const.clone(),
+                        reindex_const.clone(),
+                    )
+                },
+            )?
+        };
+        let resize_to_const = sub_helper_funcptr_constant(rtyper, &resize_to_fn)?;
+
+        // ll_dict_resize(d) (rordereddict.py:913-916).
+        let resize_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let resize_to_const = resize_to_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_resize",
+                vec![dict_ptr.clone()],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_resize_helper_graph(
+                        "ll_dict_resize",
+                        dict_ptr.clone(),
+                        resize_to_const.clone(),
+                    )
+                },
+            )?
+        };
+        let resize_const = sub_helper_funcptr_constant(rtyper, &resize_fn)?;
+
+        // Struct-array `rgc.ll_arraycopy` specialisation for `odictentry` —
+        // rlist's generic scalar `ll_arraycopy` moves bare `Ptr(GcArray(ITEM))`
+        // elements; a struct-element array needs a field-by-field copy
+        // instead, so this is a fresh (documented) loop, not a reuse of
+        // rlist's helper.
+        let arraycopy_fn = {
+            let entries_ptr = entries_ptr.clone();
+            let key_lltype = key_lltype.clone();
+            let value_lltype = value_lltype.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_entries_arraycopy",
+                vec![
+                    entries_ptr.clone(),
+                    entries_ptr.clone(),
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_entries_arraycopy_helper_graph(
+                        "ll_dict_entries_arraycopy",
+                        entries_ptr.clone(),
+                        key_lltype.clone(),
+                        value_lltype.clone(),
+                    )
+                },
+            )?
+        };
+        let arraycopy_const = sub_helper_funcptr_constant(rtyper, &arraycopy_fn)?;
+
+        // ll_dict_grow(d) -> Bool (rordereddict.py:755-787).
+        let grow_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let entries_array_ty = entries_array_ty.clone();
+            let arraycopy_const = arraycopy_const.clone();
+            let remove_deleted_const = remove_deleted_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_grow",
+                vec![dict_ptr.clone()],
+                LowLevelType::Bool,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_grow_helper_graph(
+                        "ll_dict_grow",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        entries_array_ty.clone(),
+                        remove_deleted_const.clone(),
+                        arraycopy_const.clone(),
+                    )
+                },
+            )?
+        };
+        let grow_const = sub_helper_funcptr_constant(rtyper, &grow_fn)?;
+
+        // _ll_dict_setitem_lookup_done(d, key, value, hash, i)
+        // (rordereddict.py:675-711).
+        let lookup_done_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let key_lltype = key_lltype.clone();
+            let value_lltype = value_lltype.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "_ll_dict_setitem_lookup_done",
+                vec![
+                    dict_ptr.clone(),
+                    key_lltype.clone(),
+                    value_lltype.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_setitem_lookup_done_helper_graph(
+                        "_ll_dict_setitem_lookup_done",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        key_lltype.clone(),
+                        value_lltype.clone(),
+                        grow_const.clone(),
+                        resize_const.clone(),
+                        insert_clean_const.clone(),
+                    )
+                },
+            )?
+        };
+        Ok(lookup_done_fn)
+    }
+
+    /// Mint `ll_dict_setitem` (fused with `ll_dict_setitem_with_hash`) around
+    /// the shared `_ll_dict_setitem_lookup_done` tail.
+    fn ll_dict_setitem_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
+        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let rtyper = &hop.rtyper;
+        let dict_ptr = self.lowleveltype.clone();
+        let key_lltype = self.DICTKEY.clone();
+        let value_lltype = self.DICTVALUE.clone();
+        let lookup_done_fn = self.ll_dict_setitem_lookup_done_helper(hop)?;
+        let lookup_done_const = sub_helper_funcptr_constant(rtyper, &lookup_done_fn)?;
+        // ll_dict_setitem(d, key, value) (rordereddict.py:665-673, fused
+        // with its `_with_hash` half and the FLAG_STORE lookup call).
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_setitem",
+            vec![dict_ptr.clone(), key_lltype.clone(), value_lltype.clone()],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_dict_setitem_helper_graph(
+                    "ll_dict_setitem",
+                    dict_ptr.clone(),
+                    key_lltype.clone(),
+                    value_lltype.clone(),
+                    hash_fn_const.clone(),
+                    call_lookup_const.clone(),
+                    lookup_done_const.clone(),
+                )
+            },
+        )
+    }
+
+    /// Mint `ll_dict_delitem` (fused with `ll_dict_delitem_with_hash`) and its
+    /// deletion tail: `ll_call_delete_by_entry_index` ->
+    /// `ll_dict_delete_by_entry_index` -> `_ll_dict_del_entry`, with
+    /// `ll_dict_resize` available for the 87.5%-dead shrink rule.
+    fn ll_dict_delitem_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
+        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let rtyper = &hop.rtyper;
+        let dict_ptr = self.lowleveltype.clone();
+        let entries_ptr = self.entries_ptr_lltype();
+        let key_lltype = self.DICTKEY.clone();
+        let value_lltype = self.DICTVALUE.clone();
+        let entries_array_ty = LowLevelType::Array(Box::new(self.DICTENTRYARRAY.clone()));
+
+        // _ll_write_indexes(d, i, value) (rordereddict.py:558-563).
+        let write_indexes_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "_ll_write_indexes",
+                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_write_indexes_helper_graph(
+                        "_ll_write_indexes",
+                        dict_ptr.clone(),
+                        LowLevelType::Unsigned,
+                    )
+                },
+            )?
+        };
+        let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
+
+        // ll_dict_delete_by_entry_index(d, hash, locate_index, replace_with, T)
+        // (rordereddict.py:1123-1144).
+        let delete_by_entry_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let write_indexes_const = write_indexes_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_delete_by_entry_index",
+                vec![
+                    dict_ptr.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_delete_by_entry_index_helper_graph(
+                        "ll_dict_delete_by_entry_index",
+                        dict_ptr.clone(),
+                        write_indexes_const.clone(),
+                    )
+                },
+            )?
+        };
+        let delete_by_entry_const = sub_helper_funcptr_constant(rtyper, &delete_by_entry_fn)?;
+
+        // ll_call_delete_by_entry_index(d, hash, i, replace_with)
+        // (rordereddict.py:582-597) — FUNC_* dispatch collapses to a single
+        // delete helper call for the same width-collapse reason as
+        // ll_call_insert_clean_function.
+        let call_delete_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let delete_by_entry_const = delete_by_entry_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_call_delete_by_entry_index",
+                vec![
+                    dict_ptr.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_call_delete_by_entry_index_helper_graph(
+                        "ll_call_delete_by_entry_index",
+                        dict_ptr.clone(),
+                        delete_by_entry_const.clone(),
+                    )
+                },
+            )?
+        };
+        let call_delete_const = sub_helper_funcptr_constant(rtyper, &call_delete_fn)?;
+
+        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py:1108-1125),
+        // used by ll_dict_reindex below.
+        let store_clean_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_store_clean",
+                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_store_clean_helper_graph(
+                        "ll_dict_store_clean",
+                        dict_ptr.clone(),
+                        write_indexes_const.clone(),
+                    )
+                },
+            )?
+        };
+        let store_clean_const = sub_helper_funcptr_constant(rtyper, &store_clean_fn)?;
+
+        let malloc_choose_fn = {
+            let dict_ptr = dict_ptr.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_malloc_indexes_and_choose_lookup",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_malloc_indexes_and_choose_lookup_helper_graph(
+                        "ll_malloc_indexes_and_choose_lookup",
+                        dict_ptr.clone(),
+                    )
+                },
+            )?
+        };
+        let malloc_choose_const = sub_helper_funcptr_constant(rtyper, &malloc_choose_fn)?;
+
+        let reindex_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let malloc_choose_const = malloc_choose_const.clone();
+            let store_clean_const = store_clean_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_reindex",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_reindex_helper_graph(
+                        "ll_dict_reindex",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        malloc_choose_const.clone(),
+                        store_clean_const.clone(),
+                    )
+                },
+            )?
+        };
+        let reindex_const = sub_helper_funcptr_constant(rtyper, &reindex_fn)?;
+
+        let remove_deleted_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let entries_array_ty = entries_array_ty.clone();
+            let key_lltype = key_lltype.clone();
+            let value_lltype = value_lltype.clone();
+            let reindex_const = reindex_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_remove_deleted_items",
+                vec![dict_ptr.clone()],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_remove_deleted_items_helper_graph(
+                        "ll_dict_remove_deleted_items",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        entries_array_ty.clone(),
+                        key_lltype.clone(),
+                        value_lltype.clone(),
+                        reindex_const.clone(),
+                    )
+                },
+            )?
+        };
+        let remove_deleted_const = sub_helper_funcptr_constant(rtyper, &remove_deleted_fn)?;
+
+        let resize_to_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let remove_deleted_const = remove_deleted_const.clone();
+            let reindex_const = reindex_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "_ll_dict_resize_to",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_resize_to_helper_graph(
+                        "_ll_dict_resize_to",
+                        dict_ptr.clone(),
+                        remove_deleted_const.clone(),
+                        reindex_const.clone(),
+                    )
+                },
+            )?
+        };
+        let resize_to_const = sub_helper_funcptr_constant(rtyper, &resize_to_fn)?;
+
+        let resize_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let resize_to_const = resize_to_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "ll_dict_resize",
+                vec![dict_ptr.clone()],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_resize_helper_graph(
+                        "ll_dict_resize",
+                        dict_ptr.clone(),
+                        resize_to_const.clone(),
+                    )
+                },
+            )?
+        };
+        let resize_const = sub_helper_funcptr_constant(rtyper, &resize_fn)?;
+
+        let del_entry_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let key_lltype = key_lltype.clone();
+            let value_lltype = value_lltype.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "_ll_dict_del_entry",
+                vec![dict_ptr.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_del_entry_helper_graph(
+                        "_ll_dict_del_entry",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        key_lltype.clone(),
+                        value_lltype.clone(),
+                    )
+                },
+            )?
+        };
+        let del_entry_const = sub_helper_funcptr_constant(rtyper, &del_entry_fn)?;
+
+        let del_fn = {
+            let dict_ptr = dict_ptr.clone();
+            let entries_ptr = entries_ptr.clone();
+            let call_delete_const = call_delete_const.clone();
+            let del_entry_const = del_entry_const.clone();
+            let resize_const = resize_const.clone();
+            rtyper.lowlevel_helper_function_with_builder(
+                "_ll_dict_del",
+                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_dict_del_helper_graph(
+                        "_ll_dict_del",
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                        call_delete_const.clone(),
+                        del_entry_const.clone(),
+                        resize_const.clone(),
+                    )
+                },
+            )?
+        };
+        let del_const = sub_helper_funcptr_constant(rtyper, &del_fn)?;
+
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_delitem",
+            vec![dict_ptr.clone(), key_lltype.clone()],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_dict_delitem_helper_graph(
+                    "ll_dict_delitem",
+                    dict_ptr.clone(),
+                    key_lltype.clone(),
+                    hash_fn_const.clone(),
+                    call_lookup_const.clone(),
+                    del_const.clone(),
+                )
+            },
+        )
+    }
+
+    fn ll_dict_get_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
+        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let rtyper = &hop.rtyper;
+        let dict_ptr = self.lowleveltype.clone();
+        let entries_ptr = self.entries_ptr_lltype();
+        let key_lltype = self.DICTKEY.clone();
+        let value_lltype = self.DICTVALUE.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_get",
+            vec![dict_ptr.clone(), key_lltype.clone(), value_lltype.clone()],
+            value_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_dict_get_helper_graph(
+                    "ll_dict_get",
+                    dict_ptr.clone(),
+                    entries_ptr.clone(),
+                    key_lltype.clone(),
+                    value_lltype.clone(),
+                    hash_fn_const.clone(),
+                    call_lookup_const.clone(),
+                )
+            },
+        )
+    }
+
+    fn ll_dict_setdefault_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
+        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let rtyper = &hop.rtyper;
+        let dict_ptr = self.lowleveltype.clone();
+        let entries_ptr = self.entries_ptr_lltype();
+        let key_lltype = self.DICTKEY.clone();
+        let value_lltype = self.DICTVALUE.clone();
+        let lookup_done_fn = self.ll_dict_setitem_lookup_done_helper(hop)?;
+        let lookup_done_const = sub_helper_funcptr_constant(rtyper, &lookup_done_fn)?;
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_setdefault",
+            vec![dict_ptr.clone(), key_lltype.clone(), value_lltype.clone()],
+            value_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_dict_setdefault_helper_graph(
+                    "ll_dict_setdefault",
+                    dict_ptr.clone(),
+                    entries_ptr.clone(),
+                    key_lltype.clone(),
+                    value_lltype.clone(),
+                    hash_fn_const.clone(),
+                    call_lookup_const.clone(),
+                    lookup_done_const.clone(),
+                )
+            },
+        )
+    }
 }
 
 impl Repr for OrderedDictRepr {
@@ -234,6 +1060,196 @@ impl Repr for OrderedDictRepr {
             },
         )?;
         hop.gendirectcall(&helper, v_dict)
+    }
+
+    /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`
+    /// (`rordereddict.py:441-447`):
+    ///
+    /// ```python
+    /// def rtype_getitem((r_dict, r_key), hop):
+    ///     v_dict, v_key = hop.inputargs(r_dict, r_dict.key_repr)
+    ///     if not r_dict.custom_eq_hash:
+    ///         hop.has_implicit_exception(KeyError)   # record that we know about it
+    ///     hop.exception_is_here()
+    ///     v_res = hop.gendirectcall(ll_dict_getitem, v_dict, v_key)
+    ///     return r_dict.recast_value(hop.llops, v_res)
+    /// ```
+    ///
+    /// The second pairtype receiver (`r_key`) is never read in the upstream
+    /// body — only `r_dict.key_repr` is — so this port dispatches it as a
+    /// direct `Repr::rtype_getitem` override (same shape as
+    /// `ListRepr::rtype_getitem`) rather than a `pair_*` free function; the
+    /// `(OrderedDictRepr, _, "getitem")` pairtype-dispatch arm forwards here
+    /// for any key repr.
+    fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        let args = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::Repr(self.base.key_repr.as_ref()),
+        ])?;
+        if !self.base.custom_eq_hash {
+            hop.has_implicit_exception("KeyError");
+        }
+        hop.exception_is_here()?;
+
+        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let dict_ptr = self.lowleveltype.clone();
+        let entries_ptr = self.entries_ptr_lltype();
+        let key_lltype = self.DICTKEY.clone();
+        let value_lltype = self.DICTVALUE.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_getitem",
+            vec![dict_ptr.clone(), key_lltype.clone()],
+            value_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_dict_getitem_helper_graph(
+                    "ll_dict_getitem",
+                    dict_ptr.clone(),
+                    entries_ptr.clone(),
+                    key_lltype.clone(),
+                    value_lltype.clone(),
+                    hash_fn_const.clone(),
+                    call_lookup_const.clone(),
+                )
+            },
+        )?;
+        let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
+            TyperError::message("rtype_getitem: ll_dict_getitem call produced no value")
+        })?;
+        let (value_repr, external_value_repr) = self.base.recast_value();
+        let recast = hop.llops.borrow_mut().convertvar(
+            v_res,
+            value_repr.as_ref(),
+            external_value_repr.as_ref(),
+        )?;
+        Ok(Some(recast))
+    }
+
+    /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_setitem`
+    /// (`rordereddict.py:448-455`):
+    ///
+    /// ```python
+    /// def rtype_setitem((r_dict, r_key), hop):
+    ///     v_dict, v_key, v_value = hop.inputargs(r_dict, r_dict.key_repr, r_dict.value_repr)
+    ///     if r_dict.custom_eq_hash:
+    ///         hop.exception_is_here()
+    ///     else:
+    ///         hop.exception_cannot_occur()
+    ///     hop.gendirectcall(ll_dict_setitem, v_dict, v_key, v_value)
+    /// ```
+    ///
+    /// Same wildcard-`_` dispatch rationale as [`Repr::rtype_getitem`] above
+    /// (`r_key` is never read, only `r_dict.key_repr`); the
+    /// `(OrderedDictRepr, _, "setitem")` pairtype arm forwards here for any
+    /// key repr.
+    fn rtype_setitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        let args = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::Repr(self.base.key_repr.as_ref()),
+            ConvertedTo::Repr(self.base.value_repr.as_ref()),
+        ])?;
+        if self.base.custom_eq_hash {
+            hop.exception_is_here()?;
+        } else {
+            hop.exception_cannot_occur()?;
+        }
+
+        let helper = self.ll_dict_setitem_helper(hop)?;
+        hop.gendirectcall(&helper, args)?;
+        Ok(None)
+    }
+
+    /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_delitem`
+    /// (`rordereddict.py:449-454`):
+    ///
+    /// ```python
+    /// def rtype_delitem((r_dict, r_key), hop):
+    ///     v_dict, v_key = hop.inputargs(r_dict, r_dict.key_repr)
+    ///     if not r_dict.custom_eq_hash:
+    ///         hop.has_implicit_exception(KeyError)
+    ///     hop.exception_is_here()
+    ///     hop.gendirectcall(ll_dict_delitem, v_dict, v_key)
+    /// ```
+    fn rtype_delitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        let args = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::Repr(self.base.key_repr.as_ref()),
+        ])?;
+        if !self.base.custom_eq_hash {
+            hop.has_implicit_exception("KeyError");
+        }
+        hop.exception_is_here()?;
+
+        let helper = self.ll_dict_delitem_helper(hop)?;
+        hop.gendirectcall(&helper, args)?;
+        Ok(None)
+    }
+
+    /// RPython `OrderedDictRepr.rtype_method_get` / `rtype_method_setdefault`
+    /// (`rordereddict.py:285-301`).
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        match method_name {
+            "get" => {
+                let args = if hop.nb_args() == 3 {
+                    hop.inputargs(vec![
+                        ConvertedTo::Repr(self),
+                        ConvertedTo::Repr(self.base.key_repr.as_ref()),
+                        ConvertedTo::Repr(self.base.value_repr.as_ref()),
+                    ])?
+                } else if hop.nb_args() == 2 {
+                    let mut args = hop.inputargs(vec![
+                        ConvertedTo::Repr(self),
+                        ConvertedTo::Repr(self.base.key_repr.as_ref()),
+                    ])?;
+                    let default = HighLevelOp::inputconst(
+                        ConvertedTo::Repr(self.base.value_repr.as_ref()),
+                        &ConstValue::None,
+                    )?;
+                    args.push(Hlvalue::Constant(default));
+                    args
+                } else {
+                    return Err(TyperError::message(format!(
+                        "OrderedDictRepr.rtype_method_get expects 2 or 3 args, got {}",
+                        hop.nb_args()
+                    )));
+                };
+                hop.exception_cannot_occur()?;
+                let helper = self.ll_dict_get_helper(hop)?;
+                let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
+                    TyperError::message("rtype_method_get: ll_dict_get call produced no value")
+                })?;
+                let (value_repr, external_value_repr) = self.base.recast_value();
+                let recast = hop.llops.borrow_mut().convertvar(
+                    v_res,
+                    value_repr.as_ref(),
+                    external_value_repr.as_ref(),
+                )?;
+                Ok(Some(recast))
+            }
+            "setdefault" => {
+                let args = hop.inputargs(vec![
+                    ConvertedTo::Repr(self),
+                    ConvertedTo::Repr(self.base.key_repr.as_ref()),
+                    ConvertedTo::Repr(self.base.value_repr.as_ref()),
+                ])?;
+                hop.exception_cannot_occur()?;
+                let helper = self.ll_dict_setdefault_helper(hop)?;
+                let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
+                    TyperError::message(
+                        "rtype_method_setdefault: ll_dict_setdefault call produced no value",
+                    )
+                })?;
+                let (value_repr, external_value_repr) = self.base.recast_value();
+                let recast = hop.llops.borrow_mut().convertvar(
+                    v_res,
+                    value_repr.as_ref(),
+                    external_value_repr.as_ref(),
+                )?;
+                Ok(Some(recast))
+            }
+            _ => Err(TyperError::message(format!(
+                "missing OrderedDictRepr.rtype_method_{method_name}"
+            ))),
+        }
     }
 }
 
@@ -385,6 +1401,154 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
     ))
 }
 
+/// Synthesise `ll_newdict(DICT) -> Ptr(DICT)`
+/// (`rordereddict.py:1160-1169` + `:509-518`):
+///
+/// ```python
+/// def ll_newdict(DICT):
+///     d = DICT.allocate()                # _ll_malloc_dict: lltype.malloc(DICT)
+///     d.entries = _ll_empty_array(DICT)  # DICT.entries.TO.allocate(0)
+///     d.num_live_items = 0
+///     d.num_ever_used_items = 0
+///     ll_no_initial_index(d)
+///     return d
+///
+/// def ll_no_initial_index(d):
+///     d.lookup_function_no = FUNC_MUST_REINDEX
+///     d.indexes = lltype.nullptr(llmemory.GCREF.TO)
+/// ```
+///
+/// Single-block graph, no runtime arguments — the `DICT` class argument is
+/// `Void` upstream and is instead baked into the cached helper shape by
+/// [`OrderedDictRepr::ll_newdict`] (`ptr_lltype`/`dict_struct`/`entryarray`
+/// close over the specific dict specialization, matching how
+/// [`build_ll_newlist_helper_graph`](super::super::rlist) bakes its item type
+/// rather than threading a `Void` const through `gendirectcall`).
+///
+/// `_ll_empty_array` is a `@specialize.memo()` prebuilt zero-length array
+/// upstream (`rordereddict.py:1155-1158`), shared across every empty dict of
+/// a given specialization. This port allocates a fresh `malloc_varsize(...,
+/// 0)` entries array per call instead of sharing one prebuilt instance — the
+/// memo-sharing is deferred (no local prebuilt-const cache mechanism exists
+/// yet for this shape); behavior is unaffected since a 0-length array is
+/// immutable in practice, only the allocation is not shared.
+pub(crate) fn build_ll_dict_newdict_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    dict_struct: Struct,
+    entryarray: Array,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let startblock = Block::shared(vec![]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let signed_zero = || constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+
+    // d = DICT.allocate() -- `_ll_malloc_dict(DICT)` = `lltype.malloc(DICT)`.
+    let d = variable_with_lltype("d", ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc",
+        vec![
+            lowlevel_type_const(LowLevelType::Struct(Box::new(dict_struct))),
+            gc_flavor_const()?,
+        ],
+        Hlvalue::Variable(d.clone()),
+    ));
+
+    // d.entries = _ll_empty_array(DICT) -- `DICT.entries.TO.allocate(0)`
+    // = `_ll_malloc_entries(ENTRIES, 0)` = `lltype.malloc(ENTRIES, 0, zero=True)`;
+    // `malloc_varsize` zero-fills, matching `zero=True`.
+    let entries_array_type = LowLevelType::Array(Box::new(entryarray.clone()));
+    let entries_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(entryarray),
+    }));
+    let entries = variable_with_lltype("entries", entries_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(entries_array_type),
+            gc_flavor_const()?,
+            signed_zero(),
+        ],
+        Hlvalue::Variable(entries.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("entries"),
+            Hlvalue::Variable(entries),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    // d.num_live_items = 0
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("num_live_items"),
+            signed_zero(),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    // d.num_ever_used_items = 0
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("num_ever_used_items"),
+            signed_zero(),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    // ll_no_initial_index(d): d.lookup_function_no = FUNC_MUST_REINDEX;
+    // d.indexes = lltype.nullptr(llmemory.GCREF.TO).
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("lookup_function_no"),
+            constant_with_lltype(ConstValue::Int(FUNC_MUST_REINDEX), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    let null_indexes =
+        Hlvalue::Constant(Constant::with_concretetype(ConstValue::None, GCREF.clone()));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("indexes"),
+            null_indexes,
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(d)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, vec![], func))
+}
+
 pub fn ll_newdict_size(_dict: &Struct, _length_estimate: usize) -> Result<(), TyperError> {
     Err(TyperError::missing_rtype_operation(
         "lltypesystem.rordereddict.ll_newdict_size — ordered hash table allocation deferred",
@@ -397,22 +1561,12 @@ fn ordered_dict_runtime_deferred(name: &str) -> TyperError {
     ))
 }
 
-pub fn ll_call_lookup_function() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_call_lookup_function"))
-}
-
 pub fn get_ll_dict() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("get_ll_dict"))
 }
 
 pub fn ll_no_initial_index() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_no_initial_index"))
-}
-
-pub fn ll_malloc_indexes_and_choose_lookup() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred(
-        "ll_malloc_indexes_and_choose_lookup",
-    ))
 }
 
 pub fn ll_clear_indexes() -> Result<(), TyperError> {
@@ -527,6 +1681,10 @@ fn direct_compare_op(key_lltype: &LowLevelType) -> Result<&'static str, TyperErr
             )));
         }
     })
+}
+
+fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
+    matches!(lltype, LowLevelType::Ptr(ptr) if ptr._needsgc())
 }
 
 /// Synthesise `ll_dict_lookup(d, key, hash, store_flag, T) -> Signed`
@@ -1411,6 +2569,4565 @@ pub fn build_ll_dict_lookup_helper_graph(
     ))
 }
 
+/// Synthesise `ll_malloc_indexes_and_choose_lookup(d, n)` (`rordereddict.py:520-541`):
+///
+/// ```python
+/// def ll_malloc_indexes_and_choose_lookup(d, n):
+///     if n <= 256:
+///         d.indexes = ...; d.lookup_function_no = FUNC_BYTE
+///     elif n <= 65536:
+///         d.indexes = ...; d.lookup_function_no = FUNC_SHORT
+///     elif IS_64BIT and n <= 2 ** 32:
+///         d.indexes = ...; d.lookup_function_no = FUNC_INT
+///     else:
+///         d.indexes = ...; d.lookup_function_no = FUNC_LONG
+/// ```
+///
+/// All `DICTINDEX_*` widths collapse to the identical `Ptr(GcArray(Unsigned))`
+/// shape locally (see [`DICTINDEX_BYTE`]), so every branch allocates the same
+/// array; only the `FUNC_*` selector constant stamped into
+/// `lookup_function_no` differs. `IS_64BIT` is a Rust compile-time constant
+/// here exactly as upstream's module-level `IS_64BIT and` guard is decided
+/// once, not per call — the `n <= 2 ** 32` check is only emitted when built
+/// for a 64-bit target (matching `FUNC_INT`'s own conditional definition,
+/// `:59-60`).
+pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let indexes_array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Unsigned)));
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
+
+    let d0 = variable_with_lltype("d", dict_ptr_lltype.clone());
+    let n0 = variable_with_lltype("n", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d0.clone()),
+        Hlvalue::Variable(n0.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let returnblock = graph.returnblock.clone();
+
+    // Shared leaf body: malloc the (uniformly `Unsigned`-element) index
+    // array, then stamp `d.indexes` / `d.lookup_function_no`. Only
+    // `func_const` differs branch to branch.
+    let alloc_leaf = |func_const: i64| -> Result<BlockRef, TyperError> {
+        let d = variable_with_lltype("d", dict_ptr_lltype.clone());
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let block = Block::shared(vec![
+            Hlvalue::Variable(d.clone()),
+            Hlvalue::Variable(n.clone()),
+        ]);
+        let arr = variable_with_lltype("arr", indexes_ptr_lltype.clone());
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(indexes_array_ty.clone()),
+                gc_flavor_const()?,
+                Hlvalue::Variable(n),
+            ],
+            Hlvalue::Variable(arr.clone()),
+        ));
+        let gcref = variable_with_lltype("indexes_gcref", GCREF.clone());
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_opaque_ptr",
+            vec![Hlvalue::Variable(arr)],
+            Hlvalue::Variable(gcref.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(d.clone()),
+                void_field_const("indexes"),
+                Hlvalue::Variable(gcref),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(d),
+                void_field_const("lookup_function_no"),
+                constant_with_lltype(ConstValue::Int(func_const), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+        let none_const = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ));
+        block.closeblock(vec![
+            Link::new(vec![none_const], Some(returnblock.clone()), None).into_ref(),
+        ]);
+        Ok(block)
+    };
+
+    let mut thresholds: Vec<(i64, i64)> = vec![(256, FUNC_BYTE), (65536, FUNC_SHORT)];
+    if IS_64BIT {
+        thresholds.push((1i64 << 32, FUNC_INT));
+    }
+    let long_leaf = alloc_leaf(FUNC_LONG)?;
+
+    // Cascade the threshold checks from the last (LONG fallback, no check
+    // needed) to the first (BYTE), so each check block's false-edge target
+    // already exists when the block closes.
+    let mut false_target = long_leaf;
+    for (threshold, func_const) in thresholds.into_iter().rev() {
+        let leaf = alloc_leaf(func_const)?;
+        let d = variable_with_lltype("d", dict_ptr_lltype.clone());
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let block = Block::shared(vec![
+            Hlvalue::Variable(d.clone()),
+            Hlvalue::Variable(n.clone()),
+        ]);
+        let le = variable_with_lltype("le", LowLevelType::Bool);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "int_le",
+            vec![
+                Hlvalue::Variable(n.clone()),
+                constant_with_lltype(ConstValue::Int(threshold), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(le.clone()),
+        ));
+        block.borrow_mut().exitswitch = Some(Hlvalue::Variable(le));
+        block.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(d.clone()), Hlvalue::Variable(n.clone())],
+                Some(leaf),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(true),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref(),
+            Link::new(
+                vec![Hlvalue::Variable(d), Hlvalue::Variable(n)],
+                Some(false_target),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(false),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref(),
+        ]);
+        false_target = block;
+    }
+
+    // startblock forwards straight into the first (BYTE) threshold check.
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(d0), Hlvalue::Variable(n0)],
+            Some(false_target),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "n".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_create_initial_index(d)` (`rordereddict.py:942-953`):
+///
+/// ```python
+/// def ll_dict_create_initial_index(d):
+///     if d.num_live_items == 0:
+///         ll_malloc_indexes_and_choose_lookup(d, DICT_INITSIZE)
+///         d.resize_counter = DICT_INITSIZE * 2
+///     else:
+///         ll_dict_rehash_after_translation(d)
+/// ```
+///
+/// **Scope note:** the `else` arm rehashes a "prebuilt dictionary frozen by
+/// translation" (`ll_dict_rehash_after_translation`, `rordereddict.py:955-977`)
+/// — a translation-time-only RPython concept with no analogue in this JIT.
+/// Every dict this port can construct comes from `ll_newdict`
+/// (`num_live_items == 0` at construction), and no write path exists yet
+/// (Slice 3), so `num_live_items != 0` while `lookup_function_no ==
+/// FUNC_MUST_REINDEX` is unreachable for any census-reachable dict today.
+/// This builder ports only the reachable `num_live_items == 0` branch
+/// straight-line (no runtime check), matching the "statically dead branch"
+/// precedent in [`build_ll_dict_lookup_helper_graph`]'s doc comment. Revisit
+/// once Slice 3's write path lands.
+pub(crate) fn build_ll_dict_create_initial_index_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    malloc_choose_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(d.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(malloc_choose_fn),
+            Hlvalue::Variable(d.clone()),
+            constant_with_lltype(ConstValue::Int(DICT_INITSIZE), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d),
+            void_field_const("resize_counter"),
+            constant_with_lltype(ConstValue::Int(DICT_INITSIZE * 2), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_ensure_indexes(d)` (`rordereddict.py:934-940`):
+///
+/// ```python
+/// def ll_ensure_indexes(d):
+///     num = d.lookup_function_no
+///     if num == FUNC_MUST_REINDEX:
+///         ll_dict_create_initial_index(d)
+///     else:
+///         ll_assert((num & FUNC_MASK) != FUNC_MUST_REINDEX, "...")
+/// ```
+///
+/// The `else` arm's `ll_assert` is a debug-only sanity check with no runtime
+/// effect after translation (same omission as
+/// [`build_ll_write_indexes_helper_graph`]'s `ll_assert`) — that arm just
+/// returns.
+pub(crate) fn build_ll_ensure_indexes_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    create_initial_index_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(d.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let d_for_reindex = variable_with_lltype("d", dict_ptr_lltype);
+    let block_reindex = Block::shared(vec![Hlvalue::Variable(d_for_reindex.clone())]);
+
+    let num = variable_with_lltype("num", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("lookup_function_no"),
+        ],
+        Hlvalue::Variable(num.clone()),
+    ));
+    let is_must_reindex = variable_with_lltype("is_must_reindex", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_eq",
+        vec![
+            Hlvalue::Variable(num),
+            constant_with_lltype(ConstValue::Int(FUNC_MUST_REINDEX), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(is_must_reindex.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_must_reindex));
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(d)],
+            Some(block_reindex.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_const()],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    block_reindex
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(create_initial_index_fn),
+                Hlvalue::Variable(d_for_reindex),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    block_reindex.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_call_lookup_function(d, key, hash, flag) -> Signed`
+/// (`rordereddict.py:46-65`):
+///
+/// ```python
+/// def ll_call_lookup_function(d, key, hash, flag):
+///     while True:
+///         fun = d.lookup_function_no & FUNC_MASK
+///         if likely(fun == FUNC_BYTE): return ll_dict_lookup(d, key, hash, flag, TYPE_BYTE)
+///         elif fun == FUNC_SHORT: return ll_dict_lookup(d, key, hash, flag, TYPE_SHORT)
+///         elif IS_64BIT and fun == FUNC_INT: return ll_dict_lookup(d, key, hash, flag, TYPE_INT)
+///         elif fun == FUNC_LONG: return ll_dict_lookup(d, key, hash, flag, TYPE_LONG)
+///         else:
+///             ll_dict_create_initial_index(d)
+///             # then, retry
+/// ```
+///
+/// Every `TYPE_*`/`DICTINDEX_*` width collapses to the same
+/// `Ptr(GcArray(Unsigned))` shape locally (see [`DICTINDEX_BYTE`]), so the
+/// 4-way `FUNC_*` dispatch always calls the *same*
+/// [`build_ll_dict_lookup_helper_graph`] specialization regardless of which
+/// selector `ll_ensure_indexes` chose — the `while True` retry loop
+/// collapses to "ensure the index exists, then look up once":
+/// [`build_ll_ensure_indexes_helper_graph`] already implements the
+/// `fun == FUNC_MUST_REINDEX` retry-trigger check, so calling it
+/// unconditionally before a single `ll_dict_lookup` call is behaviorally
+/// identical to the upstream loop for this port's collapsed width space.
+pub(crate) fn build_ll_call_lookup_function_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    ensure_indexes_fn: Constant,
+    lookup_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let key = variable_with_lltype("key", key_lltype);
+    let hash = variable_with_lltype("hash", LowLevelType::Signed);
+    let store_flag = variable_with_lltype("store_flag", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(key.clone()),
+        Hlvalue::Variable(hash.clone()),
+        Hlvalue::Variable(store_flag.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(ensure_indexes_fn),
+            Hlvalue::Variable(d.clone()),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    let index = variable_with_lltype("index", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(lookup_fn),
+            Hlvalue::Variable(d),
+            Hlvalue::Variable(key),
+            Hlvalue::Variable(hash),
+            Hlvalue::Variable(store_flag),
+        ],
+        Hlvalue::Variable(index.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(index)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "d".to_string(),
+            "key".to_string(),
+            "hash".to_string(),
+            "store_flag".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_getitem(d, key) -> DICTVALUE` (`rordereddict.py:655-663`,
+/// fused with its `_with_hash` half):
+///
+/// ```python
+/// def ll_dict_getitem(d, key):
+///     return ll_dict_getitem_with_hash(d, key, d.keyhash(key))
+///
+/// def ll_dict_getitem_with_hash(d, key, hash):
+///     index = d.lookup_function(d, key, hash, FLAG_LOOKUP)
+///     if index >= 0:
+///         return d.entries[index].value
+///     else:
+///         raise KeyError
+/// ```
+///
+/// `d.keyhash`/`d.lookup_function` are RPython adtmeths — resolved once per
+/// dict specialization at translation time, not a runtime vtable
+/// indirection. This port bakes the specialization's hash helper
+/// (`hash_fn`) and `ll_call_lookup_function` (`call_lookup_fn`) into the
+/// closure exactly as [`OrderedDictRepr::ll_newdict`] bakes `DICT`, rather
+/// than threading them as `Void` consts. Fusing the two upstream functions
+/// into one graph (instead of a `direct_call` chain) keeps the `raise
+/// KeyError` exceptblock link in the same graph that emits it — the same
+/// byte-equivalent-fusion precedent as `build_ll_dict_lookup_helper_graph`'s
+/// "Store path inlined" note.
+pub(crate) fn build_ll_dict_getitem_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+    hash_fn: Constant,
+    call_lookup_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let exc_args = exception_args("KeyError")?;
+
+    let d = variable_with_lltype("d", dict_ptr_lltype.clone());
+    let key = variable_with_lltype("key", key_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(key.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", value_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let d_valid = variable_with_lltype("d", dict_ptr_lltype);
+    let index_valid = variable_with_lltype("index", LowLevelType::Signed);
+    let block_valid = Block::shared(vec![
+        Hlvalue::Variable(d_valid.clone()),
+        Hlvalue::Variable(index_valid.clone()),
+    ]);
+
+    let hash = variable_with_lltype("hash", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(hash_fn), Hlvalue::Variable(key.clone())],
+        Hlvalue::Variable(hash.clone()),
+    ));
+    let index = variable_with_lltype("index", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_lookup_fn),
+            Hlvalue::Variable(d.clone()),
+            Hlvalue::Variable(key),
+            Hlvalue::Variable(hash),
+            constant_with_lltype(ConstValue::Int(FLAG_LOOKUP), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(index.clone()),
+    ));
+    let found = variable_with_lltype("found", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_ge",
+        vec![
+            Hlvalue::Variable(index.clone()),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(found.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(found));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(d), Hlvalue::Variable(index)],
+            Some(block_valid.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    let entries = variable_with_lltype("entries", entries_ptr_lltype);
+    block_valid
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(d_valid), void_field_const("entries")],
+            Hlvalue::Variable(entries.clone()),
+        ));
+    let value = variable_with_lltype("value", value_lltype);
+    block_valid
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(entries),
+                Hlvalue::Variable(index_valid),
+                void_field_const("value"),
+            ],
+            Hlvalue::Variable(value.clone()),
+        ));
+    block_valid.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(value)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "key".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_contains(d, key) -> Bool` (`rordereddict.py:1462-1468`,
+/// fused with its `_with_hash` half — same rationale as
+/// [`build_ll_dict_getitem_helper_graph`], minus the raise since `contains`
+/// never fails for the direct-compare key space this port covers):
+///
+/// ```python
+/// def ll_dict_contains(d, key):
+///     return ll_dict_contains_with_hash(d, key, d.keyhash(key))
+///
+/// def ll_dict_contains_with_hash(d, key, hash):
+///     i = d.lookup_function(d, key, hash, FLAG_LOOKUP)
+///     return i >= 0
+/// ```
+pub(crate) fn build_ll_dict_contains_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    hash_fn: Constant,
+    call_lookup_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let key = variable_with_lltype("key", key_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(key.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let hash = variable_with_lltype("hash", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(hash_fn), Hlvalue::Variable(key.clone())],
+        Hlvalue::Variable(hash.clone()),
+    ));
+    let index = variable_with_lltype("index", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_lookup_fn),
+            Hlvalue::Variable(d),
+            Hlvalue::Variable(key),
+            Hlvalue::Variable(hash),
+            constant_with_lltype(ConstValue::Int(FLAG_LOOKUP), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(index.clone()),
+    ));
+    let result = variable_with_lltype("result", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_ge",
+        vec![
+            Hlvalue::Variable(index),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "key".to_string()],
+        func,
+    ))
+}
+
+/// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_contains`
+/// (`rordereddict.py:464-467`):
+///
+/// ```python
+/// def rtype_contains((r_dict, r_key), hop):
+///     v_dict, v_key = hop.inputargs(r_dict, r_dict.key_repr)
+///     hop.exception_is_here()
+///     return hop.gendirectcall(ll_dict_contains, v_dict, v_key)
+/// ```
+pub fn pair_ordereddict_repr_rtype_contains(
+    r1: &dyn Repr,
+    _r2: &dyn Repr,
+    hop: &HighLevelOp,
+) -> RTypeResult {
+    let any_r: &dyn std::any::Any = r1;
+    let r_dict = any_r.downcast_ref::<OrderedDictRepr>().ok_or_else(|| {
+        TyperError::message("pair_ordereddict_repr_rtype_contains: r1 is not an OrderedDictRepr")
+    })?;
+
+    let args = hop.inputargs(vec![
+        ConvertedTo::Repr(r_dict),
+        ConvertedTo::Repr(r_dict.base.key_repr.as_ref()),
+    ])?;
+    hop.exception_is_here()?;
+
+    let (hash_fn_const, call_lookup_const) = r_dict.lookup_chain_helpers(hop)?;
+    let dict_ptr = r_dict.lowleveltype().clone();
+    let key_lltype = r_dict.DICTKEY.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_dict_contains",
+        vec![dict_ptr.clone(), key_lltype.clone()],
+        LowLevelType::Bool,
+        move |_rtyper, _args, _result| {
+            build_ll_dict_contains_helper_graph(
+                "ll_dict_contains",
+                dict_ptr.clone(),
+                key_lltype.clone(),
+                hash_fn_const.clone(),
+                call_lookup_const.clone(),
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, args)
+}
+
+/// Synthesise `ll_dict_store_clean(d, hash, index, T)` (`rordereddict.py:1108-1125`):
+///
+/// ```python
+/// def ll_dict_store_clean(d, hash, index, T):
+///     INDEXES = _ll_ptr_to_array_of(T)
+///     indexes = lltype.cast_opaque_ptr(INDEXES, d.indexes)
+///     mask = len(indexes) - 1
+///     i = r_uint(hash & mask)
+///     perturb = r_uint(hash)
+///     while rffi.cast(lltype.Signed, indexes[i]) != FREE:
+///         i = (i << 2) + i + perturb + 1
+///         i = i & mask
+///         perturb >>= PERTURB_SHIFT
+///     _ll_write_indexes(d, i, index + VALID_OFFSET, T)
+/// ```
+///
+/// A simplified `ll_dict_lookup`: no key comparison, no `deletedslot`
+/// tracking — the caller (reindex, insert-clean) guarantees the hash is not
+/// already present, so the probe only needs to find the first `FREE` slot.
+/// Same unsigned-arithmetic idiom as [`build_ll_dict_lookup_helper_graph`]
+/// (`i`/`perturb` are `r_uint`; the perturb shift is the *logical*
+/// `uint_rshift`). All `DICTINDEX_*` widths collapse to
+/// `Ptr(GcArray(Unsigned))` locally, so `T` is inert — this one graph serves
+/// every `FUNC_*` width (same collapse as `ll_call_lookup_function`, Slice 2).
+/// Calls the real [`build_ll_write_indexes_helper_graph`] helper for the
+/// final store (not inlined) — that helper's own doc note already flagged
+/// it as reserved for "the non-inlined callers (`ll_dict_store_clean`,
+/// reindex) ported in later slices".
+pub(crate) fn build_ll_dict_store_clean_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    write_indexes_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let sig = || LowLevelType::Signed;
+    let uns = || LowLevelType::Unsigned;
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let hash = new_var("hash", sig());
+    let index = new_var("index", sig());
+    let startblock = Block::shared(vec![var(&d), var(&hash), var(&index)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let gcref = new_var("indexes_gcref", GCREF.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("indexes")],
+        &gcref,
+    );
+    let indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    push(&startblock, "cast_pointer", vec![var(&gcref)], &indexes);
+    let len = new_var("len", sig());
+    push(&startblock, "getarraysize", vec![var(&indexes)], &len);
+    let mask = new_var("mask", sig());
+    push(&startblock, "int_sub", vec![var(&len), signed(1)], &mask);
+    let mask_u = new_var("mask_u", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&mask)], &mask_u);
+    let hashmask = new_var("hashmask", sig());
+    push(
+        &startblock,
+        "int_and",
+        vec![var(&hash), var(&mask)],
+        &hashmask,
+    );
+    let i0 = new_var("i", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&hashmask)], &i0);
+    let perturb0 = new_var("perturb", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&hash)], &perturb0);
+
+    // block_cond(d, indexes, mask_u, index, i, perturb).
+    let cd_d = new_var("d", dict_ptr_lltype.clone());
+    let cd_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let cd_mask_u = new_var("mask_u", uns());
+    let cd_index = new_var("index", sig());
+    let cd_i = new_var("i", uns());
+    let cd_perturb = new_var("perturb", uns());
+    let block_cond = Block::shared(vec![
+        var(&cd_d),
+        var(&cd_indexes),
+        var(&cd_mask_u),
+        var(&cd_index),
+        var(&cd_i),
+        var(&cd_perturb),
+    ]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                var(&d),
+                var(&indexes),
+                var(&mask_u),
+                var(&index),
+                var(&i0),
+                var(&perturb0),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // block_write(d, i_s, index): value = index + VALID_OFFSET; direct_call.
+    let wr_d = new_var("d", dict_ptr_lltype.clone());
+    let wr_i_s = new_var("i_s", sig());
+    let wr_index = new_var("index", sig());
+    let block_write = Block::shared(vec![var(&wr_d), var(&wr_i_s), var(&wr_index)]);
+
+    // block_advance(d, indexes, mask_u, index, i, perturb).
+    let ad_d = new_var("d", dict_ptr_lltype.clone());
+    let ad_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let ad_mask_u = new_var("mask_u", uns());
+    let ad_index = new_var("index", sig());
+    let ad_i = new_var("i", uns());
+    let ad_perturb = new_var("perturb", uns());
+    let block_advance = Block::shared(vec![
+        var(&ad_d),
+        var(&ad_indexes),
+        var(&ad_mask_u),
+        var(&ad_index),
+        var(&ad_i),
+        var(&ad_perturb),
+    ]);
+
+    // ---- block_cond body: read indexes[i]; branch on == FREE.
+    let cd_i_s = new_var("i_s", sig());
+    push(&block_cond, "cast_uint_to_int", vec![var(&cd_i)], &cd_i_s);
+    let cd_elem = new_var("elem", uns());
+    push(
+        &block_cond,
+        "getarrayitem",
+        vec![var(&cd_indexes), var(&cd_i_s)],
+        &cd_elem,
+    );
+    let cd_val = new_var("val", sig());
+    push(
+        &block_cond,
+        "cast_uint_to_int",
+        vec![var(&cd_elem)],
+        &cd_val,
+    );
+    let cd_is_free = new_var("is_free", LowLevelType::Bool);
+    push(
+        &block_cond,
+        "int_eq",
+        vec![var(&cd_val), signed(FREE)],
+        &cd_is_free,
+    );
+    block_cond.borrow_mut().exitswitch = Some(var(&cd_is_free));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![var(&cd_d), var(&cd_i_s), var(&cd_index)],
+            Some(block_write.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&cd_d),
+                var(&cd_indexes),
+                var(&cd_mask_u),
+                var(&cd_index),
+                var(&cd_i),
+                var(&cd_perturb),
+            ],
+            Some(block_advance.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_advance body: i = ((i<<2)+i+perturb+1)&mask_u; perturb >>= PERTURB_SHIFT.
+    let ad_ish = new_var("ish", uns());
+    push(
+        &block_advance,
+        "uint_lshift",
+        vec![var(&ad_i), signed(2)],
+        &ad_ish,
+    );
+    let ad_ipi = new_var("ipi", uns());
+    push(
+        &block_advance,
+        "uint_add",
+        vec![var(&ad_ish), var(&ad_i)],
+        &ad_ipi,
+    );
+    let ad_ipp = new_var("ipp", uns());
+    push(
+        &block_advance,
+        "uint_add",
+        vec![var(&ad_ipi), var(&ad_perturb)],
+        &ad_ipp,
+    );
+    let ad_iinc = new_var("iinc", uns());
+    push(
+        &block_advance,
+        "uint_add",
+        vec![
+            var(&ad_ipp),
+            constant_with_lltype(ConstValue::Int(1), uns()),
+        ],
+        &ad_iinc,
+    );
+    let ad_inew = new_var("i", uns());
+    push(
+        &block_advance,
+        "uint_and",
+        vec![var(&ad_iinc), var(&ad_mask_u)],
+        &ad_inew,
+    );
+    let ad_pnew = new_var("perturb", uns());
+    push(
+        &block_advance,
+        "uint_rshift",
+        vec![var(&ad_perturb), signed(PERTURB_SHIFT)],
+        &ad_pnew,
+    );
+    block_advance.closeblock(vec![
+        Link::new(
+            vec![
+                var(&ad_d),
+                var(&ad_indexes),
+                var(&ad_mask_u),
+                var(&ad_index),
+                var(&ad_inew),
+                var(&ad_pnew),
+            ],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_write body: _ll_write_indexes(d, i_s, index + VALID_OFFSET).
+    let wr_value = new_var("value", sig());
+    push(
+        &block_write,
+        "int_add",
+        vec![var(&wr_index), signed(VALID_OFFSET)],
+        &wr_value,
+    );
+    push(
+        &block_write,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(write_indexes_fn),
+            var(&wr_d),
+            var(&wr_i_s),
+            var(&wr_value),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_write.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            ))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "hash".to_string(), "index".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_call_insert_clean_function(d, hash, i)`
+/// (`rordereddict.py:565-580`):
+///
+/// ```python
+/// def ll_call_insert_clean_function(d, hash, i):
+///     fun = d.lookup_function_no & FUNC_MASK
+///     if fun == FUNC_BYTE: ll_dict_store_clean(d, hash, i, TYPE_BYTE)
+///     elif fun == FUNC_SHORT: ll_dict_store_clean(d, hash, i, TYPE_SHORT)
+///     elif IS_64BIT and fun == FUNC_INT: ll_dict_store_clean(d, hash, i, TYPE_INT)
+///     elif fun == FUNC_LONG: ll_dict_store_clean(d, hash, i, TYPE_LONG)
+///     else: ll_assert(False, "...")
+/// ```
+///
+/// Same width-collapse rationale as `ll_call_lookup_function`'s FUNC_*
+/// dispatch (Slice 2): every `TYPE_*`/`DICTINDEX_*` width aliases the same
+/// `Ptr(GcArray(Unsigned))` shape locally, so the 4-way dispatch collapses
+/// to a single unconditional `ll_dict_store_clean` call. The `ll_assert`
+/// dead-fallthrough is debug-only and not modelled.
+pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    store_clean_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let hash = variable_with_lltype("hash", LowLevelType::Signed);
+    let i = variable_with_lltype("i", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(hash.clone()),
+        Hlvalue::Variable(i.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(store_clean_fn),
+            Hlvalue::Variable(d),
+            Hlvalue::Variable(hash),
+            Hlvalue::Variable(i),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "hash".to_string(), "i".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_call_delete_by_entry_index(d, hash, i, replace_with)`
+/// (`rordereddict.py:582-597`):
+///
+/// ```python
+/// def ll_call_delete_by_entry_index(d, hash, i, replace_with):
+///     fun = d.lookup_function_no & FUNC_MASK
+///     if fun == FUNC_BYTE: ll_dict_delete_by_entry_index(..., TYPE_BYTE)
+///     elif fun == FUNC_SHORT: ll_dict_delete_by_entry_index(..., TYPE_SHORT)
+///     elif IS_64BIT and fun == FUNC_INT: ll_dict_delete_by_entry_index(..., TYPE_INT)
+///     elif fun == FUNC_LONG: ll_dict_delete_by_entry_index(..., TYPE_LONG)
+/// ```
+///
+/// rordereddict.py:586-593 — the `FUNC_*` dispatch collapses to one
+/// `ll_dict_delete_by_entry_index` call because all `DICTINDEX_*` aliases are
+/// currently `Ptr(GcArray(Unsigned))`; same #148-width deviation as
+/// [`build_ll_call_insert_clean_function_helper_graph`].
+pub(crate) fn build_ll_call_delete_by_entry_index_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    delete_by_entry_index_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let hash = variable_with_lltype("hash", LowLevelType::Signed);
+    let i = variable_with_lltype("i", LowLevelType::Signed);
+    let replace_with = variable_with_lltype("replace_with", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(hash.clone()),
+        Hlvalue::Variable(i.clone()),
+        Hlvalue::Variable(replace_with.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(delete_by_entry_index_fn),
+            Hlvalue::Variable(d),
+            Hlvalue::Variable(hash),
+            Hlvalue::Variable(i),
+            Hlvalue::Variable(replace_with),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "d".to_string(),
+            "hash".to_string(),
+            "i".to_string(),
+            "replace_with".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_delete_by_entry_index(d, hash, locate_index,
+/// replace_with, T)` (`rordereddict.py:1123-1144`):
+///
+/// ```python
+/// locate_value = locate_index + VALID_OFFSET
+/// while rffi.cast(lltype.Signed, indexes[i]) != locate_value:
+///     i = (i << 2) + i + perturb + 1
+///     i = i & mask
+///     perturb >>= PERTURB_SHIFT
+/// _ll_write_indexes(d, i, replace_with, T)
+/// ```
+pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    write_indexes_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let unsigned = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Unsigned);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let sig = || LowLevelType::Signed;
+    let uns = || LowLevelType::Unsigned;
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let hash = new_var("hash", sig());
+    let locate_index = new_var("locate_index", sig());
+    let replace_with = new_var("replace_with", sig());
+    let startblock = Block::shared(vec![
+        var(&d),
+        var(&hash),
+        var(&locate_index),
+        var(&replace_with),
+    ]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let gcref = new_var("indexes_gcref", GCREF.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("indexes")],
+        &gcref,
+    );
+    let indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    push(&startblock, "cast_pointer", vec![var(&gcref)], &indexes);
+    let len = new_var("len", sig());
+    push(&startblock, "getarraysize", vec![var(&indexes)], &len);
+    let mask = new_var("mask", sig());
+    push(&startblock, "int_sub", vec![var(&len), signed(1)], &mask);
+    let mask_u = new_var("mask_u", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&mask)], &mask_u);
+    let hashmask = new_var("hashmask", sig());
+    push(
+        &startblock,
+        "int_and",
+        vec![var(&hash), var(&mask)],
+        &hashmask,
+    );
+    let i0 = new_var("i", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&hashmask)], &i0);
+    let perturb0 = new_var("perturb", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&hash)], &perturb0);
+    let locate_value = new_var("locate_value", sig());
+    push(
+        &startblock,
+        "int_add",
+        vec![var(&locate_index), signed(VALID_OFFSET)],
+        &locate_value,
+    );
+
+    let cd_d = new_var("d", dict_ptr_lltype.clone());
+    let cd_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let cd_mask = new_var("mask_u", uns());
+    let cd_replace = new_var("replace_with", sig());
+    let cd_locate = new_var("locate_value", sig());
+    let cd_i = new_var("i", uns());
+    let cd_perturb = new_var("perturb", uns());
+    let block_cond = Block::shared(vec![
+        var(&cd_d),
+        var(&cd_indexes),
+        var(&cd_mask),
+        var(&cd_replace),
+        var(&cd_locate),
+        var(&cd_i),
+        var(&cd_perturb),
+    ]);
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                var(&d),
+                var(&indexes),
+                var(&mask_u),
+                var(&replace_with),
+                var(&locate_value),
+                var(&i0),
+                var(&perturb0),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let wr_d = new_var("d", dict_ptr_lltype.clone());
+    let wr_i_s = new_var("i_s", sig());
+    let wr_replace = new_var("replace_with", sig());
+    let block_write = Block::shared(vec![var(&wr_d), var(&wr_i_s), var(&wr_replace)]);
+
+    let ad_d = new_var("d", dict_ptr_lltype.clone());
+    let ad_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let ad_mask = new_var("mask_u", uns());
+    let ad_replace = new_var("replace_with", sig());
+    let ad_locate = new_var("locate_value", sig());
+    let ad_i = new_var("i", uns());
+    let ad_perturb = new_var("perturb", uns());
+    let block_advance = Block::shared(vec![
+        var(&ad_d),
+        var(&ad_indexes),
+        var(&ad_mask),
+        var(&ad_replace),
+        var(&ad_locate),
+        var(&ad_i),
+        var(&ad_perturb),
+    ]);
+
+    let cd_i_s = new_var("i_s", sig());
+    push(&block_cond, "cast_uint_to_int", vec![var(&cd_i)], &cd_i_s);
+    let cd_elem = new_var("elem", uns());
+    push(
+        &block_cond,
+        "getarrayitem",
+        vec![var(&cd_indexes), var(&cd_i_s)],
+        &cd_elem,
+    );
+    let cd_value = new_var("value", sig());
+    push(
+        &block_cond,
+        "cast_uint_to_int",
+        vec![var(&cd_elem)],
+        &cd_value,
+    );
+    let found = new_var("found", LowLevelType::Bool);
+    push(
+        &block_cond,
+        "int_eq",
+        vec![var(&cd_value), var(&cd_locate)],
+        &found,
+    );
+    block_cond.borrow_mut().exitswitch = Some(var(&found));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![var(&cd_d), var(&cd_i_s), var(&cd_replace)],
+            Some(block_write.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&cd_d),
+                var(&cd_indexes),
+                var(&cd_mask),
+                var(&cd_replace),
+                var(&cd_locate),
+                var(&cd_i),
+                var(&cd_perturb),
+            ],
+            Some(block_advance.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let ish = new_var("ish", uns());
+    push(
+        &block_advance,
+        "uint_lshift",
+        vec![var(&ad_i), signed(2)],
+        &ish,
+    );
+    let ipi = new_var("ipi", uns());
+    push(
+        &block_advance,
+        "uint_add",
+        vec![var(&ish), var(&ad_i)],
+        &ipi,
+    );
+    let ipp = new_var("ipp", uns());
+    push(
+        &block_advance,
+        "uint_add",
+        vec![var(&ipi), var(&ad_perturb)],
+        &ipp,
+    );
+    let iinc = new_var("iinc", uns());
+    push(
+        &block_advance,
+        "uint_add",
+        vec![var(&ipp), unsigned(1)],
+        &iinc,
+    );
+    let inew = new_var("i", uns());
+    push(
+        &block_advance,
+        "uint_and",
+        vec![var(&iinc), var(&ad_mask)],
+        &inew,
+    );
+    let perturb_new = new_var("perturb", uns());
+    push(
+        &block_advance,
+        "uint_rshift",
+        vec![var(&ad_perturb), signed(PERTURB_SHIFT)],
+        &perturb_new,
+    );
+    block_advance.closeblock(vec![
+        Link::new(
+            vec![
+                var(&ad_d),
+                var(&ad_indexes),
+                var(&ad_mask),
+                var(&ad_replace),
+                var(&ad_locate),
+                var(&inew),
+                var(&perturb_new),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_write,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(write_indexes_fn),
+            var(&wr_d),
+            var(&wr_i_s),
+            var(&wr_replace),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    block_write.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "d".to_string(),
+            "hash".to_string(),
+            "locate_index".to_string(),
+            "replace_with".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise a struct-array specialisation of `rgc.ll_arraycopy` (`rgc.py:365`)
+/// for the `odictentry` entries array — the same primitive
+/// `build_ll_arraycopy_helper_graph` in `rlist.rs` specialises for bare
+/// scalar-item `Ptr(GcArray(ITEM))` lists:
+///
+/// ```python
+/// def ll_arraycopy(source, dest, 0, 0, length):
+///     i = 0
+///     while i < length:
+///         dest[i].key = source[i].key
+///         dest[i].f_valid = source[i].f_valid
+///         dest[i].value = source[i].value
+///         dest[i].f_hash = source[i].f_hash
+///         i += 1
+/// ```
+///
+/// rlist's generic `ll_arraycopy` moves one scalar element per iteration via
+/// `getarrayitem`/`setarrayitem`; an array of `odictentry` GcStructs has no
+/// single-op "copy this struct element" primitive here, so each field is
+/// copied individually via `getinteriorfield`/`setinteriorfield` — a fresh,
+/// documented loop rather than a reuse of rlist's helper. Used only by
+/// [`build_ll_dict_grow_helper_graph`]'s always-`source_start == dest_start
+/// == 0` grow copy, matching rlist's own 3-arg specialisation shape (not the
+/// 5-arg general form `ll_extend` needs).
+pub(crate) fn build_ll_dict_entries_arraycopy_helper_graph(
+    name: &str,
+    entries_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let src = new_var("source", entries_ptr_lltype.clone());
+    let dst = new_var("dest", entries_ptr_lltype.clone());
+    let length = new_var("length", sig());
+    let startblock = Block::shared(vec![var(&src), var(&dst), var(&length)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let src_c = new_var("source", entries_ptr_lltype.clone());
+    let dst_c = new_var("dest", entries_ptr_lltype.clone());
+    let len_c = new_var("length", sig());
+    let i_c = new_var("i", sig());
+    let block_cond = Block::shared(vec![var(&src_c), var(&dst_c), var(&len_c), var(&i_c)]);
+
+    let src_b = new_var("source", entries_ptr_lltype.clone());
+    let dst_b = new_var("dest", entries_ptr_lltype.clone());
+    let len_b = new_var("length", sig());
+    let i_b = new_var("i", sig());
+    let block_body = Block::shared(vec![var(&src_b), var(&dst_b), var(&len_b), var(&i_b)]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&src), var(&dst), var(&length), signed(0)],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let cond = new_var("cond", LowLevelType::Bool);
+    push(&block_cond, "int_lt", vec![var(&i_c), var(&len_c)], &cond);
+    block_cond.borrow_mut().exitswitch = Some(var(&cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![var(&src_c), var(&dst_c), var(&len_c), var(&i_c)],
+            Some(block_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_void()],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let kv = new_var("kv", key_lltype);
+    push(
+        &block_body,
+        "getinteriorfield",
+        vec![var(&src_b), var(&i_b), void_field_const("key")],
+        &kv,
+    );
+    push(
+        &block_body,
+        "setinteriorfield",
+        vec![var(&dst_b), var(&i_b), void_field_const("key"), var(&kv)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let fv = new_var("fv", LowLevelType::Bool);
+    push(
+        &block_body,
+        "getinteriorfield",
+        vec![var(&src_b), var(&i_b), void_field_const("f_valid")],
+        &fv,
+    );
+    push(
+        &block_body,
+        "setinteriorfield",
+        vec![
+            var(&dst_b),
+            var(&i_b),
+            void_field_const("f_valid"),
+            var(&fv),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let vv = new_var("vv", value_lltype);
+    push(
+        &block_body,
+        "getinteriorfield",
+        vec![var(&src_b), var(&i_b), void_field_const("value")],
+        &vv,
+    );
+    push(
+        &block_body,
+        "setinteriorfield",
+        vec![var(&dst_b), var(&i_b), void_field_const("value"), var(&vv)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let hv = new_var("hv", sig());
+    push(
+        &block_body,
+        "getinteriorfield",
+        vec![var(&src_b), var(&i_b), void_field_const("f_hash")],
+        &hv,
+    );
+    push(
+        &block_body,
+        "setinteriorfield",
+        vec![var(&dst_b), var(&i_b), void_field_const("f_hash"), var(&hv)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let i_next = new_var("i", sig());
+    push(&block_body, "int_add", vec![var(&i_b), signed(1)], &i_next);
+    block_body.closeblock(vec![
+        Link::new(
+            vec![var(&src_b), var(&dst_b), var(&len_b), var(&i_next)],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "source".to_string(),
+            "dest".to_string(),
+            "length".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_remove_deleted_items(d)` (`rordereddict.py:802-851`):
+///
+/// ```python
+/// if d.num_live_items < len(d.entries) // 4:
+///     newitems = malloc(..., _overallocate_entries_len(d.num_live_items))
+/// else:
+///     newitems = d.entries
+/// isrc = idst = 0
+/// while isrc < d.num_ever_used_items:
+///     if d.entries.valid(isrc):
+///         newitems[idst] = d.entries[isrc]
+///         idst += 1
+///     isrc += 1
+/// d.num_ever_used_items = idst
+/// if (must_clear_key or must_clear_value) and d.entries == newitems:
+///     clear trailing pointer fields
+/// else:
+///     d.entries = newitems
+/// ll_dict_reindex(d, _ll_len_of_d_indexes(d))
+/// ```
+///
+/// rordereddict.py:814-815 — `llop.gc_writebarrier` is a performance hint for
+/// the in-place compaction branch and has no local llop surface; the graph still
+/// performs the same field writes and trailing pointer clears.
+pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    entries_array_ty: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+    reindex_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let must_clear_key = lltype_must_clear_gc_ptr(&key_lltype);
+    let must_clear_value = lltype_must_clear_gc_ptr(&value_lltype);
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let null_of = |lltype: &LowLevelType| {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            lltype.clone(),
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let startblock = Block::shared(vec![var(&d)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("entries")],
+        &entries,
+    );
+    let len_entries = new_var("len_entries", sig());
+    push(
+        &startblock,
+        "getarraysize",
+        vec![var(&entries)],
+        &len_entries,
+    );
+    let quarter = new_var("quarter", sig());
+    push(
+        &startblock,
+        "int_rshift",
+        vec![var(&len_entries), signed(2)],
+        &quarter,
+    );
+    let num_live = new_var("num_live", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let shrink = new_var("shrink", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_lt",
+        vec![var(&num_live), var(&quarter)],
+        &shrink,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&shrink));
+
+    let al_d = new_var("d", dict_ptr_lltype.clone());
+    let al_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let al_live = new_var("num_live", sig());
+    let block_alloc = Block::shared(vec![var(&al_d), var(&al_old), var(&al_live)]);
+
+    let ip_d = new_var("d", dict_ptr_lltype.clone());
+    let ip_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let block_inplace = Block::shared(vec![var(&ip_d), var(&ip_old)]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d), var(&entries), var(&num_live)],
+            Some(block_alloc.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), var(&entries)],
+            Some(block_inplace.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let li_d = new_var("d", dict_ptr_lltype.clone());
+    let li_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let li_new = new_var("newitems", entries_ptr_lltype.clone());
+    let li_replace_entries = new_var("replace_entries", LowLevelType::Bool);
+    let block_loop_init = Block::shared(vec![
+        var(&li_d),
+        var(&li_old),
+        var(&li_new),
+        var(&li_replace_entries),
+    ]);
+
+    let live_shr = new_var("live_shr", sig());
+    push(
+        &block_alloc,
+        "int_rshift",
+        vec![var(&al_live), signed(3)],
+        &live_shr,
+    );
+    let newsize0 = new_var("newsize0", sig());
+    push(
+        &block_alloc,
+        "int_add",
+        vec![var(&al_live), var(&live_shr)],
+        &newsize0,
+    );
+    let new_allocated = new_var("new_allocated", sig());
+    push(
+        &block_alloc,
+        "int_add",
+        vec![var(&newsize0), signed(8)],
+        &new_allocated,
+    );
+    let newitems = new_var("newitems", entries_ptr_lltype.clone());
+    push(
+        &block_alloc,
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(entries_array_ty),
+            gc_flavor_const()?,
+            var(&new_allocated),
+        ],
+        &newitems,
+    );
+    block_alloc.closeblock(vec![
+        Link::new(
+            vec![var(&al_d), var(&al_old), var(&newitems), bool_const(true)],
+            Some(block_loop_init.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    block_inplace.closeblock(vec![
+        Link::new(
+            vec![var(&ip_d), var(&ip_old), var(&ip_old), bool_const(false)],
+            Some(block_loop_init.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let isrclimit = new_var("isrclimit", sig());
+    push(
+        &block_loop_init,
+        "getfield",
+        vec![var(&li_d), void_field_const("num_ever_used_items")],
+        &isrclimit,
+    );
+
+    let cd_d = new_var("d", dict_ptr_lltype.clone());
+    let cd_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let cd_new = new_var("newitems", entries_ptr_lltype.clone());
+    let cd_limit = new_var("isrclimit", sig());
+    let cd_isrc = new_var("isrc", sig());
+    let cd_idst = new_var("idst", sig());
+    let cd_replace_entries = new_var("replace_entries", LowLevelType::Bool);
+    let block_cond = Block::shared(vec![
+        var(&cd_d),
+        var(&cd_old),
+        var(&cd_new),
+        var(&cd_limit),
+        var(&cd_isrc),
+        var(&cd_idst),
+        var(&cd_replace_entries),
+    ]);
+
+    block_loop_init.closeblock(vec![
+        Link::new(
+            vec![
+                var(&li_d),
+                var(&li_old),
+                var(&li_new),
+                var(&isrclimit),
+                signed(0),
+                signed(0),
+                var(&li_replace_entries),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let bd_d = new_var("d", dict_ptr_lltype.clone());
+    let bd_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let bd_new = new_var("newitems", entries_ptr_lltype.clone());
+    let bd_limit = new_var("isrclimit", sig());
+    let bd_isrc = new_var("isrc", sig());
+    let bd_idst = new_var("idst", sig());
+    let bd_replace_entries = new_var("replace_entries", LowLevelType::Bool);
+    let block_body = Block::shared(vec![
+        var(&bd_d),
+        var(&bd_old),
+        var(&bd_new),
+        var(&bd_limit),
+        var(&bd_isrc),
+        var(&bd_idst),
+        var(&bd_replace_entries),
+    ]);
+
+    let done_d = new_var("d", dict_ptr_lltype.clone());
+    let done_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let done_new = new_var("newitems", entries_ptr_lltype.clone());
+    let done_limit = new_var("isrclimit", sig());
+    let done_idst = new_var("idst", sig());
+    let done_replace_entries = new_var("replace_entries", LowLevelType::Bool);
+    let block_after_loop = Block::shared(vec![
+        var(&done_d),
+        var(&done_old),
+        var(&done_new),
+        var(&done_limit),
+        var(&done_idst),
+        var(&done_replace_entries),
+    ]);
+
+    let cond = new_var("cond", LowLevelType::Bool);
+    push(
+        &block_cond,
+        "int_lt",
+        vec![var(&cd_isrc), var(&cd_limit)],
+        &cond,
+    );
+    block_cond.borrow_mut().exitswitch = Some(var(&cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![
+                var(&cd_d),
+                var(&cd_old),
+                var(&cd_new),
+                var(&cd_limit),
+                var(&cd_isrc),
+                var(&cd_idst),
+                var(&cd_replace_entries),
+            ],
+            Some(block_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&cd_d),
+                var(&cd_old),
+                var(&cd_new),
+                var(&cd_limit),
+                var(&cd_idst),
+                var(&cd_replace_entries),
+            ],
+            Some(block_after_loop.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let cp_d = new_var("d", dict_ptr_lltype.clone());
+    let cp_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let cp_new = new_var("newitems", entries_ptr_lltype.clone());
+    let cp_limit = new_var("isrclimit", sig());
+    let cp_isrc = new_var("isrc", sig());
+    let cp_idst = new_var("idst", sig());
+    let cp_replace_entries = new_var("replace_entries", LowLevelType::Bool);
+    let block_copy = Block::shared(vec![
+        var(&cp_d),
+        var(&cp_old),
+        var(&cp_new),
+        var(&cp_limit),
+        var(&cp_isrc),
+        var(&cp_idst),
+        var(&cp_replace_entries),
+    ]);
+
+    let nx_d = new_var("d", dict_ptr_lltype.clone());
+    let nx_old = new_var("old_entries", entries_ptr_lltype.clone());
+    let nx_new = new_var("newitems", entries_ptr_lltype.clone());
+    let nx_limit = new_var("isrclimit", sig());
+    let nx_isrc = new_var("isrc", sig());
+    let nx_idst = new_var("idst", sig());
+    let nx_replace_entries = new_var("replace_entries", LowLevelType::Bool);
+    let block_next = Block::shared(vec![
+        var(&nx_d),
+        var(&nx_old),
+        var(&nx_new),
+        var(&nx_limit),
+        var(&nx_isrc),
+        var(&nx_idst),
+        var(&nx_replace_entries),
+    ]);
+
+    let valid = new_var("valid", LowLevelType::Bool);
+    push(
+        &block_body,
+        "getinteriorfield",
+        vec![var(&bd_old), var(&bd_isrc), void_field_const("f_valid")],
+        &valid,
+    );
+    block_body.borrow_mut().exitswitch = Some(var(&valid));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                var(&bd_d),
+                var(&bd_old),
+                var(&bd_new),
+                var(&bd_limit),
+                var(&bd_isrc),
+                var(&bd_idst),
+                var(&bd_replace_entries),
+            ],
+            Some(block_copy.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&bd_d),
+                var(&bd_old),
+                var(&bd_new),
+                var(&bd_limit),
+                var(&bd_isrc),
+                var(&bd_idst),
+                var(&bd_replace_entries),
+            ],
+            Some(block_next.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let kv = new_var("kv", key_lltype.clone());
+    push(
+        &block_copy,
+        "getinteriorfield",
+        vec![var(&cp_old), var(&cp_isrc), void_field_const("key")],
+        &kv,
+    );
+    push(
+        &block_copy,
+        "setinteriorfield",
+        vec![
+            var(&cp_new),
+            var(&cp_idst),
+            void_field_const("key"),
+            var(&kv),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let vv = new_var("vv", value_lltype.clone());
+    push(
+        &block_copy,
+        "getinteriorfield",
+        vec![var(&cp_old), var(&cp_isrc), void_field_const("value")],
+        &vv,
+    );
+    push(
+        &block_copy,
+        "setinteriorfield",
+        vec![
+            var(&cp_new),
+            var(&cp_idst),
+            void_field_const("value"),
+            var(&vv),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let hv = new_var("hv", sig());
+    push(
+        &block_copy,
+        "getinteriorfield",
+        vec![var(&cp_old), var(&cp_isrc), void_field_const("f_hash")],
+        &hv,
+    );
+    push(
+        &block_copy,
+        "setinteriorfield",
+        vec![
+            var(&cp_new),
+            var(&cp_idst),
+            void_field_const("f_hash"),
+            var(&hv),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    push(
+        &block_copy,
+        "setinteriorfield",
+        vec![
+            var(&cp_new),
+            var(&cp_idst),
+            void_field_const("f_valid"),
+            bool_const(true),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let idst_next = new_var("idst", sig());
+    push(
+        &block_copy,
+        "int_add",
+        vec![var(&cp_idst), signed(1)],
+        &idst_next,
+    );
+    block_copy.closeblock(vec![
+        Link::new(
+            vec![
+                var(&cp_d),
+                var(&cp_old),
+                var(&cp_new),
+                var(&cp_limit),
+                var(&cp_isrc),
+                var(&idst_next),
+                var(&cp_replace_entries),
+            ],
+            Some(block_next.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let isrc_next = new_var("isrc", sig());
+    push(
+        &block_next,
+        "int_add",
+        vec![var(&nx_isrc), signed(1)],
+        &isrc_next,
+    );
+    block_next.closeblock(vec![
+        Link::new(
+            vec![
+                var(&nx_d),
+                var(&nx_old),
+                var(&nx_new),
+                var(&nx_limit),
+                var(&isrc_next),
+                var(&nx_idst),
+                var(&nx_replace_entries),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_after_loop,
+        "setfield",
+        vec![
+            var(&done_d),
+            void_field_const("num_ever_used_items"),
+            var(&done_idst),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_after_loop.borrow_mut().exitswitch = Some(var(&done_replace_entries));
+
+    let se_d = new_var("d", dict_ptr_lltype.clone());
+    let se_new = new_var("newitems", entries_ptr_lltype.clone());
+    let block_set_entries = Block::shared(vec![var(&se_d), var(&se_new)]);
+
+    let cl_d = new_var("d", dict_ptr_lltype.clone());
+    let cl_new = new_var("newitems", entries_ptr_lltype.clone());
+    let cl_limit = new_var("isrclimit", sig());
+    let cl_idst = new_var("idst", sig());
+    let block_clear_or_reindex = Block::shared(vec![
+        var(&cl_d),
+        var(&cl_new),
+        var(&cl_limit),
+        var(&cl_idst),
+    ]);
+
+    block_after_loop.closeblock(vec![
+        Link::new(
+            vec![var(&done_d), var(&done_new)],
+            Some(block_set_entries.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&done_d),
+                var(&done_new),
+                var(&done_limit),
+                var(&done_idst),
+            ],
+            Some(block_clear_or_reindex.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let ri_d = new_var("d", dict_ptr_lltype.clone());
+    let block_reindex = Block::shared(vec![var(&ri_d)]);
+
+    push(
+        &block_set_entries,
+        "setfield",
+        vec![var(&se_d), void_field_const("entries"), var(&se_new)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_set_entries.closeblock(vec![
+        Link::new(vec![var(&se_d)], Some(block_reindex.clone()), None).into_ref(),
+    ]);
+
+    if must_clear_key || must_clear_value {
+        let cc_d = new_var("d", dict_ptr_lltype.clone());
+        let cc_entries = new_var("newitems", entries_ptr_lltype.clone());
+        let cc_limit = new_var("isrclimit", sig());
+        let cc_i = new_var("idst", sig());
+        let block_clear_cond = Block::shared(vec![
+            var(&cc_d),
+            var(&cc_entries),
+            var(&cc_limit),
+            var(&cc_i),
+        ]);
+
+        block_clear_or_reindex.closeblock(vec![
+            Link::new(
+                vec![var(&cl_d), var(&cl_new), var(&cl_limit), var(&cl_idst)],
+                Some(block_clear_cond.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let cb_d = new_var("d", dict_ptr_lltype.clone());
+        let cb_entries = new_var("newitems", entries_ptr_lltype.clone());
+        let cb_limit = new_var("isrclimit", sig());
+        let cb_i = new_var("idst", sig());
+        let block_clear_body = Block::shared(vec![
+            var(&cb_d),
+            var(&cb_entries),
+            var(&cb_limit),
+            var(&cb_i),
+        ]);
+
+        let clear_cond = new_var("clear_cond", LowLevelType::Bool);
+        push(
+            &block_clear_cond,
+            "int_lt",
+            vec![var(&cc_i), var(&cc_limit)],
+            &clear_cond,
+        );
+        block_clear_cond.borrow_mut().exitswitch = Some(var(&clear_cond));
+        block_clear_cond.closeblock(vec![
+            Link::new(
+                vec![var(&cc_d), var(&cc_entries), var(&cc_limit), var(&cc_i)],
+                Some(block_clear_body.clone()),
+                Some(bool_const(true)),
+            )
+            .into_ref(),
+            Link::new(
+                vec![var(&cc_d)],
+                Some(block_reindex.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+        ]);
+
+        if must_clear_key {
+            push(
+                &block_clear_body,
+                "setinteriorfield",
+                vec![
+                    var(&cb_entries),
+                    var(&cb_i),
+                    void_field_const("key"),
+                    null_of(&key_lltype),
+                ],
+                &new_var("v", LowLevelType::Void),
+            );
+        }
+        if must_clear_value {
+            push(
+                &block_clear_body,
+                "setinteriorfield",
+                vec![
+                    var(&cb_entries),
+                    var(&cb_i),
+                    void_field_const("value"),
+                    null_of(&value_lltype),
+                ],
+                &new_var("v", LowLevelType::Void),
+            );
+        }
+        let clear_next = new_var("idst", sig());
+        push(
+            &block_clear_body,
+            "int_add",
+            vec![var(&cb_i), signed(1)],
+            &clear_next,
+        );
+        block_clear_body.closeblock(vec![
+            Link::new(
+                vec![
+                    var(&cb_d),
+                    var(&cb_entries),
+                    var(&cb_limit),
+                    var(&clear_next),
+                ],
+                Some(block_clear_cond),
+                None,
+            )
+            .into_ref(),
+        ]);
+    } else {
+        block_clear_or_reindex.closeblock(vec![
+            Link::new(vec![var(&cl_d)], Some(block_reindex.clone()), None).into_ref(),
+        ]);
+    }
+
+    let indexes_gcref = new_var("indexes_gcref", GCREF.clone());
+    push(
+        &block_reindex,
+        "getfield",
+        vec![var(&ri_d), void_field_const("indexes")],
+        &indexes_gcref,
+    );
+    let indexes = new_var("indexes", indexes_ptr_lltype);
+    push(
+        &block_reindex,
+        "cast_pointer",
+        vec![var(&indexes_gcref)],
+        &indexes,
+    );
+    let len_indexes = new_var("len_indexes", sig());
+    push(
+        &block_reindex,
+        "getarraysize",
+        vec![var(&indexes)],
+        &len_indexes,
+    );
+    push(
+        &block_reindex,
+        "direct_call",
+        vec![Hlvalue::Constant(reindex_fn), var(&ri_d), var(&len_indexes)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_reindex.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_grow(d) -> Bool` (`rordereddict.py:755-787`):
+///
+/// ```python
+/// def ll_dict_grow(d):
+///     if d.num_live_items < d.num_ever_used_items // 2:
+///         ll_dict_remove_deleted_items(d)
+///         return True
+///     new_allocated = _overallocate_entries_len(len(d.entries))
+///     if _ll_dict_entries_size_too_big(d, new_allocated):
+///         ll_dict_remove_deleted_items(d)
+///         assert d.num_live_items == d.num_ever_used_items
+///         return True
+///     newitems = lltype.malloc(lltype.typeOf(d).TO.entries.TO, new_allocated)
+///     rgc.ll_arraycopy(d.entries, newitems, 0, 0, len(d.entries))
+///     d.entries = newitems
+///     return False
+/// ```
+///
+/// rordereddict.py:779-782 — `_ll_dict_entries_size_too_big` remains collapsed:
+/// it protects genuinely narrow UCHAR/USHORT/UINT index arrays from entry-index
+/// overflow, but all local `DICTINDEX_*` aliases are currently
+/// `Ptr(GcArray(Unsigned))` until #148 lands.
+pub(crate) fn build_ll_dict_grow_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    entries_array_ty: LowLevelType,
+    remove_deleted_items_fn: Constant,
+    arraycopy_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let startblock = Block::shared(vec![var(&d)]);
+    let return_var = new_var("result", LowLevelType::Bool);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let num_live = new_var("num_live", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let num_ever = new_var("num_ever", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_ever_used_items")],
+        &num_ever,
+    );
+    let half_ever = new_var("half_ever", sig());
+    push(
+        &startblock,
+        "int_rshift",
+        vec![var(&num_ever), signed(1)],
+        &half_ever,
+    );
+    let do_compact = new_var("do_compact", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_lt",
+        vec![var(&num_live), var(&half_ever)],
+        &do_compact,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&do_compact));
+
+    let cp_d = new_var("d", dict_ptr_lltype.clone());
+    let block_compact = Block::shared(vec![var(&cp_d)]);
+    let gr_d = new_var("d", dict_ptr_lltype.clone());
+    let block_grow = Block::shared(vec![var(&gr_d)]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d)],
+            Some(block_compact.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d)],
+            Some(block_grow.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_compact,
+        "direct_call",
+        vec![Hlvalue::Constant(remove_deleted_items_fn), var(&cp_d)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_compact.closeblock(vec![
+        Link::new(
+            vec![bool_const(true)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &block_grow,
+        "getfield",
+        vec![var(&gr_d), void_field_const("entries")],
+        &entries,
+    );
+    let len_entries = new_var("len_entries", sig());
+    push(
+        &block_grow,
+        "getarraysize",
+        vec![var(&entries)],
+        &len_entries,
+    );
+    // _overallocate_entries_len(baselen) = baselen + (baselen >> 3) + 8.
+    let shr = new_var("shr", sig());
+    push(
+        &block_grow,
+        "int_rshift",
+        vec![var(&len_entries), signed(3)],
+        &shr,
+    );
+    let newsize = new_var("newsize", sig());
+    push(
+        &block_grow,
+        "int_add",
+        vec![var(&len_entries), var(&shr)],
+        &newsize,
+    );
+    let new_allocated = new_var("new_allocated", sig());
+    push(
+        &block_grow,
+        "int_add",
+        vec![var(&newsize), signed(8)],
+        &new_allocated,
+    );
+    let newitems = new_var("newitems", entries_ptr_lltype);
+    push(
+        &block_grow,
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(entries_array_ty),
+            gc_flavor_const()?,
+            var(&new_allocated),
+        ],
+        &newitems,
+    );
+    push(
+        &block_grow,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(arraycopy_fn),
+            var(&entries),
+            var(&newitems),
+            var(&len_entries),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    push(
+        &block_grow,
+        "setfield",
+        vec![var(&gr_d), void_field_const("entries"), var(&newitems)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_grow.closeblock(vec![
+        Link::new(
+            vec![bool_const(false)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_reindex(d, new_size)` (`rordereddict.py:979-1019`):
+///
+/// ```python
+/// def ll_dict_reindex(d, new_size):
+///     if bool(d.indexes) and _ll_len_of_d_indexes(d) == new_size:
+///         ll_clear_indexes(d, new_size)
+///     else:
+///         ll_malloc_indexes_and_choose_lookup(d, new_size)
+///     d.resize_counter = new_size * 2 - d.num_live_items * 3
+///     entries = d.entries
+///     i = 0
+///     ibound = d.num_ever_used_items
+///     fun = d.lookup_function_no
+///     while i < ibound:
+///         if entries.valid(i):
+///             ll_dict_store_clean(d, entries.entry_hash(d, i), i, TYPE_*)
+///         i += 1
+/// ```
+///
+/// **The "reuse + `ll_clear_indexes`" branch is skipped** — this port
+/// always re-mallocs via `ll_malloc_indexes_and_choose_lookup`, which is
+/// semantically identical (both produce a zero-filled `new_size`-length
+/// index array); the skipped branch is purely a GC-pressure optimisation,
+/// not a correctness path, and avoids porting the otherwise-unused
+/// `ll_clear_indexes`/`rgc.ll_arrayclear` primitive. The `fun`/`FUNC_*`
+/// 4-way dispatch in the loop collapses to a single `ll_dict_store_clean`
+/// call (same width-collapse rationale as `ll_call_lookup_function`, Slice
+/// 2). `entries.entry_hash(d, i)` reads the cached `f_hash` field
+/// (`ll_hash_from_cache`) — the baseline layout here is always
+/// non-`simple_hash_eq` (`f_hash` unconditional, see the roadmap's "general
+/// baseline takes both else-branches" note). `entries.valid(i)` reads
+/// `f_valid` (`ll_valid_from_flag`).
+pub(crate) fn build_ll_dict_reindex_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    malloc_choose_fn: Constant,
+    store_clean_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let new_size = new_var("new_size", sig());
+    let startblock = Block::shared(vec![var(&d), var(&new_size)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    push(
+        &startblock,
+        "direct_call",
+        vec![Hlvalue::Constant(malloc_choose_fn), var(&d), var(&new_size)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let t1 = new_var("t1", sig());
+    push(&startblock, "int_mul", vec![var(&new_size), signed(2)], &t1);
+    let num_live = new_var("num_live", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let t2 = new_var("t2", sig());
+    push(&startblock, "int_mul", vec![var(&num_live), signed(3)], &t2);
+    let rc = new_var("rc", sig());
+    push(&startblock, "int_sub", vec![var(&t1), var(&t2)], &rc);
+    push(
+        &startblock,
+        "setfield",
+        vec![var(&d), void_field_const("resize_counter"), var(&rc)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("entries")],
+        &entries,
+    );
+    let ibound = new_var("ibound", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_ever_used_items")],
+        &ibound,
+    );
+
+    // block_cond(d, entries, ibound, i).
+    let cd_d = new_var("d", dict_ptr_lltype.clone());
+    let cd_entries = new_var("entries", entries_ptr_lltype.clone());
+    let cd_ibound = new_var("ibound", sig());
+    let cd_i = new_var("i", sig());
+    let block_cond = Block::shared(vec![
+        var(&cd_d),
+        var(&cd_entries),
+        var(&cd_ibound),
+        var(&cd_i),
+    ]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d), var(&entries), var(&ibound), signed(0)],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // block_body(d, entries, ibound, i): check f_valid.
+    let bd_d = new_var("d", dict_ptr_lltype.clone());
+    let bd_entries = new_var("entries", entries_ptr_lltype.clone());
+    let bd_ibound = new_var("ibound", sig());
+    let bd_i = new_var("i", sig());
+    let block_body = Block::shared(vec![
+        var(&bd_d),
+        var(&bd_entries),
+        var(&bd_ibound),
+        var(&bd_i),
+    ]);
+
+    let cond = new_var("cond", LowLevelType::Bool);
+    push(
+        &block_cond,
+        "int_lt",
+        vec![var(&cd_i), var(&cd_ibound)],
+        &cond,
+    );
+    block_cond.borrow_mut().exitswitch = Some(var(&cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![var(&cd_d), var(&cd_entries), var(&cd_ibound), var(&cd_i)],
+            Some(block_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_void()],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // block_store(d, entries, ibound, i): entry_hash + store_clean.
+    let st_d = new_var("d", dict_ptr_lltype.clone());
+    let st_entries = new_var("entries", entries_ptr_lltype.clone());
+    let st_ibound = new_var("ibound", sig());
+    let st_i = new_var("i", sig());
+    let block_store = Block::shared(vec![
+        var(&st_d),
+        var(&st_entries),
+        var(&st_ibound),
+        var(&st_i),
+    ]);
+
+    // block_next(d, entries, ibound, i).
+    let nx_d = new_var("d", dict_ptr_lltype.clone());
+    let nx_entries = new_var("entries", entries_ptr_lltype.clone());
+    let nx_ibound = new_var("ibound", sig());
+    let nx_i = new_var("i", sig());
+    let block_next = Block::shared(vec![
+        var(&nx_d),
+        var(&nx_entries),
+        var(&nx_ibound),
+        var(&nx_i),
+    ]);
+
+    let valid = new_var("valid", LowLevelType::Bool);
+    push(
+        &block_body,
+        "getinteriorfield",
+        vec![var(&bd_entries), var(&bd_i), void_field_const("f_valid")],
+        &valid,
+    );
+    block_body.borrow_mut().exitswitch = Some(var(&valid));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![var(&bd_d), var(&bd_entries), var(&bd_ibound), var(&bd_i)],
+            Some(block_store.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&bd_d), var(&bd_entries), var(&bd_ibound), var(&bd_i)],
+            Some(block_next.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let h = new_var("h", sig());
+    push(
+        &block_store,
+        "getinteriorfield",
+        vec![var(&st_entries), var(&st_i), void_field_const("f_hash")],
+        &h,
+    );
+    push(
+        &block_store,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(store_clean_fn),
+            var(&st_d),
+            var(&h),
+            var(&st_i),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_store.closeblock(vec![
+        Link::new(
+            vec![var(&st_d), var(&st_entries), var(&st_ibound), var(&st_i)],
+            Some(block_next.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let i_next = new_var("i", sig());
+    push(&block_next, "int_add", vec![var(&nx_i), signed(1)], &i_next);
+    block_next.closeblock(vec![
+        Link::new(
+            vec![var(&nx_d), var(&nx_entries), var(&nx_ibound), var(&i_next)],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "new_size".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_dict_resize_to(d, num_extra)` (`rordereddict.py:923-932`):
+///
+/// ```python
+/// def _ll_dict_resize_to(d, num_extra):
+///     new_estimate = (d.num_live_items + num_extra) * 2
+///     new_size = DICT_INITSIZE
+///     while new_size <= new_estimate:
+///         new_size *= 2
+///     if new_size < _ll_len_of_d_indexes(d):
+///         ll_dict_remove_deleted_items(d)
+///     else:
+///         ll_dict_reindex(d, new_size)
+/// ```
+pub(crate) fn build_ll_dict_resize_to_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    remove_deleted_items_fn: Constant,
+    reindex_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let num_extra = new_var("num_extra", sig());
+    let startblock = Block::shared(vec![var(&d), var(&num_extra)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let num_live = new_var("num_live", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let sum1 = new_var("sum1", sig());
+    push(
+        &startblock,
+        "int_add",
+        vec![var(&num_live), var(&num_extra)],
+        &sum1,
+    );
+    let new_estimate = new_var("new_estimate", sig());
+    push(
+        &startblock,
+        "int_mul",
+        vec![var(&sum1), signed(2)],
+        &new_estimate,
+    );
+
+    // block_double_cond(d, new_estimate, new_size).
+    let dc_d = new_var("d", dict_ptr_lltype.clone());
+    let dc_estimate = new_var("new_estimate", sig());
+    let dc_size = new_var("new_size", sig());
+    let block_double_cond = Block::shared(vec![var(&dc_d), var(&dc_estimate), var(&dc_size)]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d), var(&new_estimate), signed(DICT_INITSIZE)],
+            Some(block_double_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // block_double_body(d, new_estimate, new_size): new_size *= 2.
+    let db_d = new_var("d", dict_ptr_lltype.clone());
+    let db_estimate = new_var("new_estimate", sig());
+    let db_size = new_var("new_size", sig());
+    let block_double_body = Block::shared(vec![var(&db_d), var(&db_estimate), var(&db_size)]);
+
+    // block_check_shrink(d, new_size): compare with len(d.indexes).
+    let cs_d = new_var("d", dict_ptr_lltype.clone());
+    let cs_size = new_var("new_size", sig());
+    let block_check_shrink = Block::shared(vec![var(&cs_d), var(&cs_size)]);
+
+    // block_call_remove(d): ll_dict_remove_deleted_items(d).
+    let rm_d = new_var("d", dict_ptr_lltype.clone());
+    let block_call_remove = Block::shared(vec![var(&rm_d)]);
+
+    // block_call_reindex(d, new_size).
+    let cr_d = new_var("d", dict_ptr_lltype.clone());
+    let cr_size = new_var("new_size", sig());
+    let block_call_reindex = Block::shared(vec![var(&cr_d), var(&cr_size)]);
+
+    let cond = new_var("cond", LowLevelType::Bool);
+    push(
+        &block_double_cond,
+        "int_le",
+        vec![var(&dc_size), var(&dc_estimate)],
+        &cond,
+    );
+    block_double_cond.borrow_mut().exitswitch = Some(var(&cond));
+    block_double_cond.closeblock(vec![
+        Link::new(
+            vec![var(&dc_d), var(&dc_estimate), var(&dc_size)],
+            Some(block_double_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&dc_d), var(&dc_size)],
+            Some(block_check_shrink.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let db_size2 = new_var("new_size", sig());
+    push(
+        &block_double_body,
+        "int_mul",
+        vec![var(&db_size), signed(2)],
+        &db_size2,
+    );
+    block_double_body.closeblock(vec![
+        Link::new(
+            vec![var(&db_d), var(&db_estimate), var(&db_size2)],
+            Some(block_double_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let indexes_gcref = new_var("indexes_gcref", GCREF.clone());
+    push(
+        &block_check_shrink,
+        "getfield",
+        vec![var(&cs_d), void_field_const("indexes")],
+        &indexes_gcref,
+    );
+    let indexes = new_var("indexes", indexes_ptr_lltype);
+    push(
+        &block_check_shrink,
+        "cast_pointer",
+        vec![var(&indexes_gcref)],
+        &indexes,
+    );
+    let len_indexes = new_var("len_indexes", sig());
+    push(
+        &block_check_shrink,
+        "getarraysize",
+        vec![var(&indexes)],
+        &len_indexes,
+    );
+    let shrink = new_var("shrink", LowLevelType::Bool);
+    push(
+        &block_check_shrink,
+        "int_lt",
+        vec![var(&cs_size), var(&len_indexes)],
+        &shrink,
+    );
+    block_check_shrink.borrow_mut().exitswitch = Some(var(&shrink));
+    block_check_shrink.closeblock(vec![
+        Link::new(
+            vec![var(&cs_d)],
+            Some(block_call_remove.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&cs_d), var(&cs_size)],
+            Some(block_call_reindex.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_call_remove,
+        "direct_call",
+        vec![Hlvalue::Constant(remove_deleted_items_fn), var(&rm_d)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_call_remove.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    push(
+        &block_call_reindex,
+        "direct_call",
+        vec![Hlvalue::Constant(reindex_fn), var(&cr_d), var(&cr_size)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_call_reindex.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "num_extra".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_resize(d)` (`rordereddict.py:913-916`):
+///
+/// ```python
+/// def ll_dict_resize(d):
+///     num_extra = min(d.num_live_items + 1, 30000)
+///     _ll_dict_resize_to(d, num_extra)
+/// ```
+pub(crate) fn build_ll_dict_resize_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    resize_to_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let startblock = Block::shared(vec![var(&d)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let num_live = new_var("num_live", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let plus1 = new_var("plus1", sig());
+    push(
+        &startblock,
+        "int_add",
+        vec![var(&num_live), signed(1)],
+        &plus1,
+    );
+    let lt = new_var("lt", LowLevelType::Bool);
+    push(&startblock, "int_lt", vec![var(&plus1), signed(30000)], &lt);
+    startblock.borrow_mut().exitswitch = Some(var(&lt));
+
+    // block_call(d, num_extra) — shared tail for both arms of min(...).
+    let cl_d = new_var("d", dict_ptr_lltype.clone());
+    let cl_num_extra = new_var("num_extra", sig());
+    let block_call = Block::shared(vec![var(&cl_d), var(&cl_num_extra)]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d), var(&plus1)],
+            Some(block_call.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), signed(30000)],
+            Some(block_call.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_call,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(resize_to_fn),
+            var(&cl_d),
+            var(&cl_num_extra),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_call.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            ))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_dict_del_entry(d, index)` (`rordereddict.py:872-882`):
+///
+/// ```python
+/// d.entries.mark_deleted(index)
+/// d.num_live_items -= 1
+/// if ENTRIES.must_clear_key: entry.key = nullptr(...)
+/// if ENTRIES.must_clear_value: entry.value = nullptr(...)
+/// ```
+pub(crate) fn build_ll_dict_del_entry_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype);
+    let index = new_var("index", sig());
+    let startblock = Block::shared(vec![var(&d), var(&index)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("entries")],
+        &entries,
+    );
+    push(
+        &startblock,
+        "setinteriorfield",
+        vec![
+            var(&entries),
+            var(&index),
+            void_field_const("f_valid"),
+            bool_const(false),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let num_live = new_var("num_live", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let live_after = new_var("live_after", sig());
+    push(
+        &startblock,
+        "int_sub",
+        vec![var(&num_live), signed(1)],
+        &live_after,
+    );
+    push(
+        &startblock,
+        "setfield",
+        vec![
+            var(&d),
+            void_field_const("num_live_items"),
+            var(&live_after),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+
+    // rordereddict.py:879-882 — conditional GC pointer clears map to local
+    // pointer low-level types; non-pointer key/value fields need no clear.
+    if lltype_must_clear_gc_ptr(&key_lltype) {
+        let null_key = Hlvalue::Constant(Constant::with_concretetype(ConstValue::None, key_lltype));
+        push(
+            &startblock,
+            "setinteriorfield",
+            vec![
+                var(&entries),
+                var(&index),
+                void_field_const("key"),
+                null_key,
+            ],
+            &new_var("v", LowLevelType::Void),
+        );
+    }
+    if lltype_must_clear_gc_ptr(&value_lltype) {
+        let null_value =
+            Hlvalue::Constant(Constant::with_concretetype(ConstValue::None, value_lltype));
+        push(
+            &startblock,
+            "setinteriorfield",
+            vec![
+                var(&entries),
+                var(&index),
+                void_field_const("value"),
+                null_value,
+            ],
+            &new_var("v", LowLevelType::Void),
+        );
+    }
+    startblock.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "index".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_dict_del(d, hash, index)` (`rordereddict.py:884-911`):
+///
+/// ```python
+/// ll_call_delete_by_entry_index(d, hash, index, DELETED)
+/// _ll_dict_del_entry(d, index)
+/// if d.num_live_items == 0: reset num_ever + lookup_function_no high bits
+/// elif index == d.num_ever_used_items - 1: reclaim trailing deleted entries
+/// if d.num_live_items + DICT_INITSIZE <= len(d.entries) / 8: ll_dict_resize(d)
+/// ```
+pub(crate) fn build_ll_dict_del_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    call_delete_fn: Constant,
+    del_entry_fn: Constant,
+    resize_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let hash = new_var("hash", sig());
+    let index = new_var("index", sig());
+    let startblock = Block::shared(vec![var(&d), var(&hash), var(&index)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let empty_d = new_var("d", dict_ptr_lltype.clone());
+    let block_empty = Block::shared(vec![var(&empty_d)]);
+    let lc_d = new_var("d", dict_ptr_lltype.clone());
+    let lc_index = new_var("index", sig());
+    let block_last_check = Block::shared(vec![var(&lc_d), var(&lc_index)]);
+    let sh_d = new_var("d", dict_ptr_lltype.clone());
+    let block_shrink_check = Block::shared(vec![var(&sh_d)]);
+
+    push(
+        &startblock,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_delete_fn),
+            var(&d),
+            var(&hash),
+            var(&index),
+            signed(DELETED),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    push(
+        &startblock,
+        "direct_call",
+        vec![Hlvalue::Constant(del_entry_fn), var(&d), var(&index)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let num_live = new_var("num_live", sig());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let is_empty = new_var("is_empty", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_eq",
+        vec![var(&num_live), signed(0)],
+        &is_empty,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&is_empty));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d)],
+            Some(block_empty.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), var(&index)],
+            Some(block_last_check.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_empty,
+        "setfield",
+        vec![
+            var(&empty_d),
+            void_field_const("num_ever_used_items"),
+            signed(0),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let lookup_no = new_var("lookup_no", sig());
+    push(
+        &block_empty,
+        "getfield",
+        vec![var(&empty_d), void_field_const("lookup_function_no")],
+        &lookup_no,
+    );
+    let lookup_masked = new_var("lookup_masked", sig());
+    push(
+        &block_empty,
+        "int_and",
+        vec![var(&lookup_no), signed(FUNC_MASK)],
+        &lookup_masked,
+    );
+    push(
+        &block_empty,
+        "setfield",
+        vec![
+            var(&empty_d),
+            void_field_const("lookup_function_no"),
+            var(&lookup_masked),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_empty.closeblock(vec![
+        Link::new(vec![var(&empty_d)], Some(block_shrink_check.clone()), None).into_ref(),
+    ]);
+
+    let num_ever = new_var("num_ever", sig());
+    push(
+        &block_last_check,
+        "getfield",
+        vec![var(&lc_d), void_field_const("num_ever_used_items")],
+        &num_ever,
+    );
+    let last = new_var("last", sig());
+    push(
+        &block_last_check,
+        "int_sub",
+        vec![var(&num_ever), signed(1)],
+        &last,
+    );
+    let is_last = new_var("is_last", LowLevelType::Bool);
+    push(
+        &block_last_check,
+        "int_eq",
+        vec![var(&lc_index), var(&last)],
+        &is_last,
+    );
+    block_last_check.borrow_mut().exitswitch = Some(var(&is_last));
+
+    let sc_d = new_var("d", dict_ptr_lltype.clone());
+    let sc_i = new_var("i", sig());
+    let block_scan = Block::shared(vec![var(&sc_d), var(&sc_i)]);
+    block_last_check.closeblock(vec![
+        Link::new(
+            vec![var(&lc_d), var(&lc_index)],
+            Some(block_scan.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&lc_d)],
+            Some(block_shrink_check.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // rordereddict.py:899 — the `assert i >= 0` in the trailing-delete scan
+    // is debug-only; the non-empty branch guarantees one valid entry remains.
+    let i_prev = new_var("i", sig());
+    push(&block_scan, "int_sub", vec![var(&sc_i), signed(1)], &i_prev);
+    let entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &block_scan,
+        "getfield",
+        vec![var(&sc_d), void_field_const("entries")],
+        &entries,
+    );
+    let valid = new_var("valid", LowLevelType::Bool);
+    push(
+        &block_scan,
+        "getinteriorfield",
+        vec![var(&entries), var(&i_prev), void_field_const("f_valid")],
+        &valid,
+    );
+    block_scan.borrow_mut().exitswitch = Some(var(&valid));
+
+    let se_d = new_var("d", dict_ptr_lltype.clone());
+    let se_i = new_var("i", sig());
+    let block_set_ever = Block::shared(vec![var(&se_d), var(&se_i)]);
+    block_scan.closeblock(vec![
+        Link::new(
+            vec![var(&sc_d), var(&i_prev)],
+            Some(block_set_ever.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&sc_d), var(&i_prev)],
+            Some(block_scan.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let ever_after = new_var("ever_after", sig());
+    push(
+        &block_set_ever,
+        "int_add",
+        vec![var(&se_i), signed(1)],
+        &ever_after,
+    );
+    push(
+        &block_set_ever,
+        "setfield",
+        vec![
+            var(&se_d),
+            void_field_const("num_ever_used_items"),
+            var(&ever_after),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_set_ever.closeblock(vec![
+        Link::new(vec![var(&se_d)], Some(block_shrink_check.clone()), None).into_ref(),
+    ]);
+
+    let live = new_var("live", sig());
+    push(
+        &block_shrink_check,
+        "getfield",
+        vec![var(&sh_d), void_field_const("num_live_items")],
+        &live,
+    );
+    let live_plus_init = new_var("live_plus_init", sig());
+    push(
+        &block_shrink_check,
+        "int_add",
+        vec![var(&live), signed(DICT_INITSIZE)],
+        &live_plus_init,
+    );
+    let sh_entries = new_var("entries", entries_ptr_lltype);
+    push(
+        &block_shrink_check,
+        "getfield",
+        vec![var(&sh_d), void_field_const("entries")],
+        &sh_entries,
+    );
+    let len_entries = new_var("len_entries", sig());
+    push(
+        &block_shrink_check,
+        "getarraysize",
+        vec![var(&sh_entries)],
+        &len_entries,
+    );
+    let one_eighth = new_var("one_eighth", sig());
+    push(
+        &block_shrink_check,
+        "int_rshift",
+        vec![var(&len_entries), signed(3)],
+        &one_eighth,
+    );
+    let should_resize = new_var("should_resize", LowLevelType::Bool);
+    push(
+        &block_shrink_check,
+        "int_le",
+        vec![var(&live_plus_init), var(&one_eighth)],
+        &should_resize,
+    );
+    block_shrink_check.borrow_mut().exitswitch = Some(var(&should_resize));
+
+    let rs_d = new_var("d", dict_ptr_lltype);
+    let block_call_resize = Block::shared(vec![var(&rs_d)]);
+    block_shrink_check.closeblock(vec![
+        Link::new(
+            vec![var(&sh_d)],
+            Some(block_call_resize.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_void()],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_call_resize,
+        "direct_call",
+        vec![Hlvalue::Constant(resize_fn), var(&rs_d)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_call_resize.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "hash".to_string(), "index".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_delitem(d, key)` (`rordereddict.py:854-861`, fused
+/// with `ll_dict_delitem_with_hash`):
+///
+/// ```python
+/// index = d.lookup_function(d, key, d.keyhash(key), FLAG_LOOKUP)
+/// if index < 0: raise KeyError
+/// _ll_dict_del(d, hash, index)
+/// ```
+pub(crate) fn build_ll_dict_delitem_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    hash_fn: Constant,
+    call_lookup_fn: Constant,
+    del_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let exc_args = exception_args("KeyError")?;
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let key = new_var("key", key_lltype);
+    let startblock = Block::shared(vec![var(&d), var(&key)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let hash = new_var("hash", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        &hash,
+    );
+    let index = new_var("index", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_lookup_fn),
+            var(&d),
+            var(&key),
+            var(&hash),
+            signed(FLAG_LOOKUP),
+        ],
+        &index,
+    );
+    let missing = new_var("missing", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_lt",
+        vec![var(&index), signed(0)],
+        &missing,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&missing));
+
+    let fd = new_var("d", dict_ptr_lltype);
+    let fh = new_var("hash", sig());
+    let fi = new_var("index", sig());
+    let block_found = Block::shared(vec![var(&fd), var(&fh), var(&fi)]);
+    startblock.closeblock(vec![
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), var(&hash), var(&index)],
+            Some(block_found.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_found,
+        "direct_call",
+        vec![Hlvalue::Constant(del_fn), var(&fd), var(&fh), var(&fi)],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_found.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "key".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_get(dict, key, default)` (`rordereddict.py:1284-1289`).
+pub(crate) fn build_ll_dict_get_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+    hash_fn: Constant,
+    call_lookup_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("dict", dict_ptr_lltype.clone());
+    let key = new_var("key", key_lltype);
+    let default = new_var("default", value_lltype.clone());
+    let startblock = Block::shared(vec![var(&d), var(&key), var(&default)]);
+    let return_var = new_var("result", value_lltype.clone());
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let hash = new_var("hash", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        &hash,
+    );
+    let index = new_var("index", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_lookup_fn),
+            var(&d),
+            var(&key),
+            var(&hash),
+            signed(FLAG_LOOKUP),
+        ],
+        &index,
+    );
+    let missing = new_var("missing", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_lt",
+        vec![var(&index), signed(0)],
+        &missing,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&missing));
+
+    let fd = new_var("dict", dict_ptr_lltype);
+    let fi = new_var("index", sig());
+    let block_found = Block::shared(vec![var(&fd), var(&fi)]);
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&default)],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), var(&index)],
+            Some(block_found.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let entries = new_var("entries", entries_ptr_lltype);
+    push(
+        &block_found,
+        "getfield",
+        vec![var(&fd), void_field_const("entries")],
+        &entries,
+    );
+    let value = new_var("value", value_lltype);
+    push(
+        &block_found,
+        "getinteriorfield",
+        vec![var(&entries), var(&fi), void_field_const("value")],
+        &value,
+    );
+    block_found.closeblock(vec![
+        Link::new(vec![var(&value)], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["dict".to_string(), "key".to_string(), "default".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_setdefault(dict, key, default)`
+/// (`rordereddict.py:1291-1298`).
+pub(crate) fn build_ll_dict_setdefault_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+    hash_fn: Constant,
+    call_lookup_fn: Constant,
+    lookup_done_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("dict", dict_ptr_lltype.clone());
+    let key = new_var("key", key_lltype.clone());
+    let default = new_var("default", value_lltype.clone());
+    let startblock = Block::shared(vec![var(&d), var(&key), var(&default)]);
+    let return_var = new_var("result", value_lltype.clone());
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let hash = new_var("hash", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        &hash,
+    );
+    let index = new_var("index", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_lookup_fn),
+            var(&d),
+            var(&key),
+            var(&hash),
+            signed(FLAG_STORE),
+        ],
+        &index,
+    );
+    let missing = new_var("missing", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_lt",
+        vec![var(&index), signed(0)],
+        &missing,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&missing));
+
+    let md = new_var("dict", dict_ptr_lltype.clone());
+    let mk = new_var("key", key_lltype);
+    let mv = new_var("default", value_lltype.clone());
+    let mh = new_var("hash", sig());
+    let block_missing = Block::shared(vec![var(&md), var(&mk), var(&mv), var(&mh)]);
+    let fd = new_var("dict", dict_ptr_lltype);
+    let fi = new_var("index", sig());
+    let block_found = Block::shared(vec![var(&fd), var(&fi)]);
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d), var(&key), var(&default), var(&hash)],
+            Some(block_missing.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), var(&index)],
+            Some(block_found.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_missing,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(lookup_done_fn),
+            var(&md),
+            var(&mk),
+            var(&mv),
+            var(&mh),
+            signed(-1),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_missing.closeblock(vec![
+        Link::new(vec![var(&mv)], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let entries = new_var("entries", entries_ptr_lltype);
+    push(
+        &block_found,
+        "getfield",
+        vec![var(&fd), void_field_const("entries")],
+        &entries,
+    );
+    let value = new_var("value", value_lltype);
+    push(
+        &block_found,
+        "getinteriorfield",
+        vec![var(&entries), var(&fi), void_field_const("value")],
+        &value,
+    );
+    block_found.closeblock(vec![
+        Link::new(vec![var(&value)], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["dict".to_string(), "key".to_string(), "default".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_dict_setitem_lookup_done(d, key, value, hash, i)`
+/// (`rordereddict.py:675-711`):
+///
+/// ```python
+/// def _ll_dict_setitem_lookup_done(d, key, value, hash, i):
+///     ENTRY = lltype.typeOf(d.entries).TO.OF
+///     if i >= 0:
+///         entry = d.entries[i]
+///         entry.value = value
+///     else:
+///         reindexed = False
+///         if len(d.entries) == d.num_ever_used_items:
+///             reindexed = ll_dict_grow(d)
+///         rc = d.resize_counter - 3
+///         if rc <= 0:
+///             ll_dict_resize(d)
+///             reindexed = True
+///             rc = d.resize_counter - 3
+///         if reindexed:
+///             ll_call_insert_clean_function(d, hash, d.num_ever_used_items)
+///         d.resize_counter = rc
+///         entry = d.entries[d.num_ever_used_items]
+///         entry.key = key
+///         entry.value = value
+///         if hasattr(ENTRY, 'f_hash'):
+///             entry.f_hash = hash
+///         if hasattr(ENTRY, 'f_valid'):
+///             entry.f_valid = True
+///         d.num_ever_used_items += 1
+///         d.num_live_items += 1
+/// ```
+///
+/// The `try/except: _ll_dict_rescue(d); raise` wrapping the `ll_dict_grow`
+/// and `ll_dict_resize` calls is not modelled: `_ll_dict_rescue` is a
+/// MemoryError-only rescue path (a malloc failure mid-grow leaving
+/// `d.indexes` in an inconsistent state), and this port's malloc/
+/// malloc_varsize ops carry no failure-detection surface at the RPython
+/// level, matching `rlist.rs`'s `ll_extend` precedent
+/// (`build_ll_extend_helper_graph`'s doc note: "MemoryError is an implicit
+/// (always-possible) exception, not a Python-level one the caller's flow
+/// graph handles"). `d.num_ever_used_items` is read once (it is provably
+/// unchanged by `ll_dict_grow`/`ll_dict_resize`/`ll_dict_reindex` in this
+/// port's simplified shape — none of them touch that field) and threaded
+/// through as a block argument rather than re-read at each of upstream's
+/// three use sites; same value, fewer ops. `hasattr(ENTRY, 'f_hash')` /
+/// `'f_valid'` are unconditionally true in the baseline (non-`simple_hash_eq`,
+/// no dummy-obj) layout this repr always builds today, so both entry writes
+/// are unconditional.
+pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+    grow_fn: Constant,
+    resize_fn: Constant,
+    insert_clean_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let key = new_var("key", key_lltype.clone());
+    let value = new_var("value", value_lltype.clone());
+    let hash = new_var("hash", sig());
+    let i = new_var("i", sig());
+    let startblock = Block::shared(vec![var(&d), var(&key), var(&value), var(&hash), var(&i)]);
+    let return_var = new_var("result", LowLevelType::Void);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    // ===== overwrite path (i >= 0): entries[i].value = value. =====
+    let ow_d = new_var("d", dict_ptr_lltype.clone());
+    let ow_i = new_var("i", sig());
+    let ow_value = new_var("value", value_lltype.clone());
+    let block_overwrite = Block::shared(vec![var(&ow_d), var(&ow_i), var(&ow_value)]);
+
+    // ===== insert path (i < 0). =====
+    let ins_d = new_var("d", dict_ptr_lltype.clone());
+    let ins_key = new_var("key", key_lltype.clone());
+    let ins_value = new_var("value", value_lltype.clone());
+    let ins_hash = new_var("hash", sig());
+    let block_insert_entry = Block::shared(vec![
+        var(&ins_d),
+        var(&ins_key),
+        var(&ins_value),
+        var(&ins_hash),
+    ]);
+
+    let ge = new_var("ge", LowLevelType::Bool);
+    push(&startblock, "int_ge", vec![var(&i), signed(0)], &ge);
+    startblock.borrow_mut().exitswitch = Some(var(&ge));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&d), var(&i), var(&value)],
+            Some(block_overwrite.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), var(&key), var(&value), var(&hash)],
+            Some(block_insert_entry.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_overwrite body.
+    let ow_entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &block_overwrite,
+        "getfield",
+        vec![var(&ow_d), void_field_const("entries")],
+        &ow_entries,
+    );
+    push(
+        &block_overwrite,
+        "setinteriorfield",
+        vec![
+            var(&ow_entries),
+            var(&ow_i),
+            void_field_const("value"),
+            var(&ow_value),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_overwrite.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // ---- block_insert_entry body: len(entries) == num_ever_used_items?
+    let orig_entries = new_var("orig_entries", entries_ptr_lltype.clone());
+    push(
+        &block_insert_entry,
+        "getfield",
+        vec![var(&ins_d), void_field_const("entries")],
+        &orig_entries,
+    );
+    let len_entries = new_var("len_entries", sig());
+    push(
+        &block_insert_entry,
+        "getarraysize",
+        vec![var(&orig_entries)],
+        &len_entries,
+    );
+    let num_ever0 = new_var("num_ever", sig());
+    push(
+        &block_insert_entry,
+        "getfield",
+        vec![var(&ins_d), void_field_const("num_ever_used_items")],
+        &num_ever0,
+    );
+    let need_grow = new_var("need_grow", LowLevelType::Bool);
+    push(
+        &block_insert_entry,
+        "int_eq",
+        vec![var(&len_entries), var(&num_ever0)],
+        &need_grow,
+    );
+    block_insert_entry.borrow_mut().exitswitch = Some(var(&need_grow));
+
+    // block_do_grow(d, key, value, hash).
+    let dg_d = new_var("d", dict_ptr_lltype.clone());
+    let dg_key = new_var("key", key_lltype.clone());
+    let dg_value = new_var("value", value_lltype.clone());
+    let dg_hash = new_var("hash", sig());
+    let block_do_grow = Block::shared(vec![
+        var(&dg_d),
+        var(&dg_key),
+        var(&dg_value),
+        var(&dg_hash),
+    ]);
+
+    // block_after_grow(d, key, value, hash, reindexed).
+    let ag_d = new_var("d", dict_ptr_lltype.clone());
+    let ag_key = new_var("key", key_lltype.clone());
+    let ag_value = new_var("value", value_lltype.clone());
+    let ag_hash = new_var("hash", sig());
+    let ag_reindexed = new_var("reindexed", LowLevelType::Bool);
+    let block_after_grow = Block::shared(vec![
+        var(&ag_d),
+        var(&ag_key),
+        var(&ag_value),
+        var(&ag_hash),
+        var(&ag_reindexed),
+    ]);
+
+    block_insert_entry.closeblock(vec![
+        Link::new(
+            vec![var(&ins_d), var(&ins_key), var(&ins_value), var(&ins_hash)],
+            Some(block_do_grow.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&ins_d),
+                var(&ins_key),
+                var(&ins_value),
+                var(&ins_hash),
+                bool_const(false),
+            ],
+            Some(block_after_grow.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_do_grow body.
+    let reindexed_grow = new_var("reindexed_grow", LowLevelType::Bool);
+    push(
+        &block_do_grow,
+        "direct_call",
+        vec![Hlvalue::Constant(grow_fn), var(&dg_d)],
+        &reindexed_grow,
+    );
+    block_do_grow.closeblock(vec![
+        Link::new(
+            vec![
+                var(&dg_d),
+                var(&dg_key),
+                var(&dg_value),
+                var(&dg_hash),
+                var(&reindexed_grow),
+            ],
+            Some(block_after_grow.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_after_grow body: rc = resize_counter - 3; branch rc <= 0.
+    let rc0 = new_var("rc0", sig());
+    push(
+        &block_after_grow,
+        "getfield",
+        vec![var(&ag_d), void_field_const("resize_counter")],
+        &rc0,
+    );
+    let rc = new_var("rc", sig());
+    push(
+        &block_after_grow,
+        "int_sub",
+        vec![var(&rc0), signed(3)],
+        &rc,
+    );
+    let need_resize = new_var("need_resize", LowLevelType::Bool);
+    push(
+        &block_after_grow,
+        "int_le",
+        vec![var(&rc), signed(0)],
+        &need_resize,
+    );
+    block_after_grow.borrow_mut().exitswitch = Some(var(&need_resize));
+
+    // block_do_resize(d, key, value, hash).
+    let dr_d = new_var("d", dict_ptr_lltype.clone());
+    let dr_key = new_var("key", key_lltype.clone());
+    let dr_value = new_var("value", value_lltype.clone());
+    let dr_hash = new_var("hash", sig());
+    let block_do_resize = Block::shared(vec![
+        var(&dr_d),
+        var(&dr_key),
+        var(&dr_value),
+        var(&dr_hash),
+    ]);
+
+    // block_after_resize(d, key, value, hash, reindexed, rc).
+    let ar_d = new_var("d", dict_ptr_lltype.clone());
+    let ar_key = new_var("key", key_lltype.clone());
+    let ar_value = new_var("value", value_lltype.clone());
+    let ar_hash = new_var("hash", sig());
+    let ar_reindexed = new_var("reindexed", LowLevelType::Bool);
+    let ar_rc = new_var("rc", sig());
+    let block_after_resize = Block::shared(vec![
+        var(&ar_d),
+        var(&ar_key),
+        var(&ar_value),
+        var(&ar_hash),
+        var(&ar_reindexed),
+        var(&ar_rc),
+    ]);
+
+    block_after_grow.closeblock(vec![
+        Link::new(
+            vec![var(&ag_d), var(&ag_key), var(&ag_value), var(&ag_hash)],
+            Some(block_do_resize.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&ag_d),
+                var(&ag_key),
+                var(&ag_value),
+                var(&ag_hash),
+                var(&ag_reindexed),
+                var(&rc),
+            ],
+            Some(block_after_resize.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_do_resize body: ll_dict_resize(d); reindexed=True; rc = resize_counter - 3.
+    push(
+        &block_do_resize,
+        "direct_call",
+        vec![Hlvalue::Constant(resize_fn), var(&dr_d)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let rc2_0 = new_var("rc2_0", sig());
+    push(
+        &block_do_resize,
+        "getfield",
+        vec![var(&dr_d), void_field_const("resize_counter")],
+        &rc2_0,
+    );
+    let rc2 = new_var("rc2", sig());
+    push(
+        &block_do_resize,
+        "int_sub",
+        vec![var(&rc2_0), signed(3)],
+        &rc2,
+    );
+    block_do_resize.closeblock(vec![
+        Link::new(
+            vec![
+                var(&dr_d),
+                var(&dr_key),
+                var(&dr_value),
+                var(&dr_hash),
+                bool_const(true),
+                var(&rc2),
+            ],
+            Some(block_after_resize.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_after_resize body: branch on reindexed.
+    block_after_resize.borrow_mut().exitswitch = Some(var(&ar_reindexed));
+
+    // block_do_insert_clean(d, key, value, hash, rc).
+    let ic_d = new_var("d", dict_ptr_lltype.clone());
+    let ic_key = new_var("key", key_lltype.clone());
+    let ic_value = new_var("value", value_lltype.clone());
+    let ic_hash = new_var("hash", sig());
+    let ic_rc = new_var("rc", sig());
+    let block_do_insert_clean = Block::shared(vec![
+        var(&ic_d),
+        var(&ic_key),
+        var(&ic_value),
+        var(&ic_hash),
+        var(&ic_rc),
+    ]);
+
+    // block_write_entry(d, key, value, hash, rc).
+    let we_d = new_var("d", dict_ptr_lltype.clone());
+    let we_key = new_var("key", key_lltype.clone());
+    let we_value = new_var("value", value_lltype.clone());
+    let we_hash = new_var("hash", sig());
+    let we_rc = new_var("rc", sig());
+    let block_write_entry = Block::shared(vec![
+        var(&we_d),
+        var(&we_key),
+        var(&we_value),
+        var(&we_hash),
+        var(&we_rc),
+    ]);
+
+    block_after_resize.closeblock(vec![
+        Link::new(
+            vec![
+                var(&ar_d),
+                var(&ar_key),
+                var(&ar_value),
+                var(&ar_hash),
+                var(&ar_rc),
+            ],
+            Some(block_do_insert_clean.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&ar_d),
+                var(&ar_key),
+                var(&ar_value),
+                var(&ar_hash),
+                var(&ar_rc),
+            ],
+            Some(block_write_entry.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_do_insert_clean body.
+    let num_ever_ic = new_var("num_ever_ic", sig());
+    push(
+        &block_do_insert_clean,
+        "getfield",
+        vec![var(&ic_d), void_field_const("num_ever_used_items")],
+        &num_ever_ic,
+    );
+    push(
+        &block_do_insert_clean,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(insert_clean_fn),
+            var(&ic_d),
+            var(&ic_hash),
+            var(&num_ever_ic),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_do_insert_clean.closeblock(vec![
+        Link::new(
+            vec![
+                var(&ic_d),
+                var(&ic_key),
+                var(&ic_value),
+                var(&ic_hash),
+                var(&ic_rc),
+            ],
+            Some(block_write_entry.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_write_entry body: write the fresh entry, bump counters.
+    push(
+        &block_write_entry,
+        "setfield",
+        vec![var(&we_d), void_field_const("resize_counter"), var(&we_rc)],
+        &new_var("v", LowLevelType::Void),
+    );
+    let entries2 = new_var("entries2", entries_ptr_lltype.clone());
+    push(
+        &block_write_entry,
+        "getfield",
+        vec![var(&we_d), void_field_const("entries")],
+        &entries2,
+    );
+    let num_ever2 = new_var("num_ever2", sig());
+    push(
+        &block_write_entry,
+        "getfield",
+        vec![var(&we_d), void_field_const("num_ever_used_items")],
+        &num_ever2,
+    );
+    push(
+        &block_write_entry,
+        "setinteriorfield",
+        vec![
+            var(&entries2),
+            var(&num_ever2),
+            void_field_const("key"),
+            var(&we_key),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    push(
+        &block_write_entry,
+        "setinteriorfield",
+        vec![
+            var(&entries2),
+            var(&num_ever2),
+            void_field_const("value"),
+            var(&we_value),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    push(
+        &block_write_entry,
+        "setinteriorfield",
+        vec![
+            var(&entries2),
+            var(&num_ever2),
+            void_field_const("f_hash"),
+            var(&we_hash),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    push(
+        &block_write_entry,
+        "setinteriorfield",
+        vec![
+            var(&entries2),
+            var(&num_ever2),
+            void_field_const("f_valid"),
+            bool_const(true),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let new_num_ever = new_var("new_num_ever", sig());
+    push(
+        &block_write_entry,
+        "int_add",
+        vec![var(&num_ever2), signed(1)],
+        &new_num_ever,
+    );
+    push(
+        &block_write_entry,
+        "setfield",
+        vec![
+            var(&we_d),
+            void_field_const("num_ever_used_items"),
+            var(&new_num_ever),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    let num_live = new_var("num_live", sig());
+    push(
+        &block_write_entry,
+        "getfield",
+        vec![var(&we_d), void_field_const("num_live_items")],
+        &num_live,
+    );
+    let new_num_live = new_var("new_num_live", sig());
+    push(
+        &block_write_entry,
+        "int_add",
+        vec![var(&num_live), signed(1)],
+        &new_num_live,
+    );
+    push(
+        &block_write_entry,
+        "setfield",
+        vec![
+            var(&we_d),
+            void_field_const("num_live_items"),
+            var(&new_num_live),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_write_entry.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "d".to_string(),
+            "key".to_string(),
+            "value".to_string(),
+            "hash".to_string(),
+            "i".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise `ll_dict_setitem(d, key, value)` (`rordereddict.py:665-673`,
+/// fused with its `_with_hash` half and the `FLAG_STORE` lookup call — same
+/// fusion rationale as [`build_ll_dict_getitem_helper_graph`]):
+///
+/// ```python
+/// def ll_dict_setitem(d, key, value):
+///     ll_dict_setitem_with_hash(d, key, d.keyhash(key), value)
+///
+/// def ll_dict_setitem_with_hash(d, key, hash, value):
+///     index = d.lookup_function(d, key, hash, FLAG_STORE)
+///     _ll_dict_setitem_lookup_done(d, key, value, hash, index)
+/// ```
+pub(crate) fn build_ll_dict_setitem_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+    hash_fn: Constant,
+    call_lookup_fn: Constant,
+    lookup_done_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let key = variable_with_lltype("key", key_lltype);
+    let value = variable_with_lltype("value", value_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(key.clone()),
+        Hlvalue::Variable(value.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let hash = variable_with_lltype("hash", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(hash_fn), Hlvalue::Variable(key.clone())],
+        Hlvalue::Variable(hash.clone()),
+    ));
+    let index = variable_with_lltype("index", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_lookup_fn),
+            Hlvalue::Variable(d.clone()),
+            Hlvalue::Variable(key.clone()),
+            Hlvalue::Variable(hash.clone()),
+            constant_with_lltype(ConstValue::Int(FLAG_STORE), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(index.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(lookup_done_fn),
+            Hlvalue::Variable(d),
+            Hlvalue::Variable(key),
+            Hlvalue::Variable(value),
+            Hlvalue::Variable(hash),
+            Hlvalue::Variable(index),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "key".to_string(), "value".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise `_ll_dictnext(iter) -> Signed` (`rordereddict.py:1229-1259`),
 /// the forward dict-iterator step shared by keys/values/items iteration.
 ///
@@ -1457,10 +7174,10 @@ pub fn build_ll_dict_lookup_helper_graph(
 /// run. The only caller today is the unit test below, so the helper is inert
 /// (no production or census reach) — it cannot miscompile. Wiring `rtype_next`
 /// is blocked on the unported ordered-dict runtime: the `ll_dictiter` graph
-/// builder, `get_tuple_result` (tuple-malloc, `rdict.py:95-111`), the
-/// `variant_*` recast helpers, and a working `ll_newdict`/`ll_dict_getitem`/
-/// `ll_dict_setitem` chain (all `ordered_dict_runtime_deferred`). Tracked by the
-/// DictRepr port epic (#140).
+/// builder, `get_tuple_result` (tuple-malloc, `rdict.py:95-111`), and the
+/// `variant_*` recast helpers (`ordered_dict_runtime_deferred`) — `ll_newdict`/
+/// `ll_dict_getitem`/`ll_dict_setitem` are now real (Slices 1-3). Tracked by
+/// the DictRepr port epic (#140).
 pub fn build_ll_dictnext_helper_graph(
     name: &str,
     iter_ptr_lltype: LowLevelType,
@@ -1850,12 +7567,6 @@ pub fn build_ll_dictnext_helper_graph(
     ))
 }
 
-pub fn ll_call_insert_clean_function() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred(
-        "ll_call_insert_clean_function",
-    ))
-}
-
 pub fn ll_call_delete_by_entry_index() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred(
         "ll_call_delete_by_entry_index",
@@ -1914,28 +7625,6 @@ pub fn ll_dict_bool() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_dict_bool"))
 }
 
-pub fn ll_dict_getitem() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_getitem"))
-}
-
-pub fn ll_dict_getitem_with_hash() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_getitem_with_hash"))
-}
-
-pub fn ll_dict_setitem() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_setitem"))
-}
-
-pub fn ll_dict_setitem_with_hash() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_setitem_with_hash"))
-}
-
-pub fn _ll_dict_setitem_lookup_done() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred(
-        "_ll_dict_setitem_lookup_done",
-    ))
-}
-
 pub fn _ll_dict_rescue() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_dict_rescue"))
 }
@@ -1958,58 +7647,14 @@ pub fn _overallocate_entries_len(baselen: usize) -> usize {
     newsize + 8
 }
 
-pub fn ll_dict_grow() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_grow"))
-}
-
 pub fn _ll_dict_entries_size_too_big() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred(
         "_ll_dict_entries_size_too_big",
     ))
 }
 
-pub fn ll_dict_remove_deleted_items() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred(
-        "ll_dict_remove_deleted_items",
-    ))
-}
-
-pub fn ll_dict_delitem() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_delitem"))
-}
-
-pub fn ll_dict_delitem_with_hash() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_delitem_with_hash"))
-}
-
 pub fn ll_dict_delitem_if_value_is() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_dict_delitem_if_value_is"))
-}
-
-pub fn _ll_dict_del_entry() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("_ll_dict_del_entry"))
-}
-
-pub fn _ll_dict_del() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("_ll_dict_del"))
-}
-
-pub fn ll_dict_resize() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_resize"))
-}
-
-pub fn _ll_dict_resize_to() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("_ll_dict_resize_to"))
-}
-
-pub fn ll_ensure_indexes() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_ensure_indexes"))
-}
-
-pub fn ll_dict_create_initial_index() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred(
-        "ll_dict_create_initial_index",
-    ))
 }
 
 pub fn ll_dict_rehash_after_translation() -> Result<(), TyperError> {
@@ -2018,31 +7663,13 @@ pub fn ll_dict_rehash_after_translation() -> Result<(), TyperError> {
     ))
 }
 
-pub fn ll_dict_reindex() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_reindex"))
-}
-
 /// RPython `_ll_ptr_to_array_of(T)` (`rordereddict.py:1033-1035`).
 pub fn _ll_ptr_to_array_of(T: LowLevelType) -> LowLevelType {
     ptr_to_gc_array(T)
 }
 
-pub fn ll_dict_store_clean() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_store_clean"))
-}
-
-pub fn ll_dict_delete_by_entry_index() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred(
-        "ll_dict_delete_by_entry_index",
-    ))
-}
-
 pub fn _ll_empty_array() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_empty_array"))
-}
-
-pub fn ll_newdict() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_newdict"))
 }
 
 pub fn _ll_malloc_dict() -> Result<(), TyperError> {
@@ -2063,14 +7690,6 @@ pub fn ll_dictiter_reversed() -> Result<(), TyperError> {
 
 pub fn _ll_dictnext_reversed() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_dictnext_reversed"))
-}
-
-pub fn ll_dict_get() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_get"))
-}
-
-pub fn ll_dict_setdefault() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_setdefault"))
 }
 
 pub fn ll_dict_copy() -> Result<(), TyperError> {
@@ -2107,14 +7726,6 @@ pub fn ll_dict_values() -> Result<(), TyperError> {
 
 pub fn ll_dict_items() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_dict_items"))
-}
-
-pub fn ll_dict_contains() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_contains"))
-}
-
-pub fn ll_dict_contains_with_hash() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_contains_with_hash"))
 }
 
 pub fn _ll_getnextitem() -> Result<(), TyperError> {
@@ -2312,17 +7923,13 @@ mod tests {
 
     #[test]
     fn runtime_helper_surface_is_explicitly_deferred() {
-        let err = ll_call_lookup_function().expect_err("runtime helper deferred");
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("ll_call_lookup_function"));
-
         let err = ll_dict_len().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("ll_dict_len"));
 
-        let err = ll_dict_getitem().expect_err("runtime helper deferred");
+        let err = ll_dict_delitem_if_value_is().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("ll_dict_getitem"));
+        assert!(err.to_string().contains("ll_dict_delitem_if_value_is"));
 
         let err = ll_dict_keys().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
@@ -2404,6 +8011,30 @@ mod tests {
         )
         .expect("ordered dict repr");
         repr.lowleveltype().clone()
+    }
+
+    fn sample_ordered_dict_repr() -> OrderedDictRepr {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        OrderedDictRepr::new(
+            rtyper,
+            signed_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr")
     }
 
     /// `ll_dict_len` is a one-block graph reading the `num_live_items`
@@ -2507,6 +8138,100 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Bool),
             "ll_dict_bool returns Bool"
+        );
+    }
+
+    /// `ll_newdict` is a single-block graph: `malloc(DICT)` for the header,
+    /// `malloc_varsize(DICTENTRYARRAY, 0)` for the empty entries array, then
+    /// five `setfield`s (`entries`, `num_live_items`, `num_ever_used_items`,
+    /// `lookup_function_no`, `indexes`) before returning the fresh `d`.
+    #[test]
+    fn build_ll_dict_newdict_allocates_and_initializes_dict() {
+        let repr = sample_ordered_dict_repr();
+        let helper = build_ll_dict_newdict_helper_graph(
+            "ll_newdict",
+            repr.lowleveltype().clone(),
+            repr.DICT.clone(),
+            repr.DICTENTRYARRAY.clone(),
+        )
+        .expect("build_ll_dict_newdict_helper_graph");
+        assert_eq!(helper.func.name, "ll_newdict");
+        let inner = helper.graph.borrow();
+
+        // No runtime arguments — the DICT specialization is baked into the
+        // cached helper shape, not threaded through as a Void const.
+        assert!(inner.startblock.borrow().inputargs.is_empty());
+
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            start_ops,
+            vec![
+                "malloc",         // d = DICT.allocate()
+                "malloc_varsize", // _ll_empty_array(DICT): entries = allocate(0)
+                "setfield",       // d.entries = entries
+                "setfield",       // d.num_live_items = 0
+                "setfield",       // d.num_ever_used_items = 0
+                "setfield",       // d.lookup_function_no = FUNC_MUST_REINDEX
+                "setfield",       // d.indexes = nullptr(GCREF.TO)
+            ]
+        );
+
+        // malloc_varsize's length argument is the constant 0.
+        let entries_len = &startblock.operations[1].args[2];
+        assert!(
+            matches!(entries_len, Hlvalue::Constant(c) if c.value == ConstValue::Int(0)),
+            "entries array must be allocated with length 0, got {entries_len:?}"
+        );
+
+        // Field-name constants, in setfield emission order.
+        let field_names: Vec<ConstValue> = startblock.operations[2..]
+            .iter()
+            .map(|op| match &op.args[1] {
+                Hlvalue::Constant(c) => c.value.clone(),
+                other => panic!("expected Constant field name, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            field_names,
+            vec![
+                ConstValue::byte_str("entries"),
+                ConstValue::byte_str("num_live_items"),
+                ConstValue::byte_str("num_ever_used_items"),
+                ConstValue::byte_str("lookup_function_no"),
+                ConstValue::byte_str("indexes"),
+            ]
+        );
+
+        // lookup_function_no is set to the FUNC_MUST_REINDEX selector.
+        let lookup_fn_value = &startblock.operations[5].args[2];
+        assert!(
+            matches!(lookup_fn_value, Hlvalue::Constant(c) if c.value == ConstValue::Int(FUNC_MUST_REINDEX)),
+            "lookup_function_no must be seeded FUNC_MUST_REINDEX, got {lookup_fn_value:?}"
+        );
+
+        // indexes is set to a null GCREF constant.
+        let indexes_value = &startblock.operations[6].args[2];
+        assert!(
+            matches!(indexes_value, Hlvalue::Constant(c) if c.value == ConstValue::None),
+            "indexes must be seeded null, got {indexes_value:?}"
+        );
+
+        assert!(startblock.exitswitch.is_none());
+        assert_eq!(startblock.exits.len(), 1);
+        drop(startblock);
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(repr.lowleveltype().clone()),
+            "ll_newdict returns Ptr(DICT)"
         );
     }
 
@@ -2743,6 +8468,1450 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Signed),
             "_ll_dictnext returns Signed"
+        );
+    }
+
+    fn dummy_funcptr_const() -> Constant {
+        Constant::with_concretetype(ConstValue::None, LowLevelType::Void)
+    }
+
+    /// `ll_malloc_indexes_and_choose_lookup` cascades `n <= 256` / `<= 65536`
+    /// / (64-bit) `<= 2**32` / else, each leaf allocating the (uniformly
+    /// `Unsigned`-element) index array and stamping `indexes` +
+    /// `lookup_function_no`.
+    #[test]
+    fn build_ll_malloc_indexes_and_choose_lookup_assembles_threshold_cascade() {
+        let helper = build_ll_malloc_indexes_and_choose_lookup_helper_graph(
+            "ll_malloc_indexes_and_choose_lookup",
+            sample_dict_ptr_lltype(),
+        )
+        .expect("build_ll_malloc_indexes_and_choose_lookup_helper_graph");
+        assert_eq!(helper.func.name, "ll_malloc_indexes_and_choose_lookup");
+        let inner = helper.graph.borrow();
+
+        // startblock just forwards (d, n) into the first threshold check.
+        let startblock = inner.startblock.borrow();
+        assert!(startblock.operations.is_empty());
+        assert_eq!(startblock.exits.len(), 1);
+        drop(startblock);
+
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(
+            ops.iter().filter(|o| *o == "int_le").count(),
+            3,
+            "3 threshold checks on a 64-bit target (BYTE/SHORT/INT), got {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().filter(|o| *o == "malloc_varsize").count(),
+            4,
+            "4 leaves (BYTE/SHORT/INT/LONG), got {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().filter(|o| *o == "cast_opaque_ptr").count(),
+            4,
+            "each leaf casts the freshly malloc'd array to GCREF, got {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().filter(|o| *o == "setfield").count(),
+            8,
+            "each leaf sets indexes + lookup_function_no, got {ops:?}"
+        );
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Void),
+            "ll_malloc_indexes_and_choose_lookup returns Void"
+        );
+    }
+
+    /// `ll_dict_create_initial_index` calls the malloc/choose helper with
+    /// the `DICT_INITSIZE` constant, then sets `resize_counter = 2 *
+    /// DICT_INITSIZE` (the "prebuilt/frozen dict" `else` arm is unreachable
+    /// in this port, see the builder's doc comment).
+    #[test]
+    fn build_ll_dict_create_initial_index_calls_malloc_choose_then_sets_resize_counter() {
+        let helper = build_ll_dict_create_initial_index_helper_graph(
+            "ll_dict_create_initial_index",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_create_initial_index_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call", "setfield"]);
+
+        let call_args = &startblock.operations[0].args;
+        assert!(
+            matches!(&call_args[2], Hlvalue::Constant(c) if c.value == ConstValue::Int(DICT_INITSIZE)),
+            "malloc/choose call must pass DICT_INITSIZE, got {call_args:?}"
+        );
+        let setfield_args = &startblock.operations[1].args;
+        assert!(
+            matches!(&setfield_args[1], Hlvalue::Constant(c) if c.value == ConstValue::byte_str("resize_counter"))
+        );
+        assert!(
+            matches!(&setfield_args[2], Hlvalue::Constant(c) if c.value == ConstValue::Int(DICT_INITSIZE * 2))
+        );
+    }
+
+    /// `ll_ensure_indexes` reads `lookup_function_no`, branches on `==
+    /// FUNC_MUST_REINDEX`; the True arm calls `ll_dict_create_initial_index`,
+    /// the False arm (`ll_assert`, debug-only) just returns.
+    #[test]
+    fn build_ll_ensure_indexes_branches_on_must_reindex() {
+        let helper = build_ll_ensure_indexes_helper_graph(
+            "ll_ensure_indexes",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_ensure_indexes_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "int_eq"]);
+        assert!(startblock.exitswitch.is_some());
+        assert_eq!(startblock.exits.len(), 2);
+
+        let true_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)))
+            .expect("True exit link present");
+        let block_reindex = true_link
+            .borrow()
+            .target
+            .clone()
+            .expect("True link target block");
+        assert_eq!(
+            block_reindex.borrow().operations[0].opname,
+            "direct_call",
+            "must_reindex arm calls ll_dict_create_initial_index"
+        );
+    }
+
+    /// `ll_call_lookup_function` collapses the upstream `FUNC_*` 4-way
+    /// dispatch loop to "ensure the index exists, then look up once" — see
+    /// the builder's doc comment for why that is behaviorally identical
+    /// given this port's collapsed `DICTINDEX_*` widths.
+    #[test]
+    fn build_ll_call_lookup_function_calls_ensure_indexes_then_lookup() {
+        let (dict_ptr, _entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_call_lookup_function_helper_graph(
+            "ll_call_lookup_function",
+            dict_ptr,
+            key_lltype,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_call_lookup_function_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call", "direct_call"]);
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Signed),
+            "ll_call_lookup_function returns Signed"
+        );
+    }
+
+    /// `ll_dict_getitem` hashes the key, looks it up, and either reads
+    /// `entries[index].value` or raises `KeyError`.
+    #[test]
+    fn build_ll_dict_getitem_reads_value_or_raises_keyerror() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_getitem_helper_graph(
+            "ll_dict_getitem",
+            dict_ptr,
+            entries_ptr,
+            key_lltype,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_getitem_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call", "direct_call", "int_ge"]);
+        assert_eq!(startblock.exits.len(), 2);
+
+        // The False (index < 0) arm raises KeyError via the exceptblock.
+        let raise_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)))
+            .expect("False exit link present");
+        assert!(Rc::ptr_eq(
+            &raise_link
+                .borrow()
+                .target
+                .clone()
+                .expect("exceptblock target"),
+            &inner.exceptblock,
+        ));
+
+        // The True (index >= 0) arm reads entries[index].value.
+        let valid_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)))
+            .expect("True exit link present");
+        let block_valid = valid_link
+            .borrow()
+            .target
+            .clone()
+            .expect("True link target block");
+        let valid_ops: Vec<String> = block_valid
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(valid_ops, vec!["getfield", "getinteriorfield"]);
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Signed),
+            "ll_dict_getitem returns the value lltype"
+        );
+    }
+
+    /// `ll_dict_contains` hashes the key, looks it up, and returns `index >=
+    /// 0` — no raise, unlike `ll_dict_getitem`.
+    #[test]
+    fn build_ll_dict_contains_returns_index_ge_zero() {
+        let (dict_ptr, _entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_contains_helper_graph(
+            "ll_dict_contains",
+            dict_ptr,
+            key_lltype,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_contains_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call", "direct_call", "int_ge"]);
+        assert!(startblock.exitswitch.is_none(), "contains never branches");
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Bool),
+            "ll_dict_contains returns Bool"
+        );
+    }
+
+    // NOTE: takes an already-constructed `rtyper` rather than building its
+    // own `RPythonAnnotator` — `RPythonTyper::annotator` is only a `Weak`
+    // reference (rtyper.rs, cycle avoidance), so a helper that builds and
+    // drops its own annotator leaves every `lowlevel_helper_function_with_builder`
+    // call downstream hitting "annotator weak reference dropped". Callers
+    // must keep their own `ann`/`rtyper` alive for the test's duration.
+    fn make_int_int_dict_repr(rtyper: Rc<RPythonTyper>) -> Arc<OrderedDictRepr> {
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        Arc::new(
+            OrderedDictRepr::new(
+                rtyper,
+                signed_repr() as Arc<dyn Repr>,
+                signed_repr() as Arc<dyn Repr>,
+                dictdef,
+                None,
+                false,
+                false,
+            )
+            .expect("ordered dict repr"),
+        )
+    }
+
+    /// End-to-end wiring: `OrderedDictRepr::rtype_getitem` on an int-keyed
+    /// dict (direct-compare, no eq-gate) emits the hash + lookup
+    /// `direct_call` chain and threads `hop.exception_is_here()`.
+    #[test]
+    fn ordereddictrepr_rtype_getitem_int_key_emits_direct_call_chain() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_int_int_dict_repr(rtyper);
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            repr.base.rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+
+        // A caught KeyError exitcase on this getitem.
+        let exitblock = Block::shared(vec![]);
+        let cls_keyerror = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("KeyError")
+            .expect("KeyError class");
+        let link_keyerror = Link::new(
+            vec![],
+            Some(exitblock),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                cls_keyerror,
+            )))),
+        )
+        .into_ref();
+
+        let hop = HighLevelOp::new(
+            repr.base.rtyper.clone(),
+            SpaceOperation::new(
+                "getitem".to_string(),
+                vec![Hlvalue::Variable(v_dict), Hlvalue::Variable(v_key)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![link_keyerror],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Impossible, SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = repr
+            .rtype_getitem(&hop)
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_getitem: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_getitem must call hop.exception_is_here()"
+        );
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_getitem"));
+    }
+
+    /// End-to-end wiring: `pair_ordereddict_repr_rtype_contains` on an
+    /// int-keyed dict emits the same hash + lookup chain, wrapped in
+    /// `ll_dict_contains` (no raise).
+    #[test]
+    fn pair_ordereddict_repr_rtype_contains_int_key_emits_direct_call() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_int_int_dict_repr(rtyper);
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            repr.base.rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Bool));
+
+        let hop = HighLevelOp::new(
+            repr.base.rtyper.clone(),
+            SpaceOperation::new(
+                "contains".to_string(),
+                vec![Hlvalue::Variable(v_dict), Hlvalue::Variable(v_key)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Impossible, SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result =
+            pair_ordereddict_repr_rtype_contains(repr.as_ref(), signed_repr().as_ref(), &hop)
+                .unwrap_or_else(|err| panic!("pair_ordereddict_repr_rtype_contains: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_contains"));
+    }
+
+    /// The eq-gate fails closed for str keys instead of silently routing
+    /// through `build_ll_dict_lookup_helper_graph`'s `ptr_eq` direct-compare
+    /// (Slice 0 landmine).
+    #[test]
+    fn ordereddictrepr_rtype_getitem_str_key_fails_closed_on_eq_gate() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let repr = Arc::new(
+            OrderedDictRepr::new(
+                rtyper.clone(),
+                string_repr() as Arc<dyn Repr>,
+                signed_repr() as Arc<dyn Repr>,
+                dictdef,
+                None,
+                false,
+                false,
+            )
+            .expect("ordered dict repr"),
+        );
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(string_repr().lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "getitem".to_string(),
+                vec![Hlvalue::Variable(v_dict), Hlvalue::Variable(v_key)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops,
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Impossible, SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(string_repr() as Arc<dyn Repr>),
+        ]);
+
+        let err = repr
+            .rtype_getitem(&hop)
+            .expect_err("str-keyed dict getitem must fail closed on the eq-gate");
+        assert!(
+            err.to_string().contains("dict key eq function not wired"),
+            "expected the eq-gate message, got {err}"
+        );
+    }
+
+    /// `ll_dict_store_clean` probes for the first `FREE` slot (no key
+    /// comparison, no `deletedslot` tracking) via the same unsigned
+    /// perturb-probe arithmetic as `ll_dict_lookup`, then calls the
+    /// write-indexes helper.
+    #[test]
+    fn build_ll_dict_store_clean_probes_for_free_slot() {
+        let (dict_ptr, _entries_ptr, _key) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_store_clean_helper_graph(
+            "ll_dict_store_clean",
+            dict_ptr,
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_store_clean_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_store_clean");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 3); // d, hash, index
+
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(
+            block_count, 5,
+            "startblock + cond + write + advance + returnblock"
+        );
+        for needed in [
+            "getarraysize",
+            "cast_int_to_uint",
+            "cast_uint_to_int",
+            "getarrayitem",
+            "int_eq",
+            "uint_lshift",
+            "uint_add",
+            "uint_and",
+            "uint_rshift",
+            "direct_call",
+        ] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "store_clean CFG must emit {needed}, got {ops:?}"
+            );
+        }
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    /// `ll_call_insert_clean_function`'s FUNC_* dispatch collapses to a
+    /// single unconditional `ll_dict_store_clean` call.
+    #[test]
+    fn build_ll_call_insert_clean_function_calls_store_clean_directly() {
+        let dict_ptr = sample_dict_ptr_lltype();
+        let helper = build_ll_call_insert_clean_function_helper_graph(
+            "ll_call_insert_clean_function",
+            dict_ptr,
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_call_insert_clean_function_helper_graph");
+        assert_eq!(helper.func.name, "ll_call_insert_clean_function");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.inputargs.len(), 3); // d, hash, i
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call"]);
+    }
+
+    /// `ll_call_delete_by_entry_index`'s FUNC_* dispatch collapses to a
+    /// single unconditional `ll_dict_delete_by_entry_index` call, matching
+    /// the current uniform `DICTINDEX_* = Unsigned` layout.
+    #[test]
+    fn build_ll_call_delete_by_entry_index_calls_delete_directly() {
+        let helper = build_ll_call_delete_by_entry_index_helper_graph(
+            "ll_call_delete_by_entry_index",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_call_delete_by_entry_index_helper_graph");
+        assert_eq!(helper.func.name, "ll_call_delete_by_entry_index");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.inputargs.len(), 4); // d, hash, i, replace_with
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call"]);
+    }
+
+    /// `ll_dict_delete_by_entry_index` probes by hash until the stored
+    /// `locate_index + VALID_OFFSET` is found, then writes `DELETED` through
+    /// `_ll_write_indexes`.
+    #[test]
+    fn build_ll_dict_delete_by_entry_index_probes_for_locate_value() {
+        let helper = build_ll_dict_delete_by_entry_index_helper_graph(
+            "ll_dict_delete_by_entry_index",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_delete_by_entry_index_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_delete_by_entry_index");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 4);
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        for needed in [
+            "getarrayitem",
+            "int_eq",
+            "uint_lshift",
+            "uint_add",
+            "uint_and",
+            "uint_rshift",
+            "direct_call",
+        ] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "delete_by_entry_index CFG must emit {needed}, got {ops:?}"
+            );
+        }
+    }
+
+    /// `ll_dict_grow` first restores the upstream deleted-entry compaction
+    /// branch (`num_live_items < num_ever_used_items // 2`), otherwise it
+    /// mallocs + copies + rebinds `d.entries` and returns `False`.
+    #[test]
+    fn build_ll_dict_grow_compacts_deleted_entries_before_growing() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let entries_array_ty = LowLevelType::Array(Box::new(repr.DICTENTRYARRAY.clone()));
+        let helper = build_ll_dict_grow_helper_graph(
+            "ll_dict_grow",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            entries_array_ty,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_grow_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_grow");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(
+            startblock.exitswitch.is_some(),
+            "ll_dict_grow branches on deleted-entry compaction"
+        );
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "getfield", "int_rshift", "int_lt"]);
+        drop(startblock);
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        for needed in ["malloc_varsize", "direct_call", "setfield"] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "grow CFG must emit {needed}, got {ops:?}"
+            );
+        }
+        assert_eq!(
+            ops.iter().filter(|o| *o == "direct_call").count(),
+            2,
+            "remove_deleted_items + entries_arraycopy"
+        );
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Bool));
+    }
+
+    /// `ll_dict_remove_deleted_items` either allocates a smaller entries
+    /// array or compacts in place, copies valid entries forward, clears
+    /// trailing GC refs when needed, and reindexes against the current index
+    /// length.
+    #[test]
+    fn build_ll_dict_remove_deleted_items_compacts_and_reindexes() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let entries_array_ty = LowLevelType::Array(Box::new(repr.DICTENTRYARRAY.clone()));
+        let helper = build_ll_dict_remove_deleted_items_helper_graph(
+            "ll_dict_remove_deleted_items",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            entries_array_ty,
+            repr.DICTKEY.clone(),
+            repr.DICTVALUE.clone(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_remove_deleted_items_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_remove_deleted_items");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 1);
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        for needed in [
+            "malloc_varsize",
+            "getinteriorfield",
+            "setinteriorfield",
+            "setfield",
+            "getarraysize",
+            "direct_call",
+        ] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "remove_deleted_items CFG must emit {needed}, got {ops:?}"
+            );
+        }
+        assert_eq!(
+            ops.iter().filter(|o| *o == "direct_call").count(),
+            1,
+            "tail reindex call"
+        );
+    }
+
+    /// `_ll_dict_resize_to` restores the shrink-via-compaction branch:
+    /// after the sizing loop, `new_size < len(d.indexes)` calls
+    /// `ll_dict_remove_deleted_items`; otherwise it reindexes to `new_size`.
+    #[test]
+    fn build_ll_dict_resize_to_removes_deleted_items_on_shrink() {
+        let helper = build_ll_dict_resize_to_helper_graph(
+            "_ll_dict_resize_to",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_resize_to_helper_graph");
+        assert_eq!(helper.func.name, "_ll_dict_resize_to");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 2); // d, num_extra
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        for needed in ["getarraysize", "int_lt", "direct_call"] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "resize_to CFG must emit {needed}, got {ops:?}"
+            );
+        }
+        assert_eq!(
+            ops.iter().filter(|o| *o == "direct_call").count(),
+            2,
+            "remove_deleted_items + reindex"
+        );
+    }
+
+    /// `ll_dict_reindex` always re-mallocs the index array (the reuse +
+    /// `ll_clear_indexes` branch is skipped), then loops over
+    /// `[0, num_ever_used_items)` calling `ll_dict_store_clean` for every
+    /// `f_valid` entry.
+    #[test]
+    fn build_ll_dict_reindex_loops_and_stores_valid_entries() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let helper = build_ll_dict_reindex_helper_graph(
+            "ll_dict_reindex",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_reindex_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_reindex");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 2); // d, new_size
+
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(
+            block_count, 6,
+            "startblock + cond + body + store + next + returnblock"
+        );
+        for needed in ["getinteriorfield", "int_lt", "int_add", "direct_call"] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "reindex CFG must emit {needed}, got {ops:?}"
+            );
+        }
+        assert_eq!(
+            ops.iter().filter(|o| *o == "direct_call").count(),
+            2,
+            "malloc_choose + store_clean"
+        );
+    }
+
+    /// `_ll_dict_setitem_lookup_done` branches on `i >= 0`: the overwrite
+    /// path writes only `value`; the insert path threads grow/resize/
+    /// insert-clean before writing all four entry fields and bumping both
+    /// counters.
+    #[test]
+    fn build_ll_dict_setitem_lookup_done_branches_overwrite_vs_insert() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let helper = build_ll_dict_setitem_lookup_done_helper_graph(
+            "_ll_dict_setitem_lookup_done",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            repr.DICTKEY.clone(),
+            repr.DICTVALUE.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_setitem_lookup_done_helper_graph");
+        assert_eq!(helper.func.name, "_ll_dict_setitem_lookup_done");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 5); // d, key, value, hash, i
+        assert!(inner.startblock.borrow().exitswitch.is_some());
+
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(block_count, 10, "9 work blocks + returnblock");
+        // Overwrite path writes a single `value` field; the insert path
+        // writes key/value/f_hash/f_valid (4) — 5 setinteriorfields total.
+        assert_eq!(ops.iter().filter(|o| *o == "setinteriorfield").count(), 5);
+        assert_eq!(
+            ops.iter().filter(|o| *o == "direct_call").count(),
+            3,
+            "grow + resize + insert_clean"
+        );
+    }
+
+    /// `_ll_dict_del_entry` marks the entry invalid, decrements
+    /// `num_live_items`, and conditionally clears GC key/value fields.
+    #[test]
+    fn build_ll_dict_del_entry_marks_invalid_and_decrements_live_count() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let helper = build_ll_dict_del_entry_helper_graph(
+            "_ll_dict_del_entry",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            repr.DICTKEY.clone(),
+            repr.DICTVALUE.clone(),
+        )
+        .expect("build_ll_dict_del_entry_helper_graph");
+        assert_eq!(helper.func.name, "_ll_dict_del_entry");
+        let inner = helper.graph.borrow();
+        let ops: Vec<String> = inner
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                "getfield",
+                "setinteriorfield",
+                "getfield",
+                "int_sub",
+                "setfield",
+                "setinteriorfield"
+            ],
+            "int key needs no clear; string value is a GC pointer and is cleared"
+        );
+    }
+
+    /// `_ll_dict_del` calls the index deletion helper, marks the entry
+    /// deleted, reclaims trailing invalid entries, and applies the 87.5%
+    /// dead-items shrink rule.
+    #[test]
+    fn build_ll_dict_del_restores_trailing_reclaim_and_dead_item_shrink() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let helper = build_ll_dict_del_helper_graph(
+            "_ll_dict_del",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_del_helper_graph");
+        assert_eq!(helper.func.name, "_ll_dict_del");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 3);
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        for needed in [
+            "direct_call",
+            "getinteriorfield",
+            "setfield",
+            "int_le",
+            "int_rshift",
+        ] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "_ll_dict_del CFG must emit {needed}, got {ops:?}"
+            );
+        }
+        assert_eq!(
+            ops.iter().filter(|o| *o == "direct_call").count(),
+            3,
+            "delete_by_entry_index + del_entry + resize"
+        );
+    }
+
+    /// `ll_dict_delitem` hashes, looks up with `FLAG_LOOKUP`, raises
+    /// KeyError on a miss, and calls `_ll_dict_del` on a hit.
+    #[test]
+    fn build_ll_dict_delitem_deletes_or_raises_keyerror() {
+        let (dict_ptr, _entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_delitem_helper_graph(
+            "ll_dict_delitem",
+            dict_ptr,
+            key_lltype,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_delitem_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_delitem");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call", "direct_call", "int_lt"]);
+        assert_eq!(startblock.exits.len(), 2);
+        let raise_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)))
+            .expect("True exit link present");
+        assert!(Rc::ptr_eq(
+            &raise_link
+                .borrow()
+                .target
+                .clone()
+                .expect("exceptblock target"),
+            &inner.exceptblock,
+        ));
+    }
+
+    /// `ll_dict_get` returns the supplied default on a missing key, otherwise
+    /// reads `entries[index].value`.
+    #[test]
+    fn build_ll_dict_get_returns_default_or_value() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_get_helper_graph(
+            "ll_dict_get",
+            dict_ptr,
+            entries_ptr,
+            key_lltype,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_get_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_get");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call", "direct_call", "int_lt"]);
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        assert!(
+            ops.iter().any(|o| o == "getinteriorfield"),
+            "found arm reads entries[index].value"
+        );
+    }
+
+    /// `ll_dict_setdefault` inserts the default through
+    /// `_ll_dict_setitem_lookup_done(..., -1)` on a missing key, otherwise
+    /// returns the existing value.
+    #[test]
+    fn build_ll_dict_setdefault_inserts_default_or_returns_existing_value() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_setdefault_helper_graph(
+            "ll_dict_setdefault",
+            dict_ptr,
+            entries_ptr,
+            key_lltype,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_setdefault_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_setdefault");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["direct_call", "direct_call", "int_lt"]);
+        drop(startblock);
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
+        assert!(
+            ops.iter().any(|o| o == "direct_call"),
+            "missing arm calls _ll_dict_setitem_lookup_done"
+        );
+        assert!(
+            ops.iter().any(|o| o == "getinteriorfield"),
+            "found arm reads entries[index].value"
+        );
+    }
+
+    /// End-to-end wiring: `OrderedDictRepr::rtype_setitem` on an int-keyed
+    /// dict (direct-compare, no eq-gate) emits the hash + lookup +
+    /// `_ll_dict_setitem_lookup_done` chain fused into a single
+    /// `ll_dict_setitem` `direct_call`, and threads
+    /// `hop.exception_cannot_occur()` (the non-`custom_eq_hash` branch,
+    /// `rordereddict.py:448-455`).
+    #[test]
+    fn ordereddictrepr_rtype_setitem_int_key_emits_direct_call_chain() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_int_int_dict_repr(rtyper);
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            repr.base.rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_value = Variable::new();
+        v_value.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+
+        let hop = HighLevelOp::new(
+            repr.base.rtyper.clone(),
+            SpaceOperation::new(
+                "setitem".to_string(),
+                vec![
+                    Hlvalue::Variable(v_dict),
+                    Hlvalue::Variable(v_key),
+                    Hlvalue::Variable(v_value),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = repr
+            .rtype_setitem(&hop)
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_setitem: {err:?}"));
+        assert!(result.is_none(), "rtype_setitem returns None (Void op)");
+
+        let ops = llops.borrow();
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_setitem must call hop.exception_cannot_occur() (non-custom_eq_hash)"
+        );
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_setitem"));
+    }
+
+    /// End-to-end pairtype wiring: `(OrderedDictRepr, _).rtype_delitem`
+    /// dispatches to `OrderedDictRepr::rtype_delitem`, emits
+    /// `ll_dict_delitem`, and threads `hop.exception_is_here()`.
+    #[test]
+    fn pairtype_ordereddict_rtype_delitem_int_key_emits_direct_call_chain() {
+        use crate::translator::rtyper::pairtype::pair_rtype_delitem;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_int_int_dict_repr(rtyper);
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            repr.base.rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+
+        let exitblock = Block::shared(vec![]);
+        let cls_keyerror = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("KeyError")
+            .expect("KeyError class");
+        let link_keyerror = Link::new(
+            vec![],
+            Some(exitblock),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                cls_keyerror,
+            )))),
+        )
+        .into_ref();
+
+        let hop = HighLevelOp::new(
+            repr.base.rtyper.clone(),
+            SpaceOperation::new(
+                "delitem".to_string(),
+                vec![Hlvalue::Variable(v_dict), Hlvalue::Variable(v_key)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![link_keyerror],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Impossible, SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = pair_rtype_delitem(repr.as_ref(), signed_repr().as_ref(), &hop)
+            .unwrap_or_else(|err| panic!("pair_rtype_delitem: {err:?}"));
+        assert!(result.is_none(), "rtype_delitem returns None (Void op)");
+
+        let ops = llops.borrow();
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_delitem must call hop.exception_is_here()"
+        );
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_delitem"));
+    }
+
+    /// Method routing: `d.get(k, default)` goes through
+    /// `OrderedDictRepr::rtype_method("get")` and emits `ll_dict_get`.
+    #[test]
+    fn ordereddictrepr_rtype_method_get_int_key_emits_ll_dict_get() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_int_int_dict_repr(rtyper);
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            repr.base.rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_default = Variable::new();
+        v_default.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+
+        let hop = HighLevelOp::new(
+            repr.base.rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![
+                    Hlvalue::Variable(v_dict),
+                    Hlvalue::Variable(v_key),
+                    Hlvalue::Variable(v_default),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = repr
+            .rtype_method("get", &hop)
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_method_get: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_method_get must call hop.exception_cannot_occur()"
+        );
+        assert_eq!(ops.ops.len(), 1);
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_get"));
+    }
+
+    /// Method routing: `d.setdefault(k, default)` emits
+    /// `ll_dict_setdefault` and returns the value repr.
+    #[test]
+    fn ordereddictrepr_rtype_method_setdefault_int_key_emits_ll_dict_setdefault() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_int_int_dict_repr(rtyper);
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            repr.base.rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_default = Variable::new();
+        v_default.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+
+        let hop = HighLevelOp::new(
+            repr.base.rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![
+                    Hlvalue::Variable(v_dict),
+                    Hlvalue::Variable(v_key),
+                    Hlvalue::Variable(v_default),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = repr
+            .rtype_method("setdefault", &hop)
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_method_setdefault: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_method_setdefault must call hop.exception_cannot_occur()"
+        );
+        assert_eq!(ops.ops.len(), 1);
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_setdefault"));
+    }
+
+    /// The eq-gate fails closed for str keys on delitem too — Slice 4 keeps
+    /// every lookup-dependent helper routed through `lookup_chain_helpers`.
+    #[test]
+    fn ordereddictrepr_rtype_delitem_str_key_fails_closed_on_eq_gate() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let repr = Arc::new(
+            OrderedDictRepr::new(
+                rtyper.clone(),
+                string_repr() as Arc<dyn Repr>,
+                signed_repr() as Arc<dyn Repr>,
+                dictdef,
+                None,
+                false,
+                false,
+            )
+            .expect("ordered dict repr"),
+        );
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(string_repr().lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "delitem".to_string(),
+                vec![Hlvalue::Variable(v_dict), Hlvalue::Variable(v_key)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops,
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Impossible, SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(string_repr() as Arc<dyn Repr>),
+        ]);
+
+        let err = repr
+            .rtype_delitem(&hop)
+            .expect_err("str-keyed dict delitem must fail closed on the eq-gate");
+        assert!(
+            err.to_string().contains("dict key eq function not wired"),
+            "expected the eq-gate message, got {err}"
+        );
+    }
+
+    /// The eq-gate fails closed for str keys on setitem too — same
+    /// `lookup_chain_helpers`/`require_direct_compare_key` gate as
+    /// getitem/contains.
+    #[test]
+    fn ordereddictrepr_rtype_setitem_str_key_fails_closed_on_eq_gate() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let repr = Arc::new(
+            OrderedDictRepr::new(
+                rtyper.clone(),
+                string_repr() as Arc<dyn Repr>,
+                signed_repr() as Arc<dyn Repr>,
+                dictdef,
+                None,
+                false,
+                false,
+            )
+            .expect("ordered dict repr"),
+        );
+        let dict_lltype = repr.lowleveltype().clone();
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(string_repr().lowleveltype().clone()));
+        let v_value = Variable::new();
+        v_value.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "setitem".to_string(),
+                vec![
+                    Hlvalue::Variable(v_dict),
+                    Hlvalue::Variable(v_key),
+                    Hlvalue::Variable(v_value),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops,
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(string_repr() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let err = repr
+            .rtype_setitem(&hop)
+            .expect_err("str-keyed dict setitem must fail closed on the eq-gate");
+        assert!(
+            err.to_string().contains("dict key eq function not wired"),
+            "expected the eq-gate message, got {err}"
         );
     }
 }
