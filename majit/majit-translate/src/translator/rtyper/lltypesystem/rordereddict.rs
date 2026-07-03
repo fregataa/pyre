@@ -26,8 +26,8 @@ use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, gc_flavor_const, lowlevel_type_const,
 };
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype, exception_args,
-    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
+    exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 fn ptr_to_gc_array(of: LowLevelType) -> LowLevelType {
@@ -220,26 +220,25 @@ impl OrderedDictRepr {
         }))
     }
 
-    /// Fail-closed gate for the landmine `build_ll_dict_lookup_helper_graph`'s
-    /// doc comment flags: `direct_compare_op` hardcodes `ptr_eq` for every
-    /// `Ptr(_)` key lltype, which is wrong for keys whose repr defines a real
-    /// structural equality (`get_ll_eq_function` returning `Some`, e.g.
-    /// `StringRepr::ll_streq`). int/bool/char/unichar keys return `None`
-    /// (direct-compare is correct for them) and proceed; every other key
-    /// repr fails closed here instead of silently miscompiling to
-    /// pointer-identity comparison.
+    /// Fail-closed gate for the still-unported `custom_eq_hash` (`r_dict`)
+    /// path: `get_ll_dict` (`rordereddict.py:137-147`) wires `d.keyeq` to
+    /// `ll_keyeq_custom`, which reads the runtime `d.fnkeyeq` PBC funcptr
+    /// field, and `d.paranoia` is `True` (`not simple_hash_eq`) — the
+    /// mutation-restart branch (`ll_dict_lookup`'s recursive
+    /// `return ll_dict_lookup(d, key, hash, store_flag, T)`) is genuinely
+    /// live for that case and unported here. Plain (`not custom_eq_hash`)
+    /// dicts route entirely through `self.base.key_repr.get_ll_eq_function`
+    /// instead (`rordereddict.py:220-222`) — see
+    /// [`build_ll_dict_lookup_helper_graph`]'s doc comment for how that
+    /// `d.keyeq` value (e.g. `StringRepr::ll_streq` for str keys, `None` for
+    /// identity keys) is wired into the direct-compare fallback.
     fn require_direct_compare_key(&self, hop: &HighLevelOp) -> Result<(), TyperError> {
-        if self
-            .base
-            .key_repr
-            .get_ll_eq_function(&hop.rtyper)?
-            .is_some()
-        {
+        let _ = hop;
+        if self.base.custom_eq_hash {
             return Err(TyperError::message(format!(
-                "OrderedDictRepr: dict key eq function not wired into \
-                 build_ll_dict_lookup_helper_graph's direct_compare (key repr {} \
-                 defines a custom get_ll_eq_function — str/instance keys need the \
-                 call-based keyeq branch, not yet ported)",
+                "OrderedDictRepr: custom_eq_hash (r_dict) dict key eq function not wired into \
+                 build_ll_dict_lookup_helper_graph (key repr {} uses the runtime d.fnkeyeq PBC \
+                 funcptr + d.paranoia mutation-restart — not yet ported)",
                 self.base.key_repr.class_name()
             )));
         }
@@ -267,6 +266,17 @@ impl OrderedDictRepr {
             })?;
         let hash_fn_const = sub_helper_funcptr_constant(rtyper, &hash_fn)?;
 
+        // `d.keyeq` for a plain (non-custom_eq_hash) dict is the key repr's
+        // own `get_ll_eq_function` result — `None` for identity keys
+        // (int/bool/char/unichar/instance-without-__eq__), `Some(ll_streq)`
+        // for str keys (`rordereddict.py:150-157`).
+        let eq_fn_const = self
+            .base
+            .key_repr
+            .get_ll_eq_function(rtyper)?
+            .map(|eq_fn| sub_helper_funcptr_constant(rtyper, &eq_fn))
+            .transpose()?;
+
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
         let key_lltype = self.DICTKEY.clone();
@@ -275,6 +285,7 @@ impl OrderedDictRepr {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
             let key_lltype = key_lltype.clone();
+            let eq_fn_const = eq_fn_const.clone();
             rtyper.lowlevel_helper_function_with_builder(
                 "ll_dict_lookup",
                 vec![
@@ -291,6 +302,7 @@ impl OrderedDictRepr {
                         entries_ptr.clone(),
                         LowLevelType::Unsigned,
                         key_lltype.clone(),
+                        eq_fn_const.clone(),
                     )
                 },
             )?
@@ -1064,6 +1076,33 @@ impl Repr for OrderedDictRepr {
         hop.gendirectcall(&helper, v_dict)
     }
 
+    /// RPython `OrderedDictRepr.make_iterator_repr(self, *variant)`
+    /// (`rordereddict.py:282-283`):
+    ///
+    /// ```python
+    /// def make_iterator_repr(self, *variant):
+    ///     return DictIteratorRepr(self, *variant)
+    /// ```
+    ///
+    /// Only the no-variant case (implicit `for k in d:`, `DictIteratorRepr`'s
+    /// default `variant="keys"`) is wired. `reversed(d)`
+    /// (`variant=("reversed",)`) needs the `ll_dictiter_reversed`/
+    /// `_ll_dictnext_reversed` constructors (still `ordered_dict_runtime_deferred`
+    /// stubs); accepting it here without swapping those in would silently walk
+    /// the dict forward, so it is rejected fail-closed instead.
+    fn make_iterator_repr(
+        &self,
+        variant: &[String],
+        _foldable: bool,
+    ) -> Result<Arc<dyn Repr>, TyperError> {
+        if !variant.is_empty() {
+            return Err(ordered_dict_runtime_deferred(&format!(
+                "make_iterator_repr variant {variant:?} (reversed dict iteration)"
+            )));
+        }
+        Ok(Arc::new(DictIteratorRepr::new(self, "keys")))
+    }
+
     /// RPython `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`
     /// (`rordereddict.py:441-447`):
     ///
@@ -1247,6 +1286,30 @@ impl Repr for OrderedDictRepr {
                     external_value_repr.as_ref(),
                 )?;
                 Ok(Some(recast))
+            }
+            // RPython `OrderedDictRepr.rtype_method_iterkeys`/
+            // `rtype_method_itervalues`/`rtype_method_iteritems`
+            // (`rordereddict.py:342-352`):
+            //
+            // ```python
+            // def rtype_method_iterkeys(self, hop):
+            //     hop.exception_cannot_occur()
+            //     return DictIteratorRepr(self, "keys").newiter(hop)
+            // ```
+            //
+            // `iterkeys_with_hash`/`iteritems_with_hash` (`:354-364`) need
+            // `ll_ensure_indexes`/`entry_hash`, unported — out of scope here.
+            "iterkeys" => {
+                hop.exception_cannot_occur()?;
+                DictIteratorRepr::new(self, "keys").newiter(hop)
+            }
+            "itervalues" => {
+                hop.exception_cannot_occur()?;
+                DictIteratorRepr::new(self, "values").newiter(hop)
+            }
+            "iteritems" => {
+                hop.exception_cannot_occur()?;
+                DictIteratorRepr::new(self, "items").newiter(hop)
             }
             _ => Err(TyperError::message(format!(
                 "missing OrderedDictRepr.rtype_method_{method_name}"
@@ -1703,8 +1766,13 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 ///     index = rffi.cast(lltype.Signed, indexes[intmask(i)])
 ///     if index >= VALID_OFFSET:
 ///         checkingkey = entries[index - VALID_OFFSET].key
-///         if checkingkey == key:                 # direct_compare, keyeq is None
+///         if direct_compare and checkingkey == key:
 ///             return index - VALID_OFFSET
+///         if d.keyeq is not None and entries.entry_hash(d, index - VALID_OFFSET) == hash:
+///             found = d.keyeq(checkingkey, key)
+///             if d.paranoia: ...                 # restart on mutation, r_dict-only
+///             if found:
+///                 return index - VALID_OFFSET
 ///         deletedslot = -1
 ///     elif index == DELETED:
 ///         deletedslot = intmask(i)
@@ -1726,19 +1794,47 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 ///             return -1
 ///         elif index >= VALID_OFFSET:
 ///             checkingkey = entries[index - VALID_OFFSET].key
-///             if checkingkey == key:
+///             if direct_compare and checkingkey == key:
 ///                 return index - VALID_OFFSET
+///             if d.keyeq is not None and entries.entry_hash(d, index - VALID_OFFSET) == hash:
+///                 found = d.keyeq(checkingkey, key)
+///                 if found:
+///                     return index - VALID_OFFSET
 ///         elif deletedslot == -1:
 ///             deletedslot = intmask(i)
 ///         perturb >>= PERTURB_SHIFT
 /// ```
 ///
-/// **Scope (faithful subset):** simple-hash-eq + `direct_compare`. The
-/// `d.keyeq is not None` / `d.paranoia` branches (custom `__eq__`, PBC
-/// `hlinvoke`, lookup restart) are skipped — they are statically dead when
-/// `keyeq is None`, exactly as RPython folds them. All `DICTINDEX_*` widths
-/// collapse to `Ptr(GcArray(Unsigned))`, so this one graph serves every
-/// `FUNC_*` width (the `T`/`ll_call_lookup_function` 4-way dispatch is inert).
+/// **Scope (faithful subset):** `direct_compare` is always `True` here (no
+/// key repr this file wires sets `no_direct_compare`, e.g. `ll_streq` does
+/// not — see `rint.py:627`/`_rweakkeydict.py:107` for the two upstream cases
+/// that do, both out of scope). `d.keyeq` is `eq_fn_const` — `None` for
+/// identity keys (int/bool/char/unichar/instance-without-`__eq__`, matching
+/// `get_ll_eq_function() -> None`, `rordereddict.py:150-157`), or the key
+/// repr's `get_ll_eq_function()` result for keys with real structural
+/// equality (`Some(ll_streq)` for str). When `eq_fn_const` is `Some`, a
+/// direct-compare miss falls through to `direct_call(eq_fn_const,
+/// checkingkey, key)` at both comparison sites, exactly mirroring `d.keyeq(
+/// checkingkey, key)`. `d.paranoia` is `False` for every dict this repr
+/// builds (`custom_eq_hash` is rejected earlier by
+/// [`OrderedDictRepr::require_direct_compare_key`]), so the mutation-restart
+/// branch is statically dead and stays unported, exactly as RPython folds it.
+///
+/// **Simplification (disclosed, correctness-preserving):** the
+/// `entries.entry_hash(d, index) == hash` precheck ahead of `d.keyeq(...)`
+/// is a pure performance short-circuit — `ll_streq` (or any `get_ll_eq_function`
+/// result) is a full, hash-independent content-equality function, so calling
+/// it unconditionally on every direct-compare miss cannot change the boolean
+/// outcome, only skip a possible early-out. This graph omits the precheck
+/// rather than threading the original `hash` value through the in-loop
+/// `perturb`-carrying block cycle (`loop_body`/`loop_notfree`/`loop_valid`/
+/// `loop_deleted`/`perturb_shift`), which drops `hash` after `loop_init`
+/// derives `perturb = r_uint(hash)` and never carries it further. Revisit if
+/// dict lookups become hot on the corpus.
+///
+/// All `DICTINDEX_*` widths collapse to `Ptr(GcArray(Unsigned))`, so this one
+/// graph serves every `FUNC_*` width (the `T`/`ll_call_lookup_function`
+/// 4-way dispatch is inert).
 ///
 /// **Unsigned arithmetic is load-bearing, not cosmetic:** `i` and `perturb`
 /// are `r_uint`. `perturb >>= PERTURB_SHIFT` is a *logical* shift
@@ -1755,16 +1851,19 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 /// standalone `_ll_write_indexes` helper remains for the non-inlined callers
 /// (`ll_dict_store_clean`, reindex) ported in later slices.
 ///
-/// 13-block CFG (plus the returnblock). First-try-before-loop mirrors the
-/// "do the first try before any looping" optimisation; the loop body
-/// re-derives `i`, reads the slot, and 3-way branches FREE / VALID / DELETED
-/// before the `perturb` shift back-edge.
+/// 13-block CFG (plus the returnblock) when `eq_fn_const` is `None`, 15-block
+/// when `Some` (one extra `direct_call(eq_fn_const, ...)` block per
+/// comparison site). First-try-before-loop mirrors the "do the first try
+/// before any looping" optimisation; the loop body re-derives `i`, reads the
+/// slot, and 3-way branches FREE / VALID / DELETED before the `perturb`
+/// shift back-edge.
 pub fn build_ll_dict_lookup_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
     entries_ptr_lltype: LowLevelType,
     index_elem_lltype: LowLevelType,
     key_lltype: LowLevelType,
+    eq_fn_const: Option<Constant>,
 ) -> Result<PyGraph, TyperError> {
     let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
     let eq_op = direct_compare_op(&key_lltype)?;
@@ -2088,30 +2187,117 @@ pub fn build_ll_dict_lookup_helper_graph(
         &fv_eq,
     );
     block_first_valid.borrow_mut().exitswitch = Some(var(&fv_eq));
-    block_first_valid.closeblock(vec![
-        Link::new(
-            vec![var(&fv_slot)],
-            Some(graph.returnblock.clone()),
-            Some(bool_true()),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                var(&fv_d),
-                var(&fv_entries),
-                var(&fv_indexes),
-                var(&fv_mask),
-                var(&fv_key),
-                var(&fv_sf),
-                var(&fv_hash),
-                var(&fv_i),
-                signed(-1),
-            ],
-            Some(block_loop_init.clone()),
-            Some(bool_false()),
-        )
-        .into_ref(),
-    ]);
+    let fv_loop_init_args = vec![
+        var(&fv_d),
+        var(&fv_entries),
+        var(&fv_indexes),
+        var(&fv_mask),
+        var(&fv_key),
+        var(&fv_sf),
+        var(&fv_hash),
+        var(&fv_i),
+        signed(-1),
+    ];
+    if let Some(eq_fn) = eq_fn_const.clone() {
+        // d.keyeq is not None (rordereddict.py:1052-1055): direct-compare
+        // missed, fall through to a call-based content compare via the key
+        // repr's get_ll_eq_function (ll_streq for str keys).
+        let fkc_d = new_var("d", dict_ptr_lltype.clone());
+        let fkc_entries = new_var("entries", entries_ptr_lltype.clone());
+        let fkc_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+        let fkc_mask = new_var("mask_u", uns());
+        let fkc_key = new_var("key", key_lltype.clone());
+        let fkc_sf = new_var("store_flag", sig());
+        let fkc_hash = new_var("hash", sig());
+        let fkc_i = new_var("i", uns());
+        let fkc_slot = new_var("slot", sig());
+        let fkc_ckey = new_var("checkingkey", key_lltype.clone());
+        let block_first_keyeq_call = Block::shared(vec![
+            var(&fkc_d),
+            var(&fkc_entries),
+            var(&fkc_indexes),
+            var(&fkc_mask),
+            var(&fkc_key),
+            var(&fkc_sf),
+            var(&fkc_hash),
+            var(&fkc_i),
+            var(&fkc_slot),
+            var(&fkc_ckey),
+        ]);
+        block_first_valid.closeblock(vec![
+            Link::new(
+                vec![var(&fv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&fv_d),
+                    var(&fv_entries),
+                    var(&fv_indexes),
+                    var(&fv_mask),
+                    var(&fv_key),
+                    var(&fv_sf),
+                    var(&fv_hash),
+                    var(&fv_i),
+                    var(&fv_slot),
+                    var(&fv_ckey),
+                ],
+                Some(block_first_keyeq_call.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+
+        let fkc_found = new_var("found", LowLevelType::Bool);
+        push(
+            &block_first_keyeq_call,
+            "direct_call",
+            vec![Hlvalue::Constant(eq_fn), var(&fkc_ckey), var(&fkc_key)],
+            &fkc_found,
+        );
+        block_first_keyeq_call.borrow_mut().exitswitch = Some(var(&fkc_found));
+        block_first_keyeq_call.closeblock(vec![
+            Link::new(
+                vec![var(&fkc_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&fkc_d),
+                    var(&fkc_entries),
+                    var(&fkc_indexes),
+                    var(&fkc_mask),
+                    var(&fkc_key),
+                    var(&fkc_sf),
+                    var(&fkc_hash),
+                    var(&fkc_i),
+                    signed(-1),
+                ],
+                Some(block_loop_init.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    } else {
+        block_first_valid.closeblock(vec![
+            Link::new(
+                vec![var(&fv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                fv_loop_init_args,
+                Some(block_loop_init.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    }
 
     // ===== block_first_notvalid: DELETED vs pristine FREE. =====
     let nv_i_s = new_var("i_s", sig());
@@ -2402,30 +2588,119 @@ pub fn build_ll_dict_lookup_helper_graph(
         &lv_eq,
     );
     block_loop_valid.borrow_mut().exitswitch = Some(var(&lv_eq));
-    block_loop_valid.closeblock(vec![
-        Link::new(
-            vec![var(&lv_slot)],
-            Some(graph.returnblock.clone()),
-            Some(bool_true()),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                var(&lv_d),
-                var(&lv_entries),
-                var(&lv_indexes),
-                var(&lv_mask),
-                var(&lv_key),
-                var(&lv_sf),
-                var(&lv_perturb),
-                var(&lv_i),
-                var(&lv_ds),
-            ],
-            Some(block_perturb_shift.clone()),
-            Some(bool_false()),
-        )
-        .into_ref(),
-    ]);
+    let lv_perturb_shift_args = vec![
+        var(&lv_d),
+        var(&lv_entries),
+        var(&lv_indexes),
+        var(&lv_mask),
+        var(&lv_key),
+        var(&lv_sf),
+        var(&lv_perturb),
+        var(&lv_i),
+        var(&lv_ds),
+    ];
+    if let Some(eq_fn) = eq_fn_const.clone() {
+        // d.keyeq is not None (rordereddict.py:1092-1095), in-loop mirror of
+        // the first-try block_first_keyeq_call fallback above.
+        let lkc_d = new_var("d", dict_ptr_lltype.clone());
+        let lkc_entries = new_var("entries", entries_ptr_lltype.clone());
+        let lkc_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+        let lkc_mask = new_var("mask_u", uns());
+        let lkc_key = new_var("key", key_lltype.clone());
+        let lkc_sf = new_var("store_flag", sig());
+        let lkc_perturb = new_var("perturb", uns());
+        let lkc_i = new_var("i", uns());
+        let lkc_ds = new_var("deletedslot", sig());
+        let lkc_slot = new_var("slot", sig());
+        let lkc_ckey = new_var("checkingkey", key_lltype.clone());
+        let block_loop_keyeq_call = Block::shared(vec![
+            var(&lkc_d),
+            var(&lkc_entries),
+            var(&lkc_indexes),
+            var(&lkc_mask),
+            var(&lkc_key),
+            var(&lkc_sf),
+            var(&lkc_perturb),
+            var(&lkc_i),
+            var(&lkc_ds),
+            var(&lkc_slot),
+            var(&lkc_ckey),
+        ]);
+        block_loop_valid.closeblock(vec![
+            Link::new(
+                vec![var(&lv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&lv_d),
+                    var(&lv_entries),
+                    var(&lv_indexes),
+                    var(&lv_mask),
+                    var(&lv_key),
+                    var(&lv_sf),
+                    var(&lv_perturb),
+                    var(&lv_i),
+                    var(&lv_ds),
+                    var(&lv_slot),
+                    var(&lv_ckey),
+                ],
+                Some(block_loop_keyeq_call.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+
+        let lkc_found = new_var("found", LowLevelType::Bool);
+        push(
+            &block_loop_keyeq_call,
+            "direct_call",
+            vec![Hlvalue::Constant(eq_fn), var(&lkc_ckey), var(&lkc_key)],
+            &lkc_found,
+        );
+        block_loop_keyeq_call.borrow_mut().exitswitch = Some(var(&lkc_found));
+        block_loop_keyeq_call.closeblock(vec![
+            Link::new(
+                vec![var(&lkc_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&lkc_d),
+                    var(&lkc_entries),
+                    var(&lkc_indexes),
+                    var(&lkc_mask),
+                    var(&lkc_key),
+                    var(&lkc_sf),
+                    var(&lkc_perturb),
+                    var(&lkc_i),
+                    var(&lkc_ds),
+                ],
+                Some(block_perturb_shift.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    } else {
+        block_loop_valid.closeblock(vec![
+            Link::new(
+                vec![var(&lv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                lv_perturb_shift_args,
+                Some(block_perturb_shift.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    }
 
     // ===== block_loop_deleted: record first deleted slot (deletedslot == -1). =====
     let ld_i_s = new_var("i_s", sig());
@@ -2755,16 +3030,19 @@ pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
 /// ```
 ///
 /// **Scope note:** the `else` arm rehashes a "prebuilt dictionary frozen by
-/// translation" (`ll_dict_rehash_after_translation`, `rordereddict.py:955-977`)
-/// — a translation-time-only RPython concept with no analogue in this JIT.
-/// Every dict this port can construct comes from `ll_newdict`
-/// (`num_live_items == 0` at construction), and no write path exists yet
-/// (Slice 3), so `num_live_items != 0` while `lookup_function_no ==
-/// FUNC_MUST_REINDEX` is unreachable for any census-reachable dict today.
-/// This builder ports only the reachable `num_live_items == 0` branch
-/// straight-line (no runtime check), matching the "statically dead branch"
-/// precedent in [`build_ll_dict_lookup_helper_graph`]'s doc comment. Revisit
-/// once Slice 3's write path lands.
+/// translation" (`ll_dict_rehash_after_translation`, `rordereddict.py:955-977`,
+/// `@jit.dont_look_inside`) — a translation-time-only RPython concept with no
+/// analogue in this runtime JIT, which constructs every dict at run time.
+/// `lookup_function_no` is written to `FUNC_MUST_REINDEX` in exactly one place
+/// (`ll_no_initial_index`, at `ll_newdict`, where `num_live_items == 0`); the
+/// write path's `ll_dict_reindex` stamps a concrete `FUNC_BYTE/SHORT/INT/LONG`
+/// selector instead, and `ll_dict_remove_deleted_items` only clears the high
+/// bits (`&= FUNC_MASK`). So `ll_ensure_indexes` reaches this helper only while
+/// `num_live_items == 0`; the `num_live_items != 0` else arm stays unreachable.
+/// Re-verified after the Slice 3/4 write + delete paths landed. This builder
+/// ports only the reachable `num_live_items == 0` branch straight-line (no
+/// runtime check), matching the "statically dead branch" precedent in
+/// [`build_ll_dict_lookup_helper_graph`]'s doc comment.
 pub(crate) fn build_ll_dict_create_initial_index_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -7164,22 +7442,17 @@ pub(crate) fn build_ll_dict_setitem_helper_graph(
 /// 8-block CFG plus the returnblock and exceptblock. Both the null-`dict`
 /// guard and the loop-exhausted tail raise `StopIteration` via `exceptblock`.
 ///
-/// PORT STATUS — this is the leaf `_ll_dictnext` helper only; it is NOT yet
-/// wired into dict-iterator rtyping. Upstream `AbstractDictIteratorRepr`
-/// (`rdict.py:70-93`) reaches it via `newiter` → `rtype_next`, where
-/// `rtype_next` `gendirectcall`s `self._ll_dictnext`, reads `iter.dict.entries`,
-/// and recasts through `variant_keys/values/items` (`rdict.py:113-148`). None of
-/// that surface is ported: `OrderedDictRepr` does not override
-/// `make_iterator_repr`, and `DictIteratorRepr` overrides no `newiter`/
-/// `rtype_next`, so a dict-iteration graph errors at `make_iterator_repr`
-/// (`MissingRTypeOperation`, a clean census Skip) long before this helper could
-/// run. The only caller today is the unit test below, so the helper is inert
-/// (no production or census reach) — it cannot miscompile. Wiring `rtype_next`
-/// is blocked on the unported ordered-dict runtime: the `ll_dictiter` graph
-/// builder, `get_tuple_result` (tuple-malloc, `rdict.py:95-111`), and the
-/// `variant_*` recast helpers (`ordered_dict_runtime_deferred`) — `ll_newdict`/
-/// `ll_dict_getitem`/`ll_dict_setitem` are now real (Slices 1-3). Tracked by
-/// the DictRepr port epic (#140).
+/// PORT STATUS — `newiter`/`rtype_next`/`make_iterator_repr` are now wired
+/// (`OrderedDictRepr::make_iterator_repr`, `DictIteratorRepr::newiter`/
+/// `rtype_next`, `rtype_method_iterkeys`/`itervalues`/`iteritems` — #145).
+/// `rtype_next` `gendirectcall`s this helper, reads `iter.dict.entries`, and
+/// recasts through `variant_keys`/`variant_values`/`variant_items`
+/// (`rdict.py:113-148`); `build_ll_dictiter_helper_graph` mints the matching
+/// `newiter` constructor. Still deferred, fail-closed via
+/// `ordered_dict_runtime_deferred`: the `reversed(d)` variant
+/// (`ll_dictiter_reversed`/`_ll_dictnext_reversed`) and the `*_with_hash`
+/// variants (need `ll_ensure_indexes`/`entry_hash`). Tracked by the DictRepr
+/// port epic (#140).
 pub fn build_ll_dictnext_helper_graph(
     name: &str,
     iter_ptr_lltype: LowLevelType,
@@ -7753,6 +8026,7 @@ pub fn ll_dict_lookup(
     entries_ptr_lltype: LowLevelType,
     index_elem_lltype: LowLevelType,
     key_lltype: LowLevelType,
+    eq_fn_const: Option<Constant>,
 ) -> Result<PyGraph, TyperError> {
     build_ll_dict_lookup_helper_graph(
         "ll_dict_lookup",
@@ -7760,6 +8034,7 @@ pub fn ll_dict_lookup(
         entries_ptr_lltype,
         index_elem_lltype,
         key_lltype,
+        eq_fn_const,
     )
 }
 
@@ -7929,20 +8204,149 @@ pub fn get_ll_dictiter(DICTPTR: LowLevelType) -> LowLevelType {
 
 /// RPython `class DictIteratorRepr(AbstractDictIteratorRepr)`
 /// (`lltypesystem/rordereddict.py:1192`).
+///
+/// Upstream stores the whole `r_dict` (`DictIteratorRepr.__init__`,
+/// `:1206-1215`) and reaches `r_dict.recast_key`/`recast_value` through it.
+/// Rust has no single owned/`Arc`-shared `OrderedDictRepr` to stash at
+/// `make_iterator_repr` time (mirroring how `ListIteratorRepr`/
+/// `RangeIteratorRepr` decompose their container repr into the specific
+/// fields they need instead of holding it whole), so the pieces
+/// `newiter`/`rtype_next` actually read — the dict/entries lltypes and the
+/// key/value recast repr pairs — are copied out at construction time
+/// instead.
 #[derive(Debug)]
 pub struct DictIteratorRepr {
     pub base: AbstractDictIteratorRepr,
     pub r_dict_lowleveltype: LowLevelType,
+    pub entries_lowleveltype: LowLevelType,
+    pub key_repr: Arc<dyn Repr>,
+    pub external_key_repr: Arc<dyn Repr>,
+    pub value_repr: Arc<dyn Repr>,
+    pub external_value_repr: Arc<dyn Repr>,
 }
 
 impl DictIteratorRepr {
-    pub fn new(r_dict_lowleveltype: LowLevelType, variant: impl Into<String>) -> Self {
+    /// RPython `DictIteratorRepr.__init__(self, r_dict, variant="keys")`
+    /// (`rordereddict.py:1206-1215`). Only the forward `ll_dictiter`/
+    /// `_ll_dictnext` constructors are wired — the `variant == "reversed"`
+    /// swap to `ll_dictiter_reversed`/`_ll_dictnext_reversed` is rejected by
+    /// [`Repr::make_iterator_repr`] before this ever runs with that variant.
+    pub fn new(r_dict: &OrderedDictRepr, variant: impl Into<String>) -> Self {
         let variant = variant.into();
+        let r_dict_lowleveltype = r_dict.lowleveltype().clone();
         let lowleveltype = get_ll_dictiter(r_dict_lowleveltype.clone());
+        let (key_repr, external_key_repr) = r_dict.base.recast_key();
+        let (value_repr, external_value_repr) = r_dict.base.recast_value();
         DictIteratorRepr {
             base: AbstractDictIteratorRepr::new(lowleveltype, vec![variant]),
             r_dict_lowleveltype,
+            entries_lowleveltype: r_dict.entries_ptr_lltype(),
+            key_repr: key_repr.clone(),
+            external_key_repr: external_key_repr.clone(),
+            value_repr: value_repr.clone(),
+            external_value_repr: external_value_repr.clone(),
         }
+    }
+
+    /// RPython `AbstractDictIteratorRepr.variant_keys` (`rdict.py:113-118`);
+    /// also `variant_reversed = variant_keys` (`:120`) — the read step is
+    /// identical for the forward and reversed variants, only the iterator
+    /// walk direction differs (in the unported `ll_dictiter_reversed`/
+    /// `_ll_dictnext_reversed` constructors).
+    fn variant_keys(&self, hop: &HighLevelOp, v_entries: Hlvalue, v_index: Hlvalue) -> RTypeResult {
+        let key_lltype = self.key_repr.lowleveltype().clone();
+        let v_key = hop
+            .genop(
+                "getinteriorfield",
+                vec![v_entries, v_index, void_field_const("key")],
+                GenopResult::LLType(key_lltype),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.variant_keys: getinteriorfield 'key' returned no value",
+                )
+            })?;
+        let recast = hop.llops.borrow_mut().convertvar(
+            v_key,
+            self.key_repr.as_ref(),
+            self.external_key_repr.as_ref(),
+        )?;
+        Ok(Some(recast))
+    }
+
+    /// RPython `AbstractDictIteratorRepr.variant_values` (`rdict.py:122-127`).
+    fn variant_values(
+        &self,
+        hop: &HighLevelOp,
+        v_entries: Hlvalue,
+        v_index: Hlvalue,
+    ) -> RTypeResult {
+        let value_lltype = self.value_repr.lowleveltype().clone();
+        let v_value = hop
+            .genop(
+                "getinteriorfield",
+                vec![v_entries, v_index, void_field_const("value")],
+                GenopResult::LLType(value_lltype),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.variant_values: getinteriorfield 'value' returned no value",
+                )
+            })?;
+        let recast = hop.llops.borrow_mut().convertvar(
+            v_value,
+            self.value_repr.as_ref(),
+            self.external_value_repr.as_ref(),
+        )?;
+        Ok(Some(recast))
+    }
+
+    /// RPython `AbstractDictIteratorRepr.variant_items` (`rdict.py:129-132`),
+    /// via `get_tuple_result` (`:95-111`). The local `items` result type is
+    /// already a [`crate::translator::rtyper::rtuple::TupleRepr`] of
+    /// `(external_key_repr, external_value_repr)` (`hop.r_result`), so the
+    /// tuple malloc is [`crate::translator::rtyper::rtuple::TupleRepr::newtuple`]
+    /// rather than a hand-rolled malloc — the local equivalent of upstream's
+    /// inline tuple allocation, same idiom as
+    /// [`crate::translator::rtyper::rtuple::TupleRepr::newtuple_cached`]
+    /// reading `hop.r_result`.
+    fn variant_items(
+        &self,
+        hop: &HighLevelOp,
+        v_entries: Hlvalue,
+        v_index: Hlvalue,
+    ) -> RTypeResult {
+        let v_key = self
+            .variant_keys(hop, v_entries.clone(), v_index.clone())?
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.variant_items: variant_keys produced no value",
+                )
+            })?;
+        let v_value = self
+            .variant_values(hop, v_entries, v_index)?
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.variant_items: variant_values produced no value",
+                )
+            })?;
+        let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+            TyperError::message("DictIteratorRepr.variant_items: hop.r_result missing")
+        })?;
+        let any_r: &dyn std::any::Any = r_result.as_ref();
+        let r_tuple = any_r
+            .downcast_ref::<crate::translator::rtyper::rtuple::TupleRepr>()
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.variant_items: hop.r_result is not a TupleRepr",
+                )
+            })?;
+        let v_tuple = crate::translator::rtyper::rtuple::TupleRepr::newtuple(
+            &mut hop.llops.borrow_mut(),
+            r_tuple,
+            vec![v_key, v_value],
+        )?;
+        Ok(Some(v_tuple))
     }
 }
 
@@ -7962,6 +8366,135 @@ impl Repr for DictIteratorRepr {
     fn repr_class_id(&self) -> crate::translator::rtyper::pairtype::ReprClassId {
         crate::translator::rtyper::pairtype::ReprClassId::DictIteratorRepr
     }
+
+    /// RPython `AbstractDictIteratorRepr.newiter(self, hop)` (`rdict.py:70-73`):
+    ///
+    /// ```python
+    /// def newiter(self, hop):
+    ///     v_dict, = hop.inputargs(self.r_dict)
+    ///     citerptr = hop.inputconst(lltype.Void, self.lowleveltype)
+    ///     return hop.gendirectcall(self.ll_dictiter, citerptr, v_dict)
+    /// ```
+    ///
+    /// Same shape as [`super::super::rlist::ListIteratorRepr::newiter`]: the
+    /// iterator lltype is baked into the `ll_dictiter` helper builder
+    /// instead of threaded as a `citerptr` Void const, and the
+    /// `hop.inputargs(self.r_dict)` conversion target is the operand's own
+    /// dict repr (`hop.args_r[0]`) — there is no `OrderedDictRepr ->
+    /// OrderedDictRepr` conversion, so `convertvar` needs the operand's own
+    /// repr to short-circuit as identity.
+    fn newiter(&self, hop: &HighLevelOp) -> RTypeResult {
+        let r_dict = {
+            let args_r = hop.args_r.borrow();
+            args_r
+                .first()
+                .and_then(|o| o.clone())
+                .ok_or_else(|| TyperError::message("DictIteratorRepr.newiter: arg0 repr missing"))?
+        };
+        let vargs = hop.inputargs(vec![ConvertedTo::Repr(r_dict.as_ref())])?;
+        let dict_lltype = self.r_dict_lowleveltype.clone();
+        let iter_lltype = self.lowleveltype().clone();
+        let dict_for_builder = dict_lltype.clone();
+        let iter_for_builder = iter_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_dictiter".to_string(),
+            vec![dict_lltype],
+            iter_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_dictiter_helper_graph(
+                    "ll_dictiter",
+                    iter_for_builder.clone(),
+                    dict_for_builder.clone(),
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, vargs)
+    }
+
+    /// RPython `AbstractDictIteratorRepr.rtype_next(self, hop)`
+    /// (`rdict.py:75-93`):
+    ///
+    /// ```python
+    /// def rtype_next(self, hop):
+    ///     v_iter, = hop.inputargs(self)
+    ///     hop.has_implicit_exception(StopIteration)
+    ///     hop.has_implicit_exception(RuntimeError)
+    ///     hop.exception_is_here()
+    ///     v_index = hop.gendirectcall(self._ll_dictnext, v_iter)
+    ///     DICT = self.lowleveltype.TO.dict
+    ///     v_dict = hop.genop('getfield', [v_iter, c_dict], resulttype=DICT)
+    ///     ENTRIES = DICT.TO.entries
+    ///     v_entries = hop.genop('getfield', [v_dict, c_entries], resulttype=ENTRIES)
+    ///     method = getattr(self, 'variant_' + self.variant)
+    ///     return method(hop, ENTRIES, v_entries, v_dict, v_index)
+    /// ```
+    ///
+    /// `keys_with_hash`/`items_with_hash` (needing `ll_ensure_indexes` +
+    /// `entry_hash`) are unported and fail closed via the wildcard arm below.
+    fn rtype_next(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_iter = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        hop.has_implicit_exception("StopIteration");
+        hop.has_implicit_exception("RuntimeError");
+        hop.exception_is_here()?;
+
+        let iter_lltype = self.lowleveltype().clone();
+        let dict_lltype = self.r_dict_lowleveltype.clone();
+        let entries_lltype = self.entries_lowleveltype.clone();
+        let iter_for_builder = iter_lltype.clone();
+        let dict_for_builder = dict_lltype.clone();
+        let entries_for_builder = entries_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "_ll_dictnext".to_string(),
+            vec![iter_lltype],
+            LowLevelType::Signed,
+            move |_rtyper, _args, _result| {
+                build_ll_dictnext_helper_graph(
+                    "_ll_dictnext",
+                    iter_for_builder.clone(),
+                    dict_for_builder.clone(),
+                    entries_for_builder.clone(),
+                )
+            },
+        )?;
+        let v_index = hop.gendirectcall(&helper, v_iter.clone())?.ok_or_else(|| {
+            TyperError::message("DictIteratorRepr.rtype_next: _ll_dictnext returned Void")
+        })?;
+
+        // DICT = self.lowleveltype.TO.dict ; v_dict = getfield(v_iter, 'dict')
+        let v_dict = hop
+            .genop(
+                "getfield",
+                vec![v_iter[0].clone(), void_field_const("dict")],
+                GenopResult::LLType(dict_lltype),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.rtype_next: getfield 'dict' returned no value",
+                )
+            })?;
+        // ENTRIES = DICT.TO.entries ; v_entries = getfield(v_dict, 'entries')
+        let v_entries = hop
+            .genop(
+                "getfield",
+                vec![v_dict, void_field_const("entries")],
+                GenopResult::LLType(entries_lltype),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.rtype_next: getfield 'entries' returned no value",
+                )
+            })?;
+
+        match self.base.variant.first().map(|s| s.as_str()) {
+            Some("keys") | Some("reversed") => self.variant_keys(hop, v_entries, v_index),
+            Some("values") => self.variant_values(hop, v_entries, v_index),
+            Some("items") => self.variant_items(hop, v_entries, v_index),
+            other => Err(ordered_dict_runtime_deferred(&format!(
+                "DictIteratorRepr.rtype_next variant {other:?} (with_hash variants need \
+                 ll_ensure_indexes/entry_hash)"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7973,6 +8506,8 @@ mod tests {
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rint::signed_repr;
     use crate::translator::rtyper::rstr::string_repr;
+    use crate::translator::rtyper::rtyper::LowLevelOpList;
+    use std::cell::RefCell;
 
     #[test]
     fn ordereddictrepr_builds_sparse_index_dicttable_shape() {
@@ -8120,10 +8655,9 @@ mod tests {
 
     #[test]
     fn dictiteratorrepr_extends_abstract_iterator_repr() {
-        let dictptr = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc("dicttable", vec![])),
-        }));
-        let repr = DictIteratorRepr::new(dictptr.clone(), "keys");
+        let r_dict = sample_ordered_dict_repr();
+        let dictptr = r_dict.lowleveltype().clone();
+        let repr = DictIteratorRepr::new(&r_dict, "keys");
 
         assert_eq!(repr.class_name(), "DictIteratorRepr");
         assert_eq!(repr.repr_class_id(), ReprClassId::DictIteratorRepr);
@@ -8136,6 +8670,225 @@ mod tests {
                 ReprClassId::AbstractDictIteratorRepr,
                 ReprClassId::Repr
             ]
+        );
+    }
+
+    /// `ll_dictiter` mints a fresh `dictiter{dict, index}`: `iter.dict = d`
+    /// and `iter.index = d.lookup_function_no >> FUNC_SHIFT`
+    /// (`rordereddict.py:1218-1223`) — no constant-zero index (unlike
+    /// `ll_listiter`), since `_ll_dictnext`'s popitem(last=False)
+    /// fast-forward hack stashes a resume offset in `lookup_function_no`.
+    #[test]
+    fn build_ll_dictiter_helper_mints_dict_and_shifted_index() {
+        let dict_lltype = sample_dict_ptr_lltype();
+        let iter_lltype = get_ll_dictiter(dict_lltype.clone());
+        let helper =
+            build_ll_dictiter_helper_graph("ll_dictiter", iter_lltype.clone(), dict_lltype)
+                .expect("build_ll_dictiter_helper_graph");
+        assert_eq!(helper.func.name, "ll_dictiter");
+        let inner = helper.graph.borrow();
+
+        let start_ops: Vec<_> = inner
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(
+            start_ops,
+            vec!["malloc", "setfield", "getfield", "int_rshift", "setfield"],
+        );
+        // single-block CFG: startblock links straight to the returnblock.
+        assert_eq!(inner.startblock.borrow().exits.len(), 1);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(iter_lltype),
+            "ll_dictiter returns the dictiter Ptr"
+        );
+    }
+
+    /// `OrderedDictRepr::make_iterator_repr` (`rordereddict.py:282-283`)
+    /// mints a `DictIteratorRepr` for the implicit `for k in d:` iteration
+    /// (no variant); the `reversed(d)` variant is rejected fail-closed since
+    /// `ll_dictiter_reversed`/`_ll_dictnext_reversed` are unported.
+    #[test]
+    fn make_iterator_repr_yields_dictiteratorrepr_and_rejects_reversed_variant() {
+        let r_dict = sample_ordered_dict_repr();
+
+        let it = r_dict
+            .make_iterator_repr(&[], false)
+            .expect("make_iterator_repr");
+        assert_eq!(it.class_name(), "DictIteratorRepr");
+        assert_eq!(it.repr_class_id(), ReprClassId::DictIteratorRepr);
+
+        let err = r_dict
+            .make_iterator_repr(&["reversed".to_string()], false)
+            .expect_err("reversed variant must be rejected");
+        assert!(err.is_missing_rtype_operation());
+    }
+
+    /// `DictIteratorRepr::new` selects the `keys`/`values`/`items` variant
+    /// (`rordereddict.py:342-352` — `rtype_method_iterkeys`/`itervalues`/
+    /// `iteritems` each construct `DictIteratorRepr(self, "<variant>")`).
+    #[test]
+    fn dictiteratorrepr_new_selects_keys_values_items_variant() {
+        let r_dict = sample_ordered_dict_repr();
+        for variant in ["keys", "values", "items"] {
+            let repr = DictIteratorRepr::new(&r_dict, variant);
+            assert_eq!(repr.base.variant, vec![variant.to_string()]);
+        }
+    }
+
+    fn hop_llops(rtyper: &Rc<RPythonTyper>) -> Rc<RefCell<LowLevelOpList>> {
+        Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)))
+    }
+
+    /// `iter(d)` rtypes through `DictIteratorRepr::newiter` to a
+    /// `direct_call(ll_dictiter, v_dict)` (`rdict.py:70-73`).
+    #[test]
+    fn newiter_emits_direct_call_to_ll_dictiter() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let r_dict = OrderedDictRepr::new(
+            rtyper.clone(),
+            signed_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef.clone(),
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr");
+        let iter_repr = DictIteratorRepr::new(&r_dict, "keys");
+        let r_dict_arc: Arc<dyn Repr> = Arc::new(r_dict);
+
+        let llops = hop_llops(&rtyper);
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(r_dict_arc.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(iter_repr.lowleveltype().clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "iter".to_string(),
+                vec![Hlvalue::Variable(v_dict)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Dict(crate::annotator::model::SomeDict::new(
+                dictdef,
+            )));
+        hop.args_r.borrow_mut().push(Some(r_dict_arc));
+
+        let result = iter_repr
+            .newiter(&hop)
+            .unwrap_or_else(|err| panic!("dict iter: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_dictiter"),
+            "expected 'll_dictiter' in {dbg}"
+        );
+    }
+
+    /// `next(iter)` rtypes through `DictIteratorRepr::rtype_next`
+    /// (`rdict.py:75-93`): `direct_call(_ll_dictnext, v_iter)`, then
+    /// `getfield(v_iter, 'dict')` / `getfield(v_dict, 'entries')`, then the
+    /// `variant_keys` read `getinteriorfield(entries, index, 'key')`.
+    #[test]
+    fn rtype_next_keys_variant_walks_dict_entries_then_key() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let r_dict = OrderedDictRepr::new(
+            rtyper.clone(),
+            signed_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef.clone(),
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr");
+        let iter_repr: Arc<dyn Repr> = Arc::new(DictIteratorRepr::new(&r_dict, "keys"));
+
+        let llops = hop_llops(&rtyper);
+        let v_iter = Variable::new();
+        v_iter.set_concretetype(Some(iter_repr.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "next".to_string(),
+                vec![Hlvalue::Variable(v_iter)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().push(SomeValue::Iterator(
+            crate::annotator::model::SomeIterator::new(
+                SomeValue::Dict(crate::annotator::model::SomeDict::new(dictdef)),
+                vec![],
+            ),
+        ));
+        hop.args_r.borrow_mut().push(Some(iter_repr.clone()));
+
+        let result = iter_repr
+            .rtype_next(&hop)
+            .unwrap_or_else(|err| panic!("dict next: {err:?}"));
+        assert!(matches!(result, Some(_)));
+        let ops = llops.borrow();
+        let opnames: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(
+            opnames,
+            vec!["direct_call", "getfield", "getfield", "getinteriorfield"],
+        );
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_next must call hop.exception_is_here()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("_ll_dictnext"),
+            "expected '_ll_dictnext' in {dbg}"
         );
     }
 
@@ -8460,6 +9213,40 @@ mod tests {
         )
     }
 
+    /// Str-keyed sample `(dict_ptr, entries_ptr, key_lltype)` for the lookup
+    /// builder, derived from a freshly built `OrderedDictRepr`.
+    fn sample_dict_lookup_str_key_lltypes() -> (LowLevelType, LowLevelType, LowLevelType) {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let repr = OrderedDictRepr::new(
+            rtyper,
+            string_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr");
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        (
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            repr.DICTKEY.clone(),
+        )
+    }
+
     /// Walk every block reachable from `start`, returning the visited block
     /// count and the flattened op-name list.
     fn walk_blocks(start: &BlockRef) -> (usize, Vec<String>) {
@@ -8499,6 +9286,7 @@ mod tests {
             entries_ptr,
             LowLevelType::Unsigned,
             key_lltype,
+            None,
         )
         .expect("build_ll_dict_lookup_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_lookup");
@@ -8553,6 +9341,12 @@ mod tests {
                 "lookup CFG must emit {needed}, got {ops:?}"
             );
         }
+        // eq_fn_const is None (identity/int keys) — no keyeq call branch, no
+        // direct_call anywhere in the CFG.
+        assert!(
+            !ops.iter().any(|o| o == "direct_call"),
+            "eq_fn_const=None must stay direct-compare-only, got {ops:?}"
+        );
 
         // Returns the Signed entry slot (index - VALID_OFFSET) or -1.
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
@@ -8568,8 +9362,14 @@ mod tests {
     #[test]
     fn ll_dict_lookup_surface_builds_lookup_graph() {
         let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
-        let helper = ll_dict_lookup(dict_ptr, entries_ptr, LowLevelType::Unsigned, key_lltype)
-            .expect("ll_dict_lookup");
+        let helper = ll_dict_lookup(
+            dict_ptr,
+            entries_ptr,
+            LowLevelType::Unsigned,
+            key_lltype,
+            None,
+        )
+        .expect("ll_dict_lookup");
         assert_eq!(helper.func.name, "ll_dict_lookup");
     }
 
@@ -8597,6 +9397,39 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Ptr(_))
         ));
+    }
+
+    /// When `eq_fn_const` is `Some` (str keys), a direct-compare miss at
+    /// both comparison sites falls through to `direct_call(eq_fn_const,
+    /// checkingkey, key)` instead of returning -1/continuing unconditionally
+    /// — `d.keyeq(checkingkey, key)` (`rordereddict.py:1052-1055,1092-1095`).
+    /// Validate the block count grows by exactly the 2 new keyeq-call blocks
+    /// and that `direct_call` reaches the minted `ll_streq` funcptr.
+    #[test]
+    fn build_ll_dict_lookup_wires_keyeq_call_for_str_keys() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_str_key_lltypes();
+        let eq_fn = dummy_funcptr_const();
+        let helper = build_ll_dict_lookup_helper_graph(
+            "ll_dict_lookup",
+            dict_ptr,
+            entries_ptr,
+            LowLevelType::Unsigned,
+            key_lltype,
+            Some(eq_fn),
+        )
+        .expect("build_ll_dict_lookup_helper_graph");
+        let inner = helper.graph.borrow();
+
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(
+            block_count, 16,
+            "13 work blocks + 2 keyeq-call blocks + returnblock"
+        );
+        let direct_call_count = ops.iter().filter(|o| *o == "direct_call").count();
+        assert_eq!(
+            direct_call_count, 2,
+            "one direct_call per comparison site (first-try + in-loop), got {ops:?}"
+        );
     }
 
     /// `_ll_dictnext` walks the entries array; on a valid entry it advances
@@ -9083,11 +9916,13 @@ mod tests {
         assert!(format!("{:?}", c.value).contains("ll_dict_contains"));
     }
 
-    /// The eq-gate fails closed for str keys instead of silently routing
-    /// through `build_ll_dict_lookup_helper_graph`'s `ptr_eq` direct-compare
-    /// (Slice 0 landmine).
+    /// The eq-gate lets plain (non-`custom_eq_hash`) str keys through: the
+    /// direct-compare `ptr_eq` landmine from Slice 0 is now covered by the
+    /// `d.keyeq`-fallback wiring in `build_ll_dict_lookup_helper_graph`
+    /// (`ll_streq`, via `key_repr.get_ll_eq_function()`), so
+    /// `OrderedDictRepr::rtype_getitem` succeeds like the int-key case.
     #[test]
-    fn ordereddictrepr_rtype_getitem_str_key_fails_closed_on_eq_gate() {
+    fn ordereddictrepr_rtype_getitem_str_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
 
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
@@ -9134,7 +9969,7 @@ mod tests {
                 Hlvalue::Variable(v_result),
             ),
             vec![],
-            llops,
+            llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         hop.args_s
@@ -9145,13 +9980,18 @@ mod tests {
             Some(string_repr() as Arc<dyn Repr>),
         ]);
 
-        let err = repr
+        let result = repr
             .rtype_getitem(&hop)
-            .expect_err("str-keyed dict getitem must fail closed on the eq-gate");
-        assert!(
-            err.to_string().contains("dict key eq function not wired"),
-            "expected the eq-gate message, got {err}"
-        );
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_getitem: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_getitem"));
     }
 
     /// `ll_dict_store_clean` probes for the first `FREE` slot (no key
@@ -9950,10 +10790,10 @@ mod tests {
         assert!(format!("{:?}", c.value).contains("ll_dict_setdefault"));
     }
 
-    /// The eq-gate fails closed for str keys on delitem too — Slice 4 keeps
-    /// every lookup-dependent helper routed through `lookup_chain_helpers`.
+    /// The eq-gate lets plain str keys through on delitem too, same
+    /// `d.keyeq`-fallback wiring as getitem/contains/setitem.
     #[test]
-    fn ordereddictrepr_rtype_delitem_str_key_fails_closed_on_eq_gate() {
+    fn ordereddictrepr_rtype_delitem_str_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
 
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
@@ -10000,7 +10840,7 @@ mod tests {
                 Hlvalue::Variable(v_result),
             ),
             vec![],
-            llops,
+            llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         hop.args_s
@@ -10011,20 +10851,25 @@ mod tests {
             Some(string_repr() as Arc<dyn Repr>),
         ]);
 
-        let err = repr
+        let result = repr
             .rtype_delitem(&hop)
-            .expect_err("str-keyed dict delitem must fail closed on the eq-gate");
-        assert!(
-            err.to_string().contains("dict key eq function not wired"),
-            "expected the eq-gate message, got {err}"
-        );
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_delitem: {err:?}"));
+        assert!(result.is_none(), "rtype_delitem returns None (Void op)");
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_delitem"));
     }
 
-    /// The eq-gate fails closed for str keys on setitem too — same
+    /// The eq-gate lets plain str keys through on setitem too — same
     /// `lookup_chain_helpers`/`require_direct_compare_key` gate as
-    /// getitem/contains.
+    /// getitem/contains/delitem.
     #[test]
-    fn ordereddictrepr_rtype_setitem_str_key_fails_closed_on_eq_gate() {
+    fn ordereddictrepr_rtype_setitem_str_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
 
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
@@ -10077,7 +10922,7 @@ mod tests {
                 Hlvalue::Variable(v_result),
             ),
             vec![],
-            llops,
+            llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         hop.args_s.borrow_mut().extend([
@@ -10091,12 +10936,17 @@ mod tests {
             Some(signed_repr() as Arc<dyn Repr>),
         ]);
 
-        let err = repr
+        let result = repr
             .rtype_setitem(&hop)
-            .expect_err("str-keyed dict setitem must fail closed on the eq-gate");
-        assert!(
-            err.to_string().contains("dict key eq function not wired"),
-            "expected the eq-gate message, got {err}"
-        );
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_setitem: {err:?}"));
+        assert!(result.is_none(), "rtype_setitem returns None (Void op)");
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_setitem"));
     }
 }
