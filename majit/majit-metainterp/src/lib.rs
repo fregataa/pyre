@@ -47,6 +47,7 @@ pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
 pub use majit_backend::model as cpu;
+pub use majit_ir::Value;
 pub use majit_ir::debug;
 pub mod executor;
 pub mod gc;
@@ -121,11 +122,12 @@ pub use pyjitpl::{
     CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
     DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
-    MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
-    call_int_function, call_ref_function, call_void_function, consume_observed_float_call,
-    consume_observed_getfield, consume_observed_int_call, consume_observed_ref_call,
-    consume_observed_void_call, counters, observer_arg_to_i64, observer_i64_to_value,
-    struct_field_write_effect_info, trace_jitcode, trace_jitcode_observer,
+    MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, authoritative_executor_enabled,
+    build_state_field_snapshot, call_int_function, call_ref_function, call_void_function,
+    cancel_observer_replay, consume_observed_float_call, consume_observed_getfield,
+    consume_observed_int_call, consume_observed_ref_call, consume_observed_void_call, counters,
+    in_observer_mode, in_observer_replay, observer_arg_to_i64, observer_i64_to_value,
+    single_pass_enabled, struct_field_write_effect_info, trace_jitcode, trace_jitcode_observer,
     trace_jitcode_observer_with_args, trace_jitcode_observer_with_args_and_runtime,
     trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
@@ -225,6 +227,15 @@ pub enum TraceAction {
     /// (do_recursive_call assembler_call=True), then continue tracing
     /// the parent (ChangeFrame).
     RecursiveCallAssembler { green_key: u64, target_pc: usize },
+    /// Per-opcode single-executor (D2 / `PYRE_AUTHORITATIVE`): the
+    /// authoritative walker executed exactly ONE interpreter opcode and
+    /// reached the next merge-point boundary. `next_pc` is the concrete
+    /// interpreter pc of that boundary merge point (the promoted-green slot-0
+    /// pc). The native loop assigns it to its program counter and skips its own
+    /// dispatch of the walked opcode. Unlike `CloseLoop`, the trace is NEITHER
+    /// drained NOR compiled — accumulation continues on the next merge_point
+    /// call. Produced only under `authoritative_executor_enabled()`.
+    OpcodeComplete { next_pc: usize },
 }
 
 /// Marker macro for the tracing merge point.

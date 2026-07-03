@@ -692,7 +692,9 @@ impl<'c> Lowerer<'c> {
         let base_name = named_member(&base_field.member)?;
         let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
         let member = field.member.clone();
-        let tid = struct_type_id(&struct_path);
+        // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, a
+        // distinct descriptor id from any GC `new_struct` of the same type.
+        let tid = struct_type_id(&struct_path, false);
         // Lower the `state.<ref_scalar>` base to a ref binding (its
         // load_state_field_ref already declares the ref identity slot live for
         // resume), then read the field off that concrete ref.
@@ -713,20 +715,11 @@ impl<'c> Lowerer<'c> {
                 // struct (no GC header), so `is_gc_managed = false`: the
                 // field read must not be runtime-type-pinned with a
                 // `GUARD_GC_TYPE` that would read a non-existent `ref - 8`
-                // type-id word.
-                //
-                // LATENT (no current consumer): `#tid = struct_type_id(T)` is
-                // shared with the GC `new_struct` path, and the size-descr
-                // cache is first-write-wins by `LLType::Struct(type_id)`.  If
-                // some `T` were used BOTH as a JIT-allocated struct literal
-                // (is_gc_managed=true) and as a `ref(T)` state scalar
-                // (is_gc_managed=false), whichever registered first would pin
-                // the flag for both — a raw getfield could then emit
-                // GUARD_GC_TYPE against a headerless pointer, or a GC alloc
-                // could lose its type guard.  No aheui type is used both ways
-                // (ref scalars are Stack/Storage, never New-allocated).  Fix
-                // when a dual-use type appears: fold raw-vs-GC into the
-                // descriptor identity (separate type IDs per kind).
+                // type-id word.  `#tid = struct_type_id(T, false)` folds the
+                // raw-ness into the id (`descr.py:105` keys by lltype STRUCT),
+                // so it cannot alias a GC `new_struct(T)` descr even if some
+                // `T` were used both ways — the raw and GC layouts get
+                // distinct `LLType::Struct(type_id)` cache slots.
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,
@@ -752,21 +745,23 @@ impl<'c> Lowerer<'c> {
         })
     }
 
-    /// Recognizes a pool-array element read through a marker call
-    /// `<fn>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on the
-    /// raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points at —
-    /// the aheui `pools[selected]` read.  Unlike the residual-call form (an
+    /// Recognizes a pool-array element read through the registered getter call
+    /// `<getter>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on
+    /// the raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points
+    /// at — the aheui `pools[selected]` read.  Unlike the residual-call form (an
     /// opaque CALL_R the optimizer can neither re-produce in the short preamble
     /// nor invalidate), the getarrayitem on the immutable `pools` array
     /// re-derives the element each loop entry from the consistent `selected`
     /// index, so the loaded ref can no longer be carried as an independent
     /// loop-red that diverges from the promoted index.
     ///
-    /// `state.<base>` must be declared in `pool_arrays`; pointer elements are 8
-    /// bytes at array offset 0 (`add_ptr_array_descr`).  The call's function
-    /// name is irrelevant — what selects the lowering is that arg0 is a
-    /// declared pool-base ref-scalar (the marker function's body remains the
-    /// concrete-path fallback when no `pool_arrays` is configured).
+    /// Selection is keyed on OPERATION IDENTITY: the call's function path must
+    /// match the `getter` registered for this `base` in `pool_arrays`, and arg0
+    /// must be `state.<base>`.  An unrelated helper that happens to share the
+    /// `(state.<base>, int)` arg shape does NOT match, so it is not miscompiled
+    /// into a pool read — it falls through to its own residual body (which is
+    /// also the getter's concrete fallback when no `pool_arrays` is configured).
+    /// Pointer elements are 8 bytes at array offset 0 (`add_ptr_array_descr`).
     pub(super) fn lower_pool_array_get_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
         let config = self.config?;
         if call.args.len() != 2 {
@@ -780,7 +775,17 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let base_name = named_member(&base_field.member)?;
-        if !config.pool_arrays.iter().any(|n| n == &base_name) {
+        // Operation identity: the call's function must be the registered getter
+        // for this base, not merely any call sharing the `(state.<base>, int)`
+        // arg shape.  A function mismatch falls through to the residual CALL_R
+        // fallback (the marker function's own body) rather than miscompiling an
+        // unrelated helper into a `getarrayitem_gc_r`.
+        let func_segments = canonical_expr_segments(&call.func)?;
+        if !config
+            .pool_arrays
+            .iter()
+            .any(|(base, getter)| base == &base_name && getter == &func_segments)
+        {
             return None;
         }
         // Lower the `state.<base>` ref-scalar (declares its ref identity slot
@@ -843,7 +848,9 @@ impl<'c> Lowerer<'c> {
         let base_name = named_member(&base_field.member)?;
         let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
         let member = field.member.clone();
-        let tid = struct_type_id(&struct_path);
+        // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, the
+        // same id the matching getfield uses so this setfield invalidates it.
+        let tid = struct_type_id(&struct_path, false);
         let base = self.lower_state_field_read(&field.base)?;
         if !matches!(base.kind, BindingKind::Ref) {
             return None;

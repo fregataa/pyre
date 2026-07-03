@@ -4,12 +4,13 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, consume_observed_float_call, consume_observed_getfield,
-    consume_observed_int_call, consume_observed_ref_call, consume_observed_void_call,
-    observer_arg_to_i64, observer_i64_to_value, struct_field_write_effect_info, trace_jitcode,
-    trace_jitcode_observer, trace_jitcode_observer_with_args,
-    trace_jitcode_observer_with_args_and_runtime, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    StandaloneFrameStack, authoritative_executor_enabled, cancel_observer_replay,
+    consume_observed_float_call, consume_observed_getfield, consume_observed_int_call,
+    consume_observed_ref_call, consume_observed_void_call, in_observer_mode, in_observer_replay,
+    observer_arg_to_i64, observer_i64_to_value, single_pass_enabled,
+    struct_field_write_effect_info, trace_jitcode, trace_jitcode_observer,
+    trace_jitcode_observer_with_args, trace_jitcode_observer_with_args_and_runtime,
+    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{call_int_function, call_ref_function, call_void_function};
@@ -775,6 +776,16 @@ fn normalize_root_loop_entry_contract(
         return Err((0, jump_arg_count));
     }
     if jump_targets_current_loop && label_arg_count != jump_arg_count {
+        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+            eprintln!(
+                "@@@CONTRACT label({label_arg_count})={:?}",
+                label_op.map(|op| op.getarglist_operand())
+            );
+            eprintln!(
+                "@@@CONTRACT jump({jump_arg_count})={:?}",
+                last_jump.map(|op| op.getarglist_operand())
+            );
+        }
         // RPython compile.py:334: assert jump.numargs() == label.numargs().
         return Err((label_arg_count, jump_arg_count));
     }
@@ -1048,7 +1059,34 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
     pub(crate) compiled_loops: majit_ir::VecMap<u64, CompiledEntry<M>>,
+    /// Loop-header bytecode pc per compiled-loop green key. A bridge trace
+    /// (`is_bridge_trace`) closes by jumping to its parent loop, which lives
+    /// at this header pc — not at the bridge's own `resume_pc`. Recorded when
+    /// a loop compiles; queried at `start_bridge_tracing`.
+    pub(crate) loop_header_pcs: majit_ir::VecMap<u64, usize>,
     pub(crate) tracing: Option<TraceCtx>,
+    /// Single-pass tracing (`PYRE_SINGLE_PASS`): the `(walk_final_pc,
+    /// walk_final_reds)` snapshot copied off the active `TraceCtx` at the
+    /// CloseLoop point BEFORE `compile_loop` drains the ctx, so the
+    /// merge-point hook can read it after the trace closes. `take`n by the
+    /// `__merge` wrapper. `None` outside single-pass.
+    pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
+    /// Single-pass tracing: the green key the CloseLoop arm compiled the
+    /// (cross-loop-cut) inner loop under, captured after a `Compiled`
+    /// outcome so the merge-point hook can DIRECTLY enter that freshly
+    /// compiled loop with the walk-final state (S_{k+1}) instead of
+    /// re-interpreting the walked body — the compiled steady-state runs
+    /// iteration N+1 onward (the walk's draw was the peeled preamble).
+    /// `None` outside single-pass or when compilation did not succeed.
+    pub(crate) single_pass_compiled_key: Option<u64>,
+    /// D2 per-opcode single-executor (`PYRE_AUTHORITATIVE`): the boundary pc
+    /// carried by a `TraceAction::OpcodeComplete` — the interpreter pc the
+    /// authoritative walker advanced to after executing exactly one opcode.
+    /// Set by `jitdriver::merge_point`'s OpcodeComplete arm, `take`n by the
+    /// `__merge` wrapper's caller so the native loop assigns it to `pc` and
+    /// skips its own dispatch of the walked opcode. `None` outside
+    /// authoritative mode.
+    pub(crate) authoritative_next_pc: Option<usize>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
@@ -2229,7 +2267,11 @@ impl<M: Clone> MetaInterp<M> {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
             compiled_loops: majit_ir::VecMap::new(),
+            loop_header_pcs: majit_ir::VecMap::new(),
             tracing: None,
+            single_pass_outcome: None,
+            single_pass_compiled_key: None,
+            authoritative_next_pc: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
             pending_token: None,
@@ -5027,6 +5069,9 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             self.warm_state.abort_tracing(green_key, true);
+            if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                eprintln!("@@@CANCEL-SITE line={}", line!());
+            }
             return CompileOutcome::Cancelled;
         }
 
@@ -5255,6 +5300,9 @@ impl<M: Clone> MetaInterp<M> {
                     // abort_tracing — TRACING flag must stay active.
                     if !self.cancelled_too_many_times() {
                         self.exported_state = None;
+                        if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                            eprintln!("@@@CANCEL-SITE line={}", line!());
+                        }
                         return CompileOutcome::Cancelled;
                     }
                     {
@@ -5430,6 +5478,9 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.cancel_count += 1;
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                        eprintln!("@@@CANCEL-SITE line={}", line!());
+                    }
                     return CompileOutcome::Cancelled;
                 }
             }
@@ -5470,6 +5521,9 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.cancel_count += 1;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
                 return CompileOutcome::Cancelled;
             }
         };
@@ -5717,6 +5771,9 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
                 return CompileOutcome::Cancelled;
             }
         };
@@ -5820,6 +5877,9 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compiled_loops.insert green_key={green_key}"),
                     );
                 }
+                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                    eprintln!("@@@SPDIAG compiled_loops.insert green_key={green_key}");
+                }
                 token.set_retraced_count(final_retraced_count);
                 self.compiled_loops.insert(
                     green_key,
@@ -5880,6 +5940,9 @@ impl<M: Clone> MetaInterp<M> {
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
                 return CompileOutcome::Cancelled;
             }
         }
@@ -6061,6 +6124,9 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, bridge_origin
                     );
                 }
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
                 return CompileOutcome::Cancelled;
             };
             ctx.recorder
@@ -6168,6 +6234,9 @@ impl<M: Clone> MetaInterp<M> {
                 // (populated by `start_retrace_from_guard`).  No
                 // `(trace_id, fail_index)` reverse lookup.
                 if !self.compiled_loops.contains_key(&origin_key) {
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                        eprintln!("@@@CANCEL-SITE line={}", line!());
+                    }
                     return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
@@ -6205,6 +6274,9 @@ impl<M: Clone> MetaInterp<M> {
                 // compile a fresh entry bridge and attach it to the
                 // original interpreter green key.
                 let Some((original_green_key, entry_meta)) = entry_bridge else {
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                        eprintln!("@@@CANCEL-SITE line={}", line!());
+                    }
                     return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
@@ -6709,6 +6781,11 @@ impl<M: Clone> MetaInterp<M> {
                     crate::debug::log_one(
                         "jit-summary",
                         &format!("compiled_loops.insert green_key={green_key}"),
+                    );
+                }
+                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                    eprintln!(
+                        "@@@SPDIAG FINISH-compile compiled_loops.insert green_key={green_key}"
                     );
                 }
                 token.set_retraced_count(unroll_opt.retraced_count);
@@ -7607,6 +7684,18 @@ impl<M: Clone> MetaInterp<M> {
     /// the run_compiled_* family.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
+    }
+
+    /// Record the loop-header bytecode pc for a compiled-loop green key, so a
+    /// later bridge whose guard belongs to this loop knows where its parent
+    /// loop header lives (the close target of the bridge JUMP).
+    pub fn record_loop_header_pc(&mut self, green_key: u64, header_pc: usize) {
+        self.loop_header_pcs.insert(green_key, header_pc);
+    }
+
+    /// Loop-header bytecode pc recorded for a compiled-loop green key.
+    pub fn loop_header_pc_for(&self, green_key: u64) -> Option<usize> {
+        self.loop_header_pcs.get(&green_key).copied()
     }
 
     /// Actual key the last compile_loop stored under. Returns inner key
@@ -14246,6 +14335,7 @@ pub struct DispatchArrayDescrKey {
     pub is_array_of_pointers: bool,
     pub is_array_of_structs: bool,
     pub is_item_signed: bool,
+    pub is_gc_managed: bool,
     pub array_type_id: Option<String>,
     pub interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
 }

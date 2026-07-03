@@ -94,6 +94,7 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
         ei_index: u32::MAX,
         array_type_id: None,
         interior_fields: Vec::new(),
+        is_gc_managed: a.is_gc_managed(),
     })
 }
 
@@ -287,6 +288,12 @@ pub struct TraceCtx {
     /// skip when no compiled targets exist for the current
     /// greenkey) gate on this flag instead of fn presence.
     pub is_bridge_trace: bool,
+    /// For a bridge trace (`is_bridge_trace`), the loop-header bytecode pc of
+    /// the parent loop the bridge will JUMP into. The bridge closes when it
+    /// reaches this pc (a real compiled-loop header), NOT when it transiently
+    /// revisits its own `resume_pc` (`header_pc`). `None` for primary traces
+    /// and for bridges whose parent loop header pc is unknown.
+    pub bridge_target_header_pc: Option<usize>,
     /// pyjitpl.py:1551 `if self.metainterp.portal_call_depth: return` parity
     /// — live read of `MetaInterp.portal_call_depth` at the
     /// `BC_JIT_MERGE_POINT` first-iteration auto loop-header gate.  When
@@ -330,6 +337,20 @@ pub struct TraceCtx {
     /// Used by cut_trace_from to remap escaped original inputargs to their
     /// stable Const value.
     pub initial_inputarg_consts: Vec<BoxRef>,
+    /// Single-pass tracing (`PYRE_SINGLE_PASS`): the resume-aligned bytecode
+    /// pc the walk closed back to, captured at the CloseLoop decision point
+    /// in the JitCode dispatch. `None` for every trace unless single-pass
+    /// populated it. Surfaced through `MetaInterp::single_pass_outcome` (set
+    /// before `compile_loop` drains the ctx) to the gated merge-point hook.
+    pub walk_final_pc: Option<usize>,
+    /// Single-pass tracing: the walk-final concrete RED values captured from
+    /// the closing merge point's red operands (their live `int_values` /
+    /// `ref_values` / `float_values` shadow), in operand order (slot 3 ints,
+    /// slot 4 refs, slot 5 floats). The merge-point hook feeds these to
+    /// `restore_values` to complete the `S_{k+1}` transfer that storage-only
+    /// `recover` cannot reconstruct (loop-carried state held in a red bank but
+    /// never written back to the shared heap). Empty unless single-pass.
+    pub walk_final_reds: Vec<majit_ir::Value>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
@@ -1144,10 +1165,13 @@ impl TraceCtx {
             force_finish: false,
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
+            walk_final_pc: None,
+            walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
+            bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
@@ -1214,10 +1238,13 @@ impl TraceCtx {
             force_finish: false,
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
+            walk_final_pc: None,
+            walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
+            bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,

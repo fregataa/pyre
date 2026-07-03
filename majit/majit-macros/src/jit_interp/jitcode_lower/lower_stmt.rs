@@ -6,15 +6,25 @@ impl<'c> Lowerer<'c> {
     /// `struct_field_write_effect_info(...)` expression naming the written
     /// field, so the residual call records a write-set `EffectInfo` that
     /// invalidates the cached `getfield_gc_i` on that field.  `None` for a
-    /// plain residual call (empty write-set).
-    fn residual_write_effect_info_tokens(&self, func: &Expr) -> Option<TokenStream> {
+    /// plain residual call (empty write-set).  `can_raise` carries the
+    /// call policy's extra-effect into the write-set `EffectInfo` so a
+    /// `ResidualVoidCannotRaise` mutator keeps `CannotRaise` instead of
+    /// silently widening to `CanRaise`.
+    pub(super) fn residual_write_effect_info_tokens(
+        &self,
+        func: &Expr,
+        can_raise: bool,
+    ) -> Option<TokenStream> {
         let config = self.config?;
         let func_segments = canonical_expr_segments(func)?;
         let (_, struct_path, field) = config
             .residual_writes
             .iter()
             .find(|(segments, _, _)| *segments == func_segments)?;
-        let tid = struct_type_id(struct_path);
+        // Raw host-owned struct (the ref-scalar's pointee, no GC header) →
+        // `is_gc_managed = false`, the same id the getfield/setfield lowering
+        // uses so this write-EI rebuilds the SAME parent SizeDescr identity.
+        let tid = struct_type_id(struct_path, false);
         Some(quote! {
             // The residual mutates a host-owned native struct field (no
             // GC header) → `is_gc_managed = false`, matching the
@@ -30,6 +40,7 @@ impl<'c> Lowerer<'c> {
                     stringify!(#field),
                 )],
                 stringify!(#field),
+                #can_raise,
             )
         })
     }
@@ -986,11 +997,12 @@ impl<'c> Lowerer<'c> {
                         kind,
                         crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaise,
                     );
-                    let write_ei = self.residual_write_effect_info_tokens(func);
+                    let write_ei = self.residual_write_effect_info_tokens(func, !cannot_raise);
                     let call_stmt = if let Some(write_ei) = write_ei {
-                        // Declared field mutator: residual + can-raise, but with
-                        // a write-set naming the mutated field so the optimizer
-                        // invalidates its cached `getfield_gc_i`.
+                        // Declared field mutator: residual with a write-set
+                        // naming the mutated field so the optimizer invalidates
+                        // its cached `getfield_gc_i`, preserving the policy's
+                        // can-raise / cannot-raise extra-effect.
                         quote! {
                             __builder.residual_call_void_canonical_via_target_with_effect_info(
                                 __fn_idx,
@@ -1153,7 +1165,7 @@ impl<'c> Lowerer<'c> {
                     // release-gil / loop-invariant carry their own effects).
                     let write_ei = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualInt => {
-                            self.residual_write_effect_info_tokens(func)
+                            self.residual_write_effect_info_tokens(func, true)
                         }
                         _ => None,
                     };

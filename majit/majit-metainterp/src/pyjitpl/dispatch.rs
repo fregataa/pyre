@@ -192,6 +192,18 @@ pub fn drain_observed_calls() {
     OBSERVED_CALLS.with(|q| q.borrow_mut().clear());
 }
 
+/// Single-pass tracing: cancel the observer-replay handover that
+/// `ObserverGuard::drop` set after the walk. The single-pass merge-point hook
+/// transfers the walk-final state directly and `continue`s the native loop,
+/// so the body that `drop` expected to REPLAY the queue never runs as a
+/// replay — clear the queue and the `OBSERVER_REPLAY` flag so the post-transfer
+/// native body executes in real mode (the walk did NOT execute that iteration's
+/// body) instead of replaying stale recorded calls against the transferred state.
+pub fn cancel_observer_replay() {
+    OBSERVED_CALLS.with(|q| q.borrow_mut().clear());
+    OBSERVER_REPLAY.with(|m| m.set(false));
+}
+
 pub fn record_observed_void_call(func: *const (), args: &[i64]) {
     if observer_debug() {
         eprintln!("[observer] record void func={func:?} args={args:?}");
@@ -439,6 +451,41 @@ fn observer_debug() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_OBSERVER_DEBUG").is_some())
 }
 
+/// Single-pass tracing: when set, the walk is the SOLE executor — its final
+/// reds are transferred into native state at the merge-point hook instead of
+/// being replayed. Default-off: the observer/replay two-executor path is
+/// unchanged. Read once.
+pub fn single_pass_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_SINGLE_PASS").is_some())
+}
+
+/// pyjitpl.py:3018-3060 reached_loop_header parity for a NESTED inner loop:
+/// when the JitCode dispatch walk re-reaches a non-header merge point whose
+/// green key it already visited, close the loop there (cross-loop cut) instead
+/// of spinning to the trace limit. Gated for incremental bring-up; single-pass
+/// (`single_pass_enabled`) implies it so the close + reds transfer move
+/// together.
+pub fn inner_close_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| single_pass_enabled() || std::env::var_os("PYRE_INNER_CLOSE").is_some())
+}
+
+/// Walker-as-tracer (`PYRE_AUTHORITATIVE`): when set, the `run_to_end` walk is
+/// the SOLE authoritative executor for a trace — residual calls execute exactly
+/// once during the walk and the outer mainloop must neither replay them nor
+/// re-run the walked span. Parity target: `pyre-jit-trace`
+/// `WalkContext::is_authoritative_executor` + `production_walker_handles`
+/// (the eval loop skips `execute_opcode_step` for walker-handled opcodes).
+/// Default-off preserves the observer/replay two-executor path unchanged. This
+/// is the incremental bring-up gate for the seam rewrite; on its own it only
+/// suppresses replay handover (`ObserverGuard::drop`), so the native-side
+/// walked-span skip must land before it is correct end-to-end.
+pub fn authoritative_executor_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_AUTHORITATIVE").is_some())
+}
+
 impl ObserverGuard {
     fn enter() -> Self {
         let previous = OBSERVER_MODE.with(|m| m.replace(true));
@@ -465,6 +512,22 @@ impl Drop for ObserverGuard {
         // circuit, on Abort it covers the executed prefix; either way the
         // outer body consumes the queue in order and falls back to real
         // execution once it empties.
+        // Hand the executed-call queue over to the outer interpreter: the
+        // mainloop body that runs right after the walk re-runs the walked
+        // span and must REPLAY these calls (consume_observed_*_call)
+        // rather than execute them a second time. This holds for every
+        // walk outcome — on CloseLoop the queue covers one full loop
+        // circuit, on Abort it covers the executed prefix; either way the
+        // outer body consumes the queue in order and falls back to real
+        // execution once it empties.
+        //
+        // NOTE (walker-as-tracer): re-using this replay as an authoritative
+        // "walked-span skip" (keep the queue under PYRE_AUTHORITATIVE instead
+        // of cancelling it in the single-pass arm) was tried and REFUTED — the
+        // replay diverges (observed_call_mismatch, `observed_call_mismatch`
+        // above), which is exactly why single-pass cancels it. The handover is
+        // therefore unconditional; the authoritative fix must make native NOT
+        // re-execute the walked span at all (per-opcode single-executor).
         let handover = OBSERVED_CALLS.with(|q| !q.borrow().is_empty());
         OBSERVER_REPLAY.with(|m| m.set(handover));
         if observer_debug() {
@@ -673,6 +736,7 @@ pub fn struct_field_write_effect_info(
     is_gc_managed: bool,
     fields: &[(usize, bool, &str)],
     write_field: &str,
+    can_raise: bool,
 ) -> majit_ir::EffectInfo {
     // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
     // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
@@ -729,10 +793,12 @@ pub fn struct_field_write_effect_info(
                 "struct_field_write_effect_info: field `{write_field}` not registered for type {type_id}"
             )
         });
-    let mut ei = majit_ir::EffectInfo::const_new(
-        majit_ir::ExtraEffect::CanRaise,
-        majit_ir::OopSpecIndex::None,
-    );
+    let extra_effect = if can_raise {
+        majit_ir::ExtraEffect::CanRaise
+    } else {
+        majit_ir::ExtraEffect::CannotRaise
+    };
+    let mut ei = majit_ir::EffectInfo::const_new(extra_effect, majit_ir::OopSpecIndex::None);
     ei._write_descrs_fields = Some(vec![fd as majit_ir::DescrRef]);
     ei
 }
@@ -1236,6 +1302,15 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
+    /// D2 per-opcode single-executor: within one `run_to_end` call under
+    /// `authoritative_executor_enabled()`, the machine enters at the current
+    /// opcode's merge point (the ENTRY MP) and must stop at the NEXT
+    /// non-closing merge point (the BOUNDARY MP) after executing exactly one
+    /// opcode. This flag distinguishes them: `false` until the entry MP is
+    /// passed, then `true`; the boundary MP returns
+    /// `TraceAction::OpcodeComplete`. Reset at the top of every `run_to_end`.
+    /// Inert unless authoritative.
+    authoritative_seen_entry_mp: bool,
     marker: PhantomData<(S, R)>,
 }
 
@@ -1612,6 +1687,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            is_gc_managed,
             ei_index,
             array_type_id,
             interior_fields,
@@ -1625,6 +1701,7 @@ where
                 is_array_of_pointers,
                 is_array_of_structs,
                 is_item_signed,
+                is_gc_managed,
                 interior_fields,
                 ei_index,
                 array_type_id,
@@ -1637,6 +1714,7 @@ where
                 *is_array_of_pointers,
                 *is_array_of_structs,
                 *is_item_signed,
+                *is_gc_managed,
                 *ei_index,
                 array_type_id.clone(),
                 interior_fields.clone(),
@@ -1667,6 +1745,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            is_gc_managed,
             array_type_id,
             interior_fields,
         };
@@ -1750,6 +1829,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            is_gc_managed,
             lendescr,
             false, // is_pure — bytecode array is mutable from the JIT's POV
             ei_index,
@@ -1813,6 +1893,7 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
+            authoritative_seen_entry_mp: false,
             marker: PhantomData,
         }
     }
@@ -2218,6 +2299,10 @@ where
             .outer_program_pc
             .unwrap_or_else(|| self.frames.current_mut().pc);
         sym.begin_portal_op(portal_pc);
+        // D2 per-opcode single-executor: each `run_to_end` call walks exactly
+        // one opcode under authoritative mode, so the entry-vs-boundary
+        // merge-point flag starts fresh every call.
+        self.authoritative_seen_entry_mp = false;
         // Safety backstop against a runaway trace-recording loop.  A
         // jitcode-level cycle that re-steps without growing the recorded op
         // list never trips `is_too_long` (which counts ops), so the
@@ -2288,8 +2373,21 @@ where
                 }
             };
             if !matches!(action, TraceAction::Continue) {
+                if std::env::var_os("MAJIT_TLDBG").is_some() {
+                    eprintln!(
+                        "@@@TLDBG run_to_end end action={:?} step_count={} num_recorded_ops={} trace_limit={}",
+                        action,
+                        step_count,
+                        ctx.num_recorded_ops(),
+                        ctx.trace_limit()
+                    );
+                }
                 match action {
-                    TraceAction::CloseLoop => sym.commit_portal_op(),
+                    // OpcodeComplete = a successful one-opcode boundary (D2), not
+                    // an abort: commit the portal op like a normal close.
+                    TraceAction::CloseLoop | TraceAction::OpcodeComplete { .. } => {
+                        sym.commit_portal_op()
+                    }
                     _ => sym.abort_portal_op(),
                 }
                 return action;
@@ -2992,6 +3090,17 @@ where
                 } else {
                     0
                 };
+                if !is_ref && ctx.is_bridge_trace && std::env::var_os("MAJIT_HEAPDBG").is_some() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 240 {
+                        eprintln!(
+                            "@@@HEAP getfield_i n={} struct_ptr={:#x} off={} loaded={}",
+                            n, struct_ptr, offset, loaded
+                        );
+                    }
+                }
                 // A non-pure (mutable) field is advanced by the residual storage
                 // ops of this full-circuit observer walk, so a raw re-read on the
                 // outer replay would see the already-advanced value. Record the
@@ -4047,6 +4156,35 @@ where
                 // `BC_JIT_MERGE_POINT`).  A non-constant green here
                 // indicates a macro emission gap.  RPython
                 // `assert` ↔ Rust `debug_assert!` parity.
+                // pyjitpl.py:3018-3060 reached_loop_header / same_greenkey: the
+                // merge point's pc green identifies the loop header.  Capture it
+                // (the first int green — greens are declared pc-first) so the
+                // close gate can decline a merge point whose pc differs from the
+                // trace-start `header_pc`.  The promoted greens are constants at
+                // trace time (verify_green_args, asserted below).
+                let mut mp_green_pc: Option<i64> = None;
+                // MAJIT_PCSEQ diagnostic: all int-green constants at this merge
+                // point (pc plus any scalar greens like aheui's stackok/is_queue).
+                let mut mp_green_ints: Vec<i64> = Vec::new();
+                // Single-pass tracing: the walk closes back to an interpreter
+                // program pc; capture it (below, gated) so the merge-point hook
+                // can resume the native loop there. Gated so the
+                // observer/replay path pays nothing.
+                let capture_walk_reds = single_pass_enabled();
+                let inner_close = inner_close_enabled();
+                // pyjitpl.py:3060 reached_loop_header `current_merge_points.append`:
+                // the live arg boxes (greens slots 0..3 + reds slots 3..6, in
+                // operand order) at this merge point. A NESTED inner-loop revisit
+                // records these as the inner loop's inputargs so the cross-loop
+                // cut can peel the outer prefix as preamble. Built during the
+                // tracing walk only — off the compiled hot path.
+                let mut live_arg_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
+                // Single-pass: accumulate the walk-final concrete RED values from
+                // the live value-bank shadow (slots 3-5 = reds I/R/F in operand
+                // order) so the merge-point hook can `restore_values` them into
+                // native state — completing the transfer that storage-only
+                // `recover` cannot (loop-carried reds never written to the heap).
+                let mut walk_reds: Vec<Value> = Vec::new();
                 for slot in 0..6 {
                     let count = frame.next_u8() as usize;
                     let max = max_regs[slot];
@@ -4054,6 +4192,66 @@ where
                     for _ in 0..count {
                         let reg = frame.next_u8();
                         let reg_idx = reg as usize;
+                        if capture_walk_reds && slot >= 3 {
+                            match slot {
+                                3 => {
+                                    if let Some(v) =
+                                        frame.int_values.get(reg_idx).copied().flatten()
+                                    {
+                                        walk_reds.push(Value::Int(v));
+                                    }
+                                }
+                                4 => {
+                                    if let Some(r) =
+                                        frame.ref_values.get(reg_idx).copied().flatten()
+                                    {
+                                        walk_reds.push(Value::Ref(majit_ir::GcRef(r as usize)));
+                                    }
+                                }
+                                _ => {
+                                    if let Some(b) =
+                                        frame.float_values.get(reg_idx).copied().flatten()
+                                    {
+                                        walk_reds.push(Value::Float(f64::from_bits(b as u64)));
+                                    }
+                                }
+                            }
+                        }
+                        if inner_close {
+                            // The merge point's live arg boxes (only the green
+                            // slots are populated for the state-field dispatch
+                            // model; reds are state fields restored separately).
+                            // These become the inner loop's `original_boxes` —
+                            // the promoted-green constants — for the cross-loop
+                            // cut remap (compile.py:269 cut_trace_from_with_consts).
+                            let (opref_opt, ty) = match slot {
+                                0 | 3 => (
+                                    frame.int_regs.get(reg_idx).copied().flatten(),
+                                    majit_ir::Type::Int,
+                                ),
+                                1 | 4 => (
+                                    frame.ref_regs.get(reg_idx).copied().flatten(),
+                                    majit_ir::Type::Ref,
+                                ),
+                                _ => (
+                                    frame.float_regs.get(reg_idx).copied().flatten(),
+                                    majit_ir::Type::Float,
+                                ),
+                            };
+                            if let Some(opref) = opref_opt {
+                                live_arg_boxes.push(crate::trace_ctx::GreenBox::new(opref, ty));
+                            }
+                        }
+                        if slot == 0 {
+                            if let Some(majit_ir::OpRef::ConstInt(v)) =
+                                frame.int_regs.get(reg_idx).copied().flatten()
+                            {
+                                if mp_green_pc.is_none() {
+                                    mp_green_pc = Some(v);
+                                }
+                                mp_green_ints.push(v);
+                            }
+                        }
                         debug_assert!(
                             reg_idx < max,
                             "BC_JIT_MERGE_POINT: register byte {reg} \
@@ -4105,6 +4303,19 @@ where
                 // continues to its next opcode.  Gated to the FR experiment.
                 if portal_inline_experiment_enabled() && ctx.inline_depth() > 0 {
                     return TraceAction::Continue;
+                }
+                // MAJIT_PCSEQ (W4/D2 diagnostic): log the interpreter green pc
+                // captured at EVERY merge-point re-entry (not gated on
+                // seen_loop_header like MAJIT_MPTRACE). Confirms the walk holds a
+                // concrete per-opcode next-pc = mp_green_pc, the walker-drives-pc
+                // data source for the per-opcode single-executor.
+                if std::env::var_os("MAJIT_PCSEQ").is_some() {
+                    let sf: Vec<Option<i64>> = (0..3).map(|i| sym.state_field_value(i)).collect();
+                    eprintln!(
+                        "@@@PCSEQ mp pc={mp_green_pc:?} greens={mp_green_ints:?} sf={sf:?} num_ops={} seen_lh={}",
+                        ctx.num_ops(),
+                        self.seen_loop_header_for_jdindex,
+                    );
                 }
                 // pyjitpl.py:1547-1556 opimpl_jit_merge_point auto
                 // loop-header.  When `seen_loop_header_for_jdindex < 0`
@@ -4176,26 +4387,214 @@ where
                         self.seen_loop_header_for_jdindex,
                     );
                     self.seen_loop_header_for_jdindex = -1;
-                    // pyjitpl.py:2967-2969 reached_loop_header: emit a dummy
-                    // GUARD_FUTURE_CONDITION just before the implicit JUMP so
-                    // unroll's `jump_to_existing_trace` has a `patchguardop`
-                    // whose `rd_resume_position` it copies onto every extra
-                    // virtual-state guard (unroll.py:333-337, resume.py:397).
-                    // The source-level tracer emits this in `close_loop_args_at`
-                    // (trace_opcode.rs:3397); the state-field dispatch model
-                    // closes here instead, so the GFC must be recorded here.
-                    // `record_state_guard` captures the matching resume
-                    // snapshot at `mp_opcode_pc`, mirroring `generate_guard`'s
-                    // `capture_resumedata` (pyjitpl.py:2591-2602).
-                    self.record_state_guard(
-                        ctx,
-                        sym,
-                        OpCode::GuardFutureCondition,
-                        &[],
-                        mp_opcode_pc,
-                        false,
-                    );
-                    return TraceAction::CloseLoop;
+                    // pyjitpl.py:2974-3060 reached_loop_header: close the loop
+                    // ONLY when the current merge point's green key matches the
+                    // trace-start (loop-header) key — `same_greenkey`
+                    // (pyjitpl.py:3018-3022 / 3912-3920).  The seen_loop_header
+                    // flag alone is necessary but not sufficient: the auto-stamp
+                    // (above) keys on the FIXED trace-start `ctx.green_key`, so it
+                    // fires at whatever merge point the trace reaches once the
+                    // start key has compiled targets — not necessarily the loop
+                    // header.  The pc green is the loop-header discriminator; a
+                    // merge point whose pc differs from `header_pc` is a
+                    // different green key, which RPython appends to
+                    // current_merge_points and keeps tracing past.  Closing there
+                    // emits a JUMP from a non-header pc back to the header
+                    // inputargs, manufacturing a degenerate loop whose now-
+                    // redundant exit guards const-fold away (infinite loop).  A
+                    // jitdriver with no int pc green keeps the flag-only close.
+                    // pyjitpl.py:2978 reached_loop_header: a bridge has no own
+                    // loop header to loop back to — it closes by JUMPing into
+                    // its parent loop (`has_compiled_targets(greenboxes)`), which
+                    // lives at `bridge_target_header_pc`. Closing on a transient
+                    // revisit of the bridge's own `resume_pc` (`header_pc`) bakes
+                    // a degenerate empty bridge that jumps back with no forward
+                    // progress. A primary trace still self-closes at `header_pc`.
+                    let close_target_pc = if ctx.is_bridge_trace {
+                        ctx.bridge_target_header_pc.unwrap_or(ctx.header_pc)
+                    } else {
+                        ctx.header_pc
+                    };
+                    let header_matches =
+                        mp_green_pc.map_or(true, |pc| pc == close_target_pc as i64);
+                    if std::env::var_os("MAJIT_MPTRACE").is_some() {
+                        eprintln!(
+                            "@@@MPTRACE visit pc={mp_green_pc:?} header_pc={} close_target={close_target_pc} matches={header_matches} num_ops={}",
+                            ctx.header_pc,
+                            ctx.num_ops(),
+                        );
+                    }
+                    if header_matches {
+                        if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                            eprintln!(
+                                "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
+                            );
+                        }
+                        if capture_walk_reds {
+                            // Single-pass: stash the resume-aligned close pc (the
+                            // interpreter green pc, NOT the JitCode op cursor) so
+                            // the merge-point hook can resume the native loop
+                            // there in lieu of the observer replay. The loop-carried
+                            // red values are transferred into native state by the
+                            // hook (`restore_values`); storage caches re-derive via
+                            // `recover`.
+                            ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
+                            ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                        }
+                        // pyjitpl.py:2967-2969 reached_loop_header: emit a dummy
+                        // GUARD_FUTURE_CONDITION just before the implicit JUMP so
+                        // unroll's `jump_to_existing_trace` has a `patchguardop`
+                        // whose `rd_resume_position` it copies onto every extra
+                        // virtual-state guard (unroll.py:333-337, resume.py:397).
+                        // The source-level tracer emits this in
+                        // `close_loop_args_at` (trace_opcode.rs:3397); the
+                        // state-field dispatch model closes here instead, so the
+                        // GFC must be recorded here.  `record_state_guard`
+                        // captures the matching resume snapshot at
+                        // `mp_opcode_pc`, mirroring `generate_guard`'s
+                        // `capture_resumedata` (pyjitpl.py:2591-2602).
+                        self.record_state_guard(
+                            ctx,
+                            sym,
+                            OpCode::GuardFutureCondition,
+                            &[],
+                            mp_opcode_pc,
+                            false,
+                        );
+                        return TraceAction::CloseLoop;
+                    }
+                    // No same_greenkey match — fall through and keep tracing
+                    // (the merge point op is otherwise a no-op while recording).
+                    //
+                    // pyjitpl.py:3018-3060 reached_loop_header: a merge point
+                    // whose pc differs from the trace-start header is a different
+                    // green key. RPython scans current_merge_points for a prior
+                    // same_greenkey visit; if found it closes the loop THERE
+                    // (cutting the outer prefix as preamble); otherwise it appends
+                    // and keeps tracing. The MAJIT dispatch model never wired this
+                    // append/scan, so a trace that enters at an outer header and
+                    // spins in a NESTED inner loop never closes. Record the inner
+                    // merge point keyed on (green_key_from_code_ptr(code, pc),
+                    // ctx.header_pc) — header_pc stays the trace's so the
+                    // cross_loop_cut consumer (cross_loop_cut_info /
+                    // compile_loop_body) finds it via get_merge_point_at(inner_key,
+                    // ctx.header_pc).
+                    //
+                    // S0 census (env-gated MAJIT_INNERMP): append-and-observe with
+                    // NO close, to confirm the inner key is stable and detected on
+                    // revisit before enabling the cut close.
+                    if inner_close {
+                        if let Some(pc) = mp_green_pc {
+                            let header_pc = ctx.header_pc;
+                            let inner_key =
+                                crate::green_key_from_code_ptr(ctx.green_key_raw.0, pc as usize);
+                            if ctx.has_merge_point_at(inner_key, header_pc)
+                                && std::env::var_os("PYRE_NO_INNER_CLOSE").is_none()
+                            {
+                                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                                    eprintln!(
+                                        "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
+                                    );
+                                }
+                                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                                    let mut i = 0;
+                                    while let Some(o) = sym.state_field_ref(i) {
+                                        eprintln!("@@@RED int[{i}]={o:?}");
+                                        i += 1;
+                                    }
+                                    let mut j = 0;
+                                    while let Some(o) = sym.state_ref_field_ref(j) {
+                                        eprintln!("@@@RED ref[{j}]={o:?}");
+                                        j += 1;
+                                    }
+                                }
+                                // same_greenkey revisit of a nested inner loop →
+                                // close HERE and cut the outer prefix as preamble.
+                                // Setting cut_inner_green_key routes compile_loop
+                                // through cross_loop_cut (compile.py:269-270).
+                                ctx.cut_inner_green_key = Some(inner_key);
+                                if capture_walk_reds {
+                                    // Single-pass: resume at the inner loop's
+                                    // interpreter green pc (the loop variable the
+                                    // hook assigns to `pc`). The loop-carried red
+                                    // values captured above are transferred into
+                                    // native state by the merge-point hook
+                                    // (`restore_values`); storage caches are then
+                                    // re-derived by `recover`.
+                                    ctx.walk_final_pc = Some(pc as usize);
+                                    ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                                }
+                                self.record_state_guard(
+                                    ctx,
+                                    sym,
+                                    OpCode::GuardFutureCondition,
+                                    &[],
+                                    mp_opcode_pc,
+                                    false,
+                                );
+                                return TraceAction::CloseLoop;
+                            }
+                            // first visit → append and keep tracing
+                            // (pyjitpl.py:3058-3060). For the state-field dispatch
+                            // model the merge point's loop-carried values are the
+                            // RED state fields (the closing JUMP = collect_jump_args),
+                            // NOT the green operands captured in `live_arg_boxes`
+                            // (those are promoted constants folded inline in the cut
+                            // body). Use the red state-field oprefs in
+                            // collect_jump_args order (int scalars then ref scalars)
+                            // as the cut's `original_boxes` so the inner loop's LABEL
+                            // inputarg arity matches the JUMP (compile.py:334
+                            // jump.numargs()==label.numargs()). Falls back to the
+                            // operand-captured boxes for interpreters with no
+                            // int/ref state fields.
+                            let mut red_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
+                            let mut sfi = 0;
+                            while let Some(o) = sym.state_field_ref(sfi) {
+                                red_boxes
+                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Int));
+                                sfi += 1;
+                            }
+                            let mut sfr = 0;
+                            while let Some(o) = sym.state_ref_field_ref(sfr) {
+                                red_boxes
+                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Ref));
+                                sfr += 1;
+                            }
+                            let original_boxes = if red_boxes.is_empty() {
+                                live_arg_boxes
+                            } else {
+                                red_boxes
+                            };
+                            if std::env::var_os("MAJIT_MPTRACE").is_some() {
+                                eprintln!(
+                                    "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
+                                    ctx.num_ops(),
+                                );
+                            }
+                            ctx.add_merge_point(inner_key, original_boxes, header_pc);
+                        }
+                    }
+                }
+                // D2 per-opcode single-executor (PYRE_AUTHORITATIVE): reaching
+                // here means every loop-close check above declined (a closing
+                // merge point already returned CloseLoop). A non-closing merge
+                // point is an interpreter-opcode boundary. The FIRST such point
+                // in this run_to_end call is the ENTRY (the opcode about to
+                // execute) — mark it and keep tracing the body. The NEXT is the
+                // BOUNDARY reached after exactly one opcode — return its
+                // interpreter green pc so the native loop advances pc there and
+                // skips re-dispatching the walked opcode. Inert (falls through
+                // to Continue) unless authoritative.
+                if authoritative_executor_enabled() {
+                    if self.authoritative_seen_entry_mp {
+                        if let Some(pc) = mp_green_pc {
+                            return TraceAction::OpcodeComplete {
+                                next_pc: pc as usize,
+                            };
+                        }
+                    } else {
+                        self.authoritative_seen_entry_mp = true;
+                    }
                 }
             }
             jitcode::insns::BC_LOOP_HEADER => {

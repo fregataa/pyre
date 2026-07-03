@@ -117,13 +117,15 @@ pub struct JitInterpConfig {
     /// the call.  Empty for interpreters with no residual field mutators.
     pub residual_writes: Vec<ResidualWriteEntry>,
     /// `ref(T)` state scalars that are bases of a contiguous raw-pointer array
-    /// (`[*mut U; N]` at offset 0 of `T`), declared as `pool_arrays = [<ref>]`.
-    /// An indexing marker call `<fn>(state.<ref>, <int>)` on such a base lowers
-    /// to `getarrayitem_gc_r` (a re-producible heap read) instead of an opaque
-    /// residual CALL_R, so the loaded element re-derives from the index each
-    /// loop entry and the short preamble can re-emit it.  Empty for
-    /// interpreters with no pool-array indexing.
-    pub pool_arrays: Vec<Ident>,
+    /// (`[*mut U; N]` at offset 0 of `T`), declared as
+    /// `pool_arrays = { <ref> => <getter>, ... }`.  The indexing marker call
+    /// `<getter>(state.<ref>, <int>)` lowers to `getarrayitem_gc_r` (a
+    /// re-producible heap read) instead of an opaque residual CALL_R, so the
+    /// loaded element re-derives from the index each loop entry and the short
+    /// preamble can re-emit it.  Selection is keyed on the `getter` function
+    /// identity (not the arg shape alone).  Empty for interpreters with no
+    /// pool-array indexing.
+    pub pool_arrays: Vec<PoolArrayEntry>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -305,6 +307,19 @@ pub struct ResidualWriteEntry {
     pub helpers: Vec<Path>,
 }
 
+/// A `ref(T)` state scalar that is the base of a contiguous raw-pointer array,
+/// paired with the marker `getter` function whose call indexes it.  Declared as
+/// `pool_arrays = { <ref> => <getter>, ... }`.  The lowering recognizes a pool
+/// read only when BOTH the call's function path matches `getter` AND arg0 is
+/// `state.<base>` — operation identity, not arg shape alone, so an unrelated
+/// helper that happens to take the same `(state.<base>, int)` shape is not
+/// miscompiled into a `getarrayitem_gc_r`.
+#[derive(Clone)]
+pub struct PoolArrayEntry {
+    pub base: Ident,
+    pub getter: Path,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -464,7 +479,7 @@ impl Parse for JitInterpConfig {
         let mut recover: Option<Path> = None;
         let mut recursive_entry: Option<Path> = None;
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
-        let mut pool_arrays: Vec<Ident> = Vec::new();
+        let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -517,11 +532,7 @@ impl Parse for JitInterpConfig {
                     residual_writes = parse_residual_writes_map(input)?;
                 }
                 "pool_arrays" => {
-                    let content;
-                    bracketed!(content in input);
-                    let idents: Punctuated<Ident, Token![,]> =
-                        content.parse_terminated(Ident::parse, Token![,])?;
-                    pool_arrays = idents.into_iter().collect();
+                    pool_arrays = parse_pool_arrays_map(input)?;
                 }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
@@ -602,6 +613,22 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
             field,
             helpers: helpers.into_iter().collect(),
         });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+/// Parse `pool_arrays = { <ref> => <getter>, ... }`.  Each entry maps a `ref(T)`
+/// state scalar (the array base) to the marker function whose call indexes it.
+fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let base: Ident = content.parse()?;
+        content.parse::<Token![=>]>()?;
+        let getter: Path = content.parse()?;
+        entries.push(PoolArrayEntry { base, getter });
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)
@@ -1089,7 +1116,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __driver: &mut majit_metainterp::JitDriver<#state_type>,
             __env: &#env_type,
             __pc: usize,
-        ) {
+        ) -> ::core::option::Option<(usize, ::std::vec::Vec<majit_metainterp::Value>)> {
             // Clone the dispatch JitCode Arc before the mutable
             // `merge_point` borrow so the closure can forward it to
             // `#trace_fn_name` without holding a `JitDriver` reference.
@@ -1144,6 +1171,12 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 }
                 __result
             });
+            // Single-pass tracing: surface the walk-final (pc, reds) snapshot
+            // the CloseLoop arm stashed onto the MetaInterp before draining the
+            // ctx. `None` outside single-pass (the hot path) and whenever the
+            // walk did not populate reds — in which case the caller's hook is
+            // inert and the observer/replay path runs unchanged.
+            __driver.take_single_pass_outcome()
         }
     }
 }
@@ -1289,6 +1322,13 @@ fn rewrite_body(
         driver: Option<Expr>,
         env: Option<Expr>,
         pc: Option<Expr>,
+        /// Single-pass tracing opt-in handle: the mutable native `JitState`
+        /// binding. Supplied as the first expr after `;`
+        /// (`jit_merge_point!(driver, env, pc; state)`). When present, the
+        /// expansion emits the gated post-walk transfer hook; when absent
+        /// (the default `jit_merge_point!()` form), the expansion is the
+        /// byte-identical observer/replay statement.
+        state: Option<Expr>,
     }
 
     impl Parse for MergePointArgs {
@@ -1301,15 +1341,20 @@ fn rewrite_body(
             let env: Expr = input.parse()?;
             input.parse::<Token![,]>()?;
             let pc: Expr = input.parse()?;
+            let mut state = None;
             if input.peek(Token![;]) {
                 input.parse::<Token![;]>()?;
-                let _: Punctuated<Expr, Token![,]> =
+                let tail: Punctuated<Expr, Token![,]> =
                     input.parse_terminated(Expr::parse, Token![,])?;
+                // The first tail expr is the single-pass `state` handle; any
+                // further exprs remain accepted-and-ignored (legacy form).
+                state = tail.into_iter().next();
             }
             Ok(Self {
                 driver: Some(driver),
                 env: Some(env),
                 pc: Some(pc),
+                state,
             })
         }
     }
@@ -1813,9 +1858,104 @@ fn rewrite_body(
                     // (avoids the cold `__merge_*` call when not tracing).  It does NOT
                     // add a second merge-point dispatch — `driver.merge_point` guards
                     // again internally, but the closure runs only once.
-                    let new_tokens: TokenStream = quote! {
-                        if #driver.is_tracing() {
-                            #merge_fn(&mut #driver, #env, #pc);
+                    let new_tokens: TokenStream = if let Some(state) = &args.state {
+                        // Single-pass opt-in: after the walk, if the CloseLoop
+                        // populated a walk-final (pc, reds) snapshot, transfer
+                        // it into native state and resume the native loop at the
+                        // close pc — skipping the body re-run (NO observer
+                        // replay). `#merge_fn` returns `None` (so this is inert)
+                        // whenever `PYRE_SINGLE_PASS` is off or the walk did not
+                        // populate reds, leaving the observer/replay path intact.
+                        quote! {
+                            if #driver.is_tracing() {
+                                let __mp_out = #merge_fn(&mut #driver, #env, #pc);
+                                // D2 per-opcode single-executor
+                                // (PYRE_AUTHORITATIVE): the authoritative walker
+                                // executed exactly one opcode and returned its
+                                // boundary pc. Re-derive the native scalar caches
+                                // (stacksize / selected ref) from the
+                                // walk-advanced shared storage, jump the native
+                                // loop to the boundary pc, and skip native's own
+                                // dispatch of the walked opcode. Inert (the
+                                // channel stays `None`) unless authoritative.
+                                if let Some(__next_pc) =
+                                    #driver.take_authoritative_next_pc()
+                                {
+                                    // Cancel the observer-replay handover the
+                                    // walk's `ObserverGuard::drop` queued: the
+                                    // authoritative walker executed the opcode
+                                    // and native skips its dispatch, so nothing
+                                    // re-runs the body — leaving the replay queue
+                                    // set would make the next opcode consume this
+                                    // opcode's stale calls (same cleanup the
+                                    // single-pass branch below performs).
+                                    majit_metainterp::cancel_observer_replay();
+                                    // Propagate the walk's scalar state fields
+                                    // (e.g. SEL's new `selected`) from the live
+                                    // sym into native state BEFORE recover, so
+                                    // recover re-derives the storage-backed
+                                    // caches from the current scalars.
+                                    #driver.writeback_authoritative_state_fields(
+                                        &mut #state,
+                                    );
+                                    majit_metainterp::JitState::recover_after_compiled_run(
+                                        &mut #state,
+                                    );
+                                    #pc = __next_pc;
+                                    continue;
+                                }
+                                if let Some((__sp_pc, __sp_reds)) = __mp_out
+                                {
+                                    // Cancel the observer-replay handover the
+                                    // walk's `ObserverGuard::drop` set: we
+                                    // transfer state directly and skip the body
+                                    // re-run, so nothing should replay the queue.
+                                    majit_metainterp::cancel_observer_replay();
+                                    // Transfer any loop-carried reds the walk
+                                    // captured, then re-derive the
+                                    // storage-backed cache fields (stacksize,
+                                    // selected/storage refs) from the
+                                    // walk-advanced shared storage via the
+                                    // `recover` hook. The native `state`'s scalar
+                                    // fields are frozen at trace-start (S_k) — the
+                                    // walk mutates only the shared storage and
+                                    // the JitCode machine — so the cache fields
+                                    // are one iteration stale; `recover` is what
+                                    // brings them to the walk-final state (S_k+1).
+                                    if !__sp_reds.is_empty() {
+                                        let __sp_meta = majit_metainterp::JitState::build_meta(
+                                            &#state, __sp_pc, #env,
+                                        );
+                                        majit_metainterp::JitState::restore_values(
+                                            &mut #state, &__sp_meta, &__sp_reds,
+                                        );
+                                    }
+                                    majit_metainterp::JitState::recover_after_compiled_run(
+                                        &mut #state,
+                                    );
+                                    // Direct-entry: run the loop the walk just
+                                    // compiled with the walk-final state so the
+                                    // compiled steady-state advances PAST the
+                                    // walked span instead of re-interpreting it
+                                    // (the native back-edges never key the walk's
+                                    // merge-point header, so the compiled inner
+                                    // loop is otherwise unreachable). Falls back to
+                                    // the close pc when nothing compiled / the run
+                                    // could not start.
+                                    #pc = #driver
+                                        .try_resume_into_compiled_loop(
+                                            __sp_pc, &mut #state, #env,
+                                        )
+                                        .unwrap_or(__sp_pc);
+                                    continue;
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            if #driver.is_tracing() {
+                                #merge_fn(&mut #driver, #env, #pc);
+                            }
                         }
                     };
                     *stmt =
