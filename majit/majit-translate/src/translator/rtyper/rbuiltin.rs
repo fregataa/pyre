@@ -43,6 +43,8 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::translator::rtyper::rrange::{rtype_builtin_range, rtype_builtin_xrange};
+
 /// Process-global counter for the legacy InstanceRepr→PtrRepr swap
 /// inside [`rtype_cast_ptr_to_int`].  Each fire is one
 /// `cast_ptr_to_int` call whose operand reached the typer without a
@@ -213,6 +215,9 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("bytearray", rtype_builtin_bytearray),
         // rbuiltin.py:209-211
         ("list", rtype_builtin_list),
+        // rrange.py:96-126 — `@typer_for(range)` / `@typer_for(xrange)`.
+        ("range", rtype_builtin_range),
+        ("xrange", rtype_builtin_xrange),
         // rbuiltin.py:234-238
         ("min", rtype_builtin_min),
         // rbuiltin.py:246-250
@@ -221,6 +226,9 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
         ("object.__init__", rtype_object__init__),
+        // rbuiltin.py:286-297 — registered only when the host exposes
+        // WindowsError.__init__; HOST_ENV lookup preserves that conditional.
+        ("WindowsError.__init__", rtype_WindowsError__init__),
         // Pyre-internal front-end pointer-downcast narrow (#298).  Keyed
         // by the `__pyre_cast_instance` HOST_ENV singleton (same Arc the
         // adapter resolves the call's callable to), lowers to a
@@ -1275,6 +1283,14 @@ pub fn rtype_builtin_min(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     rtype_builtin_min_max(hop, "ll_min")
 }
 
+/// RPython `def ll_min(i1, i2)` (rbuiltin.py:240-243).
+pub fn ll_min<T: PartialOrd + Copy>(i1: T, i2: T) -> T {
+    if i1 < i2 {
+        return i1;
+    }
+    i2
+}
+
 /// RPython `@typer_for(max) def rtype_builtin_max(hop)`
 /// (rbuiltin.py:246-250).
 ///
@@ -1287,6 +1303,14 @@ pub fn rtype_builtin_min(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 /// ```
 pub fn rtype_builtin_max(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     rtype_builtin_min_max(hop, "ll_max")
+}
+
+/// RPython `def ll_max(i1, i2)` (rbuiltin.py:252-255).
+pub fn ll_max<T: PartialOrd + Copy>(i1: T, i2: T) -> T {
+    if i1 > i2 {
+        return i1;
+    }
+    i2
 }
 
 /// Shared body of `rtype_builtin_min` / `rtype_builtin_max` — the two
@@ -1616,6 +1640,22 @@ pub fn rtype_EnvironmentError__init__(
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
     Err(rbuiltin_deferred("rtype_EnvironmentError__init__"))
+}
+
+/// RPython conditional `@typer_for(WindowsError.__init__) def
+/// rtype_WindowsError__init__(hop)` (rbuiltin.py:286-297).
+///
+/// CPython 3 removed `WindowsError` as a distinct builtin, but upstream
+/// still exposes this helper when running on hosts where the class exists.
+/// The concrete field writes need the same `InstanceRepr::setfield` work as
+/// `rtype_EnvironmentError__init__`, so keep the public parity hook explicit
+/// and deferred.
+#[allow(non_snake_case)]
+pub fn rtype_WindowsError__init__(
+    _hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    Err(rbuiltin_deferred("rtype_WindowsError__init__"))
 }
 
 /// RPython `def rtype_hlinvoke(hop)` (rbuiltin.py:300-309).
@@ -4457,6 +4497,7 @@ mod tests {
                 "rtype_EnvironmentError__init__",
                 rtype_EnvironmentError__init__,
             ),
+            ("rtype_WindowsError__init__", rtype_WindowsError__init__),
             ("rtype_hlinvoke", rtype_hlinvoke),
             ("rtype_offsetof", rtype_offsetof),
             ("rtype_instantiate", rtype_instantiate),

@@ -293,12 +293,18 @@ impl PackSet {
                 // follow_def_uses: users of left/right that are isomorphic
                 for &uleft in &graph.nodes[left].users {
                     for &uright in &graph.nodes[right].users {
+                        let Some(uleft_op) = graph.nodes[uleft].getoperation() else {
+                            continue;
+                        };
+                        let Some(uright_op) = graph.nodes[uright].getoperation() else {
+                            continue;
+                        };
                         if uleft < uright
-                            && graph.nodes[uleft].op.opcode == graph.nodes[uright].op.opcode
+                            && uleft_op.opcode == uright_op.opcode
                             && !self.already_packed(uleft)
                             && !self.already_packed(uright)
                         {
-                            let sc = graph.nodes[uleft].op.opcode;
+                            let sc = uleft_op.opcode;
                             self.packs.push(Pack {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
@@ -313,12 +319,18 @@ impl PackSet {
                 // follow_use_defs: deps of left/right that are isomorphic
                 for &dleft in &graph.nodes[left].deps {
                     for &dright in &graph.nodes[right].deps {
+                        let Some(dleft_op) = graph.nodes[dleft].getoperation() else {
+                            continue;
+                        };
+                        let Some(dright_op) = graph.nodes[dright].getoperation() else {
+                            continue;
+                        };
                         if dleft < dright
-                            && graph.nodes[dleft].op.opcode == graph.nodes[dright].op.opcode
+                            && dleft_op.opcode == dright_op.opcode
                             && !self.already_packed(dleft)
                             && !self.already_packed(dright)
                         {
-                            let sc = graph.nodes[dleft].op.opcode;
+                            let sc = dleft_op.opcode;
                             self.packs.push(Pack {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
@@ -408,8 +420,8 @@ impl PackSet {
         forward: bool,
         graph: &DependencyGraph,
     ) -> Result<Option<Pack>, NotAVectorizeableLoop> {
-        let l_op = &graph.nodes[lnode].op;
-        let r_op = &graph.nodes[rnode].op;
+        let l_op = graph.nodes[lnode].op();
+        let r_op = graph.nodes[rnode].op();
 
         if !isomorphic(state, l_op, r_op) {
             return Ok(None);
@@ -493,10 +505,10 @@ impl PackSet {
         forward: bool,
         graph: &DependencyGraph,
     ) -> bool {
-        let l_op = &graph.nodes[lnode].op;
-        let r_op = &graph.nodes[rnode].op;
-        let origin_left_op = &graph.nodes[origin_pack.members[0]].op;
-        let origin_right_op = &graph.nodes[*origin_pack.members.last().unwrap()].op;
+        let l_op = graph.nodes[lnode].op();
+        let r_op = graph.nodes[rnode].op();
+        let origin_left_op = graph.nodes[origin_pack.members[0]].op();
+        let origin_right_op = graph.nodes[*origin_pack.members.last().unwrap()].op();
 
         if Self::prohibit_packing(origin_left_op, l_op, forward) {
             return false;
@@ -544,7 +556,7 @@ impl PackSet {
         origin_pack: &Pack,
         graph: &DependencyGraph,
     ) -> Option<Pack> {
-        let left = &graph.nodes[lnode].op;
+        let left = graph.nodes[lnode].op();
         let opnum = left.opcode;
 
         // vector.py:772-774: AccumPack.SUPPORTED = { INT_ADD: '+' }
@@ -569,7 +581,7 @@ impl PackSet {
             }
         };
 
-        let right = &graph.nodes[rnode].op;
+        let right = graph.nodes[rnode].op();
 
         // vector.py:778: assert left.numargs() == 2 and not left.returns_void()
         if left.num_args() != 2 || left.opcode.result_type() == majit_ir::Type::Void {
@@ -593,9 +605,9 @@ impl PackSet {
         // vector.py:789: scalar = left.getarg(index)  (original accumulator variable)
         // vector.py:793-796: other args must align with origin pack
         let other_index = (index + 1) % 2;
-        let origin_left_pos = graph.nodes[origin_pack.members[0]].op.pos.get();
+        let origin_left_pos = graph.nodes[origin_pack.members[0]].op().pos.get();
         let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()]
-            .op
+            .op()
             .pos
             .get();
 
@@ -1663,13 +1675,17 @@ impl VectorizingOptimizer {
             for &r_dep in &r_deps {
                 // vector.py:434-437: left = lnode.getoperation();
                 // args = pack.leftmost().getarglist(); if left not in args: continue
-                let dep_opref = graph.nodes[l_dep].op.pos.get();
-                let left_args = graph.nodes[left_idx].op.getarglist();
+                let Some(l_op) = graph.nodes[l_dep].getoperation() else {
+                    continue;
+                };
+                let Some(r_op) = graph.nodes[r_dep].getoperation() else {
+                    continue;
+                };
+                let dep_opref = l_op.pos.get();
+                let left_args = graph.nodes[left_idx].op().getarglist();
                 if !left_args.iter().any(|a| a.to_opref() == dep_opref) {
                     continue;
                 }
-                let l_op = &graph.nodes[l_dep].op;
-                let r_op = &graph.nodes[r_dep].op;
                 // vector.py:438-439: isomorphic and lnode.is_before(rnode)
                 if isomorphic(state, l_op, r_op) && l_dep < r_dep {
                     match packset.can_be_packed(state, l_dep, r_dep, Some(pack), false, graph) {
@@ -1693,7 +1709,7 @@ impl VectorizingOptimizer {
         debug_assert!(pack.members.len() == 2);
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
-        let left_opref = graph.nodes[left_idx].op.pos.get();
+        let left_opref = graph.nodes[left_idx].op().pos.get();
 
         // vector.py:446-447: for ldep in pack.leftmost(node=True).provides()
         let l_users: Vec<usize> = graph.nodes[left_idx].users.clone();
@@ -1704,16 +1720,15 @@ impl VectorizingOptimizer {
                 // vector.py:451-453: left = pack.leftmost()
                 // args = lnode.getoperation().getarglist()
                 // if left not in args: continue
-                if !graph.nodes[l_user]
-                    .op
-                    .getarglist()
-                    .iter()
-                    .any(|a| a.to_opref() == left_opref)
-                {
+                let Some(l_op) = graph.nodes[l_user].getoperation() else {
+                    continue;
+                };
+                let Some(r_op) = graph.nodes[r_user].getoperation() else {
+                    continue;
+                };
+                if !l_op.getarglist().iter().any(|a| a.to_opref() == left_opref) {
                     continue;
                 }
-                let l_op = &graph.nodes[l_user].op;
-                let r_op = &graph.nodes[r_user].op;
                 // vector.py:454-455: isomorphic and lnode.is_before(rnode)
                 if isomorphic(state, l_op, r_op) && l_user < r_user {
                     match packset.can_be_packed(state, l_user, r_user, Some(pack), true, graph) {
@@ -1772,27 +1787,106 @@ impl VectorizingOptimizer {
     // ── vector.py:523-583: analyse_index_calculations ──────────────────
 
     /// vector.py:523-583: analyse_index_calculations — move guarding
-    /// instructions (and their dependencies) to the loop header.
+    /// instructions (and all the instructions the guard needs) to the loop
+    /// header so guards fail "early" and dependencies relax. Without this
+    /// step vectorization would not be possible.
     ///
-    /// This ensures guards fail "early" and relax dependencies, which is
-    /// a prerequisite for vectorization.
-    ///
-    /// TODO: The full RPython implementation requires:
-    /// - DependencyGraph.imaginary_node() — synthetic graph nodes
-    /// - Node.iterate_paths() — path enumeration with blacklist
-    /// - Path.is_always_pure() — purity analysis along paths
-    /// - Node.remove_edge_to() / edge_to() — graph mutation
-    /// These dependency.rs primitives are not yet ported. Until they are,
-    /// return None unconditionally — the earlier "zero-dep guard" heuristic
-    /// did not actually rewire the graph the way RPython does, and feeding
-    /// the unmodified graph back to the caller as a reschedule basis was a
-    /// silent divergence. mark_guard is similarly stubbed.
+    /// Every dependency primitive this needs is ported: `add_imaginary_node`
+    /// (imaginary_node), `iterate_paths`, `Path::is_always_pure`, and the
+    /// graph-mutation pair `edge_to`/`remove_edge_to`. The returned graph is
+    /// the reschedule basis — its rewired `deps`/`users` drive
+    /// `schedule_operations`, and the "early exit" imaginary node is emitted
+    /// by no operation. `mark_guard`'s failargs half stays #175-blocked.
     fn analyse_index_calculations(
         &self,
-        _loop_: &VectorLoop,
-        _constant_of: &dyn Fn(OpRef) -> Option<i64>,
+        loop_: &VectorLoop,
+        constant_of: &dyn Fn(OpRef) -> Option<i64>,
     ) -> Option<DependencyGraph> {
-        None
+        // vector.py:529: graph = DependencyGraph(loop)
+        let mut graph = DependencyGraph::build(&loop_.operations_as_ops(), constant_of);
+        // vector.py:530-533: zero_deps = every node with no backward deps.
+        // Keyed by node position (like `guards`, `Path`, and the final loop),
+        // not `Node.idx` — an imaginary node's idx is a synthetic sentinel.
+        let mut zero_deps: VecSet<usize> = VecSet::new();
+        for (i, node) in graph.nodes.iter().enumerate() {
+            if node.depends_count() == 0 {
+                zero_deps.insert(i);
+            }
+        }
+        // vector.py:534: earlyexit = graph.imaginary_node("early exit")
+        let earlyexit = graph.add_imaginary_node("early exit");
+        // vector.py:535: guards = graph.guards
+        let guards = graph.guards.clone();
+        let mut one_valid = false;
+        for guard_idx in guards {
+            let mut modify_later: Vec<usize> = Vec::new();
+            let mut valid = true;
+            // vector.py:542-543
+            zero_deps.remove(&guard_idx);
+            // vector.py:544-545: for prev_dep in guard_node.depends(): prev_node = prev_dep.to
+            // Snapshot the (predecessor, failarg) pairs before mutating the graph.
+            let prev_deps: Vec<(usize, bool)> = graph.nodes[guard_idx]
+                .depends()
+                .iter()
+                .map(|dep| (dep.target_node(), dep.is_failarg()))
+                .collect();
+            for (prev_node, is_failarg) in &prev_deps {
+                if *is_failarg {
+                    // vector.py:546-552: this edge exists only because of failing;
+                    // remove it later so a pure-only guard can execute earlier.
+                    modify_later.push(*prev_node);
+                } else {
+                    // vector.py:554-559
+                    for path in graph.iterate_paths(*prev_node, None, true, -1, true) {
+                        if !path.is_always_pure(&graph.nodes, false, false) {
+                            valid = false;
+                        } else if let Some(last) = path.last() {
+                            zero_deps.remove(&last);
+                        }
+                    }
+                    // vector.py:560-561
+                    if !valid {
+                        break;
+                    }
+                }
+            }
+            if valid {
+                // vector.py:562-565: transformation is valid — execute this guard earlier.
+                one_valid = true;
+                // vector.py:566-567
+                for node in &modify_later {
+                    graph.remove_edge_to(*node, guard_idx);
+                }
+                // vector.py:568-573: the early exit inherits every edge starting
+                // at the guard; the guard then only provides to the early exit.
+                let provides: Vec<usize> = graph.nodes[guard_idx]
+                    .provides()
+                    .iter()
+                    .map(|dep| dep.target_node())
+                    .collect();
+                for target in provides {
+                    debug_assert!(!graph.nodes[target].is_imaginary());
+                    graph.edge_to(earlyexit, target, None, true);
+                    graph.remove_edge_to(guard_idx, target);
+                }
+                // vector.py:574-577
+                graph.edge_to(guard_idx, earlyexit, None, false);
+                let guard_op = loop_
+                    .operations
+                    .get(guard_idx)
+                    .expect("dependency guard index must refer to a loop operation");
+                self.mark_guard(guard_op, loop_);
+            }
+        }
+        // vector.py:578-580
+        for node_idx in 0..graph.nodes.len() {
+            if zero_deps.contains(&node_idx) {
+                debug_assert!(!graph.nodes[node_idx].is_imaginary());
+                graph.edge_to(earlyexit, node_idx, None, false);
+            }
+        }
+        // vector.py:581-583
+        if one_valid { Some(graph) } else { None }
     }
 
     // ── vector.py:585-599: mark_guard ──────────────────────────────────
@@ -1801,17 +1895,20 @@ impl VectorizingOptimizer {
     /// by attaching a CompileLoopVersionDescr and setting failargs to
     /// the label's input args.
     ///
-    /// Stubbed: the descr itself IS ported (`make_compile_loop_version_descr_from`
-    /// in compile.rs, already used by `Guard::transitive_imply`), but the failargs
-    /// half — `label.getarglist_copy()` carrying the label's live producer boxes —
-    /// is blocked on #175 (the dormant vectorizer narrows label args to `OpRef`,
-    /// so a faithful copy has no producer `Rc` to carry; emitting failargs here
-    /// via `bound_from_opref` would only widen the synthetic-producer surface).
-    /// Reached only under the `vec_all()` debug gate.
-    fn mark_guard(&self, _guard_idx: usize, _loop_: &VectorLoop) {
-        // vector.py:588-594: create CompileLoopVersionDescr, copy attrs
-        // vector.py:595-599: set failargs to label.getarglist_copy()
-        // Faithful failargs-carry deferred to #175 (producer-carrying label args).
+    /// For GUARD_TRUE/GUARD_FALSE, attach a CompileLoopVersionDescr and copy
+    /// resume attributes from the old descr when one is present. Every guard
+    /// gets the loop label args as failargs.
+    fn mark_guard(&self, guard_op: &Op, loop_: &VectorLoop) {
+        debug_assert!(guard_op.opcode.is_guard());
+        if matches!(guard_op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
+            let descr = if guard_op.getdescr().is_some() {
+                crate::compile::make_compile_loop_version_descr_from(guard_op)
+            } else {
+                crate::compile::make_compile_loop_version_descr()
+            };
+            guard_op.setdescr(descr);
+        }
+        guard_op.setfailargs(loop_.label.getarglist_operand());
     }
 
     // ── Optimization trait helper: try_vectorize ───────────────────────
@@ -2605,6 +2702,58 @@ mod tests {
         assert!(vloop.prefix.is_empty());
         assert!(vloop.prefix_label.is_none());
         assert!(vloop.align_operations.is_empty());
+    }
+
+    #[test]
+    fn test_mark_guard_sets_loop_version_descr_and_label_failargs() {
+        let label = Op::new(
+            OpCode::Label,
+            &[bx(OpRef::input_arg_int(0)), bx(OpRef::input_arg_ref(1))],
+        );
+        let guard = Op::new(OpCode::GuardTrue, &[bx(OpRef::input_arg_int(0))]);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[bx(OpRef::input_arg_int(0)), bx(OpRef::input_arg_ref(1))],
+        );
+        let vloop = VectorLoop::new(label, vec![guard], jump);
+        let opt = VectorizingOptimizer::new();
+
+        opt.mark_guard(&vloop.operations[0], &vloop);
+
+        let descr = vloop.operations[0]
+            .getdescr()
+            .expect("mark_guard must attach a loop-version descr");
+        assert!(descr.is_loop_version());
+        let failargs = vloop.operations[0]
+            .getfailargs()
+            .expect("mark_guard must attach label failargs");
+        assert_eq!(failargs.len(), 2);
+        assert_eq!(failargs[0].to_opref(), OpRef::input_arg_int(0));
+        assert_eq!(failargs[1].to_opref(), OpRef::input_arg_ref(1));
+    }
+
+    #[test]
+    fn test_mark_guard_copies_existing_resume_descr_types() {
+        let label = Op::new(OpCode::Label, &[bx(OpRef::input_arg_int(0))]);
+        let guard = Op::new(OpCode::GuardFalse, &[bx(OpRef::input_arg_int(0))]);
+        guard.setdescr(crate::compile::make_resume_guard_descr_typed(vec![
+            Type::Int,
+            Type::Ref,
+        ]));
+        let jump = Op::new(OpCode::Jump, &[bx(OpRef::input_arg_int(0))]);
+        let vloop = VectorLoop::new(label, vec![guard], jump);
+        let opt = VectorizingOptimizer::new();
+
+        opt.mark_guard(&vloop.operations[0], &vloop);
+
+        let descr = vloop.operations[0]
+            .getdescr()
+            .expect("mark_guard must preserve a guard descr");
+        assert!(descr.is_loop_version());
+        assert_eq!(
+            descr.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Int, Type::Ref]
+        );
     }
 
     #[test]

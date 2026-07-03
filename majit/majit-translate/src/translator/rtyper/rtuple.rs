@@ -1317,15 +1317,35 @@ impl Repr for Length1TupleIteratorRepr {
 }
 
 /// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402).
+///
+/// The executable lowering uses [`build_ll_tupleiter_helper_graph`] because
+/// `hop.gendirectcall` needs a helper graph carrying malloc/setfield ops. Keep
+/// this public symbol so the Rust module still exposes the upstream helper
+/// surface.
 pub fn ll_tupleiter(_iterptr: &LowLevelType, _tuple: Hlvalue) -> Result<Hlvalue, TyperError> {
     Err(rtuple_deferred("ll_tupleiter"))
 }
 
 /// RPython `ll_tuplenext(iter)` (rtuple.py:404-411).
+///
+/// The executable lowering uses [`build_ll_tuplenext_helper_graph`] so it can
+/// model the branch and StopIteration edge in a flow graph. Keep this public
+/// symbol for upstream helper-name parity.
 pub fn ll_tuplenext(_iter: Hlvalue) -> Result<Hlvalue, TyperError> {
     Err(rtuple_deferred("ll_tuplenext"))
 }
 
+/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402):
+///
+/// ```python
+/// def ll_tupleiter(ITERPTR, tuple):
+///     iter = malloc(ITERPTR.TO)
+///     iter.tuple = tuple
+///     return iter
+/// ```
+///
+/// Single block: `malloc ITERPTR.TO (flavor=gc)` + `setfield(iter,
+/// 'tuple', tuple)` → return iter.
 pub(crate) fn build_ll_tupleiter_helper_graph(
     name: &str,
     tuple_lltype: LowLevelType,
@@ -1394,6 +1414,21 @@ pub(crate) fn build_ll_tupleiter_helper_graph(
     ))
 }
 
+/// RPython `ll_tuplenext(iter)` (rtuple.py:404-411), for length-1 tuples:
+///
+/// ```python
+/// def ll_tuplenext(iter):
+///     t = iter.tuple
+///     if t:
+///         iter.tuple = nullptr(typeOf(t).TO)
+///         return t.item0
+///     else:
+///         raise StopIteration
+/// ```
+///
+/// 2-block CFG plus `graph.exceptblock`: **start** reads `iter.tuple`,
+/// `ptr_nonzero` branches → **cont** (null the field, return `item0`) or
+/// raises `StopIteration`.
 pub(crate) fn build_ll_tuplenext_helper_graph(
     name: &str,
     iter_lltype: LowLevelType,

@@ -21,9 +21,8 @@
 //! variable-step `RANGESTITER` (`ll_rangeiter` step-field copy +
 //! `ll_rangenext_updown`).
 //!
-//! Deferred to follow-on slices: `rtype_builtin_range` (the `range(...)`
-//! constructor lowering, which needs `ll_newrange` / `ll_newrangest` and the
-//! list-repr-backed `ll_range2list`).
+//! `rtype_builtin_range` also covers the real-list arm (`ll_range2list`) by
+//! reusing the graph-built resized-list helpers from `rlist`.
 
 #![allow(non_camel_case_types)]
 
@@ -35,11 +34,15 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
+use crate::translator::rtyper::rlist::{
+    ListLayout, ListRepr, build_ll_newlist_helper_graph, build_ll_setitem_fast_helper_graph,
+};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
     exception_args, helper_pygraph_from_graph, variable_with_lltype,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn rrange_deferred(name: &str) -> TyperError {
@@ -119,15 +122,182 @@ pub fn ll_rangeitem(
 }
 
 /// RPython `rtype_builtin_range(hop)` (`rrange.py:96-126`) — lowers
-/// `range(...)`. Deferred: the `AbstractRangeRepr` result arm needs
-/// `ll_newrange` / `ll_newrangest` helper graphs (malloc + setfield
-/// start/stop[/step], `lltypesystem/rrange.py:77-102`), and the
-/// non-range (real-list) arm needs `ll_range2list`, which builds a list
-/// via the list repr's `ll_newlist` + `ll_setitem_fast` (not yet a
-/// graph-buildable surface here). It is also not yet wired into the
-/// rtyper's builtin dispatch.
-pub fn rtype_builtin_range(_hop: &HighLevelOp) -> RTypeResult {
-    Err(rrange_deferred("rtype_builtin_range"))
+/// `range(...)`:
+///
+/// ```python
+/// def rtype_builtin_range(hop):
+///     vstep = hop.inputconst(Signed, 1)
+///     if hop.nb_args == 1:
+///         vstart = hop.inputconst(Signed, 0)
+///         vstop, = hop.inputargs(Signed)
+///     elif hop.nb_args == 2:
+///         vstart, vstop = hop.inputargs(Signed, Signed)
+///     else:
+///         vstart, vstop, vstep = hop.inputargs(Signed, Signed, Signed)
+///         if isinstance(vstep, Constant) and vstep.value == 0:
+///             raise TyperError("range cannot have a const step of zero")
+///     if isinstance(hop.r_result, AbstractRangeRepr):
+///         if hop.r_result.step != 0:
+///             c_rng = hop.inputconst(Void, hop.r_result.RANGE)
+///             hop.exception_is_here()
+///             return hop.gendirectcall(hop.r_result.ll_newrange, c_rng, vstart, vstop)
+///         else:
+///             hop.exception_is_here()
+///             return hop.gendirectcall(hop.r_result.ll_newrangest, vstart, vstop, vstep)
+///     else:
+///         ... ll_range2list ...
+/// ```
+///
+/// The `AbstractRangeRepr` result arm is ported: the constant-step arm
+/// (`step != 0`) `direct_call`s `ll_newrange` (`malloc RANGE` + setfield
+/// start/stop, `RANGE` folded into the builder), and the variable-step arm
+/// (`step == 0`) `direct_call`s `ll_newrangest` (`malloc RANGEST` + setfield
+/// start/stop/step, guarded by the runtime `step == 0` → `ValueError`).
+///
+/// The real-list arm (`ll_range2list`, `rrange.py:128-139`) builds the result
+/// via the resized [`ListRepr`] helper graphs: `ll_newlist(length)`, followed
+/// by a runtime fill loop that calls `ll_setitem_fast(idx, start)`.
+pub fn rtype_builtin_range(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    let vstep_one = constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed);
+    let (vstart, vstop, vstep) = match hop.nb_args() {
+        1 => {
+            let args = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+            (
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                args[0].clone(),
+                vstep_one,
+            )
+        }
+        2 => {
+            let args = hop.inputargs(vec![
+                ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ConvertedTo::LowLevelType(&LowLevelType::Signed),
+            ])?;
+            (args[0].clone(), args[1].clone(), vstep_one)
+        }
+        _ => {
+            let args = hop.inputargs(vec![
+                ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ConvertedTo::LowLevelType(&LowLevelType::Signed),
+            ])?;
+            if let Hlvalue::Constant(c) = &args[2] {
+                if matches!(c.value, ConstValue::Int(0)) {
+                    return Err(TyperError::message(
+                        "range cannot have a const step of zero",
+                    ));
+                }
+            }
+            (args[0].clone(), args[1].clone(), args[2].clone())
+        }
+    };
+
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_builtin_range: r_result not populated"))?;
+    let any: &dyn std::any::Any = r_result.as_ref();
+    let Some(range) = any.downcast_ref::<AbstractRangeRepr>() else {
+        let Some(r_list) = any.downcast_ref::<ListRepr>() else {
+            return Err(rrange_deferred(
+                "rtype_builtin_range result is neither AbstractRangeRepr nor ListRepr",
+            ));
+        };
+        let ptr_lltype = r_list.lowleveltype().clone();
+        let item_lltype = r_list.item_lowleveltype();
+        hop.exception_is_here()?;
+        let newlist_fn = {
+            let ptr = ptr_lltype.clone();
+            let item = item_lltype.clone();
+            hop.rtyper.lowlevel_helper_function_with_builder(
+                "ll_newlist".to_string(),
+                vec![LowLevelType::Signed],
+                ptr_lltype.clone(),
+                move |_rtyper, _args, _result| {
+                    build_ll_newlist_helper_graph(
+                        "ll_newlist",
+                        ListLayout::Resized,
+                        ptr.clone(),
+                        item.clone(),
+                    )
+                },
+            )?
+        };
+        let setitem_fn = if item_lltype == LowLevelType::Void {
+            None
+        } else {
+            let ptr = ptr_lltype.clone();
+            let item = item_lltype.clone();
+            Some(hop.rtyper.lowlevel_helper_function_with_builder(
+                "ll_setitem_fast".to_string(),
+                vec![
+                    ptr_lltype.clone(),
+                    LowLevelType::Signed,
+                    item_lltype.clone(),
+                ],
+                LowLevelType::Void,
+                move |_rtyper, _args, _result| {
+                    build_ll_setitem_fast_helper_graph("ll_setitem_fast", ptr.clone(), item.clone())
+                },
+            )?)
+        };
+        let helper = {
+            let ptr = ptr_lltype.clone();
+            let item = item_lltype.clone();
+            let newlist = newlist_fn.clone();
+            let setitem = setitem_fn.clone();
+            hop.rtyper.lowlevel_helper_function_with_builder(
+                "ll_range2list".to_string(),
+                vec![
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                ptr_lltype,
+                move |rtyper, _args, _result| {
+                    build_ll_range2list_helper_graph(
+                        rtyper,
+                        "ll_range2list",
+                        ptr.clone(),
+                        item.clone(),
+                        &newlist,
+                        setitem.as_ref(),
+                    )
+                },
+            )?
+        };
+        return hop.gendirectcall(&helper, vec![vstart, vstop, vstep]);
+    };
+    hop.exception_is_here()?;
+    let range_lltype = range.lltype.clone();
+    if range.step != 0 {
+        let rl = range_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newrange".to_string(),
+            vec![LowLevelType::Signed, LowLevelType::Signed],
+            range_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_newrange_helper_graph("ll_newrange", rl.clone())
+            },
+        )?;
+        hop.gendirectcall(&helper, vec![vstart, vstop])
+    } else {
+        let rl = range_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newrangest".to_string(),
+            vec![
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+            ],
+            range_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_newrangest_helper_graph("ll_newrangest", rl.clone())
+            },
+        )?;
+        hop.gendirectcall(&helper, vec![vstart, vstop, vstep])
+    }
 }
 
 /// RPython `rtype_builtin_xrange = rtype_builtin_range`.
@@ -147,6 +317,240 @@ pub fn ll_range2list(start: i64, stop: i64, step: i64) -> Result<Vec<i64>, Typer
         value += step;
     }
     Ok(out)
+}
+
+/// Synthesise `ll_range2list(LIST, start, stop, step)` (`rrange.py:128-139`):
+/// zero-step raises `ValueError`, then the helper allocates `LIST.ll_newlist`
+/// with `_ll_rangelen(start, stop, step)` and fills it by repeated
+/// `ll_setitem_fast(idx, start); start += step; idx += 1`.
+fn build_ll_range2list_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist: &LowLevelFunction,
+    setitem_fast: Option<&LowLevelFunction>,
+) -> Result<PyGraph, TyperError> {
+    let rangelen_const = underscore_rangelen_funcptr(rtyper)?;
+    let newlist_const = sub_helper_funcptr_constant(rtyper, newlist)?;
+    let setitem_const = match setitem_fast {
+        Some(func) => Some(sub_helper_funcptr_constant(rtyper, func)?),
+        None => None,
+    };
+
+    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
+    let stop_arg = variable_with_lltype("stop", LowLevelType::Signed);
+    let step_arg = variable_with_lltype("step", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(start_arg.clone()),
+        Hlvalue::Variable(stop_arg.clone()),
+        Hlvalue::Variable(step_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let is_zero = variable_with_lltype("is_zero", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_eq",
+        vec![Hlvalue::Variable(step_arg.clone()), signed_const(0)],
+        Hlvalue::Variable(is_zero.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_zero));
+
+    let alloc_start = variable_with_lltype("start", LowLevelType::Signed);
+    let alloc_stop = variable_with_lltype("stop", LowLevelType::Signed);
+    let alloc_step = variable_with_lltype("step", LowLevelType::Signed);
+    let alloc_block = Block::shared(vec![
+        Hlvalue::Variable(alloc_start.clone()),
+        Hlvalue::Variable(alloc_stop.clone()),
+        Hlvalue::Variable(alloc_step.clone()),
+    ]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            exception_args("ValueError")?,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(start_arg),
+                Hlvalue::Variable(stop_arg),
+                Hlvalue::Variable(step_arg),
+            ],
+            Some(alloc_block.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    alloc_block
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(rangelen_const),
+                Hlvalue::Variable(alloc_start.clone()),
+                Hlvalue::Variable(alloc_stop),
+                Hlvalue::Variable(alloc_step.clone()),
+            ],
+            Hlvalue::Variable(length.clone()),
+        ));
+    let list = variable_with_lltype("l", ptr_lltype.clone());
+    alloc_block
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(newlist_const),
+                Hlvalue::Variable(length.clone()),
+            ],
+            Hlvalue::Variable(list.clone()),
+        ));
+
+    if item_lltype == LowLevelType::Void {
+        alloc_block.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(list)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+    } else {
+        let loop_l = variable_with_lltype("l", ptr_lltype.clone());
+        let loop_idx = variable_with_lltype("idx", LowLevelType::Signed);
+        let loop_length = variable_with_lltype("length", LowLevelType::Signed);
+        let loop_current = variable_with_lltype("start", LowLevelType::Signed);
+        let loop_step = variable_with_lltype("step", LowLevelType::Signed);
+        let loop_block = Block::shared(vec![
+            Hlvalue::Variable(loop_l.clone()),
+            Hlvalue::Variable(loop_idx.clone()),
+            Hlvalue::Variable(loop_length.clone()),
+            Hlvalue::Variable(loop_current.clone()),
+            Hlvalue::Variable(loop_step.clone()),
+        ]);
+        alloc_block.closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(list),
+                    signed_const(0),
+                    Hlvalue::Variable(length),
+                    Hlvalue::Variable(alloc_start),
+                    Hlvalue::Variable(alloc_step),
+                ],
+                Some(loop_block.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let should_continue = variable_with_lltype("continue", LowLevelType::Bool);
+        loop_block.borrow_mut().operations.push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(loop_idx.clone()),
+                Hlvalue::Variable(loop_length.clone()),
+            ],
+            Hlvalue::Variable(should_continue.clone()),
+        ));
+        loop_block.borrow_mut().exitswitch = Some(Hlvalue::Variable(should_continue));
+
+        let fill_l = variable_with_lltype("l", ptr_lltype.clone());
+        let fill_idx = variable_with_lltype("idx", LowLevelType::Signed);
+        let fill_length = variable_with_lltype("length", LowLevelType::Signed);
+        let fill_current = variable_with_lltype("start", LowLevelType::Signed);
+        let fill_step = variable_with_lltype("step", LowLevelType::Signed);
+        let fill_block = Block::shared(vec![
+            Hlvalue::Variable(fill_l.clone()),
+            Hlvalue::Variable(fill_idx.clone()),
+            Hlvalue::Variable(fill_length.clone()),
+            Hlvalue::Variable(fill_current.clone()),
+            Hlvalue::Variable(fill_step.clone()),
+        ]);
+        loop_block.closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(loop_l.clone()),
+                    Hlvalue::Variable(loop_idx),
+                    Hlvalue::Variable(loop_length),
+                    Hlvalue::Variable(loop_current),
+                    Hlvalue::Variable(loop_step),
+                ],
+                Some(fill_block.clone()),
+                Some(bool_const(true)),
+            )
+            .into_ref(),
+            Link::new(
+                vec![Hlvalue::Variable(loop_l)],
+                Some(graph.returnblock.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+        ]);
+
+        let setitem_void = variable_with_lltype("v", LowLevelType::Void);
+        fill_block.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(
+                    setitem_const.expect("non-Void range list must have ll_setitem_fast"),
+                ),
+                Hlvalue::Variable(fill_l.clone()),
+                Hlvalue::Variable(fill_idx.clone()),
+                Hlvalue::Variable(fill_current.clone()),
+            ],
+            Hlvalue::Variable(setitem_void),
+        ));
+        let next_current = variable_with_lltype("start", LowLevelType::Signed);
+        fill_block.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(fill_current),
+                Hlvalue::Variable(fill_step.clone()),
+            ],
+            Hlvalue::Variable(next_current.clone()),
+        ));
+        let next_idx = variable_with_lltype("idx", LowLevelType::Signed);
+        fill_block.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(fill_idx), signed_const(1)],
+            Hlvalue::Variable(next_idx.clone()),
+        ));
+        fill_block.closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(fill_l),
+                    Hlvalue::Variable(next_idx),
+                    Hlvalue::Variable(fill_length),
+                    Hlvalue::Variable(next_current),
+                    Hlvalue::Variable(fill_step),
+                ],
+                Some(loop_block),
+                None,
+            )
+            .into_ref(),
+        ]);
+    }
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["start".to_string(), "stop".to_string(), "step".to_string()],
+        func,
+    ))
 }
 
 /// Lightweight carrier for `ll_rangenext_*` tests and deferred iterator reprs.
@@ -1839,6 +2243,202 @@ pub(crate) fn build_ll_rangeiter_helper_graph(
     ))
 }
 
+/// Push `l = malloc(<ptr_lltype>.TO, flavor=gc)` onto `block` and return the
+/// gc pointer var.
+fn emit_gc_malloc(
+    block: &BlockRef,
+    ptr_lltype: &LowLevelType,
+    ctx: &str,
+) -> Result<Variable, TyperError> {
+    let LowLevelType::Ptr(ptr) = ptr_lltype else {
+        return Err(TyperError::message(format!("{ctx}: lltype is not Ptr")));
+    };
+    let PtrTarget::Struct(inner_struct) = &ptr.TO else {
+        return Err(TyperError::message(format!(
+            "{ctx}: Ptr target must be Struct"
+        )));
+    };
+    let c_type = Constant::with_concretetype(
+        ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(
+            inner_struct.clone(),
+        )))),
+        LowLevelType::Void,
+    );
+    let c_flags =
+        Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let v_l = variable_with_lltype("l", ptr_lltype.clone());
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc",
+        vec![Hlvalue::Constant(c_type), Hlvalue::Constant(c_flags)],
+        Hlvalue::Variable(v_l.clone()),
+    ));
+    Ok(v_l)
+}
+
+/// Push `l.<field> = value` (a Void-result `setfield`) onto `block`.
+fn emit_void_setfield(block: &BlockRef, l: &Variable, field: &str, value: Hlvalue) {
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![Hlvalue::Variable(l.clone()), void_field(field), value],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+}
+
+/// Synthesise the `ll_newrange(RANGE, start, stop)` helper graph
+/// (`lltypesystem/rrange.py:70-74`):
+///
+/// ```python
+/// def ll_newrange(RANGE, start, stop):
+///     l = malloc(RANGE.TO)
+///     l.start = start
+///     l.stop = stop
+///     return l
+/// ```
+///
+/// The `RANGE` type is folded into the builder, so the helper takes
+/// `(start, stop)`. Single block: `malloc RANGE.TO (flavor=gc)` + setfield
+/// start/stop.
+pub(crate) fn build_ll_newrange_helper_graph(
+    name: &str,
+    range_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
+    let stop_arg = variable_with_lltype("stop", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(start_arg.clone()),
+        Hlvalue::Variable(stop_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", range_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let v_l = emit_gc_malloc(&startblock, &range_lltype, "build_ll_newrange_helper_graph")?;
+    emit_void_setfield(&startblock, &v_l, "start", Hlvalue::Variable(start_arg));
+    emit_void_setfield(&startblock, &v_l, "stop", Hlvalue::Variable(stop_arg));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_l)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["start".to_string(), "stop".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise the `ll_newrangest(start, stop, step)` helper graph
+/// (`lltypesystem/rrange.py:77-83`):
+///
+/// ```python
+/// def ll_newrangest(start, stop, step):
+///     if step == 0:
+///         raise ValueError
+///     l = malloc(RANGEST)
+///     l.start = start
+///     l.stop = stop
+///     l.step = step
+///     return l
+/// ```
+///
+/// 2-block CFG plus `graph.exceptblock`: **start** guards `int_eq(step, 0)`
+/// → raise `ValueError`, else → **build** (`malloc RANGEST` + setfield
+/// start/stop/step → return).
+pub(crate) fn build_ll_newrangest_helper_graph(
+    name: &str,
+    rangest_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
+    let stop_arg = variable_with_lltype("stop", LowLevelType::Signed);
+    let step_arg = variable_with_lltype("step", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(start_arg.clone()),
+        Hlvalue::Variable(stop_arg.clone()),
+        Hlvalue::Variable(step_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", rangest_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let exc_args = exception_args("ValueError")?;
+
+    // build block params: (start, stop, step).
+    let b_start = variable_with_lltype("start", LowLevelType::Signed);
+    let b_stop = variable_with_lltype("stop", LowLevelType::Signed);
+    let b_step = variable_with_lltype("step", LowLevelType::Signed);
+    let build = Block::shared(vec![
+        Hlvalue::Variable(b_start.clone()),
+        Hlvalue::Variable(b_stop.clone()),
+        Hlvalue::Variable(b_step.clone()),
+    ]);
+
+    // ---- start: is_zero = int_eq(step, 0); branch.
+    let is_zero = variable_with_lltype("is_zero", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_eq",
+        vec![Hlvalue::Variable(step_arg.clone()), signed_const(0)],
+        Hlvalue::Variable(is_zero.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_zero));
+    startblock.closeblock(vec![
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(start_arg),
+                Hlvalue::Variable(stop_arg),
+                Hlvalue::Variable(step_arg),
+            ],
+            Some(build.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- build: l = malloc(RANGEST); l.start/stop/step = ...; return l.
+    let v_l = emit_gc_malloc(&build, &rangest_lltype, "build_ll_newrangest_helper_graph")?;
+    emit_void_setfield(&build, &v_l, "start", Hlvalue::Variable(b_start));
+    emit_void_setfield(&build, &v_l, "stop", Hlvalue::Variable(b_stop));
+    emit_void_setfield(&build, &v_l, "step", Hlvalue::Variable(b_step));
+    build.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_l)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["start".to_string(), "stop".to_string(), "step".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise the `ll_rangenext_up` / `ll_rangenext_down` helper graph
 /// (`rrange.py:172-184`):
 ///
@@ -2697,6 +3297,216 @@ mod tests {
         }
         assert_eq!(rangelen_calls, 1, "expected a single _ll_rangelen call");
         assert_eq!(raise_links, 2, "expected two IndexError-raising links");
+    }
+
+    /// Drive `rtype_builtin_range` for `range(<nb_args> Signed args)` whose
+    /// result repr is `RangeRepr(step)` and return the funcptr-`Constant`
+    /// debug string of the emitted `direct_call`.
+    fn range_builtin_call_funcptr(nb_args: usize, step: i64) -> String {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let range_repr: Arc<AbstractRangeRepr> =
+            Arc::new(AbstractRangeRepr::new(step).expect("AbstractRangeRepr::new"));
+        let range_lltype = range_repr.lowleveltype().clone();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+
+        let mut call_args = Vec::new();
+        for _ in 0..nb_args {
+            let v = Variable::new();
+            v.set_concretetype(Some(LowLevelType::Signed));
+            call_args.push(Hlvalue::Variable(v));
+        }
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(range_lltype));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                call_args.clone(),
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(call_args);
+        for _ in 0..nb_args {
+            hop.args_s
+                .borrow_mut()
+                .push(SomeValue::Integer(SomeInteger::new(false, false)));
+            hop.args_r
+                .borrow_mut()
+                .push(Some(signed_repr() as Arc<dyn Repr>));
+        }
+        *hop.r_result.borrow_mut() = Some(range_repr as Arc<dyn Repr>);
+
+        let result = rtype_builtin_range(&hop, &HashMap::new())
+            .unwrap_or_else(|err| panic!("rtype_builtin_range({nb_args}, {step}): {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        let last = ops.ops.last().expect("expected a direct_call op");
+        assert_eq!(last.opname, "direct_call");
+        let Hlvalue::Constant(c) = &last.args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        format!("{:?}", c.value)
+    }
+
+    fn range_builtin_list_call_funcptr(nb_args: usize) -> String {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let item_repr: Arc<dyn Repr> = signed_repr();
+        let list_repr: Arc<ListRepr> =
+            Arc::new(ListRepr::new(&rtyper, item_repr).expect("ListRepr::new"));
+        let list_lltype = list_repr.lowleveltype().clone();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+
+        let mut call_args = Vec::new();
+        for _ in 0..nb_args {
+            let v = Variable::new();
+            v.set_concretetype(Some(LowLevelType::Signed));
+            call_args.push(Hlvalue::Variable(v));
+        }
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(list_lltype));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                call_args.clone(),
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(call_args);
+        for _ in 0..nb_args {
+            hop.args_s
+                .borrow_mut()
+                .push(SomeValue::Integer(SomeInteger::new(false, false)));
+            hop.args_r
+                .borrow_mut()
+                .push(Some(signed_repr() as Arc<dyn Repr>));
+        }
+        *hop.r_result.borrow_mut() = Some(list_repr as Arc<dyn Repr>);
+
+        let result = rtype_builtin_range(&hop, &HashMap::new())
+            .unwrap_or_else(|err| panic!("rtype_builtin_range list arm: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        let last = ops.ops.last().expect("expected a direct_call op");
+        assert_eq!(last.opname, "direct_call");
+        let Hlvalue::Constant(c) = &last.args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        format!("{:?}", c.value)
+    }
+
+    /// A constant-step `range(a, b)` lowers to a `direct_call` of `ll_newrange`
+    /// (`rrange.py:110-112`); a variable-step result lowers to `ll_newrangest`
+    /// (`rrange.py:114`).
+    #[test]
+    fn rtype_builtin_range_selects_newrange_vs_newrangest_by_step() {
+        let const_step = range_builtin_call_funcptr(2, 1);
+        assert!(
+            const_step.contains("ll_newrange") && !const_step.contains("ll_newrangest"),
+            "expected 'll_newrange' in {const_step}"
+        );
+        let var_step = range_builtin_call_funcptr(3, 0);
+        assert!(
+            var_step.contains("ll_newrangest"),
+            "expected 'll_newrangest' in {var_step}"
+        );
+    }
+
+    #[test]
+    fn rtype_builtin_range_list_result_calls_ll_range2list() {
+        let list_call = range_builtin_list_call_funcptr(3);
+        assert!(
+            list_call.contains("ll_range2list"),
+            "expected 'll_range2list' in {list_call}"
+        );
+    }
+
+    /// `ll_newrange(start, stop)` mallocs the RANGE struct and sets both
+    /// fields: a single block of `malloc` + 2×`setfield`.
+    #[test]
+    fn build_ll_newrange_helper_graph_mallocs_and_sets_start_stop() {
+        let ptr = AbstractRangeRepr::new(1).unwrap().lowleveltype().clone();
+        let g = build_ll_newrange_helper_graph("ll_newrange", ptr).unwrap();
+        let inner = g.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["malloc", "setfield", "setfield"]);
+        assert_eq!(startblock.inputargs.len(), 2);
+        assert!(startblock.exitswitch.is_none());
+    }
+
+    /// `ll_newrangest(start, stop, step)` guards `int_eq(step, 0)` → raise
+    /// `ValueError`, else mallocs RANGEST and sets all three fields.
+    #[test]
+    fn build_ll_newrangest_helper_graph_guards_zero_step_then_mallocs() {
+        let ptr = AbstractRangeRepr::new(0).unwrap().lowleveltype().clone();
+        let g = build_ll_newrangest_helper_graph("ll_newrangest", ptr).unwrap();
+        let inner = g.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["int_eq"]);
+        assert!(startblock.exitswitch.is_some());
+        // One exit raises ValueError (links to exceptblock), the other builds.
+        let mut raise_links = 0usize;
+        let mut build_target = None;
+        for link in startblock.exits.iter() {
+            let target = link.borrow().target.clone().unwrap();
+            if std::rc::Rc::ptr_eq(&target, &inner.exceptblock) {
+                raise_links += 1;
+            } else {
+                build_target = Some(target);
+            }
+        }
+        assert_eq!(raise_links, 1, "expected one ValueError-raising link");
+        let build = build_target.expect("expected a build block");
+        let build_block = build.borrow();
+        let build_ops: Vec<&str> = build_block
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            build_ops,
+            vec!["malloc", "setfield", "setfield", "setfield"]
+        );
     }
 
     /// `make_iterator_repr` mints a `RangeIteratorRepr` whose lowleveltype
