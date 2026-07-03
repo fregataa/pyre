@@ -6352,96 +6352,42 @@ fn collect_outer_active_boxes(
     // `semantic_ref_slot_for_reg_color`, read the vable shadow for
     // portal-owner frames, and route the two portal red regs through
     // `sym.frame` / `sym.execution_context` directly.
-    let (
-        nlocals,
-        valid_stack_only,
-        owns_vable,
-        local_color_map,
-        portal_stack_color_map,
-        portal_live_locals,
-        portal_frame_reg,
-        portal_ec_reg,
-    ) = if sym.jitcode.is_null() {
-        (
-            0usize,
-            0usize,
-            false,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            u16::MAX,
-            u16::MAX,
-        )
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode;
-            let payload = &jc.payload;
-            // A portal-bridge install leaves `pcdep_color_slots` empty by
-            // design (keyed off by `is_portal_bridge()`), so its color→slot
-            // inversion has no per-PC source and must keep flowing through the
-            // flat identity maps — the pre-#348 path. The non-portal common
-            // case is covered by `pcdep_opt` below, so its flat-map inputs stay
-            // empty (the #348 drain). Computing the liveness-derived
-            // `live_locals` only for portals preserves that drain.
-            let is_portal = payload.is_portal_bridge();
-            let (portal_stack_color_map, portal_live_locals, stack_depth_at_pc) =
-                if payload.code_ptr.is_null() {
-                    (Vec::new(), Vec::new(), 0usize)
+    let (nlocals, valid_stack_only, owns_vable, portal_frame_reg, portal_ec_reg) =
+        if sym.jitcode.is_null() {
+            (0usize, 0usize, false, u16::MAX, u16::MAX)
+        } else {
+            unsafe {
+                let jc = &*sym.jitcode;
+                let payload = &jc.payload;
+                // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
+                // liveness banks (`frame_liveness_reg_indices_by_bank_at`) are
+                // read at that py_pc, so the per-PC color→slot window
+                // (`pcdep_opt`'s stack clamp below) must be the depth at that
+                // py_pc too — NOT `sym.valuestackdepth` (the walker's *current*
+                // position).  For the per-opcode entry caller the two coincide,
+                // but a guard resuming at a not-taken branch target with a kept
+                // operand-stack temp (conditional expr / short-circuit / chained
+                // compare, #124/#281) resumes at a py_pc whose depth `> 0` while
+                // the walker stands at depth 0 — using the current depth there
+                // drops the kept temp's semantic slot, corrupting the frame.
+                let stack_depth_at_pc = if payload.code_ptr.is_null() {
+                    0usize
                 } else {
-                    let live_vars = crate::liveness::liveness_for(payload.code_ptr);
-                    // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
-                    // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
-                    // are read at that py_pc, so the per-PC color→slot window
-                    // (`pcdep_opt`'s stack clamp below) must be the depth at
-                    // that py_pc too — NOT `sym.valuestackdepth` (the walker's
-                    // *current* position).  For the per-opcode entry caller the
-                    // two coincide, but a guard resuming at a not-taken branch
-                    // target with a kept operand-stack temp (conditional expr /
-                    // short-circuit / chained compare, #124/#281) resumes at a
-                    // py_pc whose depth `> 0` while the walker stands at depth
-                    // 0 — using the current depth there drops the kept temp's
-                    // semantic slot, corrupting the resumed frame.
-                    let depth = live_vars
+                    crate::liveness::liveness_for(payload.code_ptr)
                         .depth_at_py_pc()
                         .get(entry_py_pc as usize)
                         .copied()
-                        .unwrap_or(0) as usize;
-                    let (stack_color_map, live_locals) = if is_portal {
-                        let live_locals = (0..sym.nlocals)
-                            .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
-                            .collect::<Vec<usize>>();
-                        // #73: recompute the portal stack color map from its
-                        // defining formula instead of reading the flat
-                        // `stack_slot_color_map` field. A portal install
-                        // (`install_portal_for`) runs no regalloc, so the color
-                        // of stack slot `d` is its own PyFrame index
-                        // `stack_base + d` (`stack_base = nlocals + ncells`) —
-                        // byte-identical to the stored map. Draining this reader
-                        // moves the field one step closer to removal.
-                        let code = &*payload.code_ptr;
-                        let stack_base =
-                            code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-                        let scm: Vec<u16> = (0..code.max_stackdepth as u16)
-                            .map(|d| stack_base as u16 + d)
-                            .collect();
-                        (scm, live_locals)
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
-                    (stack_color_map, live_locals, depth)
+                        .unwrap_or(0) as usize
                 };
-            (
-                sym.nlocals,
-                stack_depth_at_pc,
-                sym.owns_virtualizable_shadow(),
-                payload.metadata.pyre_color_for_semantic_local.clone(),
-                portal_stack_color_map,
-                portal_live_locals,
-                payload.metadata.portal_frame_reg,
-                payload.metadata.portal_ec_reg,
-            )
-        }
-    };
+                (
+                    sym.nlocals,
+                    stack_depth_at_pc,
+                    sym.owns_virtualizable_shadow(),
+                    payload.metadata.portal_frame_reg,
+                    payload.metadata.portal_ec_reg,
+                )
+            }
+        };
     // #348: per-PC color→slot entries at the snapshot PC — the color→slot source
     // the inversions below consult for every drained (non-portal) jitcode, the
     // per-program-point color space the `-live-` markers carry. Branch-guard
@@ -6450,10 +6396,9 @@ fn collect_outer_active_boxes(
     // resume snapshot records Variables only), so `semantic_ref_slot_for_reg_color`
     // returns `None` and the live color falls to the `regs_r[color]` walk-bank
     // read below. Portal-bridge frames carry no `pcdep` entry (empty by install),
-    // so for them `pcdep_opt` is `None` and the flat identity
-    // `portal_stack_color_map` / `portal_live_locals` (empty for non-portal) carry
-    // the inversion instead; `local_color_map` (`pyre_color_for_semantic_local`)
-    // backs the function's local-position scan on that path.
+    // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
+    // returns `None`, and every live color falls to the `regs_r[color]`
+    // walk-bank read.
     let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
         Vec::new()
     } else {
@@ -6566,10 +6511,7 @@ fn collect_outer_active_boxes(
                     let s = crate::state::semantic_ref_slot_for_reg_color(
                         nlocals,
                         valid_stack_only,
-                        &local_color_map,
-                        &portal_stack_color_map,
-                        &portal_live_locals,
-                        pcdep_opt,
+                        pcdep_opt.unwrap_or(&[]),
                         c as usize,
                     )?;
                     (s >= nlocals).then_some((s, c))
@@ -6610,10 +6552,7 @@ fn collect_outer_active_boxes(
                 let Some(s) = crate::state::semantic_ref_slot_for_reg_color(
                     nlocals,
                     valid_stack_only,
-                    &local_color_map,
-                    &portal_stack_color_map,
-                    &portal_live_locals,
-                    pcdep_opt,
+                    pcdep_opt.unwrap_or(&[]),
                     c as usize,
                 ) else {
                     continue;
@@ -6659,10 +6598,7 @@ fn collect_outer_active_boxes(
             if let Some(sem) = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
                 valid_stack_only,
-                &local_color_map,
-                &portal_stack_color_map,
-                &portal_live_locals,
-                pcdep_opt,
+                pcdep_opt.unwrap_or(&[]),
                 color,
             ) {
                 if sem >= nlocals {
@@ -6699,10 +6635,7 @@ fn collect_outer_active_boxes(
         let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
             nlocals,
             valid_stack_only,
-            &local_color_map,
-            &portal_stack_color_map,
-            &portal_live_locals,
-            pcdep_opt,
+            pcdep_opt.unwrap_or(&[]),
             color,
         );
         // Portal-red routing applies only to the force-alived SCRATCH case
@@ -9887,102 +9820,41 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 }
             };
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
-                let (depth, stack_color_map) = unsafe {
+                let depth = unsafe {
                     let jc = &*sym.jitcode;
                     if jc.payload.code_ptr.is_null() {
-                        (0usize, Vec::new())
+                        0usize
                     } else {
-                        let d = crate::liveness::liveness_for(jc.payload.code_ptr)
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
                             .depth_at_py_pc()
                             .get(py_pc as usize)
                             .copied()
-                            .unwrap_or(0) as usize;
-                        (d, jc.payload.metadata.stack_slot_color_map.clone())
+                            .unwrap_or(0) as usize
                     }
                 };
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 let nlocals = sym.nlocals;
-                // #420: a kept slot whose merge color the not-taken edge fills
-                // reads stale in `registers_r` at the guard; the branch handler
-                // decoded the edge's `ref_copy` moves into `(merge color ->
-                // live guard value)`.  Prefer that recovered value so the vable
-                // shadow (the authoritative deopt restore) carries the exact
-                // kept operand, not the stale merge-color read.
-                let recovered: Vec<(u16, OpRef)> =
-                    BRANCH_GUARD_KEPT_RECOVERED.with(|c| c.borrow().clone());
-                // #73 (SLICE 1) PyPy-faithful kept-stack source — MEASUREMENT
-                // HARNESS, fully INERT by default.  The legacy read
-                // (`registers_r[stack_slot_color_map[s]]` + #420 recovered
-                // patch) is unreliable in loop traces: loop-carried slots are
-                // renamed to inputarg colors and chordal coloring reuses
-                // colors, so a static-color read can return a stale / reused
-                // box.  The walk-level operand-stack box mirror
+                // #73: the walk-level operand-stack box mirror
                 // (`ctx.vstack_boxes[s]`, maintained per-op by
                 // `step_vstack_mirror`) is the analog of PyPy
-                // `MIFrame.registers_r` valuestack array.
-                //
-                // The mirror is the primary source for every slot `0..depth`;
-                // a slot the mirror does not cover (invalid mirror, slot beyond
-                // the mirror, or an Int-bank temp the Ref-only mirror leaves
-                // NONE) falls back to the legacy `registers_r[stack_color_map]`
-                // read, gated behind `ctx.vstack_valid`.  `PYRE_VSTACK_DIAG`
-                // logs every slot where the mirror disagrees with the legacy
-                // read (read-only — never changes the value used).
-                let vstack_diag = std::env::var_os("PYRE_VSTACK_DIAG").is_some();
-                // Iterate the FULL resume depth, not just
-                // `depth.min(stack_color_map.len())`.  The mirror is the
-                // primary source for every slot `0..depth`, so a slot beyond
-                // the (possibly shorter) static color map is still covered; a
-                // slot with no mirror box and no color reads NONE and is
-                // filtered out below.
+                // `MIFrame.registers_r` and the sole kept-stack source at a
+                // branch guard.  The retired flat `stack_slot_color_map` read
+                // (`registers_r[color]` plus the #420 edge-move recovery) was
+                // unreliable in loop traces: loop-carried slots are renamed to
+                // inputarg colors and chordal coloring reuses colors, so a
+                // static-color read returned a stale / reused box (the #424
+                // merge-color staleness).  Dropping it was proven redundant —
+                // force-off byte-identical on 37/169 corpus benches on both
+                // backends — so a slot the mirror does not cover (invalid
+                // mirror, slot beyond the mirror, or an Int-bank temp the
+                // Ref-only mirror leaves NONE) is simply omitted; resume
+                // re-materializes it rather than reading the flat color.
                 (0..depth)
                     .filter_map(|s| {
-                        // Legacy read: only defined for slots the static color
-                        // map covers; beyond it there is no legacy source.
-                        let color = stack_color_map.get(s).copied();
-                        let legacy = color.map_or(OpRef::NONE, |color| {
-                            recovered
-                                .iter()
-                                .find(|&&(dst, _)| dst == color)
-                                .map(|&(_, v)| v)
-                                .unwrap_or_else(|| {
-                                    ctx.registers_r
-                                        .get(color as usize)
-                                        .copied()
-                                        .unwrap_or(OpRef::NONE)
-                                })
-                        });
-                        // The mirror value for slot `s`, when the mirror is
-                        // valid and covers this depth.
-                        let mirror = if ctx.vstack_valid {
-                            ctx.vstack_boxes.get(s).copied()
+                        let v = if ctx.vstack_valid {
+                            ctx.vstack_boxes.get(s).copied().unwrap_or(OpRef::NONE)
                         } else {
-                            None
-                        };
-                        if vstack_diag {
-                            match mirror {
-                                Some(m) if m != legacy => eprintln!(
-                                    "[vstack-diag] py_pc={py_pc} slot={s} color={color:?} \
-                                     legacy={legacy:?} mirror={m:?} \
-                                     vstack_depth={} vstack_valid={}",
-                                    ctx.vstack_depth, ctx.vstack_valid
-                                ),
-                                Some(_) => {}
-                                None => eprintln!(
-                                    "[vstack-diag] py_pc={py_pc} slot={s} color={color:?} \
-                                     legacy={legacy:?} mirror=NONE(valid={})",
-                                    ctx.vstack_valid
-                                ),
-                            }
-                        }
-                        // PRIMARY: the mirror for every slot `0..depth`.  Fall
-                        // back to legacy only when the mirror lacks a box for
-                        // this slot (mirror invalid, slot beyond the mirror, or
-                        // a slot the mirror left NONE — e.g. an Int-bank stack
-                        // temp the Ref-only mirror does not hold).
-                        let v = match mirror {
-                            Some(m) if m != OpRef::NONE => m,
-                            _ => legacy,
+                            OpRef::NONE
                         };
                         if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
                             Some((nvs + nlocals + s, v))
@@ -10331,8 +10203,12 @@ fn walker_capture_multi_frame_inline_snapshot(
         py
     };
     if std::env::var_os("PYRE_FBW_MF_DIAG").is_some() {
-        let local_cm = crate::state::local_slot_color_map_at(callee_jitcode_index as i32);
-        let stack_cm = crate::state::stack_slot_color_map_at(callee_jitcode_index as i32);
+        let pcdep = callee_pjc
+            .metadata
+            .pcdep_color_slots
+            .get(callee_py_pc as usize)
+            .cloned()
+            .unwrap_or_default();
         let depth = callee_pjc
             .metadata
             .depth_at_py_pc
@@ -10346,7 +10222,7 @@ fn walker_capture_multi_frame_inline_snapshot(
         eprintln!(
             "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
              py_pc={callee_py_pc} after_residual={after_residual_call} depth={depth} \
-             local_color_map={local_cm:?} stack_color_map={stack_cm:?}"
+             pcdep_color_slots={pcdep:?}"
         );
         eprintln!(
             "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",
@@ -12150,16 +12026,23 @@ fn try_walker_inline_user_call(
     // param registers with their concrete shadow (mirror of
     // `dispatch_inline_call_dr_kind`).  The canonical splice regalloc does
     // not pin local-i inputargs to identity colors, so the register the
-    // body reads param i from is `pyre_color_for_semantic_local[i]`, not
-    // `r{i}`; an empty map (portal-bridge install) is identity.
-    let param_colors = crate::state::sub_jitcode_param_colors_for_code(w_code);
+    // body reads param i from is its per-PC pcdep color at the callee entry
+    // (`pcdep_color_slots[0]`), not `r{i}`; an empty map (portal-bridge
+    // install) is identity.
+    let entry_colors = crate::state::sub_jitcode_entry_param_colors(w_code);
     for i in 0..nparams {
-        let reg = match &param_colors {
-            Some(colors) if !colors.is_empty() => match colors.get(i) {
-                Some(&c) => c as usize,
-                None => return Ok(None),
+        let reg = match &entry_colors {
+            // Colored jitcode: seed param `i` at the register it occupies at
+            // the callee entry PC.  A param dead at entry carries no entry
+            // color — the body never reads it, so skip seeding rather than
+            // clobber a live register.
+            Some(entries) => match entries.iter().find(|&&(_, slot)| slot as usize == i) {
+                Some(&(color, _)) => color as usize,
+                None => continue,
             },
-            _ => i,
+            // Portal / skeleton install (empty `pcdep_color_slots`): colors
+            // are slot-identity, so param `i` lives in register `i`.
+            None => i,
         };
         if reg >= callee_regs_r.len() {
             return Ok(None);
@@ -18668,9 +18551,13 @@ fn handle(
                 // snapshot is 100% mirror-sourced with no legacy fallback.  This
                 // bypasses the kept-stack declines below (whose purpose is
                 // precisely the unreliable legacy resume the mirror replaces).
-                // When the mirror does NOT cover a kept slot (invalid mirror,
-                // Int-bank temp, inline sub-walk) `mirror_covers_kept` is
-                // `false` and the conservative declines below still fire.
+                // When the mirror does NOT cover a kept slot,
+                // `mirror_covers_kept` is `false` and the hazard checks below
+                // still run — but with the flat maps deleted they decline only
+                // for an unrestorable-Ref arm (Hazard 1) or an INVALID mirror
+                // (undermodeled walk); a VALID mirror with a NONE hole (an
+                // edge-materialized merge temp) compiles, its slot sourced from
+                // the decoded trampoline recovery (`resolved_recovered`).
                 let mirror_covers_kept = ctx.vstack_valid
                     && resume_depth.is_some_and(|d| {
                         (0..d).all(|s| {
@@ -18807,43 +18694,46 @@ fn handle(
                     };
                     // Hazard (2): the not-taken edge carries `ref_copy` renames
                     // (`kept_recovered` non-empty) — the #416/#420 short-circuit
-                    // / chained-comparison kept-stack recovery.  That recovery
-                    // re-uses ONE register's snapshot value for the kept slot,
-                    // but the two branch arms produce DIFFERENT values there; it
-                    // happens to work only when the not-taken arm re-materializes
-                    // the value in-arm (a small-int `c`-immediate `w_int_new`).
-                    // A heap int constant (`< 0` or `>= 256`) is pre-built and
-                    // hoisted as a loop-invariant the arm does NOT re-materialize,
-                    // so the recovery reconstructs a WRONG value — the boxed-int
-                    // short-circuit silent miscompile (`((i & 1) and 1000000)`).
-                    // The boxed vs small distinction is not recoverable at record
-                    // time (the const is dedup'd with the loop bound, never read
-                    // directly by the resume arm — it would need the
-                    // symbolic-valuestack capture of #73/#124), so decline the
-                    // whole recovery path: correct, matching the pre-#416 decline.
-                    // Conditional expressions carry no edge rename (empty
-                    // `kept_recovered`) and keep compiling.
-                    let uses_edge_recovery = kept_recovered
-                        .as_deref()
-                        .is_some_and(|moves| !moves.is_empty());
+                    // / chained-comparison kept-stack recovery.  Historically the
+                    // recovery read the flat merge-color register file, which
+                    // could return a stale reused box for a hoisted heap-int
+                    // constant (the `((i & 1) and 1000000)` silent miscompile).
+                    // With the flat maps deleted the capture is per-slot: a
+                    // VALID walk mirror sources every on-stack kept slot, and an
+                    // edge-materialized merge slot resolves through the decoded
+                    // `(dst, src)` trampoline against the guard-pc register file
+                    // (`resolved_recovered`) — verified byte-exact against the
+                    // declined-interpreter oracle across the 599-program
+                    // adversarial corpus (#73 kept-stack census, incl. the
+                    // heap-int short-circuit / conditional-expression repros).
+                    // The hazard remains only for an UNDERMODELED walk (invalid
+                    // mirror: inline sub-walk / Unmodeled opcode), where those
+                    // per-slot sources are unavailable and forcing the recovery
+                    // through miscompiles (nested and/or under an inline
+                    // sub-walk).
+                    let uses_edge_recovery = !ctx.vstack_valid
+                        && kept_recovered
+                            .as_deref()
+                            .is_some_and(|moves| !moves.is_empty());
                     // Hazard (3): a kept operand-stack slot itself holds a heap
                     // int outside the 1-byte immediate range `[0, 256)` (the
-                    // accumulator in `acc += (x if c else y)`).  A kept-stack
-                    // branch guard resumes MID-jitcode; the blackhole rebuilds
-                    // that slot from the guard's resume snapshot, but a hoisted
-                    // boxed-int slot is reconstructed with a WRONG / NULL value
-                    // (the conditional-expression boxed-int crash, e.g.
-                    // `257 if (i < 1000000) else 3` where the optimizer folds
-                    // the always-true guard yet leaves a stale resume coord).
-                    // A cached small int (`0..=255`) re-materializes losslessly,
-                    // so a small-int kept slot stays restorable and keeps
-                    // compiling.  Whether the boxed slot's restore happens to
-                    // succeed depends on optimizer guard-folding the record does
-                    // not see, so decline whenever a kept slot is a boxed int —
-                    // correct (interpreter), matching the pre-#416 decline.
-                    let kept_boxed_int = gate_frame.as_ref().is_some_and(|f| {
-                        kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
-                    });
+                    // accumulator in `acc += (x if c else y)`).  Historically the
+                    // guard's resume snapshot rebuilt such a slot through the
+                    // flat merge-color maps and could deliver a WRONG / NULL box
+                    // (the conditional-expression boxed-int crash).  As with
+                    // Hazard (2), the per-slot capture that replaced the flat
+                    // maps restores boxed-int kept slots faithfully whenever the
+                    // walk mirror is VALID (corpus-verified against the declined
+                    // oracle), so the hazard is scoped to the undermodeled
+                    // invalid-mirror walk.
+                    let kept_boxed_int = !ctx.vstack_valid
+                        && gate_frame.as_ref().is_some_and(|f| {
+                            kept_stack_has_boxed_int_hazard(
+                                f,
+                                other_target,
+                                ctx.concrete_registers_r,
+                            )
+                        });
                     // A not-taken arm resuming at an exception-handler-protected
                     // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
                     // Ref) on its operand stack; the handler-entry mirror reseed
@@ -18857,13 +18747,16 @@ fn handle(
                         });
                     }
                 }
-                // A depth > 1 kept operand stack is recoverable on resume only
-                // from the symbolic-valuestack mirror (`mirror_covers_kept`).  When
-                // the mirror is invalid (an undermodeled walk: inline sub-walk /
-                // Unmodeled opcode), the kept slots have no reliable per-slot
-                // source, so decline → interpreter (correct).  `PYRE_RELAX_124`
-                // forces depth > 1 through for diagnosis.
-                if depth_gt_1 && !relax_124 && !mirror_covers_kept {
+                // A depth > 1 kept operand stack is recoverable on resume from
+                // the per-slot sources of a VALID walk mirror: every on-stack
+                // kept slot from `ctx.vstack_boxes`, and an edge-materialized
+                // merge slot (a NONE hole in an otherwise valid mirror) from the
+                // decoded trampoline recovery (`resolved_recovered`).  Only an
+                // INVALID mirror (an undermodeled walk: inline sub-walk /
+                // Unmodeled opcode) leaves the kept slots without a reliable
+                // per-slot source, so decline → interpreter (correct).
+                // `PYRE_RELAX_124` forces depth > 1 through for diagnosis.
+                if depth_gt_1 && !relax_124 && !ctx.vstack_valid {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);

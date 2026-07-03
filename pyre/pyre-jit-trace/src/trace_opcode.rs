@@ -1576,41 +1576,14 @@ impl MIFrame {
         // pyjitpl.py:194-198 — pre_opcode_registers_r is captured at orgpc
         // and would mis-size live_max for the fallthrough_pc resume.
         let portal_live_vsd = self.portal_bridge_vable_vsd(live_pc).map(|d| d as usize);
-        let (
-            nlocals,
-            valid_stack_only,
-            jitcode_ptr,
-            local_color_map,
-            stack_slot_color_map,
-            live_local_indices,
-            is_portal_bridge,
-            pcdep_entries,
-        ) = {
+        let (nlocals, valid_stack_only, jitcode_ptr, is_portal_bridge, pcdep_entries) = {
             let s = self.sym();
-            let (
-                local_color_map,
-                stack_slot_color_map,
-                live_local_indices,
-                is_portal_bridge,
-                metadata_stack_depth,
-                pcdep_entries,
-            ) = if s.jitcode.is_null() {
-                (Vec::new(), Vec::new(), Vec::new(), false, None, Vec::new())
+            let (is_portal_bridge, metadata_stack_depth, pcdep_entries) = if s.jitcode.is_null() {
+                (false, None, Vec::new())
             } else {
                 unsafe {
                     let jc = &*s.jitcode;
-                    let live_local_indices = if jc.payload.code_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        let live_vars = crate::liveness::liveness_for(jc.payload.code_ptr);
-                        (0..s.nlocals)
-                            .filter(|&idx| live_vars.is_local_live(live_pc, idx))
-                            .collect()
-                    };
                     (
-                        jc.payload.metadata.pyre_color_for_semantic_local.clone(),
-                        jc.payload.metadata.stack_slot_color_map.clone(),
-                        live_local_indices,
                         jc.payload.is_portal_bridge(),
                         jc.payload
                             .metadata
@@ -1639,9 +1612,6 @@ impl MIFrame {
                 s.nlocals,
                 valid_stack_only,
                 s.jitcode,
-                local_color_map,
-                stack_slot_color_map,
-                live_local_indices,
                 is_portal_bridge,
                 pcdep_entries,
             )
@@ -1674,10 +1644,7 @@ impl MIFrame {
                 crate::state::semantic_ref_slot_for_reg_color(
                     nlocals,
                     valid_stack_only,
-                    &local_color_map,
-                    &stack_slot_color_map,
-                    &live_local_indices,
-                    pcdep_opt,
+                    pcdep_opt.unwrap_or(&[]),
                     color_idx,
                 )
             }) else {
@@ -1873,10 +1840,21 @@ impl MIFrame {
                             let color_idx_opt = if is_portal_bridge {
                                 Some(abs_idx)
                             } else {
-                                stack_slot_color_map
-                                    .get(result_idx)
-                                    .copied()
-                                    .map(|c| c as usize)
+                                // #73: the not-yet-produced call result is not a
+                                // live Variable at the resume PC, so it carries no
+                                // `pcdep_color_slots` entry; its color comes from
+                                // the precomputed `result_color_at_pc` table (the
+                                // `_result_argcode` analog, same source as
+                                // `compute_inline_caller_frame`). `live_pc` is the
+                                // fallthrough pc here (`in_a_call`), where the
+                                // result slot is the top of stack. `u16::MAX` =
+                                // empty stack / skeleton, skip the bank null.
+                                (!jitcode_ptr.is_null())
+                                    .then(|| unsafe { &*jitcode_ptr })
+                                    .and_then(|jc| {
+                                        jc.payload.metadata.result_color_at_pc.get(live_pc).copied()
+                                    })
+                                    .and_then(|c| (c != u16::MAX).then_some(c as usize))
                             };
                             if let Some(color_idx) = color_idx_opt {
                                 if color_idx >= registers_r_bank.len() {
@@ -2077,10 +2055,7 @@ impl MIFrame {
                     && crate::state::semantic_ref_slot_for_reg_color(
                         nlocals,
                         valid_stack_only,
-                        &local_color_map,
-                        &stack_slot_color_map,
-                        &live_local_indices,
-                        pcdep_opt,
+                        pcdep_opt.unwrap_or(&[]),
                         reg_idx as usize,
                     )
                     .is_none();
@@ -9915,8 +9890,14 @@ mod tests {
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         pyjit.metadata.depth_at_py_pc.push(1);
-        pyjit.metadata.pyre_color_for_semantic_local = vec![0, 1];
-        pyjit.metadata.stack_slot_color_map = vec![0];
+        // Per-PC (color, slot) entries the codewriter publishes at pc 0:
+        // local 0 -> color 0 (slot 0), local 1 -> color 1 (slot 1), and the
+        // live operand-stack slot (depth 0 = abs slot nlocals+0 = 2) -> color
+        // 0, reusing dead local 0's color. Sorted by (color, slot).
+        pyjit
+            .metadata
+            .pcdep_color_slots
+            .push(vec![(0, 0), (0, 2), (1, 1)]);
         let inner_jc = crate::state::JitCode {
             index: 0,
             payload: Arc::new(pyjit),
