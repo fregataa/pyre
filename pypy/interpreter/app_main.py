@@ -1144,7 +1144,13 @@ def run_command_line(interactive,
                 # make sure we quit with the right process exit code on
                 # receiving a SIGINT
                 _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
-                os.kill(os.getpid(), _signal.SIGINT);
+                if sys.platform == 'win32':
+                    # On Windows, os.kill(SIGINT) calls TerminateProcess with
+                    # exit code 2.  Using C raise() with SIG_DFL restored lets
+                    # the MSVC runtime exit with STATUS_CONTROL_C_EXIT instead.
+                    _signal.raise_signal(_signal.SIGINT)
+                else:
+                    os.kill(os.getpid(), _signal.SIGINT)
                 assert 0, "should be unreachable"
     else:
         status = not success

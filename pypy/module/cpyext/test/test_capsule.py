@@ -36,14 +36,12 @@ class AppTestCapsule(AppTestCpythonExtensionBase):
             PyObject *object;
             const char *error = NULL;
             char *known = "known";
-            PyObject *gc_module = PyImport_ImportModule("gc");
-            PyObject *collect = PyObject_GetAttrString(gc_module, "collect");
         #define FAIL(x) { error = (x); goto exit; }
 
         #define CHECK_DESTRUCTOR                        \\
-            PyObject_CallFunction(collect, NULL);       \\
-            PyObject_CallFunction(collect, NULL);       \\
-            PyObject_CallFunction(collect, NULL);       \\
+            PyGC_Collect();                             \\
+            PyGC_Collect();                             \\
+            PyGC_Collect();                             \\
             if (capsule_error) {                        \\
                 FAIL(capsule_error);                    \\
             }                                           \\
@@ -88,8 +86,6 @@ class AppTestCapsule(AppTestCpythonExtensionBase):
             }
 
           exit:
-            Py_DECREF(gc_module);
-            Py_DECREF(collect);
             if (error) {
                 PyErr_Format(PyExc_RuntimeError, "test_capsule: %s", error);
                 return NULL;
@@ -124,14 +120,7 @@ class AppTestCapsule(AppTestCpythonExtensionBase):
                 }
                 """
                 )
-        import gc
-        # make the calls to `collect` in C reach the `debug_collect` mock function
-        _collect = gc.collect
-        gc.collect = self.debug_collect
-        try:
-            module.test_capsule()
-        finally:
-            gc.collect = _collect
+        module.test_capsule()
 
     def test_capsule_destructor_via_gc_collect(self):
         # Like test_capsule_set but the C code calls PyGC_Collect() directly

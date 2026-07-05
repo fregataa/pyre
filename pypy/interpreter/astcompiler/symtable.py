@@ -803,3 +803,10 @@ class SymtableBuilder(ast.GenericASTVisitor):
     def visit_MatchStar(self, match_star):
         if match_star.name:
             self.note_symbol(match_star.name, SYM_ASSIGNED, match_star)
+
+    def visit_MatchMapping(self, match_mapping):
+        self.visit_sequence(match_mapping.keys)
+        self.visit_sequence(match_mapping.patterns)
+        if match_mapping.rest:
+            self.note_symbol(match_mapping.rest, SYM_ASSIGNED, match_mapping)
+

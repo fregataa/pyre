@@ -116,9 +116,14 @@ def test_socket_connect():
         pytest.skip("GAIError - probably no connection: %s" % str(ex.args))
     except ConnectionRefusedError as ex:
         pytest.skip("Connection Refused - probably no connection: %s" % str(ex.args))
-    name = s.getpeername() # Will raise socket.error if not connected
-    assert name[1] == 80
-    s.close()
+    else:
+        name = s.getpeername() # Will raise socket.error if not connected
+        assert name[1] == 80
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 def test_socket_connect_ex():
     import _socket
@@ -126,8 +131,10 @@ def test_socket_connect_ex():
     # The following might fail if the DNS redirects failed requests to a
     # catch-all address (i.e. opendns).
     # Make sure we get an app-level error, not an interp one.
-    pytest.raises(_socket.gaierror, s.connect_ex, ("wrong.invalid", 80))
-    s.close()
+    try:
+        pytest.raises(_socket.gaierror, s.connect_ex, ("wrong.invalid", 80))
+    finally:
+        s.close()
 
 def test_socket_connect_typeerrors():
     tests = [
@@ -139,20 +146,25 @@ def test_socket_connect_typeerrors():
     ]
     import _socket
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM, 0)
-    for args in tests:
-        pytest.raises((TypeError, ValueError), s.connect, args)
-    s.close()
+    try:
+        for args in tests:
+            pytest.raises((TypeError, ValueError), s.connect, args)
+    finally:
+        s.close()
 
 def test_bigport():
     import _socket
     s = _socket.socket()
-    exc = pytest.raises(OverflowError, s.connect, ("localhost", -1))
-    assert "port must be 0-65535." in str(exc.value)
-    exc = pytest.raises(OverflowError, s.connect, ("localhost", 1000000))
-    assert "port must be 0-65535." in str(exc.value)
-    s = _socket.socket(_socket.AF_INET6)
-    exc = pytest.raises(OverflowError, s.connect, ("::1", 1234, 1048576))
-    assert "flowinfo must be 0-1048575." in str(exc.value)
+    try:
+        exc = pytest.raises(OverflowError, s.connect, ("localhost", -1))
+        assert "port must be 0-65535." in str(exc.value)
+        exc = pytest.raises(OverflowError, s.connect, ("localhost", 1000000))
+        assert "port must be 0-65535." in str(exc.value)
+        s = _socket.socket(_socket.AF_INET6)
+        exc = pytest.raises(OverflowError, s.connect, ("::1", 1234, 1048576))
+        assert "flowinfo must be 0-1048575." in str(exc.value)
+    finally:
+        s.close()
 
 def test_NtoH():
     import _socket as socket
@@ -174,54 +186,56 @@ def test_NtoH():
         if size > 16:    # else, values too large are ignored
             pytest.raises(OverflowError, func, 2 ** size)
 
-def test_newsocket():
-    import _socket
-    s = _socket.socket()
-
 def test_subclass():
     from _socket import socket
     class MySock(socket):
         blah = 123
     s = MySock()
-    assert s.blah == 123
+    try:
+        assert s.blah == 123
+    finally:
+        s.close()
 
 def test_getsetsockopt():
     import _socket as socket
     import struct
     # A socket should start with reuse == 0
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    reuse = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
-    assert reuse == 0
-    #
-    pytest.raises(TypeError, s.setsockopt, socket.SOL_SOCKET,
-                      socket.SO_REUSEADDR, 2 ** 31)
-    pytest.raises(TypeError, s.setsockopt, socket.SOL_SOCKET,
-                      socket.SO_REUSEADDR, 2 ** 32 + 1)
-    assert s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
-    #
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    reuse = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
-    assert reuse != 0
-    # String case
-    intsize = struct.calcsize('i')
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    reusestr = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,
-                            intsize)
-    (reuse,) = struct.unpack('i', reusestr)
-    assert reuse == 0
-    reusestr = struct.pack('i', 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, reusestr)
-    reusestr = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,
-                            intsize)
-    (reuse,) = struct.unpack('i', reusestr)
-    assert reuse != 0
-    # try to call setsockopt() with a buffer argument
-    reusestr = struct.pack('i', 0)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, memoryview(reusestr))
-    reusestr = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,
-                            intsize)
-    (reuse,) = struct.unpack('i', reusestr)
-    assert reuse == 0
+    try:
+        reuse = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+        assert reuse == 0
+        #
+        pytest.raises(TypeError, s.setsockopt, socket.SOL_SOCKET,
+                          socket.SO_REUSEADDR, 2 ** 31)
+        pytest.raises(TypeError, s.setsockopt, socket.SOL_SOCKET,
+                          socket.SO_REUSEADDR, 2 ** 32 + 1)
+        assert s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        #
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reuse = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+        assert reuse != 0
+        # String case
+        intsize = struct.calcsize('i')
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        reusestr = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,
+                                intsize)
+        (reuse,) = struct.unpack('i', reusestr)
+        assert reuse == 0
+        reusestr = struct.pack('i', 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, reusestr)
+        reusestr = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,
+                                intsize)
+        (reuse,) = struct.unpack('i', reusestr)
+        assert reuse != 0
+        # try to call setsockopt() with a buffer argument
+        reusestr = struct.pack('i', 0)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, memoryview(reusestr))
+        reusestr = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,
+                                intsize)
+        (reuse,) = struct.unpack('i', reusestr)
+        assert reuse == 0
+    finally:
+        s.close()
 
 def test_getsetsockopt_zero():
     # related to issue #2561: when specifying the buffer size param:
@@ -845,3 +859,116 @@ def test_errno():
     # error is EINVAL, or WSAEINVAL on Windows
     assert exc.value.errno == getattr(errno, 'WSAEINVAL', errno.EINVAL)
     assert isinstance(exc.value.strerror, str)
+
+def test_create_alg():
+    import _socket
+    if not hasattr(_socket, 'AF_ALG'):
+        pytest.skip('No AF_ALG on this platform')
+    for typ, name in (("hash", "sha256"),):
+        try:
+            sock = _socket.socket(_socket.AF_ALG, _socket.SOCK_SEQPACKET, 0)
+            try:
+                # should not raise 
+
+                sock.bind((typ, name))
+            except FileNotFoundError as e:
+                # type / algorithm is not available
+                pass
+            sock.close()
+        finally:
+            sock.close()
+        
+
+def test_create_qipcrtr():
+    import _socket
+    if not hasattr(_socket, 'AF_QIPCRTR'):
+        pytest.skip('No AF_QIPCRTR on this platform')
+    try:
+        sock = _socket.socket(_socket.AF_QIPCRTR, _socket.SOCK_DGRAM)
+        assert sock.getsockname()[1] == 0
+        sock.bind((sock.getsockname()[0], 0))
+        assert sock.getsockname()[1] != 0
+    finally:
+        sock.close()
+
+
+def _alg_skip_if_unavailable():
+    import _socket
+    if not hasattr(_socket, 'AF_ALG'):
+        pytest.skip('No AF_ALG on this platform')
+
+
+def _alg_create(typ, name):
+    import _socket
+    sock = _socket.socket(_socket.AF_ALG, _socket.SOCK_SEQPACKET, 0)
+    try:
+        sock.bind((typ, name))
+    except FileNotFoundError as e:
+        sock.close()
+        pytest.skip('algorithm not available: %s/%s: %s' % (typ, name, e))
+    return sock
+
+
+def test_sendmsg_afalg_args():
+    import _socket
+    _alg_skip_if_unavailable()
+    sock = _socket.socket(_socket.AF_ALG, _socket.SOCK_SEQPACKET, 0)
+    try:
+        with pytest.raises(TypeError):
+            sock.sendmsg_afalg()
+        with pytest.raises(TypeError):
+            sock.sendmsg_afalg(op=None)
+        with pytest.raises(TypeError):
+            sock.sendmsg_afalg(1)
+        with pytest.raises(TypeError):
+            sock.sendmsg_afalg(op=_socket.ALG_OP_ENCRYPT, assoclen=None)
+        with pytest.raises(TypeError):
+            sock.sendmsg_afalg(op=_socket.ALG_OP_ENCRYPT, assoclen=-1)
+    finally:
+        sock.close()
+
+
+def test_sendmsg_afalg_aes_cbc():
+    import _socket
+    _alg_skip_if_unavailable()
+    key = bytes.fromhex('06a9214036b8a15b512e03d534120006')
+    iv = bytes.fromhex('3dafba429d9eb430b422da802c9fac41')
+    msg = b"Single block msg"
+    ciphertext = bytes.fromhex('e353779c1079aeb82708942dbe77181a')
+    msglen = len(msg)
+    algo = _alg_create('skcipher', 'cbc(aes)')
+    try:
+        algo.setsockopt(_socket.SOL_ALG, _socket.ALG_SET_KEY, key)
+        fd, _ = algo._accept()
+        op = _socket.socket(_socket.AF_ALG, _socket.SOCK_SEQPACKET, 0, fd)
+        try:
+            op.sendmsg_afalg(op=_socket.ALG_OP_ENCRYPT, iv=iv,
+                             flags=_socket.MSG_MORE)
+            op.sendall(msg)
+            assert op.recv(msglen) == ciphertext
+        finally:
+            op.close()
+        fd, _ = algo._accept()
+        op = _socket.socket(_socket.AF_ALG, _socket.SOCK_SEQPACKET, 0, fd)
+        try:
+            op.sendmsg_afalg([ciphertext], op=_socket.ALG_OP_DECRYPT, iv=iv)
+            assert op.recv(msglen) == msg
+        finally:
+            op.close()
+    finally:
+        algo.close()
+
+def test_setsockopt_aead():
+    import _socket
+    _alg_skip_if_unavailable()
+    key = bytes.fromhex('06a9214036b8a15b512e03d534120006')
+    expected_tag = bytes.fromhex('0032a1dc85f1c9786925a2e71d8272dd')
+    taglen = len(expected_tag)
+    algo = _alg_create('aead', 'gcm(aes)')
+    try:
+        algo.setsockopt(_socket.SOL_ALG, _socket.ALG_SET_KEY, key)
+        algo.setsockopt(_socket.SOL_ALG, _socket.ALG_SET_AEAD_AUTHSIZE,
+                        None, taglen)
+    finally:
+        algo.close()
+ 

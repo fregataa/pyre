@@ -125,7 +125,7 @@ class Instruction(object):
             return PSEUDO_OPNAMES[~self.opcode]
 
     def __repr__(self):
-        data = ["<", self._opname()]
+        data = ["<", self.opname()]
         if self.opcode >= ops.HAVE_ARGUMENT:
             data.append(" ")
             data.append(str(self.arg))
