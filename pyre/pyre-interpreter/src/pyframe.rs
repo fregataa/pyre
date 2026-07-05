@@ -19,6 +19,26 @@ const _: () = assert!(
         == std::mem::size_of::<Rc<PyExecutionContext>>()
 );
 
+/// `types.FrameType` — the PyType every `PyFrame`'s `ob_header` points at.
+/// pyframe.py `class PyFrame(W_Root)` with `typedef.py:736 PyFrame.typedef
+/// = TypeDef("frame", ...)`. The descriptors (`f_back`, `f_locals`, …) are
+/// attached to this type by the `frame` typedef; until then it is a bare
+/// identity tag so a frame carries a valid `ob_type` like every other
+/// W_Root (mirrors `pytraceback::PYTRACEBACK_TYPE`).
+pub static FRAME_TYPE: PyType = new_pytype("frame");
+
+/// Build the `ob_header` for a freshly-created `PyFrame` — `ob_type`
+/// pinned to [`FRAME_TYPE`], `w_class` the cached `W_TypeObject`
+/// (null during bootstrap before `init_typeobjects`). Mirrors
+/// `pytraceback::pytraceback_new`'s header construction.
+#[inline]
+fn frame_ob_header() -> PyObject {
+    PyObject {
+        ob_type: &FRAME_TYPE as *const PyType,
+        w_class: get_instantiate(&FRAME_TYPE),
+    }
+}
+
 /// Execution frame for a single Python code block.
 ///
 /// Unified `locals_cells_stack_w` array layout:
@@ -38,6 +58,12 @@ const _: () = assert!(
 /// in registers. A "force" flushes them back to the heap.
 #[repr(C)]
 pub struct PyFrame {
+    /// `PyObject` prefix (`ob_type` / `w_class`) making the frame a
+    /// Python-visible `W_Root` — `pyframe.py class PyFrame(W_Root)`.
+    /// `ob_type` points at [`FRAME_TYPE`]. Kept at offset 0 like every
+    /// other `PyObject`-layout struct so `ob_type` reads land on the
+    /// typeptr the JIT `GuardClass` / `type()` expect.
+    pub ob_header: PyObject,
     /// Raw pointer to the shared execution context.
     /// The top-level frame leaks the Rc via `Rc::into_raw`.
     /// Callee frames just copy the pointer (no atomic refcount ops).
@@ -260,8 +286,55 @@ pub struct FrameBox {
 }
 
 impl FrameBox {
-    /// Move `frame` onto the heap behind a zeroed GC header.
+    /// Move `frame` onto the heap behind a GC header.
+    ///
+    /// `pyframe.py class PyFrame(W_Root)` — an executing frame is a normal
+    /// GC object whose lifetime is its reachability.  When the GC hook is
+    /// installed this allocates a non-moving old-gen `PYFRAME_GC_TYPE_ID`
+    /// block (the same `try_gc_alloc_stable` path every `W_*` uses, e.g.
+    /// `function.rs:373`); the block is reclaimed by a major mark-sweep
+    /// once no root (`walk_pyframe_roots` over the `CURRENT_FRAME` /
+    /// `f_backref` chain) reaches it, so `Drop` performs no manual free
+    /// (`executioncontext.py:91-107 leave` frees nothing either).
+    ///
+    /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
+    /// returns `None`; fall back to the `std::alloc` `GcFramePrefix` box,
+    /// which `Drop` frees manually.  The two regimes share one memory
+    /// layout — an 8-byte GC header immediately before the frame body — so
+    /// every reader (`frame - GC_HEADER_SIZE` write-barrier header,
+    /// `pyframe_object_custom_trace`) is regime-independent; `Drop`
+    /// distinguishes them with `try_gc_owns_object`.
     pub fn new(frame: PyFrame) -> Self {
+        if let Some(raw) = pyre_object::gc_hook::try_gc_alloc_stable(
+            PYFRAME_GC_TYPE_ID,
+            std::mem::size_of::<PyFrame>(),
+        )
+        .filter(|p| !p.is_null())
+        {
+            pyre_object::gc_interp::note_alloc();
+            let ptr = raw as *mut PyFrame;
+            unsafe {
+                std::ptr::write(ptr, frame);
+            }
+            // The old-gen frame may hold pointers to freshly nursery-born
+            // argument / locals objects; remember it for the next minor
+            // tracer, exactly as `generator.rs:72` does for a stable
+            // generator wrapping young frame contents.
+            pyre_object::gc_hook::try_gc_write_barrier(raw);
+            return FrameBox { ptr };
+        }
+        FrameBox::new_boxed(frame)
+    }
+
+    /// Allocate a frame that is NOT GC-managed even when the GC hook is
+    /// installed — a plain `std::alloc` `GcFramePrefix` box reclaimed by
+    /// `Drop`.  Used for tracer snapshots (`snapshot_for_tracing`), which
+    /// a tracer holds off the `CURRENT_FRAME` chain across an entire
+    /// `trace_bytecode` walk: a major cycle can complete mid-walk, and no
+    /// root reaches the snapshot, so GC lifetime would reclaim it while the
+    /// tracer still reads it.  A deterministic scope-end free is correct
+    /// for these transient, tracer-private copies.
+    pub fn new_boxed(frame: PyFrame) -> Self {
         let raw = Box::into_raw(Box::new(GcFramePrefix {
             gc_header: 0,
             frame,
@@ -301,13 +374,21 @@ impl FrameBox {
     /// needs for the borrowed-`&mut self` case.
     pub fn into_generator(mut self) -> crate::PyResult {
         self.fix_array_ptrs();
+        // A suspended generator frame is off the call chain — `f_back` is
+        // None until a resume re-links it (`executioncontext.py enter`
+        // rebinds `f_backref = topframeref`; pyre does the same at
+        // `execute_frame`).  Null it now so the generator's custom trace,
+        // which greys the frame block and recurses `f_backref`, never greys
+        // the (possibly already-freed) caller frame captured at suspend.
+        self.f_backref = std::ptr::null_mut();
         let frame_ptr = self.into_raw();
         // `w_generator_new` allocates and may trigger a collection. Until the
-        // generator owns `frame_ptr`, the frame's locals/args live only in its
-        // `locals_cells_stack_w` — the caller has already dropped them from its
-        // own stack — so root that slot across the allocation. The frame struct
-        // itself is a plain heap allocation (not a nursery object), so only the
-        // locals array needs protecting.
+        // generator owns `frame_ptr` (and its custom trace greys the frame
+        // block), the frame's locals/args live only in its
+        // `locals_cells_stack_w` — the caller has already dropped them from
+        // its own stack — so root that slot across the allocation. The frame
+        // block is non-moving (old-gen when GC-managed, `std::alloc`
+        // otherwise), so only the locals array needs protecting.
         let _root = LocalsRoot::new(frame_ptr);
         let generator = pyre_object::generator::w_generator_new(frame_ptr as *mut u8);
         unsafe {
@@ -334,6 +415,17 @@ impl std::ops::DerefMut for FrameBox {
 
 impl Drop for FrameBox {
     fn drop(&mut self) {
+        // GC-managed (old-gen) frames are reclaimed by a major mark-sweep
+        // when no root reaches them (`pyframe.py class PyFrame(W_Root)`;
+        // `executioncontext.py:91-107 leave` frees nothing).  Their
+        // `PyFrame::drop` side effects (freeing the locals array / debug
+        // data / block chain) run from the registered `PYFRAME_GC_TYPE_ID`
+        // destructor at sweep, not here.  Only the `std::alloc` fallback
+        // box is freed manually — reconstruct and drop it, which runs
+        // `PyFrame::drop` for that block.
+        if pyre_object::gc_hook::try_gc_owns_object(self.ptr as *mut u8) {
+            return;
+        }
         unsafe {
             let prefix = (self.ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcFramePrefix;
             drop(Box::from_raw(prefix));
@@ -414,7 +506,33 @@ unsafe fn clear_block_chain(ptr: &mut *mut FrameBlock) {
 
 impl Drop for PyFrame {
     fn drop(&mut self) {
-        if !self.locals_cells_stack_w.is_null() {
+        // Reached only for a `std::alloc`-backed frame (the `FrameBox`
+        // fallback box, or a bare stack `PyFrame`): its `locals_cells_stack_w`
+        // is always a `std::alloc` array, so free it here.  GC-managed frames
+        // never run `PyFrame::drop` (their `FrameBox::drop` returns early);
+        // their contents are freed by the `PYFRAME_GC_TYPE_ID` destructor.
+        unsafe { self.free_owned_contents(true) };
+    }
+}
+
+impl PyFrame {
+    /// Free the frame's owned off-GC resources — the `locals_cells_stack_w`
+    /// array, the `FrameDebugData` box, and the `FrameBlock` chain.  Shared
+    /// by `Drop for PyFrame` (the `std::alloc` fallback path) and the
+    /// `PYFRAME_GC_TYPE_ID` destructor (`pyframe_object_destructor`) run when
+    /// a GC-managed frame is swept.
+    ///
+    /// `free_locals_array` gates freeing `locals_cells_stack_w`: it is a
+    /// `std::alloc` block for every `FrameBox`/stack frame (free it), but a
+    /// GC-managed `PY_OBJECT_ARRAY_GC_TYPE_ID` array for a JIT-built inline
+    /// frame (the GC sweeps it — freeing it here would double-free).  The
+    /// caller decides by querying `try_gc_owns_object` on the array.
+    ///
+    /// # Safety
+    /// Runs at most once per frame — the pointers are nulled as they are
+    /// freed so a second call is a no-op.
+    pub unsafe fn free_owned_contents(&mut self, free_locals_array: bool) {
+        if free_locals_array && !self.locals_cells_stack_w.is_null() {
             unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
             self.locals_cells_stack_w = std::ptr::null_mut();
         }
@@ -423,9 +541,7 @@ impl Drop for PyFrame {
             clear_block_chain(&mut self.lastblock);
         }
     }
-}
 
-impl PyFrame {
     /// Access locals_cells_stack_w (deref the pointer).
     #[inline]
     pub fn locals_w(&self) -> &FixedObjectArray {
@@ -666,6 +782,405 @@ pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
         .get(stopat as usize)
         .map(|(start, _)| start.line.get())
         .unwrap_or(lineno)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// `f_lineno` jump validation — a port of CPython 3.14's `mark_stacks`
+// (`Objects/frameobject.c`).
+//
+// PyPy's `fset_f_lineno` (`pyframe.py`) validates a debugger line-jump
+// against the 3.11-era block model: it scans for `SETUP_LOOP` /
+// `SETUP_FINALLY` / `END_FINALLY` / `POP_BLOCK` and walks `co_lnotab`.
+// pyre runs 3.14-structural bytecode where those block-setup opcodes are
+// pseudo-ops the compiler lowers into `co_exceptiontable`; there is no
+// `co_lnotab`.  A line-by-line PyPy port is therefore impossible — the
+// opcodes it inspects don't exist here.  The behaviour-correct 3.14
+// equivalent is `mark_stacks`: a fixpoint reachability analysis that
+// abstracts each operand-stack slot to a `Kind`, so a jump is admitted
+// only when the source and target abstract stacks are compatible.
+// ─────────────────────────────────────────────────────────────────────
+
+/// `frameobject.c` `Kind` — the abstract contents of one operand-stack
+/// slot.  Packed 3 bits per slot into an `i64` (`BITS_PER_BLOCK = 3`),
+/// so the abstract stack of up to `MAX_STACK_ENTRIES = 21` slots is a
+/// single integer that can be compared for equality across paths.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+enum StackKind {
+    Iterator = 1,
+    Except = 2,
+    Object = 3,
+    Null = 4,
+    Lasti = 5,
+}
+
+const MARK_BITS_PER_BLOCK: i64 = 3;
+const MARK_MASK: i64 = (1 << MARK_BITS_PER_BLOCK) - 1;
+/// `1 << (63 - BITS_PER_BLOCK)` — a stack whose unsigned value is at or
+/// above this would lose its top slot when shifted left.  The negative
+/// sentinels (`OVERFLOWED` / `UNINITIALIZED`) reinterpret as huge
+/// unsigned values, so this test also propagates them.
+const MARK_WILL_OVERFLOW: u64 = 1u64 << (63 - MARK_BITS_PER_BLOCK);
+
+/// `frameobject.c` sentinels for a per-instruction abstract stack.
+const MARK_UNINITIALIZED: i64 = -2;
+const MARK_OVERFLOWED: i64 = -1;
+const MARK_EMPTY_STACK: i64 = 0;
+
+#[inline]
+fn mark_push_value(stack: i64, kind: StackKind) -> i64 {
+    mark_push_kind_bits(stack, kind as i64)
+}
+
+/// `push_value` with the kind supplied as raw bits — used by `COPY`,
+/// which re-pushes a slot peeked from the stack (whose kind is not
+/// statically one of the [`StackKind`] variants).
+#[inline]
+fn mark_push_kind_bits(stack: i64, kind_bits: i64) -> i64 {
+    if (stack as u64) >= MARK_WILL_OVERFLOW {
+        MARK_OVERFLOWED
+    } else {
+        (stack << MARK_BITS_PER_BLOCK) | kind_bits
+    }
+}
+
+#[inline]
+fn mark_pop_value(stack: i64) -> i64 {
+    // Arithmetic right shift preserves the OVERFLOWED / UNINITIALIZED
+    // sentinels (both negative).
+    stack >> MARK_BITS_PER_BLOCK
+}
+
+#[inline]
+fn mark_top_of_stack(stack: i64) -> i64 {
+    stack & MARK_MASK
+}
+
+#[inline]
+fn mark_peek(stack: i64, n: i64) -> i64 {
+    (stack >> (MARK_BITS_PER_BLOCK * (n - 1))) & MARK_MASK
+}
+
+#[inline]
+fn mark_stack_swap(stack: i64, n: i64) -> i64 {
+    let top = mark_top_of_stack(stack);
+    let nth = mark_peek(stack, n);
+    let shift = MARK_BITS_PER_BLOCK * (n - 1);
+    let stack = stack & !(MARK_MASK << shift) | (top << shift);
+    (stack & !MARK_MASK) | nth
+}
+
+/// `frameobject.c pop_to_level` — pop the abstract stack down to `level`
+/// slots.
+#[inline]
+fn mark_pop_to_level(mut stack: i64, level: i32) -> i64 {
+    let mut depth = 0i64;
+    let mut s = stack;
+    while s > MARK_EMPTY_STACK {
+        s = mark_pop_value(s);
+        depth += 1;
+    }
+    while depth > level as i64 {
+        stack = mark_pop_value(stack);
+        depth -= 1;
+    }
+    stack
+}
+
+/// True when a jump from `from` kind to `to` kind is admissible
+/// (`frameobject.c compatible_kind`).
+#[inline]
+fn mark_compatible_kind(from: i64, to: i64) -> bool {
+    if to == 0 {
+        return false;
+    }
+    if to == StackKind::Object as i64 {
+        return from != StackKind::Null as i64;
+    }
+    if to == StackKind::Null as i64 {
+        return true;
+    }
+    from == to
+}
+
+/// `frameobject.c compatible_stack` — pop `from_stack` to the target
+/// depth, then compare each slot's kind.
+fn mark_compatible_stack(mut from_stack: i64, target_stack: i64) -> bool {
+    if from_stack < 0 || target_stack < 0 {
+        return false;
+    }
+    let mut to = target_stack;
+    // Depth of each packed stack.
+    let depth = |mut s: i64| -> i64 {
+        let mut d = 0;
+        while s > MARK_EMPTY_STACK {
+            s = mark_pop_value(s);
+            d += 1;
+        }
+        d
+    };
+    while depth(from_stack) > depth(to) {
+        from_stack = mark_pop_value(from_stack);
+    }
+    while to > MARK_EMPTY_STACK {
+        if from_stack <= MARK_EMPTY_STACK {
+            return false;
+        }
+        if !mark_compatible_kind(mark_top_of_stack(from_stack), mark_top_of_stack(to)) {
+            return false;
+        }
+        from_stack = mark_pop_value(from_stack);
+        to = mark_pop_value(to);
+    }
+    from_stack == MARK_EMPTY_STACK
+}
+
+/// Diagnostic for an incompatible target stack
+/// (`frameobject.c explain_incompatible_stack`).
+fn mark_explain_incompatible_stack(target_stack: i64) -> &'static str {
+    if target_stack == MARK_OVERFLOWED {
+        return "stack too deep to analyze";
+    }
+    if target_stack == MARK_UNINITIALIZED {
+        return "can't jump into an exception handler, or code may be unreachable";
+    }
+    let top = mark_top_of_stack(target_stack);
+    if top == StackKind::Except as i64 {
+        "can't jump into an 'except' block as there's no exception"
+    } else if top == StackKind::Lasti as i64 {
+        "can't jump into a re-raising block as there's no location"
+    } else if top == StackKind::Object as i64 || top == StackKind::Null as i64 {
+        "incompatible stacks"
+    } else if top == StackKind::Iterator as i64 {
+        "can't jump into the body of a for loop"
+    } else {
+        "incompatible stacks"
+    }
+}
+
+/// `frameobject.c marklines` — the source line that starts at each
+/// instruction-unit index (`-1` where no line change begins).
+fn mark_lines(code: &CodeObject, len: usize) -> Vec<i32> {
+    let mut lines = vec![-1i32; len];
+    let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+    let mut last_line = -1i32;
+    for i in 0..len {
+        // `locations[i].0` is the start SourceLocation of unit `i`.
+        let line = code
+            .locations
+            .get(i)
+            .map(|(start, _)| start.line.get() as i32)
+            .unwrap_or(first);
+        if line != last_line && line != -1 {
+            lines[i] = line;
+            last_line = line;
+        }
+    }
+    lines
+}
+
+/// `frameobject.c first_line_not_before` — the smallest line `>= line`
+/// present in `lines`, or `-1`.
+fn mark_first_line_not_before(lines: &[i32], line: i32) -> i32 {
+    let mut result = i32::MAX;
+    for &l in lines {
+        if l < result && l >= line {
+            result = l;
+        }
+    }
+    if result == i32::MAX { -1 } else { result }
+}
+
+/// `frameobject.c mark_stacks` — fixpoint abstract-interpretation of the
+/// operand stack.  Returns `stacks[i]` = the packed abstract stack on
+/// entry to unit `i` (`UNINITIALIZED` where unreachable), length
+/// `len + 1`.
+fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
+    use crate::bytecode::Instruction;
+
+    let mut stacks = vec![MARK_UNINITIALIZED; len + 1];
+    stacks[0] = MARK_EMPTY_STACK;
+
+    let mut todo = true;
+    while todo {
+        todo = false;
+        // ── Scan instructions ──
+        let mut i = 0usize;
+        while i < len {
+            let mut next_stack = stacks[i];
+            let Some((opcode, op_arg)) = crate::pyopcode::decode_instruction_at(code, i) else {
+                i += 1;
+                continue;
+            };
+            // `decode_instruction_at` already accumulates EXTENDED_ARG
+            // prefixes into `op_arg` at the real opcode's index.  Mirror
+            // CPython's inner `while opcode == EXTENDED_ARG` loop by
+            // propagating this unit's entry stack onto the following unit
+            // (the next prefix or the real opcode), so an instruction with
+            // an EXTENDED_ARG prefix inherits the prefix's entry stack.
+            if matches!(opcode, Instruction::ExtendedArg) {
+                if i + 1 < stacks.len() {
+                    stacks[i + 1] = next_stack;
+                }
+                i += 1;
+                continue;
+            }
+            let raw_arg: u32 = op_arg.into();
+            let caches = opcode.cache_entries();
+            let next_i = i + caches + 1;
+
+            if next_stack == MARK_UNINITIALIZED {
+                i = next_i;
+                continue;
+            }
+
+            // Relative jump targets are measured from `next_i` (past the
+            // opcode's cache slots), matching `absolutize_jump_target`.
+            match opcode {
+                Instruction::PopJumpIfFalse { delta }
+                | Instruction::PopJumpIfTrue { delta }
+                | Instruction::PopJumpIfNone { delta }
+                | Instruction::PopJumpIfNotNone { delta } => {
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    next_stack = mark_pop_value(next_stack);
+                    if j <= len {
+                        stacks[j] = next_stack;
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::Send { delta } => {
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    if j <= len {
+                        stacks[j] = next_stack;
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::JumpForward { delta } => {
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    if j <= len {
+                        stacks[j] = next_stack;
+                    }
+                }
+                Instruction::JumpBackward { delta }
+                | Instruction::JumpBackwardNoInterrupt { delta } => {
+                    let j = next_i.saturating_sub(delta.get(op_arg).as_usize());
+                    if stacks[j] == MARK_UNINITIALIZED && j < i {
+                        todo = true;
+                    }
+                    stacks[j] = next_stack;
+                }
+                Instruction::GetIter | Instruction::GetAiter => {
+                    next_stack = mark_push_value(mark_pop_value(next_stack), StackKind::Iterator);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::ForIter { delta } => {
+                    // Fall-through: iterator stays on the stack, the loop
+                    // variable (Object) is pushed above it.  Exhaustion
+                    // branch: the iterator stays on the stack (net 0) — it
+                    // is popped later by `POP_ITER`, matching the runtime
+                    // stack effect (liveness.rs ForIter `(d+1, d)`).  No
+                    // loop variable is pushed on that branch.
+                    let target_stack = mark_push_value(next_stack, StackKind::Object);
+                    stacks[next_i] = target_stack;
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    if j <= len {
+                        stacks[j] = next_stack;
+                    }
+                }
+                Instruction::EndAsyncFor => {
+                    next_stack = mark_pop_value(mark_pop_value(next_stack));
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::PushExcInfo => {
+                    // Runtime (codewriter PushExcInfo): pop the new
+                    // exception, push the previous exception (Except slot),
+                    // then push the new exception back (Object).  Net +1,
+                    // but the shape is `[.., Except, Object]` — model both
+                    // slots so `f_lineno` jump validation matches the live
+                    // handler stack.
+                    let below = mark_pop_value(next_stack);
+                    next_stack = mark_push_value(below, StackKind::Except);
+                    next_stack = mark_push_value(next_stack, StackKind::Object);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::PopExcept => {
+                    next_stack = mark_pop_value(next_stack);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::ReturnValue => {
+                    // End of a path.
+                }
+                Instruction::RaiseVarargs { .. } | Instruction::Reraise { .. } => {
+                    // End of a path.
+                }
+                Instruction::PushNull => {
+                    next_stack = mark_push_value(next_stack, StackKind::Null);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::LoadGlobal { .. } => {
+                    next_stack = mark_push_value(next_stack, StackKind::Object);
+                    if raw_arg & 1 != 0 {
+                        next_stack = mark_push_value(next_stack, StackKind::Null);
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::LoadAttr { .. } => {
+                    if raw_arg & 1 != 0 {
+                        next_stack = mark_pop_value(next_stack);
+                        next_stack = mark_push_value(next_stack, StackKind::Object);
+                        next_stack = mark_push_value(next_stack, StackKind::Null);
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::Swap { .. } => {
+                    next_stack = mark_stack_swap(next_stack, raw_arg as i64);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::Copy { .. } => {
+                    next_stack =
+                        mark_push_kind_bits(next_stack, mark_peek(next_stack, raw_arg as i64));
+                    stacks[next_i] = next_stack;
+                }
+                _ => {
+                    // `PyCompile_OpcodeStackEffect(opcode, oparg)` — the
+                    // net slot delta, with every pushed slot abstracted to
+                    // Object.
+                    let mut delta = opcode.stack_effect(raw_arg);
+                    while delta < 0 {
+                        next_stack = mark_pop_value(next_stack);
+                        delta += 1;
+                    }
+                    while delta > 0 {
+                        next_stack = mark_push_value(next_stack, StackKind::Object);
+                        delta -= 1;
+                    }
+                    stacks[next_i] = next_stack;
+                }
+            }
+            i = next_i;
+        }
+
+        // ── Scan the exception table ──
+        for entry in crate::pycode::decode_exceptiontable(&code.exceptiontable) {
+            let start_offset = (entry.start / 2) as usize;
+            let handler = (entry.target / 2) as usize;
+            let level = entry.depth as i32;
+            let lasti = entry.lasti;
+            if start_offset >= stacks.len() || handler >= stacks.len() {
+                continue;
+            }
+            if stacks[start_offset] != MARK_UNINITIALIZED && stacks[handler] == MARK_UNINITIALIZED {
+                todo = true;
+                let mut target_stack = mark_pop_to_level(stacks[start_offset], level);
+                if lasti {
+                    target_stack = mark_push_value(target_stack, StackKind::Lasti);
+                }
+                target_stack = mark_push_value(target_stack, StackKind::Except);
+                stacks[handler] = target_stack;
+            }
+        }
+    }
+    stacks
 }
 
 /// pyframe.py:105-106 — cell + free variable slot count.
@@ -1134,6 +1649,7 @@ impl PyFrame {
             crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
         }
         let mut frame = PyFrame {
+            ob_header: frame_ob_header(),
             execution_context,
             pycode: code,
             locals_cells_stack_w: unsafe {
@@ -1253,6 +1769,7 @@ impl PyFrame {
             crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
         }
         let mut frame = PyFrame {
+            ob_header: frame_ob_header(),
             execution_context,
             pycode: code,
             locals_cells_stack_w: unsafe {
@@ -1288,15 +1805,28 @@ impl PyFrame {
     /// recording a trace to keep the real frame state unchanged until the
     /// interpreter actually executes the same path.
     pub fn snapshot_for_tracing(&self) -> FrameBox {
-        // Frame-LOCAL state (locals_cells_stack_w / valuestackdepth / last_instr)
-        // is COPIED, so snapshot mutations to locals/stack are discarded — that
-        // is the abort-safety the snapshot exists for.  `w_globals` (below) is
-        // the SAME dict ptr, so a concrete shared-heap write during recording
-        // would leak to the real heap and double-apply on the compiled loop's
-        // re-run.  Gap 10 removed that path: the concrete executor is retired,
-        // so inline-frame STORE_GLOBAL is recorded as deferred IR (no concrete
-        // write during the walk) and the compiled loop applies it exactly once.
-        let mut frame = FrameBox::new(PyFrame {
+        // A tracer holds this snapshot off the `CURRENT_FRAME` chain across
+        // the whole `trace_bytecode` walk, during which a major GC cycle can
+        // complete; no root reaches it, so it must NOT have GC lifetime —
+        // `new_boxed` gives it a deterministic scope-end free.
+        let mut frame = FrameBox::new_boxed(self.build_snapshot_frame());
+        // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
+        // point to the heap-allocated frame, not a stale stack address.
+        frame.fix_array_ptrs();
+        frame
+    }
+
+    /// Build the copied `PyFrame` value shared by the tracer snapshot and
+    /// the generator snapshot.  Frame-LOCAL state (`locals_cells_stack_w` /
+    /// `valuestackdepth` / `last_instr`) is COPIED, so snapshot mutations to
+    /// locals/stack are discarded — the abort-safety the snapshot exists
+    /// for.  `w_globals` is the SAME dict ptr, so a concrete shared-heap
+    /// write during recording would leak to the real heap and double-apply
+    /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
+    /// STORE_GLOBAL records as deferred IR, applied exactly once).
+    fn build_snapshot_frame(&self) -> PyFrame {
+        PyFrame {
+            ob_header: frame_ob_header(),
             execution_context: self.execution_context,
             pycode: self.pycode,
             locals_cells_stack_w: unsafe { alloc_fixed_array_from_vec(self.locals_w().to_vec()) },
@@ -1312,9 +1842,16 @@ impl PyFrame {
             f_backref: self.f_backref,
             w_builtin: self.w_builtin,
             w_globals: self.w_globals,
-        });
-        // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
-        // point to the heap-allocated frame, not a stale stack address.
+        }
+    }
+
+    /// Snapshot a borrowed frame into a GC-managed owned frame for
+    /// `initialize_as_generator`.  Unlike `snapshot_for_tracing` this uses
+    /// `FrameBox::new` (GC lifetime): a generator's suspended frame lives as
+    /// long as the generator object reaches it (`generator.py` holds the
+    /// frame), and the generator's custom trace greys the frame block.
+    pub fn snapshot_for_generator(&self) -> FrameBox {
+        let mut frame = FrameBox::new(self.build_snapshot_frame());
         frame.fix_array_ptrs();
         frame
     }
@@ -1797,10 +2334,104 @@ impl PyFrame {
         w_builtin
     }
 
-    /// PyPy-compatible `fget_f_back`.
+    /// pyframe.py:764 `fget_f_back` — the next non-hidden frame, i.e.
+    /// `ExecutionContext.getnextframe_nohidden(self)`, skipping
+    /// `hidden_applevel` gateway / bridge frames.  The plain
+    /// `get_f_back()` accessor (used internally, including by the
+    /// nohidden walker itself) returns the raw `f_backref` link.
     #[inline]
     pub fn fget_f_back(&self) -> *mut PyFrame {
-        self.get_f_back()
+        crate::executioncontext::ExecutionContext::getnextframe_nohidden(
+            self as *const PyFrame as *mut PyFrame,
+        )
+    }
+
+    /// pyframe.py:641-642 fget_code → self.getcode().  Returns the `PyCode`
+    /// wrapper object (`self.pycode`) itself, which is what `frame.f_code`
+    /// yields to Python — not the inner `CodeObject`.
+    #[inline]
+    pub fn fget_f_code(&self) -> PyObjectRef {
+        self.pycode as PyObjectRef
+    }
+
+    /// pyframe.py:849-853 descr_repr — `<frame at 0x…, file '…', line …,
+    /// code …>` via `getrepr(space, "frame", moreinfo)`.
+    pub fn descr_repr(&self) -> String {
+        let code = self.code();
+        format!(
+            "<frame at {:p}, file '{}', line {}, code {}>",
+            self as *const PyFrame,
+            code.source_path.as_str(),
+            self.get_last_lineno(),
+            code.obj_name.as_str(),
+        )
+    }
+
+    /// `frame_clear` (`frame.clear()`): clear most references held by the
+    /// frame.  Refuses on an executing (non-generator) frame or a running
+    /// generator (`"cannot clear an executing frame"`) and on a generator
+    /// frame suspended at a `yield` (`"cannot clear a suspended frame"`);
+    /// a not-yet-started or already-exhausted generator is finalized
+    /// (marked exhausted).  Otherwise clears `w_f_trace`, resets
+    /// `w_locals` to a fresh dict, and replaces every local / cell / free
+    /// var / stack slot (cells are rebound to fresh empty cells so a
+    /// shared inner/outer cell is not mutated).
+    pub fn descr_clear(&mut self) -> Result<(), crate::PyError> {
+        if !self.frame_finished_execution {
+            if !self._is_generator_or_coroutine() {
+                return Err(crate::PyError::runtime_error(
+                    "cannot clear an executing frame",
+                ));
+            }
+            let w_gen = self.get_generator();
+            if !w_gen.is_null() {
+                if unsafe { pyre_object::generator::w_generator_is_running(w_gen) } {
+                    return Err(crate::PyError::runtime_error(
+                        "cannot clear an executing frame",
+                    ));
+                }
+                // A generator started but not exhausted is suspended at a
+                // `yield`; clearing it would drop the live operand stack
+                // out from under a later `resume`, so refuse.
+                let suspended = unsafe {
+                    pyre_object::generator::w_generator_is_started(w_gen)
+                        && !pyre_object::generator::w_generator_is_exhausted(w_gen)
+                };
+                if suspended {
+                    return Err(crate::PyError::runtime_error(
+                        "cannot clear a suspended frame",
+                    ));
+                }
+                // Not started or already exhausted: finalize.
+                unsafe { pyre_object::generator::w_generator_set_exhausted(w_gen) };
+            }
+        }
+
+        if let Some(debug) = self.getdebug() {
+            let had_locals = !debug.w_locals.is_null();
+            let d = self.getorcreate_debug_data(-1);
+            d.w_f_trace = pyre_object::PY_NULL;
+            if had_locals {
+                d.w_locals = unsafe { pyre_object::w_dict_new() };
+            }
+        }
+
+        // Clear locals, cell/free vars, and the stack.  A cell slot is
+        // rebound to a fresh empty cell (not mutated in place, since it may
+        // still be shared by an inner/outer function).
+        let len = self.locals_w().len();
+        for i in 0..len {
+            let w_oldvalue = self.locals_w()[i];
+            let w_newvalue = if !w_oldvalue.is_null() && unsafe { pyre_object::is_cell(w_oldvalue) }
+            {
+                pyre_object::w_cell_new(pyre_object::PY_NULL)
+            } else {
+                pyre_object::PY_NULL
+            };
+            self.locals_w_mut()[i] = w_newvalue;
+        }
+        self.valuestackdepth = 0;
+        Ok(())
     }
 
     /// pyframe.py:773 fget_f_lasti → space.newint(self.last_instr)
@@ -1917,10 +2548,151 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:680 fset_f_lineno (simplified — full version validates jumps)
-    #[inline]
-    pub fn fset_f_lineno(&mut self, new_f_lineno: isize) {
-        self.getorcreate_debug_data(-1).f_lineno = new_f_lineno;
+    /// `frameobject.c frame_lineno_set` — set the line the frame will
+    /// resume at, validating the jump against [`mark_stacks`].
+    ///
+    /// Only a trace function may jump (`get_w_f_trace()` non-null); the
+    /// jump target must land on a real source line, must not enter an
+    /// exception handler / for-loop body / re-raise block, and the source
+    /// and target abstract operand stacks must be compatible.  On success
+    /// the operand stack is unwound to the target depth (closing dropped
+    /// values, restoring `exc_info` for popped `Except` slots) and
+    /// `last_instr` is repointed.
+    ///
+    /// Deviation: `frame_lineno_set` also binds `None` to any local the
+    /// compiler proved live-but-unbound at the target (the `PyStackRef_None`
+    /// pass over `co_localspluskinds`).  pyre keeps unbound locals as
+    /// `PY_NULL` guarded by `LOAD_FAST_CHECK`, so that pass is omitted; the
+    /// only observable difference is an `UnboundLocalError` where the
+    /// jumped-to code reads such a local before assigning it, versus
+    /// silently seeing `None`.
+    pub fn fset_f_lineno(&mut self, new_f_lineno: isize) -> Result<(), crate::PyError> {
+        // frame_lineno_set: you can only jump from within a trace
+        // function, not via `_getframe` / similar hackery.
+        if self.get_w_f_trace().is_null() {
+            return Err(crate::PyError::value_error(
+                "f_lineno can only be set by a trace function.",
+            ));
+        }
+        // A newly-entered frame (call event) has no dispatched
+        // instruction yet.
+        if self.last_instr == -1 {
+            return Err(crate::PyError::value_error(
+                "can't jump from the 'call' trace event of a new frame",
+            ));
+        }
+        // Jumps are allowed from a `line` trace event, and — outside a
+        // line event — only when the frame is suspended at `YIELD_VALUE`
+        // (`frame_lineno_set_impl` lists `PY_MONITORING_EVENT_PY_YIELD`
+        // in the same allowed group as line/jump events).  The pending
+        // yield value is accounted for by the `is_suspended` unwind
+        // below.  pyframe.py:685-689:
+        //     if not d.is_in_line_tracing:
+        //         if ord(code[self.last_instr]) != YIELD_VALUE:
+        //             raise "can only jump from a 'line' trace event"
+        if !self.getdebug().map_or(false, |d| d.is_in_line_tracing) {
+            let at_yield = matches!(
+                crate::pyopcode::decode_instruction_at(self.code(), self.last_instr as usize),
+                Some((crate::bytecode::Instruction::YieldValue { .. }, _))
+            );
+            if !at_yield {
+                return Err(crate::PyError::value_error(
+                    "can only jump from a 'line' trace event",
+                ));
+            }
+        }
+        // `frame_is_suspended` — a generator/coroutine frame that has
+        // started, is not currently running, and is not exhausted has a
+        // pending `yield` value on the stack that the resume will pop, so
+        // the unwind must account for it.
+        let is_suspended = if self._is_generator_or_coroutine() {
+            let w_gen = self.get_generator();
+            !w_gen.is_null()
+                && unsafe {
+                    pyre_object::generator::w_generator_is_started(w_gen)
+                        && !pyre_object::generator::w_generator_is_running(w_gen)
+                        && !pyre_object::generator::w_generator_is_exhausted(w_gen)
+                }
+        } else {
+            false
+        };
+
+        let code = self.code();
+        let len = code.instructions.len();
+        let first_line = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+
+        let mut new_lineno = new_f_lineno as i32;
+        if new_lineno < first_line {
+            return Err(crate::PyError::value_error(format!(
+                "line {new_lineno} comes before the current code block"
+            )));
+        }
+
+        let lines = mark_lines(code, len);
+        new_lineno = mark_first_line_not_before(&lines, new_lineno);
+        if new_lineno < 0 {
+            return Err(crate::PyError::value_error(format!(
+                "line {new_f_lineno} comes after the current code block"
+            )));
+        }
+
+        let stacks = mark_stacks(code, len);
+        let last_instr = self.last_instr as usize;
+        let start_stack = *stacks.get(last_instr).unwrap_or(&MARK_UNINITIALIZED);
+
+        let mut best_stack = MARK_OVERFLOWED;
+        let mut best_addr: isize = -1;
+        let mut err: i32 = -1;
+        let mut msg: String = "cannot find bytecode for specified line".to_string();
+        for i in 0..len {
+            if lines[i] != new_lineno {
+                continue;
+            }
+            let target_stack = stacks[i];
+            if mark_compatible_stack(start_stack, target_stack) {
+                err = 0;
+                if target_stack > best_stack {
+                    best_stack = target_stack;
+                    best_addr = i as isize;
+                }
+            } else if err < 0 {
+                if start_stack == MARK_OVERFLOWED {
+                    msg = "stack too deep to analyze".to_string();
+                } else if start_stack == MARK_UNINITIALIZED {
+                    msg = "can't jump from unreachable code".to_string();
+                } else {
+                    msg = mark_explain_incompatible_stack(target_stack).to_string();
+                    err = 1;
+                }
+            }
+        }
+        if err != 0 {
+            return Err(crate::PyError::value_error(msg));
+        }
+
+        // Unwind the operand stack from `start_stack` down to
+        // `best_stack`, closing dropped values.  A dropped `Except` slot
+        // restores the previous `exc_info` (pyre keeps the active
+        // exception in the TLS current-exception slot, saved beneath the
+        // handler on the value stack — see `push_exc_info`).
+        let mut cur_stack = start_stack;
+        if is_suspended {
+            // Account for the value popped by yield.
+            cur_stack = mark_pop_value(cur_stack);
+        }
+        while cur_stack > best_stack {
+            let popped = self.popvalue();
+            if mark_top_of_stack(cur_stack) == StackKind::Except as i64 {
+                // The popped value is the saved previous exception; make
+                // it current again.
+                crate::eval::set_current_exception(popped);
+            }
+            cur_stack = mark_pop_value(cur_stack);
+        }
+
+        self.getorcreate_debug_data(-1).f_lineno = new_lineno as isize;
+        self.last_instr = best_addr;
+        Ok(())
     }
 
     /// PyPy-compatible `setfastscope`.
@@ -2317,6 +3089,7 @@ impl PyFrame {
         }
 
         let mut frame = PyFrame {
+            ob_header: frame_ob_header(),
             execution_context,
             pycode: code,
             locals_cells_stack_w,
@@ -2361,8 +3134,10 @@ impl PyFrame {
         // pyframe.py:259 wraps `self` directly. A borrowed `&mut self` cannot
         // hand ownership to the generator, so snapshot into an owned FrameBox
         // first. Callers that already own a FrameBox should use
-        // `FrameBox::into_generator` to skip this copy.
-        self.snapshot_for_tracing().into_generator()
+        // `FrameBox::into_generator` to skip this copy.  Use the GC-managed
+        // snapshot: the generator owns the frame for its whole life, off the
+        // `CURRENT_FRAME` chain, so its lifetime is GC reachability.
+        self.snapshot_for_generator().into_generator()
     }
 
     #[inline]
@@ -2631,6 +3406,7 @@ pub fn createframe_obj(
     let size = num_locals + num_cells + max_stack;
     let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
     let mut frame = FrameBox::new(PyFrame {
+        ob_header: frame_ob_header(),
         execution_context,
         pycode: code,
         locals_cells_stack_w: unsafe { alloc_fixed_array_with_header(size, PY_NULL) },
@@ -2737,5 +3513,93 @@ mod tests {
 
         let loaded = load_const_from_code(&code, ellipsis_index);
         assert_eq!(loaded, pyre_object::special::w_ellipsis());
+    }
+
+    // ── mark_stacks (f_lineno jump validation) ──
+
+    use super::{
+        MARK_EMPTY_STACK, MARK_UNINITIALIZED, StackKind, mark_compatible_stack,
+        mark_first_line_not_before, mark_lines, mark_stacks,
+    };
+
+    #[test]
+    fn mark_stacks_entry_is_empty_and_reachable() {
+        let code = crate::compile_exec("x = 1\ny = x + 1\n").expect("compile");
+        let len = code.instructions.len();
+        let stacks = mark_stacks(&code, len);
+        // Entry to the first instruction is the empty stack.
+        assert_eq!(stacks[0], MARK_EMPTY_STACK);
+        // Every real (decodable, non-cache) instruction is reachable in
+        // straight-line code — none stay UNINITIALIZED.
+        for pc in 0..len {
+            if let Some((instr, _)) = crate::pyopcode::decode_instruction_at(&code, pc) {
+                if matches!(instr, crate::bytecode::Instruction::Cache) {
+                    continue;
+                }
+                assert_ne!(
+                    stacks[pc], MARK_UNINITIALIZED,
+                    "pc {pc} ({instr:?}) should be reachable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mark_stacks_for_iter_target_carries_iterator() {
+        // The FOR_ITER body sees the iterator underneath the loop var, so
+        // the abstract stack at the body has an Iterator slot at bottom.
+        let code = crate::compile_exec("t = 0\nfor i in range(3):\n    t += i\n").expect("compile");
+        let len = code.instructions.len();
+        let stacks = mark_stacks(&code, len);
+        // Find a GET_ITER; the slot it produces is Iterator and stays on
+        // the stack through the loop body.
+        let mut saw_iterator_slot = false;
+        for pc in 0..len {
+            if stacks[pc] > MARK_EMPTY_STACK
+                && (stacks[pc] & 0b111 == StackKind::Iterator as i64
+                    || (stacks[pc] >> 3) & 0b111 == StackKind::Iterator as i64)
+            {
+                saw_iterator_slot = true;
+                break;
+            }
+        }
+        assert!(
+            saw_iterator_slot,
+            "a for-loop's abstract stacks should contain an Iterator slot"
+        );
+    }
+
+    #[test]
+    fn mark_lines_and_first_line_not_before() {
+        let code = crate::compile_exec("a = 1\nb = 2\nc = 3\n").expect("compile");
+        let len = code.instructions.len();
+        let lines = mark_lines(&code, len);
+        let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+        // The earliest recorded line is the first source line.
+        let min_line = lines.iter().copied().filter(|&l| l >= 0).min().unwrap();
+        assert_eq!(min_line, first);
+        // A request before the code resolves to the first line.
+        assert_eq!(mark_first_line_not_before(&lines, first), first);
+        // A request past the end resolves to -1.
+        assert_eq!(mark_first_line_not_before(&lines, first + 1000), -1);
+    }
+
+    #[test]
+    fn compatible_stack_same_and_incompatible() {
+        // Identical stacks are compatible.
+        assert!(mark_compatible_stack(MARK_EMPTY_STACK, MARK_EMPTY_STACK));
+        // An Object target accepts an Iterator source popped to depth, but
+        // an Iterator target rejects an Object source (can't fabricate a
+        // loop iterator).
+        let obj = super::mark_push_value(MARK_EMPTY_STACK, StackKind::Object);
+        let iter = super::mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator);
+        assert!(
+            mark_compatible_stack(iter, obj),
+            "Object target accepts any non-Null"
+        );
+        assert!(
+            !mark_compatible_stack(obj, iter),
+            "Iterator target rejects Object source"
+        );
     }
 }
