@@ -408,6 +408,12 @@ impl FrameState {
         }
     }
 
+    fn clear_local_value(&mut self, reg: usize) {
+        if let Some(slot) = self.locals_w.get_mut(reg) {
+            *slot = None;
+        }
+    }
+
     fn copy<F>(&self, fresh_variable: &mut F) -> Self
     where
         F: FnMut(Option<Kind>) -> super::flow::Variable,
@@ -1845,6 +1851,24 @@ fn pop_and_decr_depth(state: &mut FrameState, depth: &mut u16) {
     *depth = depth.saturating_sub(1);
 }
 
+/// PEEK(oparg) the accumulator container without popping it — the
+/// residual mutates it in place and it stays live on the stack.  Mirrors
+/// the ListExtend inline peek: after the operands are popped, the
+/// container sits at `len - oparg` (oparg counts from the new TOS).
+/// Returns a fresh Ref when the shadow stack is too shallow.
+fn peek_container_or_fresh(
+    state: &FrameState,
+    oparg: usize,
+    graph: &mut super::flow::FunctionGraph,
+) -> super::flow::FlowValue {
+    let len = state.stack.len();
+    if oparg >= 1 && oparg <= len {
+        state.stack[len - oparg].clone()
+    } else {
+        fresh_ref_value(graph)
+    }
+}
+
 fn null_stack_sentinel() -> super::flow::FlowValue {
     // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker.  The
     // runtime side emits `PY_NULL = 0` via `emit_pushvalue_ref_const!`;
@@ -2554,6 +2578,45 @@ fn emit_frontend_list_extend(
         block,
         "list_extend",
         vec![list.into(), iterable.into()],
+        None,
+        offset,
+    );
+}
+
+/// 2-Ref void accumulator HLOp emitter (SET_ADD / SET_UPDATE /
+/// DICT_UPDATE) — the peeked container is mutated in place.  Mirrors
+/// `emit_frontend_list_extend`; the caller passes the opname.
+fn emit_frontend_accumulate_2(
+    block: &super::flow::BlockRef,
+    opname: &'static str,
+    container: super::flow::FlowValue,
+    operand: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        opname,
+        vec![container.into(), operand.into()],
+        None,
+        offset,
+    );
+}
+
+/// 3-Ref void accumulator HLOp emitter (MAP_ADD / DICT_MERGE) — the
+/// peeked container is mutated in place.  `a`/`b` are key/value for
+/// MAP_ADD, or source/callable for DICT_MERGE.
+fn emit_frontend_accumulate_3(
+    block: &super::flow::BlockRef,
+    opname: &'static str,
+    container: super::flow::FlowValue,
+    a: super::flow::FlowValue,
+    b: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        opname,
+        vec![container.into(), a.into(), b.into()],
         None,
         offset,
     );
@@ -3402,13 +3465,37 @@ struct FnPtrIndices {
     make_cell_fn: HelperHandle,
     unary_negative_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
+    unary_positive_fn: HelperHandle,
+    load_common_constant_fn: HelperHandle,
+    list_to_tuple_fn: HelperHandle,
+    load_from_dict_or_globals_fn: HelperHandle,
+    call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
+    set_add_fn: HelperHandle,
+    set_update_fn: HelperHandle,
+    dict_update_fn: HelperHandle,
+    map_add_fn: HelperHandle,
+    dict_merge_fn: HelperHandle,
     list_append_fn: HelperHandle,
     store_slice_fn: HelperHandle,
     get_iter_fn: HelperHandle,
     for_iter_next_fn: HelperHandle,
+    call_kw_fn_0: HelperHandle,
+    call_kw_fn_1: HelperHandle,
+    call_kw_fn_2: HelperHandle,
+    call_kw_fn_3: HelperHandle,
+    call_kw_fn_4: HelperHandle,
+    call_kw_fn_5: HelperHandle,
+    call_kw_fn_6: HelperHandle,
+    call_kw_fn_7: HelperHandle,
+    call_kw_fn_8: HelperHandle,
+    call_kw_fn_9: HelperHandle,
+    call_kw_fn_10: HelperHandle,
+    call_kw_fn_11: HelperHandle,
+    call_kw_fn_12: HelperHandle,
+    call_kw_fn_13: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3891,6 +3978,135 @@ fn register_helper_fn_pointers(
         cpu.list_append_fn as *const (),
         CallFlavor::Plain,
     );
+    // `bh_unary_positive_fn` computes `+value`; a user `__pos__` may run
+    // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let unary_positive_fn = bind(
+        assembler,
+        cpu.unary_positive_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_load_common_constant_fn` resolves a CommonConstant discriminant;
+    // the `all`/`any` variants allocate a builtin function → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let load_common_constant_fn = bind(
+        assembler,
+        cpu.load_common_constant_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // Comprehension/display accumulators (`bh_set_add_fn` etc.) mutate a
+    // peeked container in place; a user `__hash__`/iterator may run Python
+    // → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let set_add_fn = bind(assembler, cpu.set_add_fn as *const (), CallFlavor::MayForce);
+    let set_update_fn = bind(
+        assembler,
+        cpu.set_update_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let dict_update_fn = bind(
+        assembler,
+        cpu.dict_update_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let map_add_fn = bind(assembler, cpu.map_add_fn as *const (), CallFlavor::MayForce);
+    let dict_merge_fn = bind(
+        assembler,
+        cpu.dict_merge_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_list_to_tuple_fn` allocates a fresh tuple / can raise TypeError →
+    // `MayForce`.  Appended last to preserve fn_ptr indices.
+    let list_to_tuple_fn = bind(
+        assembler,
+        cpu.list_to_tuple_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_load_from_dict_or_globals_fn` may run a user `__getattr__` on the
+    // mapping → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let load_from_dict_or_globals_fn = bind(
+        assembler,
+        cpu.load_from_dict_or_globals_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_call_function_ex_fn` unpacks `*`/`**` and dispatches, running
+    // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let call_function_ex_fn = bind(
+        assembler,
+        cpu.call_function_ex_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // Per-arity `bh_call_kw_<n>` CALL_KW helpers resolve keyword args and
+    // dispatch, running Python → `MayForce`.  Appended last to preserve
+    // fn_ptr indices.
+    let call_kw_fn_0 = bind(
+        assembler,
+        cpu.call_kw_fn_0 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_1 = bind(
+        assembler,
+        cpu.call_kw_fn_1 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_2 = bind(
+        assembler,
+        cpu.call_kw_fn_2 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_3 = bind(
+        assembler,
+        cpu.call_kw_fn_3 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_4 = bind(
+        assembler,
+        cpu.call_kw_fn_4 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_5 = bind(
+        assembler,
+        cpu.call_kw_fn_5 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_6 = bind(
+        assembler,
+        cpu.call_kw_fn_6 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_7 = bind(
+        assembler,
+        cpu.call_kw_fn_7 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_8 = bind(
+        assembler,
+        cpu.call_kw_fn_8 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_9 = bind(
+        assembler,
+        cpu.call_kw_fn_9 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_10 = bind(
+        assembler,
+        cpu.call_kw_fn_10 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_11 = bind(
+        assembler,
+        cpu.call_kw_fn_11 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_12 = bind(
+        assembler,
+        cpu.call_kw_fn_12 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_13 = bind(
+        assembler,
+        cpu.call_kw_fn_13 as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3956,6 +4172,30 @@ fn register_helper_fn_pointers(
         unpack_ex_fn,
         get_iter_fn,
         for_iter_next_fn,
+        unary_positive_fn,
+        load_common_constant_fn,
+        set_add_fn,
+        set_update_fn,
+        dict_update_fn,
+        map_add_fn,
+        dict_merge_fn,
+        list_to_tuple_fn,
+        load_from_dict_or_globals_fn,
+        call_function_ex_fn,
+        call_kw_fn_0,
+        call_kw_fn_1,
+        call_kw_fn_2,
+        call_kw_fn_3,
+        call_kw_fn_4,
+        call_kw_fn_5,
+        call_kw_fn_6,
+        call_kw_fn_7,
+        call_kw_fn_8,
+        call_kw_fn_9,
+        call_kw_fn_10,
+        call_kw_fn_11,
+        call_kw_fn_12,
+        call_kw_fn_13,
     }
 }
 
@@ -5351,6 +5591,31 @@ impl CodeWriter {
                     idx: unary_invert_fn_idx,
                     flavor: _unary_invert_fn_flavor,
                 },
+            unary_positive_fn:
+                HelperHandle {
+                    idx: unary_positive_fn_idx,
+                    flavor: _unary_positive_fn_flavor,
+                },
+            load_common_constant_fn:
+                HelperHandle {
+                    idx: load_common_constant_fn_idx,
+                    flavor: _load_common_constant_fn_flavor,
+                },
+            list_to_tuple_fn:
+                HelperHandle {
+                    idx: list_to_tuple_fn_idx,
+                    flavor: _list_to_tuple_fn_flavor,
+                },
+            load_from_dict_or_globals_fn:
+                HelperHandle {
+                    idx: load_from_dict_or_globals_fn_idx,
+                    flavor: _load_from_dict_or_globals_fn_flavor,
+                },
+            call_function_ex_fn:
+                HelperHandle {
+                    idx: call_function_ex_fn_idx,
+                    flavor: _call_function_ex_fn_flavor,
+                },
             unary_not_fn:
                 HelperHandle {
                     idx: unary_not_fn_idx,
@@ -5365,6 +5630,31 @@ impl CodeWriter {
                 HelperHandle {
                     idx: list_extend_fn_idx,
                     flavor: _list_extend_fn_flavor,
+                },
+            set_add_fn:
+                HelperHandle {
+                    idx: set_add_fn_idx,
+                    flavor: _set_add_fn_flavor,
+                },
+            set_update_fn:
+                HelperHandle {
+                    idx: set_update_fn_idx,
+                    flavor: _set_update_fn_flavor,
+                },
+            dict_update_fn:
+                HelperHandle {
+                    idx: dict_update_fn_idx,
+                    flavor: _dict_update_fn_flavor,
+                },
+            map_add_fn:
+                HelperHandle {
+                    idx: map_add_fn_idx,
+                    flavor: _map_add_fn_flavor,
+                },
+            dict_merge_fn:
+                HelperHandle {
+                    idx: dict_merge_fn_idx,
+                    flavor: _dict_merge_fn_flavor,
                 },
             list_append_fn:
                 HelperHandle {
@@ -5390,6 +5680,76 @@ impl CodeWriter {
                 HelperHandle {
                     idx: for_iter_next_fn_idx,
                     flavor: _for_iter_next_fn_flavor,
+                },
+            call_kw_fn_0:
+                HelperHandle {
+                    idx: call_kw_fn_0_idx,
+                    flavor: _call_kw_fn_0_flavor,
+                },
+            call_kw_fn_1:
+                HelperHandle {
+                    idx: call_kw_fn_1_idx,
+                    flavor: _call_kw_fn_1_flavor,
+                },
+            call_kw_fn_2:
+                HelperHandle {
+                    idx: call_kw_fn_2_idx,
+                    flavor: _call_kw_fn_2_flavor,
+                },
+            call_kw_fn_3:
+                HelperHandle {
+                    idx: call_kw_fn_3_idx,
+                    flavor: _call_kw_fn_3_flavor,
+                },
+            call_kw_fn_4:
+                HelperHandle {
+                    idx: call_kw_fn_4_idx,
+                    flavor: _call_kw_fn_4_flavor,
+                },
+            call_kw_fn_5:
+                HelperHandle {
+                    idx: call_kw_fn_5_idx,
+                    flavor: _call_kw_fn_5_flavor,
+                },
+            call_kw_fn_6:
+                HelperHandle {
+                    idx: call_kw_fn_6_idx,
+                    flavor: _call_kw_fn_6_flavor,
+                },
+            call_kw_fn_7:
+                HelperHandle {
+                    idx: call_kw_fn_7_idx,
+                    flavor: _call_kw_fn_7_flavor,
+                },
+            call_kw_fn_8:
+                HelperHandle {
+                    idx: call_kw_fn_8_idx,
+                    flavor: _call_kw_fn_8_flavor,
+                },
+            call_kw_fn_9:
+                HelperHandle {
+                    idx: call_kw_fn_9_idx,
+                    flavor: _call_kw_fn_9_flavor,
+                },
+            call_kw_fn_10:
+                HelperHandle {
+                    idx: call_kw_fn_10_idx,
+                    flavor: _call_kw_fn_10_flavor,
+                },
+            call_kw_fn_11:
+                HelperHandle {
+                    idx: call_kw_fn_11_idx,
+                    flavor: _call_kw_fn_11_flavor,
+                },
+            call_kw_fn_12:
+                HelperHandle {
+                    idx: call_kw_fn_12_idx,
+                    flavor: _call_kw_fn_12_flavor,
+                },
+            call_kw_fn_13:
+                HelperHandle {
+                    idx: call_kw_fn_13_idx,
+                    flavor: _call_kw_fn_13_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -5475,10 +5835,36 @@ impl CodeWriter {
                 make_cell_fn_idx,
                 unary_negative_fn_idx,
                 unary_invert_fn_idx,
+                unary_positive_fn_idx,
+                load_common_constant_fn_idx,
+                list_to_tuple_fn_idx,
+                load_from_dict_or_globals_fn_idx,
+                call_function_ex_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
+                set_add_fn_idx,
+                set_update_fn_idx,
+                dict_update_fn_idx,
+                map_add_fn_idx,
+                dict_merge_fn_idx,
                 store_slice_fn_idx,
+                call_kw_idx_by_nargs: [
+                    call_kw_fn_0_idx,
+                    call_kw_fn_1_idx,
+                    call_kw_fn_2_idx,
+                    call_kw_fn_3_idx,
+                    call_kw_fn_4_idx,
+                    call_kw_fn_5_idx,
+                    call_kw_fn_6_idx,
+                    call_kw_fn_7_idx,
+                    call_kw_fn_8_idx,
+                    call_kw_fn_9_idx,
+                    call_kw_fn_10_idx,
+                    call_kw_fn_11_idx,
+                    call_kw_fn_12_idx,
+                    call_kw_fn_13_idx,
+                ],
             });
         }
 
@@ -8657,11 +9043,17 @@ impl CodeWriter {
                         }
 
                         Instruction::WithExceptStart => {
-                            // CPython 3.14: `WITH_EXCEPT_START` leaves the existing
-                            // stack entries intact and pushes the exit-function
-                            // result on top. Preserve the net `+1` stack effect in
-                            // the shadow graph and fall back to the interpreter for
+                            // `WITH_EXCEPT_START` leaves the existing stack
+                            // entries intact and pushes the exit-function result
+                            // on top. Preserve the net `+1` stack effect in the
+                            // shadow graph and fall back to the interpreter for
                             // the actual helper call semantics.
+                            //
+                            // Portable (flowspace records a `direct_call` /
+                            // `indirect_call`) but latent: a `with` block's
+                            // exception table prevents the enclosing loop/callee
+                            // from ever reaching a JIT token, so this abort is
+                            // never reached in practice — no residual yet.
                             emit_abort_permanent!(py_pc);
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8787,7 +9179,13 @@ impl CodeWriter {
                         Instruction::MakeFunction { .. } => {
                             // Pops code object (TOS), pushes function. Net: 0.
                             // Replace shadow value so SET_FUNCTION_ATTRIBUTE sees func.
-                            // RustPython: (1 pushed, 1 popped).
+                            // (1 pushed, 1 popped).
+                            //
+                            // Portable (flowspace `newfunction`) but latent:
+                            // function definition is a def-time op, not a hot-loop
+                            // body, and MAKE_FUNCTION + SET_FUNCTION_ATTRIBUTE must
+                            // port as a pair (the flowspace fold resolves the code
+                            // constant to a Constant closure). No residual yet.
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!(py_pc);
@@ -9259,15 +9657,81 @@ impl CodeWriter {
                         // Pops: kwnames + argc args + null_or_self + callable = argc + 3.
                         // Pushes: result. Net stack effect: -(argc + 2).
                         // pyopcode.py CALL_FUNCTION_KW / CALL_KW / eval.rs:2570-2726.
+                        //
+                        // Records `call_kw(callable, null_or_self, kwnames,
+                        // arg0..argN-1)` → `residual_call_r_r(call_kw_fn_N,
+                        // ListR([...])`; `bh_call_kw_N` resolves keyword args
+                        // against the callable and dispatches (running user
+                        // code) under `force_plain_eval` so the
+                        // `call_user_function_resolved` fast path stays on
+                        // `eval_frame_plain` (no JIT re-entry from a blackhole
+                        // residual).  nargs > 13 keeps the `abort_permanent`
+                        // branch: the per-arity helper family tops out at
+                        // nargs=13 (callable + null_or_self + kwnames + 13 args
+                        // = 16 i64, the backend dispatch ceiling), mirroring
+                        // the `Call` nargs>14 clamp.
                         Instruction::CallKw { argc } => {
                             let nargs = argc.get(op_arg) as usize;
-                            // Pop kwnames + nargs args + null_or_self + callable.
-                            for _ in 0..nargs + 3 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            if nargs > 13 {
+                                // Pop kwnames + nargs args + null_or_self + callable.
+                                for _ in 0..nargs + 3 {
+                                    pop_and_decr_depth(&mut current_state, &mut current_depth);
+                                }
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_abort_permanent!(py_pc);
+                            } else {
+                                // Pop order (top→bottom): kwnames, arg{N-1}..arg0,
+                                // null_or_self, callable — mirroring the
+                                // interpreter's `call_kw` stack reads.
+                                let kwnames_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let kwnames_value =
+                                    pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &kwnames_value {
+                                    pin!(Some(*v), kwnames_reg);
+                                }
+                                let mut arg_values_rev = Vec::with_capacity(nargs);
+                                for _ in 0..nargs {
+                                    let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                    let arg_value =
+                                        pop_ref_or_fresh(&mut current_state, &mut graph);
+                                    if let super::flow::FlowValue::Variable(v) = &arg_value {
+                                        pin!(Some(*v), arg_reg);
+                                    }
+                                    arg_values_rev.push(arg_value);
+                                }
+                                let self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &self_value {
+                                    pin!(Some(*v), self_reg);
+                                }
+                                let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let callable_value =
+                                    pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &callable_value {
+                                    pin!(Some(*v), callable_reg);
+                                }
+                                // Graph op args: callable, null_or_self, kwnames,
+                                // arg0..argN-1 (pops were top-first, so reverse).
+                                let mut op_args: Vec<super::flow::SpaceOperationArg> =
+                                    Vec::with_capacity(nargs + 3);
+                                op_args.push(callable_value.into());
+                                op_args.push(self_value.into());
+                                op_args.push(kwnames_value.into());
+                                for arg in arg_values_rev.into_iter().rev() {
+                                    op_args.push(arg.into());
+                                }
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "call_kw",
+                                    op_args,
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                pin!(Some(result_value), stack_base + current_depth);
+                                push_and_bump!(result_value.into(), py_pc);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
                         }
 
                         Instruction::Swap { i } => {
@@ -9336,17 +9800,40 @@ impl CodeWriter {
 
                         // LoadFastAndClear: push local, clear it. Net: +1.
                         // pyopcode.py LOAD_FAST_AND_CLEAR / eval.rs:2052-2058.
+                        // LOAD_FAST_AND_CLEAR: push the local's value (like
+                        // LOAD_FAST, but no unbound-slot error — a cleared slot
+                        // reads as NULL) then clear the slot to NULL.  Net: +1.
+                        // flowcontext.rs LoadFastAndClear reads `locals_w[idx]`
+                        // and sets it to `None`; the runtime local read + NULL
+                        // clear is the vable dual-write below (portal-gated,
+                        // mirroring LOAD_FAST + the pyframe.py:411 NULL slot
+                        // clear).  Used by comprehension/`except*` scope save.
                         Instruction::LoadFastAndClear { var_num } => {
-                            let idx = var_num.get(op_arg).as_usize();
-                            let value = current_state
-                                .local_value_at(idx)
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            if idx < current_state.locals_w.len() {
-                                current_state.locals_w[idx] = None;
+                            let reg = var_num.get(op_arg).as_usize() as u16;
+                            emit_load_fast_ref!(current_depth, reg, py_pc);
+                            if is_portal {
+                                // Clear the LOCAL slot to NULL:
+                                // `setarrayitem_vable_r(locals_cells_stack_w,
+                                // local_slot, ConstRef(0))`, the same
+                                // NULL-slot write pyframe.py uses for
+                                // `popvalue_maybe_none` (Constant::none() →
+                                // ConstRef(0)).
+                                let local_slot = local_to_vable_slot(reg as usize) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(local_slot).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                        super::flow::Constant::none().into(),
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
                             }
-                            current_state.stack.push(value);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            current_state.clear_local_value(reg as usize);
                         }
 
                         // ListAppend(i): peek list at stack[i], pop value. Net: -1.
@@ -9468,11 +9955,29 @@ impl CodeWriter {
 
                         // MapAdd(i): peek dict at stack[i], pop value + key. Net: -2.
                         // eval.rs map_add.
-                        Instruction::MapAdd { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            emit_abort_permanent!(py_pc);
+                        // MapAdd(i): PEEK(i) dict (mutated in place), pop value
+                        // (TOS) then key (TOS1). Net: -2.  `map_add(dict, key,
+                        // value)` via the 3-Ref `map_add` residual (`dict[key] =
+                        // value`).  eval.rs map_add: value = pop(), key = pop(),
+                        // dict = peek_at(i - 1).
+                        Instruction::MapAdd { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let key = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let dict_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            emit_frontend_accumulate_3(
+                                &current_block.block(),
+                                "map_add",
+                                dict_value,
+                                key,
+                                value,
+                                py_pc as i64,
+                            );
                         }
 
                         // ── Remaining instructions: stack-effect-only accounting ──
@@ -9663,14 +10168,50 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // CallFunctionEx: pops callable+null+args+kwargs_or_null (4), pushes 1. Net: -3.
+                        // CallFunctionEx: pops callable+null+args+kwargs_or_null
+                        // (4), pushes 1. Net: -3.  Stack top→bottom is
+                        // kwargs_or_null, starargs, self_or_null, callable
+                        // (eval.rs:3636-3639).  Lowers to `call_function_ex(
+                        // callable, self_or_null, starargs, kwargs_or_null)` →
+                        // `residual_call_r_r(call_function_ex_fn, ListR[...])`;
+                        // `bh_call_function_ex_fn` unpacks `*`/`**` and
+                        // dispatches (MayForce).
                         Instruction::CallFunctionEx => {
-                            for _ in 0..4 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let kwargs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let kwargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &kwargs_value {
+                                pin!(Some(*v), kwargs_reg);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let starargs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let starargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &starargs_value {
+                                pin!(Some(*v), starargs_reg);
+                            }
+                            let self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &self_value {
+                                pin!(Some(*v), self_reg);
+                            }
+                            let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &callable_value {
+                                pin!(Some(*v), callable_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "call_function_ex",
+                                vec![
+                                    callable_value.into(),
+                                    self_value.into(),
+                                    starargs_value.into(),
+                                    kwargs_value.into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // DeleteSubscr: pops 2 (index, obj). Net: -2.
@@ -9719,16 +10260,108 @@ impl CodeWriter {
                         }
 
                         // PopJumpIfNone / PopJumpIfNotNone: pops 1. Net: -1.
-                        Instruction::PopJumpIfNone { .. }
-                        | Instruction::PopJumpIfNotNone { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        //
+                        // `flowcontext.py` folds these to a static
+                        // `is None` constant test with no residual guard.
+                        // The meta-trace analog composes two already-ported
+                        // front-end ops: `is`/`is_not` against the immortal
+                        // `None` singleton (`pyobject_const_ref_value(w_none())`
+                        // — GC-safe to const-fold; `None` never moves), then
+                        // `bool` on that Ref result to feed the generic Bool
+                        // exitswitch.  Both variants jump on TRUE, so the exit
+                        // wiring is identical to POP_JUMP_IF_TRUE; the only
+                        // difference is `is` (POP_JUMP_IF_NONE) vs `is_not`
+                        // (POP_JUMP_IF_NOT_NONE).
+                        Instruction::PopJumpIfNone { delta }
+                        | Instruction::PopJumpIfNotNone { delta } => {
+                            let invert_kind = match instruction {
+                                Instruction::PopJumpIfNone { .. } => {
+                                    pyre_interpreter::bytecode::Invert::No
+                                }
+                                _ => pyre_interpreter::bytecode::Invert::Yes,
+                            };
+                            let target_py_pc = jump_target_forward(
+                                code,
+                                num_instrs,
+                                py_pc + 1,
+                                delta.get(op_arg).as_usize(),
+                            );
+                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &cond_value {
+                                pin!(Some(*v), cond_reg);
+                            }
+                            // `x is None` / `x is not None` — the None singleton
+                            // is const-folded as a Ref operand.
+                            let none_value = pyobject_const_ref_value(pyre_object::w_none());
+                            let is_value = emit_frontend_is_op(
+                                &mut graph,
+                                &current_block.block(),
+                                cond_value,
+                                none_value,
+                                invert_kind,
+                                py_pc as i64,
+                            );
+                            let bool_value = emit_frontend_bool(
+                                &mut graph,
+                                &current_block.block(),
+                                is_value.into(),
+                                py_pc as i64,
+                            );
+                            // flowcontext.py:756-763 `block.exitswitch = w_cond`.
+                            current_block.block().borrow_mut().exitswitch =
+                                Some(super::flow::ExitSwitch::Value(bool_value.into()));
+                            let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                            pin!(Some(bool_value), scratch_truth);
+                            let fallthrough_py_pc = py_pc + 1;
+                            if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
+                                // Jump-on-TRUE: mirror POP_JUMP_IF_TRUE — the
+                                // TRUE link is the jump target, so mergeblock the
+                                // target FIRST, then append the FALSE
+                                // (fallthrough) link.  `needs_fallthrough = false`
+                                // suppresses the PC-sequential walker's spurious
+                                // fallthrough injection (see PopJumpIfTrue).
+                                mergeblock(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &current_block,
+                                    &{
+                                        let mut branch_state = current_state.clone();
+                                        branch_state.next_offset = target_py_pc;
+                                        branch_state.blocklist =
+                                            frame_blocks_for_offset(code, target_py_pc);
+                                        branch_state
+                                    },
+                                    target_py_pc,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                );
+                                set_last_bool_exitcase(&current_block.block(), true);
+                                emit_goto_if_not!(scratch_truth, fallthrough_py_pc);
+                                set_last_bool_exitcase(&current_block.block(), false);
+                                needs_fallthrough = false;
+                            }
                         }
 
                         // SetAdd(i): peek set, pop value. Net: -1.
-                        Instruction::SetAdd { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // SetAdd(i): PEEK(i) set (mutated in place), pop value.
+                        // Net: -1.  `set_add(set, value)` via the `set_add`
+                        // residual (`set.add(value)` / `list.append`).
+                        Instruction::SetAdd { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let set_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            emit_frontend_accumulate_2(
+                                &current_block.block(),
+                                "set_add",
+                                set_value,
+                                value,
+                                py_pc as i64,
+                            );
                         }
 
                         // ListExtend(i): PEEK(i) list (mutated in place, stays
@@ -9760,21 +10393,79 @@ impl CodeWriter {
                         }
 
                         // SetUpdate(i): peek set, pop iterable. Net: -1.
-                        Instruction::SetUpdate { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // SetUpdate(i): PEEK(i) set (mutated in place), pop
+                        // iterable. Net: -1.  `set_update(set, iterable)` via the
+                        // `set_update` residual (`set.update` / `list.extend`).
+                        Instruction::SetUpdate { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let iterable = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let set_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            emit_frontend_accumulate_2(
+                                &current_block.block(),
+                                "set_update",
+                                set_value,
+                                iterable,
+                                py_pc as i64,
+                            );
                         }
 
-                        // DictUpdate(i) / DictMerge(i): peek dict, pop source. Net: -1.
-                        Instruction::DictUpdate { .. } | Instruction::DictMerge { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // DictUpdate(i): PEEK(i) dict (mutated in place), pop
+                        // source. Net: -1.  `dict_update(dict, source)` via the
+                        // `dict_update` residual (`dict.update` with ismapping
+                        // gate).
+                        Instruction::DictUpdate { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let source = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let dict_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            emit_frontend_accumulate_2(
+                                &current_block.block(),
+                                "dict_update",
+                                dict_value,
+                                source,
+                                py_pc as i64,
+                            );
+                        }
+
+                        // DictMerge(i): PEEK(i) dict (mutated in place), pop
+                        // source.  The callable at `peekvalue(oparg + 2)` is
+                        // peeked (never popped) for `**kwargs` error prefixes.
+                        // Net: -1.  `dict_merge(dict, source, callable)` via the
+                        // 3-Ref `dict_merge` residual.  `pyopcode.py:1514`.
+                        Instruction::DictMerge { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let source = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let dict_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            // callable = peekvalue(oparg + 2) after the source pop
+                            // → stack offset (oparg + 3) from the new TOS.
+                            let callable_value =
+                                peek_container_or_fresh(&current_state, oparg + 3, &mut graph);
+                            emit_frontend_accumulate_3(
+                                &current_block.block(),
+                                "dict_merge",
+                                dict_value,
+                                source,
+                                callable_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // SetFunctionAttribute: pops func (TOS), pops attr (TOS1),
                         // pushes same func back. Net: -1. Preserve func identity.
                         // eval.rs:1907-1908: func = pop(), attr = pop().
                         Instruction::SetFunctionAttribute { .. } => {
+                            // Portable (flowspace `newfunction` with constant
+                            // defaults) but latent: the def-time partner of
+                            // MAKE_FUNCTION; ports as a pair with it. No residual
+                            // yet.
                             let func = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             let _ = current_state.stack.pop(); // attr
@@ -9793,6 +10484,10 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(result);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects END_SEND
+                            // with `unsupported_rpython("async iteration is not
+                            // RPython")` — the generated JIT cannot trace it
+                            // either, so abort_permanent is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10077,6 +10772,10 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // BUILD_INTERPOLATION with `unsupported_rpython(
+                            // "f-strings and template strings are not RPython")`
+                            // — abort is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10087,20 +10786,65 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // BUILD_TEMPLATE with `unsupported_rpython("f-strings
+                            // and template strings are not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
                         // CallIntrinsic1: pops 1, pushes 1 (result may differ). Net: 0.
-                        Instruction::CallIntrinsic1 { .. } => {
-                            let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!(py_pc);
+                        // UnaryPositive (`+value`, pyopcode.rs:1390 → space.pos)
+                        // is lowered to the object-space `pos(value)` op, the
+                        // single-Ref FORMAT_SIMPLE shape (mirrors UNARY_INVERT);
+                        // the other intrinsics remain unported → abort_permanent.
+                        Instruction::CallIntrinsic1 { func } => {
+                            use pyre_interpreter::bytecode::IntrinsicFunction1;
+                            // UnaryPositive→`pos`, ListToTuple→`list_to_tuple`
+                            // are the two portable CALL_INTRINSIC_1 variants
+                            // (flowcontext.rs:2422-2431 record real ops); both
+                            // are single-Ref→Ref residuals.  Every other variant
+                            // is `unsupported_rpython` (flowcontext.rs:2435) —
+                            // abort_permanent is parity-correct there.
+                            let opname = match func.get(op_arg) {
+                                IntrinsicFunction1::UnaryPositive => Some("pos"),
+                                IntrinsicFunction1::ListToTuple => Some("list_to_tuple"),
+                                _ => None,
+                            };
+                            if let Some(opname) = opname {
+                                let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &val_value {
+                                    pin!(Some(*v), val_reg);
+                                }
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    opname,
+                                    vec![val_value.into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                pin!(Some(result_value), stack_base + current_depth);
+                                push_and_bump!(result_value.into(), py_pc);
+                            } else {
+                                let _ = current_state.stack.pop();
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                emit_abort_permanent!(py_pc);
+                            }
                         }
 
                         // CallIntrinsic2: variant-dependent stack effect.
                         // SetFunctionTypeParams: pops type_params (TOS), leaves func. Net: -1.
                         // Other variants: general pop 2, push 1. Net: -1.
                         // pyopcode.rs:1302-1316.
+                        //
+                        // Only SetTypeparamDefault is portable (flowspace
+                        // `set_typeparam_default` pure op); the rest are genuine
+                        // boundaries (`unsupported_rpython`).  The portable one is
+                        // deeply latent — a PEP 695 def-time intrinsic that
+                        // imports `_typing` and calls a Python helper, never a hot
+                        // loop body. No residual.
                         Instruction::CallIntrinsic2 { func } => {
                             use pyre_interpreter::bytecode::IntrinsicFunction2;
                             match func.get(op_arg) {
@@ -10123,11 +10867,23 @@ impl CodeWriter {
                         Instruction::GetLen => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects GET_LEN
+                            // with `unsupported_rpython("GET_LEN is used by match
+                            // statements (not RPython)")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
                         // pyopcode.rs:2059 delegates to load_method; eval.rs:2365 pops 1 pushes 2.
+                        //
+                        // Enter/Exit are portable (flowspace records a
+                        // `record_maybe_raise_op`), AEnter/AExit are a genuine
+                        // async boundary (`unsupported_rpython("async with is not
+                        // RPython")`).  The portable Enter/Exit half is latent:
+                        // LOAD_SPECIAL only heads a `with` block, whose exception
+                        // table blocks token creation (see WITH_EXCEPT_START), so
+                        // this abort is never reached in practice. No residual yet.
                         Instruction::LoadSpecial { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
                             push_fresh_ref(&mut current_state, &mut graph);
@@ -10139,10 +10895,45 @@ impl CodeWriter {
 
                         // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
                         // Replace shadow value. eval.rs:2028.
-                        Instruction::LoadFromDictOrGlobals { .. } => {
-                            let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!(py_pc);
+                        // LoadFromDictOrGlobals(i): pop dict, push result. Net 0.
+                        // `flowcontext.py` resolves via find_global, but the op
+                        // carries a runtime dict operand so it lowers to a
+                        // residual: `load_from_dict_or_globals(dict, code, frame,
+                        // namei)` → `residual_call_ir_r(fn, ListI[namei],
+                        // ListR[dict, code, frame])`.  `bh_load_from_dict_or_
+                        // globals_fn` tries `getattr(dict, name)` then the live
+                        // frame's globals (GC-safe when the frame owns w_code,
+                        // like bh_load_global_fn), else NameError.  `namei` is a
+                        // direct co_names index.
+                        Instruction::LoadFromDictOrGlobals { i } => {
+                            let name_idx = i.get(op_arg) as usize;
+                            let dict_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let dict_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &dict_value {
+                                pin!(Some(*v), dict_reg);
+                            }
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_from_dict_or_globals",
+                                vec![
+                                    dict_value.into(),
+                                    code_const.into(),
+                                    frame_var.into(),
+                                    name_idx_const.into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // LoadFromDictOrDeref: structural adaptation — CPython pops dict,
@@ -10152,6 +10943,10 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
+                            // Genuine trace boundary: flowspace rejects
+                            // LOAD_FROM_DICT_OR_DEREF with `unsupported_rpython(
+                            // "closure cell mutation is not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10236,9 +11031,47 @@ impl CodeWriter {
                         }
 
                         // Loads that push +1.
-                        Instruction::LoadCommonConstant { .. }
-                        | Instruction::LoadLocals
-                        | Instruction::LoadBuildClass => {
+                        // LoadCommonConstant(idx): pushes 1 (the resolved
+                        // CommonConstant object). Net +1.
+                        //
+                        // `flowcontext.py` resolves LOAD_COMMON_CONSTANT to a
+                        // static const push (exception class, builtin type, or
+                        // `all`/`any` via find_global).  The meta-trace records a
+                        // `load_common_constant(disc)` HLOp lowered to
+                        // `residual_call_ir_r(load_common_constant_fn,
+                        // ListI[disc], ListR[])`.  `disc` is the compile-time
+                        // `CommonConstant` discriminant baked as a constant;
+                        // `bh_load_common_constant_fn` re-resolves it through the
+                        // shared `opcode_ops::load_common_constant_value`.  The
+                        // `all`/`any` variants allocate a builtin function, so
+                        // the residual is `MayForce` — a fresh object each call,
+                        // never const-folded.
+                        Instruction::LoadCommonConstant { idx } => {
+                            let disc: u32 =
+                                pyre_interpreter::pyopcode::common_constant_arg(idx, op_arg).into();
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_common_constant",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(disc as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
+                        // Genuine trace boundaries: flowspace rejects both —
+                        // LOAD_LOCALS with `unsupported_rpython("locals() is not
+                        // RPython")` and LOAD_BUILD_CLASS with `unsupported_rpython(
+                        // "defining classes inside functions is not RPython")`.
+                        // abort is parity-correct.
+                        Instruction::LoadLocals | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!(py_pc);
@@ -10361,6 +11194,10 @@ impl CodeWriter {
                         Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
+                            // Genuine trace boundary: flowspace rejects
+                            // GET_YIELD_FROM_ITER with `unsupported_rpython(
+                            // "`yield from` is not supported by flowspace yet")`
+                            // — abort is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10500,6 +11337,10 @@ impl CodeWriter {
                         // ExitInitCheck: no-op in pyre (pyopcode.rs:2069). Net: 0.
                         // RustPython pops the __init__ return value, but pyre's
                         // dispatch is a plain Ok(StepResult::Continue).
+                        // Genuine trace boundary: flowspace rejects
+                        // EXIT_INIT_CHECK with `unsupported_rpython("`__init__`
+                        // return-None check is not RPython")` — abort is
+                        // parity-correct.
                         Instruction::ExitInitCheck => {
                             emit_abort_permanent!(py_pc);
                         }
@@ -10510,6 +11351,15 @@ impl CodeWriter {
                         // YieldValue: pops yielded value, pushes placeholder back. Net: 0.
                         // Replace shadow value. rpython/flowspace/flowcontext.py:721,
                         // liveness.rs:569, assemble.py:1543.
+                        //
+                        // Fundamentally unsound to port: YIELD_VALUE suspends the
+                        // frame (StepResult::Yield), resuming later in a different
+                        // stack context — a residual call cannot express that.
+                        // flowspace's `record_pure_op("yield")` is an analysis
+                        // artifact (flow purity, not runtime effect-freedom), not
+                        // a signal that a residual is possible.  A JIT traces one
+                        // continuous execution, so abort_permanent is the only
+                        // parity-correct choice.
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
@@ -10517,6 +11367,11 @@ impl CodeWriter {
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
+                        // Portable (a plain push-None in flowspace) but useless:
+                        // it only heads a generator/coroutine body, whose
+                        // YIELD_VALUE aborts anyway (frame suspension is not
+                        // traceable), so a residual would never let a generator
+                        // loop compile. No residual.
                         Instruction::ReturnGenerator => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -10528,6 +11383,9 @@ impl CodeWriter {
                         Instruction::Send { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
+                            // Genuine trace boundary: flowspace rejects SEND with
+                            // `unsupported_rpython("async iteration is not
+                            // RPython")` — abort is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10546,6 +11404,11 @@ impl CodeWriter {
                         // CPython 3.12/3.13 semantics; PyPy pops 3 (w_exc, w_prev, aiter)
                         // on the StopAsyncIteration path (assemble.py:1578). Structural
                         // adaptation: pyre targets CPython opcode shape here.
+                        //
+                        // Genuine trace boundary: flowspace rejects END_ASYNC_FOR
+                        // with `unsupported_rpython` (the async cluster —
+                        // GET_AITER/GET_AWAITABLE/GET_ANEXT/SEND/END_ASYNC_FOR —
+                        // `async for` is not RPython), so abort is parity-correct.
                         Instruction::EndAsyncFor => {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
@@ -10560,6 +11423,10 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // CLEANUP_THROW with `unsupported_rpython("async
+                            // iteration is not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10568,6 +11435,10 @@ impl CodeWriter {
                         Instruction::MatchSequence => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // MATCH_SEQUENCE with `unsupported_rpython("structural
+                            // pattern matching is not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -12127,10 +12998,12 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
         // Forward conditional / unconditional jumps.  Targets compute
         // via `jump_target_forward(code, num_instrs, py_pc + 1, delta)`
         // matching the walker's PopJumpIfFalse / PopJumpIfTrue /
-        // JumpForward arms.
+        // PopJumpIfNone / PopJumpIfNotNone / JumpForward arms.
         let forward_delta = match scan_instr {
             Instruction::PopJumpIfFalse { delta }
             | Instruction::PopJumpIfTrue { delta }
+            | Instruction::PopJumpIfNone { delta }
+            | Instruction::PopJumpIfNotNone { delta }
             | Instruction::JumpForward { delta }
             | Instruction::ForIter { delta } => Some(delta.get(scan_arg).as_usize()),
             _ => None,
@@ -12152,6 +13025,8 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
                 scan_instr,
                 Instruction::PopJumpIfFalse { .. }
                     | Instruction::PopJumpIfTrue { .. }
+                    | Instruction::PopJumpIfNone { .. }
+                    | Instruction::PopJumpIfNotNone { .. }
                     | Instruction::ForIter { .. }
             ) && fallthrough < num_instrs
             {

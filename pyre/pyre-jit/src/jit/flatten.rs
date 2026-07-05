@@ -3148,7 +3148,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
 /// family; `compare_op_fn_idx` covers the COMPARE_OP family.
 /// `truth_fn_idx`, `setitem_fn_idx`, etc. cover
 /// one per HLOp family that the lowering pass brings online.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LoweringContext {
     /// `binary_op_fn` descrs-pool index — see codewriter.rs:3081
     /// (`descrs.intern_int_method_index("binary_op_fn", ...)`) for
@@ -3425,6 +3425,45 @@ pub struct LoweringContext {
     /// shape); `bh_unary_invert_fn` computes `~value` (a user `__invert__`
     /// may force virtualizables → `MayForce`).
     pub unary_invert_fn_idx: u16,
+    /// `unary_positive_fn` descrs-pool index.  UNARY_POSITIVE records the
+    /// object-space `pos(value)` op (pyopcode.py:649) lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
+    /// [`lower_unary_positive_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
+    /// shape); `bh_unary_positive_fn` computes `+value` (a user `__pos__`
+    /// may force virtualizables → `MayForce`).
+    pub unary_positive_fn_idx: u16,
+    /// `load_common_constant_fn` descrs-pool index.  LOAD_COMMON_CONSTANT
+    /// records the `load_common_constant(disc)` HLOp lowered to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([disc]), ListR([]),
+    /// Descr) → reg` via [`lower_load_common_constant_hlop_to_insn`] (the
+    /// `(Int) → Ref` int-only shape, empty `ListR`).
+    /// `bh_load_common_constant_fn` re-resolves the discriminant through
+    /// the shared `opcode_ops::load_common_constant_value`; the `all`/`any`
+    /// variants allocate a builtin function → `MayForce`.
+    pub load_common_constant_fn_idx: u16,
+    /// `list_to_tuple_fn` descrs-pool index.  CALL_INTRINSIC_1 ListToTuple
+    /// records the `list_to_tuple(value)` HLOp lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg`
+    /// via [`lower_list_to_tuple_hlop_to_insn`] (the single-Ref
+    /// FORMAT_SIMPLE shape); `bh_list_to_tuple_fn` allocates a fresh tuple
+    /// (non-list → TypeError → `MayForce`).
+    pub list_to_tuple_fn_idx: u16,
+    /// `load_from_dict_or_globals_fn` descrs-pool index.
+    /// LOAD_FROM_DICT_OR_GLOBALS records `load_from_dict_or_globals(dict,
+    /// code, frame, namei)` lowered to `residual_call_ir_r(ConstInt(fn_idx),
+    /// ListI([namei]), ListR([dict, code, frame]), Descr) → reg` via
+    /// [`lower_load_from_dict_or_globals_hlop_to_insn`] (the three-Ref
+    /// IMPORT_NAME shape); `bh_load_from_dict_or_globals_fn` tries the
+    /// popped mapping then the live frame globals (user `__getattr__` →
+    /// `MayForce`).
+    pub load_from_dict_or_globals_fn_idx: u16,
+    /// `call_function_ex_fn` descrs-pool index.  CALL_FUNCTION_EX records
+    /// `call_function_ex(callable, self_or_null, starargs, kwargs_or_null)`
+    /// lowered to `residual_call_r_r(ConstInt(fn_idx), ListR([callable,
+    /// self_or_null, starargs, kwargs_or_null]), Descr) → reg` via
+    /// [`lower_call_function_ex_hlop_to_insn`]; `bh_call_function_ex_fn`
+    /// unpacks `*`/`**` and dispatches (user code → `MayForce`).
+    pub call_function_ex_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
     /// `not_(value)` op (pyopcode.py:651) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -3448,6 +3487,18 @@ pub struct LoweringContext {
     /// DELETE_SUBSCR shape); `bh_list_extend_fn` extends the list in place
     /// from an arbitrary iterable (user `__iter__`/`__next__` → `MayForce`).
     pub list_extend_fn_idx: u16,
+    /// Comprehension/display accumulator residual descrs-pool indices.
+    /// SET_ADD/SET_UPDATE/DICT_UPDATE record 2-Ref void HLOps
+    /// (`set_add(set, value)` etc.), MAP_ADD/DICT_MERGE record 3-Ref void
+    /// HLOps (`map_add(dict, key, value)`, `dict_merge(dict, source,
+    /// callable)`), all lowered to `residual_call_r_v` via
+    /// [`lower_accumulator_hlop_to_insn`]; the `bh_*` residuals mutate the
+    /// peeked container in place (user `__hash__`/iterator → `MayForce`).
+    pub set_add_fn_idx: u16,
+    pub set_update_fn_idx: u16,
+    pub dict_update_fn_idx: u16,
+    pub map_add_fn_idx: u16,
+    pub dict_merge_fn_idx: u16,
     /// `store_slice_fn` descrs-pool index.  STORE_SLICE records the
     /// `store_slice(obj, start, stop, value)` HLOp lowered to
     /// `residual_call_r_v(ConstInt(fn_idx), ListR([obj, start, stop, value]),
@@ -3455,6 +3506,15 @@ pub struct LoweringContext {
     /// four-Ref STORE_SUBSCR shape); `bh_store_slice_fn` builds a `slice` and
     /// runs `setitem` (user `__setitem__`/`__index__` → `MayForce`).
     pub store_slice_fn_idx: u16,
+    /// Per-arity `call_kw_fn` descrs-pool indices, indexed by nargs
+    /// (`call_kw_idx_by_nargs[nargs]`): `[u16; 14]` covers nargs 0..=13.
+    /// CALL_KW records `call_kw(callable, null_or_self, kwnames, arg0..
+    /// argN-1)` lowered to `residual_call_r_r(ConstInt(fn_idx), ListR([
+    /// callable, null_or_self, kwnames, args...]), Descr) → reg` via
+    /// [`lower_call_kw_hlop_to_insn`]; `bh_call_kw_<n>` resolves keyword
+    /// args and dispatches (user code → `MayForce`).  A CALL_KW with
+    /// nargs > 13 takes the `abort_permanent` branch and records no HLOp.
+    pub call_kw_idx_by_nargs: [u16; 14],
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4314,6 +4374,65 @@ where
                 dst_reg,
             ))
         }
+        "call_function_ex" => {
+            // CALL_FUNCTION_EX: `call_function_ex(callable, self_or_null,
+            // starargs, kwargs_or_null)` → `residual_call_r_r(ConstInt(
+            // call_function_ex_fn_idx), ListR([callable, self_or_null,
+            // starargs, kwargs_or_null]), Descr) → reg`.  Unpacks `*`/`**`
+            // and dispatches (runs user code) → `MayForce`.
+            if op.args.len() != 4 {
+                return None;
+            }
+            let ref_operands: Vec<Operand> = op
+                .args
+                .iter()
+                .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
+                .collect();
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.call_function_ex_fn_idx,
+                ref_operands,
+                CallFlavor::MayForce,
+                majit_ir::PyreHelperKind::CallFunctionEx,
+                dst_reg,
+            ))
+        }
+        "call_kw" => {
+            // CALL_KW: `call_kw(callable, null_or_self, kwnames, arg0..
+            // argN-1)` → `residual_call_r_r(ConstInt(
+            // call_kw_idx_by_nargs[nargs]), ListR([callable, null_or_self,
+            // kwnames, args...]), Descr) → reg`.  nargs = args.len() - 3
+            // (callable + null_or_self + kwnames).  Resolves keyword args and
+            // dispatches (runs user code) → `MayForce`.  nargs > 13 records
+            // no HLOp (the walker takes `abort_permanent`), so a graph-side
+            // `call_kw` past the table is non-orthodox → passthrough.
+            if op.args.len() < 3 {
+                return None;
+            }
+            let nargs = op.args.len() - 3;
+            if nargs >= ctx.call_kw_idx_by_nargs.len() {
+                return None;
+            }
+            let ref_operands: Vec<Operand> = op
+                .args
+                .iter()
+                .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
+                .collect();
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.call_kw_idx_by_nargs[nargs],
+                ref_operands,
+                CallFlavor::MayForce,
+                majit_ir::PyreHelperKind::CallKw,
+                dst_reg,
+            ))
+        }
         "build_string_from_array" => {
             if op.args.len() != 1 {
                 return None;
@@ -4931,6 +5050,9 @@ where
     if let Some(insn) = lower_list_extend_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_accumulator_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_delete_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -4947,6 +5069,11 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_import_from_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) =
+        lower_load_from_dict_or_globals_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
         return Some(insn);
     }
     if let Some(insn) = lower_load_super_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -4970,6 +5097,15 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_unary_invert_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_unary_positive_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_list_to_tuple_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_common_constant_hlop_to_insn(op, ctx, get_register) {
         return Some(insn);
     }
     if let Some(insn) = lower_unary_not_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -5055,7 +5191,15 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Tag the LOAD_ATTR helper calldescr so the full-body walker recognizes the
+    // call and folds a monomorphic instance-attribute read to a guarded inline
+    // storage read (`try_walker_specialize_load_attr`) instead of recording the
+    // opaque `CALL_MAY_FORCE` getattr MRO-walk.  The tag is the recognition
+    // vehicle (the walker crate cannot match the helper by fnaddr); a decline
+    // falls back to this same residual, so tagging is behaviour-preserving when
+    // the fold is disabled or the receiver shape is unsupported.
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -5452,6 +5596,77 @@ where
     ))
 }
 
+/// Lower the UNARY_POSITIVE object-space op `pos(value)` → `result: Ref`
+/// (pyopcode.py:649 `unaryoperation("pos")`) to
+/// `residual_call_r_r(ConstInt(unary_positive_fn_idx), ListR([value]),
+/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
+/// `bh_unary_positive_fn` computes `+value`; a user `__pos__` may force
+/// virtualizables → `MayForce`.
+///
+/// Returns `None` for non-`pos` opnames so the caller can fall through
+/// to other lowering arms.
+pub fn lower_unary_positive_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "pos" || op.args.len() != 1 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.unary_positive_fn_idx,
+        vec![value],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the CALL_INTRINSIC_1 ListToTuple HLOp `list_to_tuple(value)` →
+/// `result: Ref` to `residual_call_r_r(ConstInt(list_to_tuple_fn_idx),
+/// ListR([value]), Descr) → reg`, the single-Ref FORMAT_SIMPLE shape.
+/// `bh_list_to_tuple_fn` allocates a fresh tuple (non-list → TypeError →
+/// `MayForce`).
+///
+/// Returns `None` for non-`list_to_tuple` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_list_to_tuple_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "list_to_tuple" || op.args.len() != 1 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.list_to_tuple_fn_idx,
+        vec![value],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
 /// Lower the UNARY_NOT object-space op `not_(value)` → `result: Ref`
 /// (pyopcode.py:651 `unaryoperation("not_")`) to
 /// `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]), Descr) →
@@ -5572,6 +5787,52 @@ where
     ))
 }
 
+/// Lower the LOAD_COMMON_CONSTANT pyre HLOp `load_common_constant(disc)`
+/// → `result: Ref` to `residual_call_ir_r(ConstInt(
+/// load_common_constant_fn_idx), ListI([disc]), ListR([]), Descr) → reg`,
+/// the `(Int) → Ref` int-only shape (empty `ListR`, sibling of the
+/// box_int form).  `disc` is the compile-time `CommonConstant`
+/// discriminant; `bh_load_common_constant_fn` re-resolves it.  Flavor is
+/// `MayForce` (the `all`/`any` variants allocate a fresh builtin
+/// function); unlike box_int, no `BoxInt` helper tag — the result is a
+/// resolved object, not a boxed int.
+///
+/// Returns `None` for non-`load_common_constant` opnames so the caller can
+/// fall through to other lowering arms.
+pub fn lower_load_common_constant_hlop_to_insn<F>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+{
+    if op.opname != "load_common_constant" || op.args.len() != 1 {
+        return None;
+    }
+    let disc = const_int_for_value_arg(&op.args[0])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_common_constant_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(disc)])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
 /// Lower the IMPORT_NAME pyre HLOp `import_name(fromlist, level, code, frame,
 /// name_idx)` → `result: Ref` to `residual_call_ir_r(ConstInt(
 /// import_name_fn_idx), ListI([name_idx]), ListR([fromlist, level, code,
@@ -5677,6 +5938,58 @@ where
                 vec![Operand::ConstInt(name_idx)],
             )),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![module, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOAD_FROM_DICT_OR_GLOBALS HLOp `load_from_dict_or_globals(
+/// dict, code, frame, namei)` → `result: Ref` to `residual_call_ir_r(
+/// ConstInt(fn_idx), ListI([namei]), ListR([dict, code, frame]), Descr) →
+/// reg` — the three-Ref IMPORT_NAME shape.
+/// `bh_load_from_dict_or_globals_fn` tries the popped mapping via
+/// `getattr` then the live frame globals; a user `__getattr__` may run
+/// Python (`MayForce`).
+///
+/// Returns `None` for non-`load_from_dict_or_globals` opnames so the
+/// caller can fall through to other lowering arms.
+pub fn lower_load_from_dict_or_globals_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_from_dict_or_globals" || op.args.len() != 4 {
+        return None;
+    }
+    let dict = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let frame = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_from_dict_or_globals_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![dict, code, frame])),
             descr_operand,
         ],
         dst_reg,
@@ -5853,6 +6166,50 @@ where
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.list_extend_fn_idx,
         vec![list_operand, iterable_operand],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+    ))
+}
+
+/// Lower the comprehension/display accumulator HLOps to `residual_call_r_v`
+/// (void, N Ref operands, `MayForce`).  Each mutates a peeked container in
+/// place through its `bh_*` residual:
+/// - `set_add(set, value)` / `set_update(set, iterable)` /
+///   `dict_update(dict, source)` — 2 Ref operands.
+/// - `map_add(dict, key, value)` / `dict_merge(dict, source, callable)` —
+///   3 Ref operands.
+///
+/// Returns `None` for any other opname so the caller can fall through to
+/// other lowering arms.
+pub fn lower_accumulator_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    let (fn_idx, argc) = match op.opname.as_str() {
+        "set_add" => (ctx.set_add_fn_idx, 2),
+        "set_update" => (ctx.set_update_fn_idx, 2),
+        "dict_update" => (ctx.dict_update_fn_idx, 2),
+        "map_add" => (ctx.map_add_fn_idx, 3),
+        "dict_merge" => (ctx.dict_merge_fn_idx, 3),
+        _ => return None,
+    };
+    if op.args.len() != argc || op.result.is_some() {
+        return None;
+    }
+    let operands: Vec<Operand> = op
+        .args
+        .iter()
+        .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
+        .collect();
+    Some(build_residual_call_r_v_insn_from_operands(
+        fn_idx,
+        operands,
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
     ))
@@ -7227,38 +7584,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -7387,38 +7713,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -7534,38 +7829,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -7644,38 +7908,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -7798,38 +8031,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -7997,38 +8199,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -8242,41 +8413,7 @@ mod tests {
         let op = SpaceOperation::new("add", vec![lhs.into(), rhs.into()], Some(result.into()), 42);
         let ctx = LoweringContext {
             binary_op_fn_idx: 7,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8356,41 +8493,7 @@ mod tests {
         let op = SpaceOperation::new("bool", vec![v.into()], Some(r.into()), 0);
         let ctx = LoweringContext {
             binary_op_fn_idx: 7,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8414,41 +8517,7 @@ mod tests {
         let result = Variable::new(VariableId(2), Kind::Ref);
         let ctx = LoweringContext {
             binary_op_fn_idx: 11,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -8548,42 +8617,8 @@ mod tests {
         let result = Variable::new(VariableId(2), Kind::Ref);
         let op = SpaceOperation::new("lt", vec![lhs.into(), rhs.into()], Some(result.into()), 7);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
             compare_op_fn_idx: 13,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8641,42 +8676,8 @@ mod tests {
         let result = Variable::new(VariableId(2), Kind::Ref);
         let op = SpaceOperation::new("is", vec![lhs.into(), rhs.into()], Some(result.into()), 11);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
             compare_op_fn_idx: 13,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8707,40 +8708,7 @@ mod tests {
         let ctx = LoweringContext {
             binary_op_fn_idx: 7,
             compare_op_fn_idx: 13,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8761,42 +8729,8 @@ mod tests {
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
             compare_op_fn_idx: 17,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8824,42 +8758,8 @@ mod tests {
         let result = Variable::new(VariableId(1), Kind::Int);
         let op = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 5);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
             truth_fn_idx: 23,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8914,42 +8814,8 @@ mod tests {
         let result = Variable::new(VariableId(1), Kind::Int);
         let op = SpaceOperation::new("neg", vec![cond.into()], Some(result.into()), 0);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
             truth_fn_idx: 23,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8967,42 +8833,8 @@ mod tests {
         let cond = Variable::new(VariableId(0), Kind::Ref);
         let result = Variable::new(VariableId(1), Kind::Int);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
             truth_fn_idx: 31,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -9034,42 +8866,8 @@ mod tests {
             11,
         );
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9180,42 +8978,8 @@ mod tests {
         // Wrong opname.
         let op = SpaceOperation::new("getitem", vec![v.into(), v.into(), v.into()], None, 0);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9248,42 +9012,8 @@ mod tests {
         let key = Variable::new(VariableId(1), Kind::Ref);
         let value = Variable::new(VariableId(2), Kind::Ref);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -9335,38 +9065,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9394,38 +9093,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9453,38 +9121,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9517,38 +9154,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9595,38 +9201,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -10767,44 +10342,7 @@ mod tests {
         start.closeblock(exits);
 
         let mut ssarepr = SSARepr::new(name);
-        let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
-        };
+        let ctx = LoweringContext::default();
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
     }
@@ -11067,44 +10605,7 @@ mod tests {
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let mut call_fn_idx_by_nargs = [0u16; 15];
         call_fn_idx_by_nargs[0] = 42;
-        let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs,
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
-        };
+        let ctx = LoweringContext::default();
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
@@ -11255,19 +10756,10 @@ mod tests {
     /// `co_names` index) the 4-arg HLOp shape threads through.
     fn load_attr_lowering_fixture() -> (LoweringContext, Constant, Constant) {
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            getattr_fn_idx: 0,
             load_attr_fn_idx: 91,
             load_method_self_fn_idx: 92,
             load_name_fn_idx: 93,
             store_name_fn_idx: 94,
-            store_global_fn_idx: 0,
             store_attr_fn_idx: 95,
             build_map_from_array_fn_idx: 96,
             binary_slice_fn_idx: 97,
@@ -11291,6 +10783,22 @@ mod tests {
             store_deref_value_fn_idx: 114,
             make_cell_fn_idx: 115,
             store_slice_fn_idx: 116,
+            unary_positive_fn_idx: 118,
+            load_common_constant_fn_idx: 119,
+            set_add_fn_idx: 120,
+            set_update_fn_idx: 121,
+            dict_update_fn_idx: 122,
+            map_add_fn_idx: 123,
+            dict_merge_fn_idx: 124,
+            list_to_tuple_fn_idx: 125,
+            load_from_dict_or_globals_fn_idx: 126,
+            call_function_ex_fn_idx: 127,
+            call_kw_idx_by_nargs: {
+                let mut t = [0u16; 14];
+                t[2] = 130;
+                t
+            },
+            ..Default::default()
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -11619,6 +11127,219 @@ mod tests {
                             "ListR = [array], got {:?}",
                             list.content
                         );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_call_function_ex_emits_residual() {
+        // `call_function_ex(callable, self_or_null, starargs, kwargs_or_null)`
+        // → `residual_call_r_r(ConstInt(call_function_ex_fn_idx), ListR([
+        // callable, self_or_null, starargs, kwargs_or_null]), Descr) → reg`
+        // (MayForce — unpack + dispatch run user code).  The `call_function_ex`
+        // arm lives in the shared opname dispatcher `lower_tuple_build_hlop_to_insn`
+        // (alongside newtuple/build_map/build_set), so that is the entry point
+        // exercised here.
+        let callable_var = Variable::new(VariableId(8), Kind::Ref);
+        let self_var = Variable::new(VariableId(10), Kind::Ref);
+        let starargs_var = Variable::new(VariableId(11), Kind::Ref);
+        let kwargs_var = Variable::new(VariableId(12), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "call_function_ex",
+            vec![
+                callable_var.into(),
+                self_var.into(),
+                starargs_var.into(),
+                kwargs_var.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(11) => Register {
+                kind: Kind::Ref,
+                index: 104,
+            },
+            VariableId(12) => Register {
+                kind: Kind::Ref,
+                index: 105,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("4-arg call_function_ex lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(127)),
+                    "call_function_ex_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(c),
+                                Operand::Register(s),
+                                Operand::Register(sa),
+                                Operand::Register(kw),
+                            ] => {
+                                assert_eq!(c.index, 101, "arg0 must be callable");
+                                assert_eq!(s.index, 103, "arg1 must be self_or_null");
+                                assert_eq!(sa.index, 104, "arg2 must be starargs");
+                                assert_eq!(kw.index, 105, "arg3 must be kwargs_or_null");
+                            }
+                            other => panic!(
+                                "ListR must be [callable, self, starargs, kwargs], got {other:?}"
+                            ),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_call_kw_emits_residual() {
+        // `call_kw(callable, null_or_self, kwnames, arg0, arg1)` (nargs=2)
+        // → `residual_call_r_r(ConstInt(call_kw_idx_by_nargs[2]), ListR([
+        // callable, null_or_self, kwnames, arg0, arg1]), Descr) → reg`
+        // (MayForce — keyword resolution + dispatch run user code).  The
+        // `call_kw` arm lives in the shared opname dispatcher
+        // `lower_tuple_build_hlop_to_insn`, so that is the entry point here.
+        let callable_var = Variable::new(VariableId(8), Kind::Ref);
+        let self_var = Variable::new(VariableId(10), Kind::Ref);
+        let kwnames_var = Variable::new(VariableId(11), Kind::Ref);
+        let arg0_var = Variable::new(VariableId(12), Kind::Ref);
+        let arg1_var = Variable::new(VariableId(13), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "call_kw",
+            vec![
+                callable_var.into(),
+                self_var.into(),
+                kwnames_var.into(),
+                arg0_var.into(),
+                arg1_var.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(11) => Register {
+                kind: Kind::Ref,
+                index: 104,
+            },
+            VariableId(12) => Register {
+                kind: Kind::Ref,
+                index: 105,
+            },
+            VariableId(13) => Register {
+                kind: Kind::Ref,
+                index: 106,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("5-arg call_kw (nargs=2) lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(130)),
+                    "call_kw_idx_by_nargs[2] pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(c),
+                                Operand::Register(s),
+                                Operand::Register(kw),
+                                Operand::Register(a0),
+                                Operand::Register(a1),
+                            ] => {
+                                assert_eq!(c.index, 101, "arg0 must be callable");
+                                assert_eq!(s.index, 103, "arg1 must be null_or_self");
+                                assert_eq!(kw.index, 104, "arg2 must be kwnames");
+                                assert_eq!(a0.index, 105, "arg3 must be arg0");
+                                assert_eq!(a1.index, 106, "arg4 must be arg1");
+                            }
+                            other => panic!(
+                                "ListR must be [callable, null_or_self, kwnames, arg0, arg1], got {other:?}"
+                            ),
+                        }
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }
@@ -12152,17 +11873,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
-        // `invert(value)` →
-        // `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
-        // Descr) → reg` (MayForce — a user `__invert__` may run Python).
-        // Same single-Ref shape as FORMAT_SIMPLE.
+    /// Shared body for the single-Ref unary HLOp lowerings (`invert`, `pos`,
+    /// `not_`): each records `<op_name>(value)` and lowers to
+    /// `residual_call_r_r(ConstInt(expected_fn_idx), ListR([value]), Descr)`
+    /// returning reg. `lower` selects the specific `lower_unary_*_hlop_to_insn`.
+    fn assert_unary_lowering_emits_residual(
+        op_name: &str,
+        expected_fn_idx: i64,
+        lower: impl FnOnce(
+            &super::super::flow::SpaceOperation,
+            &LoweringContext,
+            &mut dyn FnMut(Variable) -> Register,
+            &mut dyn FnMut(&Constant) -> Operand,
+        ) -> Option<Insn>,
+    ) {
         let value_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
         let op = super::super::flow::SpaceOperation::new(
-            "invert",
+            op_name,
             vec![value_var.into()],
             Some(result_var.into()),
             0,
@@ -12179,13 +11908,8 @@ mod tests {
             _ => panic!("unexpected var id {:?}", var.id),
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn = super::lower_unary_invert_hlop_to_insn(
-            &op,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        )
-        .expect("1-arg unary_invert lowering must succeed");
+        let insn = lower(&op, &ctx, &mut get_register, &mut lower_constant)
+            .unwrap_or_else(|| panic!("1-arg {op_name} lowering must succeed"));
         match insn {
             Insn::Op {
                 opname,
@@ -12194,8 +11918,8 @@ mod tests {
             } => {
                 assert_eq!(opname, "residual_call_r_r");
                 assert!(
-                    matches!(args[0], Operand::ConstInt(109)),
-                    "unary_invert_fn pool index, got {:?}",
+                    matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
+                    "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
                     args[0]
                 );
                 match &args[1] {
@@ -12222,68 +11946,35 @@ mod tests {
     }
 
     #[test]
+    fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
+        // MayForce — a user `__invert__` may run Python.
+        assert_unary_lowering_emits_residual("invert", 109, |op, ctx, gr, lc| {
+            super::lower_unary_invert_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
+    }
+
+    #[test]
+    fn lower_unary_positive_hlop_emits_unary_positive_fn_residual() {
+        // MayForce — a user `__pos__` may run Python.
+        assert_unary_lowering_emits_residual("pos", 118, |op, ctx, gr, lc| {
+            super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
+    }
+
+    #[test]
+    fn lower_list_to_tuple_hlop_emits_list_to_tuple_fn_residual() {
+        // MayForce — allocates a fresh tuple / non-list raises TypeError.
+        assert_unary_lowering_emits_residual("list_to_tuple", 125, |op, ctx, gr, lc| {
+            super::lower_list_to_tuple_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
+    }
+
+    #[test]
     fn lower_unary_not_hlop_emits_unary_not_fn_residual() {
-        // `not_(value)` →
-        // `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]),
-        // Descr) → reg` (MayForce — a user `__bool__` / `__len__` may run
-        // Python).  Same single-Ref shape as FORMAT_SIMPLE.
-        let value_var = Variable::new(VariableId(8), Kind::Ref);
-        let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let (ctx, _, _) = load_attr_lowering_fixture();
-        let op = super::super::flow::SpaceOperation::new(
-            "not_",
-            vec![value_var.into()],
-            Some(result_var.into()),
-            0,
-        );
-        let mut get_register = |var: Variable| match var.id {
-            VariableId(8) => Register {
-                kind: Kind::Ref,
-                index: 101,
-            },
-            VariableId(9) => Register {
-                kind: Kind::Ref,
-                index: 102,
-            },
-            _ => panic!("unexpected var id {:?}", var.id),
-        };
-        let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn =
-            super::lower_unary_not_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-                .expect("1-arg unary_not lowering must succeed");
-        match insn {
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } => {
-                assert_eq!(opname, "residual_call_r_r");
-                assert!(
-                    matches!(args[0], Operand::ConstInt(110)),
-                    "unary_not_fn pool index, got {:?}",
-                    args[0]
-                );
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert!(
-                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
-                            "ListR = [value], got {:?}",
-                            list.content
-                        );
-                    }
-                    other => panic!("expected ListR, got {other:?}"),
-                }
-                assert_eq!(
-                    result,
-                    Some(Register {
-                        kind: Kind::Ref,
-                        index: 102
-                    }),
-                );
-            }
-            _ => panic!("expected Insn::Op, got {insn:?}"),
-        }
+        // MayForce — a user `__bool__` / `__len__` may run Python.
+        assert_unary_lowering_emits_residual("not_", 110, |op, ctx, gr, lc| {
+            super::lower_unary_not_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
     }
 
     #[test]
@@ -12446,6 +12137,167 @@ mod tests {
                 );
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_load_common_constant_hlop_emits_residual() {
+        // `load_common_constant(disc)` →
+        // `residual_call_ir_r(ConstInt(load_common_constant_fn_idx),
+        // ListI([disc]), ListR([]), Descr) → reg` (MayForce — the `all`/`any`
+        // variants allocate).  `disc = 0` is AssertionError; the empty ListR
+        // distinguishes the `(Int) → Ref` int-only shape from the `(Int, Ref)`
+        // convert_value shape.
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "load_common_constant",
+            vec![Constant::signed(0).into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let insn = super::lower_load_common_constant_hlop_to_insn(&op, &ctx, &mut get_register)
+            .expect("load_common_constant lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(119)),
+                    "load_common_constant_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(0)]),
+                            "ListI = [disc], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            list.content.is_empty(),
+                            "ListR must be empty, got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected empty ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_accumulator_hlops_emit_residual_call_r_v() {
+        // 2-Ref `set_add(set, value)` and 3-Ref `map_add(dict, key, value)`
+        // both lower to `residual_call_r_v(ConstInt(fn_idx), ListR([...]),
+        // Descr)` (void, MayForce).  Confirms opname→fn_idx dispatch, the
+        // Ref-operand count, and the absence of a result Register.
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(1) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(2) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            VariableId(3) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            other => panic!("unexpected var id {other:?}"),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+
+        // 2-Ref: set_add → fn_idx 120, ListR = [set, value].
+        let set = Variable::new(VariableId(1), Kind::Ref);
+        let value = Variable::new(VariableId(2), Kind::Ref);
+        let op = super::super::flow::SpaceOperation::new(
+            "set_add",
+            vec![set.into(), value.into()],
+            None,
+            0,
+        );
+        let insn = super::lower_accumulator_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("set_add lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(matches!(args[0], Operand::ConstInt(120)));
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2, "set_add is 2-Ref");
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(result, None, "void residual has no result");
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+
+        // 3-Ref: map_add → fn_idx 123, ListR = [dict, key, value].
+        let key = Variable::new(VariableId(3), Kind::Ref);
+        let op3 = super::super::flow::SpaceOperation::new(
+            "map_add",
+            vec![set.into(), key.into(), value.into()],
+            None,
+            0,
+        );
+        let insn3 = super::lower_accumulator_hlop_to_insn(
+            &op3,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("map_add lowering must succeed");
+        match insn3 {
+            Insn::Op { opname, args, .. } => {
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(matches!(args[0], Operand::ConstInt(123)));
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.content.len(), 3, "map_add is 3-Ref");
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Insn::Op, got {insn3:?}"),
         }
     }
 
@@ -12726,6 +12578,106 @@ mod tests {
                             }
                             other => {
                                 panic!("ListR must be [self, cls, code], got {other:?}")
+                            }
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_load_from_dict_or_globals_hlop_emits_residual() {
+        // `load_from_dict_or_globals(dict, code, frame, name_idx)` →
+        // `residual_call_ir_r(ConstInt(load_from_dict_or_globals_fn_idx),
+        // ListI([name_idx]), ListR([dict, code, frame]), Descr) → reg`
+        // (MayForce — a mapping `__getattr__` may run).  Same three-Ref
+        // shape as IMPORT_NAME/LOAD_SUPER_ATTR; `frame` is the portal
+        // frame input Variable, `code` a compile-time `ConstRef`.
+        let dict_var = Variable::new(VariableId(8), Kind::Ref);
+        let frame_var = Variable::new(VariableId(10), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "load_from_dict_or_globals",
+            vec![
+                dict_var.into(),
+                code_const.into(),
+                frame_var.into(),
+                name_idx_const.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_load_from_dict_or_globals_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("4-arg load_from_dict_or_globals lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(126)),
+                    "load_from_dict_or_globals_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(5)]),
+                            "ListI = [name_idx], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(d),
+                                Operand::ConstRef(0x2000),
+                                Operand::Register(f),
+                            ] => {
+                                assert_eq!(d.index, 101, "leading Ref operand must be dict");
+                                assert_eq!(f.index, 103, "third Ref operand must be frame");
+                            }
+                            other => {
+                                panic!("ListR must be [dict, code, frame], got {other:?}")
                             }
                         }
                     }

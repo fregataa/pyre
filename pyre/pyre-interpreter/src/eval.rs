@@ -811,111 +811,6 @@ pub fn set_current_exception(exc: PyObjectRef) {
     }
 }
 
-/// `pyopcode.py:1524-1532 DICT_UPDATE` — update `dict` from a mapping
-/// source via the `keys()` + `__getitem__` protocol.  Falls back to
-/// direct `w_dict_items` for exact-dict sources.
-fn dict_update_from_mapping(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
-    unsafe {
-        if pyre_object::is_dict(source) {
-            for (k, v) in pyre_object::w_dict_items(source) {
-                pyre_object::w_dict_store(dict, k, v);
-            }
-            return Ok(());
-        }
-    }
-    // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
-    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
-        Ok(m) => m,
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { (*(*source).ob_type).name };
-            return Err(PyError::type_error(format!(
-                "'{type_name}' object is not a mapping"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
-    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
-    let keys = crate::builtins::collect_iterable(keys_obj)?;
-    for key in keys {
-        let val = crate::baseobjspace::getitem(source, key)?;
-        unsafe { pyre_object::w_dict_store(dict, key, val) };
-    }
-    Ok(())
-}
-
-/// Resolve callable display prefix for `**kwargs` error messages.
-/// Returns e.g. `"foo()"` or just `""` when unresolvable.
-fn callable_prefix(w_callable: PyObjectRef) -> String {
-    if w_callable.is_null() {
-        return String::new();
-    }
-    unsafe {
-        if crate::is_function(w_callable) {
-            let name = crate::function_get_qualname(w_callable);
-            return format!("{name}() ");
-        }
-        if pyre_object::is_type(w_callable) {
-            let name = pyre_object::w_type_get_name(w_callable);
-            return format!("{name}() ");
-        }
-    }
-    String::new()
-}
-
-/// pyopcode.py:1979-2026 `_dict_merge` — merge `source` into `dict`.
-/// Dict path checks duplicates; mapping path does keys/getitem/setitem
-/// without extra validation (string key check is CALL_FUNCTION_EX's job).
-fn dict_merge_from_mapping(
-    dict: PyObjectRef,
-    source: PyObjectRef,
-    w_callable: PyObjectRef,
-) -> Result<(), PyError> {
-    let prefix = callable_prefix(w_callable);
-
-    unsafe {
-        if pyre_object::is_dict(source) {
-            for (k, v) in pyre_object::w_dict_items(source) {
-                if pyre_object::w_dict_lookup(dict, k).is_some() {
-                    // pyopcode.py:1987 — %S is str(key)
-                    let key_str = crate::display::py_str(k)?;
-                    return Err(PyError::type_error(format!(
-                        "{prefix}got multiple values for keyword argument '{key_str}'"
-                    )));
-                }
-                pyre_object::w_dict_store(dict, k, v);
-            }
-            return Ok(());
-        }
-    }
-    // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
-    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
-        Ok(m) => m,
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { (*(*source).ob_type).name };
-            return Err(PyError::type_error(format!(
-                "{prefix}argument after ** must be a mapping, not {type_name}"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
-    // pyopcode.py:2021 _dict_merge_loop: keys/getitem/contains/setitem
-    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
-    let keys = crate::builtins::collect_iterable(keys_obj)?;
-    for key in keys {
-        let val = crate::baseobjspace::getitem(source, key)?;
-        unsafe {
-            if pyre_object::w_dict_lookup(dict, key).is_some() {
-                let key_str = crate::display::py_str(key)?;
-                return Err(PyError::type_error(format!(
-                    "{prefix}got multiple values for keyword argument '{key_str}'"
-                )));
-            }
-            pyre_object::w_dict_store(dict, key, val);
-        }
-    }
-    Ok(())
-}
-
 pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
     unsafe {
         if crate::baseobjspace::exception_is_valid_obj_as_class_w(value) {
@@ -2509,45 +2404,11 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── LoadCommonConstant ──
     fn load_common_constant(&mut self, cc: crate::bytecode::CommonConstant) -> Result<(), PyError> {
-        use crate::bytecode::CommonConstant;
-        let val = match cc {
-            CommonConstant::AssertionError => {
-                // `LOAD_ASSERTION_ERROR` pushes the `AssertionError` class
-                // itself, so `assert x` raises `AssertionError()` and
-                // `assert x, msg` raises `AssertionError(msg)`.
-                crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
-                    crate::typedef::gettypeobject(
-                        &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
-                    )
-                })
-            }
-            CommonConstant::NotImplementedError => {
-                crate::builtins::lookup_exc_class("NotImplementedError").unwrap_or_else(|| {
-                    crate::make_builtin_function("NotImplementedError", |_args| {
-                        Err(crate::PyError::type_error("not implemented"))
-                    })
-                })
-            }
-            CommonConstant::BuiltinTuple => {
-                crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
-            }
-            CommonConstant::BuiltinAll => crate::make_module_builtin_function_with_arity(
-                "all",
-                crate::builtins::builtin_all_fn,
-                1,
-            ),
-            CommonConstant::BuiltinAny => crate::make_module_builtin_function_with_arity(
-                "any",
-                crate::builtins::builtin_any_fn,
-                1,
-            ),
-            CommonConstant::BuiltinList => {
-                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
-            }
-            CommonConstant::BuiltinSet => {
-                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
-            }
-        };
+        // `LOAD_ASSERTION_ERROR` pushes the `AssertionError` class itself,
+        // so `assert x` raises `AssertionError()` and `assert x, msg`
+        // raises `AssertionError(msg)`.  The resolution is shared with the
+        // JIT residual via `opcode_ops::load_common_constant_value`.
+        let val = crate::opcode_ops::load_common_constant_value(cc);
         self.push(val);
         Ok(())
     }
@@ -3390,7 +3251,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn dict_update(&mut self, i: usize) -> Result<(), PyError> {
         let source = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
-        dict_update_from_mapping(dict, source)
+        crate::opcode_ops::dict_update_value(dict, source)
     }
 
     // ── DictMerge ──
@@ -3406,7 +3267,7 @@ impl OpcodeStepExecutor for PyFrame {
         } else {
             pyre_object::PY_NULL
         };
-        dict_merge_from_mapping(dict, source, w_callable)
+        crate::opcode_ops::dict_merge_value(dict, source, w_callable)
     }
 
     // ── MapAdd ──
@@ -3416,10 +3277,7 @@ impl OpcodeStepExecutor for PyFrame {
         let value = self.pop();
         let key = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            pyre_object::w_dict_store(dict, key, value);
-        }
-        Ok(())
+        crate::opcode_ops::map_add_value(dict, key, value)
     }
 
     // ── SetAdd ──
@@ -3428,14 +3286,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn set_add(&mut self, i: usize) -> Result<(), PyError> {
         let value = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            if pyre_object::is_set_or_frozenset(set) {
-                pyre_object::w_set_add(set, value);
-            } else if pyre_object::is_list(set) {
-                pyre_object::w_list_append(set, value);
-            }
-        }
-        Ok(())
+        crate::opcode_ops::set_add_value(set, value)
     }
 
     // ── none_value ──
@@ -3452,13 +3303,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── list_to_tuple ──
     // PyPy intrinsic: convert list to tuple (used in star unpacking).
     fn list_to_tuple(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        unsafe {
-            if pyre_object::is_list(val) {
-                let items = pyre_object::w_list_items_copy_as_vec(val);
-                return Ok(pyre_object::w_tuple_new(items));
-            }
-        }
-        Err(PyError::type_error("expected list for list_to_tuple"))
+        crate::opcode_ops::list_to_tuple_value(val)
     }
 
     // ── print_expr ──
@@ -3809,55 +3654,10 @@ impl OpcodeStepExecutor for PyFrame {
     fn call_function_ex(&mut self) -> Result<(), PyError> {
         let kwargs_or_null = self.pop();
         let args_obj = self.pop();
-        let _null = self.pop();
+        let self_or_null = self.pop();
         let callable = self.pop();
-
-        // argument.py unpack_combined_starargs equivalent: fast-path tuple
-        // and list so common bytecode emits avoid iter protocol overhead;
-        // fall back to the iter protocol for arbitrary iterables.
-        let args: Vec<PyObjectRef> = unsafe {
-            if pyre_object::is_tuple(args_obj) {
-                let n = pyre_object::w_tuple_len(args_obj);
-                (0..n as i64)
-                    .filter_map(|i| pyre_object::w_tuple_getitem(args_obj, i))
-                    .collect()
-            } else if pyre_object::is_list(args_obj) {
-                let n = pyre_object::w_list_len(args_obj);
-                (0..n as i64)
-                    .filter_map(|i| pyre_object::w_list_getitem(args_obj, i))
-                    .collect()
-            } else {
-                crate::builtins::collect_iterable(args_obj)?
-            }
-        };
-
-        // Merge the `**` mapping into the call.  argument.py:106-150
-        // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
-        // path or an arbitrary object via `keys()` / `__getitem__` — raising
-        // "argument after ** must be a mapping" for a non-mapping and
-        // "keywords must be strings" for a non-str key.
-        if !kwargs_or_null.is_null() {
-            let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
-            let mut keywords_w: Vec<PyObjectRef> = Vec::new();
-            crate::argument::combine_starstarargs_wrapped(
-                &mut keyword_names_w,
-                &mut keywords_w,
-                kwargs_or_null,
-                callable,
-            )?;
-            if !keyword_names_w.is_empty() {
-                let entries: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = keyword_names_w
-                    .iter()
-                    .zip(keywords_w.iter())
-                    .map(|(&k, &v)| (unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned(), v))
-                    .collect();
-                let result = crate::call::call_with_kwargs(self, callable, &args, &entries)?;
-                self.push(result);
-                return Ok(());
-            }
-        }
-
-        let result = call_callable(self, callable, &args)?;
+        let result =
+            crate::call::call_function_ex(self, callable, self_or_null, args_obj, kwargs_or_null)?;
         self.push(result);
         Ok(())
     }
@@ -3884,170 +3684,7 @@ impl OpcodeStepExecutor for PyFrame {
         let self_or_null = self.pop();
         let callable = self.pop();
 
-        if self_or_null != PY_NULL && !unsafe { pyre_object::is_none(self_or_null) } {
-            args.insert(0, self_or_null);
-        }
-
-        // Unwrap bound methods: load_method pushes (method, PY_NULL) for
-        // bound methods. Extract the underlying function and prepend the
-        // receiver so resolve_kwargs sees the correct function signature.
-        let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
-        let callable_unwrapped = if unsafe { pyre_object::is_method(callable_unwrapped) } {
-            let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
-            let receiver = unsafe { pyre_object::w_method_get_self(callable_unwrapped) };
-            if !receiver.is_null() && !unsafe { pyre_object::is_none(receiver) } {
-                args.insert(0, receiver);
-            }
-            func
-        } else {
-            callable_unwrapped
-        };
-
-        // For type objects with kwargs: use call_with_kwargs which handles
-        // __new__/__init__ kwargs forwarding correctly.
-        if unsafe { pyre_object::is_type(callable_unwrapped) } {
-            let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
-                unsafe { pyre_object::w_tuple_len(kwarg_names) }
-            } else {
-                0
-            };
-            if nkw > 0 {
-                let n_pos = args.len() - nkw;
-                let pos_args = args[..n_pos].to_vec();
-                let mut kw_entries = Vec::with_capacity(nkw);
-                for ki in 0..nkw {
-                    let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
-                    if let Some(name_obj) = name {
-                        let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
-                        kw_entries.push((key, args[n_pos + ki]));
-                    }
-                }
-                let result = crate::call::call_with_kwargs(
-                    self,
-                    callable_unwrapped,
-                    &pos_args,
-                    &kw_entries,
-                )?;
-                self.push(result);
-                return Ok(());
-            }
-        }
-
-        // A generic alias has no signature of its own; its __call__
-        // forwards to __origin__(*args, **kwargs).  Split the keyword tail
-        // and route through call_with_kwargs so the origin's own kwargs
-        // handling (e.g. dict.__init__) sees real keywords.
-        if unsafe { pyre_object::is_generic_alias(callable_unwrapped) } {
-            let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
-                unsafe { pyre_object::w_tuple_len(kwarg_names) }
-            } else {
-                0
-            };
-            let n_pos = args.len().saturating_sub(nkw);
-            let pos_args = args[..n_pos].to_vec();
-            let mut kw_entries = Vec::with_capacity(nkw);
-            for ki in 0..nkw {
-                let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
-                if let Some(name_obj) = name {
-                    let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
-                    kw_entries.push((key, args[n_pos + ki]));
-                }
-            }
-            let result =
-                crate::call::call_with_kwargs(self, callable_unwrapped, &pos_args, &kw_entries)?;
-            self.push(result);
-            return Ok(());
-        }
-
-        // Resolve keyword args into positional order.
-        // argument.py Arguments._match_signature step: match keywords to
-        // argnames, fill defaults, pack *args/**kwargs. PyPy's
-        // `space.call_args` performs this exactly once; pyre mirrors that
-        // by calling resolve_kwargs here and then dispatching directly to
-        // call_user_function_resolved — which skips the defaults_fill /
-        // pack_varargs replay that call_user_function_with_args performs
-        // for positional-only paths.
-        let is_builtin = unsafe { crate::is_function(callable_unwrapped) }
-            && unsafe {
-                crate::is_builtin_code(
-                    crate::getcode(callable_unwrapped) as pyre_object::PyObjectRef
-                )
-            };
-        if is_builtin {
-            let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
-                unsafe { pyre_object::w_tuple_len(kwarg_names) }
-            } else {
-                0
-            };
-            if nkw > 0 {
-                let n_pos = args.len() - nkw;
-                let pos_args = args[..n_pos].to_vec();
-                let mut kw_entries = Vec::with_capacity(nkw);
-                for ki in 0..nkw {
-                    let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
-                    if let Some(name_obj) = name {
-                        let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
-                        kw_entries.push((key, args[n_pos + ki]));
-                    }
-                }
-                // PyPy CALL_FUNCTION_KW builds an Arguments object with
-                // keyword_names_w / keywords_w, and the profiled-builtin path
-                // passes that same object to call_args_and_c_profile.  Route
-                // through call_with_kwargs so pyre's profile path constructs
-                // Arguments::with_kw instead of treating the kwargs dict tail
-                // as a positional firstarg.
-                let result = crate::call::call_with_kwargs(
-                    self,
-                    callable_unwrapped,
-                    &pos_args,
-                    &kw_entries,
-                )?;
-                self.push(result);
-                return Ok(());
-            }
-            let result = call_callable(self, callable_unwrapped, &args)?;
-            self.push(result);
-            return Ok(());
-        }
-
-        // pypy/interpreter/function.py Method.call_args parity: unwrap
-        // bound method by prepending the receiver, then run resolve_kwargs
-        // against the underlying function. This matches
-        // `self.space.call_args(w_function, args)` after the MRO-dispatched
-        // `im_func` has been extracted.
-        let (target_func, mut prepended) = if unsafe { pyre_object::is_method(callable_unwrapped) }
-        {
-            let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
-            let receiver = unsafe {
-                let w_self = pyre_object::w_method_get_self(callable_unwrapped);
-                if !w_self.is_null() && !pyre_object::is_none(w_self) {
-                    w_self
-                } else {
-                    pyre_object::w_method_get_class(callable_unwrapped)
-                }
-            };
-            if !receiver.is_null() && unsafe { !pyre_object::is_none(receiver) } {
-                let mut prepended = Vec::with_capacity(1 + args.len());
-                prepended.push(receiver);
-                prepended.extend_from_slice(&args);
-                (func, Some(prepended))
-            } else {
-                (func, None)
-            }
-        } else {
-            (callable_unwrapped, None)
-        };
-        let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
-        let resolved = crate::call::resolve_kwargs(target_func, call_args, kwarg_names)?;
-        // Drop the temporary prepended buffer once resolved is built.
-        prepended = None;
-        let _ = prepended;
-
-        let result = if unsafe { crate::is_function(target_func) } {
-            crate::call::call_user_function_resolved(self, target_func, &resolved)?
-        } else {
-            call_callable(self, target_func, &resolved)?
-        };
+        let result = crate::call::call_kw(self, callable, self_or_null, &args, kwarg_names)?;
         self.push(result);
         Ok(())
     }
@@ -4119,26 +3756,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn set_update(&mut self, i: usize) -> Result<(), PyError> {
         let iterable = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            if pyre_object::is_set_or_frozenset(set) {
-                let items = crate::builtins::collect_iterable(iterable)?;
-                for item in items {
-                    pyre_object::w_set_add(set, item);
-                }
-            } else if pyre_object::is_list(set) {
-                if pyre_object::is_list(iterable) {
-                    let items = pyre_object::w_list_items_copy_as_vec(iterable);
-                    for item in items {
-                        pyre_object::w_list_append(set, item);
-                    }
-                } else if pyre_object::is_tuple(iterable) {
-                    for item in pyre_object::w_tuple_items_copy_as_vec(iterable) {
-                        pyre_object::w_list_append(set, item);
-                    }
-                }
-            }
-        }
-        Ok(())
+        crate::opcode_ops::set_update_value(set, iterable)
     }
 
     // ── BuildSlice ──

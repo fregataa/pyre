@@ -3526,6 +3526,91 @@ bh_call_fn_arity!(bh_call_fn_12; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 bh_call_fn_arity!(bh_call_fn_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
 bh_call_fn_arity!(bh_call_fn_14; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
 
+/// CALL_KW residual shared body (`call_kw(callable, self_or_null,
+/// positional, kwnames)` HLOp → per-arity `residual_call_r_r`).  Resolves
+/// the parent frame from the execution context like [`bh_call_fn_impl`],
+/// then runs keyword resolution + the dispatched call under
+/// `force_plain_eval` (blackhole.py:1225 `bhimpl_residual_call_*` is an
+/// opaque CPU call — no JIT re-entry; `call_kw`'s
+/// `call_user_function_resolved` fast path routes through the JIT-aware
+/// `get_eval_fn()`, so the guard is what keeps it on `eval_frame_plain`).
+/// `positional` is `arg0..argN-1` in positional order (keyword tail
+/// included); `kwnames` is the constant kwnames tuple.  MayForce: keyword
+/// binding and the dispatched call may run Python.
+fn bh_call_kw_impl(
+    callable: PyObjectRef,
+    null_or_self: PyObjectRef,
+    kwnames: PyObjectRef,
+    positional: &[PyObjectRef],
+) -> i64 {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let parent_frame_ptr: *const PyFrame = if ec.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*ec).gettopframe() as *const PyFrame }
+    };
+    assert!(
+        !parent_frame_ptr.is_null(),
+        "bh_call_kw_impl requires a live parent PyFrame from \
+         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         execution context before any residual call"
+    );
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    unsafe {
+        pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
+    }
+    let parent_frame = unsafe { &mut *(parent_frame_ptr as *mut PyFrame) };
+    let result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_kw(parent_frame, callable, null_or_self, positional, kwnames)
+    };
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+    match result {
+        Ok(result) => result as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
+/// Per-arity `bh_call_kw_<n>` thunks for the CALL_KW residual, ABI
+/// `(callable, null_or_self, kwnames, arg0..arg{n-1})` = 3 + n i64 params.
+/// The backend dispatch tops out at `MAX_HOST_CALL_ARITY` = 16 i64 args, so
+/// the kwnames slot leaves room for nargs 0..=13; CALL_KW with nargs > 13
+/// falls through to `emit_abort_permanent!`.
+macro_rules! bh_call_kw_arity {
+    ($name:ident; $($arg:ident),* $(,)?) => {
+        pub extern "C" fn $name(
+            callable: i64,
+            null_or_self: i64,
+            kwnames: i64,
+            $($arg: i64),*
+        ) -> i64 {
+            bh_call_kw_impl(
+                callable as PyObjectRef,
+                null_or_self as PyObjectRef,
+                kwnames as PyObjectRef,
+                &[$($arg as PyObjectRef),*],
+            )
+        }
+    };
+}
+bh_call_kw_arity!(bh_call_kw_0;);
+bh_call_kw_arity!(bh_call_kw_1; a0);
+bh_call_kw_arity!(bh_call_kw_2; a0, a1);
+bh_call_kw_arity!(bh_call_kw_3; a0, a1, a2);
+bh_call_kw_arity!(bh_call_kw_4; a0, a1, a2, a3);
+bh_call_kw_arity!(bh_call_kw_5; a0, a1, a2, a3, a4);
+bh_call_kw_arity!(bh_call_kw_6; a0, a1, a2, a3, a4, a5);
+bh_call_kw_arity!(bh_call_kw_7; a0, a1, a2, a3, a4, a5, a6);
+bh_call_kw_arity!(bh_call_kw_8; a0, a1, a2, a3, a4, a5, a6, a7);
+bh_call_kw_arity!(bh_call_kw_9; a0, a1, a2, a3, a4, a5, a6, a7, a8);
+bh_call_kw_arity!(bh_call_kw_10; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+bh_call_kw_arity!(bh_call_kw_11; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+bh_call_kw_arity!(bh_call_kw_12; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
+
 /// blackhole.py:1224 bhimpl_residual_call: cpu.bh_call_r.
 /// RPython: cpu.bh_call_r (llmodel.py:816) invokes calldescr.call_stub_r
 /// directly — a plain function-pointer call, no portal_runner indirection.
@@ -3653,6 +3738,58 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     }
 }
 
+/// CALL_FUNCTION_EX residual (`call_function_ex(callable, self_or_null,
+/// starargs, kwargs_or_null)` HLOp → `residual_call_r_r`).  Unpacks the
+/// `*` iterable and merges the `**` mapping through the shared
+/// `call::call_function_ex`, then dispatches.  Resolves the parent frame
+/// from the execution context like [`bh_call_fn_impl`], and runs the
+/// nested Python call under `force_plain_eval` (blackhole.py:1225
+/// `bhimpl_residual_call_*` is an opaque CPU call — no JIT re-entry).
+/// MayForce: unpacking an arbitrary iterable / mapping and the dispatched
+/// call may run Python.
+pub extern "C" fn bh_call_function_ex_fn(
+    callable: i64,
+    self_or_null: i64,
+    starargs: i64,
+    kwargs_or_null: i64,
+) -> i64 {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let parent_frame_ptr: *const PyFrame = if ec.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*ec).gettopframe() as *const PyFrame }
+    };
+    assert!(
+        !parent_frame_ptr.is_null(),
+        "bh_call_function_ex_fn requires a live parent PyFrame from \
+         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         execution context before any residual call"
+    );
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    unsafe {
+        pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
+    }
+    let parent_frame = unsafe { &mut *(parent_frame_ptr as *mut PyFrame) };
+    let result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_ex(
+            parent_frame,
+            callable as PyObjectRef,
+            self_or_null as PyObjectRef,
+            starargs as PyObjectRef,
+            kwargs_or_null as PyObjectRef,
+        )
+    };
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+    match result {
+        Ok(result) => result as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// `_load_global` residual (pyopcode.py:958-969).  Resolves the namespace via
 /// the executing frame's `get_w_globals_storage()` when the live frame OWNS this
 /// `w_code` (`frame.pycode == w_code`) — honoring an `exec(code, ns)`
@@ -3753,6 +3890,67 @@ pub extern "C" fn bh_load_global_fn(
     );
     let exc_obj = err.to_exc_object();
     publish_residual_call_exception(exc_obj as i64);
+    0
+}
+
+/// LOAD_FROM_DICT_OR_GLOBALS residual (`load_from_dict_or_globals` HLOp →
+/// `residual_call_ir_r`).  Mirrors `eval.rs::load_from_dict_or_globals`:
+/// try `getattr_str(dict, name)` on the popped mapping first, then fall
+/// back to the live frame's globals, else NameError.  `namei` is a direct
+/// `code.names` index (no LOAD_GLOBAL push-null low-bit shift).
+///
+/// GC-safety: the globals are read from the LIVE frame when it owns this
+/// `w_code` (`frame.pycode == w_code`), matching `bh_load_global_fn`, so a
+/// relocated module dict is followed rather than a const-folded dangling
+/// pointer.  A user `__getattr__`/`__getitem__` on the mapping may run
+/// Python (`MayForce`).
+pub extern "C" fn bh_load_from_dict_or_globals_fn(
+    dict_ptr: i64,
+    w_code_ptr: i64,
+    frame_ptr: i64,
+    namei: i64,
+) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    let idx = namei as usize;
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let varname = code.names[idx].as_ref();
+    let dict = dict_ptr as pyre_object::PyObjectRef;
+
+    // Try the popped mapping first (`getattr_str`), matching the
+    // interpreter's `if let Ok(val) = getattr_str(dict, name)` fast path.
+    match pyre_interpreter::baseobjspace::getattr_str(dict, varname) {
+        Ok(val) => return val as i64,
+        Err(_) => {}
+    }
+
+    // Fall back to the live frame's globals (GC-safe when the frame owns
+    // this w_code; else the promoted w_code's own globals).
+    let parent_frame_ptr = frame_ptr as *const PyFrame;
+    let w_globals = if !parent_frame_ptr.is_null()
+        && unsafe { (*parent_frame_ptr).pycode } as usize == w_code_ptr as usize
+    {
+        unsafe { (*parent_frame_ptr).get_w_globals() }
+    } else {
+        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+    };
+    if !w_globals.is_null() {
+        if let Some(val) =
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, varname) }
+        {
+            return val as i64;
+        }
+    }
+
+    let err = pyre_interpreter::PyError::name_error_with_name(
+        format!("name '{varname}' is not defined"),
+        varname,
+    );
+    publish_residual_call_exception(err.to_exc_object() as i64);
     0
 }
 
@@ -4139,6 +4337,81 @@ pub extern "C" fn bh_list_extend_fn(list: i64, iterable: i64) -> i64 {
     ) {
         let exc_obj = err.to_exc_object();
         publish_residual_call_exception(exc_obj as i64);
+    }
+    0
+}
+
+/// SET_ADD residual (`set_add` HLOp → `residual_call_r_v`).  Runs
+/// `set.add(value)` (or `list.append`) through the shared
+/// `opcode_ops::set_add_value`; `set` is peeked and mutated in place.
+/// A user `__hash__`/`__eq__` can run Python (`MayForce`).  Void result.
+pub extern "C" fn bh_set_add_fn(set: i64, value: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::set_add_value(
+        set as pyre_object::PyObjectRef,
+        value as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// SET_UPDATE residual (`set_update` HLOp → `residual_call_r_v`).  Runs
+/// `set.update(iterable)` (or `list.extend`) through the shared
+/// `opcode_ops::set_update_value`; `set` is peeked and mutated in place.
+/// A user iterator / `__hash__` can run Python (`MayForce`).  Void result.
+pub extern "C" fn bh_set_update_fn(set: i64, iterable: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::set_update_value(
+        set as pyre_object::PyObjectRef,
+        iterable as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// DICT_UPDATE residual (`dict_update` HLOp → `residual_call_r_v`).  Runs
+/// `dict.update(source)` with the ismapping gate through the shared
+/// `opcode_ops::dict_update_value`; `dict` is peeked and mutated in
+/// place.  A `keys()`/`__getitem__`/`__hash__` can run Python
+/// (`MayForce`).  Void result.
+pub extern "C" fn bh_dict_update_fn(dict: i64, source: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::dict_update_value(
+        dict as pyre_object::PyObjectRef,
+        source as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// MAP_ADD residual (`map_add` HLOp → `residual_call_r_v`).  Runs
+/// `dict[key] = value` through the shared `opcode_ops::map_add_value`;
+/// `dict` is peeked and mutated in place.  A user key `__hash__`/`__eq__`
+/// can run Python (`MayForce`).  Void result.
+pub extern "C" fn bh_map_add_fn(dict: i64, key: i64, value: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::map_add_value(
+        dict as pyre_object::PyObjectRef,
+        key as pyre_object::PyObjectRef,
+        value as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// DICT_MERGE residual (`dict_merge` HLOp → `residual_call_r_v`).  Runs
+/// `dict.update(source)` with duplicate-key checks through the shared
+/// `opcode_ops::dict_merge_value`; `dict` is peeked and mutated in place.
+/// `w_callable` is the peeked callable used only for error-message
+/// prefixes.  A `keys()`/`__getitem__`/`__hash__` can run Python
+/// (`MayForce`).  Void result.
+pub extern "C" fn bh_dict_merge_fn(dict: i64, source: i64, w_callable: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::dict_merge_value(
+        dict as pyre_object::PyObjectRef,
+        source as pyre_object::PyObjectRef,
+        w_callable as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
     }
     0
 }
@@ -4787,6 +5060,53 @@ pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
             publish_residual_call_exception(exc_obj as i64);
             0
         }
+    }
+}
+
+/// UNARY_POSITIVE residual (`pos` HLOp → `residual_call_r_r`).  Computes
+/// `+value` through `opcode_ops::unary_positive_value` (`pos`); a user
+/// `__pos__` may run Python (`MayForce`).  On error the exception is
+/// published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_unary_positive_fn(value: i64) -> i64 {
+    match pyre_interpreter::opcode_ops::unary_positive_value(value as pyre_object::PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
+/// CALL_INTRINSIC_1 ListToTuple residual (`list_to_tuple` HLOp →
+/// `residual_call_r_r`).  Converts a list to a tuple through the shared
+/// `opcode_ops::list_to_tuple_value`; allocates a fresh tuple, and a
+/// non-list operand raises TypeError (`MayForce`).  On error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_list_to_tuple_fn(value: i64) -> i64 {
+    match pyre_interpreter::opcode_ops::list_to_tuple_value(value as pyre_object::PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
+/// LOAD_COMMON_CONSTANT residual (`load_common_constant` HLOp →
+/// `residual_call_ir_r`).  `disc` is the `CommonConstant` discriminant
+/// (0-6).  Resolves the pushed object through the shared
+/// `opcode_ops::load_common_constant_value`, matching the interpreter:
+/// immortal type/exception classes for the class variants, a freshly
+/// built builtin function for `all`/`any` (hence `MayForce` — it
+/// allocates).  Runs no user code and never raises; an out-of-range
+/// discriminant (corrupt bytecode) returns PY_NULL.
+pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> i64 {
+    match pyre_interpreter::bytecode::CommonConstant::try_from(disc as u32) {
+        Ok(cc) => pyre_interpreter::opcode_ops::load_common_constant_value(cc) as i64,
+        Err(_) => pyre_object::PY_NULL as i64,
     }
 }
 

@@ -637,6 +637,36 @@ pub enum PyreHelperKind {
     /// The recognition has no bound-method callable to pin: the list and
     /// value arrive directly as the residual's Ref operands.
     ListAppendValue,
+    /// `bh_call_function_ex_fn(callable, self_or_null, starargs,
+    /// kwargs_or_null)` — the CALL_FUNCTION_EX residual.  Both `self_or_null`
+    /// (arg index 1) and `kwargs_or_null` (arg index 3) are `PY_NULL`
+    /// sentinels the helper checks before use (`self_or_null` is prepended
+    /// as arg0 only when non-null; a null `kwargs_or_null` skips the `**`
+    /// merge), so a concrete-NULL there is the normal shape — not the broken
+    /// baked-NULL-globals shape the walker's may-force NULL-ref gate rejects.
+    CallFunctionEx,
+    /// `bh_call_kw_<n>(callable, null_or_self, kwnames, arg0..arg{n-1})` —
+    /// the CALL_KW residual.  `null_or_self` (arg index 1) is a `PY_NULL`
+    /// sentinel the helper checks before use (prepended as arg0 only when
+    /// non-null), so a concrete-NULL there is the normal shape — not the
+    /// broken baked-NULL-globals shape the walker's may-force NULL-ref gate
+    /// rejects.  `kwnames` (arg index 2) is the constant kwnames tuple and
+    /// is always a live Ref.
+    CallKw,
+    /// `load_attr_fn(obj, code, name_idx)` — the plain (non-method) LOAD_ATTR
+    /// residual (`lower_getattr_hlop_to_insn` → `space.getattr`).  The Ref
+    /// operands are the receiver and the jitcode's own PyCode; the Int operand
+    /// is the co_names index.  The full-body walker recognises this tag to fold
+    /// a monomorphic instance-attribute read (`mapdict.py:1479-1537
+    /// LOAD_ATTR_caching`) to `guard_class(obj, w_type)` +
+    /// `guard_value(getfield(obj, map), map)` + `getfield(obj, storage)` +
+    /// `getarrayitem_gc_r(block, C_storageindex)` (the inline read
+    /// `mapdict.py:914-916 _mapdict_read_storage`), eliding the opaque
+    /// `CALL_MAY_FORCE` MRO-walk residual.  Falls through to the residual for
+    /// every shape the storage read cannot cover (non-instance receiver, custom
+    /// `__getattribute__`, data descriptor, unboxed slot, attribute absent from
+    /// this instance's map).
+    LoadAttr,
 }
 
 impl EffectInfo {

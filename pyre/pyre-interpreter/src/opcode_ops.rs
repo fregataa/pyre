@@ -170,6 +170,31 @@ pub fn unary_invert_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     invert(value)
 }
 
+pub fn unary_positive_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let value = crate::baseobjspace::unwrap_cell(value);
+    crate::baseobjspace::pos(value)
+}
+
+/// CALL_INTRINSIC_1 ListToTuple — convert a list to a tuple (star
+/// unpacking).  Shared by the interpreter's `list_to_tuple` and the JIT
+/// residual `bh_list_to_tuple_fn`.  Allocates a fresh tuple.
+///
+/// pyopcode.py does `space.call_function(space.w_tuple, w_l)` (accepts any
+/// iterable); the compiler only ever emits INTRINSIC_LIST_TO_TUPLE right
+/// after a `BUILD_LIST` + `LIST_EXTEND` chain, so the operand is always an
+/// exact list.  A non-iterable `*arg` is already rejected upstream by
+/// LIST_EXTEND ("argument after * must be an iterable"), so the non-list
+/// TypeError below is an unreachable defensive guard.
+pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        if pyre_object::is_list(value) {
+            let items = pyre_object::w_list_items_copy_as_vec(value);
+            return Ok(pyre_object::w_tuple_new(items));
+        }
+    }
+    Err(PyError::type_error("expected list for list_to_tuple"))
+}
+
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
     let value = crate::baseobjspace::unwrap_cell(value);
     is_true(value)
@@ -177,6 +202,49 @@ pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
 
 pub fn bool_value_from_truth(value: bool) -> PyObjectRef {
     w_bool_from(value)
+}
+
+/// LOAD_COMMON_CONSTANT — resolve a `CommonConstant` to the object the
+/// interpreter pushes.  Shared by the interpreter's `load_common_constant`
+/// handler and the JIT residual `bh_load_common_constant_fn` so both
+/// resolve identical objects (immortal type/exception classes for the
+/// class variants; a freshly built builtin function for `all`/`any`).
+pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObjectRef {
+    use crate::bytecode::CommonConstant;
+    match cc {
+        CommonConstant::AssertionError => crate::builtins::lookup_exc_class("AssertionError")
+            .unwrap_or_else(|| {
+                crate::typedef::gettypeobject(
+                    &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
+                )
+            }),
+        CommonConstant::NotImplementedError => {
+            crate::builtins::lookup_exc_class("NotImplementedError").unwrap_or_else(|| {
+                crate::make_builtin_function("NotImplementedError", |_args| {
+                    Err(crate::PyError::type_error("not implemented"))
+                })
+            })
+        }
+        CommonConstant::BuiltinTuple => {
+            crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
+        }
+        CommonConstant::BuiltinAll => crate::make_module_builtin_function_with_arity(
+            "all",
+            crate::builtins::builtin_all_fn,
+            1,
+        ),
+        CommonConstant::BuiltinAny => crate::make_module_builtin_function_with_arity(
+            "any",
+            crate::builtins::builtin_any_fn,
+            1,
+        ),
+        CommonConstant::BuiltinList => {
+            crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
+        }
+        CommonConstant::BuiltinSet => {
+            crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE)
+        }
+    }
 }
 
 /// LIST_EXTEND — extend `list` in place with the items of `iterable`.
@@ -221,6 +289,185 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
                 Err(e) => return Err(e),
             }
         }
+    }
+    Ok(())
+}
+
+/// SET_ADD — `set.add(value)` (or `list.append` for the list-shaped
+/// accumulator).  Shared by the interpreter's `set_add` and the JIT
+/// residual `bh_set_add_fn`.  `set` is peeked, mutated in place.
+///
+/// pyopcode.py uses `space.call_method(w_set, 'add', ...)`; this stores
+/// directly by container type instead.  These accumulators only ever touch
+/// the container the surrounding BUILD_SET / BUILD_MAP / BUILD_LIST just
+/// pushed — a set/dict/list comprehension or display has no syntax to
+/// target a user subclass — so the container is always the exact builtin
+/// type and the method-dispatch vs direct-store distinction is not
+/// observable (SET_UPDATE / DICT_UPDATE below take the same shortcut; the
+/// *source* iterable/mapping, which can be arbitrary, still goes through
+/// the iterator / mapping protocol).
+pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_set_or_frozenset(set) {
+            pyre_object::w_set_add(set, value);
+        } else if pyre_object::is_list(set) {
+            pyre_object::w_list_append(set, value);
+        }
+    }
+    Ok(())
+}
+
+/// SET_UPDATE — `set.update(iterable)` (or `list.extend` for the
+/// list-shaped accumulator).  Shared by the interpreter's `set_update`
+/// and the JIT residual `bh_set_update_fn`.  `set` is peeked, mutated in
+/// place; a user iterator may run Python.
+pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_set_or_frozenset(set) {
+            let items = crate::builtins::collect_iterable(iterable)?;
+            for item in items {
+                pyre_object::w_set_add(set, item);
+            }
+        } else if pyre_object::is_list(set) {
+            if pyre_object::is_list(iterable) {
+                let items = pyre_object::w_list_items_copy_as_vec(iterable);
+                for item in items {
+                    pyre_object::w_list_append(set, item);
+                }
+            } else if pyre_object::is_tuple(iterable) {
+                for item in pyre_object::w_tuple_items_copy_as_vec(iterable) {
+                    pyre_object::w_list_append(set, item);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// MAP_ADD — `dict[key] = value`.  Shared by the interpreter's `map_add`
+/// and the JIT residual `bh_map_add_fn`.  `dict` is peeked, mutated in
+/// place; runs no user code (raw dict store).
+pub fn map_add_value(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), PyError> {
+    unsafe {
+        pyre_object::w_dict_store(dict, key, value);
+    }
+    Ok(())
+}
+
+/// DICT_UPDATE — `dict.update(source)` with the `ismapping` gate.  Shared
+/// by the interpreter's `dict_update` and the JIT residual
+/// `bh_dict_update_fn`.  Non-mapping surfaces "'<T>' object is not a
+/// mapping"; a `keys()`/`__getitem__` may run Python.
+pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_dict(source) {
+            for (k, v) in pyre_object::w_dict_items(source) {
+                pyre_object::w_dict_store(dict, k, v);
+            }
+            return Ok(());
+        }
+    }
+    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
+        Ok(m) => m,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(PyError::type_error(format!(
+                "'{type_name}' object is not a mapping"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+    let keys = crate::builtins::collect_iterable(keys_obj)?;
+    for key in keys {
+        let val = crate::baseobjspace::getitem(source, key)?;
+        unsafe { pyre_object::w_dict_store(dict, key, val) };
+    }
+    Ok(())
+}
+
+/// DICT_MERGE — merge `source` into `dict` with duplicate-key checks.
+/// Shared by the interpreter's `dict_merge` and the JIT residual
+/// `bh_dict_merge_fn`.  `w_callable` is the peeked callable used only for
+/// error-message prefixes; a `keys()`/`__getitem__` may run Python.
+pub fn dict_merge_value(
+    dict: PyObjectRef,
+    source: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), PyError> {
+    // pyopcode.py:1979 `_dict_merge`.
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses;
+    // a non-dict target is a RuntimeError, not a TypeError.
+    if !unsafe { crate::baseobjspace::isinstance_w(dict, w_dict_type) } {
+        let type_name = unsafe { (*(*dict).ob_type).name };
+        return Err(PyError::new(
+            crate::PyErrorKind::RuntimeError,
+            format!("expected a dict, got {type_name}"),
+        ));
+    }
+    // `space.len_w` is a generic `__len__` dispatch — a raw `w_dict_len`
+    // would be UB on a dict subclass whose layout is not `W_DictObject`.
+    let l1 = crate::baseobjspace::len_w(dict)?;
+    let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source, w_dict_type) };
+    if !source_is_dict {
+        // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
+        // after ** must be a mapping, not %T")`.
+        if !crate::baseobjspace::ismapping_w(source) {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(crate::argument::raise_type_error(
+                w_callable,
+                format!("argument after ** must be a mapping, not {type_name}"),
+            ));
+        }
+    } else {
+        // Dict source fast paths: an empty target merges without the
+        // duplicate check (`update1`); an empty source is a no-op.  The raw
+        // items walk is exact-dict only — a dict subclass may override
+        // `keys()` / `__getitem__`, so it falls through to the generic loop.
+        let l2 = crate::baseobjspace::len_w(source)?;
+        if l1 == 0 && unsafe { pyre_object::is_dict(source) } {
+            unsafe {
+                for (k, v) in pyre_object::w_dict_items(source) {
+                    pyre_object::w_dict_store(dict, k, v);
+                }
+            }
+            return Ok(());
+        }
+        if l2 == 0 {
+            return Ok(());
+        }
+    }
+    // `_dict_merge_loop`: iterate `iter(w_item.keys())`, look each value up
+    // with `space.getitem`, reject a key already present in the target with
+    // `"%s got multiple values for keyword argument '%S'"`, then store.
+    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
+        Ok(m) => m,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(crate::argument::raise_type_error(
+                w_callable,
+                format!("argument after ** must be a mapping, not {type_name}"),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+    let keys = crate::builtins::collect_iterable(keys_obj)?;
+    for key in keys {
+        let val = crate::baseobjspace::getitem(source, key)?;
+        if crate::baseobjspace::contains(dict, key)? {
+            let key_str = unsafe { crate::display::py_str(key) }?;
+            return Err(crate::argument::raise_type_error(
+                w_callable,
+                format!("got multiple values for keyword argument '{key_str}'"),
+            ));
+        }
+        unsafe { pyre_object::w_dict_store(dict, key, val) };
     }
     Ok(())
 }
@@ -488,9 +735,11 @@ mod tests {
         assert!(!truth_value(w_int_new(0)).unwrap());
         let neg = unary_negative_value(w_int_new(4)).expect("unary negate should succeed");
         let inv = unary_invert_value(w_int_new(5)).expect("unary invert should succeed");
+        let pos = unary_positive_value(w_int_new(6)).expect("unary positive should succeed");
         unsafe {
             assert_eq!(w_int_get_value(neg), -4);
             assert_eq!(w_int_get_value(inv), !5);
+            assert_eq!(w_int_get_value(pos), 6);
         }
     }
 

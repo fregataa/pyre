@@ -91,6 +91,66 @@ pub struct Cpu {
     ) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bh_load_from_dict_or_globals_fn(dict, code, frame, namei)` —
+    /// LOAD_FROM_DICT_OR_GLOBALS: try the popped mapping then frame globals.
+    pub load_from_dict_or_globals_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
+    /// — CALL_FUNCTION_EX: unpack `*`/`**` and dispatch.
+    pub call_function_ex_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// Per-arity `bh_call_kw_<n>` helpers for CALL_KW, ABI
+    /// `(callable, null_or_self, kwnames, arg0..arg{n-1})` = 3 + n i64.
+    /// The kwnames slot leaves room for nargs 0..=13 within the backend's
+    /// `MAX_HOST_CALL_ARITY` = 16 ceiling; CALL_KW with nargs > 13 aborts.
+    pub call_kw_fn_0: extern "C" fn(i64, i64, i64) -> i64,
+    pub call_kw_fn_1: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_2: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_3: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_9:
+        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_10:
+        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_11:
+        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_12: extern "C" fn(
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) -> i64,
+    pub call_kw_fn_13: extern "C" fn(
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) -> i64,
     /// LOOKUP_METHOD attribute half — `(obj, code, name_idx) → attr`.
     /// Reproduces `PyFrame::load_method`'s `getattr` for blackhole resume.
     pub load_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
@@ -110,6 +170,17 @@ pub struct Cpu {
     /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
     /// list peeked + mutated in place).
     pub list_extend_fn: extern "C" fn(i64, i64) -> i64,
+    /// SET_ADD residual — `(set, value) → void` (`set.add(value)`, peeked).
+    pub set_add_fn: extern "C" fn(i64, i64) -> i64,
+    /// SET_UPDATE residual — `(set, iterable) → void` (`set.update`, peeked).
+    pub set_update_fn: extern "C" fn(i64, i64) -> i64,
+    /// DICT_UPDATE residual — `(dict, source) → void` (`dict.update`, peeked).
+    pub dict_update_fn: extern "C" fn(i64, i64) -> i64,
+    /// MAP_ADD residual — `(dict, key, value) → void` (`dict[key]=value`, peeked).
+    pub map_add_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// DICT_MERGE residual — `(dict, source, callable) → void` (`**` merge,
+    /// peeked; callable only for error-message prefixes).
+    pub dict_merge_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// LIST_APPEND residual — `(list, value) → void` (`list.append(value)`,
     /// list peeked + mutated in place).  The full-body walker's #171 fold
     /// intercepts it (`PyreHelperKind::ListAppendValue`); this is the decline
@@ -172,6 +243,16 @@ pub struct Cpu {
     /// `bh_unary_invert_fn(value)` — UNARY_INVERT `~value` residual
     /// (a user `__invert__` may run Python → fallible).
     pub unary_invert_fn: extern "C" fn(i64) -> i64,
+    /// `bh_unary_positive_fn(value)` — UNARY_POSITIVE `+value` residual
+    /// (a user `__pos__` may run Python → fallible).
+    pub unary_positive_fn: extern "C" fn(i64) -> i64,
+    /// `bh_load_common_constant_fn(disc)` — LOAD_COMMON_CONSTANT residual
+    /// resolving a `CommonConstant` discriminant to its pushed object
+    /// (allocates for the `all`/`any` builtin variants → `MayForce`).
+    pub load_common_constant_fn: extern "C" fn(i64) -> i64,
+    /// `bh_list_to_tuple_fn(value)` — CALL_INTRINSIC_1 ListToTuple residual
+    /// (`list_to_tuple`, allocates a fresh tuple; non-list → TypeError).
+    pub list_to_tuple_fn: extern "C" fn(i64) -> i64,
     /// `bh_unary_not_fn(value)` — UNARY_NOT `not value` residual returning a
     /// bool (a user `__bool__` / `__len__` may run Python; infallible).
     pub unary_not_fn: extern "C" fn(i64) -> i64,
@@ -331,6 +412,22 @@ impl Cpu {
             call_fn_13: crate::call_jit::bh_call_fn_13,
             call_fn_14: crate::call_jit::bh_call_fn_14,
             load_global_fn: crate::call_jit::bh_load_global_fn,
+            load_from_dict_or_globals_fn: crate::call_jit::bh_load_from_dict_or_globals_fn,
+            call_function_ex_fn: crate::call_jit::bh_call_function_ex_fn,
+            call_kw_fn_0: crate::call_jit::bh_call_kw_0,
+            call_kw_fn_1: crate::call_jit::bh_call_kw_1,
+            call_kw_fn_2: crate::call_jit::bh_call_kw_2,
+            call_kw_fn_3: crate::call_jit::bh_call_kw_3,
+            call_kw_fn_4: crate::call_jit::bh_call_kw_4,
+            call_kw_fn_5: crate::call_jit::bh_call_kw_5,
+            call_kw_fn_6: crate::call_jit::bh_call_kw_6,
+            call_kw_fn_7: crate::call_jit::bh_call_kw_7,
+            call_kw_fn_8: crate::call_jit::bh_call_kw_8,
+            call_kw_fn_9: crate::call_jit::bh_call_kw_9,
+            call_kw_fn_10: crate::call_jit::bh_call_kw_10,
+            call_kw_fn_11: crate::call_jit::bh_call_kw_11,
+            call_kw_fn_12: crate::call_jit::bh_call_kw_12,
+            call_kw_fn_13: crate::call_jit::bh_call_kw_13,
             load_attr_fn: crate::call_jit::bh_load_attr_fn,
             load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
             store_attr_fn: crate::call_jit::bh_store_attr_fn,
@@ -339,6 +436,11 @@ impl Cpu {
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
             delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
             list_extend_fn: crate::call_jit::bh_list_extend_fn,
+            set_add_fn: crate::call_jit::bh_set_add_fn,
+            set_update_fn: crate::call_jit::bh_set_update_fn,
+            dict_update_fn: crate::call_jit::bh_dict_update_fn,
+            map_add_fn: crate::call_jit::bh_map_add_fn,
+            dict_merge_fn: crate::call_jit::bh_dict_merge_fn,
             list_append_fn: pyre_object::listobject::jit_list_append,
             format_simple_fn: crate::call_jit::bh_format_simple_fn,
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
@@ -354,6 +456,9 @@ impl Cpu {
             for_iter_next_fn: pyre_interpreter::runtime_ops::jit_next,
             unary_negative_fn: crate::call_jit::bh_unary_negative_fn,
             unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
+            unary_positive_fn: crate::call_jit::bh_unary_positive_fn,
+            load_common_constant_fn: crate::call_jit::bh_load_common_constant_fn,
+            list_to_tuple_fn: crate::call_jit::bh_list_to_tuple_fn,
             unary_not_fn: crate::call_jit::bh_unary_not_fn,
             load_fast_check_fn: crate::call_jit::bh_load_fast_check_fn,
             compare_fn: crate::call_jit::bh_compare_fn,

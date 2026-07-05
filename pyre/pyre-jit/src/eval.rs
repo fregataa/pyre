@@ -421,6 +421,19 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
     let obj = obj_addr as pyre_object::PyObjectRef;
     let inst = unsafe { &mut *(obj_addr as *mut pyre_object::objectobject::W_ObjectObject) };
     f(&mut inst.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // Mark the `storage` block (`W_MAPDICT_STORAGE_GC_TYPE_ID`, a stable leaf
+    // GcArray) live: forward the block-pointer field slot itself so a major GC
+    // greys the block (its interior is a GC leaf, so the collector never walks
+    // it — this instance's walk below is the only thing that forwards the boxed
+    // element slots). Non-moving, so the minor-GC forward is a no-op; the value
+    // is keeping the block off the sweep list. Mirrors `list_object_custom_trace`
+    // forwarding `int_items.block` / `float_items.block`. Guard on GC ownership:
+    // a `std::alloc` fallback block (no GC hook) is not GC-managed.
+    if !inst.storage.is_null() && pyre_object::gc_hook::try_gc_owns_object(inst.storage as *mut u8)
+    {
+        let storage_slot = std::ptr::addr_of_mut!(inst.storage);
+        f(storage_slot as *mut majit_ir::GcRef);
+    }
     pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
         obj,
         &mut |slot: *mut pyre_object::PyObjectRef| {
@@ -1936,6 +1949,31 @@ thread_local! {
         pytype_to_tid.insert(
             &pyre_object::pyobject::COMPLEX_TYPE as *const _ as usize,
             w_complex_tid,
+        );
+        // `W_ObjectObject.storage` block — the mapdict instance attribute-value
+        // array (`mapdict.py:910`, `Ptr(GcArray(OBJECTPTR))`).  Registered as a
+        // GC **leaf** varsize (`items_have_gc_ptrs=false`): the block is a MIXED
+        // boxed/unboxed array (a `firstunwrapped` unboxed slot holds a raw
+        // `*mut Vec<i64>`, not an object), so the collector must NOT inline-walk
+        // its items as `PY_OBJECT_ARRAY_GC_TYPE_ID` (9) does.  The owning
+        // instance's `object_object_custom_trace` walks the interior instead,
+        // consulting the map to skip unboxed slots
+        // (`instance_walk_boxed_storage`), and forwards this block pointer to
+        // keep the (non-moving, stable-allocated) block marked live.  Length at
+        // offset 0 (the `ItemsBlock.capacity` header), 8-byte ref items.
+        // Registered here, immediately after `W_COMPLEX_GC_TYPE_ID = 54`, so it
+        // takes tid 55 before the runtime-numbered `#[pyre_class]` / per-ExcKind
+        // registrations below.
+        let w_mapdict_storage_tid = gc.register_type(TypeInfo::varsize(
+            pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
+            std::mem::size_of::<pyre_object::pyobject::PyObjectRef>(),
+            0,
+            false,
+            Vec::new(),
+        ));
+        debug_assert_eq!(
+            w_mapdict_storage_tid,
+            pyre_object::object_array::W_MAPDICT_STORAGE_GC_TYPE_ID,
         );
         // `#[pyre_class]`-emitted typed-payload registrations.  Each
         // entry is one line consuming the macro-generated
