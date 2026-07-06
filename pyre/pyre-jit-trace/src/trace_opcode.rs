@@ -1447,7 +1447,7 @@ impl MIFrame {
         // box count than the encoder wrote.
         let resume_jit_pc: Option<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
-            if jc.payload.metadata.pc_map.is_empty() {
+            if !jc.payload.is_populated() {
                 None
             } else {
                 let marker_call_pc = if in_a_call {
@@ -1507,7 +1507,7 @@ impl MIFrame {
             // Portal-bridge has no regalloc so colors == slot indices
             // (identity); the `is_portal_bridge` guard in the Ref-bank
             // materialization loop below provides the same bypass.
-            if jc.payload.metadata.pc_map.is_empty() {
+            if !jc.payload.is_populated() {
                 if jc.payload.is_portal_bridge() {
                     let stack_base = jc.payload.metadata.stack_base;
                     let depth = jc
@@ -1530,7 +1530,7 @@ impl MIFrame {
                 // populated, so collect every listed bank/index and complete
                 // the matching bank immediately before the direct snapshot.
                 let jit_pc =
-                    resume_jit_pc.expect("pc_map non-empty branch above ensures lookup hits");
+                    resume_jit_pc.expect("is_populated() branch above ensures lookup hits");
                 let op_live = crate::state::op_live();
                 let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
                 let all_liveness = crate::state::liveness_info_snapshot();
@@ -9996,6 +9996,7 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.is_drained = true;
         let inner_jc = crate::state::JitCode {
             index: 0,
             payload: Arc::new(pyjit),
@@ -10072,6 +10073,7 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.is_drained = true;
         pyjit.metadata.depth_at_py_pc.push(1);
         // Per-PC (color, slot) entries the codewriter publishes at pc 0:
         // local 0 -> color 0 (slot 0), local 1 -> color 1 (slot 1), and the

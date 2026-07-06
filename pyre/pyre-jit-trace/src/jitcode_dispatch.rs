@@ -2601,6 +2601,16 @@ fn compute_bridge_root_parent_frame(
         jitcode_index,
         resume_py_pc,
         None,
+        // Paused ROOT (outermost caller) frame: the sentinel is
+        // correct-by-construction, not a lossy deferral.  `resume_py_pc` is a
+        // CALL-return fallthrough opcode boundary where `pc_map` is lossless
+        // (no kept operand-stack temp), so the frame resumes through the plain
+        // `py_pc → pc_map` path — matching the emit-side sentinel the paused
+        // caller word carries elsewhere.  It must NOT be "upgraded" to a direct
+        // pc without a real per-frame `MIFrame.pc` for the whole caller chain
+        // (the `#124`/task#50 register↔value-stack rework); the only
+        // pc_map-independent carried coordinate today is the kept-stack branch
+        // guard's own `op.pc`.
         majit_ir::resumedata::NO_JITCODE_PC,
         None,
     );
@@ -7227,6 +7237,36 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
     })
 }
 
+/// `PYRE_M366_NONBRANCH_PC` (#366, default OFF): carry a direct JitCode
+/// resume pc for the non-branch specialization guards (`GuardValue` /
+/// `GuardClass`) instead of the `NO_JITCODE_PC` sentinel, so their resume
+/// decode consults the carried word rather than the stored Python pc →
+/// `pc_map` translation.
+///
+/// The carried word is `resume_jitcode_pc_for(py_pc)` — the SAME `-live-`
+/// marker offset the `pc_map` fallback returns — not the guard op's raw
+/// `op_pc`.  These guards resume by re-executing their own opcode at
+/// `orgpc` with a deterministic operand stack (no kept temp), so the
+/// marker `pc_map[py_pc]` names is a valid startpoint (`can_decode_live_vars`
+/// holds) AND identical to what the decoder would translate to — the encoder
+/// (`collect_outer_active_boxes` reg banks) and decoder (`setposition` /
+/// liveness) resolve the same offset, keeping the box layout symmetric.
+/// Carrying the raw `op_pc` (which may sit mid-opcode, `op_pc != pc_map[
+/// py_pc]`) is what broke the earlier attempt; anchoring to the marker
+/// avoids that.  Default ON — corpus-wide OFF/ON byte-equality validated on
+/// both backends (171/171 dynasm + cranelift); opt out with
+/// `PYRE_M366_NONBRANCH_PC=0`.
+pub(crate) fn m366_nonbranch_pc_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M366_NONBRANCH_PC") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_VABLE_SCALAR_CA` (default OFF) — sub-mode of
 /// [`fbw_loop_callee_ca_enabled`]. When on, the gap-10 loop-callee
 /// CALL_ASSEMBLER passes the callee's loop-carried locals as scalar
@@ -8904,6 +8944,122 @@ fn vstack_enter_exception_handler(
 /// `resume_jitcode_pc_for`, used by the full-body walk to stamp a guard's
 /// snapshot with the Python opcode the blackhole resumes (and re-executes)
 /// at — matching the trait path's `orgpc` snapshot coordinate.
+/// `PYRE_PCMAP_BLOCKHEAD_AUDIT` enables the corpus-diff assertion that the
+/// precomputed `block_head_py_by_jit_pc` table reproduces the legacy
+/// `pc_map.iter().position()` block-head scan.  Diagnostic only; off in
+/// production.
+fn block_head_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BLOCKHEAD_AUDIT").is_some())
+}
+
+/// `PYRE_PCMAP_CARRY_AUDIT` enables the assertion that the ONLY carried
+/// `guard_jitcode_pc` word not derivable from `pc_map` is the kept-stack
+/// branch guard's own `op.pc` (the walker `MIFrame.pc`, stashed in
+/// `BRANCH_GUARD_JITCODE_PC`).  Every other carried word equals
+/// `resume_jitcode_pc_for(py_pc)` / `after_residual_call_resume_pc_for(..)`
+/// — a `pc_map` read relocated from decode to encode, not an independent
+/// coordinate.  This certifies the `pc_map`-deletion precondition: the map
+/// stays load-bearing until the kept-stack coordinate is re-sourced off the
+/// walker `op.pc` for every frame (the `#124`/task#50 register↔value-stack
+/// rework).  Diagnostic only; off in production.
+fn carry_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CARRY_AUDIT").is_some())
+}
+
+/// `PYRE_PCMAP_DEPTH_AUDIT` enables the assertion that the jitcode-pc-keyed
+/// `depth_by_jit_pc` twin reproduces the py_pc-indexed `depth_at_py_pc` value
+/// at the walker capture seam: for a genuine walker `op_pc` that lands on a
+/// block-head marker, `depth_for_jitcode_pc(op_pc)` equals
+/// `depth_at_py_pc[python_pc_for_jitcode_pc(op_pc)]`.  Both are compile-time
+/// derivations of the same `pc_map` bytes, so the equality holds by
+/// construction; the audit certifies the depth re-key precondition (the twin
+/// can source the value from `op_pc` without the py_pc channel) ahead of the
+/// eventual `pc_map`-deletion flip.  Diagnostic only; off in production.
+fn depth_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_DEPTH_AUDIT").is_some())
+}
+
+/// `PYRE_PCMAP_BRIDGE_AUDIT` enables the assertion that the predecessor-keyed
+/// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins reproduce the py_pc-indexed
+/// `pcdep_color_slots` / `depth_at_py_pc` values at the decode re-inversion seam
+/// (`bridge_semantic_maps_at_with_jitcode_pc`): for a carried genuine
+/// `jitcode_pc`, `pcdep_for_jitcode_pc(jp)` equals
+/// `pcdep_color_slots[python_pc_for_jitcode_pc(jp)]` and likewise for depth.
+/// Both are compile-time derivations of the same `pc_map` / `first_jit`
+/// coordinates, so the equality holds by construction; the audit certifies the
+/// precondition for retiring the decode-side `pc_map` re-inversion (the twins
+/// can source pcdep/depth from the carried `jitcode_pc` without the py_pc
+/// channel). Diagnostic only; off in production.
+pub(crate) fn bridge_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
+}
+
+/// `PYRE_M366_BRIDGE_JITCODE` (default OFF) consumes the predecessor-keyed
+/// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins directly from the carried
+/// genuine `jitcode_pc` at `bridge_semantic_maps_at_with_jitcode_pc`, instead of
+/// re-inverting the coordinate to a Python PC via `python_pc_for_jitcode_pc` and
+/// indexing the py_pc-keyed `pcdep_color_slots` / `depth_at_py_pc`. The equality
+/// this relies on is the one `PYRE_PCMAP_BRIDGE_AUDIT` certifies. This is the
+/// decode-side identity step toward retiring the `pc_map` re-inversion — a
+/// behavioral flip validated by that audit certificate plus full corpus, since
+/// no byte-identical fallback exists once the re-inversion is bypassed.
+pub(crate) fn bridge_jitcode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M366_BRIDGE_JITCODE").is_some())
+}
+
+/// `PYRE_M73_ENCODE_AUDIT` enables the assertion that the trivia-aware
+/// `depth_trivia_by_jit_pc` twin reproduces the ENCODE-side branch-resume depth
+/// that `branch_resume_target_stack_depth` computes via
+/// `depth_at_py_pc[skip_python_trivia_forward(python_pc_for_jitcode_pc(target))]`.
+/// Certifies the precondition for re-sourcing that depth off the genuine jitcode
+/// `target` without the py_pc channel + runtime trivia walk. Off in production.
+pub(crate) fn m73_encode_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE_AUDIT").is_some())
+}
+
+/// `PYRE_M73_ENCODE` (default OFF) flips the three ENCODE branch-resume depth
+/// readers from the `python_pc_for_jitcode_pc` inversion + runtime trivia walk
+/// to the jitcode-pc-keyed `depth_trivia_for_jitcode_pc` twin. Behavioral flip
+/// (no byte-identity guarantee), certified by the always-computed
+/// `PYRE_M73_ENCODE_AUDIT` full-`Option` equality + `check.py`. When the twin is
+/// empty (skeleton / portal-bridge / fixture) the reader keeps the raw value so
+/// the pre-populated-twin installs are unaffected.
+pub(crate) fn m73_encode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE").is_some())
+}
+
+/// `PYRE_M73_LIVENESS_AUDIT` enables the assertion that querying the register
+/// liveness banks off the genuine jitcode `target`
+/// (`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(idx, py, target)`)
+/// reproduces the banks the ENCODE-side branch-arm readers compute via the
+/// `python_pc_for_jitcode_pc(target)` inversion + `skip_python_trivia_forward`.
+/// Certifies the precondition for re-sourcing the branch-arm Ref-liveness off
+/// the carried coordinate without the py_pc channel. Off in production.
+pub(crate) fn m73_liveness_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS_AUDIT").is_some())
+}
+
+/// `PYRE_M73_LIVENESS` (default OFF) flips the branch-arm Ref-liveness reader
+/// from the `python_pc_for_jitcode_pc` inversion to the jitcode-pc-keyed
+/// `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc` twin, preferring the
+/// carried `target` coordinate. Behavioral flip (no byte-identity guarantee),
+/// certified by the always-available `PYRE_M73_LIVENESS_AUDIT` full-bank
+/// equality + `check.py`. When the carried coordinate is not `-live-`-decodable
+/// the twin falls back to the same `resolve_resume_pc` path as the raw reader,
+/// so unpopulated / portal-bridge installs are unaffected.
+pub(crate) fn m73_liveness_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -8921,7 +9077,30 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     // positions never collide with marker positions (each byte belongs
     // to exactly one instruction), so this test only fires for block
     // heads.
-    if let Some(py) = metadata.pc_map.iter().position(|&m| m == jit_pc) {
+    //
+    // The `block_head_py_by_jit_pc` table is the precomputed inverse of this
+    // block-head case (marker byte offset → smallest resuming py_pc), built
+    // from the same `pc_map` bytes at compile time, so a lookup is equal to
+    // the `pc_map.iter().position()` scan by construction.  Drained installs
+    // carry it; skeleton / portal-bridge / fixture installs leave it empty
+    // and keep the legacy scan below.
+    if !metadata.block_head_py_by_jit_pc.is_empty() {
+        if let Ok(i) = metadata
+            .block_head_py_by_jit_pc
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+        {
+            let py = metadata.block_head_py_by_jit_pc[i].1;
+            if block_head_audit_enabled() {
+                let scanned = metadata.pc_map.iter().position(|&m| m == jit_pc);
+                assert_eq!(
+                    scanned,
+                    Some(py as usize),
+                    "block_head_py_by_jit_pc diverges from pc_map.position at jit_pc={jit_pc}"
+                );
+            }
+            return py;
+        }
+    } else if let Some(py) = metadata.pc_map.iter().position(|&m| m == jit_pc) {
         return py as u32;
     }
     let first_jit = &metadata.first_jit_pc_by_py_pc;
@@ -9197,10 +9376,29 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
         let code = &*pjc.code_ptr;
         let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
         let py = skip_python_trivia_forward(code, py);
-        crate::liveness::liveness_for(pjc.code_ptr)
+        let depth = crate::liveness::liveness_for(pjc.code_ptr)
             .depth_at_py_pc()
             .get(py)
-            .copied()
+            .copied();
+        // task#50 #73-core: certify the trivia-aware `depth_trivia_by_jit_pc`
+        // twin reproduces this depth off the genuine jitcode `target`, without
+        // the `python_pc_for_jitcode_pc` inversion + runtime `skip_python_trivia_forward`
+        // walk. When the twin has an entry for `target`, it must equal the depth
+        // read here (both derive from the same static `liveness_for` depth +
+        // trivia-skip, baked at compile time). Precondition certificate for
+        // retiring the inversion at this ENCODE site. Off in production.
+        if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
+            assert_eq!(
+                pjc.depth_trivia_for_jitcode_pc(target),
+                depth,
+                "depth_trivia twin diverges from branch_resume_target_stack_depth at target={target} py={py}"
+            );
+        }
+        if m73_encode_enabled() && pjc.depth_trivia_populated() {
+            pjc.depth_trivia_for_jitcode_pc(target)
+        } else {
+            depth
+        }
     }
 }
 
@@ -9234,12 +9432,30 @@ fn kept_stack_has_boxed_int_hazard(
         let code = &*pjc.code_ptr;
         let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
         let py = skip_python_trivia_forward(code, py);
-        let Some(depth) = crate::liveness::liveness_for(pjc.code_ptr)
+        let depth_opt = crate::liveness::liveness_for(pjc.code_ptr)
             .depth_at_py_pc()
             .get(py)
-            .copied()
-            .map(|d| d as usize)
-        else {
+            .copied();
+        // task#50 #73-core: certify the shared `depth_trivia_by_jit_pc` twin
+        // reproduces this depth off the genuine jitcode `target`, at the
+        // trait/any-leg sibling of `branch_resume_target_stack_depth`. A
+        // divergence here — including the twin being `Some` where the raw read
+        // is `None` (past-last-opcode overshoot) — would make the FLIP non
+        // byte-identical, so the audit compares the full `Option`. Off in
+        // production.
+        if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
+            assert_eq!(
+                pjc.depth_trivia_for_jitcode_pc(target),
+                depth_opt,
+                "depth_trivia twin diverges from kept_stack_has_boxed_int_hazard at target={target} py={py}"
+            );
+        }
+        let depth_opt = if m73_encode_enabled() && pjc.depth_trivia_populated() {
+            pjc.depth_trivia_for_jitcode_pc(target)
+        } else {
+            depth_opt
+        };
+        let Some(depth) = depth_opt.map(|d| d as usize) else {
             // Unknown resume depth — cannot prove safe.
             return true;
         };
@@ -9335,6 +9551,26 @@ fn branch_arm_resume_ref_liveness(
             outer_jitcode_index as i32,
             py as i32,
         );
+        if m73_liveness_audit_enabled() {
+            let twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                outer_jitcode_index as i32,
+                py as i32,
+                target as i32,
+            );
+            assert_eq!(
+                twin, banks,
+                "liveness twin diverges from branch_arm_resume_ref_liveness at target={target} py={py}"
+            );
+        }
+        let banks = if m73_liveness_enabled() {
+            crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                outer_jitcode_index as i32,
+                py as i32,
+                target as i32,
+            )
+        } else {
+            banks
+        };
         let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
         let num_regs_r = jc.payload.jitcode.num_regs_r() as u16;
         Some((live, num_regs_r))
@@ -9497,10 +9733,26 @@ fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -
     let code_obj = unsafe { &*pjc.code_ptr };
     let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
     let py = skip_python_trivia_forward(code_obj, py);
-    crate::liveness::liveness_for(pjc.code_ptr)
+    let depth_opt = crate::liveness::liveness_for(pjc.code_ptr)
         .depth_at_py_pc()
         .get(py)
-        .copied()
+        .copied();
+    // task#50 #73-core: certify the shared `depth_trivia_by_jit_pc` twin at the
+    // leg-independent depth probe. Same static-liveness + trivia-skip source as
+    // the two full-body-walk readers, so the same twin must reproduce it off the
+    // genuine jitcode `target`. Off in production.
+    if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
+        assert_eq!(
+            pjc.depth_trivia_for_jitcode_pc(target),
+            depth_opt,
+            "depth_trivia twin diverges from branch_resume_target_stack_depth_any_leg at target={target} py={py}"
+        );
+    }
+    if m73_encode_enabled() && pjc.depth_trivia_populated() {
+        pjc.depth_trivia_for_jitcode_pc(target)
+    } else {
+        depth_opt
+    }
 }
 
 /// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`
@@ -9730,6 +9982,25 @@ fn walker_capture_snapshot_for_last_guard_impl(
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
                 let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
+                // task#50 phase-0: certify the jitcode-pc-keyed `depth_by_jit_pc`
+                // twin reproduces the py_pc-indexed `depth_at_py_pc` value the
+                // decode still reads.  When the genuine walker `op_pc` lands on a
+                // block-head marker the twin has an entry for, its depth must
+                // equal `depth_at_py_pc[py]` (both derived from the same `pc_map`
+                // bytes at compile time).  This is the precondition certificate
+                // for re-sourcing the resume depth off `op_pc` without the py_pc
+                // channel.  Off in production → byte-identical.
+                if depth_audit_enabled() {
+                    if let Some(twin_depth) = jc.payload.depth_for_jitcode_pc(op_pc as usize) {
+                        let field_depth =
+                            jc.payload.metadata.depth_at_py_pc.get(py as usize).copied();
+                        assert_eq!(
+                            Some(twin_depth),
+                            field_depth,
+                            "depth_by_jit_pc diverges from depth_at_py_pc at op_pc={op_pc} py={py}"
+                        );
+                    }
+                }
                 // The inverse-`pc_map` can land on a Python trivia
                 // instruction's jitcode region (e.g. a branch target
                 // whose block lowers `NOT_TAKEN`).  A resume coordinate
@@ -9963,7 +10234,105 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // `entry_py_pc`, and for a non-branch guard `op_pc != pc_map[py_pc]`
             // — the two windows diverge and the decoded box layout mismatches.
             let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
+                // The kept-stack branch guard's own `op.pc` (walker
+                // `MIFrame.pc`) — the ONE carried word not sourced from
+                // `pc_map`.  Certify that: it must differ from the `pc_map`
+                // round-trip of its resume `py_pc`, or `pc_map` would already
+                // suffice and the carry would be a pure relocation.
+                if carry_audit_enabled() {
+                    let jc = unsafe { &*sym.jitcode };
+                    let roundtrip =
+                        guard_py_pc.and_then(|gp| jc.payload.resume_jitcode_pc_for(gp as usize));
+                    assert_ne!(
+                        roundtrip,
+                        Some(guard_jc_pc_raw),
+                        "kept-stack guard op.pc={guard_jc_pc_raw} equals \
+                         pc_map[guard_py_pc={guard_py_pc:?}] — carry would be a \
+                         pc_map relocation, not an independent coordinate"
+                    );
+                }
                 guard_jc_pc_raw as i32
+            } else if m366_nonbranch_pc_enabled()
+                && !after_residual_call
+                && matches!(
+                    ctx.trace_ctx.last_guard_opcode(),
+                    Some(
+                        OpCode::GuardValue
+                            | OpCode::GuardClass
+                            | OpCode::GuardTrue
+                            | OpCode::GuardFalse
+                    )
+                )
+            {
+                // #366: carry the `-live-` marker offset (`resume_jitcode_pc_for(
+                // py_pc)`), NOT the raw guard `op_pc`.  Reached only on the
+                // sentinel path (`guard_jc_pc_raw == usize::MAX`): the
+                // specialization guards (`GuardValue`/`GuardClass`) and the
+                // depth-0 branch guards (`GuardTrue`/`GuardFalse`, kept-stack
+                // depth>0 branches take the first arm carrying `op.pc`).  For
+                // every guard here the decoder's baseline already resolves
+                // `pc_map[py_pc]` — the same `py_pc` and the same forward
+                // lookup — so carrying `resume_jitcode_pc_for(py_pc)` is
+                // identical to that fallback by construction, keeping the
+                // encoder reg-bank window and decoder liveness symmetric.  It is
+                // a valid startpoint (`can_decode_live_vars` holds: the baseline
+                // decodes `pc_map[py_pc]` without `_missing_liveness` today).
+                // The `after_residual_call` family is excluded — it routes
+                // through the separate `after_residual_call_resume_pc` map + the
+                // bit-14 marker, so `pc_map[py_pc]` would name a different
+                // offset.  Fall back to the sentinel if `py_pc` has no `pc_map`
+                // entry (portal-bridge / out-of-range).
+                let marker = unsafe {
+                    let jc = &*sym.jitcode;
+                    jc.payload.resume_jitcode_pc_for(py_pc as usize)
+                };
+                match marker {
+                    Some(jp) => jp as i32,
+                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                }
+            } else if m366_nonbranch_pc_enabled() && after_residual_call {
+                // #366: extend the direct-pc carry to the after-residual-call
+                // guard family (`GuardException`/`GuardNoException`/
+                // `GuardNotForced`/`GuardAlwaysFails` — exactly what the
+                // `after_residual_call` bool tracks, `walker_capture_snapshot_for_last_guard`).
+                // These resume AFTER the residual call at the marker the
+                // decoder already resolves for this guard, so carrying it
+                // directly makes decode consult the carried word instead of
+                // the bit-14-marked / plain `py_pc → pc_map` translation.
+                //
+                // Which marker the decoder resolves depends on the sub-case
+                // captured in `marker_call_py_pc` (set above at the CALL pc):
+                //   * `Some(call_py_pc)` — the residual call is in a try-block
+                //     (FOR_ITER-next catch resume): decode routes the bit-14
+                //     word through `after_residual_call_resume_pc_for`, so carry
+                //     that same post-call catch `-live-` offset.
+                //   * `None` — plain sequential residual call resuming at the
+                //     next opcode's start marker: decode routes the plain word
+                //     through `pc_map`, so carry `resume_jitcode_pc_for(py_pc)`.
+                //     `py_pc == liveness_py_pc` here: the residual-call path
+                //     never stashes `BRANCH_GUARD_JITCODE_PC` (only kept-stack
+                //     branch guards do), so `guard_jc_pc_raw == usize::MAX` and
+                //     `guard_py_pc` is `None`.
+                // Both offsets are the SAME physical post-call `-live-` insn by
+                // codewriter construction (the plain fallthrough re-key and the
+                // catch-predecessor anchor resolve to one marker), so the
+                // carried value is identical to the decoder's fallback by
+                // construction — encoder reg-bank window and decoder liveness
+                // stay symmetric, and both pass `can_decode_live_vars` (a
+                // `-live-` marker). Fall back to the sentinel on a map miss.
+                let marker = unsafe {
+                    let jc = &*sym.jitcode;
+                    match marker_call_py_pc {
+                        Some(call_py_pc) => jc
+                            .payload
+                            .after_residual_call_resume_pc_for(call_py_pc as usize),
+                        None => jc.payload.resume_jitcode_pc_for(py_pc as usize),
+                    }
+                };
+                match marker {
+                    Some(jp) => jp as i32,
+                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                }
             } else {
                 majit_ir::resumedata::NO_JITCODE_PC
             };
@@ -10077,7 +10446,7 @@ fn compute_inline_caller_frame(
     }
     let (jitcode_index, fallthrough_py_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
-        if jc.payload.code_ptr.is_null() || jc.payload.metadata.pc_map.is_empty() {
+        if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return None;
         }
         let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
@@ -10156,7 +10525,7 @@ fn compute_nested_inline_caller_frame(
 ) -> Option<InlineParentFrame> {
     let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())? as u32;
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
-    if pjc.metadata.pc_map.is_empty() || pjc.code_ptr.is_null() {
+    if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return None;
     }
     let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
@@ -10248,7 +10617,7 @@ fn walker_capture_multi_frame_inline_snapshot(
     let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index) else {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     };
-    if callee_pjc.metadata.pc_map.is_empty() || callee_pjc.code_ptr.is_null() {
+    if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     }
     let callee_py_pc = unsafe {
@@ -14958,6 +15327,15 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     let target_jc = read_label(code, &gin_op, 1);
     // SAFETY: code_ptr captured non-null above, live for the walk.
     let code_obj = unsafe { &*code_ptr };
+    // The `jc_pc` here is a branch ARM's op-start (`gin_op.next_pc` /
+    // `read_label`), NOT the guard's resume marker, so it does not satisfy
+    // the carried-coordinate contract (`can_decode_live_vars` may hold at an
+    // interior arm offset whose liveness window differs from the py opcode's
+    // representative resume window). The `pc_map` normalization to the py
+    // opcode's resume liveness is the intended behavior here, so this reader
+    // keeps the py_pc channel and is excluded from the jitcode-pc liveness
+    // twin — verified: querying the carried offset directly drops live
+    // colors (e.g. `ref_ [0,1,4]` vs `[0,1]`) across the branch-arm corpus.
     let arm_dst_live = |jc_pc: usize| -> bool {
         let py = skip_python_trivia_forward(
             code_obj,

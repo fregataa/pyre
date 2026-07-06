@@ -12611,6 +12611,159 @@ impl CodeWriter {
             first_jit_pc_by_py_pc[*py_pc] = combined_bytes[first_insn_base + k];
         }
 
+        // Block-head inverse: for each distinct marker byte offset, record the
+        // FIRST (smallest) py_pc that resolves to it.  Ascending `py` iteration
+        // with first-write-wins reproduces `pc_map.iter().position(|&m| m == off)`
+        // exactly, indexed for binary search.
+        let mut block_head_py_by_jit_pc: Vec<(usize, u32)> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for (py, &off) in pc_map_bytes.iter().enumerate() {
+                if seen.insert(off) {
+                    block_head_py_by_jit_pc.push((off, py as u32));
+                }
+            }
+            block_head_py_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        }
+
+        // task#50 phase-0: the jitcode-pc-keyed twin of `depth_at_pc`. Same
+        // first-seen-offset dedup as `block_head_py_by_jit_pc` (a marker offset
+        // belongs to the smallest py_pc resolving there), pairing each block-head
+        // offset with that py_pc's value-stack depth. A lookup equals
+        // `depth_at_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction, so it
+        // scaffolds the eventual jitcode-pc resume re-key without switching any
+        // consumer (`PYRE_PCMAP_DEPTH_AUDIT` certifies the equality).
+        let mut depth_by_jit_pc: Vec<(usize, u16)> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for (py, &off) in pc_map_bytes.iter().enumerate() {
+                if seen.insert(off) {
+                    let depth = depth_at_pc.get(py).copied().unwrap_or(0);
+                    depth_by_jit_pc.push((off, depth));
+                }
+            }
+            depth_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        }
+
+        // task#50 phase-1: predecessor-keyed jitcode-pc twins of
+        // `pcdep_color_slots` and `depth_at_pc`, resolving a JitCode byte
+        // offset the way `python_pc_for_jitcode_pc` does — the block-head marker
+        // match first, else the largest `first_jit_pc_by_py_pc[py]` at-or-before
+        // the offset (predecessor op containment).  Both tiers are baked into
+        // ONE table: seed every op-start offset with its own py's value, then
+        // OVERRIDE each block-head marker offset with the block-head py's value
+        // (marker precedence, `python_pc_for_jitcode_pc` :9009-9024).  A
+        // predecessor binary search (largest offset <= jit_pc) then reproduces
+        // `table[python_pc_for_jitcode_pc(jit_pc)]` for the carried resume
+        // coordinates that reach the decode re-inversion at `state.rs`
+        // (`bridge_semantic_maps_at_with_jitcode_pc`), which are the guard's own
+        // op offset or a block-head marker — never a mid-op byte.  Certified by
+        // `PYRE_PCMAP_BRIDGE_AUDIT`; empty for skeleton / portal-bridge.
+        let mut pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
+        let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
+        // task#50 #73-core: trivia-aware predecessor twin of the STATIC dense
+        // liveness depth.  The ENCODE-side branch-resume depth reader
+        // (`branch_resume_target_stack_depth`, jitcode_dispatch.rs:9329) does NOT
+        // read `depth_at_py_pc[inv(target)]` directly — it advances the inverted
+        // py through `skip_python_trivia_forward` (a not-taken branch coordinate
+        // can land on a `NOT_TAKEN`/`Cache` trivia op) BEFORE indexing the
+        // `liveness_for(code)` depth.  A plain `depth_pred_by_jit_pc` twin keys the
+        // RAW inverted py against the walk-visited `depth_at_pc`, so it diverges
+        // both when trivia moves the coordinate AND at any PC the trace never
+        // entered.  This second twin bakes the same forward trivia-skip over the
+        // same static liveness at compile time: for each resolved py, advance past
+        // `ExtendedArg`/`Resume`/`Nop`/`Cache`/`NotTaken` then record that opcode's
+        // static depth.  A predecessor lookup then equals
+        // `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(inv(jit_pc))]`.
+        // task#50 #73-core: the trivia twin is split into the SAME two tiers as
+        // `python_pc_for_jitcode_pc` — a marker table matched EXACTLY (the block
+        // -head precedence tier, `block_head_py_by_jit_pc`'s depth analog) and an
+        // op-start table matched by PREDECESSOR (`first_jit_pc_by_py_pc`'s depth
+        // analog).  A single merged predecessor table is WRONG for an interior
+        // query: a marker byte sits inside a preceding op's emitted region, so a
+        // predecessor search for a coordinate past the op-start but before the
+        // next op would land on that interior marker instead of the op-start.
+        // `python_pc_for_jitcode_pc` never returns a marker py for a non-exact
+        // coordinate, so the marker tier must stay OUT of the predecessor scan.
+        // The decode/bridge readers only ever query exact coordinates (guard op
+        // offset or exact marker), which is why the phase-1 merged twins pass;
+        // the any-leg branch-resume reader queries interior not-taken offsets and
+        // exposes the merge.
+        // Option-valued: the raw reader indexes `depth_at_py_pc().get(py)`, which
+        // is `None` for a coordinate past the last opcode (trailing-trivia
+        // overshoot: `skip_trivia(py)` can reach `n`, the truncated liveness
+        // length).  Bake the exact `Option` so the twin returns `None` there too
+        // rather than a spurious `0` — a `Some(0)` at the overshoot would flip the
+        // `None`-means-decline hazard reader (S9394) into a compile.
+        let mut depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        let mut depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        if !first_jit_pc_by_py_pc.is_empty() {
+            use std::collections::BTreeMap;
+            let mut by_off: BTreeMap<usize, usize> = BTreeMap::new();
+            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                if pos != usize::MAX {
+                    by_off.insert(pos, py);
+                }
+            }
+            let mut marker_seen: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for (py, &off) in pc_map_bytes.iter().enumerate() {
+                if marker_seen.insert(off) {
+                    by_off.insert(off, py);
+                }
+            }
+            // Compile-time twin of `skip_python_trivia_forward`
+            // (jitcode_dispatch.rs:9126): advance past Python trivia opcodes to
+            // the next executable opcode.  Same opcode set, same start-AT (not
+            // start-after) semantics.
+            let skip_trivia = |mut py: usize| -> usize {
+                loop {
+                    match pyre_interpreter::decode_instruction_at(code, py) {
+                        Some((
+                            Instruction::ExtendedArg
+                            | Instruction::Resume { .. }
+                            | Instruction::Nop
+                            | Instruction::Cache
+                            | Instruction::NotTaken,
+                            _,
+                        )) => py += 1,
+                        _ => return py,
+                    }
+                }
+            };
+            // The ENCODE branch-resume depth reader indexes the STATIC dense
+            // liveness (`liveness_for(code).depth_at_py_pc()`), not the
+            // walk-visited sparse `depth_at_pc` (which stays 0 at any PC the
+            // trace did not enter — e.g. a not-taken branch target the resume
+            // depth reader queries).  The trivia twin must reproduce the same
+            // static analysis, so source its depth from `liveness_for`.
+            let static_depth =
+                pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
+            for (&off, &py) in by_off.iter() {
+                let pcdep = pcdep_color_slots.get(py).cloned().unwrap_or_default();
+                let depth = depth_at_pc.get(py).copied().unwrap_or(0);
+                pcdep_by_jit_pc.push((off, pcdep));
+                depth_pred_by_jit_pc.push((off, depth));
+            }
+            // Marker tier: exact-match, block-head precedence (first-seen dedup
+            // gives the smallest py resolving at the marker offset).
+            for (py, &off) in pc_map_bytes.iter().enumerate() {
+                if marker_seen.remove(&off) {
+                    let depth_trivia = static_depth.get(skip_trivia(py)).copied();
+                    depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
+                }
+            }
+            depth_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // Op-start tier: predecessor scan, markers EXCLUDED.
+            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                if pos != usize::MAX {
+                    let depth_trivia = static_depth.get(skip_trivia(py)).copied();
+                    depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
+                }
+            }
+            depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        }
+
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
         // the shell returned by `grab_initial_jitcodes`; pyre still
         // builds the populated `JitCode` as the final codewriter step, so
@@ -12636,7 +12789,13 @@ impl CodeWriter {
             pc_map: pc_map_bytes,
             after_residual_call_resume_pc,
             first_jit_pc_by_py_pc,
+            block_head_py_by_jit_pc,
             depth_at_py_pc: depth_at_pc,
+            depth_by_jit_pc,
+            pcdep_by_jit_pc,
+            depth_pred_by_jit_pc,
+            depth_trivia_marker_by_jit_pc,
+            depth_trivia_pred_by_jit_pc,
             result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,
@@ -12645,6 +12804,7 @@ impl CodeWriter {
             max_stackdepth: code.max_stackdepth as usize,
             pcdep_color_slots,
             const_ref_slots_at_pc,
+            is_drained: true,
         };
 
         PyJitCode::from_parts(
