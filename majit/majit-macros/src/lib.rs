@@ -321,24 +321,27 @@ fn emit_helper_call_target_fn(
     // naming keeps it off the user-facing surface.
     let vis = &func.vis;
     let helper_name = &func.sig.ident;
+    // An `unsafe fn` helper must be called inside an `unsafe` block from the
+    // generated `extern "C"` trampoline; a safe helper is called bare (an
+    // `unsafe` wrapper there would be an unused-unsafe warning).
+    let call_expr = if func.sig.unsafety.is_some() {
+        quote! { unsafe { #helper_name(#(#converted_args),*) } }
+    } else {
+        quote! { #helper_name(#(#converted_args),*) }
+    };
     let wrapper = match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
             #[allow(non_snake_case)]
             #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) {
-                #helper_name(#(#converted_args),*);
+                #call_expr;
             }
         },
         HelperCallKind::Int | HelperCallKind::Ref => {
             let ReturnType::Type(_, ty) = &func.sig.output else {
                 return Ok(None);
             };
-            let Some(converted_return) = helper_return_to_i64(
-                quote! {
-                    #helper_name(#(#converted_args),*)
-                },
-                ty,
-            ) else {
+            let Some(converted_return) = helper_return_to_i64(call_expr.clone(), ty) else {
                 return Ok(None);
             };
             quote! {
@@ -357,15 +360,10 @@ fn emit_helper_call_target_fn(
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
-                    #helper_name(#(#converted_args),*)
+                    #call_expr
                 }
             };
-            let Some(concrete_return) = helper_return_to_i64(
-                quote! {
-                    #helper_name(#(#converted_args),*)
-                },
-                ty,
-            ) else {
+            let Some(concrete_return) = helper_return_to_i64(call_expr.clone(), ty) else {
                 return Ok(None);
             };
             let concrete_wrapper = quote! {

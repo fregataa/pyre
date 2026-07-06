@@ -860,18 +860,29 @@ pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(
     }
 }
 
-fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
+/// Allocate and initialise a heap `W_DictObject`.
+///
+/// Dispatches the thread-local GC allocation hook (`try_gc_alloc` /
+/// `try_gc_alloc_stable`) the tracer cannot model, falling back to
+/// `lltype::malloc_typed` (`NewWithVtable`); the JIT residualises the
+/// call instead of tracing into it (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the `box_str_constant` / `try_gc_add_root` twin.
+#[majit_macros::dont_look_inside]
+pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
     let raw = if stable {
-        crate::gc_hook::try_gc_alloc_stable(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+        crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
     } else {
         crate::gc_hook::try_gc_alloc(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+            .filter(|p| !p.is_null())
+            .unwrap_or(std::ptr::null_mut())
     };
-    match raw.filter(|p| !p.is_null()) {
-        Some(raw) => unsafe {
+    if !raw.is_null() {
+        unsafe {
             std::ptr::write(raw as *mut W_DictObject, value);
             raw as PyObjectRef
-        },
-        None => crate::lltype::malloc_typed(value) as PyObjectRef,
+        }
+    } else {
+        crate::lltype::malloc_typed(value) as PyObjectRef
     }
 }
 
@@ -1035,6 +1046,14 @@ pub fn w_module_dict_new() -> PyObjectRef {
 /// `ns` on a local miss.  Used by `dict_storage_to_dict` so source
 /// modules surface as W_ModuleDictObject while the frame-side
 /// `PyFrame.w_globals = *mut DictStorage` carrier still works.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+/// the body performs an unported `lltype::malloc_typed` NewWithVtable
+/// (`W_ModuleDictObject`) that survives `fuse_boxing_alloc` unfused, so
+/// the JIT residualises the whole call to a stable runtime fnaddr
+/// instead of tracing the allocation.  The `-> PyObjectRef` result is a
+/// plain GCREF with no discriminant to erase.
+#[majit_macros::dont_look_inside]
 pub fn w_module_dict_new_with_storage_proxy(ns: *mut u8) -> PyObjectRef {
     let strategy = crate::lltype::malloc_raw(crate::celldict::ModuleDictStrategy::new());
     let storage = unsafe { crate::lltype::malloc_raw((*strategy).get_empty_storage()) };

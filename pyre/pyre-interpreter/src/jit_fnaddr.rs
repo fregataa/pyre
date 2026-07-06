@@ -435,6 +435,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::gc_roots::shadow_stack_get",
+        "pyre_object::shadow_stack_get",
+        pyre_object::gc_roots::shadow_stack_get as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::typeobject::w_type_set_uses_object_setattr",
         "pyre_object::w_type_set_uses_object_setattr",
         crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
@@ -461,6 +467,74 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::pin_root",
         pyre_object::gc_roots::pin_root as *const (),
     );
+    // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY`
+    // bit, `box_str_constant` reads the TLS `STRING_CONSTANT_CACHE`, and
+    // `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — all through
+    // state the tracer cannot model (the `pin_root` / `try_gc_write_barrier`
+    // twins).  Their `#[dont_look_inside]` calls bind the Rust `fn` directly
+    // by qualified path (`-> ()` / pointer / `-> bool` signatures are
+    // JIT-representable).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_roots::mark_prebuilt_roots_dirty",
+        "pyre_object::mark_prebuilt_roots_dirty",
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::unicodeobject::box_str_constant",
+        "pyre_object::box_str_constant",
+        pyre_object::unicodeobject::box_str_constant as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_add_root",
+        "pyre_object::try_gc_add_root",
+        pyre_object::gc_hook::try_gc_add_root as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_remove_root",
+        "pyre_object::try_gc_remove_root",
+        pyre_object::gc_hook::try_gc_remove_root as *const (),
+    );
+    // #346: four direct `malloc_typed` (`NewWithVtable`) roots residualised
+    // via `#[dont_look_inside]`; each binds both the qualified module path and
+    // the glob-re-exported root alias. `function_new_impl` lives in this crate
+    // so it binds through `crate::`.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::bytesobject::w_bytes_from_bytes",
+        "pyre_object::w_bytes_from_bytes",
+        pyre_object::bytesobject::w_bytes_from_bytes as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::alloc_dict_object",
+        "pyre_object::alloc_dict_object",
+        pyre_object::dictmultiobject::alloc_dict_object as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy",
+        "pyre_object::w_module_dict_new_with_storage_proxy",
+        pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::function::function_new_impl",
+        "pyre_interpreter::function_new_impl",
+        crate::function::function_new_impl as *const (),
+    );
+    // #346: null-collapsing stable-alloc primitive residualised via
+    // `#[dont_look_inside]`, keeping the thread-local GC hook dispatch out of
+    // the trace.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_alloc_stable_raw",
+        "pyre_object::try_gc_alloc_stable_raw",
+        pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
+    );
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::dereference",
@@ -470,6 +544,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::objspace::std::mapdict::_obj_setdict",
         crate::objspace::std::mapdict::_obj_setdict as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::std::mapdict::_obj_getdict",
+        crate::objspace::std::mapdict::_obj_getdict as *const (),
     );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic and
     // `longobject::bigint_gc_type_id` reads the init-assigned `BIGINT_GC_TYPE_ID`

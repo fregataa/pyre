@@ -78,6 +78,20 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
     GC_ALLOC_STABLE_HOOK.with(|cell| cell.get().map(|f| f(type_id, payload_size)))
 }
 
+/// Null-collapsing view of [`try_gc_alloc_stable`] for JIT-traced callers.
+///
+/// Returns `null` both when no hook is installed and when the hook itself
+/// returned `null`; every traced caller already treats those two cases
+/// identically (fall back to `malloc_typed`), so the `Option` discriminant
+/// carries no information the caller reads.  Residualising this primitive
+/// (`@dont_look_inside`, `rlib/jit.py:139`) keeps the thread-local hook
+/// dispatch out of the trace — a `*mut u8` return has no discriminant to
+/// erase, unlike the `Option<*mut u8>` accessor.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+    try_gc_alloc_stable(type_id, payload_size).unwrap_or(core::ptr::null_mut())
+}
+
 thread_local! {
     static GC_ALLOC_COLLECTING_HOOK: Cell<Option<GcAllocHookFn>> = const { Cell::new(None) };
 }
@@ -345,7 +359,10 @@ pub fn clear_gc_root_hooks() {
 /// # Safety
 /// Caller must keep `slot` valid until [`try_gc_remove_root`] is
 /// called with the same pointer.
-#[inline]
+// `dont_look_inside`: host hook dispatch (`thread_local!` `Cell`
+// indirection) stays opaque to the JIT — the `try_gc_write_barrier`
+// twin; calls residualize via the registered fnaddr (`rlib/jit.py:139`).
+#[majit_macros::dont_look_inside]
 pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
     GC_ADD_ROOT_HOOK.with(|cell| match cell.get() {
         Some(f) => {
@@ -358,7 +375,10 @@ pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
 
 /// Remove a previously-registered root via the installed callback.
 /// Returns `true` when the callback was invoked.
-#[inline]
+// `dont_look_inside`: host hook dispatch (`thread_local!` `Cell`
+// indirection) stays opaque to the JIT — the `try_gc_add_root` twin;
+// calls residualize via the registered fnaddr (`rlib/jit.py:139`).
+#[majit_macros::dont_look_inside]
 pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
     GC_REMOVE_ROOT_HOOK.with(|cell| match cell.get() {
         Some(f) => {
