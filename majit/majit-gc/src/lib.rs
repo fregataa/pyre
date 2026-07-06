@@ -12,6 +12,7 @@ use majit_ir::{Const, ConstMap, GcRef, Op};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;
+pub mod gc_sync;
 pub mod gcreftracer;
 pub mod header;
 pub mod nursery;
@@ -576,6 +577,203 @@ pub trait GcAllocator: Send {
     /// TYPE_INFO entry (gctypelayout.py:642). Default `None`.
     fn typeid_is_object(&self, _typeid: u32) -> Option<bool> {
         None
+    }
+}
+
+/// Forwarding handle to the process-global GC singleton via `gc_sync`.
+///
+/// Every method routes through `gc_sync::gc_op` (mutex-guarded) or
+/// `gc_sync::gc_query`. No raw pointer — synchronisation is structural.
+/// Per-thread backend TLS stores `Box<GcHandle>` as `Box<dyn GcAllocator>`,
+/// so the ~45 trampoline functions per backend keep their existing
+/// `RefCell<Option<Box<dyn GcAllocator>>>` access pattern unchanged.
+///
+/// # Thread safety
+///
+/// All `&mut self` methods acquire `gc_sync::gc_mutex` internally.
+/// Concurrent calls from different threads serialise correctly.
+/// Collection uses STW safepoint protocol (`gc_sync::request_stw`).
+/// See gh#396 for the full free-threading GC design.
+pub struct GcHandle;
+
+// GcHandle is a zero-size marker; Send is trivially safe.
+unsafe impl Send for GcHandle {}
+
+impl GcAllocator for GcHandle {
+    fn alloc_nursery(&mut self, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_nursery(size))
+    }
+    fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_nursery_typed(type_id, size))
+    }
+    fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_nursery_no_collect(size))
+    }
+    fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_varsize(base_size, item_size, length))
+    }
+    fn alloc_varsize_typed(
+        &mut self,
+        type_id: u32,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_varsize_typed(type_id, base_size, item_size, length))
+    }
+    fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_nursery_no_collect_typed(type_id, size))
+    }
+    fn alloc_varsize_no_collect(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_varsize_no_collect(base_size, item_size, length))
+    }
+    fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_oldgen_typed(type_id, size))
+    }
+    fn charge_memory_pressure(&mut self, bytes: usize) {
+        gc_sync::gc_op(|gc| gc.charge_memory_pressure(bytes))
+    }
+    fn charge_oldgen_external(&mut self, obj_addr: usize, bytes: usize) {
+        gc_sync::gc_op(|gc| gc.charge_oldgen_external(obj_addr, bytes))
+    }
+    fn write_barrier(&mut self, obj: GcRef) {
+        gc_sync::gc_op(|gc| gc.write_barrier(obj))
+    }
+    fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
+        gc_sync::gc_op(|gc| gc.jit_remember_young_pointer_from_array(obj))
+    }
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        obj: GcRef,
+        index: usize,
+        card_page_shift: u32,
+    ) {
+        gc_sync::gc_op(|gc| gc.remember_young_pointer_from_array2(obj, index, card_page_shift))
+    }
+    fn collect_nursery(&mut self) {
+        gc_sync::gc_op(|gc| gc.collect_nursery())
+    }
+    fn collect_full(&mut self) {
+        gc_sync::gc_op(|gc| gc.collect_full())
+    }
+    fn collect_oldgen_nonmoving(&mut self) {
+        gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
+    }
+    fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
+        gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
+    }
+    fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
+        gc_sync::gc_query(|gc| gc.get_write_barrier_descr())
+    }
+    unsafe fn add_root(&mut self, root: *mut GcRef) {
+        gc_sync::gc_op(|gc| unsafe { gc.add_root(root) })
+    }
+    fn remove_root(&mut self, root: *mut GcRef) {
+        gc_sync::gc_op(|gc| gc.remove_root(root))
+    }
+    fn is_managed_heap_object(&self, addr: usize) -> bool {
+        gc_sync::gc_query(|gc| gc.is_managed_heap_object(addr))
+    }
+    fn nursery_free(&self) -> *mut u8 {
+        gc_sync::gc_query(|gc| gc.nursery_free())
+    }
+    fn nursery_free_addr(&self) -> usize {
+        gc_sync::gc_query(|gc| gc.nursery_free_addr())
+    }
+    fn nursery_top(&self) -> *const u8 {
+        gc_sync::gc_query(|gc| gc.nursery_top())
+    }
+    fn nursery_top_addr(&self) -> usize {
+        gc_sync::gc_query(|gc| gc.nursery_top_addr())
+    }
+    fn max_nursery_object_size(&self) -> usize {
+        gc_sync::gc_query(|gc| gc.max_nursery_object_size())
+    }
+    fn card_page_shift(&self) -> u32 {
+        gc_sync::gc_query(|gc| gc.card_page_shift())
+    }
+    fn jit_remember_young_pointer(&mut self, obj: GcRef) {
+        gc_sync::gc_op(|gc| gc.jit_remember_young_pointer(obj))
+    }
+    fn can_optimize_cond_call(&self) -> bool {
+        gc_sync::gc_query(|gc| gc.can_optimize_cond_call())
+    }
+    fn gc_step(&mut self) -> bool {
+        gc_sync::gc_op(|gc| gc.gc_step())
+    }
+    fn jit_free(&mut self, code_ptr: usize, size: usize) {
+        gc_sync::gc_op(|gc| gc.jit_free(code_ptr, size))
+    }
+    fn pin(&mut self, obj: GcRef) -> bool {
+        gc_sync::gc_op(|gc| gc.pin(obj))
+    }
+    fn unpin(&mut self, obj: GcRef) {
+        gc_sync::gc_op(|gc| gc.unpin(obj))
+    }
+    fn is_pinned(&self, obj: GcRef) -> bool {
+        gc_sync::gc_query(|gc| gc.is_pinned(obj))
+    }
+    fn register_type(&mut self, info: trace::TypeInfo) -> u32 {
+        gc_sync::gc_op(|gc| gc.register_type(info))
+    }
+    fn type_count(&self) -> usize {
+        gc_sync::gc_query(|gc| gc.type_count())
+    }
+    fn heap_byte_stats(&self) -> (usize, usize) {
+        gc_sync::gc_query(|gc| gc.heap_byte_stats())
+    }
+    fn collection_counts(&self) -> (usize, usize) {
+        gc_sync::gc_query(|gc| gc.collection_counts())
+    }
+    fn type_alloc_is_plain(&self, type_id: u32) -> bool {
+        gc_sync::gc_query(|gc| gc.type_alloc_is_plain(type_id))
+    }
+    fn type_size(&self, type_id: u32) -> Option<usize> {
+        gc_sync::gc_query(|gc| gc.type_size(type_id))
+    }
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        gc_sync::gc_query(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+    }
+    fn register_vtable_for_type(&mut self, vtable: usize, type_id: u32) {
+        gc_sync::gc_op(|gc| gc.register_vtable_for_type(vtable, type_id))
+    }
+    fn freeze_types(&mut self) {
+        gc_sync::gc_op(|gc| gc.freeze_types())
+    }
+    fn supports_guard_gc_type(&self) -> bool {
+        gc_sync::gc_query(|gc| gc.supports_guard_gc_type())
+    }
+    fn check_is_object(&self, gcref: GcRef) -> bool {
+        gc_sync::gc_query(|gc| gc.check_is_object(gcref))
+    }
+    fn can_move(&self, gcref: GcRef) -> bool {
+        gc_sync::gc_query(|gc| gc.can_move(gcref))
+    }
+    fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
+        gc_sync::gc_query(|gc| gc.get_translated_info_for_typeinfo())
+    }
+    fn get_translated_info_for_guard_is_object(&self) -> (usize, u8) {
+        gc_sync::gc_query(|gc| gc.get_translated_info_for_guard_is_object())
+    }
+    fn subclassrange_min_offset(&self) -> usize {
+        gc_sync::gc_query(|gc| gc.subclassrange_min_offset())
+    }
+    fn subclass_range(&self, classptr: usize) -> Option<(i64, i64)> {
+        gc_sync::gc_query(|gc| gc.subclass_range(classptr))
+    }
+    fn typeid_subclass_range(&self, typeid: u32) -> Option<(i64, i64)> {
+        gc_sync::gc_query(|gc| gc.typeid_subclass_range(typeid))
+    }
+    fn get_actual_typeid(&self, gcref: GcRef) -> Option<u32> {
+        gc_sync::gc_query(|gc| gc.get_actual_typeid(gcref))
+    }
+    fn typeid_is_object(&self, typeid: u32) -> Option<bool> {
+        gc_sync::gc_query(|gc| gc.typeid_is_object(typeid))
     }
 }
 
