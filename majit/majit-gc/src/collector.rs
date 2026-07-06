@@ -35,11 +35,10 @@ pub struct GcConfig {
 /// env.py:17-36 `_read_float_and_factor_from_env`. Parse `varname` as a float
 /// with an optional `k`/`m`/`g` size suffix (optionally followed by `b`/`B`),
 /// returning `(value, factor)`. `None` mirrors PyPy's `(0.0, 0)` absent /
-/// unparseable result, which callers treat as "unset".  A non-finite parse
-/// (`inf`/`nan`/overflow, which `f64::from_str` accepts but `float`+`r_uint`
-/// does not survive — `int(inf)`/`r_uint(inf)` raise) is treated as unset too,
-/// so callers fall back to the default instead of computing a `usize::MAX`
-/// byte count.
+/// unparseable result, which callers treat as "unset". `float(realvalue)`
+/// accepts `inf`/`nan`, so this parser passes them through unchanged;
+/// non-finite handling happens at the `int`/`r_uint` conversion sites, as
+/// upstream where `int(inf)`/`r_uint(inf)` raise.
 fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     let raw = std::env::var(varname).ok()?;
     let mut value = raw.trim();
@@ -60,7 +59,7 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
         Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
         _ => (value, 1.0),
     };
-    let parsed = number.parse::<f64>().ok().filter(|v| v.is_finite())?;
+    let parsed = number.parse::<f64>().ok()?;
     Some((parsed, factor))
 }
 
@@ -69,10 +68,12 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
 /// fall back to the default, mirroring PyPy's `if x > 0` guards. PyPy's
 /// `read_uint_from_env` r_uint-wraps a negative product to a huge positive; pyre
 /// treats non-positive as unset, differing only on nonsensical negative input.
+/// A non-finite product is treated as unset too: `int(inf)`/`r_uint(inf)` raise
+/// upstream, so we fall back to the default instead of a `usize::MAX` byte count.
 fn read_uint_from_env(varname: &str) -> Option<usize> {
     let (value, factor) = read_float_and_factor_from_env(varname)?;
     let bytes = value * factor;
-    (bytes > 0.0).then_some(bytes as usize)
+    (bytes.is_finite() && bytes > 0.0).then_some(bytes as usize)
 }
 
 /// env.py:46-50 `read_float_from_env`: the plain float, but only when no size
@@ -169,16 +170,62 @@ fn get_total_memory_darwin(result: i64) -> f64 {
     }
 }
 
-/// env.py:117-127 `get_total_memory`. Total physical memory in bytes.
-/// macOS reads `hw.memsize` via `sysctl`; other platforms return the
-/// addressable size (env.py:126-127 "XXX implement me for other platforms";
-/// the Linux `/proc/meminfo` probe, env.py:70-98, is not yet ported).
+/// env.py:70-98 `get_total_memory_linux`. Read `/proc/meminfo`, parse the
+/// `MemTotal:` line (kB) into a byte count, then clamp: fall back to the
+/// addressable size on read/parse failure (`result < 0.0`) and cap it at the
+/// addressable size otherwise. The `< 0.0` failure sentinel — NOT the darwin
+/// `<= 0` — must be kept (a probed `MemTotal: 0` is degenerate but not the
+/// "probe failed" marker).
+#[cfg(target_os = "linux")]
+fn get_total_memory_linux(filename: &str) -> f64 {
+    let mut result = -1.0_f64;
+    // env.py:74-80 `os.read(fd, 4096)`: `MemTotal:` is always the first line
+    // of `/proc/meminfo`, so the first 4 KiB always contain it.
+    if let Ok(buf) = std::fs::read(filename) {
+        let buf = &buf[..buf.len().min(4096)];
+        let prefix = b"MemTotal:";
+        if buf.starts_with(prefix) {
+            // env.py:83 `_skipspace`: advance past ' ' / '\t' after the prefix.
+            let mut start = prefix.len();
+            while start < buf.len() && (buf[start] == b' ' || buf[start] == b'\t') {
+                start += 1;
+            }
+            // env.py:85-86: take the leading ASCII-digit run.
+            let mut stop = start;
+            while stop < buf.len() && buf[stop].is_ascii_digit() {
+                stop += 1;
+            }
+            if start < stop {
+                let digits = std::str::from_utf8(&buf[start..stop]).unwrap_or("");
+                if let Ok(kb) = digits.parse::<f64>() {
+                    result = kb * 1024.0; // env.py:88 assume kB
+                }
+            }
+        }
+    }
+    if result < 0.0 {
+        ADDRESSABLE_SIZE
+    } else {
+        result.min(ADDRESSABLE_SIZE)
+    }
+}
+
+/// env.py:113-127 `get_total_memory`. Total physical memory in bytes.
+/// Linux reads `/proc/meminfo`; macOS reads `hw.memsize` via `sysctl`. The
+/// FreeBSD `hw.usermem` probe (env.py:121-123) is not ported (like
+/// `get_l2cache` non-macOS), so every other platform returns the addressable
+/// size (env.py:125-127).
+#[cfg(target_os = "linux")]
+fn get_total_memory() -> f64 {
+    get_total_memory_linux("/proc/meminfo")
+}
+
 #[cfg(target_os = "macos")]
 fn get_total_memory() -> f64 {
     get_total_memory_darwin(get_darwin_sysctl_signed(b"hw.memsize\0"))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn get_total_memory() -> f64 {
     ADDRESSABLE_SIZE
 }
@@ -269,13 +316,14 @@ struct IncrementalMarkState {
     /// Mirrors incminimark's `gc_increment_step`, which defaults to
     /// `nursery_size * 2`.
     mark_budget_per_step: usize,
-    /// Reusable scratch buffer for `mark_object`: the child refs of the
-    /// object currently being traced. Reused (cleared, capacity retained)
-    /// across calls so marking does not heap-allocate a fresh `Vec` per
-    /// object. RPython's `_collect_obj` visitor pushes straight onto the gray
-    /// stack; pyre collects into this buffer first to release the immutable
-    /// `self.types` borrow before mutating `self.incr_state.gray_stack`.
-    mark_scratch: Vec<GcRef>,
+    /// Reusable buffer for `mark_object`: the FIXED-part GC pointer offsets of
+    /// the object currently being traced (bounded by the struct's field count),
+    /// copied out so the immutable `self.types` borrow is released before
+    /// greying (which mutates `self.incr_state.gray_stack`). RPython's
+    /// `_collect_obj` visitor pushes straight onto the gray stack; pyre copies
+    /// only the small fixed offsets and streams variable-part items one at a
+    /// time, so a large varsize GC-pointer array is never retained here.
+    mark_offsets: Vec<usize>,
 }
 
 impl IncrementalMarkState {
@@ -285,7 +333,7 @@ impl IncrementalMarkState {
             marking_in_progress: false,
             objects_marked: 0,
             mark_budget_per_step: (nursery_size.saturating_mul(2)).max(1),
-            mark_scratch: Vec::new(),
+            mark_offsets: Vec::new(),
         }
     }
 }
@@ -1730,80 +1778,90 @@ impl MiniMarkGC {
         GcHeader::SIZE + payload_size
     }
 
+    /// Grey one child reference: if it is a managed, not-yet-visited heap
+    /// object, set VISITED and push it onto the gray stack. The
+    /// `is_managed_heap_object` guard mirrors `seed_major_root`: a
+    /// `Ptr(GcStruct)` field can transiently point at memory outside the
+    /// GC-managed heap during the L1/L2 stepping-stone state (e.g.
+    /// `W_TupleObject.wrappeditems` → `std::alloc`'d ItemsBlock). In that
+    /// window calling `header_of` on the field would dereference memory before
+    /// the std::alloc'd block. Upstream RPython `_collect_obj`
+    /// (incminimark.py:2739-2752) does not need this guard because RPython's
+    /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
+    /// away once every `gc_ptr_offsets` target is a real GC allocation.
+    fn grey_child(&mut self, addr: usize) {
+        if self.is_managed_heap_object(addr) {
+            let hdr = unsafe { header_of(addr) };
+            if unsafe { !(*hdr).has_flag(flags::VISITED) } {
+                unsafe { (*hdr).set_flag(flags::VISITED) };
+                self.incr_state.gray_stack.push(addr);
+                self.note_nonmoving_nursery_mark(addr);
+            }
+        }
+    }
+
     /// Mark a single object: trace its GC pointer fields and push
     /// unmarked children onto the gray stack.
     fn mark_object(&mut self, obj_addr: usize) {
-        // Collect the object's child refs into the reused scratch buffer
-        // while `type_info` borrows `self.types`, then release that borrow
-        // before greying them (which mutates `self.incr_state.gray_stack`).
-        let mut scratch = std::mem::take(&mut self.incr_state.mark_scratch);
-        scratch.clear();
-
+        // Copy the trace descriptors out of the borrowed `type_info` so the
+        // `self.types` borrow is released before greying (which mutates
+        // `self.incr_state.gray_stack`). Each child is then streamed straight
+        // to the gray stack — as RPython `_collect_obj` does — so a large
+        // varsize GC-pointer array is never buffered (the gray stack already
+        // retains the live children); only the bounded fixed-field offsets are
+        // copied into the reused `mark_offsets` buffer.
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
-        let type_info = self.types.get(type_id);
+        let custom_trace;
+        let (item_size, length_offset, fixed_size, items_have_gc_ptrs);
+        let mut offsets = std::mem::take(&mut self.incr_state.mark_offsets);
+        offsets.clear();
+        {
+            let type_info = self.types.get(type_id);
+            custom_trace = type_info.custom_trace;
+            item_size = type_info.item_size;
+            length_offset = type_info.length_offset;
+            fixed_size = type_info.size;
+            items_have_gc_ptrs = type_info.items_have_gc_ptrs;
+            if custom_trace.is_none() {
+                offsets.extend_from_slice(&type_info.gc_ptr_offsets);
+            }
+        }
 
         // custom_trace_hook parity for major GC marking.
-        if let Some(trace_fn) = type_info.custom_trace {
+        if let Some(trace_fn) = custom_trace {
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
                     if !field_ref.is_null() {
-                        scratch.push(field_ref);
+                        self.grey_child(field_ref.0);
                     }
                 });
             }
         } else {
-            // Trace fixed-part fields. The `is_managed_heap_object` guard
-            // (applied below) mirrors the `custom_trace` path and
-            // `seed_major_root`: a `Ptr(GcStruct)` field can transiently
-            // point at memory outside the GC-managed heap during the L1/L2
-            // stepping-stone state (e.g. `W_TupleObject.wrappeditems` →
-            // `std::alloc`'d ItemsBlock). In that window calling `header_of`
-            // on the field would dereference memory before the std::alloc'd
-            // block. Upstream RPython `_collect_obj`
-            // (incminimark.py:2739-2752) does not need this guard because
-            // RPython's type system guarantees every `Ptr(GcStruct)` is
-            // GC-managed; it converges away once every gc_ptr_offsets target
-            // is a real GC allocation.
-            for &offset in &type_info.gc_ptr_offsets {
+            // Fixed-part fields (count bounded by the struct's GC field count).
+            for &offset in &offsets {
                 let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
                 if !field_ref.is_null() {
-                    scratch.push(field_ref);
+                    self.grey_child(field_ref.0);
                 }
             }
-
-            // Trace variable-part items. Same `is_managed_heap_object`
-            // guard as the fixed-part loop — `items_have_gc_ptrs` blocks
-            // (e.g. `ItemsBlock` once it migrates to GC varsize) may
-            // transiently coexist with std::alloc'd siblings during the
-            // L1/L2 stepping-stone window.
-            if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
-                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
-                let items_start = obj_addr + type_info.size;
-                let item_size = type_info.item_size;
+            // Variable-part items: streamed one at a time, never buffered, so a
+            // large GC-managed pointer array does not double the marking-side
+            // peak memory or retain that capacity for the collector's lifetime.
+            if items_have_gc_ptrs && item_size > 0 {
+                let length = unsafe { *((obj_addr + length_offset) as *const usize) };
+                let items_start = obj_addr + fixed_size;
                 for i in 0..length {
                     let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
                     if !field_ref.is_null() {
-                        scratch.push(field_ref);
+                        self.grey_child(field_ref.0);
                     }
                 }
             }
         }
 
-        // `type_info` borrow ends here; now grey the collected children.
-        for &field_ref in &scratch {
-            if self.is_managed_heap_object(field_ref.0) {
-                let hdr = unsafe { header_of(field_ref.0) };
-                if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                    unsafe { (*hdr).set_flag(flags::VISITED) };
-                    self.incr_state.gray_stack.push(field_ref.0);
-                    self.note_nonmoving_nursery_mark(field_ref.0);
-                }
-            }
-        }
-
-        // Return the buffer (with its capacity) for the next object.
-        self.incr_state.mark_scratch = scratch;
+        // Return the (small) offsets buffer for reuse.
+        self.incr_state.mark_offsets = offsets;
     }
 
     /// incminimark.py:1793-1799 + :2461-2470 — final snapshot-at-the-beginning

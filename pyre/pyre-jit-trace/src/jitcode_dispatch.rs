@@ -2571,9 +2571,22 @@ fn compute_bridge_root_parent_frame(
     let resume_py_pc = root_pc as u32;
     // Null the not-yet-produced call-result slot before collecting the active
     // boxes (the reconstructed callee supplies it on `SubReturn`), mirroring
-    // `compute_inline_caller_frame`.  Operate on a clone of `registers_r` so
-    // `root_sym` stays a shared borrow.
-    let mut regs_r = root_sym.registers_r.clone();
+    // `compute_inline_caller_frame`.  Operate on a clone so `root_sym` stays a
+    // shared borrow.
+    //
+    // `collect_outer_active_boxes` reads the Ref bank by abstract register
+    // color (`_get_list_of_active_boxes`, pyjitpl.py:216-233), so it needs the
+    // color-indexed `f.registers_r` (`consume_boxes`, resume.py:1055), NOT the
+    // slot-indexed semantic mirror `setup_bridge_sym` left in
+    // `sym.registers_r`.  The mirror leaves an operand live across the resumed
+    // call (e.g. `t1` in `return fib(n-1)+fib(n-2)`) at `OpRef::NONE` under its
+    // color, which resolves to a NULL const and aborts the second residual
+    // call.  Prefer the persisted color decode; fall back to `registers_r` for
+    // non-bridge callers (`bridge_registers_r == None`).
+    let mut regs_r = root_sym
+        .bridge_registers_r
+        .clone()
+        .unwrap_or_else(|| root_sym.registers_r.clone());
     if let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index as i32, root_pc) {
         if result_color < regs_r.len() {
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
@@ -2899,9 +2912,80 @@ pub(crate) fn drive_outer_frame_continuation(
         regs_f[num_regs_f + i] = ctx.const_float(v);
     }
 
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let outer_jitcode_index = root_frame.jitcode_index;
+    let outer_active_boxes = root_frame.boxes.clone();
+
+    // Seed the full live outer-frame register file, matching `consume_boxes`
+    // (resume.py:1054-1055 + `_callback_i/_r/_f`) which fills every live
+    // register color of `framestack[-1]` from the resume numbering.  Without
+    // this only `frame_reg`/`call_dst_reg` are bound: an operand live across
+    // the resumed call (e.g. the first result of `return fib(n-1)+fib(n-2)`)
+    // stays `OpRef::NONE`, and the second residual call aborts with
+    // `ResidualCallArgUnbound`.
+    //
+    // `root_frame.boxes` already holds each live register's resolved box in
+    // `banks.int ++ banks.ref_ ++ banks.float` liveness order
+    // (`collect_outer_active_boxes`), applying the color->slot inversion the
+    // Ref bank needs.  Re-query the same (deterministic) liveness banks to
+    // recover each box's register color and scatter it into the color-indexed
+    // walker banks.  Only live colors are touched; dead slots stay
+    // `OpRef::NONE` so a later guard snapshot cannot capture a stale operand.
+    {
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            outer_jitcode_index as i32,
+            root_pc as i32,
+            majit_ir::resumedata::NO_JITCODE_PC,
+        );
+        let mut cursor = 0usize;
+        for &color in &banks.int {
+            let v = outer_active_boxes
+                .get(cursor)
+                .copied()
+                .unwrap_or(OpRef::NONE);
+            cursor += 1;
+            let c = color as usize;
+            if c < regs_i.len() && v != OpRef::NONE {
+                regs_i[c] = v;
+                if let Some(majit_ir::Value::Int(n)) = ctx.box_value(v) {
+                    concrete_i[c] = ConcreteValue::Int(n);
+                }
+            }
+        }
+        for &color in &banks.ref_ {
+            let v = outer_active_boxes
+                .get(cursor)
+                .copied()
+                .unwrap_or(OpRef::NONE);
+            cursor += 1;
+            let c = color as usize;
+            if c < regs_r.len() && v != OpRef::NONE {
+                regs_r[c] = v;
+                if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(v) {
+                    if ptr != 0 && ptr != usize::MAX {
+                        concrete_r[c] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+                    }
+                }
+            }
+        }
+        for &color in &banks.float {
+            let v = outer_active_boxes
+                .get(cursor)
+                .copied()
+                .unwrap_or(OpRef::NONE);
+            cursor += 1;
+            let c = color as usize;
+            if c < regs_f.len() && v != OpRef::NONE {
+                regs_f[c] = v;
+            }
+        }
+    }
+
     // Seed the standard virtualizable identity (frame) so the outer's vable
     // reads hit the standard fast path, and the delivered callee result into the
-    // outer's call-dst register (`make_result_of_lastop`).
+    // outer's call-dst register (`make_result_of_lastop`).  These overwrite the
+    // scattered snapshot values (the call-dst slot was nulled in
+    // `compute_bridge_root_parent_frame` for the not-yet-produced result).
     if frame_reg < regs_r.len() {
         regs_r[frame_reg] = frame_box;
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(frame_box) {
@@ -2914,10 +2998,6 @@ pub(crate) fn drive_outer_frame_continuation(
             concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
     }
-
-    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
-    let outer_jitcode_index = root_frame.jitcode_index;
-    let outer_active_boxes = root_frame.boxes.clone();
 
     let root_code = jc.code.as_slice();
     let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
@@ -6909,22 +6989,6 @@ const FBW_MAX_MULTIFRAME_DEPTH: usize = 1;
 /// Recursion depth of `w_code` on the FBW inline stack.
 fn fbw_inline_recursion_count(w_code: usize) -> usize {
     FBW_INLINE_CODE_STACK.with(|s| s.borrow().iter().filter(|&&c| c == w_code).count())
-}
-
-/// Bounded-recursion unroll depth for the self-recursive single-int callee.
-/// `PYRE_FBW_REC_UNROLL=<n>` inlines the first `n` recursion levels into the
-/// trace (mirroring `max_unroll_recursion`, `pyjitpl.py:1389-1416`) before
-/// folding the deeper tail to a recursive-portal `CALL_ASSEMBLER`, clamped to
-/// [`FBW_MAX_MULTIFRAME_DEPTH`] so every unrolled level keeps a valid multiframe
-/// resume snapshot.  Unset / `0` → `None` (disabled: the callee folds to a
-/// depth-0 CA tail, the prior behaviour).
-fn fbw_unroll_bound() -> Option<usize> {
-    let n: usize = std::env::var("PYRE_FBW_REC_UNROLL")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    (n > 0).then(|| n.min(FBW_MAX_MULTIFRAME_DEPTH))
 }
 
 thread_local! {
@@ -11937,17 +12001,10 @@ fn try_walker_inline_user_call(
             if fbw_carrier_resume() {
                 return Ok(None);
             }
-            // Bounded unroll (`pyjitpl.py:1389-1416`): inline the first `n`
-            // recursion levels into the trace, folding to the recursive-portal
-            // `CALL_ASSEMBLER` tail only once this callee is already `n` deep on
-            // the inline stack.  Disabled (`None`) keeps the depth-0 CA tail
-            // (fold every self-recursive call immediately).
-            match fbw_unroll_bound() {
-                Some(n) if fbw_inline_recursion_count(callee_code_key) < n => {
-                    // depth < n: fall through to the multiframe inline below.
-                }
-                _ => return Ok(None),
-            }
+            // A self-recursive single-int callee folds to the recursive-portal
+            // `CALL_ASSEMBLER` tail (`try_walker_call_assembler_self_recursive`),
+            // reached by returning `Ok(None)` here.
+            return Ok(None);
         }
     }
     // #68: under `PYRE_FBW_INLINE_MULTIFRAME`, a forward-branch-bearing callee
@@ -11962,11 +12019,7 @@ fn try_walker_inline_user_call(
     // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
     // a depth cap on the inline stack (the `n_parents == n_callees` valve in
     // the snapshot path is the real desync safety net).
-    // Bounded unroll drives the same multiframe inline path, so enabling the
-    // unroll (`PYRE_FBW_REC_UNROLL`) implies multiframe eligibility for the
-    // self-recursive callee whose depth-0..n-1 levels fell through above.
-    let multiframe_eligible =
-        !strict_inlinable && (fbw_inline_multiframe_enabled() || fbw_unroll_bound().is_some());
+    let multiframe_eligible = !strict_inlinable && fbw_inline_multiframe_enabled();
     let callee_frame_reg = if multiframe_eligible {
         crate::state::ensure_jitcode_index(callee_code_key as *const ())
             .map(|jc| crate::state::portal_red_regs_at(jc).0)

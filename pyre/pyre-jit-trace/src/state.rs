@@ -1974,6 +1974,27 @@ pub struct PyreSym {
     /// back to NONE, and so the full-body-walk argbox seed can recover the
     /// kept conditional-expression / short-circuit value (#124).
     pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
+    /// The color-indexed Ref register bank as `consume_boxes`
+    /// (resume.py:1055) fills `f.registers_r` — one box per abstract
+    /// register color the guard's resume numbering named. This is the
+    /// authoritative `_get_list_of_active_boxes` (pyjitpl.py:216-233)
+    /// source: it reads `registers_r[color]` by color at snapshot time.
+    ///
+    /// `sym.registers_r` diverges from this on the Ref bank: for the
+    /// tracer's own LOAD_FAST/STORE_FAST reads pyre needs a SEMANTIC
+    /// slot-indexed mirror (`[locals.., stack_tail..]`) because the
+    /// per-CodeObject regalloc colors a slot at a color other than its
+    /// slot index. `setup_bridge_sym` therefore overwrites
+    /// `sym.registers_r` with that mirror and `init_symbolic` rebuilds it
+    /// again from `bridge_local_oprefs`/`bridge_stack_oprefs`, so the
+    /// color-indexed decode is lost from `sym.registers_r`. The int/float
+    /// banks keep their color decode (init_symbolic rebuilds only the Ref
+    /// bank), so only Ref needs this side field. A cross-frame bridge
+    /// resume snapshot (`compute_bridge_root_parent_frame`) reads this to
+    /// recover an operand live across a resumed call (e.g. `t1` in
+    /// `return fib(n-1)+fib(n-2)`) that the semantic mirror does not carry
+    /// by color.
+    pub(crate) bridge_registers_r: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
     /// virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
     /// is a W_Root array → all items are Type::Ref. setup_bridge_sym
@@ -3803,6 +3824,7 @@ impl PyreSym {
             nlocals: 0,
             bridge_local_oprefs: None,
             bridge_stack_oprefs: None,
+            bridge_registers_r: None,
             bridge_local_types: None,
             vable_last_instr: OpRef::NONE,
             vable_pycode: OpRef::NONE,
@@ -5166,32 +5188,16 @@ fn rd_virtual_at(
     rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
 }
 
-/// P2 multi-frame bridge drain (`PYRE_P2_DRAIN`, default OFF): gates BOTH the
-/// `set_bridge_inline_carrier` decision and the `trace.rs` carrier drain. The
-/// carrier overrides the trace-start pc to the outermost frame's pc, which is
-/// only correct when the drain actually rebuilds + traces the reconstructed
-/// callee framestack forward; without the drain a carrier resume would resume
-/// the innermost frame at the root pc. Until the drain is net-positive the gate
-/// stays off so the bridge falls back to the single-frame resume.
+/// P2 multi-frame bridge drain (`PYRE_P2_DRAIN`, default OFF): gates the
+/// `trace.rs` carrier drain sub-walk+inject deviation. The carrier itself is
+/// installed for every `frames.len() > 1` resume (safety floor: a carrier routes
+/// a hot multi-frame guard to the `CarrierAbort` blackhole instead of the
+/// degenerate root-at-innermost-pc bridge); this gate only selects the drain
+/// driver over the default framestack path. Until the drain is net-positive the
+/// gate stays off so a carrier resume falls through to the framestack walk /
+/// clean abort.
 pub(crate) fn p2_drain_enabled() -> bool {
     std::env::var_os("PYRE_P2_DRAIN").is_some()
-}
-
-/// Shape A multi-frame bridge resume (`PYRE_P2_FRAMESTACK`, default OFF).
-/// Routes the multi-frame carrier to `drive_bridge_framestack_walk`, which
-/// reconstructs the deepest callee frame (`setup_reconstructed_callee_frame`)
-/// and sub-walks it, then aborts the trace cleanly instead of compiling the
-/// reconstruction bridge. The sub-walk specializes recursive calls to the
-/// captured base-case instance rather than folding them to a live
-/// `CALL_ASSEMBLER`, and the reconstructed-frame dst delivery does not line up
-/// with `make_result_of_lastop`, so compiling the bridge is unsound; the safe
-/// abort degrades multi-frame resumes to the interpreter with correct results.
-/// A faithful `rebuild_from_resumedata` (resume.py:1042) register-based rebuild
-/// with a continuous cross-frame forward walk is the walker-arch rework that
-/// makes compiling this bridge sound. Gated separately from `PYRE_P2_DRAIN` so
-/// the drain path and the OFF baseline stay byte-identical.
-pub(crate) fn p2_framestack_enabled() -> bool {
-    std::env::var_os("PYRE_P2_FRAMESTACK").is_some()
 }
 
 fn reconstruct_inline_recipe(
@@ -8190,6 +8196,13 @@ impl JitState for PyreJitState {
         // kept conditional-expression / short-circuit value.
         sym.bridge_stack_oprefs = Some(bridge_stack);
         sym.bridge_local_types = Some(bridge_local_types);
+        // consume_boxes (resume.py:1055) fills `f.registers_r` by abstract
+        // register color; keep that color-indexed decode so a cross-frame
+        // bridge resume snapshot can read `registers_r[color]`
+        // (`_get_list_of_active_boxes`, pyjitpl.py:216-233). `sym.registers_r`
+        // is about to be overwritten with the slot-indexed semantic mirror and
+        // then rebuilt by init_symbolic, losing this color decode.
+        sym.bridge_registers_r = Some(bridge_registers_r.clone());
 
         // pyjitpl.py:3424 `rebuild_state_after_failure` tail —
         // `consume_virtualref_boxes` (resume.py:1093):
@@ -8303,7 +8316,7 @@ impl JitState for PyreJitState {
                 resume_data.frames.len()
             );
         }
-        if (p2_drain_enabled() || p2_framestack_enabled()) && resume_data.frames.len() > 1 {
+        if resume_data.frames.len() > 1 {
             let root_pc_valid = resume_data.frames[0].pc >= 0;
             let root_pc = if root_pc_valid {
                 resume_data.frames[0].pc as usize
