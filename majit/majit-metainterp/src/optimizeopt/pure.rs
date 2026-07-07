@@ -320,6 +320,13 @@ pub struct OptPure {
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
+    /// One-shot arm for `CallPureOptimizationResult.callback()`
+    /// (pure.py). Set when `optimize_call_pure` demotes a CALL_PURE and
+    /// returns `Replace`; consumed in `propagate_postprocess` to append the
+    /// op's final `new_operations` index AFTER emission. RPython attaches the
+    /// callback to the specific result object; pyre dispatches postprocess
+    /// per pass, so a per-op flag stands in for that per-result binding.
+    pending_call_pure_position: bool,
     /// RPython pure.py / shortpreamble.py: pure ops that phase 2 should be
     /// able to reproduce from the preamble via optimizer state, not by
     /// textual body replay.
@@ -367,6 +374,7 @@ impl OptPure {
             postponed_op: None,
             postponed_box: None,
             call_pure_positions: Vec::new(),
+            pending_call_pure_position: false,
             short_preamble_pure_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
@@ -870,6 +878,11 @@ impl Optimization for OptPure {
             self.last_emitted_was_removed = false;
         }
 
+        // Clear any position arm the previous op left un-consumed: a demoted
+        // CALL removed by a downstream pass never reaches postprocess, so the
+        // one-shot could otherwise leak onto this op.
+        self.pending_call_pure_position = false;
+
         // pure.py: OVF operation postponement.
         // INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF are deferred until we see
         // GUARD_NO_OVERFLOW, so we can try CSE on the OVF op + guard pair.
@@ -1193,17 +1206,32 @@ impl Optimization for OptPure {
 
             let key = PureOpKey::from_call_op(op, start_index);
             self.cache.insert(key, op.pos.get());
-            self.call_pure_positions.push(ctx.new_operations.len());
+            // pure.py: `CallPureOptimizationResult.callback()` appends
+            // `len(_newoperations) - 1` AFTER `emit_result` has routed the op
+            // through the remaining optimizations. Recording it here (before
+            // the `Replace` routes through earlyforce/heap) is wrong: OptHeap
+            // flushes a postponed comparison op ahead of this call, so the
+            // pre-emit `len` would index that flushed op, not the call. Arm
+            // the one-shot instead and record the true index in
+            // `propagate_postprocess`, mirroring the callback's post-emit fire.
+            self.pending_call_pure_position = true;
+            // pure.py:225,227 route the emitted op through `self.emit`, i.e.
+            // the passes downstream of OptPure (earlyforce, heap). Returning
+            // `Replace` continues the op through those remaining passes, so
+            // OptHeap.emit() still runs — flushing any postponed comparison op
+            // ahead of this call. `Emit` would append the op terminally and
+            // skip OptHeap, stranding a postponed comparison whose result this
+            // call consumes past its own definition (regalloc def-after-use).
             if start_index == 0 {
                 // pure.py:222-225: replace CALL_PURE with CALL.
                 let new_op = self.demote_call_pure(op);
                 if !Self::call_pure_can_raise(op) {
                     self.short_preamble_pure_ops.push(new_op.clone());
                 }
-                return OptimizationResult::Emit(new_op);
+                return OptimizationResult::Replace(new_op);
             } else {
                 // pure.py:226-227: COND_CALL_VALUE is NOT demoted.
-                return OptimizationResult::Emit(op.clone());
+                return OptimizationResult::Replace(op.clone());
             }
         }
 
@@ -1216,6 +1244,7 @@ impl Optimization for OptPure {
         self.postponed_op = None;
         self.postponed_box = None;
         self.call_pure_positions.clear();
+        self.pending_call_pure_position = false;
         self.short_preamble_pure_ops.clear();
         self.last_emitted_was_removed = false;
         self.known_result_call_pure.clear();
@@ -1230,6 +1259,33 @@ impl Optimization for OptPure {
 
     fn name(&self) -> &'static str {
         "pure"
+    }
+
+    /// pure.py `CallPureOptimizationResult` — the demoted CALL / un-demoted
+    /// COND_CALL_VALUE carry a post-emit callback that records the call's
+    /// position. Only those two opcode families need postprocess here.
+    fn have_postprocess_op(&self, opcode: OpCode) -> bool {
+        opcode.is_real_call() || opcode.is_cond_call_value()
+    }
+
+    /// pure.py `CallPureOptimizationResult.callback`:
+    ///
+    /// ```text
+    /// self.opt.call_pure_positions.append(
+    ///     len(self.opt.optimizer._newoperations) - 1)
+    /// ```
+    ///
+    /// The callback fires after `emit_result` has routed the op through the
+    /// remaining optimizations (earlyforce, heap) and it has landed in
+    /// `_newoperations`, so `len - 1` is the call's final index — past any
+    /// postponed op OptHeap flushed ahead of it. The one-shot armed in
+    /// `optimize_call_pure` selects exactly the op this callback belongs to.
+    fn propagate_postprocess(&mut self, _op: &Op, ctx: &mut OptContext) {
+        if self.pending_call_pure_position {
+            self.pending_call_pure_position = false;
+            self.call_pure_positions
+                .push(ctx.new_operations.len().saturating_sub(1));
+        }
     }
 
     /// pure.py: produce_potential_short_preamble_ops(sb)
@@ -1820,6 +1876,7 @@ mod tests {
             postponed_op: None,
             postponed_box: None,
             call_pure_positions: Vec::new(),
+            pending_call_pure_position: false,
             short_preamble_pure_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
@@ -2760,9 +2817,11 @@ mod tests {
             ),
         ));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        // The demote routes the CALL through the remaining passes (Replace),
+        // mirroring RPython's `self.emit(newop)`, so OptHeap still processes it.
         match result {
-            OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
-            other => panic!("expected emitted demoted call, got {other:?}"),
+            OptimizationResult::Replace(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
+            other => panic!("expected demoted call routed via Replace, got {other:?}"),
         }
 
         // Deps are the call args (100, 0, 1); the call result (pos 2) is not a
