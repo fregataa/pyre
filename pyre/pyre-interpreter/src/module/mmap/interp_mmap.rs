@@ -9,13 +9,82 @@ use crate::DictStorage;
 // ──────────────────────────────────────────────────────────────────────
 // mmap module — PyPy: pypy/module/mmap/.
 //
-// The `mmap.mmap(fileno, length, ...)` class wraps libc::mmap directly.
-// Per-instance state lives in the instance dict: `_ptr` (raw pointer as
-// i64), `_len` (i64), `_pos` (i64 cursor), `_access` (int).  The
-// pointer is invalidated on close()/`__exit__` via munmap(2); leaking
-// it (e.g. GC drops the instance before close) is acceptable, matching
-// CPython behaviour.
+// `mmap.mmap(fileno, length, ...)` maps through `host_env::mmap`
+// (memmap2-based, cross-platform), not raw libc.  Per-instance state
+// lives in the instance dict: `_ptr` (mapping pointer as i64), `_len`
+// (i64), `_pos` (i64 cursor), `_access` (int), `_id` (registry key).
+// The mapping is invalidated on close()/`__exit__` by dropping the
+// registry entry (→ unmap); leaking it (e.g. GC drops the instance
+// before close) is acceptable, matching CPython behaviour.
 // ──────────────────────────────────────────────────────────────────────
+
+// host_env's `MappedFile` is an RAII handle (memmap2) that unmaps on Drop,
+// but pyre's mmap object keeps its state in a Python dict, which cannot own
+// a Rust value.  The live `MappedFile` is therefore parked in this
+// process-global table keyed by an id stashed in the instance dict (`_id`);
+// `_ptr`/`_len` mirror `MappedFile::as_ptr()`/len so every read/write path
+// stays a raw-pointer access.  close()/`__exit__`/resize drop or replace the
+// entry; a map dropped by GC without close leaks its entry, exactly as the
+// previous raw-pointer code leaked the mapping.
+#[cfg(unix)]
+use rustpython_host_env::mmap as host_mmap;
+
+#[cfg(unix)]
+static MMAP_REGISTRY: std::sync::Mutex<std::collections::BTreeMap<u64, host_mmap::MappedFile>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(unix)]
+static MMAP_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(unix)]
+fn mmap_registry_insert(m: host_mmap::MappedFile) -> (u64, *const u8, usize) {
+    let ptr = m.as_ptr();
+    let len = m.as_slice().len();
+    let id = MMAP_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MMAP_REGISTRY.lock().unwrap().insert(id, m);
+    (id, ptr, len)
+}
+
+#[cfg(unix)]
+fn mmap_registry_remove(id: u64) {
+    if id != 0 {
+        MMAP_REGISTRY.lock().unwrap().remove(&id);
+    }
+}
+
+#[cfg(unix)]
+fn mmap_registry_replace(id: u64, m: host_mmap::MappedFile) -> (*const u8, usize) {
+    let ptr = m.as_ptr();
+    let len = m.as_slice().len();
+    // Inserting over the same key drops the previous MappedFile → unmaps it.
+    MMAP_REGISTRY.lock().unwrap().insert(id, m);
+    (ptr, len)
+}
+
+#[cfg(unix)]
+fn mmap_registry_flush(id: u64, offset: usize, size: usize) -> std::io::Result<()> {
+    match MMAP_REGISTRY.lock().unwrap().get(&id) {
+        Some(m) => m.flush_range(offset, size),
+        None => Ok(()),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+fn mmap_registry_madvise(
+    id: u64,
+    start: usize,
+    length: usize,
+    advice: i32,
+) -> std::io::Result<()> {
+    match MMAP_REGISTRY.lock().unwrap().get(&id) {
+        Some(m) => m.madvise_range(start, length, advice),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn mmap_io_err(e: std::io::Error, ctx: &str) -> crate::PyError {
+    crate::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), ctx)
+}
 
 #[cfg(unix)]
 thread_local! {
@@ -169,11 +238,11 @@ fn init_mmap_type(ns: &mut DictStorage) {
             |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let p = mmap_get_attr_i64(obj, "_ptr") as usize;
-                let len = mmap_get_attr_i64(obj, "_len") as usize;
-                if p != 0 && len != 0 {
-                    let _ = unsafe { libc::munmap(p as *mut libc::c_void, len) };
+                if p != 0 {
+                    mmap_registry_remove(mmap_get_attr_i64(obj, "_id") as u64);
                     mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(0));
                     mmap_set_attr(obj, "_len", pyre_object::w_int_new(0));
+                    mmap_set_attr(obj, "_id", pyre_object::w_int_new(0));
                 }
                 Ok(pyre_object::w_none())
             },
@@ -191,12 +260,14 @@ fn init_mmap_type(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "closed",
                 |args| {
-                    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    // GetSetProperty fget callbacks receive (descriptor_self,
+                    // w_obj); the mmap instance is the second argument.
+                    let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
                     Ok(pyre_object::w_bool_from(
                         mmap_get_attr_i64(obj, "_ptr") == 0,
                     ))
                 },
-                1,
+                2,
             ),
             "closed",
         ),
@@ -500,13 +571,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             if off.checked_add(n).map(|s| s > len).unwrap_or(true) {
                 return Err(crate::PyError::value_error("flush range out of bounds"));
             }
-            let r = unsafe { libc::msync(p.add(off) as *mut libc::c_void, n, libc::MS_SYNC) };
-            if r != 0 {
-                return Err(crate::PyError::os_error_with_errno(
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                    "msync",
-                ));
-            }
+            let _ = p;
+            mmap_registry_flush(mmap_get_attr_i64(obj, "_id") as u64, off, n)
+                .map_err(|e| mmap_io_err(e, "msync"))?;
             Ok(pyre_object::w_none())
         }),
     );
@@ -635,11 +702,11 @@ fn init_mmap_type(ns: &mut DictStorage) {
         crate::make_builtin_function("__exit__", |args| {
             if let Some(&obj) = args.first() {
                 let p = mmap_get_attr_i64(obj, "_ptr") as usize;
-                let len = mmap_get_attr_i64(obj, "_len") as usize;
-                if p != 0 && len != 0 {
-                    let _ = unsafe { libc::munmap(p as *mut libc::c_void, len) };
+                if p != 0 {
+                    mmap_registry_remove(mmap_get_attr_i64(obj, "_id") as u64);
                     mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(0));
                     mmap_set_attr(obj, "_len", pyre_object::w_int_new(0));
+                    mmap_set_attr(obj, "_id", pyre_object::w_int_new(0));
                 }
             }
             Ok(pyre_object::w_bool_from(false))
@@ -870,19 +937,20 @@ fn init_mmap_type(ns: &mut DictStorage) {
                     "madvise: start or length out of range",
                 ));
             }
-            #[cfg(unix)]
+            let _ = p;
+            #[cfg(all(unix, not(target_os = "redox")))]
             {
-                let rc = unsafe { libc::madvise((p + start) as *mut libc::c_void, length, option) };
-                if rc != 0 {
-                    return Err(crate::PyError::os_error_with_errno(
-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                        "madvise",
-                    ));
-                }
+                mmap_registry_madvise(
+                    mmap_get_attr_i64(obj, "_id") as u64,
+                    start,
+                    length,
+                    option,
+                )
+                .map_err(|e| mmap_io_err(e, "madvise"))?;
             }
-            #[cfg(not(unix))]
+            #[cfg(not(all(unix, not(target_os = "redox"))))]
             {
-                let _ = (p, length, option);
+                let _ = (length, option);
             }
             Ok(pyre_object::w_none())
         }),
@@ -976,9 +1044,19 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 let fd = mmap_get_attr_i64(obj, "_fd") as libc::c_int;
                 let offset = mmap_get_attr_i64(obj, "_offset");
 
+                // host_env's `MappedFile` (memmap2) cannot mremap in place, so
+                // the Linux/Android resize re-creates the mapping at the new
+                // size and swaps the registry entry.  A file-backed map is
+                // re-mapped from the (ftruncated) fd; an anonymous map is
+                // remade and the surviving bytes copied.  The new mapping may
+                // land at a different address than an mremap would have, but
+                // that address is never exposed to Python, so the observable
+                // result is unchanged.  Platforms without mremap keep raising
+                // SystemError, matching PyPy's RValueError→SystemError.
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
-                    if fd >= 0 {
+                    let id = mmap_get_attr_i64(obj, "_id") as u64;
+                    let mapped = if fd >= 0 {
                         let r = unsafe {
                             libc::ftruncate(fd, (offset as libc::off_t) + newsize as libc::off_t)
                         };
@@ -988,23 +1066,24 @@ fn init_mmap_type(ns: &mut DictStorage) {
                                 "ftruncate",
                             ));
                         }
-                    }
-                    let newptr = unsafe {
-                        libc::mremap(
-                            p as *mut libc::c_void,
-                            old_len,
-                            newsize,
-                            libc::MREMAP_MAYMOVE,
-                        )
+                        let borrowed =
+                            unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+                        let (dup_fd, mapped) =
+                            host_mmap::map_file(borrowed, offset, newsize, host_mmap::AccessMode::Write)
+                                .map_err(|e| mmap_io_err(e, "mmap"))?;
+                        drop(dup_fd);
+                        mapped
+                    } else {
+                        let keep = old_len.min(newsize);
+                        let old = unsafe { std::slice::from_raw_parts(p, keep) }.to_vec();
+                        let mut mapped =
+                            host_mmap::map_anon(newsize).map_err(|e| mmap_io_err(e, "mmap"))?;
+                        mapped.as_mut_slice()[..keep].copy_from_slice(&old);
+                        mapped
                     };
-                    if newptr == libc::MAP_FAILED {
-                        return Err(crate::PyError::os_error_with_errno(
-                            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                            "mremap",
-                        ));
-                    }
+                    let (newptr, newlen) = mmap_registry_replace(id, mapped);
                     mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(newptr as usize as i64));
-                    mmap_set_attr(obj, "_len", pyre_object::w_int_new(newsize as i64));
+                    mmap_set_attr(obj, "_len", pyre_object::w_int_new(newlen as i64));
                     Ok(pyre_object::w_none())
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1096,12 +1175,12 @@ fn mmap_construct(
     let flags_arg = if args.len() >= 3 {
         (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
     } else {
-        libc::MAP_SHARED
+        host_mmap::MAP_SHARED
     };
     let prot_arg = if args.len() >= 4 {
         (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
     } else {
-        libc::PROT_READ | libc::PROT_WRITE
+        host_mmap::PROT_READ | host_mmap::PROT_WRITE
     };
     let access = if args.len() >= 5 {
         unsafe { pyre_object::w_int_get_value(args[4]) }
@@ -1114,37 +1193,50 @@ fn mmap_construct(
         0
     };
     let (flags, prot) = match access {
-        x if x == MMAP_ACCESS_READ => (libc::MAP_SHARED, libc::PROT_READ),
-        x if x == MMAP_ACCESS_WRITE => (libc::MAP_SHARED, libc::PROT_READ | libc::PROT_WRITE),
-        x if x == MMAP_ACCESS_COPY => (libc::MAP_PRIVATE, libc::PROT_READ | libc::PROT_WRITE),
+        x if x == MMAP_ACCESS_READ => (host_mmap::MAP_SHARED, host_mmap::PROT_READ),
+        x if x == MMAP_ACCESS_WRITE => {
+            (host_mmap::MAP_SHARED, host_mmap::PROT_READ | host_mmap::PROT_WRITE)
+        }
+        x if x == MMAP_ACCESS_COPY => {
+            (host_mmap::MAP_PRIVATE, host_mmap::PROT_READ | host_mmap::PROT_WRITE)
+        }
         _ => (flags_arg, prot_arg),
     };
-    // fileno == -1 → anonymous mapping.
+    // fileno == -1 → anonymous mapping.  host_env expresses the mapping as an
+    // `AccessMode` rather than raw prot/flags: a writable share maps as
+    // Write, a writable private map (MAP_PRIVATE) as Copy, and a
+    // non-writable map as Read.  This is exact for the ACCESS_* modes and the
+    // default read/write map; exotic low-level prot bits (PROT_EXEC/PROT_NONE)
+    // and placement flags (MAP_FIXED) collapse to the nearest mode.  `_access`
+    // still records the caller's original access argument, so repr() and the
+    // write-guard are unchanged.
     let real_fd = fd;
-    let final_flags = if real_fd == -1 {
-        flags | libc::MAP_ANON
+    let mapped = if real_fd == -1 {
+        host_mmap::map_anon(length).map_err(|e| mmap_io_err(e, "mmap"))?
     } else {
-        flags
+        let mode = if prot & host_mmap::PROT_WRITE != 0 {
+            if flags & host_mmap::MAP_PRIVATE != 0 {
+                host_mmap::AccessMode::Copy
+            } else {
+                host_mmap::AccessMode::Write
+            }
+        } else {
+            host_mmap::AccessMode::Read
+        };
+        let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(real_fd) };
+        let (dup_fd, mapped) = host_mmap::map_file(borrowed, offset, length, mode)
+            .map_err(|e| mmap_io_err(e, "mmap"))?;
+        // pyre keeps the caller's original fd for size()/resize(); the dup
+        // host_env made isn't needed once the mapping exists (the mapping
+        // survives fd close).
+        drop(dup_fd);
+        mapped
     };
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            length,
-            prot,
-            final_flags,
-            real_fd,
-            offset,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        return Err(crate::PyError::os_error_with_errno(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            "mmap",
-        ));
-    }
+    let (id, ptr, len) = mmap_registry_insert(mapped);
     let obj = pyre_object::w_instance_new(mmap_type());
     mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(ptr as usize as i64));
-    mmap_set_attr(obj, "_len", pyre_object::w_int_new(length as i64));
+    mmap_set_attr(obj, "_len", pyre_object::w_int_new(len as i64));
+    mmap_set_attr(obj, "_id", pyre_object::w_int_new(id as i64));
     mmap_set_attr(obj, "_pos", pyre_object::w_int_new(0));
     mmap_set_attr(obj, "_access", pyre_object::w_int_new(access));
     mmap_set_attr(obj, "_fd", pyre_object::w_int_new(real_fd as i64));
@@ -1161,26 +1253,29 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::dict_storage_store(ns, "error", w_os_error);
 
         // Constants.  CPython exposes both POSIX MAP_/PROT_/MADV_ and the
-        // Python ACCESS_* aliases.
+        // Python ACCESS_* aliases.  The portable subset sources from
+        // host_env's re-exports; the platform-specific extras host_env does
+        // not re-export (MAP_FIXED, the Linux-only MAP_* flags, PROT_NONE)
+        // stay on libc.
         crate::dict_storage_store(
             ns,
             "MAP_SHARED",
-            pyre_object::w_int_new(libc::MAP_SHARED as i64),
+            pyre_object::w_int_new(host_mmap::MAP_SHARED as i64),
         );
         crate::dict_storage_store(
             ns,
             "MAP_PRIVATE",
-            pyre_object::w_int_new(libc::MAP_PRIVATE as i64),
+            pyre_object::w_int_new(host_mmap::MAP_PRIVATE as i64),
         );
         crate::dict_storage_store(
             ns,
             "MAP_ANON",
-            pyre_object::w_int_new(libc::MAP_ANON as i64),
+            pyre_object::w_int_new(host_mmap::MAP_ANON as i64),
         );
         crate::dict_storage_store(
             ns,
             "MAP_ANONYMOUS",
-            pyre_object::w_int_new(libc::MAP_ANON as i64),
+            pyre_object::w_int_new(host_mmap::MAP_ANONYMOUS as i64),
         );
         crate::dict_storage_store(
             ns,
@@ -1223,17 +1318,17 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             "PROT_READ",
-            pyre_object::w_int_new(libc::PROT_READ as i64),
+            pyre_object::w_int_new(host_mmap::PROT_READ as i64),
         );
         crate::dict_storage_store(
             ns,
             "PROT_WRITE",
-            pyre_object::w_int_new(libc::PROT_WRITE as i64),
+            pyre_object::w_int_new(host_mmap::PROT_WRITE as i64),
         );
         crate::dict_storage_store(
             ns,
             "PROT_EXEC",
-            pyre_object::w_int_new(libc::PROT_EXEC as i64),
+            pyre_object::w_int_new(host_mmap::PROT_EXEC as i64),
         );
         crate::dict_storage_store(
             ns,
@@ -1255,27 +1350,27 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             "MADV_NORMAL",
-            pyre_object::w_int_new(libc::MADV_NORMAL as i64),
+            pyre_object::w_int_new(host_mmap::MADV_NORMAL as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_RANDOM",
-            pyre_object::w_int_new(libc::MADV_RANDOM as i64),
+            pyre_object::w_int_new(host_mmap::MADV_RANDOM as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_SEQUENTIAL",
-            pyre_object::w_int_new(libc::MADV_SEQUENTIAL as i64),
+            pyre_object::w_int_new(host_mmap::MADV_SEQUENTIAL as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_WILLNEED",
-            pyre_object::w_int_new(libc::MADV_WILLNEED as i64),
+            pyre_object::w_int_new(host_mmap::MADV_WILLNEED as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_DONTNEED",
-            pyre_object::w_int_new(libc::MADV_DONTNEED as i64),
+            pyre_object::w_int_new(host_mmap::MADV_DONTNEED as i64),
         );
 
         // Page-related constants (sys.PAGESIZE in CPython mmap module).

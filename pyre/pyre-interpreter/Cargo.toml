@@ -26,6 +26,9 @@ pyre-object = { workspace = true }
 pyre-macros = { workspace = true }
 pyre-native = { workspace = true }
 rustpython-wtf8 = { workspace = true }
+rustpython-literal = { workspace = true }
+rustpython-common = { workspace = true }
+rustpython-unicode = { workspace = true }
 majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
@@ -43,6 +46,8 @@ pyre-sandbox = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
 caseless = { workspace = true }
+base64 = { workspace = true }
+crc32fast = { workspace = true }
 indexmap = { workspace = true }
 paste = { workspace = true }
 unicode-xid = { workspace = true }

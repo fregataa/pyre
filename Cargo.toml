@@ -61,11 +61,16 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+# Pinned to upstream main, which now carries the rustpython-unicode crate,
+# the host_env mmap re-exports, and the float hash/format fixes (#8232).
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -146,6 +151,12 @@ sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
 blake2 = "0.10"
+# zlib backend (pyre-native only): zlib-rs is a pure-Rust zlib port whose
+# DEFLATE output is byte-identical to the reference C zlib.
+flate2 = { version = "1.1.9", default-features = false }
+# binascii transforms (pure-Rust logic).
+base64 = "0.22"
+crc32fast = "1.4"
 
 # math
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }

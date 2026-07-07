@@ -4952,9 +4952,10 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if is_str(obj) {
             let s = w_str_get_value(obj);
             // `float_from_string` strips PEP 515 underscore separators
-            // (between digits only) before parsing.
+            // (between digits only) before parsing; the numeric conversion
+            // uses the Python-literal float grammar.
             if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
-                if let Ok(v) = cleaned.parse::<f64>() {
+                if let Some(v) = rustpython_literal::float::parse_str(&cleaned) {
                     return Ok(floatobject::w_float_new(v));
                 }
             }
@@ -6313,240 +6314,61 @@ fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
 /// numeric values land on the same residue.
 const HASH_BITS: u32 = 61;
 const HASH_MODULUS: u64 = (1u64 << HASH_BITS) - 1;
-/// `floatobject.py:29-30` HASH_INF / HASH_NAN sentinels.
-const HASH_INF: i64 = 314159;
+/// `floatobject.py:29-30` HASH_NAN sentinel.
 const HASH_NAN: i64 = 0;
 
-/// `pypy/objspace/std/intobject.py:1231-1249 _hash_int` line-by-line
-/// port —
-///
-/// ```python
-/// def _hash_int(a):
-///     sign = 1 - ((a < 0) << 1)
-///     x = r_uint(a)
-///     x *= r_uint(sign)
-///     x = (x & HASH_MODULUS) + (x >> HASH_BITS)
-///     x -= HASH_MODULUS * (x >= HASH_MODULUS)
-///     h = intmask(intmask(x) * sign)
-///     return h - (h == -1)
-/// ```
-///
-/// `intmask` is "wrap-around to i64" on 64-bit RPython; Rust uses
-/// `as i64` for the same effect.  `-1` is the CPython-reserved "no
-/// hash" sentinel, so any natural hash producing `-1` is bumped to
-/// `-2`.
+/// Numeric hash of a machine-word integer: reduce `a` modulo the
+/// Mersenne prime `HASH_MODULUS = 2**61 - 1` (the residue keeps `a`'s
+/// sign) and bump a `-1` result to `-2`.  Delegated to
+/// `rustpython_common::hash`; `mod_int` is `value % HASH_MODULUS` and
+/// `fix_sentinel` is the `-1 -> -2` guard.  Shares the reduction with
+/// `_hash_long`, so `hash(42) == hash(2**100 + 42)`-class invariants
+/// hold.  `mod_int`/`fix_sentinel` are `const fn`, so this inlines to
+/// the same arithmetic the hand-rolled port produced.
 #[inline]
 pub(crate) fn _hash_int(a: i64) -> i64 {
-    let sign: i64 = 1 - (((a < 0) as i64) << 1);
-    // r_uint(a) * r_uint(sign) — multiply as u64 to compute |a|
-    // without UB on `a == i64::MIN`.  When a < 0, sign == -1 and
-    // (-1 as u64) == u64::MAX; the wrapping product yields the
-    // two's-complement negation of a, i.e. its absolute value.
-    let mut x = (a as u64).wrapping_mul(sign as u64);
-    x = (x & HASH_MODULUS) + (x >> HASH_BITS);
-    if x >= HASH_MODULUS {
-        x -= HASH_MODULUS;
-    }
-    let h = (x as i64).wrapping_mul(sign);
-    h - (h == -1) as i64
+    use rustpython_common::hash;
+    hash::fix_sentinel(hash::mod_int(a))
 }
 
-/// `pypy/objspace/std/longobject.py:468-494 _hash_long` line-by-line
-/// port:
-///
-/// ```python
-/// def _hash_long(v):
-///     i = v.numdigits() - 1
-///     if i == -1: return 0
-///     x = _load_unsigned_digit(0)
-///     while i >= 0:
-///         x = ((x << _HASH_SHIFT) & HASH_MODULUS) | (x >> (HASH_BITS - _HASH_SHIFT))
-///         x += v.udigit(i)
-///         if SHIFT > HASH_BITS:
-///             x = (x & HASH_MODULUS) + (x >> HASH_BITS)
-///         if x >= HASH_MODULUS:
-///             x -= HASH_MODULUS
-///         i -= 1
-///     h = intmask(intmask(x) * v.get_sign())
-///     return h - (h == -1)
-/// ```
-///
-/// PyPy's `rbigint` uses 31-bit digits (`SHIFT = 31`); Rust's
-/// `num_bigint::BigInt` exposes `iter_u32_digits()` so we use
-/// `SHIFT = 32`.  Since `HASH_MODULUS = 2^61 - 1` is a Mersenne
-/// prime, `value mod HASH_MODULUS` is independent of the digit
-/// base — `_hash_int(v) == _hash_long(BigInt::from(v))` for any
-/// `v` that fits in `i64`.
+/// Numeric hash of an arbitrary-precision integer: `value` reduced
+/// modulo the Mersenne prime `HASH_MODULUS = 2**61 - 1` (the residue
+/// keeps the sign), with a `-1` result bumped to `-2`.  Delegated to
+/// `rustpython_common::hash::hash_bigint`.  Because the modulus is a
+/// Mersenne prime the residue is independent of the digit base, so
+/// `_hash_int(v) == _hash_long(BigInt::from(v))` for any `v` that fits
+/// a machine word.
 #[inline]
 pub(crate) fn _hash_long(v: &BigInt) -> i64 {
-    let sign = match v.sign() {
-        malachite_bigint::Sign::Plus => 1i64,
-        malachite_bigint::Sign::Minus => -1i64,
-        malachite_bigint::Sign::NoSign => return 0, // numdigits == 0
-    };
-    // Walk digits from MSB to LSB.  `iter_u32_digits()` yields
-    // little-endian; collect + reverse so we mirror PyPy's loop.
-    let digits: Vec<u32> = v.iter_u32_digits().collect();
-    let mut x: u64 = 0;
-    const SHIFT: u32 = 32;
-    const HASH_SHIFT: u32 = SHIFT % HASH_BITS; // 32 — `SHIFT > HASH_BITS` arm reached later
-    for &d in digits.iter().rev() {
-        // x = ((x << HASH_SHIFT) & HASH_MODULUS) | (x >> (HASH_BITS - HASH_SHIFT))
-        let left = (x.wrapping_shl(HASH_SHIFT)) & HASH_MODULUS;
-        let right = if HASH_BITS > HASH_SHIFT {
-            x >> (HASH_BITS - HASH_SHIFT)
-        } else {
-            0
-        };
-        x = left | right;
-        x = x.wrapping_add(d as u64);
-        if SHIFT > HASH_BITS {
-            x = (x & HASH_MODULUS) + (x >> HASH_BITS);
-        }
-        if x >= HASH_MODULUS {
-            x -= HASH_MODULUS;
-        }
-    }
-    let h = (x as i64).wrapping_mul(sign);
-    h - (h == -1) as i64
+    rustpython_common::hash::hash_bigint(v)
 }
 
-/// `pypy/objspace/std/floatobject.py:790-822 _hash_float` line-by-line
-/// port:
-///
-/// ```python
-/// def _hash_float(v):
-///     if math.isinf(v): return HASH_INF if v > 0 else -HASH_INF
-///     # nan hash handled elsewhere (W_FloatObject.descr_hash routes to HASH_NAN)
-///     m, e = math.frexp(v)
-///     sign = 1
-///     if m < 0: sign = -1; m = -m
-///     x = r_uint(0)
-///     while m:
-///         x = ((x << 28) & HASH_MODULUS) | x >> (HASH_BITS - 28)
-///         m *= 268435456.0          # 2**28
-///         e -= 28
-///         y = r_uint(m)
-///         m -= y
-///         x += y
-///         if x >= HASH_MODULUS: x -= HASH_MODULUS
-///     e = e % HASH_BITS if e >= 0 else HASH_BITS - 1 - ((-1 - e) % HASH_BITS)
-///     x = ((x << e) & HASH_MODULUS) | x >> (HASH_BITS - e)
-///     x = intmask(intmask(x) * sign)
-///     x -= (x == -1)
-///     return x
-/// ```
-///
-/// For finite floats whose value is an integer that fits in `i64`,
-/// this returns the same value as `_hash_int(v as i64)` — that's the
-/// `hash(42) == hash(42.0)` invariant.  NaN is dispatched to
-/// `HASH_NAN` by the caller (PyPy's `W_FloatObject.descr_hash` does
-/// the NaN check before reaching `_hash_float`).
+/// Numeric hash of a `float`.  `rustpython_common::hash::hash_float`
+/// reduces the mantissa/exponent modulo the Mersenne prime
+/// `HASH_MODULUS = 2**61 - 1` (keeping the sign), so `hash(2.0) == hash(2)`
+/// and the `±inf` sentinels are `±314159`; subnormals decompose exactly.
+/// It returns `None` for NaN, and the sole caller (`hash_value`) reaches
+/// here without a prior NaN check, so map that to `HASH_NAN`.
 #[inline]
 pub(crate) fn _hash_float(v: f64) -> i64 {
-    if v.is_nan() {
-        return HASH_NAN;
-    }
-    if v.is_infinite() {
-        return if v > 0.0 { HASH_INF } else { -HASH_INF };
-    }
-    // For integral values that fit in i64, short-circuit to
-    // `_hash_int(v as i64)` so `hash(2.0) == hash(2)`.  The frexp
-    // walk below produces the same result, but the integer fast path
-    // avoids floating-point noise on already-integer inputs.
-    if v.fract() == 0.0 && (i64::MIN as f64) <= v && v <= (i64::MAX as f64) {
-        return _hash_int(v as i64);
-    }
-    let (mut m, mut e) = libm_frexp(v);
-    let mut sign: i64 = 1;
-    if m < 0.0 {
-        sign = -1;
-        m = -m;
-    }
-    let mut x: u64 = 0;
-    while m != 0.0 {
-        x = ((x.wrapping_shl(28)) & HASH_MODULUS) | (x >> (HASH_BITS - 28));
-        m *= 268435456.0; // 2**28
-        e -= 28;
-        let y = m as u64;
-        m -= y as f64;
-        x = x.wrapping_add(y);
-        if x >= HASH_MODULUS {
-            x -= HASH_MODULUS;
-        }
-    }
-    // `e = e % HASH_BITS if e >= 0 else HASH_BITS - 1 - ((-1 - e) % HASH_BITS)`
-    let e_mod: u32 = if e >= 0 {
-        (e as u32) % HASH_BITS
-    } else {
-        HASH_BITS - 1 - (((-1 - e) as u32) % HASH_BITS)
-    };
-    x = ((x.wrapping_shl(e_mod)) & HASH_MODULUS) | (x >> (HASH_BITS - e_mod));
-    let h = (x as i64).wrapping_mul(sign);
-    h - (h == -1) as i64
+    rustpython_common::hash::hash_float(v).unwrap_or(HASH_NAN)
 }
 
-/// Rust port of Python's `math.frexp(x) -> (mantissa, exponent)` where
-/// `x == mantissa * 2**exponent` and `0.5 <= |mantissa| < 1` (or both
-/// are 0).  `libm` isn't a workspace dep, so we use `f64::to_bits`
-/// to peek at the IEEE-754 exponent directly.
-#[inline]
-fn libm_frexp(v: f64) -> (f64, i32) {
-    if v == 0.0 || !v.is_finite() {
-        return (v, 0);
-    }
-    let bits = v.to_bits();
-    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
-    if raw_exp == 0 {
-        // Subnormal — normalise by multiplying with 2**54.
-        let (m, e) = libm_frexp(v * (1u64 << 54) as f64);
-        return (m, e - 54);
-    }
-    let exponent = raw_exp - 1022;
-    let mantissa_bits = (bits & !(0x7ffu64 << 52)) | (1022u64 << 52);
-    (f64::from_bits(mantissa_bits), exponent)
-}
-
-/// `pypy/objspace/std/tupleobject.py:358-401 descr_hash` line-by-line
-/// port — xxHash sequence hash (CPython 3.8+ tuple hash):
+/// `tupleobject.py:358-401 descr_hash` — the xxHash sequence hash, delegated
+/// to `rustpython_common::hash::hash_tuple`.  The caller has already computed
+/// each element's hash into `items`, so the fold is infallible here.
 ///
-/// ```python
-/// XXPRIME_1 = 0x9E3779B185EBCA87
-/// XXPRIME_2 = 0xC2B2AE3D27D4EB4F
-/// XXPRIME_5 = 0x27D4EB2F165667C5
-/// xxrotate = lambda x: (x << 31) | (x >> 33)
-///
-/// acc = XXPRIME_5
-/// for w_item in items:
-///     lane = space.hash_w(w_item)
-///     acc += lane * XXPRIME_2
-///     acc = xxrotate(acc)
-///     acc *= XXPRIME_1
-/// acc += len(items) ^ (XXPRIME_5 ^ 3527539)
-/// if acc == -1: acc = 1546275796 + 1
-/// return acc
-/// ```
-const XXPRIME_1: u64 = 11400714785074694791;
-const XXPRIME_2: u64 = 14029467366897019727;
-const XXPRIME_5: u64 = 2870177450012600261;
-
+/// The shared fold reproduces the accumulator loop and length mangle exactly.
+/// It also corrects the `acc == (uint)-1` sentinel: `tupleobject.py:403`
+/// computes `acc += (acc == -1) * (1546275796 + 1)`, so a wrapped `acc` of
+/// `-1` becomes `1546275796` — the value CPython's `tuplehash` also returns.
+/// The prior local port set the result to `1546275796 + 1` instead of adding
+/// to `acc`, an off-by-one in that (2**-64-probability) case; delegation fixes
+/// it.
 #[inline]
 fn _hash_tuple_xx(items: &[i64]) -> i64 {
-    let mut acc: u64 = XXPRIME_5;
-    for &lane in items {
-        acc = acc.wrapping_add((lane as u64).wrapping_mul(XXPRIME_2));
-        // xxrotate: rotate-left 31 bits.
-        acc = acc.rotate_left(31);
-        acc = acc.wrapping_mul(XXPRIME_1);
-    }
-    // Mangle in the length per `tupleobject.py:399`.
-    let n = items.len() as u64;
-    acc = acc.wrapping_add(n ^ (XXPRIME_5 ^ 3527539u64));
-    let mut h = acc as i64;
-    if h == -1 {
-        h = 1546275796 + 1;
-    }
-    h
+    rustpython_common::hash::hash_tuple(items.iter().map(|&h| Ok::<i64, ()>(h)))
+        .expect("element hashes are precomputed, so the fold cannot fail")
 }
 
 /// `pypy/objspace/std/unicodeobject.py:341-345 W_UnicodeObject.hash_w`
@@ -6575,6 +6397,11 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
 /// instead of panicking on the `&str` view.
 fn _hash_str(bytes: &[u8]) -> i64 {
     use core::hash::Hasher;
+    // Empty input hashes to 0 (`""` and `b""`), short-circuiting the
+    // siphash digest.
+    if bytes.is_empty() {
+        return 0;
+    }
     // `rpython/rlib/rsiphash.py:60-62 _build_key_from_seed` — when
     // `PYTHONHASHSEED=0` the key is the 16-byte all-zero buffer.
     // Pyre runs with the deterministic seed for reproducibility,
@@ -6582,6 +6409,12 @@ fn _hash_str(bytes: &[u8]) -> i64 {
     // user-overridable seed is straight-forward (`OnceLock<[u8; 16]>`
     // sampled from `getrandom` or the env var) once tests are
     // robust to it.
+    //
+    // Not delegated to `rustpython_common::hash::hash_str`: that path
+    // needs a `HashSecret`, whose all-zero key is un-constructable at
+    // the pinned rev (private `k0`/`k1`, only a seeded `new`), and it
+    // hashes through the slice `Hash` impl (length prefix) plus a
+    // `mod_int` reduction that this raw siphash24 digest omits.
     static SECRET: [u8; 16] = [0u8; 16];
     let mut hasher = siphasher::sip::SipHasher24::new_with_key(&SECRET);
     hasher.write(bytes);
@@ -6598,40 +6431,22 @@ pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
     _hash_str(bytes)
 }
 
-/// `pypy/objspace/std/setobject.py:623-642 W_FrozensetObject.descr_hash`
-/// line-by-line port:
+/// `setobject.py:623-642 W_FrozensetObject.descr_hash` — the order-independent
+/// XOR-fold, delegated to `rustpython_common::hash::FrozenSetHash`.  The caller
+/// has already computed each element's hash into `items`.
 ///
-/// ```python
-/// multi = r_uint(1822399083) + r_uint(1822399083) + 1
-/// hash = r_uint(1927868237)
-/// hash *= r_uint(self.length() + 1)
-/// for item in items:
-///     h = space.hash_w(item)
-///     value = (r_uint(h ^ (h << 16) ^ 89869747) * multi)
-///     hash = hash ^ value
-/// hash ^= (hash >> 11) ^ (hash >> 25)
-/// hash = hash * 69069 + 907133923
-/// hash = intmask(hash)
-/// if hash == -1: hash = 590923713
-/// return hash
-/// ```
+/// The shared accumulator is bit-identical: its `shuffle_bits`
+/// `((h ^ 89869747) ^ (h << 16)) * 3644798167` equals the port's
+/// `(h ^ (h << 16) ^ 89869747) * (1822399083 * 2 + 1)` (xor is associative;
+/// `3644798167 == 1822399083 * 2 + 1`), and the seed `(len + 1) * 1927868237`,
+/// the final dispersion, and the `-1 -> 590923713` sentinel all match.
 #[inline]
 fn _hash_frozenset(items: &[i64]) -> i64 {
-    let multi: u64 = 1822399083u64.wrapping_add(1822399083).wrapping_add(1);
-    let mut h: u64 = 1927868237;
-    h = h.wrapping_mul((items.len() as u64).wrapping_add(1));
+    let mut acc = rustpython_common::hash::FrozenSetHash::new(items.len());
     for &item_hash in items {
-        let item_u = item_hash as u64;
-        let v = (item_u ^ item_u.wrapping_shl(16) ^ 89869747u64).wrapping_mul(multi);
-        h ^= v;
+        acc.add(item_hash);
     }
-    h ^= (h >> 11) ^ (h >> 25);
-    h = h.wrapping_mul(69069).wrapping_add(907133923);
-    let mut hi = h as i64;
-    if hi == -1 {
-        hi = 590923713;
-    }
-    hi
+    acc.finish()
 }
 
 /// `pypy/objspace/std/objspace.py StdObjSpace.hash` parity — share one
@@ -8994,6 +8809,150 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The integer hashes now delegate to `rustpython_common::hash`
+    /// (`_hash_int` = `fix_sentinel(mod_int(a))`, `_hash_long` =
+    /// `hash_bigint`).  This locks the two crate entry points that reach
+    /// the same Mersenne reduction to one value across the machine-word
+    /// and big-integer ranges.
+    #[test]
+    fn common_hash_matches_pyre_int_helpers() {
+        use rustpython_common::hash;
+        let ints: [i64; 13] = [
+            0,
+            1,
+            -1,
+            42,
+            -42,
+            255,
+            i64::MAX,
+            i64::MIN,
+            HASH_MODULUS as i64,
+            HASH_MODULUS as i64 + 1,
+            (HASH_MODULUS as i64).wrapping_neg(),
+            1 << 40,
+            -(1 << 40),
+        ];
+        for &a in &ints {
+            assert_eq!(
+                hash::hash_bigint(&BigInt::from(a)),
+                _hash_int(a),
+                "hash_bigint vs _hash_int for {a}"
+            );
+        }
+        // -1 is the reserved sentinel, remapped to -2.
+        assert_eq!(_hash_int(-1), -2);
+        let bigs = [
+            BigInt::from(2).pow(100) + BigInt::from(42),
+            -(BigInt::from(2).pow(100)),
+            BigInt::from(2).pow(200) - BigInt::from(1),
+            BigInt::from(u128::MAX),
+            -BigInt::from(u128::MAX),
+        ];
+        for b in &bigs {
+            assert_eq!(
+                hash::hash_bigint(b),
+                _hash_long(b),
+                "hash_bigint vs _hash_long"
+            );
+        }
+    }
+
+    /// `_hash_float` delegates to `rustpython_common::hash::hash_float`,
+    /// which reproduces the reference `hash(5e-324) == 16777216` for
+    /// subnormals, the `hash(2.0) == hash(2)` integral invariant, and the
+    /// `±inf`/NaN sentinels.
+    #[test]
+    fn float_hash_delegates_to_common() {
+        use rustpython_common::hash;
+        // Subnormal reference point (the value that motivated the fix).
+        assert_eq!(_hash_float(f64::from_bits(1)), 16777216);
+        // Integral, zero, and sentinel reference points.
+        assert_eq!(_hash_float(2.0), 2);
+        assert_eq!(_hash_float(-1.0), -2);
+        assert_eq!(_hash_float(0.0), 0);
+        assert_eq!(_hash_float(-0.0), 0);
+        assert_eq!(_hash_float(f64::INFINITY), 314159);
+        assert_eq!(_hash_float(f64::NEG_INFINITY), -314159);
+        // NaN hashes to HASH_NAN here; common returns None for it.
+        assert_eq!(_hash_float(f64::NAN), HASH_NAN);
+        assert_eq!(hash::hash_float(f64::NAN), None);
+        // Differential battery of tricky finite floats: `_hash_float` must
+        // equal `Some(hash_float(f))` on every one.
+        let cases = [
+            0.0f64,
+            -0.0,
+            f64::from_bits(1), // smallest positive subnormal
+            -f64::from_bits(1),
+            5e-324,
+            1e-310,                  // subnormal
+            2.2250738585072014e-308, // smallest normal
+            0.1,
+            -0.1,
+            0.5,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            2.0,
+            3.14,
+            123.456,
+            9.999e15,
+            1e16,
+            1e20,
+            1e100,
+            1e308,
+            f64::MAX,
+            f64::MIN,
+            -123456789.123456789,
+            9.995,
+            268435456.0, // 2**28
+            1.7976931348623157e308,
+        ];
+        for &f in &cases {
+            assert_eq!(
+                Some(_hash_float(f)),
+                hash::hash_float(f),
+                "hash_float divergence for {f}"
+            );
+        }
+    }
+
+    /// Empty `str`/`bytes` hash to 0; non-empty inputs take the siphash
+    /// digest.
+    #[test]
+    fn empty_str_and_bytes_hash_to_zero() {
+        assert_eq!(_hash_str(b""), 0);
+        assert_eq!(hash_str_bytes(b""), 0);
+        assert_ne!(_hash_str(b"a"), 0);
+    }
+
+    /// Tuple and frozenset hashes delegate to `rustpython_common::hash`
+    /// (`hash_tuple` / `FrozenSetHash`).  Both fold only element hashes and are
+    /// seed-independent, so the values are fixed and match CPython 3.14.
+    /// `_hash_tuple_xx` / `_hash_frozenset` take the already-computed element
+    /// hashes; small ints hash to themselves and `hash(-1) == -2`.
+    #[test]
+    fn tuple_and_frozenset_hash_match_cpython() {
+        let h12 = _hash_tuple_xx(&[1, 2]);
+        let h34 = _hash_tuple_xx(&[3, 4]);
+        assert_eq!(_hash_tuple_xx(&[]), 5740354900026072187); // ()
+        assert_eq!(_hash_tuple_xx(&[1]), -6644214454873602895); // (1,)
+        assert_eq!(h12, -3550055125485641917); // (1, 2)
+        assert_eq!(_hash_tuple_xx(&[1, 2, 3]), 529344067295497451);
+        assert_eq!(_hash_tuple_xx(&[-2, 0, 1]), 5003556802939907908); // (-1, 0, 1)
+        assert_eq!(_hash_tuple_xx(&[h12, h34]), -1467267874458550984); // ((1,2), (3,4))
+        assert_eq!(_hash_tuple_xx(&[549755813930, -5]), 6589866070287121549); // (2**100+42, -5)
+
+        // Frozenset fold is order-independent (XOR), so element order is free.
+        let fs1 = _hash_frozenset(&[1]);
+        let fs2 = _hash_frozenset(&[2]);
+        assert_eq!(_hash_frozenset(&[]), 133146708735736); // frozenset()
+        assert_eq!(fs1, -558064481276695278); // frozenset({1})
+        assert_eq!(_hash_frozenset(&[1, 2, 3]), -272375401224217160);
+        assert_eq!(_hash_frozenset(&[-2, 0, 1]), 8868930259606097796); // {-1, 0, 1}
+        assert_eq!(_hash_frozenset(&[fs1, fs2]), 304806268181062474); // {fs{1}, fs{2}}
+    }
 
     #[test]
     fn test_hash_rejects_tuple_containing_unhashable_key() {
