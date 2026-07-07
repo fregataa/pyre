@@ -488,6 +488,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::unicodeobject::w_str_new",
+        "pyre_object::w_str_new",
+        pyre_object::unicodeobject::w_str_new as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::gc_hook::try_gc_add_root",
         "pyre_object::try_gc_add_root",
         pyre_object::gc_hook::try_gc_add_root as *const (),
@@ -522,6 +528,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::module::w_module_new_aliasing_dict",
+        "pyre_object::w_module_new_aliasing_dict",
+        pyre_object::module::w_module_new_aliasing_dict as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::function::function_new_impl",
         "pyre_interpreter::function_new_impl",
         crate::function::function_new_impl as *const (),
@@ -534,6 +546,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::gc_hook::try_gc_alloc_stable_raw",
         "pyre_object::try_gc_alloc_stable_raw",
         pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
+    );
+    // The interp-alloc boxing tail's two GC-hook toucher residuals: `note_alloc`
+    // bumps the runtime-mutable `ALLOC_SINCE_GC` atomic, and
+    // `try_gc_charge_oldgen_external` dispatches through a thread-local `Cell`.
+    // Neither is a build-time constant, so both carry `#[dont_look_inside]` and
+    // bind their `()`-returning `fn` directly by qualified path (siblings of
+    // `try_gc_alloc_stable_raw` / `gc_interp::enabled`).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_interp::note_alloc",
+        "pyre_object::note_alloc",
+        pyre_object::gc_interp::note_alloc as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_charge_oldgen_external",
+        "pyre_object::try_gc_charge_oldgen_external",
+        pyre_object::gc_hook::try_gc_charge_oldgen_external as *const (),
     );
     push_fnaddr(
         &mut entries,
@@ -580,6 +610,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_rem",
         crate::objspace::descroperation::jit_bigint_rem as *const (),
+    );
+    // `jit_bigint_div_floor` / `jit_bigint_mod_floor` residualize the
+    // `div_mod_floor()` tuple synth (`front::bigint_div_mod_floor`): the foreign
+    // malachite `div_mod_floor` returns a floored `(BigInt, BigInt)` the tracer
+    // models as a `__pos_0`/`__pos_1` tuple sourced from these two
+    // `#[dont_look_inside]` calls, bound by path.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_div_floor",
+        crate::objspace::descroperation::jit_bigint_div_floor as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
+        crate::objspace::descroperation::jit_bigint_mod_floor as *const (),
     );
     // `jit_bigint_{and,or,xor,sub,mul}` residualize the foreign BigInt binary
     // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
