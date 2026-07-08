@@ -657,10 +657,24 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
     let is_kwargs = unsafe {
         let last = *args.last().unwrap();
         pyre_object::is_dict(last)
-            && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+            && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__"))
+                .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
     };
     let (positional, start) = if is_kwargs {
         let kwargs = *args.last().unwrap();
+        // `prod(iterable, /, *, start=1)` — `start` is the only accepted
+        // keyword; any other is an unexpected-keyword TypeError.
+        for (k, _) in unsafe { pyre_object::w_dict_items(kwargs) } {
+            let name = unsafe { pyre_object::w_str_get_wtf8(k) };
+            match name.as_str() {
+                Ok("__pyre_kw__") | Ok("start") => {}
+                _ => {
+                    return Err(crate::PyError::type_error(format!(
+                        "prod() got an unexpected keyword argument '{name}'"
+                    )));
+                }
+            }
+        }
         let start_key = pyre_object::w_str_new("start");
         let start =
             unsafe { pyre_object::w_dict_lookup(kwargs, start_key) }.unwrap_or(w_int_new(1));

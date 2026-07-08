@@ -1546,10 +1546,26 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE)
     });
     namespace.get_or_insert_with("len", || {
-        make_module_builtin_function_with_arity("len", builtin_len, 1)
+        // operation.py `len(space, w_obj)` — one positional-only `obj`, so
+        // `len` no longer receives the `__pyre_kw__` marker dict and any
+        // keyword is rejected with "takes no keyword arguments".
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "len",
+            builtin_len,
+            1,
+            crate::gateway::Signature::new(vec!["obj"], None, None, 0, 1),
+        )
     });
     namespace.get_or_insert_with("abs", || {
-        make_module_builtin_function_with_arity("abs", builtin_abs, 1)
+        // operation.py `abs(space, w_val)` — one positional-only `val`, so
+        // `abs` no longer receives the `__pyre_kw__` marker dict and any
+        // keyword is rejected with "takes no keyword arguments".
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "abs",
+            builtin_abs,
+            1,
+            crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
+        )
     });
     namespace.get_or_insert_with("min", || make_module_builtin_function("min", builtin_min));
     namespace.get_or_insert_with("max", || make_module_builtin_function("max", builtin_max));
@@ -2212,10 +2228,26 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let is_kwargs = !args.is_empty()
         && unsafe {
             let last = *args.last().unwrap();
-            is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+            is_dict(last)
+                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
         };
     let (positional, end, sep, file, flush) = if is_kwargs {
         let kwargs = *args.last().unwrap();
+        // app_io.py print_ — the app-level signature is
+        // `(*args, sep, end, file, flush)`, so any other keyword is an
+        // unexpected-keyword TypeError.
+        for (k, _) in unsafe { pyre_object::w_dict_items(kwargs) } {
+            let name = unsafe { pyre_object::w_str_get_wtf8(k) };
+            match name.as_str() {
+                Ok("__pyre_kw__") | Ok("sep") | Ok("end") | Ok("file") | Ok("flush") => {}
+                _ => {
+                    return Err(crate::PyError::type_error(format!(
+                        "print() got an unexpected keyword argument '{name}'"
+                    )));
+                }
+            }
+        }
         let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("end")) };
         let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("sep")) };
         // The type check is up front; the str() rendering happens at write
@@ -2380,24 +2412,29 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "len() takes exactly one argument ({} given)",
-            args.len()
-        )));
+    // operation.py `len(space, w_obj)`.  The gateway Signature binds the keyword
+    // form at the call site, so `args` is positional only and never carries the
+    // `__pyre_kw__` marker: a single argument is `obj` (even a dict that holds
+    // the marker key), so index it directly.  A wrong positional count carries
+    // no single-dict value, so route it through the gateway for the faithful
+    // `_match_signature` arity error.
+    if let [obj] = args {
+        return crate::baseobjspace::len(*obj);
     }
-    crate::baseobjspace::len(args[0])
+    let obj = parse_single_required(args, "obj", "len")?;
+    crate::baseobjspace::len(obj)
 }
 
 /// `abs(x)` — return the absolute value of a number.
 pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "abs() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
-    let obj = args[0];
+    // operation.py `abs(space, w_val)`.  The gateway Signature binds the keyword
+    // form at the call site, so a single positional argument is `val` (even a
+    // dict holding the marker key); index it directly and route a wrong
+    // positional count through the gateway for the `_match_signature` arity error.
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "val", "abs")?,
+    };
     unsafe {
         if is_bool(obj) {
             return Ok(w_int_new(w_bool_get_value(obj) as i64));
@@ -2455,9 +2492,17 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// and the `__pyre_kw__` marker can be removed.
 pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if let Some(&last) = args.last() {
-        if unsafe {
-            is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
-        } {
+        // The marker dict stores an unforgeable sentinel under `__pyre_kw__`
+        // (`call_with_kwargs`), so detection is by value identity.  A dict
+        // passed positionally that merely contains a `__pyre_kw__` string key
+        // (`float({'__pyre_kw__': True})`) carries a different value and is a
+        // value, not the marker, so it must not be stripped.
+        let is_marker = unsafe {
+            is_dict(last)
+                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
+        };
+        if is_marker {
             return (&args[..args.len() - 1], Some(last));
         }
     }
@@ -2523,7 +2568,9 @@ pub(crate) fn kwarg_reject_unknown(
 /// CALL_KW builtin dispatch appends — i.e. the call carried keywords.
 pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
     matches!(args.last(), Some(&last) if unsafe {
-        is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+        is_dict(last)
+            && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
     })
 }
 
@@ -2616,6 +2663,45 @@ pub(crate) fn bind_builtin_kwargs(
         }
     }
     Ok(scope)
+}
+
+/// Resolve a builtin with a single required positional-or-keyword parameter
+/// through the gateway `parse_into_scope`, so the argument binds by name and
+/// the trailing `__pyre_kw__` marker dict never leaks as a value. Mirrors an
+/// `interp2app` function with `Signature([name])` (e.g. `operation.py`
+/// `abs(space, w_val)` / `len(space, w_obj)`): a missing argument, an unknown
+/// keyword, or a surplus positional raises the matching `_match_signature`
+/// TypeError.
+fn parse_single_required(
+    args: &[PyObjectRef],
+    name: &'static str,
+    fn_name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    // Fast path for the hot fixed-arity call (`len(x)` / `abs(x)`): one
+    // positional and no keywords binds directly, skipping the Signature /
+    // Arguments / scope allocation the general keyword and arity-error path
+    // needs.  Zero or surplus positionals, or any keyword, fall through so the
+    // `_match_signature` TypeError is still raised.
+    if kwargs.is_none() && positional.len() == 1 {
+        return Ok(positional[0]);
+    }
+    let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
+    let mut keywords_w: Vec<PyObjectRef> = Vec::new();
+    if let Some(dict) = kwargs {
+        for (key, val) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
+            if key.as_str() == Ok("__pyre_kw__") {
+                continue;
+            }
+            keyword_names_w.push(pyre_object::w_str_from_wtf8(key));
+            keywords_w.push(val);
+        }
+    }
+    let signature = crate::gateway::Signature::new(vec![name], None, None, 0, 0);
+    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let mut scope_w = vec![PY_NULL; signature.scope_length()];
+    arguments.parse_into_scope(PY_NULL, &mut scope_w, fn_name, &signature, None, PY_NULL)?;
+    Ok(scope_w[0])
 }
 
 /// Reject `f(x, name=...)` when `name` already arrived positionally.
@@ -4707,36 +4793,38 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 // intobject.py:1020-1023
                 return Err(crate::PyError::type_error(format!(
                     "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-                    unsafe { (*(*obj).ob_type).name }
+                    crate::type_methods::arg_type_name(obj)
                 )));
             }
             return ensure_baseint_result(w_obj, obj);
         }
-        // intobject.py:1026-1034: str
-        unsafe {
-            if is_str(obj) {
-                return parse_int_from_str(w_str_get_value(obj), 10);
-            }
-            // intobject.py:1035-1038: bytes / bytearray
-            if pyre_object::bytesobject::is_bytes_like(obj) {
-                let data = pyre_object::bytesobject::bytes_like_data(obj);
-                let s = String::from_utf8_lossy(data);
-                return parse_int_from_str(&s, 10);
-            }
+        // intobject.py:1047 — unicode is normalized through
+        // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
+        if unsafe { is_str(obj) } {
+            let s = unsafe { w_str_get_value(obj) };
+            return parse_int_from_str(&unicode_to_decimal(s), 10);
         }
-        // intobject.py:1040-1050: buffer interface fallback → TypeError
+        // intobject.py:1056-1070 — bytes / bytearray, then any object
+        // exposing a readable buffer (`space.charbuf_w`).
+        if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+            let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
+            let s = String::from_utf8_lossy(data);
+            return parse_int_from_str(&s, 10);
+        }
         return Err(crate::PyError::type_error(format!(
             "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-            unsafe { (*(*obj).ob_type).name }
+            crate::type_methods::arg_type_name(obj)
         )));
     }
 
     // intobject.py:1051-1072: w_base is not None — parse with base
     let base = getindex_w_for_base(w_base.unwrap())?;
     unsafe {
+        // intobject.py:1079 — unicode normalized through `unicode_to_decimal_w`.
         if is_str(obj) {
-            return parse_int_from_str(w_str_get_value(obj), base);
+            return parse_int_from_str(&unicode_to_decimal(w_str_get_value(obj)), base);
         }
+        // With an explicit base only str / bytes / bytearray are accepted.
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
             let s = String::from_utf8_lossy(data);
@@ -4830,6 +4918,32 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
         "int() second argument must be an integer, not '{}'",
         unsafe { (*(*w_obj).ob_type).name }
     )))
+}
+
+/// `unicodeobject.py unicode_to_decimal_w` — normalize a unicode string for
+/// numeric parsing: a non-ASCII decimal digit (`Numeric_Type=Decimal`)
+/// becomes its ASCII digit and non-ASCII whitespace becomes a space, so
+/// `int("４２")` and `float("١٫٥")`-style inputs parse.  An all-ASCII string
+/// is returned untouched.
+fn unicode_to_decimal(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.is_ascii() {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c as u32 > 127 {
+            if c.is_whitespace() {
+                out.push(' ');
+                continue;
+            }
+            if let Some(v) = crate::unicodedb::decimal_value(c) {
+                out.push((b'0' + v as u8) as char);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Parse an integer from a string with the given base.
@@ -4950,7 +5064,11 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             ));
         }
         if is_str(obj) {
-            let s = w_str_get_value(obj);
+            let raw = w_str_get_value(obj);
+            // floatobject.py:242 — unicode is normalized through
+            // `unicode_to_decimal_w` before `_string_to_float`, so non-ASCII
+            // decimal digits parse.
+            let s = unicode_to_decimal(raw);
             // `float_from_string` strips PEP 515 underscore separators
             // (between digits only) before parsing; the numeric conversion
             // uses the Python-literal float grammar.
@@ -4962,7 +5080,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             // `floatobject.py:descr_new` — message uses single-quoted str:
             // "could not convert string to float: '<s>'".
             return Err(crate::PyError::value_error(format!(
-                "could not convert string to float: '{s}'"
+                "could not convert string to float: '{raw}'"
             )));
         }
     }
@@ -4971,9 +5089,22 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__float__") } {
             let result = crate::call::call_function_impl_result(method, &[obj])?;
             unsafe {
-                // floatobject.py:228 — exact float check (no subclass support yet)
                 if is_float(result) {
-                    return Ok(result);
+                    // floatobject.py:228-238 — an exact float is returned as-is;
+                    // a strict subclass warns (deprecated) and is converted to a
+                    // base float value.
+                    if is_exact_type(result, &FLOAT_TYPE) {
+                        return Ok(result);
+                    }
+                    let value_type = crate::type_methods::arg_type_name(obj);
+                    let result_type = crate::type_methods::arg_type_name(result);
+                    crate::warn::warn_deprecation(&format!(
+                        "{value_type}.__float__ returned non-float (type {result_type}).  \
+                         The ability to return an instance of a strict subclass of \
+                         float is deprecated, and may be removed in a future version \
+                         of Python."
+                    ));
+                    return Ok(floatobject::w_float_new(w_float_get_value(result)));
                 }
             }
             // descroperation.py:891 — __float__ returned non-float (type '%T')
@@ -4996,9 +5127,28 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             )));
         }
     }
-    Err(crate::PyError::type_error(
-        "float() argument must be a string or a real number",
-    ))
+    // floatobject.py:247-255 — a readable buffer (`charbuf_w`: bytes /
+    // bytearray / array / memoryview) is decoded and parsed like a str; an
+    // unparseable value reprs as `b'...'` in the error (space.repr / `%R`).
+    if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
+        let decoded = String::from_utf8_lossy(data);
+        if let Some(cleaned) = strip_numeric_underscores(decoded.trim()) {
+            if let Ok(v) = cleaned.parse::<f64>() {
+                return Ok(floatobject::w_float_new(v));
+            }
+        }
+        let r = unsafe { crate::py_repr(obj)? };
+        return Err(crate::PyError::value_error(format!(
+            "could not convert string to float: {r}"
+        )));
+    }
+    // The message uses the modern "real number" wording (3.14) rather than
+    // the older "a number" phrasing.
+    Err(crate::PyError::type_error(format!(
+        "float() argument must be a string or a real number, not '{}'",
+        crate::type_methods::arg_type_name(obj)
+    )))
 }
 
 /// The attribute-name check mirroring `operation.py:41-45 checkattrname`
@@ -5216,11 +5366,12 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         if is_dict(src) {
             // PyPy: descr_init → shallow copy when first arg is a dict.
             // `dict(**kwargs)` reaches here with the `__pyre_kw__`-tagged
-            // kwargs vehicle as the source; the marker is an interp-level
-            // sentinel, never a real key, so drop it during the copy.
+            // kwargs vehicle as the source; its marker entry carries the
+            // unforgeable sentinel value, so drop that entry by identity — a
+            // real `__pyre_kw__` string key in a copied user dict is kept.
             let dict = w_dict_new();
             for (k, v) in pyre_object::w_dict_items(src) {
-                if is_str(k) && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__") {
+                if pyre_object::kw_marker::is_kw_marker_sentinel(v) {
                     continue;
                 }
                 w_dict_store(dict, k, v);
@@ -5242,28 +5393,20 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         }
         return Ok(dict);
     }
-    // Construct from iterable of (key, value) pairs.
+    // Construct from iterable of (key, value) pairs — dictmultiobject.py
+    // update1_pairs coerces each pair with `space.fixedview` (any 2-element
+    // iterable), not just tuple/list.
     let dict = w_dict_new();
     let items = collect_iterable(src)?;
-    for pair in items {
-        let (k, v) = unsafe {
-            if is_tuple(pair) && w_tuple_len(pair) == 2 {
-                (
-                    w_tuple_getitem(pair, 0).unwrap(),
-                    w_tuple_getitem(pair, 1).unwrap(),
-                )
-            } else if is_list(pair) && w_list_len(pair) == 2 {
-                (
-                    w_list_getitem(pair, 0).unwrap(),
-                    w_list_getitem(pair, 1).unwrap(),
-                )
-            } else {
-                return Err(crate::PyError::type_error(
-                    "dict update sequence element is not a 2-element sequence",
-                ));
-            }
-        };
-        unsafe { w_dict_store(dict, k, v) };
+    for (i, pair) in items.into_iter().enumerate() {
+        let elems = collect_iterable(pair)?;
+        if elems.len() != 2 {
+            return Err(crate::PyError::value_error(format!(
+                "dictionary update sequence element #{i} has length {}; 2 is required",
+                elems.len()
+            )));
+        }
+        unsafe { w_dict_store(dict, elems[0], elems[1]) };
     }
     Ok(dict)
 }
