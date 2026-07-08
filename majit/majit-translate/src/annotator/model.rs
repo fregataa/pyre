@@ -741,6 +741,206 @@ impl SomeObjectTrait for SomeUnicodeString {
     }
 }
 
+/// RPython `class SomeStringBuilder(SomeObject)` (`rlib/rstring.py:890`).
+///
+/// The annotator shape for a `StringBuilder()` value.  It carries no
+/// payload; its `method_*` annotations describe the builder call surface,
+/// and (once wired) the rtyper binds it to `StringBuilderRepr` via
+/// `rtyper_makerepr` (`rlib/rstring.py:919-921`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SomeStringBuilder {
+    pub base: SomeObject,
+}
+
+impl SomeStringBuilder {
+    pub fn new() -> Self {
+        SomeStringBuilder {
+            base: SomeObject::new(KnownType::Object, false),
+        }
+    }
+
+    /// `method_append(self, s_str)` (rstring.py:891-894) → `s_None`.
+    pub fn method_append(&self, s_str: &SomeValue) -> SomeValue {
+        assert!(
+            matches!(
+                s_str,
+                SomeValue::None_(_) | SomeValue::String(_) | SomeValue::Char(_)
+            ),
+            "StringBuilder.append expects str / char"
+        );
+        s_none()
+    }
+
+    /// `method_append_slice(self, s_str, s_start, s_end)`
+    /// (rstring.py:896-901) → `s_None`.
+    pub fn method_append_slice(
+        &self,
+        s_str: &SomeValue,
+        s_start: &SomeValue,
+        s_end: &SomeValue,
+    ) -> SomeValue {
+        assert!(matches!(s_str, SomeValue::None_(_) | SomeValue::String(_)));
+        assert!(matches!(s_start, SomeValue::Integer(_)));
+        assert!(matches!(s_end, SomeValue::Integer(_)));
+        s_none()
+    }
+
+    /// `method_append_multiple_char(self, s_char, s_times)`
+    /// (rstring.py:903-906) → `s_None`.
+    pub fn method_append_multiple_char(
+        &self,
+        s_char: &SomeValue,
+        s_times: &SomeValue,
+    ) -> SomeValue {
+        assert!(matches!(s_char, SomeValue::String(_) | SomeValue::Char(_)));
+        assert!(matches!(s_times, SomeValue::Integer(_)));
+        s_none()
+    }
+
+    /// `method_append_charpsize(self, s_ptr, s_size)`
+    /// (rstring.py:908-911) → `s_None`.
+    pub fn method_append_charpsize(&self, s_ptr: &SomeValue, s_size: &SomeValue) -> SomeValue {
+        assert!(matches!(s_ptr, SomeValue::Ptr(_)));
+        assert!(matches!(s_size, SomeValue::Integer(_)));
+        s_none()
+    }
+
+    /// `method_getlength(self)` (rstring.py:913-914) →
+    /// `SomeInteger(nonneg=True)`.
+    pub fn method_getlength(&self) -> SomeValue {
+        SomeValue::Integer(SomeInteger::new(true, false))
+    }
+
+    /// `method_build(self)` (rstring.py:916-917) →
+    /// `SomeString(can_be_None=False)`.
+    pub fn method_build(&self) -> SomeValue {
+        SomeValue::String(SomeString::new(false, false))
+    }
+}
+
+impl Default for SomeStringBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RPython `class SomeUnicodeBuilder(SomeObject)` (`rlib/rstring.py:930`).
+/// The `UnicodeBuilder()` mirror of [`SomeStringBuilder`]; the char /
+/// string arguments and `method_build` result are the unicode variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SomeUnicodeBuilder {
+    pub base: SomeObject,
+}
+
+impl SomeUnicodeBuilder {
+    pub fn new() -> Self {
+        SomeUnicodeBuilder {
+            base: SomeObject::new(KnownType::Object, false),
+        }
+    }
+
+    /// `method_append(self, s_str)` (rstring.py:931-934) → `s_None`.
+    pub fn method_append(&self, s_str: &SomeValue) -> SomeValue {
+        assert!(
+            matches!(
+                s_str,
+                SomeValue::None_(_) | SomeValue::UnicodeCodePoint(_) | SomeValue::UnicodeString(_)
+            ),
+            "UnicodeBuilder.append expects unicode / unichar"
+        );
+        s_none()
+    }
+
+    /// `method_append_slice(self, s_str, s_start, s_end)`
+    /// (rstring.py:936-941) → `s_None`.
+    pub fn method_append_slice(
+        &self,
+        s_str: &SomeValue,
+        s_start: &SomeValue,
+        s_end: &SomeValue,
+    ) -> SomeValue {
+        assert!(matches!(
+            s_str,
+            SomeValue::None_(_) | SomeValue::UnicodeString(_)
+        ));
+        assert!(matches!(s_start, SomeValue::Integer(_)));
+        assert!(matches!(s_end, SomeValue::Integer(_)));
+        s_none()
+    }
+
+    /// `method_append_multiple_char(self, s_char, s_times)`
+    /// (rstring.py:943-946) → `s_None`.
+    pub fn method_append_multiple_char(
+        &self,
+        s_char: &SomeValue,
+        s_times: &SomeValue,
+    ) -> SomeValue {
+        assert!(matches!(s_char, SomeValue::UnicodeCodePoint(_)));
+        assert!(matches!(s_times, SomeValue::Integer(_)));
+        s_none()
+    }
+
+    /// `method_append_charpsize(self, s_ptr, s_size)`
+    /// (rstring.py:948-951) → `s_None`.
+    pub fn method_append_charpsize(&self, s_ptr: &SomeValue, s_size: &SomeValue) -> SomeValue {
+        assert!(matches!(s_ptr, SomeValue::Ptr(_)));
+        assert!(matches!(s_size, SomeValue::Integer(_)));
+        s_none()
+    }
+
+    /// `method_getlength(self)` (rstring.py:953-954) →
+    /// `SomeInteger(nonneg=True)`.
+    pub fn method_getlength(&self) -> SomeValue {
+        SomeValue::Integer(SomeInteger::new(true, false))
+    }
+
+    /// `method_build(self)` (rstring.py:956-957) →
+    /// `SomeUnicodeString(can_be_None=False)`.
+    pub fn method_build(&self) -> SomeValue {
+        SomeValue::UnicodeString(SomeUnicodeString::new(false, false))
+    }
+}
+
+impl Default for SomeUnicodeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SomeObjectTrait for SomeStringBuilder {
+    fn knowntype(&self) -> KnownType {
+        KnownType::Object
+    }
+    fn immutable(&self) -> bool {
+        false
+    }
+    fn is_constant(&self) -> bool {
+        self.base.const_box.is_some()
+    }
+    fn can_be_none(&self) -> bool {
+        // upstream: default `SomeObject.can_be_none()` = True, no
+        // override on SomeStringBuilder.
+        true
+    }
+}
+
+impl SomeObjectTrait for SomeUnicodeBuilder {
+    fn knowntype(&self) -> KnownType {
+        KnownType::Object
+    }
+    fn immutable(&self) -> bool {
+        false
+    }
+    fn is_constant(&self) -> bool {
+        self.base.const_box.is_some()
+    }
+    fn can_be_none(&self) -> bool {
+        // upstream: default `SomeObject.can_be_none()` = True, no
+        // override on SomeUnicodeBuilder.
+        true
+    }
+}
+
 /// RPython `class SomeByteArray(SomeStringOrUnicode)`
 /// (model.py:304-306). Differs from its siblings in `immutable = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1955,6 +2155,8 @@ pub enum SomeValue {
     BuiltinMethod(SomeBuiltinMethod),
     WeakRef(SomeWeakRef),
     TypeOf(SomeTypeOf),
+    StringBuilder(SomeStringBuilder),
+    UnicodeBuilder(SomeUnicodeBuilder),
 }
 
 /// Discriminant-only view of [`SomeValue`]. Parity mirror of RPython's
@@ -1998,6 +2200,8 @@ pub enum SomeValueTag {
     BuiltinMethod,
     WeakRef,
     TypeOf,
+    StringBuilder,
+    UnicodeBuilder,
 }
 
 impl SomeValueTag {
@@ -2043,6 +2247,11 @@ impl SomeValueTag {
             T::Builtin => &[T::Builtin, T::Object],
             T::BuiltinMethod => &[T::BuiltinMethod, T::Object],
             T::WeakRef => &[T::WeakRef, T::Object],
+            // rlib/rstring.py SomeStringBuilder / SomeUnicodeBuilder are
+            // flat SomeObject subclasses; dispatch resolves to self then
+            // Object.
+            T::StringBuilder => &[T::StringBuilder, T::Object],
+            T::UnicodeBuilder => &[T::UnicodeBuilder, T::Object],
             // SomeImpossibleValue is the lattice bottom; it still
             // deserves an Object fallback so registries can bind
             // catch-all defaults keyed on Object.
@@ -2105,6 +2314,8 @@ impl SomeValue {
             SomeValue::BuiltinMethod(_) => T::BuiltinMethod,
             SomeValue::WeakRef(_) => T::WeakRef,
             SomeValue::TypeOf(_) => T::TypeOf,
+            SomeValue::StringBuilder(_) => T::StringBuilder,
+            SomeValue::UnicodeBuilder(_) => T::UnicodeBuilder,
         }
     }
 
@@ -2143,6 +2354,9 @@ impl SomeValue {
                 s.subset_of.clone(),
             ))),
             SomeValue::WeakRef(s) => Ok(SomeValue::WeakRef(SomeWeakRef::new(s.classdef.clone()))),
+            // rstring.py:1231/1271 — SomeStringBuilder / SomeUnicodeBuilder
+            // `noneify(self)` returns `self`.
+            SomeValue::StringBuilder(_) | SomeValue::UnicodeBuilder(_) => Ok(self.clone()),
             _ => Err(UnionError {
                 lhs: self.clone(),
                 rhs: s_none(),
@@ -2238,6 +2452,8 @@ impl SomeValue {
             SomeValue::BuiltinMethod(s) => s.base.const_box.as_ref(),
             SomeValue::WeakRef(s) => s.base.const_box.as_ref(),
             SomeValue::TypeOf(s) => s.base.const_box.as_ref(),
+            SomeValue::StringBuilder(s) => s.base.const_box.as_ref(),
+            SomeValue::UnicodeBuilder(s) => s.base.const_box.as_ref(),
         };
         cb.map(|c| &c.value)
     }
@@ -2285,6 +2501,8 @@ impl SomeValue {
             SomeValue::BuiltinMethod(s) => s.base.const_box = Some(c),
             SomeValue::WeakRef(s) => s.base.const_box = Some(c),
             SomeValue::TypeOf(s) => s.base.const_box = Some(c),
+            SomeValue::StringBuilder(s) => s.base.const_box = Some(c),
+            SomeValue::UnicodeBuilder(s) => s.base.const_box = Some(c),
         }
     }
 
@@ -2425,6 +2643,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.knowntype(),
             SomeValue::WeakRef(s) => s.knowntype(),
             SomeValue::TypeOf(s) => s.knowntype(),
+            SomeValue::StringBuilder(s) => s.knowntype(),
+            SomeValue::UnicodeBuilder(s) => s.knowntype(),
         }
     }
 
@@ -2462,6 +2682,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.immutable(),
             SomeValue::WeakRef(s) => s.immutable(),
             SomeValue::TypeOf(s) => s.immutable(),
+            SomeValue::StringBuilder(s) => s.immutable(),
+            SomeValue::UnicodeBuilder(s) => s.immutable(),
         }
     }
 
@@ -2499,6 +2721,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.is_constant(),
             SomeValue::WeakRef(s) => s.is_constant(),
             SomeValue::TypeOf(s) => s.is_constant(),
+            SomeValue::StringBuilder(s) => s.is_constant(),
+            SomeValue::UnicodeBuilder(s) => s.is_constant(),
         }
     }
 
@@ -2541,6 +2765,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.can_be_none(),
             SomeValue::WeakRef(s) => s.can_be_none(),
             SomeValue::TypeOf(s) => s.can_be_none(),
+            SomeValue::StringBuilder(s) => s.can_be_none(),
+            SomeValue::UnicodeBuilder(s) => s.can_be_none(),
         }
     }
 }
@@ -3259,6 +3485,8 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
         SomeValue::BuiltinMethod(v) => v.base.const_box = None,
         SomeValue::WeakRef(v) => v.base.const_box = None,
         SomeValue::TypeOf(v) => v.base.const_box = None,
+        SomeValue::StringBuilder(v) => v.base.const_box = None,
+        SomeValue::UnicodeBuilder(v) => v.base.const_box = None,
         // Impossible / PBC / None_ handled above (early-return).
         SomeValue::Impossible | SomeValue::PBC(_) | SomeValue::None_(_) => unreachable!(),
     }
@@ -5069,5 +5297,47 @@ mod tests {
         v.annotation.replace(Some(Rc::new(s.clone())));
         let got = v.annotation.borrow().as_ref().map(|rc| (**rc).clone());
         assert_eq!(got, Some(s));
+    }
+
+    /// rstring.py:913-917 — `SomeStringBuilder` getlength/build annotate to
+    /// `SomeInteger(nonneg=True)` and `SomeString(can_be_None=False)`.
+    #[test]
+    fn some_string_builder_method_annotations() {
+        let b = SomeStringBuilder::new();
+        match b.method_getlength() {
+            SomeValue::Integer(i) => assert!(i.nonneg),
+            other => panic!("getlength must be SomeInteger(nonneg), got {other:?}"),
+        }
+        match b.method_build() {
+            SomeValue::String(s) => assert!(!s.can_be_none()),
+            other => panic!("build must be SomeString(can_be_None=False), got {other:?}"),
+        }
+        assert!(matches!(
+            b.method_append(&SomeValue::String(SomeString::new(false, false))),
+            SomeValue::None_(_)
+        ));
+        assert!(matches!(b.method_getlength(), SomeValue::Integer(_)));
+    }
+
+    /// rstring.py:953-957 — `SomeUnicodeBuilder.build` annotates to
+    /// `SomeUnicodeString(can_be_None=False)`; getlength stays the nonneg
+    /// integer.
+    #[test]
+    fn some_unicode_builder_method_annotations() {
+        let b = SomeUnicodeBuilder::new();
+        match b.method_getlength() {
+            SomeValue::Integer(i) => assert!(i.nonneg),
+            other => panic!("getlength must be SomeInteger(nonneg), got {other:?}"),
+        }
+        match b.method_build() {
+            SomeValue::UnicodeString(s) => assert!(!s.can_be_none()),
+            other => panic!("build must be SomeUnicodeString(can_be_None=False), got {other:?}"),
+        }
+        assert!(matches!(
+            b.method_append(&SomeValue::UnicodeString(SomeUnicodeString::new(
+                false, false
+            ))),
+            SomeValue::None_(_)
+        ));
     }
 }

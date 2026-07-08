@@ -2835,6 +2835,12 @@ pub enum ReprKey {
     /// RPython `SomeInteriorPtr.rtyper_makekey = (self.__class__,
     /// self.ll_ptrtype)` (rptr.py:24). Same by-value lltype key as [`Ptr`].
     InteriorPtr(LowLevelType),
+    /// RPython `SomeStringBuilder.rtyper_makekey = (self.__class__,)`
+    /// (rstring.py:1228). Class-tag singleton.
+    StringBuilder,
+    /// RPython `SomeUnicodeBuilder.rtyper_makekey = (self.__class__,)`
+    /// (rstring.py:1268). Class-tag singleton.
+    UnicodeBuilder,
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -2994,6 +3000,10 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
                 s.ll_ptrtype.clone(),
             ),
         ),
+        // rstring.py:1228/1268 — SomeStringBuilder / SomeUnicodeBuilder
+        // rtyper_makekey = (self.__class__,).
+        SomeValue::StringBuilder(_) => ReprKey::StringBuilder,
+        SomeValue::UnicodeBuilder(_) => ReprKey::UnicodeBuilder,
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical
@@ -3254,6 +3264,17 @@ pub fn rtyper_makerepr(
         SomeValue::LLADTMeth(adtmeth) => {
             Ok(std::sync::Arc::new(LLADTMethRepr::new(adtmeth)) as std::sync::Arc<dyn Repr>)
         }
+        // rstring.py:1224-1226 / 1264-1266 — SomeStringBuilder /
+        // SomeUnicodeBuilder rtyper_makerepr return the module-global
+        // stringbuilder_repr / unicodebuilder_repr singletons.
+        SomeValue::StringBuilder(_) => Ok(
+            crate::translator::rtyper::lltypesystem::rbuilder::stringbuilder_repr()
+                as std::sync::Arc<dyn Repr>,
+        ),
+        SomeValue::UnicodeBuilder(_) => Ok(
+            crate::translator::rtyper::lltypesystem::rbuilder::unicodebuilder_repr()
+                as std::sync::Arc<dyn Repr>,
+        ),
     }
 }
 
@@ -4809,5 +4830,19 @@ mod tests {
         ));
         let err = rtyper_makerepr(&sv, &rtyper).expect_err("should surface self-weak error");
         assert!(err.to_string().contains("self-weak"));
+    }
+
+    #[test]
+    fn rtyper_makerepr_stringbuilder_returns_builder_reprs() {
+        use crate::annotator::model::{SomeStringBuilder, SomeUnicodeBuilder};
+        let rtyper = rtyper_for_tests();
+
+        let sb = SomeValue::StringBuilder(SomeStringBuilder::new());
+        let r = rtyper_makerepr(&sb, &rtyper).expect("stringbuilder repr");
+        assert_eq!(r.class_name(), "StringBuilderRepr");
+
+        let ub = SomeValue::UnicodeBuilder(SomeUnicodeBuilder::new());
+        let r = rtyper_makerepr(&ub, &rtyper).expect("unicodebuilder repr");
+        assert_eq!(r.class_name(), "UnicodeBuilderRepr");
     }
 }
