@@ -160,21 +160,15 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             };
             let __jitcode: majit_metainterp::JitCode = (**__dispatch_arc).clone();
 
-            // Observer mode: the outer Rust mainloop runs the same opcode
-            // body alongside this metainterp pass. The metainterp executes
-            // each residual function-pointer call (BC_CALL_INT /
-            // BC_RESIDUAL_CALL_VOID etc.) and pushes (func, args[, result])
-            // onto OBSERVED_CALLS; the outer body, rewritten by `rewrite_body`
-            // so each registered helper is wrapped in `consume_observed_*_call`,
-            // replays the queued result instead of invoking the helper a
-            // second time. The IR call op recorded above runs at compiled-
-            // trace runtime; the outer/metainterp pair stays single-execution
-            // per recording iter.
+            // The metainterp walk is the sole executor: it runs each residual
+            // function-pointer call (BC_CALL_INT / BC_RESIDUAL_CALL_VOID etc.)
+            // for real and records the matching IR call op. The IR call op runs
+            // at compiled-trace runtime.
             //
             // Dispatch JitCode reads `program` and `pc` as caller-provided
             // IR arguments (matching the (Ref, Int) prefix of `reds` declared
             // by `__declare_jit_schema_*` and consumed by
-            // `trace_jitcode_observer_with_args`).
+            // `trace_jitcode_with_args`).
             let mut __jitcode_args: ::std::vec::Vec<(
                 majit_metainterp::JitArgKind,
                 majit_ir::OpRef,
@@ -195,7 +189,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __pc_bits,
             ));
             #push_virtualizable_argbox
-            let __result = majit_metainterp::trace_jitcode_observer_with_args_and_runtime(
+            let __result = majit_metainterp::trace_jitcode_with_args_and_runtime(
                 __ctx,
                 __sym,
                 &__jitcode,
