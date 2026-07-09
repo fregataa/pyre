@@ -7238,6 +7238,35 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_STRICT_MULTIFRAME` (gh#420): give a STRICT straight-line inlined
+/// callee the same multi-frame guard snapshot the branch-bearing multiframe
+/// path uses, so an in-callee guard resumes at the callee's OWN coordinate
+/// (with the caller paused at the CALL return point) instead of collapsing to
+/// the caller boundary.  The single-frame collapse re-executes the whole call
+/// on deopt, which re-materializes it at a stale `valuestackdepth` (a resume
+/// `LOAD_FAST` push overflows the frame, an `rd_numb` decode overruns) and
+/// re-applies a committed heap side effect — visible on the wasm resume path,
+/// where a guard-failure deopt is not absorbed by a compiled bridge.
+///
+/// The caller (paused) frame is pushed whenever it is snapshot-able
+/// ([`compute_inline_caller_frame`] returns `Some`; `None` keeps the collapse).
+/// When the CALLEE frame is then not snapshot-able either — a kept operand-stack
+/// temp the callee sub-walk does not mirror (a `LOAD_METHOD` receiver, a
+/// residual-call result live across the guard) —
+/// [`walker_capture_multi_frame_inline_snapshot`] returns `Unsupported`, and the
+/// inline declines to an ordinary residual call rather than falling back to the
+/// corrupt collapse.  Default-on; `=0`/`false` opts out.
+pub(crate) fn fbw_strict_multiframe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STRICT_MULTIFRAME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_LOOP_CALLEE_CA` (gap-10, general loop-bearing-callee →
 /// CALL_ASSEMBLER): when a multi-frame inlined callee sub-walk reaches the
 /// callee's own `jit_merge_point` and a compiled loop token already exists
@@ -9964,6 +9993,13 @@ fn walker_capture_snapshot_for_last_guard_impl(
         let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
         if n_parents > 0 && n_parents == n_callees {
             let parent_frames = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().clone());
+            // A STRICT straight-line callee (gh#420) whose own frame is not
+            // MF-snapshot-able (a kept operand-stack temp the sub-walk does not
+            // mirror) propagates the `Unsupported` error the same as the branch
+            // path: the enclosing inline declines to a residual call rather than
+            // resuming through the single-frame collapse, whose caller-boundary
+            // re-execute both mis-sizes the resumed frame (a decode/`LOAD_FAST`
+            // out-of-bounds) and re-applies the callee's committed side effect.
             return walker_capture_multi_frame_inline_snapshot(
                 ctx,
                 op_pc,
@@ -11612,6 +11648,52 @@ fn callee_fast_path_inlinable(
     true
 }
 
+/// True when a STRICT straight-line callee commits a heap side effect that its
+/// single-frame collapse would re-apply on a deopt / abort re-execute — the
+/// gh#420 unsoundness.  The collapse resumes at the caller CALL boundary and
+/// re-runs the WHOLE call, so a committed store or construction is doubled
+/// (`inline_callee_constructs_object`'s `P(n)` construct;
+/// `inlined_mutation_before_abort`'s `c.n = c.n + 1` store, whose recorded
+/// value persists past the trace abort).  Such a callee routes through the
+/// multi-frame decline (a paused caller frame) so the enclosing inline declines
+/// to a residual instead of collapsing.
+///
+/// A PURE value-returning leaf — only typed helper residual calls (an int/float
+/// binop `residual_call_ir_r`, an idempotent field read) plus ref moves and a
+/// return, e.g. `inline_helper`'s `a + b` / `a * b` — re-executes identically
+/// on deopt, so its collapse is sound and it must NOT be pushed through the
+/// always-declining MF snapshot (a strict callee seeds no frame red, so that
+/// snapshot can only decline, aborting a working inline).
+///
+/// Conservative: a general ref-first-arg residual call (`residual_call_r_*`, an
+/// arbitrary Python call / constructor that may raise or mutate), a VOID
+/// residual call (`..._v`, a statement run for its effect — a store / append),
+/// or an explicit vable/gc field, array, or interior-field write all count as a
+/// side effect (`setinteriorfield_gc_*` — an array-of-struct / dict-storage
+/// write — is caught by the `setinteriorfield` substring; note the plain
+/// `setfield` substring does not span it).
+fn strict_callee_collapse_unsound(body_code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            // Undecodable tail: be conservative — take the decline, not the
+            // collapse.
+            return true;
+        };
+        let op = d.opname;
+        if op.starts_with("residual_call_r")
+            || (op.starts_with("residual_call") && op.ends_with("_v"))
+            || op.contains("setfield")
+            || op.contains("setarrayitem")
+            || op.contains("setinteriorfield")
+        {
+            return true;
+        }
+        pc = d.next_pc;
+    }
+    false
+}
+
 /// True iff `d` is a scalar `getfield_vable_r` whose field is a Ref-typed
 /// compile-time constant (`pycode` / `w_globals`) — the only vable op
 /// [`try_resolve_inline_callee_static_field`] can satisfy without a seeded
@@ -12756,6 +12838,35 @@ fn try_walker_inline_user_call(
             Some(pf) => Some(pf),
             None => return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc }),
         }
+    } else if strict_inlinable
+        && fbw_strict_multiframe_enabled()
+        && inline_depth < FBW_MAX_MULTIFRAME_DEPTH
+        && strict_callee_collapse_unsound(body.code)
+    {
+        // gh#420: a strict straight-line callee's in-callee guard collapses to
+        // the caller boundary and re-executes the whole call on deopt, doubling
+        // a committed heap side effect and resuming at a stale valuestackdepth.
+        // Give it the same paused-caller frame the branch multiframe path uses
+        // so the guard resumes at the callee's own coordinate.  Best effort:
+        // when the caller frame is not snapshot-able keep the single-frame
+        // collapse (do NOT decline the inline — that shape is otherwise served
+        // correctly today), so this never removes a working inline.
+        //
+        // Gated on the callee committing a heap side effect
+        // ([`strict_callee_collapse_unsound`]): only then is the collapse
+        // re-execute unsound and the paused-caller frame (→ MF snapshot decline
+        // → residual) warranted.  A PURE value-returning leaf (`inline_helper`'s
+        // `a + b` / `a * b`) has an idempotent collapse, so it is left on that
+        // collapse — a strict callee seeds no frame red, so pushing it through
+        // the always-declining MF snapshot would abort a working inline.
+        //
+        // Bounded by `inline_depth < FBW_MAX_MULTIFRAME_DEPTH` (mirror of
+        // `try_multiframe`): pushing a paused caller frame while already one
+        // inline level deep yields two `InlineParentFrame`s (n_parents ==
+        // n_callees == 2), a 3-frame snapshot the resume path is sound for only
+        // one paused caller frame.  A nested side-effecting strict callee then
+        // falls back to the single-frame collapse (its pre-strict-MF behavior).
+        compute_inline_caller_frame(ctx, op.pc)
     } else {
         None
     };
@@ -12769,6 +12880,86 @@ fn try_walker_inline_user_call(
     // side-effecting prologue must decline the CA inline (see the arm).
     let prologue_journal_before = fbw_store_journal_len();
     let prologue_effect_before = fbw_has_unjournaled_effect();
+    // Compute fresh outer_active_boxes for the inline sub-walk when the
+    // parent FBW walk carries an empty set (`dispatch_via_miframe`
+    // initializes `outer_active_boxes: Vec::new()`; it is computed
+    // dynamically per guard by the FBW path).  A callee guard falls
+    // through to the per-opcode arm path which reads `ctx.outer_active_boxes`,
+    // so an empty inherited set produces a resume snapshot with zero frame
+    // boxes while the decoder expects the full liveness-derived set — the
+    // same defect class as the LOAD_ATTR fold empty-boxes bug.  Mirror
+    // `try_walker_list_append_inline`: read the caller's live register
+    // banks from `FULL_BODY_SNAPSHOT_SYM` at the CALL-site py_pc.
+    //
+    // The snapshot header coordinate (`sub_wc.entry_py_pc` /
+    // `sub_wc.outer_jitcode_index`, stamped below) MUST be the SAME coordinate
+    // these boxes are collected at.  A callee guard that collapses to the
+    // caller boundary stamps that coordinate as its resume `SnapshotFrame`
+    // header, and the decoder (`setup_bridge_sym`) reads the liveness window at
+    // that header to size and place the stored boxes
+    // (`reg_indices.total_len() == frame.values.len()`).  Collecting boxes at
+    // the CALL site but stamping the walk-entry header desyncs the two windows
+    // (count-mismatch assert / wrong slot layout), so carry the box coordinate
+    // to the header alongside the boxes.
+    let (inline_outer_active_boxes, inline_outer_py_pc, inline_outer_jc_index) =
+        if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
+            let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+            if sym_ptr.is_null() {
+                (
+                    ctx.outer_active_boxes.clone(),
+                    ctx.entry_py_pc,
+                    ctx.outer_jitcode_index,
+                )
+            } else {
+                let sym = unsafe { &*sym_ptr };
+                if sym.jitcode.is_null() {
+                    (
+                        ctx.outer_active_boxes.clone(),
+                        ctx.entry_py_pc,
+                        ctx.outer_jitcode_index,
+                    )
+                } else {
+                    // Liveness coordinate is the CALL op's own (jitcode index,
+                    // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
+                    // initializes `ctx.outer_jitcode_index` to 0 and
+                    // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in
+                    // a non-root jitcode, or a CALL not at the walk-entry pc,
+                    // those select the wrong liveness window and the callee guard
+                    // snapshot encodes the wrong frame boxes.  Derive the
+                    // coordinate from the snapshot sym's jitcode at the CALL op's
+                    // pc, matching `orthodox_list_append_commit`.
+                    let (call_site_py_pc, call_site_jc_index) = unsafe {
+                        let jc = &*sym.jitcode;
+                        let jc_index = jc.index as u32;
+                        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                        if !jc.payload.code_ptr.is_null() {
+                            let codeobj = &*jc.payload.code_ptr;
+                            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                        }
+                        (py, jc_index)
+                    };
+                    let boxes = collect_outer_active_boxes(
+                        sym,
+                        ctx.trace_ctx,
+                        ctx.registers_i,
+                        ctx.registers_r,
+                        ctx.registers_f,
+                        call_site_jc_index,
+                        call_site_py_pc,
+                        None,
+                        majit_ir::resumedata::NO_JITCODE_PC,
+                        None,
+                    );
+                    (boxes, call_site_py_pc, call_site_jc_index)
+                }
+            }
+        } else {
+            (
+                ctx.outer_active_boxes.clone(),
+                ctx.entry_py_pc,
+                ctx.outer_jitcode_index,
+            )
+        };
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -12797,16 +12988,16 @@ fn try_walker_inline_user_call(
             sub_jitcode_lookup: callee_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
+            entry_py_pc: inline_outer_py_pc,
+            outer_jitcode_index: inline_outer_jc_index,
+            outer_active_boxes: inline_outer_active_boxes,
         };
         // Guards emitted inside the callee body — both the walker's own
         // and the `_nonstandard_virtualizable` PTR_EQ promote that
         // `vable_getfield_*` records internally — resume at this CALL
-        // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, inherited
-        // from the caller), not at a callee `op_pc` that has no meaning in
-        // the outer jitcode's py_pc→jitcode tables.  See
+        // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, both stamped
+        // at the CALL-site coordinate above), not at a callee `op_pc` that has
+        // no meaning in the outer jitcode's py_pc→jitcode tables.  See
         // `INLINE_SUBWALK_CAPTURE_BOUNDARY`.
         let _inline_boundary = InlineSubwalkCaptureGuard::enter();
         // Track this callee on the FBW inline stack for the lifetime of the
