@@ -141,9 +141,6 @@ pub unsafe fn w_memoryview_backing(obj: PyObjectRef) -> PyObjectRef {
 }
 
 mv_view_obj!(w_memoryview_obj, w_obj);
-mv_view_obj!(w_memoryview_format, w_format);
-mv_view_obj!(w_memoryview_shape, w_shape);
-mv_view_obj!(w_memoryview_strides, w_strides);
 mv_view_scalar!(w_memoryview_itemsize, itemsize, i64);
 mv_view_scalar!(w_memoryview_ndim, ndim, i64);
 mv_view_scalar!(w_memoryview_offset, offset, i64);
@@ -190,11 +187,33 @@ pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
 /// `obj` must point to a valid `W_MemoryView`.
 #[inline]
 pub unsafe fn w_memoryview_stride0(obj: PyObjectRef) -> i64 {
-    unsafe {
-        let view = w_memoryview_view(obj);
-        match crate::tupleobject::w_tuple_getitem(view.w_strides(), 0) {
-            Some(s) => crate::intobject::w_int_get_value(s),
-            None => view.itemsize(),
-        }
-    }
+    unsafe { w_memoryview_view(obj).stride0() }
+}
+
+/// The view's format string content (`memoryview.format`) read without
+/// wrapping a fresh string object — for callers that only need the bytes.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_format_str(obj: PyObjectRef) -> &'static str {
+    unsafe { w_memoryview_view(obj).format_str() }
+}
+
+/// The view's shape as native `i64` extents (`memoryview.shape`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_native_shape(obj: PyObjectRef) -> Vec<i64> {
+    unsafe { w_memoryview_view(obj).native_shape() }
+}
+
+/// The view's strides as native `i64` byte steps (`memoryview.strides`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_native_strides(obj: PyObjectRef) -> Vec<i64> {
+    unsafe { w_memoryview_view(obj).native_strides() }
 }
