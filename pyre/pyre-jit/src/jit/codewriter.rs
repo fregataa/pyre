@@ -319,8 +319,9 @@ impl FrameState {
             data.push(Some(w_type.clone()));
             data.push(Some(w_value.clone()));
         } else {
-            data.push(Some(super::flow::Constant::none().into()));
-            data.push(Some(super::flow::Constant::none().into()));
+            let (none_type, none_value) = last_exception_none_pair();
+            data.push(Some(none_type.into()));
+            data.push(Some(none_value.into()));
         }
         if let Some((frame, ec)) = &self.portal_extras {
             data.push(Some(frame.clone()));
@@ -506,30 +507,20 @@ impl FrameState {
                 union_flow_value(left_type, right_type, fresh_variable)?,
                 union_flow_value(left_value, right_value, fresh_variable)?,
             )),
-            (Some((left_type, left_value)), None) => Some((
-                union_flow_value(
-                    left_type,
-                    &super::flow::Constant::none().into(),
-                    fresh_variable,
-                )?,
-                union_flow_value(
-                    left_value,
-                    &super::flow::Constant::none().into(),
-                    fresh_variable,
-                )?,
-            )),
-            (None, Some((right_type, right_value))) => Some((
-                union_flow_value(
-                    &super::flow::Constant::none().into(),
-                    right_type,
-                    fresh_variable,
-                )?,
-                union_flow_value(
-                    &super::flow::Constant::none().into(),
-                    right_value,
-                    fresh_variable,
-                )?,
-            )),
+            (Some((left_type, left_value)), None) => {
+                let (none_type, none_value) = last_exception_none_pair();
+                Some((
+                    union_flow_value(left_type, &none_type.into(), fresh_variable)?,
+                    union_flow_value(left_value, &none_value.into(), fresh_variable)?,
+                ))
+            }
+            (None, Some((right_type, right_value))) => {
+                let (none_type, none_value) = last_exception_none_pair();
+                Some((
+                    union_flow_value(&none_type.into(), right_type, fresh_variable)?,
+                    union_flow_value(&none_value.into(), right_value, fresh_variable)?,
+                ))
+            }
         };
         // Portal extras carry graph-level identity; if the two sides
         // are both seeded they must reference the same `(frame, ec)`
@@ -643,6 +634,24 @@ where
 
 fn union_kind(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
     if left == right { left } else { None }
+}
+
+/// The absent-`last_exception` sentinel pair, kind-matched per slot to
+/// the exception link types: `etype`/`>i` is `Kind::Int`, `evalue`/`>r`
+/// is `Kind::Ref` (`assembler.py:220`; exceptblock inputargs in flow.rs).
+/// A raising predecessor carries a typed `(Int, Ref)` pair, so an absent
+/// predecessor must pad each slot with the SAME kind, otherwise
+/// `union_flow_value`'s `union_kind(Int, Ref)` collapses to an untyped
+/// merged Variable that later defaults to `Ref` and mints a `ref_copy`
+/// over the real Int type source.  `framestate.py:66-71 _exc_args` pads
+/// both slots with one `Constant(None)` because flowspace Variables are
+/// untyped; the rtyper assigns the exception slots a uniform type
+/// afterwards, and pyre carries that uniform per-slot typing here.
+fn last_exception_none_pair() -> (super::flow::Constant, super::flow::Constant) {
+    (
+        super::flow::Constant::new(super::flow::ConstantValue::None, Some(Kind::Int)),
+        super::flow::Constant::new(super::flow::ConstantValue::None, Some(Kind::Ref)),
+    )
 }
 
 fn entry_frame_state(code: &CodeObject, frame_inputs: FrameInputs) -> FrameState {
@@ -6718,12 +6727,30 @@ impl CodeWriter {
                 // insert_switch_exits` ("switch link requires
                 // Signed/Bool llexitcase").  Force a block boundary
                 // here so the next PC's ops emit into a fresh egg.
-                let canraise_pending = matches!(
-                    current_block.block().borrow().exitswitch,
-                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
-                        ref c,
-                    ))) if matches!(c.value, super::flow::ConstantValue::Atom(super::flow::Atom::LastException))
-                );
+                // An explicit `raise X` covered by a try attaches its
+                // exception edge through `attach_catch_exception_edge`, which
+                // sets `exitswitch=LastException` — the same shape a canraise
+                // OP produces.  `canraise_pending` must NOT treat that as a
+                // half-closed canraise block: an explicit raise is an
+                // unconditional terminator with no normal continuation.
+                // Leaving it true drives `force_branch_boundary` at the next
+                // merge PC, so `mergeblock` appends a spurious normal exit onto
+                // the raise-terminated block (making it multi-exit); then
+                // `insert_exits` lowers the raise edge as a plain catch and
+                // drops the `raise` op, so the handler never runs.
+                let has_explicit_raise = current_block
+                    .block()
+                    .borrow()
+                    .exits
+                    .iter()
+                    .any(|e| e.borrow().explicit_raise_value.is_some());
+                let canraise_pending = !has_explicit_raise
+                    && matches!(
+                        current_block.block().borrow().exitswitch,
+                        Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                            ref c,
+                        ))) if matches!(c.value, super::flow::ConstantValue::Atom(super::flow::Atom::LastException))
+                    );
                 let force_branch_boundary = needs_fallthrough
                     && current_block
                         .framestate()
@@ -7457,7 +7484,30 @@ impl CodeWriter {
                     //   op2 = -live- (for do_recursive_call / guard resume)
                     // The per-PC emit_live_placeholder!() after this block
                     // serves as op2; op3 is emitted inside the block below.
-                    if loop_header_pcs.contains(&py_pc) {
+                    // An explicit `raise X` covered by a try closes its block
+                    // with a single exception exit carrying `explicit_raise_value`
+                    // (`emit_raise!` set `needs_fallthrough = false`).  When that
+                    // block's fall-through PC is itself a loop header — the target
+                    // of the handler's back-edge — `emit_mark_label_pc!` cannot
+                    // switch away from the closed block until the joinpoint block
+                    // exists, so `current_block` is still the raise block here.
+                    // Emitting the loop-header `jit_merge_point` into it appends
+                    // the merge op AFTER the raise's operations; `insert_exits`
+                    // then serialises the block ops (including that merge) BEFORE
+                    // the `raise` op, so a blackhole guard-resume into this arm
+                    // reaches the merge and `ContinueRunningNormally`s (loops back)
+                    // before executing the `raise`, dropping the handler.  The
+                    // `jit_merge_point` belongs to the real loop-header block,
+                    // emitted when that PC is walked through its own joinpoint;
+                    // suppress it on a closed explicit-raise block (mirrors the
+                    // `block_closed_by_terminator` op-dispatch gate below).
+                    let closed_by_explicit_raise = current_block
+                        .block()
+                        .borrow()
+                        .exits
+                        .iter()
+                        .any(|e| e.borrow().explicit_raise_value.is_some());
+                    if loop_header_pcs.contains(&py_pc) && !closed_by_explicit_raise {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
                         emit_live_placeholder!();
@@ -7545,16 +7595,36 @@ impl CodeWriter {
                     let block_closed_by_terminator = {
                         let block_rc = current_block.block();
                         let block = block_rc.borrow();
+                        // An explicit `raise X` covered by a try attaches its
+                        // exception edge through `attach_catch_exception_edge`,
+                        // which sets `exitswitch=LastException` — the same
+                        // canraise shape a real raising OP produces.  The
+                        // LastException exclusion below keeps a canraise OP's
+                        // block open so the walker keeps dispatching the op's
+                        // normal-flow result and the ops after it.  An explicit
+                        // raise has no normal continuation: it is an
+                        // unconditional terminator, so the block must close.
+                        // Left open, the walker serialises the following
+                        // fall-through / loop-back ops (and a `mergeblock`
+                        // appends a spurious normal exit) into the raise's
+                        // block; `insert_exits` then lowers the raise edge as a
+                        // plain catch and drops the `raise` op, so the handler
+                        // is never entered.
+                        let has_explicit_raise = block
+                            .exits
+                            .iter()
+                            .any(|e| e.borrow().explicit_raise_value.is_some());
                         !block.exits.is_empty()
-                            && !matches!(
-                                block.exitswitch,
-                                Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
-                                    ref c,
-                                ))) if matches!(
-                                    c.value,
-                                    super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
-                                )
-                            )
+                            && (has_explicit_raise
+                                || !matches!(
+                                    block.exitswitch,
+                                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                                        ref c,
+                                    ))) if matches!(
+                                        c.value,
+                                        super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
+                                    )
+                                ))
                     };
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
