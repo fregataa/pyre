@@ -1066,6 +1066,17 @@ pub struct MetaInterp<M: Clone> {
     /// after the trace closes. `take`n by the `__merge` wrapper. `None` when
     /// the walk did not populate the reds.
     pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
+    /// Single-pass tracing: the walk-final scalar state-field values captured
+    /// off the still-live sym at the CloseLoop point (scalar state-field index
+    /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
+    /// `merge_point`'s closure sees only `&mut MetaInterp` and `&mut sym`, and
+    /// the arm sets `self.sym = None` before returning, so native `state`
+    /// (available only in the `jit_merge_point!` macro expansion) cannot read
+    /// the sym after the close. Stash the values here while the sym is still
+    /// live; the macro hook `take`s them and applies them to native `state`
+    /// via `writeback_scalar_state_fields_from_values`. `None` outside
+    /// single-pass or when the state has no scalar fields.
+    pub(crate) single_pass_scalar_values: Option<Vec<i64>>,
     /// Single-pass tracing: the green key the CloseLoop arm compiled the
     /// (cross-loop-cut) inner loop under, captured after a `Compiled`
     /// outcome so the merge-point hook can DIRECTLY enter that freshly
@@ -2260,6 +2271,7 @@ impl<M: Clone> MetaInterp<M> {
             loop_header_pcs: indexmap::IndexMap::new(),
             tracing: None,
             single_pass_outcome: None,
+            single_pass_scalar_values: None,
             single_pass_compiled_key: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
@@ -3920,6 +3932,9 @@ impl<M: Clone> MetaInterp<M> {
             &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
             &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
             &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
         ) -> R,
     ) -> Option<R> {
         let tracing = self.tracing.as_mut()?;
@@ -3999,12 +4014,41 @@ impl<M: Clone> MetaInterp<M> {
                 None
             }
         };
+        // Ref / float siblings decode the single FINISH output in its raw
+        // packing (`execute_token_raw` stores a ref as its `GcRef` bits and a
+        // float as `f64::to_bits()`, both into `outputs`), so the int decode
+        // shape carries through unchanged.
+        let recursive_exec_ref = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
+            let result = backend.execute_token_raw(token, reds);
+            if result.is_finish {
+                result.outputs.first().copied()
+            } else {
+                None
+            }
+        };
+        let recursive_exec_float = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
+            let result = backend.execute_token_raw(token, reds);
+            if result.is_finish {
+                result.outputs.first().copied()
+            } else {
+                None
+            }
+        };
+        // Void runs the callee for its side effects; a finished loop yields
+        // `Some(())`, an unfinished one `None`.
+        let recursive_exec_void = |token: &JitCellToken, reds: &[Value]| -> Option<()> {
+            let result = backend.execute_token_raw(token, reds);
+            result.is_finish.then_some(())
+        };
         Some(f(
             tracing,
             &resolver,
             &recursive_target,
             &recursive_decision,
             &recursive_exec,
+            &recursive_exec_ref,
+            &recursive_exec_float,
+            &recursive_exec_void,
         ))
     }
 
@@ -14038,7 +14082,13 @@ pub enum InlineDecision {
     Inline,
     /// Emit a CALL_ASSEMBLER: callee has compiled code.
     CallAssembler,
-    /// Emit a residual (opaque) call.
+    /// Callee not compiled and no on-demand token machinery.  pyjitpl.py:1417
+    /// (`inlining` true) would build the token via `compile_tmp_callback`
+    /// (warmstate.py:714-722) and still emit CALL_ASSEMBLER; lacking that here,
+    /// this variant means "no token yet" and the dispatcher aborts/retries
+    /// until the callee compiles.  It is not pyjitpl.py's `inlining`-false
+    /// residual call.  See `should_inline_core` for the same
+    /// `compile_tmp_callback` gap.
     ResidualCall,
 }
 
@@ -14061,9 +14111,18 @@ pub(crate) fn decide_recursive_inline(
     recursive_depth: usize,
     max_unroll: usize,
 ) -> (InlineDecision, bool) {
-    // pyjitpl.py:1417 — a non-inlined recursive call routes to
-    // CALL_ASSEMBLER when the callee has (or is converging on) compiled
-    // code, else to a residual call.
+    // pyjitpl.py:1417 — with `warmrunnerstate.inlining` true (pyjitpl.py:1381,
+    // always the case here) a non-inlined recursive call always takes
+    // `assembler_call = True`.  When the callee is (or is converging on)
+    // compiled it routes to CALL_ASSEMBLER against the resolvable token; when
+    // it is not compiled, pyjitpl.py:1417 still takes `assembler_call = True`
+    // and `get_assembler_token` synthesises the token on demand via
+    // `compile_tmp_callback` (warmstate.py:714-722).  There is no
+    // `compile_tmp_callback` here, so the not-compiled case is labelled
+    // `ResidualCall` — a stand-in meaning "no token yet, cannot emit
+    // CALL_ASSEMBLER" — which the dispatcher turns into abort/retry.  It is
+    // NOT pyjitpl.py's `inlining`-false residual (`assembler_call = False`)
+    // path.
     let non_inline = if callee_compiled {
         InlineDecision::CallAssembler
     } else {
