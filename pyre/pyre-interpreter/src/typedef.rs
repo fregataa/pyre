@@ -740,9 +740,13 @@ pub fn init_typeobjects() {
             &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
             memoryview_type as usize,
         );
+        let seq_iterator_type = new_typeobject_with_base("iterator", |_| {}, object_type);
+        // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — an iterator is produced only by
+        // `iter(obj)`, never by `iterator()`, so `tp_new` is NULL.
+        unsafe { pyre_object::w_type_set_disallow_instantiation(seq_iterator_type) };
         reg.insert(
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("iterator", |_| {}, object_type) as usize,
+            seq_iterator_type as usize,
         );
         reg.insert(
             &pyre_object::functional::LONG_RANGE_ITER_TYPE as *const PyType as usize,
@@ -2657,11 +2661,14 @@ fn init_str_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__contains__",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_bool_from(false));
+                if args.len() != 2 {
+                    return Err(crate::PyError::type_error(format!(
+                        "expected 1 argument, got {}",
+                        args.len().saturating_sub(1)
+                    )));
                 }
                 Ok(pyre_object::w_bool_from(
-                    crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
+                    crate::baseobjspace::contains_slot(args[0], args[1])?,
                 ))
             },
             2,
@@ -2744,7 +2751,10 @@ fn init_str_type(ns: &mut DictStorage) {
                 if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
                     unsafe { crate::objspace::descroperation::str_repeat(args[0], args[1]) }
                 } else {
-                    Ok(pyre_object::w_not_implemented())
+                    let count = crate::builtins::space_index_w(args[1])?;
+                    unsafe {
+                        crate::objspace::descroperation::str_repeat(args[0], w_int_new(count))
+                    }
                 }
             },
             2,
@@ -2769,15 +2779,45 @@ fn init_str_type(ns: &mut DictStorage) {
         ns,
         "maketrans",
         make_maketrans_descr(|args| {
-            // maketrans(x[, y[, z]]) → translation dict
+            if args.is_empty() {
+                return Err(crate::PyError::type_error(
+                    "maketrans expected at least 1 argument, got 0",
+                ));
+            }
+            if args.len() > 3 {
+                return Err(crate::PyError::type_error(format!(
+                    "maketrans expected at most 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+
             let d = pyre_object::w_dict_new();
-            if args.len() >= 3 {
-                // maketrans(x, y, z) — z is chars to delete (map to None).
-                // Keys/values are code-point ordinals, read through the
-                // WTF-8 view so a surrogate character does not panic.
+            if args.len() >= 2 {
+                if !unsafe { pyre_object::is_str(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "first maketrans argument must be a string if there is a second argument",
+                    ));
+                }
+                if !unsafe { pyre_object::is_str(args[1]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "maketrans() argument 2 must be str, not {}",
+                        crate::type_methods::arg_type_name(args[1])
+                    )));
+                }
+                if args.len() == 3 && !unsafe { pyre_object::is_str(args[2]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "maketrans() argument 3 must be str, not {}",
+                        crate::type_methods::arg_type_name(args[2])
+                    )));
+                }
+
                 let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
                 let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
+                if x.code_points().count() != y.code_points().count() {
+                    return Err(crate::PyError::value_error(
+                        "the first two maketrans arguments must have equal length",
+                    ));
+                }
                 for (xc, yc) in x.code_points().zip(y.code_points()) {
                     unsafe {
                         pyre_object::w_dict_store(
@@ -2787,29 +2827,24 @@ fn init_str_type(ns: &mut DictStorage) {
                         );
                     }
                 }
-                for zc in z.code_points() {
-                    unsafe {
-                        pyre_object::w_dict_store(
-                            d,
-                            pyre_object::w_int_new(zc.to_u32() as i64),
-                            pyre_object::w_none(),
-                        );
+                if args.len() == 3 {
+                    let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
+                    for zc in z.code_points() {
+                        unsafe {
+                            pyre_object::w_dict_store(
+                                d,
+                                pyre_object::w_int_new(zc.to_u32() as i64),
+                                pyre_object::w_none(),
+                            );
+                        }
                     }
                 }
-            } else if args.len() >= 2 {
-                let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                for (xc, yc) in x.code_points().zip(y.code_points()) {
-                    unsafe {
-                        pyre_object::w_dict_store(
-                            d,
-                            pyre_object::w_int_new(xc.to_u32() as i64),
-                            pyre_object::w_int_new(yc.to_u32() as i64),
-                        );
-                    }
+            } else {
+                if !unsafe { pyre_object::is_dict(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "if you give only one argument to maketrans it must be a dict",
+                    ));
                 }
-            } else if args.len() == 1 && unsafe { pyre_object::is_dict(args[0]) } {
-                // 1-arg dict form: maketrans({ord_or_char: replacement, ...})
                 let src = args[0];
                 unsafe {
                     // `w_dict_items` dispatches through `is_module_dict`
@@ -2820,12 +2855,18 @@ fn init_str_type(ns: &mut DictStorage) {
                             k
                         } else if pyre_object::is_str(k) {
                             let s = pyre_object::w_str_get_wtf8(k);
-                            match s.code_points().next() {
-                                Some(cp) => pyre_object::w_int_new(cp.to_u32() as i64),
-                                None => pyre_object::w_int_new(0),
+                            let mut cps = s.code_points();
+                            let cp = cps.next();
+                            if cp.is_none() || cps.next().is_some() {
+                                return Err(crate::PyError::value_error(
+                                    "string keys in translate table must be of length 1",
+                                ));
                             }
+                            pyre_object::w_int_new(cp.unwrap().to_u32() as i64)
                         } else {
-                            k
+                            return Err(crate::PyError::type_error(
+                                "keys in translate table must be strings or integers",
+                            ));
                         };
                         pyre_object::w_dict_store(d, ord_key, v);
                     }
@@ -8566,6 +8607,15 @@ fn init_complex_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "__format__",
+        make_builtin_function_with_arity(
+            "__format__",
+            crate::type_methods::builtin_value_format,
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "__hash__",
         make_builtin_function_with_arity(
             "__hash__",
@@ -12108,10 +12158,9 @@ pub(crate) fn decode_bytes_to_wtf8(
             if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower, err_mode) {
                 result?
             } else {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown encoding: {encoding}"),
-                ));
+                let w_data = pyre_object::bytesobject::w_bytes_from_bytes(data);
+                let w_text = crate::module::_codecs::decode_text_codec(w_data, encoding, err_mode)?;
+                unsafe { pyre_object::w_str_get_wtf8(w_text) }.to_wtf8_buf()
             }
         }
     };

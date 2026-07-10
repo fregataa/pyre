@@ -88,6 +88,21 @@ pub(crate) fn arity_at_least_positional(
     Ok(())
 }
 
+/// Validate that a str search method's substring (`args[1]`) is a `str`,
+/// else raise `TypeError("{method}() argument 1 must be str, not {type}")`.
+/// The search path reads `args[1]` as a `W_UnicodeObject`; a non-str would
+/// be dereferenced as one. `args[1]` is guaranteed present by the caller's
+/// preceding `arity_at_least(_, _, 1)`.
+pub(crate) fn require_str_sub(args: &[PyObjectRef], method: &str) -> Result<(), crate::PyError> {
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "{method}() argument 1 must be str, not {}",
+            arg_type_name(args[1])
+        )));
+    }
+    Ok(())
+}
+
 /// TypeError for a method accepting at most `max` positional arguments after
 /// the receiver, called with more — the METH_VARARGS "X expected at most N
 /// arguments, got M" form (`list.index`, `dict.pop`).
@@ -112,6 +127,24 @@ pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), c
     if args.is_empty() {
         return Err(crate::PyError::type_error(format!(
             "descriptor '{name}' of object needs an argument"
+        )));
+    }
+    Ok(())
+}
+
+/// Receiver-only arity for `str` methods that take no arguments (`isspace`,
+/// `lower`, …).  Rejects a missing receiver and any extra positional argument,
+/// matching `str.{name}() takes no arguments (N given)`.
+pub(crate) fn require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of 'str' object needs an argument"
+        )));
+    }
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "str.{name}() takes no arguments ({} given)",
+            args.len() - 1
         )));
     }
     Ok(())
@@ -330,12 +363,25 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // element must be a str; otherwise TypeError("sequence item N:
     // expected str instance, <T> found"). Silently dropping non-str
     // items lost the error and produced an empty join.
+    //
+    // A single-element join returns that element (unicode_result_unchanged):
+    // an exact str unchanged, a str subclass copied to a base str.
+    if items.len() == 1 {
+        let item = items[0];
+        if unsafe { !is_str(item) } {
+            return Err(crate::PyError::type_error(format!(
+                "sequence item 0: expected str instance, {} found",
+                arg_type_name(item)
+            )));
+        }
+        return Ok(str_result_unchanged(item));
+    }
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     for (i, item) in items.iter().enumerate() {
         if unsafe { !is_str(*item) } {
             return Err(crate::PyError::type_error(format!(
                 "sequence item {i}: expected str instance, {} found",
-                unsafe { (*(*(*item)).ob_type).name }
+                arg_type_name(*item)
             )));
         }
         if i > 0 {
@@ -572,7 +618,7 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `CaseFolding.txt` status-C+F mapping to each scalar code point and
 /// passes lone surrogates through unchanged.
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "casefold")?;
+    require_no_args(args, "casefold")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_str_from_wtf8(case::casefold_wtf8(s)))
 }
@@ -691,31 +737,44 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// unicodeobject.py:848 descr_startswith(self, prefix, start=0, end=sys.maxsize)
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "startswith", 1)?;
+    arity_at_most(args, "startswith", 3)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let slice = str_slice_args(s, args);
+    let Some(slice) = str_slice_args(s, args) else {
+        return validate_prefix_arg(args[1], "startswith").map(|()| w_bool_from(false));
+    };
     str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "endswith", 1)?;
+    arity_at_most(args, "endswith", 3)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let slice = str_slice_args(s, args);
+    let Some(slice) = str_slice_args(s, args) else {
+        return validate_prefix_arg(args[1], "endswith").map(|()| w_bool_from(false));
+    };
     str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
 }
 
-fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> &'a Wtf8 {
+/// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
+/// returning the code-point window as WTF-8. `None` signals an empty,
+/// out-of-range window (`start` past the end, or `start > end`), for which
+/// the tail match is always `False` — even for an empty needle. A positive
+/// `start` is not upper-clamped so `''.endswith('', 1, 0)` stays `start >
+/// end` rather than collapsing to a valid empty slice.
+fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> Option<&'a Wtf8> {
     let char_len = s.code_points().count() as i64;
-    let start = if args.len() >= 3 {
+    // `None` bounds mean "not provided" (start -> 0, end -> len).
+    let start = if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
         let v = unsafe { pyre_object::w_int_get_value(args[2]) };
         if v < 0 {
             (char_len + v).max(0) as usize
         } else {
-            (v as usize).min(char_len as usize)
+            v as usize
         }
     } else {
         0
     };
-    let end = if args.len() >= 4 {
+    let end = if args.len() >= 4 && !unsafe { pyre_object::is_none(args[3]) } {
         let v = unsafe { pyre_object::w_int_get_value(args[3]) };
         if v < 0 {
             (char_len + v).max(0) as usize
@@ -725,9 +784,8 @@ fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> &'a Wtf
     } else {
         char_len as usize
     };
-    let empty = unsafe { Wtf8::from_bytes_unchecked(&[]) };
     if start > end {
-        return empty;
+        return None;
     }
     let bytes = s.as_bytes();
     let byte_start = s
@@ -738,7 +796,7 @@ fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> &'a Wtf
         .code_point_indices()
         .nth(end)
         .map_or(bytes.len(), |(i, _)| i);
-    unsafe { Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end]) }
+    Some(unsafe { Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end]) })
 }
 
 fn str_prefix_match(
@@ -770,7 +828,7 @@ fn str_prefix_match(
             if !unsafe { pyre_object::is_str(item) } {
                 return Err(crate::PyError::type_error(format!(
                     "tuple for {method} must only contain str, not {}",
-                    unsafe { (*(*item).ob_type).name }
+                    arg_type_name(item)
                 )));
             }
             let p = unsafe { pyre_object::w_str_get_wtf8(item) };
@@ -782,38 +840,76 @@ fn str_prefix_match(
     }
     Err(crate::PyError::type_error(format!(
         "{method} first arg must be str or a tuple of str, not {}",
-        unsafe { (*(*needle).ob_type).name }
+        arg_type_name(needle)
+    )))
+}
+
+/// Type-check a `startswith`/`endswith` argument (a str, or a tuple whose
+/// items are all str) without running the match. Used on the out-of-range
+/// window path, where the result is `False` but a bad argument type still
+/// raises the same `TypeError` as the in-range path.
+fn validate_prefix_arg(needle: PyObjectRef, method: &str) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::is_str(needle) } {
+        return Ok(());
+    }
+    if unsafe { pyre_object::is_tuple(needle) } {
+        let n = unsafe { pyre_object::w_tuple_len(needle) };
+        for i in 0..n as i64 {
+            let item =
+                unsafe { pyre_object::w_tuple_getitem(needle, i) }.expect("index is in range");
+            if !unsafe { pyre_object::is_str(item) } {
+                return Err(crate::PyError::type_error(format!(
+                    "tuple for {method} must only contain str, not {}",
+                    arg_type_name(item)
+                )));
+            }
+        }
+        return Ok(());
+    }
+    Err(crate::PyError::type_error(format!(
+        "{method} first arg must be str or a tuple of str, not {}",
+        arg_type_name(needle)
     )))
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least_positional(args, "replace", 2)?;
+    // `old` / `new` are positional-only; `count` is positional-or-keyword.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() < 3 {
+        return Err(crate::PyError::type_error(format!(
+            "replace() takes at least 2 positional arguments ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["count"], "replace")?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "replace", "count", pos.get(3).is_some())?;
     // pypy/objspace/std/unicodeobject.py:1132-1148 descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
-    if !unsafe { pyre_object::is_str(args[1]) } {
+    if !unsafe { pyre_object::is_str(pos[1]) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 1 must be str, not {}",
-            unsafe { (*(*args[1]).ob_type).name }
+            arg_type_name(pos[1])
         )));
     }
-    if !unsafe { pyre_object::is_str(args[2]) } {
+    if !unsafe { pyre_object::is_str(pos[2]) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 2 must be str, not {}",
-            unsafe { (*(*args[2]).ob_type).name }
+            arg_type_name(pos[2])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let old = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-    let new = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
-    // `unicodeobject.py descr_replace` — optional count argument; a
-    // negative count means "no limit" (matches CPython); 0 leaves the
-    // string untouched.
-    let maxcount = match args.get(3) {
-        Some(&w_count) if unsafe { pyre_object::is_int(w_count) } => unsafe {
-            pyre_object::w_int_get_value(w_count)
-        },
-        _ => -1,
+    let s = unsafe { pyre_object::w_str_get_wtf8(pos[0]) };
+    let old = unsafe { pyre_object::w_str_get_wtf8(pos[1]) };
+    let new = unsafe { pyre_object::w_str_get_wtf8(pos[2]) };
+    // Optional `count`: a negative count means "no limit"; 0 leaves the
+    // string untouched. Resolved through `__index__`.
+    let maxcount = match pos
+        .get(3)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"))
+    {
+        Some(w_count) => crate::builtins::space_index_w(w_count)?,
+        None => -1,
     };
     Ok(w_str_from_wtf8(wtf8_replace(s, old, new, maxcount)))
 }
@@ -852,34 +948,28 @@ fn wtf8_idx_window(
 
 pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "find", 1)?;
+    arity_at_most(args, "find", 3)?;
+    require_str_sub(args, "find")?;
     Ok(w_int_new(str_unwrap_and_search(args, true)?.unwrap_or(-1)))
 }
 
 pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rfind", 1)?;
+    arity_at_most(args, "rfind", 3)?;
+    require_str_sub(args, "rfind")?;
     Ok(w_int_new(str_unwrap_and_search(args, false)?.unwrap_or(-1)))
 }
 
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "upper")?;
+    require_no_args(args, "upper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let out = wtf8_map_chars(s, |c, out| {
-        for u in c.to_uppercase() {
-            out.push_char(u);
-        }
-    });
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8(wtf8_map_str_runs(s, str::to_uppercase)))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "lower")?;
+    require_no_args(args, "lower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let out = wtf8_map_chars(s, |c, out| {
-        for l in c.to_lowercase() {
-            out.push_char(l);
-        }
-    });
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8(wtf8_map_str_runs(s, str::to_lowercase)))
 }
 
 /// PyPy: unicodeobject.py descr_format
@@ -942,7 +1032,8 @@ fn format_render(
     depth: u32,
 ) -> Result<Wtf8Buf, crate::PyError> {
     use rustpython_common::format::{
-        FieldName, FieldNamePart, FieldType, FormatPart, FormatString, FromTemplate,
+        FieldName, FieldNamePart, FieldType, FormatParseError, FormatPart, FormatString,
+        FromTemplate,
     };
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if let Some(m) = mapping {
@@ -981,8 +1072,31 @@ fn format_render(
         // `_get_argument` — resolve the base argument named by the field,
         // threading the auto-/manual-numbering state (`None` = uncommitted,
         // `Some(true)` = automatic `{}`, `Some(false)` = manual `{0}`).
-        let FieldName { field_type, parts } =
-            FieldName::parse(field_name).map_err(|e| format_parse_err(e, fmt))?;
+        //
+        // A missing `]` terminates the field, so it precedes base-argument
+        // resolution; every other chain error (empty attribute, empty/`!`
+        // item, stray char after `]`) is a resolution error that follows the
+        // base lookup. Classify only the head (up to the first `.`/`[`) here,
+        // so a missing/out-of-range base raises IndexError/KeyError before a
+        // malformed attribute or item chain raises ValueError.
+        let full = FieldName::parse(field_name);
+        if matches!(full, Err(FormatParseError::MissingRightBracket)) {
+            return Err(format_parse_err(FormatParseError::MissingRightBracket, fmt));
+        }
+        let mut head = Wtf8Buf::new();
+        for ch in field_name.code_points() {
+            if ch == '.' || ch == '[' {
+                break;
+            }
+            head.push(ch);
+        }
+        let FieldName { field_type, .. } =
+            FieldName::parse(&head).map_err(|e| format_parse_err(e, fmt))?;
+        if mapping.is_some() && matches!(field_type, FieldType::Auto | FieldType::Index(_)) {
+            return Err(crate::PyError::value_error(
+                "Format string contains positional fields",
+            ));
+        }
         let mut val = match field_type {
             FieldType::Auto => {
                 if let Some(false) = *numbering {
@@ -1019,6 +1133,10 @@ fn format_render(
             }
         };
 
+        // Surface any remaining chain parse error now that the base argument
+        // has been resolved, then walk the attribute/item chain.
+        let FieldName { parts, .. } = full.map_err(|e| format_parse_err(e, fmt))?;
+
         // `_resolve_lookups` — walk the `.attr` / `[element]` chain; a
         // bracketed all-digit element is an integer index, anything else a
         // string key (already classified by `FieldNamePart`).
@@ -1031,6 +1149,18 @@ fn format_render(
                     crate::baseobjspace::getitem(val, pyre_object::w_int_new(*idx as i64))?
                 }
                 FieldNamePart::StringIndex(key) => {
+                    // An all-digit bracket element that reached here overflowed
+                    // the integer index — a value that fits is already
+                    // classified as `Index` — so reject it like the head does.
+                    if key
+                        .as_str()
+                        .ok()
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    {
+                        return Err(crate::PyError::value_error(
+                            "Too many decimal digits in format string",
+                        ));
+                    }
                     crate::baseobjspace::getitem(val, pyre_object::w_str_from_wtf8(key.clone()))?
                 }
             };
@@ -1460,9 +1590,9 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if spec.is_empty() {
         // `str(self)` — a str self passes through as WTF-8.
         if unsafe { pyre_object::is_str(args[0]) } {
-            return Ok(pyre_object::w_str_from_wtf8(
-                unsafe { pyre_object::w_str_get_wtf8(args[0]) }.to_wtf8_buf(),
-            ));
+            return Ok(pyre_object::w_str_from_wtf8(unsafe {
+                crate::display::py_str_wtf8(args[0])?
+            }));
         }
         return Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }));
     }
@@ -1515,12 +1645,64 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
             }
             return format_finite_float(v, spec);
         }
+        if let Some((re, im)) = crate::objspace::descroperation::complex_val(val) {
+            let p = parse_spec(spec);
+            if p.fill == '0' {
+                return Err(crate::PyError::value_error(
+                    "Zero padding is not allowed in complex format specifier",
+                ));
+            }
+            if p.align == Some('=') {
+                return Err(crate::PyError::value_error(
+                    "'=' alignment flag is not allowed in complex format specifier",
+                ));
+            }
+            let align = p.align.unwrap_or('>');
+            // No presentation type and no precision: pad str(self), which
+            // already carries the parentheses / bare-imaginary form.
+            if p.ty == '\0' && p.precision.is_none() {
+                let body = Wtf8Buf::from_string(crate::py_str(val)?);
+                return Ok(pad_wtf8(&body, p.fill, align, p.width));
+            }
+            // A presentation type or precision formats the real and imaginary
+            // parts as floats and joins them; the imaginary part always
+            // carries an explicit sign and the whole ends in `j`.
+            let prec = p
+                .precision
+                .map(|precision| format!(".{precision}"))
+                .unwrap_or_default();
+            let ty = if p.ty == '\0' { 'f' } else { p.ty };
+            let re_spec = format!("{prec}{ty}");
+            let im_spec = format!("+{prec}{ty}");
+            let mut body = format_finite_float(re, &re_spec)?;
+            let im_str = format_finite_float(im, &im_spec)?;
+            body.push_wtf8(&im_str);
+            body.push_char('j');
+            return Ok(pad_wtf8(&body, p.fill, align, p.width));
+        }
         if pyre_object::is_str(val) {
             let full = pyre_object::w_str_get_wtf8(val);
             // The shared string formatter rejects grouping and numeric types
             // but not a sign or `=` alignment, which are also disallowed for
             // strings.
             reject_string_sign_align(spec)?;
+            // A `0` fill flag at the start of the width pads text with the
+            // default-left alignment; the shared formatter treats it as a
+            // numeric alignment, so handle it here.
+            let sc: Vec<char> = spec.chars().collect();
+            let zero_fill = if sc.len() >= 2 && matches!(sc[1], '<' | '>' | '=' | '^') {
+                sc.get(2) == Some(&'0')
+            } else if sc
+                .first()
+                .is_some_and(|c| matches!(c, '<' | '>' | '=' | '^'))
+            {
+                sc.get(1) == Some(&'0')
+            } else {
+                sc.first() == Some(&'0')
+            };
+            if zero_fill {
+                return format_surrogate_str(full, spec);
+            }
             // A valid-UTF-8 body goes through the shared string formatter,
             // which pads by code point.
             if let Ok(valid) = full.as_str() {
@@ -1548,10 +1730,11 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
     }
 }
 
-/// Reject a sign flag or `=` alignment in a string format spec — both are
-/// disallowed for `str` values but accepted by the shared formatter.  Only
-/// the *explicit* alignment is inspected: a leading `0` flag (which the
-/// shared parser normalises to `=`) is a zero fill and stays legal for text.
+/// Reject a sign flag, `=` alignment, or `#` alternate form in a string
+/// format spec — all disallowed for `str` values but accepted by the shared
+/// formatter.  Only the *explicit* alignment is inspected: a leading `0` flag
+/// (which the shared parser normalises to `=`) is a zero fill and stays legal
+/// for text, and a `#` used as a fill character precedes the alignment.
 fn reject_string_sign_align(spec: &str) -> Result<(), crate::PyError> {
     let chars: Vec<char> = spec.chars().collect();
     let n = chars.len();
@@ -1576,6 +1759,11 @@ fn reject_string_sign_align(spec: &str) -> Result<(), crate::PyError> {
             "Sign not allowed in string format specifier"
         }));
     }
+    if i < n && chars[i] == '#' {
+        return Err(crate::PyError::value_error(
+            "Alternate form (#) not allowed in string format specifier",
+        ));
+    }
     Ok(())
 }
 
@@ -1598,6 +1786,10 @@ fn format_surrogate_str(body: &Wtf8, spec: &str) -> Result<Wtf8Buf, crate::PyErr
     } else if n >= 1 && matches!(chars[0], '<' | '>' | '=' | '^') {
         align = chars[0];
         i = 1;
+    }
+    if i < n && chars[i] == '0' {
+        fill = '0';
+        i += 1;
     }
     let mut width = 0usize;
     while i < n && chars[i].is_ascii_digit() {
@@ -1955,10 +2147,11 @@ pub fn encode_object(
         "raw-unicode-escape" => Ok(encode_raw_unicode_escape(s)),
         _ => match encode_utf16_32(s, &enc_lower, w_object, errors) {
             Some(out) => out,
-            None => Err(crate::PyError::new(
-                crate::PyErrorKind::LookupError,
-                format!("unknown encoding: {encoding}"),
-            )),
+            None => {
+                let encoded =
+                    crate::module::_codecs::encode_text_codec(w_object, encoding, errors)?;
+                Ok(unsafe { pyre_object::bytesobject::bytes_like_data(encoded) }.to_vec())
+            }
         },
     }
 }
@@ -2525,19 +2718,34 @@ fn decode_utf32_impl(
 /// Map each scalar code point of `s` through `f`, appending to a
 /// `Wtf8Buf`; a lone surrogate passes through unchanged.  Used by the
 /// case-mapping methods, which leave surrogates untouched.
-fn wtf8_map_chars(s: &Wtf8, f: impl Fn(char, &mut Wtf8Buf)) -> Wtf8Buf {
+/// Apply a whole-string case transform (`str::to_lowercase` / `to_uppercase`)
+/// to each maximal valid-UTF-8 run of `s`, passing lone surrogates through
+/// unchanged.  Operating on the run rather than each scalar preserves the
+/// context rules those transforms encode — notably the Greek Final_Sigma
+/// (`Σ` → `ς` word-finally, `σ` elsewhere).
+fn wtf8_map_str_runs(s: &Wtf8, f: impl Fn(&str) -> String) -> Wtf8Buf {
     let mut out = Wtf8Buf::with_capacity(s.len());
+    let mut run = String::new();
     for cp in s.code_points() {
         match cp.to_char() {
-            Some(c) => f(c, &mut out),
-            None => out.push(cp),
+            Some(c) => run.push(c),
+            None => {
+                if !run.is_empty() {
+                    out.push_str(&f(&run));
+                    run.clear();
+                }
+                out.push(cp);
+            }
         }
+    }
+    if !run.is_empty() {
+        out.push_str(&f(&run));
     }
     out
 }
 
 pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isdigit")?;
+    require_no_args(args, "isdigit")?;
     // A lone surrogate satisfies no character class, so a non-UTF-8
     // backing is never all-digit (and the empty string is false too).
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2549,7 +2757,7 @@ pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isdecimal")?;
+    require_no_args(args, "isdecimal")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_decimal),
@@ -2559,7 +2767,7 @@ pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isnumeric")?;
+    require_no_args(args, "isnumeric")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_numeric),
@@ -2569,7 +2777,7 @@ pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "istitle")?;
+    require_no_args(args, "istitle")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut cased = false;
     let mut prev_cased = false;
@@ -2578,7 +2786,7 @@ pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // any other non-cased code point (the `None` arm / `else`).
         match cp.to_char() {
             Some(c) => {
-                if c.is_uppercase() {
+                if c.is_uppercase() || case::is_titlecase(c) {
                     if prev_cased {
                         return Ok(w_bool_from(false));
                     }
@@ -2601,7 +2809,7 @@ pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isalpha")?;
+    require_no_args(args, "isalpha")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_alpha),
@@ -2612,7 +2820,7 @@ pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_isidentifier
 pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isidentifier")?;
+    require_no_args(args, "isidentifier")?;
     // An identifier cannot contain a lone surrogate, so a non-UTF-8
     // backing is never an identifier.
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2642,7 +2850,7 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let len = s.code_points().count();
     if len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     let need = width - len;
     let mut cps = s.code_points();
@@ -2661,54 +2869,581 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_str_from_wtf8(out))
 }
 
-/// Number of non-overlapping occurrences of `needle` in `haystack`,
-/// scanning over the WTF-8 bytes. The encoding is self-synchronizing,
-/// so a byte-window match starts on a code-point boundary and the count
-/// equals the code-point-level count. An empty needle matches at every
-/// code-point boundary (len+1 positions), as in `str.count`.
-fn wtf8_count(haystack: &Wtf8, needle: &Wtf8) -> usize {
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    if n.is_empty() {
-        return haystack.code_points().count() + 1;
-    }
-    let mut count = 0;
-    let mut i = 0;
-    while i + n.len() <= h.len() {
-        if &h[i..i + n.len()] == n {
-            count += 1;
-            i += n.len();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Count,
+    Find,
+    RFind,
+}
+
+const TWOWAY_MAX_SHIFT: usize = 255;
+const TWOWAY_TABLE_SIZE: usize = 64;
+const TWOWAY_TABLE_MASK: usize = TWOWAY_TABLE_SIZE - 1;
+
+#[inline]
+fn rstring_bloom_add(mask: u64, c: u8) -> u64 {
+    // RPython `rstring.py:bloom_add`, with LONG_BIT = 64 on this target.
+    mask | (1u64 << (c & 63))
+}
+
+#[inline]
+fn rstring_bloom(mask: u64, c: u8) -> bool {
+    // RPython `rstring.py:bloom`.
+    (mask & (1u64 << (c & 63))) != 0
+}
+
+fn rstring_lex_search(needle: &[u8], len_needle: usize, invert_alphabet: bool) -> (usize, usize) {
+    // RPython `rstring.py:_lex_search`.
+    let mut max_suffix = 0usize;
+    let mut candidate = 1usize;
+    let mut k = 0usize;
+    let mut period = 1usize;
+    while candidate + k < len_needle {
+        let a = needle[candidate + k];
+        let b = needle[max_suffix + k];
+        if if invert_alphabet { b < a } else { a < b } {
+            candidate += k + 1;
+            k = 0;
+            period = candidate - max_suffix;
+        } else if a == b {
+            if k + 1 != period {
+                k += 1;
+            } else {
+                candidate += period;
+                k = 0;
+            }
         } else {
-            i += 1;
+            max_suffix = candidate;
+            candidate += 1;
+            k = 0;
+            period = 1;
         }
     }
-    count
+    (max_suffix, period)
+}
+
+fn rstring_factorize(needle: &[u8], len_needle: usize) -> (usize, usize) {
+    // RPython `rstring.py:_factorize`.
+    let (cut1, period1) = rstring_lex_search(needle, len_needle, false);
+    let (cut2, period2) = rstring_lex_search(needle, len_needle, true);
+    if cut1 > cut2 {
+        (cut1, period1)
+    } else {
+        (cut2, period2)
+    }
+}
+
+fn rstring_twoway_preprocess(
+    needle: &[u8],
+    len_needle: usize,
+) -> (usize, usize, usize, bool, [u8; TWOWAY_TABLE_SIZE]) {
+    // RPython `rstring.py:_twoway_preprocess`.
+    let (cut, mut period) = rstring_factorize(needle, len_needle);
+    let mut is_periodic = true;
+    let mut i = 0usize;
+    while i < cut {
+        if needle[i] != needle[period + i] {
+            is_periodic = false;
+            break;
+        }
+        i += 1;
+    }
+    let gap = if is_periodic {
+        0
+    } else {
+        period = cut.max(len_needle - cut) + 1;
+        let mut gap = len_needle;
+        let last = (needle[len_needle - 1] as usize) & TWOWAY_TABLE_MASK;
+        let mut i = len_needle - 1;
+        while i > 0 {
+            i -= 1;
+            if ((needle[i] as usize) & TWOWAY_TABLE_MASK) == last {
+                gap = len_needle - 1 - i;
+                break;
+            }
+        }
+        gap
+    };
+    let not_found_shift = len_needle.min(TWOWAY_MAX_SHIFT) as u8;
+    let mut table = [not_found_shift; TWOWAY_TABLE_SIZE];
+    let mut i = len_needle - not_found_shift as usize;
+    while i < len_needle {
+        table[(needle[i] as usize) & TWOWAY_TABLE_MASK] = (len_needle - 1 - i) as u8;
+        i += 1;
+    }
+    (cut, period, gap, is_periodic, table)
+}
+
+fn rstring_two_way(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    cut: usize,
+    mut period: usize,
+    gap: usize,
+    is_periodic: bool,
+    table: &[u8; TWOWAY_TABLE_SIZE],
+) -> isize {
+    // RPython `rstring.py:_two_way`.
+    let haystack_end = base + n;
+    let mut window_last = base + m - 1;
+    if is_periodic {
+        let mut memory = 0usize;
+        let mut skip_horspool = false;
+        while window_last < haystack_end {
+            if !skip_horspool {
+                loop {
+                    let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                    window_last += shift;
+                    if shift == 0 {
+                        break;
+                    }
+                    if window_last >= haystack_end {
+                        return -1;
+                    }
+                }
+            }
+            skip_horspool = false;
+            let window = window_last + 1 - m;
+            let mut i = cut.max(memory);
+            let mut mismatch = false;
+            while i < m {
+                if needle[i] != value[window + i] {
+                    window_last += i - cut + 1;
+                    memory = 0;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            i = memory;
+            while i < cut {
+                if needle[i] != value[window + i] {
+                    window_last += period;
+                    memory = m - period;
+                    if window_last >= haystack_end {
+                        return -1;
+                    }
+                    let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                    if shift != 0 {
+                        let mem_jump = cut.max(memory) - cut + 1;
+                        memory = 0;
+                        window_last += shift.max(mem_jump);
+                    } else {
+                        skip_horspool = true;
+                    }
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            return (window - base) as isize;
+        }
+        -1
+    } else {
+        if period < gap {
+            period = gap;
+        }
+        let gap_jump_end = (cut + gap).min(m);
+        while window_last < haystack_end {
+            loop {
+                let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                window_last += shift;
+                if shift == 0 {
+                    break;
+                }
+                if window_last >= haystack_end {
+                    return -1;
+                }
+            }
+            let window = window_last + 1 - m;
+            let mut mismatch = false;
+            let mut i = cut;
+            while i < gap_jump_end {
+                if needle[i] != value[window + i] {
+                    window_last += gap;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            i = gap_jump_end;
+            while i < m {
+                if needle[i] != value[window + i] {
+                    window_last += i - cut + 1;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            i = 0;
+            while i < cut {
+                if needle[i] != value[window + i] {
+                    window_last += period;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            return (window - base) as isize;
+        }
+        -1
+    }
+}
+
+fn rstring_two_way_count(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    cut: usize,
+    period: usize,
+    gap: usize,
+    is_periodic: bool,
+    table: &[u8; TWOWAY_TABLE_SIZE],
+) -> usize {
+    // RPython `rstring.py:_two_way_count`.
+    let mut index = 0usize;
+    let mut count = 0usize;
+    loop {
+        let result = rstring_two_way(
+            value,
+            base + index,
+            n - index,
+            needle,
+            m,
+            cut,
+            period,
+            gap,
+            is_periodic,
+            table,
+        );
+        if result == -1 {
+            return count;
+        }
+        count += 1;
+        index += result as usize + m;
+    }
+}
+
+fn rstring_default_find(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    mode: SearchMode,
+) -> isize {
+    // RPython `rstring.py:_default_find`.
+    let w = n - m;
+    let mlast = m - 1;
+    let mut count = 0usize;
+    let mut gap = mlast;
+    let last = needle[mlast];
+    let mut mask = 0u64;
+    let mut j = 0usize;
+    while j < mlast {
+        mask = rstring_bloom_add(mask, needle[j]);
+        if needle[j] == last {
+            gap = mlast - j - 1;
+        }
+        j += 1;
+    }
+    mask = rstring_bloom_add(mask, last);
+    let mut i = 0usize;
+    while i <= w {
+        if value[base + mlast + i] == last {
+            j = 0;
+            while j < mlast {
+                if value[base + i + j] != needle[j] {
+                    break;
+                }
+                j += 1;
+            }
+            if j == mlast {
+                if mode != SearchMode::Count {
+                    return i as isize;
+                }
+                count += 1;
+                i += mlast;
+            } else {
+                let la = base + mlast + i + 1;
+                let c = if la < value.len() { value[la] } else { 0 };
+                if !rstring_bloom(mask, c) {
+                    i += m;
+                } else {
+                    i += gap;
+                }
+            }
+        } else {
+            let la = base + mlast + i + 1;
+            let c = if la < value.len() { value[la] } else { 0 };
+            if !rstring_bloom(mask, c) {
+                i += m;
+            }
+        }
+        i += 1;
+    }
+    if mode != SearchMode::Count {
+        -1
+    } else {
+        count as isize
+    }
+}
+
+fn rstring_adaptive_find(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    mode: SearchMode,
+) -> isize {
+    // RPython `rstring.py:_adaptive_find`.
+    let w = n - m;
+    let mlast = m - 1;
+    let mut count = 0usize;
+    let mut gap = mlast;
+    let mut hits = 0usize;
+    let last = needle[mlast];
+    let mut mask = 0u64;
+    let mut j = 0usize;
+    while j < mlast {
+        mask = rstring_bloom_add(mask, needle[j]);
+        if needle[j] == last {
+            gap = mlast - j - 1;
+        }
+        j += 1;
+    }
+    mask = rstring_bloom_add(mask, last);
+    let mut i = 0usize;
+    while i <= w {
+        if value[base + mlast + i] == last {
+            j = 0;
+            while j < mlast {
+                if value[base + i + j] != needle[j] {
+                    break;
+                }
+                j += 1;
+            }
+            if j == mlast {
+                if mode != SearchMode::Count {
+                    return i as isize;
+                }
+                count += 1;
+                i += mlast;
+            } else {
+                hits += j + 1;
+                if hits > m / 4 && w - i > 2000 {
+                    let (cut, period, gap, is_periodic, table) =
+                        rstring_twoway_preprocess(needle, m);
+                    if mode != SearchMode::Count {
+                        let res = rstring_two_way(
+                            value,
+                            base + i,
+                            n - i,
+                            needle,
+                            m,
+                            cut,
+                            period,
+                            gap,
+                            is_periodic,
+                            &table,
+                        );
+                        return if res == -1 { -1 } else { res + i as isize };
+                    }
+                    let res = rstring_two_way_count(
+                        value,
+                        base + i,
+                        n - i,
+                        needle,
+                        m,
+                        cut,
+                        period,
+                        gap,
+                        is_periodic,
+                        &table,
+                    );
+                    return (res + count) as isize;
+                }
+                let la = base + mlast + i + 1;
+                let c = if la < value.len() { value[la] } else { 0 };
+                if !rstring_bloom(mask, c) {
+                    i += m;
+                } else {
+                    i += gap;
+                }
+            }
+        } else {
+            let la = base + mlast + i + 1;
+            let c = if la < value.len() { value[la] } else { 0 };
+            if !rstring_bloom(mask, c) {
+                i += m;
+            }
+        }
+        i += 1;
+    }
+    if mode != SearchMode::Count {
+        -1
+    } else {
+        count as isize
+    }
+}
+
+fn rstring_search_normal(
+    value: &[u8],
+    other: &[u8],
+    mut start: usize,
+    mut end: usize,
+    mode: SearchMode,
+) -> isize {
+    // RPython `rstring.py:_search_normal`, specialized to byte-backed
+    // PyPy unicode `_utf8` / pyre WTF-8 storage.
+    end = end.min(value.len());
+    start = start.min(end);
+    let n = end - start;
+    let m = other.len();
+    if m == 0 {
+        return match mode {
+            SearchMode::Count => (end - start + 1) as isize,
+            SearchMode::RFind => end as isize,
+            SearchMode::Find => start as isize,
+        };
+    }
+    let Some(w) = n.checked_sub(m) else {
+        return if mode == SearchMode::Count { 0 } else { -1 };
+    };
+    if mode != SearchMode::RFind {
+        let res = if n < 2500 || (m < 100 && n < 30000) || m < 6 {
+            rstring_default_find(value, start, n, other, m, mode)
+        } else if (m >> 2) * 3 < (n >> 2) {
+            let (cut, period, gap, is_periodic, table) = rstring_twoway_preprocess(other, m);
+            if mode == SearchMode::Count {
+                return rstring_two_way_count(
+                    value,
+                    start,
+                    n,
+                    other,
+                    m,
+                    cut,
+                    period,
+                    gap,
+                    is_periodic,
+                    &table,
+                ) as isize;
+            }
+            rstring_two_way(
+                value,
+                start,
+                n,
+                other,
+                m,
+                cut,
+                period,
+                gap,
+                is_periodic,
+                &table,
+            )
+        } else {
+            rstring_adaptive_find(value, start, n, other, m, mode)
+        };
+        if mode == SearchMode::Count {
+            res
+        } else if res == -1 {
+            -1
+        } else {
+            start as isize + res
+        }
+    } else {
+        // RPython `rstring.py:_search_normal` reverse-find branch.
+        let mlast = m - 1;
+        let mut skip = mlast;
+        let mut mask = rstring_bloom_add(0, other[0]);
+        let mut i = mlast;
+        while i > 0 {
+            mask = rstring_bloom_add(mask, other[i]);
+            if other[i] == other[0] {
+                skip = i - 1;
+            }
+            i -= 1;
+        }
+        let mut i = start + w + 1;
+        while i > start {
+            i -= 1;
+            if value[i] == other[0] {
+                let mut matched = true;
+                let mut j = mlast;
+                while j > 0 {
+                    if value[i + j] != other[j] {
+                        matched = false;
+                        break;
+                    }
+                    j -= 1;
+                }
+                if matched {
+                    return i as isize;
+                }
+                if i > 0 && !rstring_bloom(mask, value[i - 1]) {
+                    i = i.saturating_sub(m);
+                } else {
+                    i = i.saturating_sub(skip);
+                }
+            } else if i > 0 && !rstring_bloom(mask, value[i - 1]) {
+                i = i.saturating_sub(m);
+            }
+        }
+        -1
+    }
+}
+
+/// Number of non-overlapping occurrences of `needle` in `haystack`,
+/// scanning over the WTF-8 bytes. PyPy's `unicodeobject.py:1116` delegates
+/// to `_utf8.count`; the RPython translation path for non-host strings is
+/// `rstring.py:_search_normal(..., SEARCH_COUNT)`.
+fn wtf8_count(haystack: &Wtf8, needle: &Wtf8) -> usize {
+    if needle.is_empty() {
+        return haystack.code_points().count() + 1;
+    }
+    rstring_search_normal(
+        haystack.as_bytes(),
+        needle.as_bytes(),
+        0,
+        haystack.len(),
+        SearchMode::Count,
+    ) as usize
 }
 
 /// First byte offset of `needle` fully within `haystack[lo..hi]`, over
-/// WTF-8 bytes. An empty needle matches at `lo`.
+/// WTF-8 bytes. PyPy `unicodeobject.py:_unwrap_and_search` searches the
+/// `_utf8` storage after converting codepoint bounds to byte bounds.
 fn wtf8_find_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(lo);
-    }
-    if needle.len() > hi {
-        return None;
-    }
-    (lo..=hi - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+    let res = rstring_search_normal(haystack, needle, lo, hi, SearchMode::Find);
+    if res == -1 { None } else { Some(res as usize) }
 }
 
 /// Last byte offset of `needle` fully within `haystack[lo..hi]`, over
-/// WTF-8 bytes. An empty needle matches at `hi`.
+/// WTF-8 bytes. Mirrors `rstring.py:_search_normal(..., SEARCH_RFIND)`.
 fn wtf8_rfind_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(hi);
-    }
-    if needle.len() > hi {
-        return None;
-    }
-    (lo..=hi - needle.len())
-        .rev()
-        .find(|&i| &haystack[i..i + needle.len()] == needle)
+    let res = rstring_search_normal(haystack, needle, lo, hi, SearchMode::RFind);
+    if res == -1 { None } else { Some(res as usize) }
 }
 
 /// PyPy `_unwrap_and_search` (unicodeobject.py:1288-1317) — the shared
@@ -2769,6 +3504,8 @@ fn str_unwrap_and_search(
 /// PyPy: unicodeobject.py descr_count
 pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "count", 1)?;
+    arity_at_most(args, "count", 3)?;
+    require_str_sub(args, "count")?;
     // Operands read as WTF-8 so lone surrogates do not panic; the optional
     // start / end arguments bound the count window over the code points.
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
@@ -2786,6 +3523,8 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// "substring not found" (ValueError).
 pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "index", 1)?;
+    arity_at_most(args, "index", 3)?;
+    require_str_sub(args, "index")?;
     match str_unwrap_and_search(args, true)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
@@ -2797,6 +3536,8 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// unicodeobject.py:572 descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rindex", 1)?;
+    arity_at_most(args, "rindex", 3)?;
+    require_str_sub(args, "rindex")?;
     match str_unwrap_and_search(args, false)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
@@ -2805,79 +3546,23 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// PyPy: unicodeobject.py descr_title
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "title")?;
+    require_no_args(args, "title")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let mut result = Wtf8Buf::with_capacity(s.len());
-    let mut prev_is_sep = true;
-    for cp in s.code_points() {
-        match cp.to_char() {
-            Some(c) => {
-                if prev_is_sep {
-                    for u in c.to_uppercase() {
-                        result.push_char(u);
-                    }
-                } else {
-                    for l in c.to_lowercase() {
-                        result.push_char(l);
-                    }
-                }
-                prev_is_sep = !c.is_alphanumeric();
-            }
-            // A lone surrogate is not alphanumeric — it starts a new word.
-            None => {
-                result.push(cp);
-                prev_is_sep = true;
-            }
-        }
-    }
-    Ok(w_str_from_wtf8(result))
+    Ok(w_str_from_wtf8(case::title_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "capitalize")?;
+    require_no_args(args, "capitalize")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let mut result = Wtf8Buf::with_capacity(s.len());
-    let mut cps = s.code_points();
-    if let Some(first) = cps.next() {
-        match first.to_char() {
-            Some(c) => {
-                for u in c.to_uppercase() {
-                    result.push_char(u);
-                }
-            }
-            None => result.push(first),
-        }
-        for cp in cps {
-            match cp.to_char() {
-                Some(c) => {
-                    for l in c.to_lowercase() {
-                        result.push_char(l);
-                    }
-                }
-                None => result.push(cp),
-            }
-        }
-    }
-    Ok(w_str_from_wtf8(result))
+    Ok(w_str_from_wtf8(case::capitalize_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "swapcase")?;
+    require_no_args(args, "swapcase")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let out = wtf8_map_chars(s, |c, out| {
-        if c.is_uppercase() {
-            for l in c.to_lowercase() {
-                out.push_char(l);
-            }
-        } else {
-            for u in c.to_uppercase() {
-                out.push_char(u);
-            }
-        }
-    });
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8(case::swapcase_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_center
@@ -2912,6 +3597,18 @@ fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) {
     }
 }
 
+/// `unicode_result_unchanged`: a str method whose result equals the
+/// receiver returns the receiver itself only when it is an exact `str`; a
+/// `str` subclass is copied to a fresh base `str`, since str methods never
+/// return a subclass instance.
+pub(crate) fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
+    if unsafe { is_exact_type(obj, &STR_TYPE) } {
+        obj
+    } else {
+        w_str_from_wtf8(unsafe { w_str_get_wtf8(obj) }.to_owned())
+    }
+}
+
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "center", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2919,7 +3616,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let fillchar = pad_fillchar(args, "center")?;
     let s_len = s.code_points().count();
     if s_len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     // unicodeobject.py:1098 d = (width - len) ; lpad = d//2 + (d & width & 1)
     let d = width - s_len;
@@ -2940,7 +3637,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let fillchar = pad_fillchar(args, "ljust")?;
     let s_len = s.code_points().count();
     if s_len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
     out.push_wtf8(s);
@@ -2956,7 +3653,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let fillchar = pad_fillchar(args, "rjust")?;
     let s_len = s.code_points().count();
     if s_len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
     push_cp_repeated(&mut out, fillchar, width - s_len);
@@ -2977,7 +3674,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// Empty string returns True per CPython.  Delegates the per-character
 /// category check to `classify::is_printable`.
 pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isprintable")?;
+    require_no_args(args, "isprintable")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     // Empty returns True (vacuous); a lone surrogate is not printable.
     let result = match s.as_str() {
@@ -2989,7 +3686,7 @@ pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// PyPy: unicodeobject.py descr_isspace
 pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isspace")?;
+    require_no_args(args, "isspace")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_space),
@@ -3026,21 +3723,21 @@ fn wtf8_cased_all(s: &Wtf8, want_upper: bool) -> bool {
 
 /// PyPy: unicodeobject.py descr_isupper
 pub fn str_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isupper")?;
+    require_no_args(args, "isupper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, true)))
 }
 
 /// PyPy: unicodeobject.py descr_islower
 pub fn str_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "islower")?;
+    require_no_args(args, "islower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, false)))
 }
 
 /// PyPy: unicodeobject.py descr_isalnum
 pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isalnum")?;
+    require_no_args(args, "isalnum")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_alnum),
@@ -3051,7 +3748,7 @@ pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_isascii
 pub fn str_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isascii")?;
+    require_no_args(args, "isascii")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => v.is_ascii(),
@@ -3116,8 +3813,17 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
 /// PyPy: unicodeobject.py descr_partition
 pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "str.partition", 1)?;
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "must be str, not {}",
+            arg_type_name(args[1])
+        )));
+    }
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    if sep.is_empty() {
+        return Err(crate::PyError::value_error("empty separator"));
+    }
     match wtf8_find_bounded(s, sep, 0, s.len()) {
         Some(i) => Ok(w_tuple_new(vec![
             wtf8_slice_str(&s[..i]),
@@ -3131,8 +3837,17 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// PyPy: unicodeobject.py descr_rpartition
 pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "str.rpartition", 1)?;
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "must be str, not {}",
+            arg_type_name(args[1])
+        )));
+    }
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    if sep.is_empty() {
+        return Err(crate::PyError::value_error("empty separator"));
+    }
     match wtf8_rfind_bounded(s, sep, 0, s.len()) {
         Some(i) => Ok(w_tuple_new(vec![
             wtf8_slice_str(&s[..i]),
@@ -3151,6 +3866,19 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "splitlines")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "splitlines() takes at most 1 argument ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
+    crate::builtins::kwarg_reject_duplicate(
+        kwargs,
+        "splitlines",
+        "keepends",
+        pos.get(1).is_some(),
+    )?;
     // `\n` / `\r` are single bytes that cannot occur inside a multi-byte
     // WTF-8 sequence, so the line boundaries are found by walking bytes;
     // each emitted slice cuts on a code-point boundary.
@@ -3193,11 +3921,17 @@ pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             pos.len().saturating_sub(1)
         )));
     }
+    if !unsafe { pyre_object::is_str(pos[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "removeprefix() argument must be str, not {}",
+            arg_type_name(pos[1])
+        )));
+    }
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let prefix = unsafe { w_str_get_wtf8(pos[1]) };
     match s.strip_prefix(prefix) {
         Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
-        None => Ok(pos[0]),
+        None => Ok(str_result_unchanged(pos[0])),
     }
 }
 
@@ -3210,27 +3944,70 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             pos.len().saturating_sub(1)
         )));
     }
+    if !unsafe { pyre_object::is_str(pos[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "removesuffix() argument must be str, not {}",
+            arg_type_name(pos[1])
+        )));
+    }
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let suffix = unsafe { w_str_get_wtf8(pos[1]) };
     match s.strip_suffix(suffix) {
         Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
-        None => Ok(pos[0]),
+        None => Ok(str_result_unchanged(pos[0])),
     }
 }
 
 /// PyPy: unicodeobject.py descr_expandtabs
 pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "expandtabs")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let tabsize = if args.len() > 1 {
-        unsafe { w_int_get_value(args[1]) }
-    } else {
-        8
+    // `tabsize` is positional-or-keyword (default 8).
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "expandtabs() takes at most 1 argument ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
+    let s = unsafe { w_str_get_wtf8(pos[0]) };
+    let tabsize = match pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
+    {
+        Some(t) => crate::builtins::space_index_w(t)?,
+        None => 8,
     };
     // Tabs advance to the next multiple of `tabsize` measured from the
     // start of the current line (the column resets on `\n` / `\r`); a
-    // non-positive `tabsize` drops tabs entirely.
-    let mut result = Wtf8Buf::with_capacity(s.len());
+    // non-positive `tabsize` drops tabs entirely. The expanded length is
+    // tracked with checked arithmetic so a pathological `tabsize` raises
+    // OverflowError instead of attempting an unbounded allocation.
+    let overflow = || crate::PyError::overflow_error("result is too long");
+    let mut total: i64 = 0;
+    let mut col: i64 = 0;
+    for cp in s.code_points() {
+        match cp.to_char() {
+            Some('\t') => {
+                if tabsize > 0 {
+                    let incr = tabsize - (col % tabsize);
+                    col = col.checked_add(incr).ok_or_else(overflow)?;
+                    total = total.checked_add(incr).ok_or_else(overflow)?;
+                }
+            }
+            Some('\n') | Some('\r') => {
+                total = total.checked_add(1).ok_or_else(overflow)?;
+                col = 0;
+            }
+            _ => {
+                total = total.checked_add(1).ok_or_else(overflow)?;
+                col += 1;
+            }
+        }
+    }
+    let cap = usize::try_from(total).map_err(|_| overflow())?;
+    let mut result = Wtf8Buf::with_capacity(cap);
     let mut col: i64 = 0;
     for cp in s.code_points() {
         match cp.to_char() {
@@ -3256,9 +4033,7 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(w_str_from_wtf8(result))
 }
 
-/// PyPy: unicodeobject.py descr_translate
-///
-/// str.translate(table) — table is a dict mapping ordinals (int) to
+/// str.translate(table) — table is a mapping from ordinals (int) to
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "str.translate", 1)?;
@@ -3268,20 +4043,27 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     unsafe {
         for cp in s.code_points() {
             let key = w_int_new(cp.to_u32() as i64);
-            if let Some(val) = w_dict_lookup(table, key) {
-                if is_none(val) {
-                    // None → delete character
-                } else if is_int(val) {
-                    if let Some(c) = CodePoint::from_u32(w_int_get_value(val) as u32) {
+            match crate::baseobjspace::finditem(table, key)? {
+                None => result.push(cp),
+                Some(val) if is_none(val) => {}
+                Some(val) if is_int(val) => {
+                    let code = w_int_get_value(val);
+                    if let Some(c) = u32::try_from(code).ok().and_then(CodePoint::from_u32) {
                         result.push(c);
+                    } else {
+                        return Err(crate::PyError::value_error(
+                            "character mapping must be in range(0x110000)",
+                        ));
                     }
-                } else if is_str(val) {
-                    result.push_wtf8(w_str_get_wtf8(val));
-                } else {
-                    result.push(cp);
                 }
-            } else {
-                result.push(cp);
+                Some(val) if is_str(val) => {
+                    result.push_wtf8(w_str_get_wtf8(val));
+                }
+                Some(_) => {
+                    return Err(crate::PyError::type_error(
+                        "character mapping must return integer, None or str",
+                    ));
+                }
             }
         }
     }

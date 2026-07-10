@@ -1053,6 +1053,9 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // `w_str_get_value`.
     let bytes = w_str_get_wtf8(s).as_bytes();
     let count = repeat_count(n, "new string is too long")?;
+    if count == 1 {
+        return Ok(crate::type_methods::str_result_unchanged(s));
+    }
     let total = bytes
         .len()
         .checked_mul(count)
@@ -2036,8 +2039,24 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_mod(a, b);
         }
-        // str % args — PyPy: unicodeobject.py mod__String_ANY
+        // str % args — reflected-subclass priority: a str subclass on the
+        // right overriding __rmod__ is tried before the built-in formatter.
         if is_str(a) {
+            if let Some((method, w_type)) =
+                crate::baseobjspace::subclass_special_override(b, "__rmod__")
+            {
+                let priority = match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
+                    (Some(at), Some(bt)) => !std::ptr::eq(at, bt) && issubtype_cached(bt, at),
+                    _ => false,
+                };
+                if priority {
+                    match crate::baseobjspace::get_and_call_function(method, b, w_type, &[a]) {
+                        Ok(result) if !is_not_implemented(result) => return Ok(result),
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
             return crate::objspace::std::formatting::str_format_percent(a, b);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
