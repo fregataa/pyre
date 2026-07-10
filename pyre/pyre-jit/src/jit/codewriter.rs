@@ -1155,144 +1155,6 @@ fn collect_cfg_coalesce_pairs(
     pairs
 }
 
-/// Drop coalesce pairs that would TRANSITIVELY merge a
-/// frame-local slot with another DISTINCT frame-local slot, or with any
-/// stack slot, into one regalloc group.
-///
-/// The splice regalloc pre-merges `extra_coalesce_pairs` into the
-/// union-find BEFORE `make_dependencies` runs (no interference graph
-/// exists yet, so no `has_edge` guard applies), so a chain of pairs
-/// through intermediate non-slot Variables (inputargs / stack temps) can
-/// unify `i`/`s`/`j` even when no single pair directly links two slots
-/// (mult/m12: `cfg_cross == 0` yet 3 slots collapse to one rep).  Once the
-/// slots share a union-find rep they can no longer be re-separated — body
-/// locals are kept on distinct colors purely by the natural SSA-liveness
-/// interference of the `mergeable()` block inputargs, so a wrongful merge
-/// here would leave the resume reverse map non-injective.
-///
-/// This simulates the same in-order union-find merge the regalloc applies
-/// and skips any pair whose union would place two different frame slots —
-/// two distinct frame-local slots, two distinct stack slots, or a
-/// frame-local and a stack slot — in one group.  A skipped pair's
-/// endpoints get a `*_copy` at flatten time instead of sharing a register —
-/// correct, since they hold distinct frame slots.  Two distinct stack slots
-/// must not coalesce either: a guard compare's two operands occupy adjacent
-/// stack slots and are simultaneously live, so merging them aliases one
-/// register across both operands and the pre-merge voids the SSA-liveness
-/// edge that would otherwise keep them apart (simultaneously-live stack
-/// slots interfere through normal liveness only as long as the pre-merge
-/// does not collapse them).  Distinct stack slots that are
-/// disjoint-live stay free to share a color — the chordal coloring aliases
-/// them when no interference edge forces them apart, so this only forbids
-/// the union-find MERGE, not color reuse.  Only WITHIN-slot pairs survive.
-/// Splice-only (production passes the unfiltered pairs and is byte-identical).
-fn filter_cross_slot_coalesce_pairs(
-    pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    walker_slot_for_variable: &[Option<u16>],
-    nlocals: usize,
-) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
-    use super::flow::VariableId;
-    fn find(parent: &mut HashMap<VariableId, VariableId>, x: VariableId) -> VariableId {
-        let mut root = x;
-        while let Some(&p) = parent.get(&root) {
-            if p == root {
-                break;
-            }
-            root = p;
-        }
-        let mut cur = x;
-        while let Some(&p) = parent.get(&cur) {
-            if p == root {
-                break;
-            }
-            parent.insert(cur, root);
-            cur = p;
-        }
-        root
-    }
-    let slot_of = |id: VariableId| -> Option<u16> {
-        walker_slot_for_variable
-            .get(id.0 as usize)
-            .copied()
-            .flatten()
-    };
-    let local_of =
-        |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) < nlocals) };
-    let stack_of =
-        |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) >= nlocals) };
-    // Claim at most one slot of a given kind for the merged group, treating
-    // a second distinct slot of that kind as a conflict.  Returns the
-    // claimed slot (if any) or signals a conflict.
-    let claim_slot = |candidates: [Option<u16>; 4]| -> Result<Option<u16>, ()> {
-        let mut claimed: Option<u16> = None;
-        for s in candidates.into_iter().flatten() {
-            match claimed {
-                None => claimed = Some(s),
-                Some(c) if c == s => {}
-                Some(_) => return Err(()),
-            }
-        }
-        Ok(claimed)
-    };
-    let mut parent: HashMap<VariableId, VariableId> = HashMap::new();
-    // Frame-local slot claimed by each union-find root (absent = the group
-    // touches no frame-local slot).
-    let mut group_local: HashMap<VariableId, u16> = HashMap::new();
-    // Stack slot claimed by each union-find root (absent = the group touches
-    // no stack slot).
-    let mut group_stack: HashMap<VariableId, u16> = HashMap::new();
-    let mut kept = Vec::with_capacity(pairs.len());
-    for &(a, b) in pairs {
-        parent.entry(a).or_insert(a);
-        parent.entry(b).or_insert(b);
-        let ra = find(&mut parent, a);
-        let rb = find(&mut parent, b);
-        if ra == rb {
-            kept.push((a, b));
-            continue;
-        }
-        // The single frame-local slot the merged group may claim, or a
-        // conflict if the two groups + raw endpoints name 2+ distinct
-        // frame-local slots.
-        let Ok(claimed_local) = claim_slot([
-            group_local.get(&ra).copied(),
-            group_local.get(&rb).copied(),
-            local_of(a),
-            local_of(b),
-        ]) else {
-            continue;
-        };
-        // Likewise the single stack slot the merged group may claim: two
-        // distinct stack slots hold simultaneously-live values (e.g. the
-        // two operands of a guard compare), so merging them would alias one
-        // register across both and the pre-merge would void the SSA-liveness
-        // edge that keeps them apart.  Reject the cross-slot stack merge.
-        let Ok(claimed_stack) = claim_slot([
-            group_stack.get(&ra).copied(),
-            group_stack.get(&rb).copied(),
-            stack_of(a),
-            stack_of(b),
-        ]) else {
-            continue;
-        };
-        // A frame-local slot must not share a register group with any stack
-        // slot (local↔stack collision), so reject a merge that would put a
-        // claimed local and a claimed stack slot together.
-        if claimed_local.is_some() && claimed_stack.is_some() {
-            continue;
-        }
-        parent.insert(rb, ra);
-        if let Some(s) = claimed_local {
-            group_local.insert(ra, s);
-        }
-        if let Some(s) = claimed_stack {
-            group_stack.insert(ra, s);
-        }
-        kept.push((a, b));
-    }
-    kept
-}
-
 /// Port of `rpython/translator/simplify.py` `eliminate_empty_blocks`.
 ///
 /// `simplify_graph` (`translator.py:55-56`) runs this right after
@@ -1940,59 +1802,6 @@ fn record_graph_op(
     let op = super::flow::SpaceOperation::new(opname, args, result, offset);
     super::flow::push_op(block, op.clone());
     op
-}
-
-/// Production-flip bridge: pair a graph dual-write's result
-/// `Variable` with the SSARepr slot the walker assigned in the same
-/// emit.  No-op when `var` is `None` (residual_call with `ResKind::Void`,
-/// non-portal CodeWriter, etc.).
-///
-/// **Overwrite semantics**: when the same `Variable` is paired across
-/// multiple emit sites (e.g. an inputarg `Variable` initially paired
-/// with its parameter slot, then re-paired with a stack slot when a
-/// `LOAD_FAST` push lands the same `Variable` on the stack), the most
-/// recent pairing wins.  `walker_slot_for_variable[v.id]` therefore
-/// reflects "the slot this Variable currently lives in" at the walk
-/// point of the last `pair_walker_slot` call — not "the Variable's
-/// home slot".  Use [`pair_walker_slot_if_absent`] when the caller
-/// wants first-write-wins instead.
-fn pair_walker_slot(
-    table: &mut Vec<Option<u16>>,
-    var: Option<super::flow::Variable>,
-    walker_slot: u16,
-) {
-    if let Some(v) = var {
-        let idx = v.id.0 as usize;
-        if table.len() <= idx {
-            table.resize(idx + 1, None);
-        }
-        table[idx] = Some(walker_slot);
-    }
-}
-
-/// First-wins variant of `pair_walker_slot`.  Used by the post-walk
-/// FrameState pairing pass that re-iterates every block's mergeable to
-/// seed inputarg Variables; per-PC emit sites have already paired the
-/// Variables they directly produce, and that pairing reflects the
-/// register slot the walker actually wrote into.  A FrameState-derived
-/// slot for the same Variable may differ when the Variable flows through
-/// a stack push/pop that lands it at a non-canonical slot temporarily —
-/// the per-PC pairing must take precedence so canonical's `get_register`
-/// resolves to the slot the walker emit chose.
-fn pair_walker_slot_if_absent(
-    table: &mut Vec<Option<u16>>,
-    var: Option<super::flow::Variable>,
-    walker_slot: u16,
-) {
-    if let Some(v) = var {
-        let idx = v.id.0 as usize;
-        if table.len() <= idx {
-            table.resize(idx + 1, None);
-        }
-        if table[idx].is_none() {
-            table[idx] = Some(walker_slot);
-        }
-    }
 }
 
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
@@ -4794,6 +4603,125 @@ fn build_colive_interference(
         .collect()
 }
 
+/// Derive each Variable's canonical CPython slot from the pcdep snapshots:
+/// the slot it occupies at the earliest resume PC it appears in (POST before
+/// RESUME within a PC).  The inlined-callee frames record their own slots at
+/// the callee PCs (the callee's operand-stack temp sits at its frame-stack
+/// slot), so this spans all inline frames — unlike the outer-frame-only
+/// co-live snapshot pairs.  Each Variable takes the first slot seen for it in
+/// resume-PC order.
+fn pcdep_canonical_slot(
+    pcdep_slot_var: &[Vec<(u16, u32)>],
+    pcdep_slot_var_resume: &[Vec<(u16, u32)>],
+) -> Vec<Option<u16>> {
+    // Slot-indexed by `VariableId.0`.  `None` = the Variable is absent from
+    // every pcdep snapshot (never live at a resume PC).
+    let mut slot_of: Vec<Option<u16>> = Vec::new();
+    let n = pcdep_slot_var.len().max(pcdep_slot_var_resume.len());
+    for py_pc in 0..n {
+        for tbl in [pcdep_slot_var, pcdep_slot_var_resume] {
+            if let Some(snap) = tbl.get(py_pc) {
+                for &(slot, var_id) in snap {
+                    let idx = var_id as usize;
+                    if idx >= slot_of.len() {
+                        slot_of.resize(idx + 1, None);
+                    }
+                    if slot_of[idx].is_none() {
+                        slot_of[idx] = Some(slot);
+                    }
+                }
+            }
+        }
+    }
+    slot_of
+}
+
+/// Slot-identity interference for the splice coalesce filter: a coalesce
+/// candidate whose two endpoints hold DISTINCT canonical CPython slots must
+/// not merge, even when their SSA / CPython-slot live ranges are disjoint
+/// (never co-live at a single resume PC).  Merging two distinct-slot
+/// Variables onto one color extends that color's liveness across a region
+/// where no box is live in it — the liveness side-table then marks the color
+/// active at a resume PC where `regs_r[color]` is `OpRef::NONE`
+/// (`collect_outer_active_boxes` panics).  This is broader than co-liveness:
+/// the inline-callee operand-stack temp and the outer merge inputarg live at
+/// disjoint PCs yet occupy distinct frame-stack slots, so `build_colive_
+/// interference` (which only edges simultaneously-live pairs) never separates
+/// them.  Feeding these edges into the coalesce `has_edge` oracle rejects the
+/// cross-slot merge directly — the pcdep-sourced replacement for the retired
+/// walker-slot cross-slot coalesce filter.  Same-slot pairs (the walker's
+/// COPY/SWAP value lineage) are untouched, so no extra color separation is
+/// forced beyond the merges that were already dropped.
+///
+/// The slot claim is propagated through a union-find over the pairs, so a
+/// TRANSITIVE cross-slot chain is caught even when the bridging Variable has
+/// no canonical slot of its own.  A pass-through link/inputarg temp that never
+/// appears at a resume PC is absent from the pcdep snapshots, so the pairs
+/// `(slot0_var, temp)` and `(temp, slot1_var)` name no directly-distinct
+/// slots; but merging both aliases slot0 and slot1 onto one color.  The group
+/// carries slot0's claim through the first merge, so the second pair's slot1
+/// conflicts and is rejected.  A slot number is unique across locals and stack
+/// (stack slots are `>= nlocals`), so one claim per group suffices — a group
+/// holds at most one distinct slot, and any second distinct slot rejects.  The
+/// rejecting edge is emitted between the pair's direct endpoints;
+/// `DependencyGraph::coalesce` in `filter_coalesce_pairs_by_interference` moves
+/// the edge onto the surviving rep as earlier pairs merge, so the `has_edge`
+/// replay sees it.
+fn build_slot_disjoint_interference(
+    pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    canonical_slot: &[Option<u16>],
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    use super::flow::VariableId;
+    let slot_of =
+        |id: VariableId| -> Option<u16> { canonical_slot.get(id.0 as usize).copied().flatten() };
+    fn find(parent: &mut HashMap<VariableId, VariableId>, x: VariableId) -> VariableId {
+        let mut root = x;
+        while let Some(&p) = parent.get(&root) {
+            if p == root {
+                break;
+            }
+            root = p;
+        }
+        let mut cur = x;
+        while let Some(&p) = parent.get(&cur) {
+            if p == root {
+                break;
+            }
+            parent.insert(cur, root);
+            cur = p;
+        }
+        root
+    }
+    let mut parent: HashMap<VariableId, VariableId> = HashMap::new();
+    // Canonical slot claimed by each union-find root (absent = the group
+    // touches no slotted Variable yet).
+    let mut group_slot: HashMap<VariableId, u16> = HashMap::new();
+    let mut edges = Vec::new();
+    for &(a, b) in pairs {
+        parent.entry(a).or_insert(a);
+        parent.entry(b).or_insert(b);
+        let ra = find(&mut parent, a);
+        let rb = find(&mut parent, b);
+        if ra == rb {
+            continue;
+        }
+        let sa = group_slot.get(&ra).copied().or_else(|| slot_of(a));
+        let sb = group_slot.get(&rb).copied().or_else(|| slot_of(b));
+        if let (Some(x), Some(y)) = (sa, sb) {
+            if x != y {
+                // Merging would alias two distinct slots onto one color.
+                edges.push((a, b));
+                continue;
+            }
+        }
+        parent.insert(rb, ra);
+        if let Some(s) = sa.or(sb) {
+            group_slot.insert(ra, s);
+        }
+    }
+    edges
+}
+
 /// #348 Part (2): build the per-PC `(color, semantic_slot)` map shipped in
 /// `PyJitCodeMetadata::pcdep_color_slots`. For each reachable PC, every slot
 /// live and restorable there contributes `(true SSA color, slot)`, sorted by
@@ -5338,46 +5266,6 @@ impl CodeWriter {
         // (`flatten_graph`) from the graph's `block.operations`; it then
         // feeds `jit::assembler::Assembler::assemble`.
         let mut ssarepr = SSARepr::new(code.obj_name.to_string());
-
-        // Walker slot bridge: each entry maps a graph `Variable.id`
-        // to the frame slot the walker assigned that Variable.  The
-        // splice regalloc coalescing consults it to force every Variable
-        // sharing a frame slot onto one canonical Ref color and to keep
-        // distinct slots on distinct colors, so the dense per-slot resume
-        // reverse map stays injective.  Synthetic graph-only Variables
-        // (no walker counterpart) leave their entry as `None`.
-        let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
-        macro_rules! pin {
-            ($var:expr, $slot:expr $(,)?) => {
-                pair_walker_slot(&mut walker_slot_for_variable, $var, $slot)
-            };
-        }
-        macro_rules! pin_if_absent {
-            ($var:expr, $slot:expr $(,)?) => {
-                pair_walker_slot_if_absent(&mut walker_slot_for_variable, $var, $slot)
-            };
-        }
-        // Seed the bridge with the portal `(frame, ec)` red Variables —
-        // upstream `jtransform.py:840` threads `frame` (and `ec`) as the
-        // leading red args of every vable op; pyre's walker reads them
-        // out of `portal_frame_reg` / `portal_ec_reg` rather than allocating
-        // them per-op, so canonical needs the same fixed slots.
-        pin!(Some(frame_var), portal_frame_reg);
-        pin!(Some(ec_var), portal_ec_reg);
-        // Function args occupy graph startblock inputargs `VariableId(0..nargs)`
-        // and live in walker register slots `0..nargs` (the fast-local
-        // bank base).  Without seeding them, ref_return on `arg0` falls
-        // through to graph regalloc and gets a different colour than the
-        // walker's `Operand::reg(Kind::Ref, 0)` emit.
-        for idx in 0..entry_arg_slots(code) as u16 {
-            pin!(
-                Some(super::flow::Variable::new(
-                    super::flow::VariableId(idx as u32),
-                    Kind::Ref,
-                )),
-                idx,
-            );
-        }
 
         // RPython regalloc.py: keep kind-separated register files.
         // Soft minimums; `touch_reg` auto-grows the files as the dispatch
@@ -6118,6 +6006,16 @@ impl CodeWriter {
         // precise liveness generation. Stack registers stack_base..stack_base+depth
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
+        // Per-PC top-of-stack graph Variable at the resume-depth (pre-dispatch)
+        // FrameState, captured at the same program point `depth_at_pc[py_pc]` is
+        // set. `result_color_at_pc` reads the call-result operand slot's colour
+        // from this Variable's canonical splice colour directly, so the capture
+        // never inverts the walker slot map: the call result is not resume-live
+        // (no `pcdep` entry), but the top-of-stack Variable at a call's
+        // fallthrough pc IS the call op's result. `None` where top-of-stack is a
+        // constant / sentinel rather than a Variable.
+        let mut top_of_stack_var_at_pc: Vec<Option<super::flow::VariableId>> =
+            vec![None; num_instrs];
         // Stage 1a (#348, ADDITIVE / gated by `PYRE_PCDEP_VALIDATE`):
         // per-PC snapshot of `slot -> SSA Variable.id` taken from the
         // post-opcode FrameState. The splice regalloc derives the
@@ -7068,7 +6966,7 @@ impl CodeWriter {
         // canonical `[v_inst, ... descr]` operand shape.
         macro_rules! emit_vable_getfield_ref {
             ($vable_reg:expr, $dst:expr, $field_idx:expr) => {{
-                let dst = $dst;
+                let _dst = $dst;
                 let field_idx: u16 = $field_idx;
                 // `jtransform.py:846-847` getfield: `[v_inst, descr]` → result.
                 // `args[0]` is the vable register holding the live frame
@@ -7098,7 +6996,6 @@ impl CodeWriter {
                         Kind::Ref,
                         -1,
                     );
-                    pin!(Some(result), dst);
                     Some(result)
                 } else {
                     None
@@ -7302,7 +7199,6 @@ impl CodeWriter {
                         Kind::Ref,
                         load_fast_py_pc,
                     );
-                    pin!(Some(v_loaded), stack_base + $depth);
                     let loaded: super::flow::FlowValue = v_loaded.into();
                     let v_stack_idx: super::flow::FlowValue =
                         super::flow::Constant::signed(stack_slot).into();
@@ -7437,6 +7333,14 @@ impl CodeWriter {
                     // `-live-` positions for `pc_map` population are
                     // derived from the spliced SSARepr at finalize time.
                     depth_at_pc[py_pc] = current_depth;
+                    // Record the top-of-stack Variable at this pre-dispatch
+                    // depth so `result_color_at_pc` can source the call-result
+                    // slot colour graph-directly (last write wins on re-walk,
+                    // matching `depth_at_pc`).
+                    top_of_stack_var_at_pc[py_pc] = match current_state.stack.last() {
+                        Some(super::flow::FlowValue::Variable(v)) => Some(v.id),
+                        _ => None,
+                    };
 
                     // #355 B2: snapshot `slot -> Variable.id` from the
                     // PRE-dispatch (resume-depth) FrameState, the state a guard
@@ -7754,7 +7658,6 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(boxed, stack_base + current_depth);
                             let stack_value = boxed
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -7871,7 +7774,6 @@ impl CodeWriter {
                                     Kind::Ref,
                                     -1,
                                 );
-                                pin!(Some(v_loaded), stack_base + current_depth);
                                 let loaded: super::flow::FlowValue = v_loaded.into();
                                 let v_stack_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(stack_slot).into();
@@ -7967,7 +7869,6 @@ impl CodeWriter {
                                 rhs_value,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -7988,7 +7889,6 @@ impl CodeWriter {
                                 rhs_value,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -8010,11 +7910,8 @@ impl CodeWriter {
                             // TOS), so there is no staging copy — mirrors upstream
                             // flatten.py:240-260 which feeds the Variable straight to
                             // `goto_if_not`.
-                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &cond_value {
-                                pin!(Some(*v), cond_reg);
-                            }
                             let bool_value = emit_frontend_bool(
                                 &mut graph,
                                 &current_block.block(),
@@ -8025,7 +7922,6 @@ impl CodeWriter {
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            pin!(Some(bool_value), scratch_truth);
                             // POP_JUMP_IF_FALSE jumps when cond is false; the
                             // bool=true path falls through to PC+1.  Mirror
                             // POP_JUMP_IF_TRUE by attaching BOTH the linkfalse
@@ -8094,11 +7990,8 @@ impl CodeWriter {
                             );
                             // See PopJumpIfFalse — no obj_tmp0 staging
                             // needed; the residual call reads the popped stack slot.
-                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &cond_value {
-                                pin!(Some(*v), cond_reg);
-                            }
                             let bool_value = emit_frontend_bool(
                                 &mut graph,
                                 &current_block.block(),
@@ -8109,7 +8002,6 @@ impl CodeWriter {
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            pin!(Some(bool_value), scratch_truth);
                             // `flatten.py:244-267` for a Bool exitswitch always
                             // emits generic `goto_if_not cond, TLabel(linkfalse)`
                             // + inline `make_link(linktrue)`.
@@ -8404,9 +8296,6 @@ impl CodeWriter {
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                                 }
                             };
-                            if let super::flow::FlowValue::Variable(v) = &result_value {
-                                pin!(Some(*v), loaded_dst_reg);
-                            }
                             current_state.stack.push(result_value.clone());
                             // `loaded_dst_reg == stack_base + current_depth`
                             // here, so the trailing `emit_ref_copy(stack_base +
@@ -8444,11 +8333,8 @@ impl CodeWriter {
                             let nargs = argc.get(op_arg) as usize;
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
-                                let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _arg_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let arg_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &arg_value {
-                                    pin!(Some(*v), arg_reg);
-                                }
                                 graph_arg_values_rev.push(arg_value);
                             }
                             // shared_opcode.rs:56 opcode_call pops null_or_self
@@ -8504,14 +8390,10 @@ impl CodeWriter {
                             let null_or_self_value: super::flow::FlowValue =
                                 match pop_ref_or_fresh(&mut current_state, &mut graph) {
                                     super::flow::FlowValue::Variable(v) => {
-                                        pin!(Some(v), null_or_self_reg);
                                         super::flow::FlowValue::Variable(v)
                                     }
                                     _ => match null_or_self_read {
-                                        Some(v) => {
-                                            pin!(Some(v), null_or_self_reg);
-                                            super::flow::FlowValue::Variable(v)
-                                        }
+                                        Some(v) => super::flow::FlowValue::Variable(v),
                                         None => {
                                             // Non-portal plain-call PY_NULL
                                             // self-slot.  Pass the constant null
@@ -8542,11 +8424,8 @@ impl CodeWriter {
                                         }
                                     },
                                 };
-                            let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &callable_value {
-                                pin!(Some(*v), callable_reg);
-                            }
 
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
@@ -8583,7 +8462,6 @@ impl CodeWriter {
                                     graph_call_args,
                                     py_pc as i64,
                                 );
-                                pin!(Some(result), stack_base + current_depth);
                                 result.into()
                             };
                             if nargs > 14 {
@@ -8606,18 +8484,14 @@ impl CodeWriter {
                         // `opcode_ops::unary_negative_value`; a user `__neg__`
                         // may run Python → MayForce.
                         Instruction::UnaryNegative => {
-                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &val_value {
-                                pin!(Some(*v), val_reg);
-                            }
                             let result_value = emit_frontend_neg(
                                 &mut graph,
                                 &current_block.block(),
                                 val_value,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -8660,11 +8534,8 @@ impl CodeWriter {
                             let argc = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(argc);
                             for _ in 0..argc {
-                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pin!(Some(*v), item_reg);
-                                }
                                 item_values_rev.push(item_value);
                             }
                             // popvalues pops top-first; values_w keeps
@@ -8678,7 +8549,6 @@ impl CodeWriter {
                                 items,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -8714,7 +8584,6 @@ impl CodeWriter {
                                 step_info.map(|(_, value)| value),
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -8816,7 +8685,6 @@ impl CodeWriter {
                                     ResKind::Ref,
                                     py_pc as i64,
                                 );
-                                pin!(normalized_var, exc_reg);
                                 let normalized_exc_fv = normalized_var
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -9007,7 +8875,7 @@ impl CodeWriter {
                             // for the analyzer-equivalent `EF_CANNOT_RAISE
                             // + empty raw frozensets + can_collect=false`
                             // shape (`effectinfo.py:281-283`).
-                            let prev_var = residual_call!(
+                            let _prev_var = residual_call!(
                                 get_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
                                 majit_ir::PyreHelperKind::GetCurrentException,
@@ -9018,7 +8886,6 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(prev_var, scratch_prev);
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
@@ -9044,7 +8911,7 @@ impl CodeWriter {
                             // values to the slot the walker wrote, mirroring the
                             // catch-landing `last_exc_value` pin, so
                             // `get_color` agrees with the runtime register.
-                            let prev_slot = stack_base + current_depth;
+                            let _prev_slot = stack_base + current_depth;
                             let prev_value = fresh_ref_value(&mut graph);
                             current_state.stack.push(prev_value.clone());
                             emit_pushvalue_ref!(
@@ -9053,8 +8920,7 @@ impl CodeWriter {
                                 prev_value.clone(),
                                 py_pc
                             );
-                            pin!(prev_value.as_variable(), prev_slot);
-                            let exc_handler_slot = stack_base + current_depth;
+                            let _exc_handler_slot = stack_base + current_depth;
                             current_state.stack.push(exc_value.clone());
                             emit_pushvalue_ref!(
                                 current_depth,
@@ -9062,7 +8928,6 @@ impl CodeWriter {
                                 exc_value.clone(),
                                 py_pc
                             );
-                            pin!(exc_value.as_variable(), exc_handler_slot);
                         }
 
                         Instruction::CheckExcMatch => {
@@ -9132,9 +8997,6 @@ impl CodeWriter {
                                 Some(v) => v.into(),
                                 None => fresh_ref_value(&mut graph).into(),
                             };
-                            if let super::flow::FlowValue::Variable(v) = &result_value {
-                                pin!(Some(*v), stack_base + current_depth);
-                            }
                             current_state.stack.push(result_value.clone());
                             emit_pushvalue_ref!(current_depth, current_depth, result_value, py_pc);
                         }
@@ -9313,7 +9175,6 @@ impl CodeWriter {
                                 name_idx,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), loaded_dst_reg);
                             let result_fv: super::flow::FlowValue = result_value.into();
                             current_state.stack.push(result_fv.clone());
                             emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
@@ -9328,11 +9189,8 @@ impl CodeWriter {
                             let name_idx = namei.get(op_arg) as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
-                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &stored_value {
-                                pin!(Some(*v), value_reg);
-                            }
                             emit_frontend_store_name(
                                 &mut graph,
                                 &current_block.block(),
@@ -9354,11 +9212,8 @@ impl CodeWriter {
                             let name_idx = namei.get(op_arg) as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
-                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &stored_value {
-                                pin!(Some(*v), value_reg);
-                            }
                             emit_frontend_store_global(
                                 &mut graph,
                                 &current_block.block(),
@@ -9405,7 +9260,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             current_state.stack.push(result_value.into());
                             emit_pushvalue_ref!(
                                 current_depth,
@@ -9488,7 +9342,6 @@ impl CodeWriter {
                                 name_idx_const.clone(),
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             current_state.stack.push(result_value.into());
                             emit_pushvalue_ref!(
                                 current_depth,
@@ -9506,7 +9359,6 @@ impl CodeWriter {
                                     name_idx_const,
                                     py_pc as i64,
                                 );
-                                pin!(Some(bound_value), stack_base + current_depth);
                                 current_state.stack.push(bound_value.into());
                                 emit_pushvalue_ref!(
                                     current_depth,
@@ -9589,7 +9441,7 @@ impl CodeWriter {
                             // Push the items in reverse so the stack top is item[0]
                             // (opcode_unpack_sequence pushes `items.into_iter().rev()`).
                             for k in (0..n).rev() {
-                                let item_dst = stack_base + current_depth;
+                                let _item_dst = stack_base + current_depth;
                                 let item_var = residual_call!(
                                     unpack_item_fn_idx,
                                     CallFlavor::Plain,
@@ -9604,9 +9456,6 @@ impl CodeWriter {
                                 let item_value = item_var
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pin!(Some(*v), item_dst);
-                                }
                                 push_and_bump!(item_value, py_pc);
                             }
                         }
@@ -9620,11 +9469,8 @@ impl CodeWriter {
                         // `opcode_get_iter` → `baseobjspace::iter`; a user
                         // `__iter__` may run Python → `CallFlavor::MayForce`.
                         Instruction::GetIter => {
-                            let iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &iterable_value {
-                                pin!(Some(*v), iterable_reg);
-                            }
                             let iter_var = residual_call!(
                                 get_iter_fn_idx,
                                 CallFlavor::MayForce,
@@ -9638,9 +9484,6 @@ impl CodeWriter {
                             let iter_value = iter_var
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            if let super::flow::FlowValue::Variable(v) = &iter_value {
-                                pin!(Some(*v), stack_base + current_depth);
-                            }
                             // Physically write the iterator into its value-stack
                             // slot (`pyframe.py:389 pushvalue` →
                             // `setarrayitem_vable_r` via `jtransform.py:1898
@@ -9717,7 +9560,6 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                pin!(Some(v_iter), stack_base + iter_slot_depth);
                                 v_iter.into()
                             } else {
                                 // Non-portal callee: no vable read; keep the
@@ -9742,9 +9584,6 @@ impl CodeWriter {
                             let next_value = next_var
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            if let super::flow::FlowValue::Variable(v) = &next_value {
-                                pin!(Some(*v), stack_base + current_depth);
-                            }
                             // `for_iter_next_fn` is `CallFlavor::MayForce`: a user
                             // `__next__` may raise a non-StopIteration exception.
                             // When the FOR_ITER sits inside a `try` range the
@@ -9805,8 +9644,7 @@ impl CodeWriter {
                                 Kind::Int,
                                 py_pc as i64,
                             );
-                            let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            pin!(Some(truth), scratch_truth);
+                            let _scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(truth.into()));
                             // continue arm (non-null): push next, fall to PC+1.
@@ -9882,7 +9720,6 @@ impl CodeWriter {
                                 stop_value,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -9903,7 +9740,6 @@ impl CodeWriter {
                                 invert_kind,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -9938,33 +9774,21 @@ impl CodeWriter {
                                 // Pop order (top→bottom): kwnames, arg{N-1}..arg0,
                                 // null_or_self, callable — mirroring the
                                 // interpreter's `call_kw` stack reads.
-                                let kwnames_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _kwnames_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let kwnames_value =
                                     pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &kwnames_value {
-                                    pin!(Some(*v), kwnames_reg);
-                                }
                                 let mut arg_values_rev = Vec::with_capacity(nargs);
                                 for _ in 0..nargs {
-                                    let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                    let _arg_reg = emit_popvalue_ref!(current_depth, py_pc);
                                     let arg_value =
                                         pop_ref_or_fresh(&mut current_state, &mut graph);
-                                    if let super::flow::FlowValue::Variable(v) = &arg_value {
-                                        pin!(Some(*v), arg_reg);
-                                    }
                                     arg_values_rev.push(arg_value);
                                 }
-                                let self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _self_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &self_value {
-                                    pin!(Some(*v), self_reg);
-                                }
-                                let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let callable_value =
                                     pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &callable_value {
-                                    pin!(Some(*v), callable_reg);
-                                }
                                 // Graph op args: callable, null_or_self, kwnames,
                                 // arg0..argN-1 (pops were top-first, so reverse).
                                 let mut op_args: Vec<super::flow::SpaceOperationArg> =
@@ -9983,7 +9807,6 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                pin!(Some(result_value), stack_base + current_depth);
                                 push_and_bump!(result_value.into(), py_pc);
                             }
                         }
@@ -10156,11 +9979,8 @@ impl CodeWriter {
                             }
                             let mut item_values_rev = Vec::with_capacity(nitems);
                             for _ in 0..nitems {
-                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pin!(Some(*v), item_reg);
-                                }
                                 item_values_rev.push(item_value);
                             }
                             // popvalues pops top-first; the array keeps
@@ -10203,7 +10023,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10256,7 +10075,6 @@ impl CodeWriter {
                                 invert_kind,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10272,11 +10090,8 @@ impl CodeWriter {
                             let argc = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(argc);
                             for _ in 0..argc {
-                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pin!(Some(*v), item_reg);
-                                }
                                 item_values_rev.push(item_value);
                             }
                             // popvalues pops top-first; values_w keeps
@@ -10290,7 +10105,6 @@ impl CodeWriter {
                                 items,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10307,11 +10121,8 @@ impl CodeWriter {
                             let n = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(n);
                             for _ in 0..n {
-                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pin!(Some(*v), item_reg);
-                                }
                                 item_values_rev.push(item_value);
                             }
                             // popvalues pops top-first; the array keeps
@@ -10354,7 +10165,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10371,11 +10181,8 @@ impl CodeWriter {
                             let n = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(n);
                             for _ in 0..n {
-                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pin!(Some(*v), item_reg);
-                                }
                                 item_values_rev.push(item_value);
                             }
                             // popvalues pops top-first; the array keeps
@@ -10418,7 +10225,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10431,26 +10237,14 @@ impl CodeWriter {
                         // `bh_call_function_ex_fn` unpacks `*`/`**` and
                         // dispatches (MayForce).
                         Instruction::CallFunctionEx => {
-                            let kwargs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _kwargs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let kwargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &kwargs_value {
-                                pin!(Some(*v), kwargs_reg);
-                            }
-                            let starargs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _starargs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let starargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &starargs_value {
-                                pin!(Some(*v), starargs_reg);
-                            }
-                            let self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _self_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &self_value {
-                                pin!(Some(*v), self_reg);
-                            }
-                            let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &callable_value {
-                                pin!(Some(*v), callable_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -10464,7 +10258,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10540,11 +10333,8 @@ impl CodeWriter {
                                 py_pc + 1,
                                 delta.get(op_arg).as_usize(),
                             );
-                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &cond_value {
-                                pin!(Some(*v), cond_reg);
-                            }
                             // `x is None` / `x is not None` — the None singleton
                             // is const-folded as a Ref operand.
                             let none_value = pyobject_const_ref_value(pyre_object::w_none());
@@ -10566,7 +10356,6 @@ impl CodeWriter {
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            pin!(Some(bool_value), scratch_truth);
                             let fallthrough_py_pc = py_pc + 1;
                             if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
                                 // Jump-on-TRUE: mirror POP_JUMP_IF_TRUE — the
@@ -10743,7 +10532,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10796,7 +10584,6 @@ impl CodeWriter {
                                 name_idx_const,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10835,7 +10622,6 @@ impl CodeWriter {
                                 name_idx_const,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10883,16 +10669,10 @@ impl CodeWriter {
                         // through the shared `runtime_ops::format_value`; a user
                         // `__format__` may run Python → MayForce).
                         Instruction::FormatWithSpec => {
-                            let spec_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _spec_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let spec_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &spec_value {
-                                pin!(Some(*v), spec_reg);
-                            }
-                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &val_value {
-                                pin!(Some(*v), val_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -10901,7 +10681,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -10952,7 +10731,6 @@ impl CodeWriter {
                                     super::flow::Constant::signed(0).into(),
                                     py_pc as i64,
                                 );
-                                pin!(Some(func_value), stack_base + current_depth);
                                 push_and_bump!(func_value.into(), py_pc);
                                 let self_slot_value = emit_frontend_super_attr_unwrap(
                                     &mut graph,
@@ -10961,10 +10739,8 @@ impl CodeWriter {
                                     super::flow::Constant::signed(1).into(),
                                     py_pc as i64,
                                 );
-                                pin!(Some(self_slot_value), stack_base + current_depth);
                                 push_and_bump!(self_slot_value.into(), py_pc);
                             } else {
-                                pin!(Some(raw_value), stack_base + current_depth);
                                 push_and_bump!(raw_value.into(), py_pc);
                             }
                         }
@@ -11007,7 +10783,7 @@ impl CodeWriter {
                             // Push the slots in reverse so the stack top is
                             // slot[0] (unpack_ex pushes head items last).
                             for k in (0..total).rev() {
-                                let item_dst = stack_base + current_depth;
+                                let _item_dst = stack_base + current_depth;
                                 let item_var = residual_call!(
                                     unpack_item_fn_idx,
                                     CallFlavor::Plain,
@@ -11022,9 +10798,6 @@ impl CodeWriter {
                                 let item_value = item_var
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pin!(Some(*v), item_dst);
-                                }
                                 push_and_bump!(item_value, py_pc);
                             }
                         }
@@ -11084,11 +10857,8 @@ impl CodeWriter {
                                 _ => None,
                             };
                             if let Some(opname) = opname {
-                                let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &val_value {
-                                    pin!(Some(*v), val_reg);
-                                }
                                 let result_value = emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -11097,7 +10867,6 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                pin!(Some(result_value), stack_base + current_depth);
                                 push_and_bump!(result_value.into(), py_pc);
                             } else {
                                 let _ = current_state.stack.pop();
@@ -11179,11 +10948,8 @@ impl CodeWriter {
                         // direct co_names index.
                         Instruction::LoadFromDictOrGlobals { i } => {
                             let name_idx = i.get(op_arg) as usize;
-                            let dict_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _dict_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let dict_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &dict_value {
-                                pin!(Some(*v), dict_reg);
-                            }
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
                                 super::flow::ConstantValue::Signed(w_code as i64),
                                 Some(Kind::Ref),
@@ -11204,7 +10970,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11246,11 +11011,8 @@ impl CodeWriter {
                             let deref_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(deref_idx as i64).into();
                             emit_load_fast_ref!(current_depth, deref_idx, py_pc);
-                            let cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &cell_value {
-                                pin!(Some(*v), cell_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11259,7 +11021,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11285,11 +11046,8 @@ impl CodeWriter {
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(idx as i64).into();
                             emit_load_fast_ref!(current_depth, idx, py_pc);
-                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &value_value {
-                                pin!(Some(*v), value_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11298,7 +11056,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11334,7 +11091,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11355,11 +11111,8 @@ impl CodeWriter {
                         // (`bh_format_simple_fn` formats with the empty spec; a
                         // user `__format__` may run Python → MayForce).
                         Instruction::FormatSimple => {
-                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &val_value {
-                                pin!(Some(*v), val_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11368,7 +11121,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11385,11 +11137,8 @@ impl CodeWriter {
                             let conv_code = pyre_interpreter::runtime_ops::convert_value_code(
                                 oparg.get(op_arg),
                             );
-                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &val_value {
-                                pin!(Some(*v), val_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11404,7 +11153,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11417,11 +11165,8 @@ impl CodeWriter {
                         // `opcode_ops::unary_invert_value`; a user `__invert__`
                         // may run Python → MayForce.
                         Instruction::UnaryInvert => {
-                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &val_value {
-                                pin!(Some(*v), val_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11430,7 +11175,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11445,11 +11189,8 @@ impl CodeWriter {
                         // `opcode_ops::truth_value`; a user `__bool__` /
                         // `__len__` may run Python → MayForce.
                         Instruction::UnaryNot => {
-                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &val_value {
-                                pin!(Some(*v), val_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11458,7 +11199,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
@@ -11503,16 +11243,10 @@ impl CodeWriter {
                         Instruction::StoreDeref { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
                             emit_load_fast_ref!(current_depth, idx, py_pc);
-                            let cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &cell_value {
-                                pin!(Some(*v), cell_reg);
-                            }
-                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &value_value {
-                                pin!(Some(*v), value_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11554,11 +11288,8 @@ impl CodeWriter {
                         Instruction::MakeCell { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
                             emit_load_fast_ref!(current_depth, idx, py_pc);
-                            let current_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _current_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let current_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if let super::flow::FlowValue::Variable(v) = &current_value {
-                                pin!(Some(*v), current_reg);
-                            }
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -11885,7 +11616,6 @@ impl CodeWriter {
                 // compiled-trace re-entry via ContinueRunningNormally) reads
                 // stale vable state because only the SSA stack slot was
                 // populated.
-                let mut exc_slot = stack_base + site.stack_depth;
                 let mut depth: u16 = site.stack_depth;
                 if site.push_lasti {
                     // Graph-side `residual_call_ir_r` for
@@ -11909,7 +11639,6 @@ impl CodeWriter {
                             ResKind::Ref,
                             -1,
                         );
-                        pin!(boxed_lasti, exc_slot);
                         if let Some(boxed_var) = boxed_lasti {
                             let lasti_depth_value = (stack_base_absolute + depth as usize) as i64;
                             let v_lasti_idx: super::flow::FlowValue =
@@ -11929,7 +11658,6 @@ impl CodeWriter {
                     }
                     depth += 1;
                     emit_vsd!(depth, site.handler_py_pc);
-                    exc_slot += 1;
                 }
                 // `flatten.py:336-347 generate_last_exc` emits
                 // `last_exception` immediately before `last_exc_value` at
@@ -11942,20 +11670,12 @@ impl CodeWriter {
                 // output depends on (the slot itself has no live consumer
                 // — per-kind PyType makes type-discrimination implicit).
                 let _ = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                // `flatten.py:336-347 generate_last_exc` writes
-                // `last_exc_value` straight into `getcolor(handler_inputarg)`,
-                // and `insert_renamings` (flatten.py:311) excludes the exc
-                // value from the copy list.  pyre's walker materialises the
-                // exception into the positional `exc_slot` above; that slot
-                // equals `getcolor(handler_inputarg)` (both are
-                // `stack_base + depth`).  But without a pin `exc_value` reaches
-                // graph regalloc uncoloured-to-slot and gets an arbitrary
-                // colour, so the canonical stream would resume the exc from a
-                // colour the runtime never wrote — leaving the handler's
-                // CHECK_EXC_MATCH / PUSH_EXC_INFO with a NULL exception.  Pin
-                // `exc_value` to `exc_slot` so `get_color(exc_value)` matches
-                // the slot the canonical `last_exc_value` insn writes.
-                pin!(exc_value.as_variable(), exc_slot);
+                // `flatten.py:336-347 generate_last_exc` writes `last_exc_value`
+                // straight into `getcolor(handler_inputarg)`, and
+                // `insert_renamings` (flatten.py:311) excludes the exc value
+                // from the copy list.  `exc_value` is colored by the graph
+                // regalloc and its handler-entry slot is reconstructed from the
+                // per-PC pcdep resume map, so no walker slot pin is needed.
                 if is_portal {
                     let depth_value = (stack_base_absolute + depth as usize) as i64;
                     // pyframe.py:378-387 `pushvalue` semantics — graph
@@ -12097,22 +11817,6 @@ impl CodeWriter {
         // so the fresh array Variables receive colours.
         lower_frontend_collection_ops(&graph);
 
-        // Seed `walker_slot_for_variable` with each block's inputarg
-        // slots before the splice regalloc coalescing reads it.  The
-        // same pairing also runs at emit time (idempotent via
-        // `pair_walker_slot_if_absent`).
-        for spam in &all_walker_blocks {
-            let Some(state) = spam.framestate() else {
-                continue;
-            };
-            for (idx, value) in state.mergeable().iter().enumerate() {
-                if let Some(super::flow::FlowValue::Variable(v)) = value {
-                    if let Some(slot) = state.mergeable_index_to_slot(idx) {
-                        pin_if_absent!(Some(v.clone()), slot);
-                    }
-                }
-            }
-        }
         // Compute graph regallocs ONCE pre-drain so walker
         // insert_renamings and any downstream consumer share identical
         // colors (HashMap iteration non-determinism between two
@@ -12143,10 +11847,16 @@ impl CodeWriter {
         // short-circuit `(i and C)` PHI ↔ loop-var merge that collapses the
         // kept operand-stack slot's color onto the loop var (#124 float).
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
+        // `&[]`: honour SSA-liveness interference only, seeding the gate-off
+        // `graph_regallocs` coloring. The CPython-slot co-live / cross-slot
+        // merges this SSA-only pass misses are rejected on the SPLICE pairs
+        // below, where the co-live + slot-identity edges feed this same filter's
+        // `has_edge` oracle.
         let cfg_variable_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
             &graph,
             Kind::Ref,
             &cfg_variable_pairs,
+            &[],
         );
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,
@@ -12167,34 +11877,6 @@ impl CodeWriter {
         // color space — the spliced body carries graph-lifetime colors,
         // not walker stack-slot register numbers.
         //
-        // Live-Variable mask for the splice resume-color machinery.
-        // `color_leaked_arg_variables` (flatten.rs) mints a fresh color for
-        // every dead operand-stack Ref the walker pushed after an
-        // `abort_permanent` (CONTAINS_OP / UNPACK_SEQUENCE …) so the
-        // canonical stream stays serializable; those Variables sit in the
-        // severed dead region and never restore at a resume, but they share
-        // a walker slot with live Variables. The dense `slot → color`
-        // resume inverse (`splice_slot_pre_color`) and its conflict /
-        // collision guards therefore see a spurious second color for the
-        // slot and decline the splice (set_membership / tuple_unpacking).
-        // A Variable is live iff the graph regalloc — the gate-off coloring,
-        // which never sees the leaked Refs — colored it; mask the rest out
-        // of the resume-color consumers below (the same Ref-coloring
-        // membership test used throughout the splice).
-        let walker_slot_for_variable_live: Vec<Option<u16>> = walker_slot_for_variable
-            .iter()
-            .enumerate()
-            .map(|(vid, slot)| {
-                if graph_regallocs[Kind::Ref.index()]
-                    .coloring
-                    .contains_key(&super::flow::VariableId(vid as u32))
-                {
-                    *slot
-                } else {
-                    None
-                }
-            })
-            .collect();
         // Splice coalesce pairs (same-slot + CFG, cross-slot filtered).
         // Built once here — outside the IIFE — so the same set feeds the
         // splice regalloc, the co-live interference, the value-equivalence
@@ -12221,10 +11903,31 @@ impl CodeWriter {
         // needs one canonical color across its re-read Variables. Only the CFG
         // value-equivalence pairs (the walker's COPY/SWAP lineage) remain, to
         // merge provably-equal Variables.
-        let splice_pairs = filter_cross_slot_coalesce_pairs(
+        //
+        // Reject the coalesce merges that would break the color-indexed per-PC
+        // resume via the interference `has_edge` oracle (the RPython-faithful
+        // `regalloc.py:105` guard), replacing the walker-slot post-filter.  The
+        // filter was purely slot-based, so its pcdep-sourced successor is too:
+        // `build_slot_disjoint_interference` edges any coalesce candidate whose
+        // endpoints hold distinct canonical CPython slots.  This covers the
+        // disjoint-live case (never co-live at a single PC) that dominates
+        // inlined callees — a callee operand-stack temp and the outer merge
+        // inputarg occupy distinct frame-stack slots but live at disjoint PCs,
+        // so merging them extends a color's liveness across a box-less region
+        // and the resume reads `OpRef::NONE`.  Canonical slots come from the
+        // pcdep snapshots (which record each inline frame's slots at that
+        // frame's PCs), so no walker slot map is consulted here.  Co-liveness is
+        // NOT needed to gate coalescing — the co-live separations the coloring
+        // needs are applied to the interference graph below (`splice_
+        // interference`), not to the coalesce filter.
+        let canonical_slot = pcdep_canonical_slot(&pcdep_slot_var, &pcdep_slot_var_resume);
+        let splice_coalesce_oracle =
+            build_slot_disjoint_interference(&cfg_variable_pairs, &canonical_slot);
+        let splice_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
+            &graph,
+            Kind::Ref,
             &cfg_variable_pairs,
-            &walker_slot_for_variable,
-            code.varnames.len(),
+            &splice_coalesce_oracle,
         );
         // Liveness-correct CPython-co-live interference: each resume PC's
         // simultaneously-CPython-live, non-value-equivalent locals/stack
@@ -12483,91 +12186,56 @@ impl CodeWriter {
             ],
         };
 
-        // Pre-rename Ref color for a walker frame slot.  The spliced canonical
-        // body colors each frame value by its graph-lifetime Variable
-        // (`splice_regallocs[Ref].getcolor(v)`), so a slot's pre-rename color
-        // is the canonical color of the Variable the walker pinned to that
-        // slot.  Build the inverse `walker_slot → canonical Ref color` from
-        // `walker_slot_for_variable` (Variable → slot) once; the
-        // `slot_pre_color` closure then maps every resume-map lookup below into
-        // the canonical color space the live markers carry.  A slot keeps the
-        // first canonical color seen; the splice coloring is injective per
-        // frame slot, so the dense map represents every slot without loss.
-        //
-        // Build the inverse over the live-masked slot map so a dead leaked Ref
-        // (color minted by `color_leaked_arg_variables`) sharing a slot with
-        // live Variables never displaces the slot's live color.
-        let splice_slot_pre_color: Vec<Option<u16>> = {
-            let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
-            let max_slot = walker_slot_for_variable_live
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .unwrap_or(0);
-            let mut inverse: Vec<Option<u16>> = vec![None; max_slot as usize + 1];
-            for (vid, slot) in walker_slot_for_variable_live.iter().enumerate() {
-                let Some(slot) = *slot else { continue };
-                let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32)) else {
-                    continue;
-                };
-                if inverse[slot as usize].is_none() {
-                    inverse[slot as usize] = Some(color);
-                }
-            }
-            inverse
-        };
-        let slot_pre_color = |walker_slot: u16| -> u16 {
-            splice_slot_pre_color
-                .get(walker_slot as usize)
-                .copied()
-                .flatten()
-                .unwrap_or(walker_slot)
-        };
-
-        // `flatten.py:88-100` `enforce_input_args` may rotate the
-        // portal `(frame, ec)` inputargs into new colors. Keep the
-        // pyre-side metadata aligned with the post-regalloc SSA/JitCode
-        // slots the assembler will actually emit; the blackhole fill
-        // path must write the colored portal registers, not the
-        // pre-color layout placeholders.
-        let portal_frame_reg = super::regalloc::rename_lookup(
-            &alloc_result.rename,
-            Kind::Ref,
-            slot_pre_color(portal_frame_reg),
-        );
-        let portal_ec_reg = super::regalloc::rename_lookup(
-            &alloc_result.rename,
-            Kind::Ref,
-            slot_pre_color(portal_ec_reg),
-        );
+        // `enforce_input_args` (`flatten.py`) may rotate the portal
+        // `(frame, ec)` inputargs into new colors. Source those colors
+        // graph-directly from the portal input Variables' splice colors
+        // (`portal_graph_inputvars` → `frame_var`/`ec_var`), so the blackhole
+        // fill path writes the colored portal registers rather than the
+        // pre-color placeholders. `frame_var`/`ec_var` are the sole occupants
+        // of the portal placeholder slots, so this equals the retired walker
+        // slot inverse; fall back to the placeholder when either is uncolored.
+        let portal_frame_color = splice_regallocs[Kind::Ref.index()]
+            .coloring
+            .get(&frame_var.id)
+            .copied()
+            .unwrap_or(portal_frame_reg);
+        let portal_ec_color = splice_regallocs[Kind::Ref.index()]
+            .coloring
+            .get(&ec_var.id)
+            .copied()
+            .unwrap_or(portal_ec_reg);
+        let portal_frame_reg =
+            super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, portal_frame_color);
+        let portal_ec_reg =
+            super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, portal_ec_color);
 
         // result_color_at_pc: the call-result operand-stack slot's color
         // (top of stack = depth - 1) at each Python pc, so the inline
         // multiframe capture (`compute_inline_caller_frame`) finds the
         // not-yet-produced result register. The call-result slot is not a
         // live Variable at the return PC, so it carries no `pcdep_color_slots`
-        // entry; source its color directly from the operand-stack slot's
-        // post-regalloc canonical Ref color. With the input-arg pinning
-        // removed (`enforce_input_args` no longer rotates stack slots), the
-        // chordal coloring may coalesce disjointly-live stack slots into the
-        // same color, so read the per-slot color rather than assume
-        // `color == slot`. `u16::MAX` where the stack is empty or `depth - 1`
-        // is past the static peak (`code.max_stackdepth` = CPython
-        // `co_stacksize`), which the runtime decoder treats as "no result
-        // slot".
+        // entry; source its color directly from the graph Variable occupying
+        // top-of-stack at that pc's resume-depth state, whose canonical Ref
+        // color the splice coloring holds. The top-of-stack Variable at a
+        // call's fallthrough pc IS the call op's result. This reads the
+        // per-Variable splice color, not a slot inversion, so a stack slot
+        // reused by differently-colored Variables across pcs resolves to each
+        // pc's own result color. `u16::MAX` where the stack is empty, `depth -
+        // 1` is past the static peak (`code.max_stackdepth` = CPython
+        // `co_stacksize`), or top-of-stack is a constant/sentinel — all of
+        // which the runtime decoder treats as "no result slot".
+        let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
         let result_color_at_pc: Vec<u16> = depth_at_pc
             .iter()
-            .map(|&d| {
+            .enumerate()
+            .map(|(pc, &d)| {
                 let d = d as usize;
                 if d == 0 || d - 1 >= max_stackdepth {
-                    u16::MAX
-                } else {
-                    super::regalloc::rename_lookup(
-                        &alloc_result.rename,
-                        Kind::Ref,
-                        slot_pre_color(stack_base + (d - 1) as u16),
-                    )
+                    return u16::MAX;
+                }
+                match top_of_stack_var_at_pc[pc] {
+                    Some(vid) => ref_coloring.get(&vid).copied().unwrap_or(u16::MAX),
+                    None => u16::MAX,
                 }
             })
             .collect();
@@ -13609,22 +13277,49 @@ mod tests {
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
 
-    /// The coalesce filter drops any pair that would merge two distinct
-    /// frame slots — local↔stack AND stack↔stack — but keeps a within-slot
-    /// pair (two Variables pinned to the same stack slot).
+    /// A coalesce candidate whose two endpoints hold distinct canonical
+    /// CPython slots — including the disjoint-live inline-callee case that is
+    /// never co-live at a single resume PC — yields a slot-identity
+    /// interference edge, while a within-slot pair yields none.
     #[test]
-    fn filter_cross_slot_coalesce_pairs_rejects_all_cross_slot_merges() {
-        // V0 → local slot 0; V1,V3 → stack slot 3; V2 → stack slot 4.
-        let walker_slot_for_variable = vec![Some(0u16), Some(3u16), Some(4u16), Some(3u16)];
-        // local↔stack (V0,V1) dropped; cross-slot stack↔stack (V1,V2)
-        // dropped; within-slot stack (V1,V3) kept.
+    fn build_slot_disjoint_interference_edges_cross_slot_only() {
+        // v0 → slot 0, v1 → slot 3, v2 → slot 3, v3 → (no snapshot).
+        let canonical = vec![Some(0u16), Some(3), Some(3)];
         let pairs = vec![
-            (VariableId(0), VariableId(1)),
-            (VariableId(1), VariableId(2)),
-            (VariableId(1), VariableId(3)),
+            (VariableId(0), VariableId(1)), // slot 0 ≠ 3 → edge
+            (VariableId(1), VariableId(2)), // slot 3 == 3 → no edge (COPY lineage)
+            (VariableId(1), VariableId(3)), // v3 absent → no edge (never live at a resume)
         ];
-        let kept = filter_cross_slot_coalesce_pairs(&pairs, &walker_slot_for_variable, 1);
-        assert_eq!(kept, vec![(VariableId(1), VariableId(3))]);
+        let edges = build_slot_disjoint_interference(&pairs, &canonical);
+        assert_eq!(edges, vec![(VariableId(0), VariableId(1))]);
+    }
+
+    /// A transitive cross-slot chain through a Variable with no canonical slot
+    /// is still rejected: `(slot0_var, temp)` then `(temp, slot1_var)` where
+    /// `temp` is absent from the pcdep snapshots (never live at a resume PC).
+    /// The union-find carries slot0's claim through the first merge, so the
+    /// second pair's slot1 conflicts and is edged.
+    #[test]
+    fn build_slot_disjoint_interference_rejects_transitive_cross_slot_chain() {
+        // v0 → slot 0, v2 → slot 1, v1 (temp) → no snapshot.
+        let canonical = vec![Some(0u16), None, Some(1)];
+        let pairs = vec![
+            (VariableId(0), VariableId(1)), // slot0_var → temp: merge, group claims slot 0
+            (VariableId(1), VariableId(2)), // temp → slot1_var: group slot 0 ≠ 1 → edge
+        ];
+        let edges = build_slot_disjoint_interference(&pairs, &canonical);
+        assert_eq!(edges, vec![(VariableId(1), VariableId(2))]);
+    }
+
+    /// The canonical slot is the slot a Variable occupies at the earliest PC
+    /// it appears in across the pcdep snapshots (POST before RESUME).
+    #[test]
+    fn pcdep_canonical_slot_takes_earliest_pc() {
+        // v5 first appears at py_pc 1 slot 2, later at slot 0 → canonical 2.
+        let post = vec![vec![], vec![(2u16, 5u32)], vec![(0u16, 5u32)]];
+        let resume: Vec<Vec<(u16, u32)>> = vec![vec![], vec![], vec![(0u16, 5u32)]];
+        let slots = pcdep_canonical_slot(&post, &resume);
+        assert_eq!(slots.get(5).copied().flatten(), Some(2));
     }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {
