@@ -23,6 +23,7 @@
 //! [`DescEntry`]). [`DescEntry::desc_key`] derives the key from
 //! `Rc::as_ptr` per variant.
 
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -61,21 +62,14 @@ pub type GraphBuilder<'a> = Box<
 pub struct DescKey(pub(crate) usize);
 
 impl DescKey {
-    /// Turn a raw pointer identity into a [`DescKey`]. Used by tests
-    /// and (soon) the Desc constructor in commit 2.
+    /// Turn a raw id into a [`DescKey`]. Test-only.
     #[cfg(test)]
     pub(crate) fn from_raw(id: usize) -> Self {
         DescKey(id)
     }
-
-    /// Compute a DescKey from the identity of an `Rc<T>` pointer — the
-    /// Rust equivalent of Python dict-by-identity keying.
-    pub(crate) fn from_rc<T: ?Sized>(rc: &Rc<T>) -> Self {
-        DescKey(Rc::as_ptr(rc) as *const () as usize)
-    }
 }
 
-fn alloc_desc_key() -> DescKey {
+pub(crate) fn alloc_desc_key() -> DescKey {
     static NEXT_DESC_KEY: AtomicUsize = AtomicUsize::new(1);
     DescKey(NEXT_DESC_KEY.fetch_add(1, Ordering::Relaxed))
 }
@@ -160,9 +154,12 @@ impl From<String> for GraphCacheKey {
 #[derive(Debug)]
 pub struct CallFamily {
     /// RPython `self.descs = {desc: True}` (description.py:21).
-    pub(crate) descs: HashMap<DescKey, ()>,
+    /// `IndexMap`: `update`/`absorb` fold these in iteration order and
+    /// upstream is a Python dict (insertion order); a `HashMap` would
+    /// seed the phi-merge union in a run-varying order.
+    pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.calltables = {}` (description.py:22).
-    pub(crate) calltables: HashMap<CallShape, Vec<CallTableRow>>,
+    pub(crate) calltables: IndexMap<CallShape, Vec<CallTableRow>>,
     /// RPython `self.total_calltable_size = 0` (description.py:23).
     pub(crate) total_calltable_size: usize,
     /// RPython `CallFamily.normalized = False` class-level default
@@ -176,11 +173,11 @@ pub struct CallFamily {
 impl CallFamily {
     /// RPython `CallFamily.__init__(desc)` (description.py:20-23).
     pub(crate) fn new(desc: DescKey) -> Self {
-        let mut descs = HashMap::new();
+        let mut descs = IndexMap::new();
         descs.insert(desc, ());
         CallFamily {
             descs,
-            calltables: HashMap::new(),
+            calltables: IndexMap::new(),
             total_calltable_size: 0,
             normalized: false,
             modified: true,
@@ -271,22 +268,23 @@ impl UnionFindInfo for Rc<RefCell<CallFamily>> {
 #[derive(Debug)]
 pub struct FrozenAttrFamily {
     /// RPython `self.descs = {desc: True}` (description.py:79).
-    pub(crate) descs: HashMap<DescKey, ()>,
+    /// `IndexMap`: iteration order feeds `update`/`absorb`; upstream dict.
+    pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:80).
-    pub(crate) read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
+    pub(crate) read_locations: IndexMap<super::bookkeeper::PositionKey, ()>,
     /// RPython `self.attrs = {}` (description.py:81).
-    pub(crate) attrs: HashMap<String, SomeValue>,
+    pub(crate) attrs: IndexMap<String, SomeValue>,
 }
 
 impl FrozenAttrFamily {
     /// RPython `FrozenAttrFamily.__init__(desc)` (description.py:78-81).
     pub(crate) fn new(desc: DescKey) -> Self {
-        let mut descs = HashMap::new();
+        let mut descs = IndexMap::new();
         descs.insert(desc, ());
         FrozenAttrFamily {
             descs,
-            read_locations: HashMap::new(),
-            attrs: HashMap::new(),
+            read_locations: IndexMap::new(),
+            attrs: IndexMap::new(),
         }
     }
 
@@ -337,9 +335,11 @@ impl UnionFindInfo for Rc<RefCell<FrozenAttrFamily>> {
 #[derive(Debug)]
 pub struct ClassAttrFamily {
     /// RPython `self.descs = {desc: True}` (description.py:114).
-    pub(crate) descs: HashMap<DescKey, ()>,
+    /// `IndexMap`: iteration order feeds `update`/`absorb` s_value union;
+    /// upstream dict.
+    pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:115).
-    pub(crate) read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
+    pub(crate) read_locations: IndexMap<super::bookkeeper::PositionKey, ()>,
     /// RPython `self.s_value = s_ImpossibleValue` (description.py:116).
     pub(crate) s_value: SomeValue,
     /// Upstream sets this dynamically in
@@ -357,11 +357,11 @@ pub struct ClassAttrFamily {
 impl ClassAttrFamily {
     /// RPython `ClassAttrFamily.__init__(desc)` (description.py:113-116).
     pub(crate) fn new(desc: DescKey) -> Self {
-        let mut descs = HashMap::new();
+        let mut descs = IndexMap::new();
         descs.insert(desc, ());
         ClassAttrFamily {
             descs,
-            read_locations: HashMap::new(),
+            read_locations: IndexMap::new(),
             s_value: s_impossible_value(),
             commonbase: None,
         }
@@ -616,17 +616,14 @@ impl FuncDescEntry {
     /// Upstream `MemoDesc(FunctionDesc)` (description.py:395) is one
     /// object with one identity. The Rust port decomposes it into this
     /// wrapper plus a *private* inner base `FunctionDesc` (minted only
-    /// inside `newfuncdesc` and never registered on its own), so the two
-    /// would otherwise carry two identities: `desc_key()` reports the
-    /// MemoDesc (`from_rc`), while `rowkey()` / `getcallfamily()` read
-    /// the inner base's `Desc.identity`. Slave the inner base's identity
-    /// to the MemoDesc here so both coincide — then the PBC set, the
-    /// methoddesc cache key, the call family and the call table all key
-    /// on a single identity, matching upstream where the MemoDesc *is*
-    /// the FunctionDesc (`rowkey()` returns `self`, description.py:365).
+    /// inside `newfuncdesc` and never registered on its own).  Both
+    /// `desc_key()` and
+    /// `rowkey()` now read that inner `base.identity`, so the PBC set,
+    /// the methoddesc cache key, the call family and the call table all
+    /// key on the FunctionDesc's single stable identity — matching
+    /// upstream where the MemoDesc *is* the FunctionDesc (`rowkey()`
+    /// returns `self`, description.py:365).  No slaving needed.
     pub(crate) fn memo(rc: Rc<RefCell<MemoDesc>>) -> Self {
-        let base = rc.borrow().base.clone();
-        base.borrow_mut().base.identity = DescKey::from_rc(&rc);
         FuncDescEntry {
             inner: FuncDescInner::Memo(rc),
         }
@@ -667,11 +664,15 @@ impl FuncDescEntry {
     }
 
     /// `id(desc)` — the identity of the actual desc object (the
-    /// `MemoDesc` itself for a memo, not its base).
+    /// `MemoDesc` itself for a memo, not its base).  Reads the stored
+    /// monotonic `base.identity` rather than `Rc::as_ptr`, so the key —
+    /// and the ordering of every table keyed on it — is reproducible.
+    /// For a memo, `memo()` slaves the inner base's identity to the
+    /// MemoDesc, so both views coincide on one stable id.
     pub(crate) fn desc_key(&self) -> DescKey {
         match &self.inner {
-            FuncDescInner::Plain(rc) => DescKey::from_rc(rc),
-            FuncDescInner::Memo(rc) => DescKey::from_rc(rc),
+            FuncDescInner::Plain(rc) => rc.borrow().base.identity,
+            FuncDescInner::Memo(rc) => rc.borrow().base.borrow().base.identity,
         }
     }
 
@@ -695,16 +696,18 @@ impl DescEntry {
         DescEntry::Func(FuncDescEntry::memo(rc))
     }
 
-    /// RPython `id(desc)` — pointer-identity handle. Used as the dict
-    /// key by `CallFamily.descs`, `FrozenAttrFamily.descs`, and
-    /// `ClassAttrFamily.descs`.
+    /// RPython `id(desc)` — identity handle.  Used as the dict key by
+    /// `CallFamily.descs`, `FrozenAttrFamily.descs`,
+    /// `ClassAttrFamily.descs`, and the `SomePBC.descriptions` set.
+    /// Reads each desc's stored monotonic identity rather than
+    /// `Rc::as_ptr`, so those tables order reproducibly across runs.
     pub(crate) fn desc_key(&self) -> DescKey {
         match self {
             DescEntry::Func(fe) => fe.desc_key(),
-            DescEntry::Method(rc) => DescKey::from_rc(rc),
-            DescEntry::Frozen(rc) => DescKey::from_rc(rc),
-            DescEntry::MethodOfFrozen(rc) => DescKey::from_rc(rc),
-            DescEntry::Class(rc) => DescKey::from_rc(rc),
+            DescEntry::Method(rc) => rc.borrow().base.identity,
+            DescEntry::Frozen(rc) => rc.borrow().base.identity,
+            DescEntry::MethodOfFrozen(rc) => rc.borrow().base.identity,
+            DescEntry::Class(rc) => rc.borrow().identity,
         }
     }
 
@@ -2810,7 +2813,7 @@ impl MethodDesc {
                     &borrowed.name,
                     commonflags.clone(),
                 );
-                replacements.push((DescKey::from_rc(desc), DescEntry::Method(newdesc)));
+                replacements.push((borrowed.base.identity, DescEntry::Method(newdesc)));
             }
         }
         for (old_key, new_entry) in replacements {
@@ -2865,7 +2868,7 @@ impl MethodDesc {
                         continue;
                     };
                     if classdef1.borrow().issubclass(&classdef2) {
-                        remove.push(DescKey::from_rc(desc1));
+                        remove.push(borrowed1.base.identity);
                         break;
                     }
                 }
@@ -4382,8 +4385,10 @@ mod tests {
         );
 
         let mut descs = std::collections::BTreeMap::new();
-        descs.insert(DescKey::from_rc(&base_md), DescEntry::Method(base_md));
-        descs.insert(DescKey::from_rc(&child_md), DescEntry::Method(child_md));
+        let base_key = base_md.borrow().base.identity;
+        let child_key = child_md.borrow().base.identity;
+        descs.insert(base_key, DescEntry::Method(base_md));
+        descs.insert(child_key, DescEntry::Method(child_md));
 
         MethodDesc::simplify_desc_set(&mut descs);
 

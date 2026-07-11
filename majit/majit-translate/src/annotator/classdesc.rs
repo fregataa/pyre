@@ -52,6 +52,7 @@
 //! `_mixin_`, `_immutable_fields_`, `__slots__`, `_attrs_`,
 //! `__NOT_RPYTHON__`, and `_annspecialcase_`.
 
+use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
@@ -525,8 +526,9 @@ pub struct Attribute {
     ///
     /// Upstream stores positions as tuples of `(FunctionGraph, Block,
     /// op_index)`; the Rust port uses the ported [`PositionKey`]
-    /// identity.
-    pub(crate) read_locations: HashSet<PositionKey>,
+    /// identity.  `IndexSet`: these positions drive `reflowfromposition`
+    /// order during the fixpoint; upstream is a Python dict/set.
+    pub(crate) read_locations: IndexSet<PositionKey>,
 }
 
 impl Attribute {
@@ -542,7 +544,7 @@ impl Attribute {
             s_value: SomeValue::Impossible,
             readonly: true,
             attr_allowed: true,
-            read_locations: HashSet::new(),
+            read_locations: IndexSet::new(),
         }
     }
 
@@ -692,6 +694,14 @@ impl Attribute {
 /// and exception-class predicates.
 #[derive(Debug)]
 pub struct ClassDesc {
+    /// Stable identity handle, minted once at construction from the
+    /// monotonic `alloc_desc_key()` counter.  Unlike the other Desc
+    /// kinds, `ClassDesc` does not embed a `Desc` base, so it carries
+    /// its own copy.  Keys every family/PBC table entry for this
+    /// classdesc; used instead of `Rc::as_ptr` so the ordering of those
+    /// tables (and the classdef numbering derived from them) is
+    /// reproducible across runs.
+    pub(crate) identity: super::description::DescKey,
     /// RPython `self.pyobj` — the live Python class object.
     pub pyobj: HostObject,
     /// RPython `self.name` — upstream `cls.__module__ + '.' + cls.__name__`.
@@ -733,6 +743,7 @@ impl ClassDesc {
     /// callers use [`Self::new`].
     pub fn new_shell(bookkeeper: &Rc<Bookkeeper>, pyobj: HostObject, name: String) -> Self {
         ClassDesc {
+            identity: super::description::alloc_desc_key(),
             pyobj,
             name,
             basedesc: None,
@@ -905,6 +916,7 @@ impl ClassDesc {
 
         // Build `self` — subsequent mutation flows through interior mutability.
         let me = Rc::new(RefCell::new(ClassDesc {
+            identity: super::description::alloc_desc_key(),
             pyobj: cls.clone(),
             name,
             basedesc,
@@ -1595,8 +1607,7 @@ impl ClassDesc {
         this: &Rc<RefCell<Self>>,
         attrname: &str,
     ) -> Option<Rc<RefCell<super::description::ClassAttrFamily>>> {
-        use super::description::DescKey;
-        let key = DescKey::from_rc(this);
+        let key = this.borrow().identity;
         let bk = this.borrow().bookkeeper.upgrade()?;
         Some(bk.with_classpbc_attr_families(attrname, |uf| {
             let rep = uf.find_rep(key);
@@ -1621,8 +1632,7 @@ impl ClassDesc {
         this: &Rc<RefCell<Self>>,
         attrname: &str,
     ) -> Option<Rc<RefCell<super::description::ClassAttrFamily>>> {
-        use super::description::DescKey;
-        let key = DescKey::from_rc(this);
+        let key = this.borrow().identity;
         let bk = this.borrow().bookkeeper.upgrade()?;
         bk.with_classpbc_attr_families(attrname, |uf| {
             if !uf.contains(&key) {
@@ -1649,16 +1659,15 @@ impl ClassDesc {
         others: &[Rc<RefCell<Self>>],
         attrname: &str,
     ) -> bool {
-        use super::description::DescKey;
         let Some(bk) = this.borrow().bookkeeper.upgrade() else {
             return false;
         };
-        let head_key = DescKey::from_rc(this);
+        let head_key = this.borrow().identity;
         bk.with_classpbc_attr_families(attrname, |uf| {
             let mut rep = uf.find_rep(head_key);
             let mut changed = false;
             for desc in others {
-                let other_key = DescKey::from_rc(desc);
+                let other_key = desc.borrow().identity;
                 let (c, new_rep) = uf.union(rep, other_key);
                 changed |= c;
                 rep = new_rep;
@@ -1946,7 +1955,6 @@ impl ClassDesc {
         s_result: &super::model::SomeValue,
         op_key: Option<super::bookkeeper::PositionKey>,
     ) -> Result<(), super::model::AnnotatorError> {
-        use super::description::DescKey;
         use super::model::SomeValue;
         if descs.is_empty() {
             return Ok(());
@@ -1955,12 +1963,12 @@ impl ClassDesc {
         // `class ClassDesc(Desc)` inheritance collapses into a bare
         // struct here), so `getcallfamily` / `mergecallfamilies` are
         // re-derived against the bookkeeper's pbc_maximal_call_families
-        // UnionFind keyed by `DescKey::from_rc(&classdesc)` — the same
-        // pointer identity upstream `id(desc)` provides.
+        // UnionFind keyed by the classdesc's stored `identity` — the same
+        // stable id upstream `id(desc)` provides.
         let Some(bk) = descs[0].borrow().bookkeeper.upgrade() else {
             return Ok(());
         };
-        let head_key = DescKey::from_rc(&descs[0]);
+        let head_key = descs[0].borrow().identity;
         // upstream: `descs[0].getcallfamily()` — force the family slot
         // to exist so merge has a representative.
         {
@@ -1972,7 +1980,7 @@ impl ClassDesc {
             let mut families = bk.pbc_maximal_call_families.borrow_mut();
             let mut rep = families.find_rep(head_key);
             for other in descs.iter().skip(1) {
-                let other_key = DescKey::from_rc(other);
+                let other_key = other.borrow().identity;
                 let (_changed, new_rep) = families.union(rep, other_key);
                 rep = new_rep;
             }
@@ -2206,7 +2214,8 @@ pub struct ClassDef {
     /// RPython `self.attr_sources = {}` — `{name: list-of-sources}`.
     attr_sources: HashMap<String, Vec<AttrSource>>,
     /// RPython `self.read_locations_of__class__ = {}`.
-    pub(crate) read_locations_of_class: HashMap<PositionKey, bool>,
+    /// `IndexMap`: iterated to drive `reflowfromposition`; upstream dict.
+    pub(crate) read_locations_of_class: IndexMap<PositionKey, bool>,
     /// RPython `self.repr = None`. Populated by `rclass.getclassrepr()`
     /// with the cached `ClassRepr` for this classdef.
     pub repr: Option<Arc<ClassRepr>>,
@@ -2303,7 +2312,7 @@ impl ClassDef {
             shortname,
             subdefs: Vec::new(),
             attr_sources: HashMap::new(),
-            read_locations_of_class: HashMap::new(),
+            read_locations_of_class: IndexMap::new(),
             repr: None,
             extra_access_sets: HashMap::new(),
             instances_seen: HashSet::new(),
@@ -3884,8 +3893,8 @@ mod tests {
         a.borrow_mut().basedesc = Some(common.clone());
         let b = make_classdesc(&bk, "pkg.B");
         b.borrow_mut().basedesc = Some(common.clone());
-        let a_key = DescKey::from_rc(&a);
-        let b_key = DescKey::from_rc(&b);
+        let a_key = a.borrow().identity;
+        let b_key = b.borrow().identity;
         // Pre-condition: A and B belong to distinct CallFamilies.
         {
             let mut families = bk.pbc_maximal_call_families.borrow_mut();
