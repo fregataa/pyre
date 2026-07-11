@@ -12409,6 +12409,7 @@ fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
 /// `bytearrayobject.py:descr_append` — append one byte in place.
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "append", 1)?;
+    unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let b = bytearray_byte_arg(args[1])?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
     Ok(pyre_object::w_none())
@@ -12418,6 +12419,7 @@ fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// bytes, or each integer yielded by an iterable.
 fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "extend", 1)?;
+    unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let other = args[1];
     // Materialize the new bytes before mutating so `x.extend(x)` is safe.
     let appended: Vec<u8> = unsafe {
@@ -12440,6 +12442,7 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// clamping out-of-range indices (negative counts from the end).
 fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "insert", 2)?;
+    unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let index = crate::builtins::space_index_w(args[1])?;
     let b = bytearray_byte_arg(args[2])?;
     unsafe {
@@ -12455,6 +12458,7 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `value`; ValueError when absent.
 fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "remove", 1)?;
+    unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let b = bytearray_byte_arg(args[1])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
@@ -12473,6 +12477,7 @@ fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "pop")?;
     unsafe {
+        crate::builtins::bytearray_check_exports(args[0])?;
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         let len = vec.len() as i64;
         if len == 0 {
@@ -12508,7 +12513,10 @@ fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "clear")?;
-    unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear() };
+    unsafe {
+        crate::builtins::bytearray_check_exports(args[0])?;
+        pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear();
+    };
     Ok(pyre_object::w_none())
 }
 
@@ -12520,9 +12528,21 @@ fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
 }
 
+/// `bytearrayobject.py descr_releasebuffer` — the Python 3.12
+/// `__release_buffer__` protocol entry for a released bytearray export.
+fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe { pyre_object::bytearrayobject::w_bytearray_exports_decref(args[0]) };
+    Ok(pyre_object::w_none())
+}
+
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
 fn init_bytearray_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bytearray_descr_new));
+    dict_storage_store(
+        ns,
+        "__release_buffer__",
+        make_builtin_function_with_arity("__release_buffer__", bytearray_method_release_buffer, 2),
+    );
     // `bytearrayobject.py W_BytearrayObject.descr_decode` shares the
     // bytes decode machinery — `bytes_method_decode` already pulls the
     // payload via `bytes_like_data`, which handles both kinds.
@@ -12616,10 +12636,18 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 let b = args[1];
                 unsafe {
                     let a_data = pyre_object::bytesobject::bytes_like_data(a);
-                    let b_data = match buffer_as_bytes_like(b)? {
-                        Some(src) => pyre_object::bytesobject::bytes_like_data(src).to_vec(),
-                        None => vec![],
+                    // descr_add: a non-buffer operand raises rather than
+                    // concatenating as empty.
+                    let Some(src) = buffer_as_bytes_like(b)? else {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::TypeError,
+                            format!(
+                                "can't concat {} to bytearray",
+                                crate::type_methods::arg_type_name(b)
+                            ),
+                        ));
                     };
+                    let b_data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
                     let mut result = a_data.to_vec();
                     result.extend_from_slice(&b_data);
                     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
@@ -12640,10 +12668,20 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 let ba = args[0];
                 let other = args[1];
                 unsafe {
-                    if let Some(src) = buffer_as_bytes_like(other)? {
-                        let data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
-                        pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
-                    }
+                    crate::builtins::bytearray_check_exports(ba)?;
+                    // descr_inplace_add: a non-buffer operand raises rather
+                    // than silently leaving the bytearray unchanged.
+                    let Some(src) = buffer_as_bytes_like(other)? else {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::TypeError,
+                            format!(
+                                "can't concat {} to bytearray",
+                                crate::type_methods::arg_type_name(other)
+                            ),
+                        ));
+                    };
+                    let data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
+                    pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
                 }
                 Ok(ba)
             },
