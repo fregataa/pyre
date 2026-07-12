@@ -12547,8 +12547,12 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let count = match crate::baseobjspace::int_w(w_index) {
         Ok(v) => v,
         Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
-            return Err(crate::PyError::overflow_error(
-                "cannot fit 'int' into an index-sized integer",
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::OverflowError,
+                format!(
+                    "cannot fit '{}' into an index-sized integer",
+                    crate::baseobjspace::object_functionstr_type_name(args[1])
+                ),
             ));
         }
         Err(e) => return Err(e),
@@ -12594,10 +12598,38 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         if pyre_object::bytesobject::is_bytes_like(other) {
             pyre_object::bytesobject::bytes_like_data(other).to_vec()
         } else {
-            crate::builtins::collect_iterable(other)?
-                .into_iter()
-                .map(bytearray_byte_arg)
-                .collect::<Result<_, _>>()?
+            // `PyObject_GetIter` — a non-iterable operand is the "can't extend" case.
+            let it = crate::baseobjspace::iter(other).map_err(|e| {
+                if e.kind == crate::PyErrorKind::TypeError {
+                    crate::PyError::type_error(format!(
+                        "can't extend bytearray with {}",
+                        crate::baseobjspace::object_functionstr_type_name(other)
+                    ))
+                } else {
+                    e
+                }
+            })?;
+            let is_str = pyre_object::is_str(other);
+            let mut appended = Vec::new();
+            loop {
+                match crate::baseobjspace::next(it) {
+                    Ok(v) => {
+                        let b = bytearray_byte_arg(v).map_err(|e| {
+                            if is_str && e.kind == crate::PyErrorKind::TypeError {
+                                crate::PyError::type_error(
+                                    "expected iterable of integers; got: 'str'",
+                                )
+                            } else {
+                                e
+                            }
+                        })?;
+                        appended.push(b);
+                    }
+                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            appended
         }
     };
     unsafe {
