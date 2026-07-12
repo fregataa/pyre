@@ -325,9 +325,6 @@ fn is_typevartuple(param: PyObjectRef) -> bool {
     )
 }
 
-/// `subs_parameters(self, args, params, items)` (`_pypy_generic_alias.py:207`)
-/// — produce the substituted `__args__` for `self[items]`.  Shared by
-/// `GenericAlias.__getitem__` and `UnionType.__getitem__`.
 /// `%T`-style class name of `w_obj` for error messages.
 fn typename(w_obj: PyObjectRef) -> String {
     match crate::typedef::r#type(w_obj) {
@@ -336,6 +333,15 @@ fn typename(w_obj: PyObjectRef) -> String {
     }
 }
 
+/// `subs_parameters(self, args, params, items)` (`_pypy_generic_alias.py:207`)
+/// — produce the substituted `__args__` for `self[items]`.  Shared by
+/// `GenericAlias.__getitem__` and `UnionType.__getitem__`.
+///
+/// TODO: the two guards below diverge from the `_pypy_generic_alias.py`
+/// reference (PyPy `py3.11`) — the `is_tuple` handling of `items` is a Rust-port
+/// memory-safety necessity (`w_tuple_len` isn't type-checked like Python
+/// `len()`), while the unpacked tuple-return check forward-ports CPython 3.14's
+/// GH-138497; re-sync the latter once PyPy reaches 3.14 (authority = CPython 3.14).
 pub(crate) fn subs_parameters(
     self_: PyObjectRef,
     args: PyObjectRef,
