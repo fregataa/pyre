@@ -325,23 +325,9 @@ fn is_typevartuple(param: PyObjectRef) -> bool {
     )
 }
 
-/// `%T`-style class name of `w_obj` for error messages.
-fn typename(w_obj: PyObjectRef) -> String {
-    match crate::typedef::r#type(w_obj) {
-        Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
-        None => "object".to_string(),
-    }
-}
-
 /// `subs_parameters(self, args, params, items)` (`_pypy_generic_alias.py:207`)
 /// — produce the substituted `__args__` for `self[items]`.  Shared by
 /// `GenericAlias.__getitem__` and `UnionType.__getitem__`.
-///
-/// TODO: the two guards below diverge from the `_pypy_generic_alias.py`
-/// reference (PyPy `py3.11`) — the `is_tuple` handling of `items` is a Rust-port
-/// memory-safety necessity (`w_tuple_len` isn't type-checked like Python
-/// `len()`), while the unpacked tuple-return check forward-ports CPython 3.14's
-/// GH-138497; re-sync the latter once PyPy reaches 3.14 (authority = CPython 3.14).
 pub(crate) fn subs_parameters(
     self_: PyObjectRef,
     args: PyObjectRef,
@@ -376,12 +362,8 @@ pub(crate) fn subs_parameters(
             items = crate::call::call_function_impl_result(prepare, &[self_, items])?;
         }
     }
-    // `__typing_prepare_subst__` is not required to return a tuple
-    // (genericaliasobject.c `_Py_subs_parameters`): a non-tuple `item` is
-    // treated as a single argument (`nitems = 1`, `argitems = &item`) rather
-    // than dereferenced as a tuple. Mirror that instead of blindly taking
-    // `len(items)`, which would misread a non-tuple (e.g. an evil `prepare`
-    // returning `None`) and crash.
+    // Non-tuple `items` (a broken `__typing_prepare_subst__`) counts as one arg
+    // per CPython `_Py_subs_parameters`; a bare `w_tuple_len` would crash on it.
     let is_tuple_items = unsafe { is_tuple(items) };
     let nitems = if is_tuple_items {
         unsafe { w_tuple_len(items) }
@@ -432,15 +414,13 @@ pub(crate) fn subs_parameters(
             subs_tvars(old_arg, params, argitems)?
         };
         if unpack {
-            // `newargs.extend(arg)` splices an unpacked `TypeVarTuple`'s
-            // substituted members, but `__typing_subst__` must actually have
-            // returned a tuple (GH-138497); otherwise CPython raises rather
-            // than iterating an arbitrary object.
+            // GH-138497: an unpacked `__typing_subst__` must return a tuple.
+            // (authority = CPython 3.14)
             if !unsafe { is_tuple(arg) } {
                 return Err(crate::PyError::type_error(format!(
                     "expected __typing_subst__ of {} objects to return a tuple, not {}",
-                    typename(old_arg),
-                    typename(arg),
+                    crate::type_methods::arg_type_name(old_arg),
+                    crate::type_methods::arg_type_name(arg),
                 )));
             }
             let n = unsafe { w_tuple_len(arg) };
