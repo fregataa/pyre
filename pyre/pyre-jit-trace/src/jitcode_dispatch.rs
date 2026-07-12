@@ -403,6 +403,73 @@ impl CalleeLocalsShadow {
     }
 }
 
+/// One inlined-callee level of the walk's framestack.
+pub struct InlineFrame {
+    /// Callee `w_code`, used by the recursion-depth scan. Once the same code
+    /// reaches [`FBW_MAX_INLINE_RECURSION`], the call folds to a residual
+    /// instead of unrolling its call tree (`pyjitpl.py:1388-1416`).
+    pub w_code: usize,
+    /// Paused caller snapshot for the multi-frame path. `None` preserves the
+    /// straight-line single-frame collapse while retaining the callee level.
+    pub parent: Option<InlineParentFrame>,
+}
+
+/// Per-trace-attempt walk session, owned by the walk driver and threaded
+/// through [`WalkContext`] — `MetaInterp.framestack` (`pyjitpl.py:2475`,
+/// `:2487`; depth scan `:1390`). Innermost level last.
+#[derive(Default)]
+pub struct WalkSession {
+    /// Inlined callee levels. Parent snapshots are outermost-first, matching
+    /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
+    /// when the callee sub-walk returns.
+    pub framestack: Vec<InlineFrame>,
+    /// Whether the terminating permanent abort fired inside an inline
+    /// sub-walk. Its `op.pc` is then a callee coordinate with no meaning in
+    /// the outer snapshot root's py_pc→jitcode translation, so abort-point
+    /// flushing must decline after the sub-walk unwinds.
+    pub abort_in_subwalk: bool,
+}
+
+/// Compile-time-constant frame fields of an inlined callee.
+#[derive(Clone, Copy)]
+pub struct InlineCalleeConsts {
+    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
+    /// callee function's `__globals__` as a `PyObjectRef`.
+    w_globals: usize,
+    /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
+    /// pointer.
+    w_code: usize,
+}
+
+/// Walk-scoped FBW modes inherited parent-to-child across sub-walk
+/// constructions. Formerly three thread-locals.
+#[derive(Clone, Copy)]
+pub struct FbwWalkMode {
+    /// Full-body snapshot root used to map a guard's jitcode `op_pc` through
+    /// the outer jitcode and read the live walk banks. Null for per-opcode
+    /// walks, where `walker_capture_snapshot_for_last_guard` keeps its legacy
+    /// single-coordinate behavior.
+    pub snapshot_sym: *const crate::state::PyreSym,
+    /// Guards emitted in an inline sub-walk resume at the caller's CALL
+    /// boundary rather than mapping the callee `op_pc` through the outer
+    /// jitcode in `walker_capture_snapshot_for_last_guard`.
+    pub inline_subwalk: bool,
+    /// A bridge-carrier resume folds nested self-recursive calls directly to
+    /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
+    /// re-unrolling the call tree to the multi-frame depth cap.
+    pub carrier_resume: bool,
+}
+
+impl Default for FbwWalkMode {
+    fn default() -> Self {
+        Self {
+            snapshot_sym: std::ptr::null(),
+            inline_subwalk: false,
+            carrier_resume: false,
+        }
+    }
+}
+
 /// `WalkContext` carries two lifetimes:
 /// * `'frame` — the inner-frame lifetime: register banks + trace
 ///   recorder. Sub-walk recursion (`inline_call_r_r/dR>r`) allocates
@@ -415,6 +482,17 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// Present only for an inlined-callee sub-walk. Top-level and other walks
     /// have no callee shadow, preserving the former empty-stack no-op behavior.
     pub callee_shadow: Option<CalleeLocalsShadow>,
+    /// Compile-time-constant frame fields of this inlined callee's own
+    /// unseeded portal frame. This is the walk-time equivalent of the
+    /// codewriter's non-portal branch (`codewriter.rs:6720-6732` /
+    /// `:7347-7369`), where `pycode` and `w_globals` are constants rather than
+    /// reads that alias the caller's frame. `None` when this is not an
+    /// inlined-callee sub-walk.
+    pub inline_callee_consts: Option<InlineCalleeConsts>,
+    /// FBW walk modes inherited by nested sub-walk contexts.
+    pub fbw_mode: FbwWalkMode,
+    /// Caller-owned state shared by every frame in this walk attempt.
+    pub session: &'static_a std::cell::RefCell<WalkSession>,
     /// Symbolic Ref-bank register file. Indexing matches RPython
     /// `MIFrame.registers_r` (`pyjitpl.py:177-234`); the byte after a
     /// `r`-coded operand opcode indexes directly into this slice.
@@ -2402,6 +2480,7 @@ fn dispatch_switch_id(
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_via_miframe(
     miframe: &mut MIFrame,
+    session: &std::cell::RefCell<WalkSession>,
     jitcode_code: &[u8],
     position: usize,
     descr_refs: &[DescrRef],
@@ -2464,16 +2543,14 @@ pub fn dispatch_via_miframe(
 
     // Phase 7: this IS the full-body walk over the outer `sym.jitcode`,
     // so guard snapshots can resolve a per-guard resume coordinate from
-    // `op_pc`.  Mark the thread-local for the walk's lifetime;
+    // `op_pc`.  Set `fbw_mode.snapshot_sym` for the walk's lifetime;
     // `walker_capture_snapshot_for_last_guard` and
     // `fbw_foriter_body_pc_from_op_pc` read it.  This is the PRODUCTION
     // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
     // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
-    // so `FULL_BODY_SNAPSHOT_SYM` is non-null on every default-JIT
+    // so `fbw_mode.snapshot_sym` is non-null on every default-JIT
     // run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
     // (the transitional trait leg), which leaves the pointer null.
-    let _full_body_guard = FullBodySnapshotSymGuard::set(sym_ptr);
-
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
     // mirrors this as `Option<OpRef>` — `None` means "no active
@@ -2585,6 +2662,12 @@ pub fn dispatch_via_miframe(
     let result = {
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode {
+                snapshot_sym: sym_ptr,
+                ..Default::default()
+            },
+            session,
             registers_r: &mut top_regs_r,
             registers_i: &mut top_regs_i,
             registers_f: &mut top_regs_f,
@@ -2688,7 +2771,7 @@ pub fn dispatch_via_miframe(
 /// Build the paused root portal frame for a multi-frame bridge-carrier
 /// sub-walk (#215 item 2 / P2 drain).  The root resumes at `root_pc` once the
 /// reconstructed deepest callee returns; the callee's in-callee guards must
-/// snapshot this frame on `FBW_INLINE_PARENT_FRAMES` so a guard-failure resume
+/// snapshot this frame on the walk framestack so a guard-failure resume
 /// rebuilds both Python frames.  Mirror of [`compute_inline_caller_frame`], but
 /// the root register banks come straight from the bridge-seeded `root_sym`
 /// rather than a live caller [`WalkContext`] (the root walk has not started —
@@ -2772,8 +2855,8 @@ fn compute_bridge_root_parent_frame(
 /// instead of the top-level `Finish` that pyre's own-portal model rejects with
 /// `NonStandardVableFinishPortalUnsupported` — the original #215 item-2 wall.
 ///
-/// The root portal is installed as `FULL_BODY_SNAPSHOT_SYM` and pushed onto
-/// `FBW_INLINE_PARENT_FRAMES` for the sub-walk's lifetime, so an in-callee guard
+/// The root portal is installed as `fbw_mode.snapshot_sym` and pushed onto the
+/// walk framestack for the sub-walk's lifetime, so an in-callee guard
 /// snapshots both the callee frame and the paused root
 /// (`walker_capture_multi_frame_inline_snapshot`).
 ///
@@ -2784,6 +2867,7 @@ fn compute_bridge_root_parent_frame(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_bridge_carrier_subwalk(
     ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<WalkSession>,
     root_sym: &crate::state::PyreSym,
     root_pc: usize,
     callee_pjc: &std::sync::Arc<crate::PyJitCode>,
@@ -2896,13 +2980,19 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     };
 
     // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
-    // guards snapshot the paused root; restored on drop.
+    // guards snapshot the paused root.
     let root_sym_ptr = root_sym as *const crate::state::PyreSym;
-    let _full_body_guard = FullBodySnapshotSymGuard::set(root_sym_ptr);
 
     let outcome = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(Default::default()),
+            inline_callee_consts: Some(consts),
+            fbw_mode: FbwWalkMode {
+                snapshot_sym: root_sym_ptr,
+                inline_subwalk: true,
+                carrier_resume: true,
+            },
+            session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -2948,14 +3038,10 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             outer_jitcode_index,
             outer_active_boxes,
         };
-        let _inline_boundary = InlineSubwalkCaptureGuard::enter();
-        let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
-        let _callee_consts = InlineCalleeConstsGuard::enter(consts);
-        let _parent_frame_guard = InlineParentFrameGuard::enter(root_frame);
+        let _inline_frame = InlineFrameGuard::enter(session, callee_code_key, Some(root_frame));
         // Nested self-recursive calls inside the resumed callee fold straight to
         // a recursive-portal CALL_ASSEMBLER (the bridge is the deopt
         // continuation, not a fresh unroll).
-        let _carrier_resume = CarrierResumeGuard::enter();
         // Seed the reconstructed callee's local slot concretes into its frame-
         // owned shadow.  The resume is mid-body,
         // so the locals were stored to the frame vable before the guard fired;
@@ -2992,6 +3078,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_outer_frame_continuation(
     ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<WalkSession>,
     root_sym: &crate::state::PyreSym,
     root_pjc: &std::sync::Arc<crate::PyJitCode>,
     root_code_key: usize,
@@ -3167,11 +3254,17 @@ pub(crate) fn drive_outer_frame_continuation(
     };
 
     let root_sym_ptr = root_sym as *const crate::state::PyreSym;
-    let _full_body_guard = FullBodySnapshotSymGuard::set(root_sym_ptr);
 
     let outcome = {
         let mut outer_wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: Some(consts),
+            fbw_mode: FbwWalkMode {
+                snapshot_sym: root_sym_ptr,
+                inline_subwalk: true,
+                carrier_resume: true,
+            },
+            session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -3204,14 +3297,10 @@ pub(crate) fn drive_outer_frame_continuation(
             outer_jitcode_index,
             outer_active_boxes,
         };
-        let _inline_boundary = InlineSubwalkCaptureGuard::enter();
-        let _recursion_frame = InlineRecursionGuard::enter(root_code_key);
-        let _callee_consts = InlineCalleeConstsGuard::enter(consts);
-        let _parent_frame_guard = InlineParentFrameGuard::enter(root_frame);
+        let _inline_frame = InlineFrameGuard::enter(session, root_code_key, Some(root_frame));
         // The outer's own second self-recursive call folds to a live
         // recursive-portal CALL_ASSEMBLER (same as the callee's), not a fresh
         // unroll.
-        let _carrier_resume = CarrierResumeGuard::enter();
         walk(root_code, entry, &mut outer_wc)
     };
     Some(outcome)
@@ -3252,6 +3341,7 @@ pub(crate) fn drive_outer_frame_continuation(
 /// at the production tracer's contract.
 pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     miframe: &mut crate::state::MIFrame,
+    session: &'a std::cell::RefCell<WalkSession>,
     entry_jitcode: &'static majit_translate::jitcode::JitCode,
     descr_refs: &'a [DescrRef],
     sub_jitcode_lookup: &'a SubJitCodeLookup,
@@ -3377,6 +3467,9 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     let result = {
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -3850,10 +3943,7 @@ fn getfield_gc_via_heapcache(
     let is_typeptr_field = descr
         .as_field_descr()
         .is_some_and(|fd| fd.offset() == pyre_object::pyobject::OB_TYPE_OFFSET);
-    let typeptr_const = if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
-        && !obj.is_constant()
-        && is_typeptr_field
-    {
+    let typeptr_const = if ctx.fbw_mode.inline_subwalk && !obj.is_constant() && is_typeptr_field {
         let known = ctx.trace_ctx.heap_cache().get_known_class(obj);
         match (known, opcode) {
             (Some(cls), OpCode::GetfieldGcI | OpCode::GetfieldGcPureI) => {
@@ -3894,7 +3984,7 @@ fn getfield_gc_via_heapcache(
         // paths above (typeptr / const-pure / cache-hit) record nothing, so
         // they are unaffected; production sub-walks never reach this (they
         // would already panic).
-        if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        if ctx.fbw_mode.inline_subwalk
             && matches!(
                 opcode,
                 OpCode::GetfieldGcI
@@ -4011,7 +4101,7 @@ fn try_resolve_inline_callee_static_field(
     if dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(consts) = fbw_current_inline_callee_consts() else {
+    let Some(consts) = ctx.inline_callee_consts else {
         return Ok(None);
     };
     let descr = read_descr(code, op, 1, ctx)?;
@@ -4585,7 +4675,7 @@ fn setarrayitem_vable_via_metainterp(
     // masquerade as a stack TOS.  Writes ONLY `vstack_last_ref` (side-data);
     // consumed only when the mirror is valid.
     if value_bank == 'r' && ctx.vstack_valid {
-        let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        let full_body_sym = ctx.fbw_mode.snapshot_sym;
         if !full_body_sym.is_null() {
             // SAFETY: pointer live for the full-body walk; read-only.
             let nlocals = unsafe { (*full_body_sym).nlocals } as i64;
@@ -5764,7 +5854,7 @@ fn try_execute_residual_call_via_executor(
     // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
     // the first un-lowered helper.  A user-space code address fits in 47 bits
     // on 64-bit macOS/Linux; symbolic hashes set bits >= 47.
-    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+    if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
         && (addr as u64) >> 47 != 0
@@ -6348,8 +6438,8 @@ fn try_execute_residual_call_via_executor(
                 // body and deliver to the wrong pc.  The fallback (no outer
                 // full-body sym / metadata) keeps the entry coordinate, which
                 // is correct for the loop-header FOR_ITER.
-                let body_pc =
-                    fbw_foriter_body_pc_from_op_pc(op_pc).unwrap_or(ctx.entry_py_pc as usize + 1);
+                let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+                    .unwrap_or(ctx.entry_py_pc as usize + 1);
                 fbw_foriter_inflight_capture(
                     result_i64 as usize as pyre_object::PyObjectRef,
                     body_pc,
@@ -7101,36 +7191,6 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// `rd_resume_position >= 0` and can derive `op.fail_args` from the
 /// snapshot via `op.store_final_boxes(liveboxes)` instead of panicking.
 thread_local! {
-    /// Set (to the outer `PyreSym`) only for the duration of a full-body
-    /// walk (`dispatch_via_miframe`, reached exclusively under
-    /// `PYRE_FULL_BODY_WALK`).  Null in the per-opcode / trait-shadow walk
-    /// and in production default-off, so [`walker_capture_snapshot_for_last_guard`]
-    /// keeps its legacy single-coordinate behavior there.
-    ///
-    /// The full-body walk processes the outer `sym.jitcode` directly, so a
-    /// guard's `op_pc` IS a valid resume coordinate in that jitcode.  This
-    /// pointer lets the snapshot helper map `op_pc` back to its containing
-    /// Python opcode and read the live walk register banks for liveness,
-    /// instead of the static entry coordinate the per-opcode path uses.
-    static FULL_BODY_SNAPSHOT_SYM: std::cell::Cell<*const crate::state::PyreSym> =
-        const { std::cell::Cell::new(std::ptr::null()) };
-
-    /// Set (`true`) only while a `try_walker_inline_user_call` sub-walk is
-    /// running.  In that scope every guard captured by
-    /// [`walker_capture_snapshot_for_last_guard`] — both the walker's own
-    /// guards and the `_nonstandard_virtualizable` PTR_EQ promote that
-    /// `TraceCtx::vable_getfield_*` emits internally for the inlined
-    /// callee's non-standard heap frame — must resume at the *caller's*
-    /// CALL boundary (`ctx.entry_py_pc` / `ctx.outer_active_boxes`), not
-    /// at the callee `op_pc` mapped through the outer (`FULL_BODY_SNAPSHOT_SYM`)
-    /// jitcode's py_pc→jitcode translation.  The callee `op_pc` is meaningless
-    /// in that outer
-    /// translation, and pyre's blackhole can only re-enter the caller's Python
-    /// opcode; resuming at the CALL boundary re-executes the whole call,
-    /// which is sound for the side-effect-free leaves this path inlines.
-    static INLINE_SUBWALK_CAPTURE_BOUNDARY: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-
     /// Set (`true`) only for the duration of the
     /// `walker_capture_snapshot_for_last_guard` call that records a
     /// FOR_ITER-next residual's `GUARD_NO_EXCEPTION`.  Tells the snapshot
@@ -7174,88 +7234,6 @@ thread_local! {
     static BRANCH_GUARD_KEPT_RECOVERED: std::cell::RefCell<Vec<(u16, OpRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// FBW abort-flush guard: captures whether the `abort_permanent` marker
-    /// that aborted the walk fired inside an inline sub-walk
-    /// ([`INLINE_SUBWALK_CAPTURE_BOUNDARY`]).  When set, the abort's jitcode
-    /// `op.pc` is a CALLEE coordinate with no meaning in the outer
-    /// (`FULL_BODY_SNAPSHOT_SYM`) py_pc→jitcode translation, so the
-    /// abort-point flush must
-    /// decline and fall back to the legacy replay.  Captured at the marker
-    /// (before the sub-walk's RAII guard restores the boundary flag) so the
-    /// top-level walk driver reads the abort-time value, not the unwound one.
-    static FBW_ABORT_IN_SUBWALK: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-/// Whether the walk's terminating `abort_permanent` marker fired inside an
-/// inline sub-walk (callee coordinate).  Read by the full-body walk driver
-/// to decline the abort-point flush.  See [`FBW_ABORT_IN_SUBWALK`].
-pub(crate) fn fbw_abort_in_subwalk() -> bool {
-    FBW_ABORT_IN_SUBWALK.with(|c| c.get())
-}
-
-/// RAII guard: mark the current scope as an inline sub-walk (see
-/// [`INLINE_SUBWALK_CAPTURE_BOUNDARY`]) and restore the prior value on
-/// drop so nested inlines unwind to their parent's setting.
-struct InlineSubwalkCaptureGuard(bool);
-
-impl InlineSubwalkCaptureGuard {
-    fn enter() -> Self {
-        let prev = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.replace(true));
-        InlineSubwalkCaptureGuard(prev)
-    }
-}
-
-impl Drop for InlineSubwalkCaptureGuard {
-    fn drop(&mut self) {
-        INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.set(self.0));
-    }
-}
-
-thread_local! {
-    /// FBW inline call stack: the `w_code` pointer of every user function
-    /// currently being inlined by [`try_walker_inline_user_call`]'s
-    /// sub-walk, innermost last.  How many times a callee's `w_code`
-    /// already appears is its recursion depth at the call site; once it
-    /// reaches [`FBW_MAX_INLINE_RECURSION`] the inline bails to a residual
-    /// call instead of unrolling the callee's (possibly exponential) call
-    /// tree at trace time.  Mirrors the trait tracer's `recursive_depth >=
-    /// max_unroll_recursion` gate (`pyjitpl.py:1388-1416`,
-    /// `trace_opcode.rs:5604-5652`).
-    static FBW_INLINE_CODE_STACK: std::cell::RefCell<Vec<usize>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-thread_local! {
-    /// Set for the lifetime of a multi-frame bridge-carrier callee sub-walk
-    /// (`drive_bridge_carrier_subwalk`, #215 item 2 / P2 drain).  The bridge is
-    /// the unroll-budget-exhausted deopt continuation of an already-compiled
-    /// recursive portal, so a nested self-recursive call inside the resumed
-    /// callee must fold straight to a recursive-portal `CALL_ASSEMBLER`
-    /// (`opimpl_recursive_call_assembler`) rather than re-unroll the call tree
-    /// at trace time (which would bottom out at the multiframe depth cap).
-    static FBW_CARRIER_RESUME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether the walker is inside a bridge-carrier callee sub-walk.
-fn fbw_carrier_resume() -> bool {
-    FBW_CARRIER_RESUME.with(|c| c.get())
-}
-
-/// RAII guard: mark the carrier-resume sub-walk for its lifetime, restore the
-/// prior value on drop (so nesting unwinds to the parent's setting).
-pub(crate) struct CarrierResumeGuard(bool);
-
-impl CarrierResumeGuard {
-    pub(crate) fn enter() -> Self {
-        CarrierResumeGuard(FBW_CARRIER_RESUME.with(|c| c.replace(true)))
-    }
-}
-
-impl Drop for CarrierResumeGuard {
-    fn drop(&mut self) {
-        FBW_CARRIER_RESUME.with(|c| c.set(self.0));
-    }
 }
 
 /// `rlib/jit.py:601` `max_unroll_recursion` default (= warmstate
@@ -7280,9 +7258,14 @@ const FBW_MAX_INLINE_RECURSION: usize = 7;
 /// bound is now a performance, not a soundness, question.)
 const FBW_MAX_MULTIFRAME_DEPTH: usize = 1;
 
-/// Recursion depth of `w_code` on the FBW inline stack.
-fn fbw_inline_recursion_count(w_code: usize) -> usize {
-    FBW_INLINE_CODE_STACK.with(|s| s.borrow().iter().filter(|&&c| c == w_code).count())
+/// Recursion depth of `w_code` on the walk's framestack.
+fn fbw_inline_recursion_count(ctx: &WalkContext<'_, '_>, w_code: usize) -> usize {
+    ctx.session
+        .borrow()
+        .framestack
+        .iter()
+        .filter(|frame| frame.w_code == w_code)
+        .count()
 }
 
 /// The innermost inline level's strict-fold frame register (`u16::MAX` when
@@ -7291,78 +7274,6 @@ fn fbw_strict_fold_frame_reg(ctx: &WalkContext<'_, '_>) -> u16 {
     ctx.callee_shadow
         .as_ref()
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
-}
-
-/// RAII guard: push `w_code` onto the FBW inline stack for the lifetime of
-/// a sub-walk, pop on drop so nested inlines unwind to their parent depth.
-struct InlineRecursionGuard;
-
-impl InlineRecursionGuard {
-    fn enter(w_code: usize) -> Self {
-        FBW_INLINE_CODE_STACK.with(|s| s.borrow_mut().push(w_code));
-        InlineRecursionGuard
-    }
-}
-
-impl Drop for InlineRecursionGuard {
-    fn drop(&mut self) {
-        FBW_INLINE_CODE_STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
-    }
-}
-
-thread_local! {
-    /// FBW inline callee constant stack: for each user function currently
-    /// being inlined by [`try_walker_inline_user_call`]'s sub-walk, its
-    /// compile-time-constant frame fields, innermost last.  When the inlined
-    /// body reads a scalar `getfield_vable_r` off its OWN (unseeded) portal
-    /// frame — the namespace (`w_globals`, field 5) for a `LOAD_GLOBAL`, or
-    /// the promote-to-const `pycode` (field 1) — the read resolves to the
-    /// callee constant here instead of aborting `VableBoxNotSeeded`.  This is
-    /// the walk-time equivalent of the codewriter's non-portal branch
-    /// (`codewriter.rs:6720-6732` / `:7347-7369`): a non-portal callee's
-    /// `pycode`/`w_globals` are compile-time constants, fed as `ConstRef`
-    /// rather than a portal `getfield_vable` that would alias the caller's
-    /// frame and read the wrong field.
-    static FBW_INLINE_CALLEE_CONSTS: std::cell::RefCell<Vec<InlineCalleeConsts>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Compile-time-constant frame fields of an inlined callee (see
-/// [`FBW_INLINE_CALLEE_CONSTS`]).
-#[derive(Clone, Copy)]
-struct InlineCalleeConsts {
-    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
-    /// callee function's `__globals__` as a `PyObjectRef`.
-    w_globals: usize,
-    /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
-    /// pointer.
-    w_code: usize,
-}
-
-/// The innermost inlined callee's constants, if a sub-walk is active.
-fn fbw_current_inline_callee_consts() -> Option<InlineCalleeConsts> {
-    FBW_INLINE_CALLEE_CONSTS.with(|s| s.borrow().last().copied())
-}
-
-/// RAII guard: push the inlined callee's constants for the lifetime of its
-/// sub-walk, pop on drop so nested inlines unwind to their parent.
-struct InlineCalleeConstsGuard;
-
-impl InlineCalleeConstsGuard {
-    fn enter(consts: InlineCalleeConsts) -> Self {
-        FBW_INLINE_CALLEE_CONSTS.with(|s| s.borrow_mut().push(consts));
-        InlineCalleeConstsGuard
-    }
-}
-
-impl Drop for InlineCalleeConstsGuard {
-    fn drop(&mut self) {
-        FBW_INLINE_CALLEE_CONSTS.with(|s| {
-            s.borrow_mut().pop();
-        });
-    }
 }
 
 /// One paused caller frame the multi-frame inline snapshot must carry
@@ -7384,37 +7295,27 @@ struct InlineParentFrame {
     boxes: Vec<OpRef>,
 }
 
-thread_local! {
-    /// FBW inline parent-frame chain (#68/#124): for a guard emitted inside an
-    /// inlined callee sub-walk, the chain of paused caller frames the
-    /// multi-frame snapshot must carry, OUTERMOST-FIRST (the `Snapshot.frames`
-    /// order, recorder.rs:56).  A caller is pushed at the inline CALL site and
-    /// popped when its sub-walk returns, so the innermost caller is last and a
-    /// `reverse()` is not needed.  Empty outside the gated multi-frame inline
-    /// path (`PYRE_FBW_INLINE_MULTIFRAME`); the single-frame collapse
-    /// (caller-boundary re-execute, [`INLINE_SUBWALK_CAPTURE_BOUNDARY`]) stays
-    /// the default for straight-line callees.
-    static FBW_INLINE_PARENT_FRAMES: std::cell::RefCell<Vec<InlineParentFrame>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// RAII guard for one framestack level. Pop on drop so `?` and nested
+/// sub-walks unwind to the caller's level.
+struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
 
-/// RAII guard: push a paused caller frame onto the FBW inline parent-frame
-/// chain for the lifetime of its callee sub-walk; pop on drop so nested
-/// inlines unwind to their parent.
-struct InlineParentFrameGuard;
-
-impl InlineParentFrameGuard {
-    fn enter(frame: InlineParentFrame) -> Self {
-        FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow_mut().push(frame));
-        InlineParentFrameGuard
+impl<'a> InlineFrameGuard<'a> {
+    fn enter(
+        session: &'a std::cell::RefCell<WalkSession>,
+        w_code: usize,
+        parent: Option<InlineParentFrame>,
+    ) -> Self {
+        session
+            .borrow_mut()
+            .framestack
+            .push(InlineFrame { w_code, parent });
+        InlineFrameGuard(session)
     }
 }
 
-impl Drop for InlineParentFrameGuard {
+impl Drop for InlineFrameGuard<'_> {
     fn drop(&mut self) {
-        FBW_INLINE_PARENT_FRAMES.with(|s| {
-            s.borrow_mut().pop();
-        });
+        self.0.borrow_mut().framestack.pop();
     }
 }
 
@@ -7625,24 +7526,6 @@ pub(crate) fn fbw_inline_nsfold_enabled() -> bool {
         }
         None => true,
     })
-}
-
-/// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a
-/// full-body walk and restore the prior value on drop (so any nesting
-/// restores the parent rather than clearing to null).
-struct FullBodySnapshotSymGuard(*const crate::state::PyreSym);
-
-impl FullBodySnapshotSymGuard {
-    fn set(sym: *const crate::state::PyreSym) -> Self {
-        let prev = FULL_BODY_SNAPSHOT_SYM.with(|c| c.replace(sym));
-        FullBodySnapshotSymGuard(prev)
-    }
-}
-
-impl Drop for FullBodySnapshotSymGuard {
-    fn drop(&mut self) {
-        FULL_BODY_SNAPSHOT_SYM.with(|c| c.set(self.0));
-    }
 }
 
 thread_local! {
@@ -8553,7 +8436,7 @@ pub(crate) fn fbw_abort_carrier_clear() {
 
 /// An unexecutable residual call (`try_execute_residual_call_via_executor`
 /// returned `None`) reached during a multiframe-inlined callee sub-walk
-/// (`FBW_INLINE_CODE_STACK` non-empty) cannot fall back to the walk-end
+/// (the framestack is non-empty) cannot fall back to the walk-end
 /// legacy replay.  The replay re-enters the freshly compiled loop from the
 /// recorded entry state while sibling concretely-executed heap mutations of
 /// the SAME iteration (the enclosing loop's `i = i + 1`) have already
@@ -8565,7 +8448,10 @@ pub(crate) fn fbw_abort_carrier_clear() {
 /// every iteration exactly once) instead.  At top level (no active inline)
 /// the unjournaled-effect / legacy-replay path is sound, so only abort when
 /// nested.
-fn fbw_abort_nested_unjournaled_residual(pc: usize) -> Result<(), DispatchError> {
+fn fbw_abort_nested_unjournaled_residual(
+    ctx: &WalkContext<'_, '_>,
+    pc: usize,
+) -> Result<(), DispatchError> {
     // `PYRE_FBW_NESTED_RESID_ABORT=0` opts back into the prior
     // (miscompiling) mark-and-replay behavior for A/B.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -8573,7 +8459,7 @@ fn fbw_abort_nested_unjournaled_residual(pc: usize) -> Result<(), DispatchError>
         std::env::var_os("PYRE_FBW_NESTED_RESID_ABORT").as_deref()
             != Some(std::ffi::OsStr::new("0"))
     });
-    if enabled && !FBW_INLINE_CODE_STACK.with(|s| s.borrow().is_empty()) {
+    if enabled && !ctx.session.borrow().framestack.is_empty() {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc });
     }
     Ok(())
@@ -9194,7 +9080,7 @@ fn reconcile_vstack_at_boundary(
 /// non-NONE box), `false` if any slot is unsourceable (caller then
 /// latches `vstack_valid = false`).
 fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) -> bool {
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return false;
     }
@@ -9326,7 +9212,7 @@ pub(crate) fn fbw_abort_resume_py_pc(
 ///
 /// No-op unless the outer full-body sym owns the virtualizable shadow and
 /// `vstack_valid` is still set.  Reached only on the full-body walk
-/// (`FULL_BODY_SNAPSHOT_SYM` non-null); the per-opcode arm walk leaves the
+/// (`fbw_mode.snapshot_sym` non-null); the per-opcode arm walk leaves the
 /// mirror untouched (its guards use the static outer coordinate).  Writes
 /// only the `vstack_*` side-fields; never the registers / snapshot.
 fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
@@ -9334,18 +9220,18 @@ fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
         return;
     }
     // Inside an inline sub-walk the `jit_pc` is a CALLEE coordinate that
-    // does not exist in the outer (`FULL_BODY_SNAPSHOT_SYM`) jitcode's
+    // does not exist in the outer (`fbw_mode.snapshot_sym`) jitcode's
     // py_pc→jitcode tables, so `python_pc_for_jitcode_pc` would return garbage
     // and a
     // callee `write_ref_reg` would clobber `vstack_last_ref`.  Decline the
     // whole mirror for any walk that inlines a Python call — the benches
     // this targets (short-circuit `or`/`and` chains) are call-free, and
     // declining is a clean fallback to the legacy read.
-    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+    if ctx.fbw_mode.inline_subwalk {
         ctx.vstack_valid = false;
         return;
     }
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return;
     }
@@ -9468,11 +9354,11 @@ fn vstack_enter_exception_handler(
     // pre-raise walk invalidated it (e.g. at a `LOAD_GLOBAL` NULL-sentinel on
     // the `raise` expression).  Only an inline sub-walk (callee coordinate)
     // or a missing full-body sym is unrecoverable.
-    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+    if ctx.fbw_mode.inline_subwalk {
         ctx.vstack_valid = false;
         return;
     }
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return;
     }
@@ -9766,13 +9652,16 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
 /// Returns `None` when the outer full-body-walk sym / metadata is unavailable
 /// (per-opcode arm walk, test fixture); the caller then keeps the legacy
 /// walk-entry coordinate, which is correct for the loop-header FOR_ITER.
-fn fbw_foriter_body_pc_from_op_pc(op_pc: usize) -> Option<usize> {
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+fn fbw_foriter_body_pc_from_op_pc(
+    snapshot_sym: *const crate::state::PyreSym,
+    op_pc: usize,
+) -> Option<usize> {
+    let full_body_sym = snapshot_sym;
     if full_body_sym.is_null() {
         return None;
     }
     // SAFETY: the pointer is live for the full-body walk's lifetime
-    // (`FullBodySnapshotSymGuard`); only its `jitcode` metadata is read.
+    // (`snapshot-root mode`); only its `jitcode` metadata is read.
     let sym = unsafe { &*full_body_sym };
     if sym.jitcode.is_null() {
         return None;
@@ -9994,20 +9883,20 @@ fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option
 /// Two constructors mark the frame model: the gate must read the frame whose
 /// jitcode the `target` offset indexes, NOT a single global.
 /// * [`outer`](Self::outer) — the outermost portal/main frame held by
-///   `FULL_BODY_SNAPSHOT_SYM`.
+///   `fbw_mode.snapshot_sym`.
 /// * [`current`](Self::current) — the innermost inlined callee being
-///   sub-walked (`FBW_INLINE_CODE_STACK` top), or the portal frame when no
+///   sub-walked (framestack top), or the portal frame when no
 ///   sub-walk is active.  Mirrors the callee derivation in
-///   `walker_capture_multi_frame_inline_snapshot` (the `FBW_INLINE_CODE_STACK`
+///   `walker_capture_multi_frame_inline_snapshot` (the framestack
 ///   → `ensure_jitcode_index` → `pyjitcode_for_jitcode_index` chain) so the
 ///   gate and the snapshot encoder consult one consistent active frame.
 struct ActiveResumeFrame(std::sync::Arc<crate::PyJitCode>);
 
 impl ActiveResumeFrame {
-    /// The outermost portal/main frame (`FULL_BODY_SNAPSHOT_SYM`).  `None`
+    /// The outermost portal/main frame (`fbw_mode.snapshot_sym`).  `None`
     /// outside a full-body walk (per-opcode / trait path).
-    fn outer() -> Option<Self> {
-        let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    fn outer(snapshot_sym: *const crate::state::PyreSym) -> Option<Self> {
+        let full_body_sym = snapshot_sym;
         if full_body_sym.is_null() {
             return None;
         }
@@ -10024,14 +9913,18 @@ impl ActiveResumeFrame {
 
     /// The active frame at the current walk point: the innermost inlined
     /// callee when a sub-walk is in progress, else the portal frame.
-    fn current() -> Option<Self> {
-        match FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) {
+    fn current(
+        session: &std::cell::RefCell<WalkSession>,
+        snapshot_sym: *const crate::state::PyreSym,
+    ) -> Option<Self> {
+        let current_code = session.borrow().framestack.last().map(|frame| frame.w_code);
+        match current_code {
             Some(callee_w_code) => {
                 let idx = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;
                 let pjc = crate::state::pyjitcode_for_jitcode_index(idx)?;
                 Some(ActiveResumeFrame(pjc))
             }
-            None => Self::outer(),
+            None => Self::outer(snapshot_sym),
         }
     }
 }
@@ -10208,18 +10101,21 @@ fn kept_stack_has_boxed_int_hazard(
 /// (`collect_outer_active_boxes` → `frame_liveness_reg_indices_by_bank_at`)
 /// plus the const-window registers at index `>= num_regs_r` (auto-loaded
 /// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
-/// Same `FULL_BODY_SNAPSHOT_SYM` contract as
+/// Same `fbw_mode.snapshot_sym` contract as
 /// [`branch_resume_target_stack_depth`].
-fn branch_arm_resume_ref_liveness(target: usize) -> Option<(std::collections::HashSet<u16>, u16)> {
+fn branch_arm_resume_ref_liveness(
+    fbw_mode: FbwWalkMode,
+    target: usize,
+) -> Option<(std::collections::HashSet<u16>, u16)> {
     // Conservative under an inline sub-walk: `target` indexes the innermost
-    // callee's jitcode while `FULL_BODY_SNAPSHOT_SYM` (read below) is the
+    // callee's jitcode while `fbw_mode.snapshot_sym` (read below) is the
     // outer portal frame, so the outer-keyed liveness banks would be read at
     // a foreign coordinate.  `None` → the caller treats the arm as
     // unrestorable and declines, which is the current sub-walk behavior.
-    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+    if fbw_mode.inline_subwalk {
         return None;
     }
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let full_body_sym = fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return None;
     }
@@ -10413,7 +10309,7 @@ fn branch_arm_reads_unrestorable_ref(
 /// The not-taken-arm Python stack depth at a branch guard's resume target,
 /// resolved leg-INDEPENDENTLY through the `MetaInterpStaticData` jitcode
 /// store (`pyjitcode_for_jitcode_index`) rather than the full-body-walk-only
-/// `FULL_BODY_SNAPSHOT_SYM`.  [`branch_resume_target_stack_depth`] returns
+/// `fbw_mode.snapshot_sym`.  [`branch_resume_target_stack_depth`] returns
 /// `None` in the trait leg (where the bug surfaces just as it does in the
 /// full-body walk — both legs re-execute the same not-taken arm on deopt),
 /// so the unrestorable-kept-stack decline needs a depth probe that works in
@@ -10492,7 +10388,7 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // (reached via call_user_function_with_eval). Outside a full-body walk
     // the frame is always the standard virtualizable and emits no such
     // guard.
-    if FULL_BODY_SNAPSHOT_SYM.with(|c| c.get()).is_null() {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
         return Ok(());
     }
     if ctx.trace_ctx.num_guards() <= guards_before {
@@ -10501,7 +10397,7 @@ fn walker_capture_inline_nonstandard_vable_guard(
         // guard, so there is nothing to capture.
         return Ok(());
     }
-    if !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+    if !ctx.fbw_mode.inline_subwalk {
         // A callee compiled as its own Finish portal hit the non-standard
         // virtualizable path. Its internal promote GuardValue + force
         // store-back are not yet wired with a resume snapshot / FieldDescr
@@ -10609,16 +10505,16 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // and re-executes that opcode — `orgpc` parity) and read liveness
     // from the live walk register banks at that pc, instead of the
     // static entry-time coordinate the per-opcode arm path uses.
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let full_body_sym = ctx.fbw_mode.snapshot_sym;
     // Inline sub-walk: the guard's `op_pc` is a *callee* coordinate that
     // does not exist in the outer (`full_body_sym`) jitcode's py_pc→jitcode
     // tables.
     // Skip the full-body mapping and fall through to the caller-boundary
     // capture below, which resumes at the CALL site (re-execute the
-    // call on deopt — see `INLINE_SUBWALK_CAPTURE_BOUNDARY`).
-    let inline_subwalk = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get());
+    // call on deopt — see `fbw_mode.inline_subwalk`).
+    let inline_subwalk = ctx.fbw_mode.inline_subwalk;
     // #68 multi-frame inline guard: a guard emitted inside an inlined callee
-    // sub-walk with paused caller frames on `FBW_INLINE_PARENT_FRAMES` resumes
+    // sub-walk with paused caller frames on the walk framestack resumes
     // BOTH the callee (at its own pc) and the caller(s) (at the CALL return
     // point), instead of collapsing to the caller boundary (re-execute).  Only
     // the gated forward-branch inline path (`PYRE_FBW_INLINE_MULTIFRAME`)
@@ -10626,18 +10522,30 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // single-frame collapse below.
     if inline_subwalk {
         // Fire the multi-frame snapshot only when the paused-caller chain
-        // covers the FULL current inline depth: `FBW_INLINE_PARENT_FRAMES`
-        // (callers pushed by the gated multiframe path) must have one entry per
-        // active inlined callee (`FBW_INLINE_CODE_STACK`).  A nested
+        // covers the FULL current inline depth: framestack levels with parents
+        // must have one entry per active inlined callee. A nested
         // straight-line callee inlined under a multiframe ancestor (e.g.
         // `add3` inside a multiframe `mix`) pushes NO parent frame, so its own
         // guards see a SHORTER chain than the callee depth — fall through to
         // the single-frame collapse (the strict callee's resume-at-CALL
         // behavior) rather than emit a chain that skips the intermediate frame.
-        let n_parents = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().len());
-        let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
+        let (n_parents, n_callees, parent_frames) = {
+            let session = ctx.session.borrow();
+            (
+                session
+                    .framestack
+                    .iter()
+                    .filter(|frame| frame.parent.is_some())
+                    .count(),
+                session.framestack.len(),
+                session
+                    .framestack
+                    .iter()
+                    .filter_map(|frame| frame.parent.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
         if n_parents > 0 && n_parents == n_callees {
-            let parent_frames = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().clone());
             // A STRICT straight-line callee (gh#420) whose own frame is not
             // MF-snapshot-able (a kept operand-stack temp the sub-walk does not
             // mirror) propagates the `Unsupported` error the same as the branch
@@ -11612,18 +11520,24 @@ fn compute_inline_caller_frame(
     call_jit_pc: usize,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     // #68 nested multiframe: when an inlined callee is already active
-    // (`FBW_INLINE_CODE_STACK.last()` is Some), the immediate caller of THIS
+    // (the framestack has a top level), the immediate caller of THIS
     // call is that intermediate callee (a sym-less sub-jitcode), not the
-    // top-level `FULL_BODY_SNAPSHOT_SYM`.  Compute its paused frame from that
+    // top-level `fbw_mode.snapshot_sym`.  Compute its paused frame from that
     // jitcode (index / liveness / resume tables via its `PyJitCode`), reading the
     // boxes from the caller's live register banks (`ctx.registers_*`, which ARE
     // the intermediate callee's banks here) via the sym-less
     // `collect_callee_active_boxes`.  The stack is empty for a top-level
-    // caller, falling through to the `FULL_BODY_SNAPSHOT_SYM` path below.
-    if let Some(caller_code) = FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) {
+    // caller, falling through to the `fbw_mode.snapshot_sym` path below.
+    let caller_code = ctx
+        .session
+        .borrow()
+        .framestack
+        .last()
+        .map(|frame| frame.w_code);
+    if let Some(caller_code) = caller_code {
         return compute_nested_inline_caller_frame(ctx, call_jit_pc, caller_code);
     }
-    let caller_sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
     if caller_sym_ptr.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
@@ -11702,7 +11616,7 @@ fn compute_inline_caller_frame(
 /// sym-less sub-jitcode whose live boxes are in `ctx.registers_*` (this `ctx`
 /// IS that callee's sub-walk).  Mirror of the top-level
 /// [`compute_inline_caller_frame`] body but keyed on `caller_code`'s own
-/// `PyJitCode` instead of `FULL_BODY_SNAPSHOT_SYM`, and reading boxes via the
+/// `PyJitCode` instead of `fbw_mode.snapshot_sym`, and reading boxes via the
 /// sym-less [`collect_callee_active_boxes`] (no portal-vable shadow to fold).
 fn compute_nested_inline_caller_frame(
     ctx: &mut WalkContext<'_, '_>,
@@ -11779,7 +11693,7 @@ fn compute_nested_inline_caller_frame(
 
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
 /// (top/innermost) frame built from the live sub-walk register banks, plus the
-/// pre-computed paused caller frame(s) on [`FBW_INLINE_PARENT_FRAMES`].  Frame
+/// pre-computed paused caller frame(s) on the walk framestack. Frame
 /// order is OUTERMOST-FIRST (`recorder.rs:56` / `build_resumed_frames`
 /// `eval.rs:6505`): the parent chain followed by the callee top frame.  The
 /// stale doc on `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`
@@ -11795,7 +11709,13 @@ fn walker_capture_multi_frame_inline_snapshot(
     }
     // Callee (top/innermost) frame: map the guard's jitcode pc to the callee's
     // own Python pc, read liveness from the live sub-walk register banks.
-    let Some(callee_w_code) = FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) else {
+    let callee_w_code = ctx
+        .session
+        .borrow()
+        .framestack
+        .last()
+        .map(|frame| frame.w_code);
+    let Some(callee_w_code) = callee_w_code else {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     };
     let Some(callee_jitcode_index) = crate::state::ensure_jitcode_index(callee_w_code as *const ())
@@ -11908,7 +11828,7 @@ fn walker_capture_multi_frame_inline_snapshot(
     // point rather than the stale loop-header seed the walker never crosses
     // `set_orgpc` to update (mirror of the single-frame path above, 6366-6426).
     let outer = &parent_frames[0];
-    let caller_sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
     if !caller_sym_ptr.is_null() {
         let caller_sym = unsafe { &*caller_sym_ptr };
         if caller_sym.owns_virtualizable_shadow() && !caller_sym.jitcode.is_null() {
@@ -12115,7 +12035,7 @@ fn direct_call_release_gil(
     // A `None` leaves the call recorded symbolically WITHOUT running it, so
     // the walk-end no-replay commit must stay off for this trace.
     if resid_exec.is_none() {
-        fbw_abort_nested_unjournaled_residual(pc)?;
+        fbw_abort_nested_unjournaled_residual(ctx, pc)?;
         fbw_mark_unjournaled_effect();
     }
     let resid_raised = matches!(resid_exec, Some(Err(_)));
@@ -13010,7 +12930,7 @@ fn try_walker_call_assembler_self_recursive(
     // `walker_capture_snapshot_for_last_guard` uses.  Null outside a
     // production full-body walk (arm/shadow/diagnostic), in which case the
     // sym.frame / sym.execution_context reds are unavailable: bail.
-    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
         return Ok(None);
     }
@@ -13506,7 +13426,7 @@ fn try_walker_inline_user_call(
     // (`pyjitpl.py:1388-1416`) → `assembler_call` instead of trace-through
     // (`trace_opcode.rs:5604-5642`).
     let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
-    if fbw_inline_recursion_count(callee_code_key) >= FBW_MAX_INLINE_RECURSION {
+    if fbw_inline_recursion_count(ctx, callee_code_key) >= FBW_MAX_INLINE_RECURSION {
         return Ok(None);
     }
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
@@ -13594,7 +13514,7 @@ fn try_walker_inline_user_call(
         && std::env::var_os("PYRE_FBW_REC_CA").as_deref() != Some(std::ffi::OsStr::new("0"))
         && nparams == 1
     {
-        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
         let self_recursive = !sym_ptr.is_null()
             && unsafe {
                 pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode).raw_code() as *const ())
@@ -13605,11 +13525,11 @@ fn try_walker_inline_user_call(
             arg_concretes.get(2),
             Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }
         );
-        if fbw_carrier_resume() && std::env::var_os("PYRE_P2_DIAG").is_some() {
+        if ctx.fbw_mode.carrier_resume && std::env::var_os("PYRE_P2_DIAG").is_some() {
             eprintln!(
                 "[p2-diag] nested call pc={} self_recursive={self_recursive} arg_is_int={arg_is_int} strict_inlinable={strict_inlinable} recursion_count={}",
                 op.pc,
-                fbw_inline_recursion_count(callee_code_key)
+                fbw_inline_recursion_count(ctx, callee_code_key)
             );
         }
         if self_recursive && arg_is_int {
@@ -13618,7 +13538,7 @@ fn try_walker_inline_user_call(
             // call folds straight to the recursive-portal `CALL_ASSEMBLER`
             // rather than re-unrolling the call tree (which would bottom out at
             // the multiframe depth cap).
-            if fbw_carrier_resume() {
+            if ctx.fbw_mode.carrier_resume {
                 return Ok(None);
             }
             // A self-recursive single-int callee folds to the recursive-portal
@@ -13635,7 +13555,7 @@ fn try_walker_inline_user_call(
     // frame register, so resolve that register up-front (the same
     // `ensure_jitcode_index` + `portal_red_regs_at` the seeding below uses).
     // A multiframe caller no longer needs to be TOP-LEVEL: a nested caller's
-    // paused frame is computed from `FBW_INLINE_CODE_STACK.last()` (the live
+    // paused frame is computed from the framestack's top (the live
     // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
     // a depth cap on the inline stack (the `n_parents == n_callees` valve in
     // the snapshot path is the real desync safety net).
@@ -13647,7 +13567,7 @@ fn try_walker_inline_user_call(
     } else {
         u16::MAX
     };
-    let inline_depth = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
+    let inline_depth = ctx.session.borrow().framestack.len();
     let try_multiframe = multiframe_eligible
         && inline_depth < FBW_MAX_MULTIFRAME_DEPTH
         && callee_fast_path_inlinable_allowing_forward_branch(
@@ -13679,7 +13599,7 @@ fn try_walker_inline_user_call(
     // iteration calling a different function at this site must deopt
     // rather than run the wrong body.  The guard resumes at the caller's
     // CALL boundary (single outer Python frame — re-execute the whole
-    // call on deopt), captured via `INLINE_SUBWALK_CAPTURE_BOUNDARY` for
+    // call on deopt), captured via `fbw_mode.inline_subwalk` for
     // the sub-walk guards below.
     let callable_opref = r_args[0];
     let callable_expected = ctx.trace_ctx.const_ref(callable as usize as i64);
@@ -13854,7 +13774,7 @@ fn try_walker_inline_user_call(
             // callee's own `pycode` when this compiled trace re-enters as a nested
             // bridge (see `try_walker_call_assembler_self_recursive`).  The outer
             // portal frame's `execution_context` field is the single true ec.
-            let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+            let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
                 if try_multiframe {
                     return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
@@ -13900,9 +13820,9 @@ fn try_walker_inline_user_call(
     // the same Entry-carrier predicates as a zero-effect sub-walk abort.
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
     let executed_effects_before = fbw_executed_effect_count();
-    let is_top_inline = !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get());
+    let is_top_inline = !ctx.fbw_mode.inline_subwalk;
     let abort_flush_call_py_pc: Option<usize> = if ctx.is_full_body_walk && is_top_inline {
-        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
         if sym_ptr.is_null() {
             None
         } else {
@@ -13926,7 +13846,7 @@ fn try_walker_inline_user_call(
     };
 
     // #68: a forward-branch callee inlined under the multi-frame path needs a
-    // paused caller frame on `FBW_INLINE_PARENT_FRAMES` so its in-callee guards
+    // paused caller frame on the framestack so its in-callee guards
     // snapshot both frames.  Compute it here, while the caller's live register
     // banks (`ctx.registers_*`) are still in scope — at guard-capture time the
     // walk context is the callee's.  A caller frame that is not snapshot-able
@@ -14005,7 +13925,7 @@ fn try_walker_inline_user_call(
     // boxes while the decoder expects the full liveness-derived set — the
     // same defect class as the LOAD_ATTR fold empty-boxes bug.  Mirror
     // `try_walker_list_append_inline`: read the caller's live register
-    // banks from `FULL_BODY_SNAPSHOT_SYM` at the CALL-site py_pc.
+    // banks from `fbw_mode.snapshot_sym` at the CALL-site py_pc.
     //
     // The snapshot header coordinate (`sub_wc.entry_py_pc` /
     // `sub_wc.outer_jitcode_index`, stamped below) MUST be the SAME coordinate
@@ -14019,7 +13939,7 @@ fn try_walker_inline_user_call(
     // to the header alongside the boxes.
     let (inline_outer_active_boxes, inline_outer_py_pc, inline_outer_jc_index) =
         if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
-            let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+            let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
                 (
                     ctx.outer_active_boxes.clone(),
@@ -14079,6 +13999,21 @@ fn try_walker_inline_user_call(
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(Default::default()),
+            // Path-1: resolve scalar static-field reads off this callee's own
+            // unseeded portal frame to its compile-time constants.
+            inline_callee_consts: Some(inline_consts),
+            // Guards emitted inside the callee body — both the walker's own
+            // and the `_nonstandard_virtualizable` PTR_EQ promote that
+            // `vable_getfield_*` records internally — resume at this CALL
+            // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, both
+            // stamped at the CALL-site coordinate above), not at a callee
+            // `op_pc` that has no meaning in the outer jitcode's py_pc→jitcode
+            // tables.
+            fbw_mode: FbwWalkMode {
+                inline_subwalk: true,
+                ..ctx.fbw_mode
+            },
+            session: ctx.session,
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
@@ -14111,17 +14046,9 @@ fn try_walker_inline_user_call(
             outer_jitcode_index: inline_outer_jc_index,
             outer_active_boxes: inline_outer_active_boxes,
         };
-        // Guards emitted inside the callee body — both the walker's own
-        // and the `_nonstandard_virtualizable` PTR_EQ promote that
-        // `vable_getfield_*` records internally — resume at this CALL
-        // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, both stamped
-        // at the CALL-site coordinate above), not at a callee `op_pc` that has
-        // no meaning in the outer jitcode's py_pc→jitcode tables.  See
-        // `INLINE_SUBWALK_CAPTURE_BOUNDARY`.
-        let _inline_boundary = InlineSubwalkCaptureGuard::enter();
-        // Track this callee on the FBW inline stack for the lifetime of the
-        // sub-walk so a nested self-call sees the correct recursion depth.
-        let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
+        // Track this callee for the lifetime of the sub-walk so nested
+        // self-calls see the correct recursion depth.
+        let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
         // Strict fresh-frame fold: a branchless leaf inlined without a virtual
         // frame (not `try_multiframe`) whose body carries the always-portal
         // frame-vable locals prologue resolves its own `getarrayitem_vable_r` /
@@ -14145,14 +14072,6 @@ fn try_walker_inline_user_call(
                 shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
             }
         }
-        // Path-1: resolve scalar static-field reads off this callee's own
-        // unseeded portal frame to its compile-time constants for the
-        // lifetime of the sub-walk.
-        let _callee_consts = InlineCalleeConstsGuard::enter(inline_consts);
-        // #68 multi-frame: push the paused caller frame for the lifetime of the
-        // callee sub-walk so its branch guards capture both frames (no-op when
-        // `parent_frame` is None — the strict straight-line inline path).
-        let _parent_frame_guard = parent_frame.map(InlineParentFrameGuard::enter);
         // Capture a depth-1 live callee before these guards drop. This is the
         // two-frame specialization of `run_blackhole_interp_to_cancel_tracing`:
         // `_copy_data_from_miframe` preserves the callee's own position and
@@ -14272,7 +14191,7 @@ fn try_walker_inline_user_call(
                         }
                         *dst = Some(value);
                     }
-                    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+                    let sym_ptr = ctx.fbw_mode.snapshot_sym;
                     if sym_ptr.is_null() {
                         return None;
                     }
@@ -14717,7 +14636,7 @@ fn dispatch_residual_call_iRd_kind(
     // ends (same lifecycle as the STORE_SUBSCR store journal).
     //
     // Restrict to the top full-body frame: inside an inlined callee sub-walk
-    // (`INLINE_SUBWALK_CAPTURE_BOUNDARY`) the fold's gating guards collapse
+    // (`fbw_mode.inline_subwalk`) the fold's gating guards collapse
     // their resume to the caller's CALL boundary (`entry_py_pc` /
     // `outer_active_boxes`), which re-executes the whole caller iteration on a
     // guard failure — doubling any caller side effect sequenced before the
@@ -14744,7 +14663,7 @@ fn dispatch_residual_call_iRd_kind(
     // fallback).  Gated to top full-body frames, not inside a sub-walk.
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
-        && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
@@ -14762,7 +14681,7 @@ fn dispatch_residual_call_iRd_kind(
     // caller-side-effect doubling concern as the CallFn form).
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
-        && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'v'
         && ei.pyre_helper == majit_ir::PyreHelperKind::ListAppendValue
     {
@@ -14960,7 +14879,7 @@ fn dispatch_residual_call_iRd_kind(
         // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
         if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(op.pc)?;
+            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
             fbw_mark_unjournaled_effect();
         }
         let resid_raised = matches!(resid_exec, Some(Err(_)));
@@ -15194,7 +15113,7 @@ fn walker_concrete_ref_object(
 }
 
 /// B3 piece 3: resolve the walker's execution-context OpRef from the outer
-/// portal `sym.frame` (via [`FULL_BODY_SNAPSHOT_SYM`]), recovering it off
+/// portal `sym.frame` (via [`fbw_mode.snapshot_sym`]), recovering it off
 /// the frame with `GetfieldGcR(frame, execution_context)` when
 /// `sym.execution_context` is unseeded.  Mirrors the inline-frame EC
 /// recovery (jitcode_dispatch.rs `try_walker_inline_self_recursive`) and
@@ -15204,7 +15123,7 @@ fn walker_concrete_ref_object(
 /// or when the portal frame OpRef is unset — the PUSH_EXC_INFO / POP_EXCEPT
 /// exc-info lowering then declines to the residual (SAFE).
 fn walker_ensure_execution_context(ctx: &mut WalkContext<'_, '_>) -> Option<OpRef> {
-    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
         return None;
     }
@@ -15508,7 +15427,7 @@ fn walker_emit_guard_with_snapshot(
 
 /// Fold-specific guard snapshot: records the guard and delegates to the
 /// standard `walker_capture_snapshot_for_last_guard` which handles both the
-/// FBW path (fresh `collect_outer_active_boxes` from `FULL_BODY_SNAPSHOT_SYM`)
+/// FBW path (fresh `collect_outer_active_boxes` from `fbw_mode.snapshot_sym`)
 /// and the per-opcode arm path (`ctx.outer_active_boxes`).
 ///
 /// Previous attempt used `ctx.outer_active_boxes` directly, which is correct
@@ -16971,9 +16890,9 @@ fn try_walker_specialize_compare_op_long(
 /// Any deviation (escape to a local store, arithmetic use, second reader,
 /// register reuse, kept-on-stack short-circuit, missing branch) returns
 /// `false` → the caller emits the real box (current behaviour).  FBW-only
-/// (returns `false` when `FULL_BODY_SNAPSHOT_SYM` is null).
+/// (returns `false` when `fbw_mode.snapshot_sym` is null).
 fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_reg: u8) -> bool {
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return false;
     }
@@ -17788,7 +17707,7 @@ static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
 /// guard_impl` single-frame fallthrough) reads `ctx.{outer_active_boxes,
 /// outer_jitcode_index,entry_py_pc}` + the vable shadow directly, so this
 /// pre-publishes that ONE call-site coordinate (mapped from `op.pc`) before
-/// the sub-walk under [`InlineSubwalkCaptureGuard`].
+/// the sub-walk with inline-subwalk mode enabled.
 ///
 /// Like the fold, the walker only RECORDS the array-op IR; this applies the
 /// append to the concrete list + journals the rewind.  Declines (`Ok(None)`)
@@ -17853,7 +17772,7 @@ fn try_walker_orthodox_list_append(
     // Resolve the compiled `w_list_append` body + the full-body sym (the
     // resume-coordinate source) BEFORE emitting any guard — a decline must
     // leave the trace untouched.
-    let Some((sub_body, sym_ptr)) = orthodox_list_append_body_and_sym() else {
+    let Some((sub_body, sym_ptr)) = orthodox_list_append_body_and_sym(ctx) else {
         return Ok(None);
     };
     // SAFETY: `sym_ptr` is non-null with a set `jitcode` (checked in the
@@ -17967,10 +17886,12 @@ unsafe fn orthodox_list_append_recognize(
 /// Returns `None` (decline — no IR emitted yet) when the body jitcode is not
 /// compiled or the snapshot sym is absent.  The returned `sym_ptr` is
 /// non-null with a set `jitcode` field.
-fn orthodox_list_append_body_and_sym() -> Option<(SubJitCodeBody, *const crate::state::PyreSym)> {
+fn orthodox_list_append_body_and_sym(
+    ctx: &WalkContext<'_, '_>,
+) -> Option<(SubJitCodeBody, *const crate::state::PyreSym)> {
     let jc_arc = crate::jitcode_runtime::list_append_jitcode()?;
     let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
-    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
         return None;
     }
@@ -18143,19 +18064,19 @@ fn orthodox_list_append_commit(
 
     let self_concrete = ConcreteValue::Ref(inner_self);
     let value_concrete = ConcreteValue::Ref(value);
-    let walk_result = {
-        let _boundary = InlineSubwalkCaptureGuard::enter();
-        run_sub_jitcode_walk(
-            ctx,
-            op.pc,
-            sub_body,
-            &[],
-            &[],
-            &[self_ref, value_op],
-            &[self_concrete, value_concrete],
-            &[],
-        )
-    };
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.fbw_mode.inline_subwalk = true;
+    let walk_result = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        sub_body,
+        &[],
+        &[],
+        &[self_ref, value_op],
+        &[self_concrete, value_concrete],
+        &[],
+    );
+    ctx.fbw_mode = saved_fbw_mode;
 
     ctx.entry_py_pc = saved_entry;
     ctx.outer_jitcode_index = saved_oji;
@@ -18230,7 +18151,7 @@ fn try_walker_orthodox_list_append_opcode(
 
     // Resolve the compiled body BEFORE emitting any IR — the opcode form emits
     // no guard before the commit, so this is the only decline point.
-    let Some((sub_body, sym_ptr)) = orthodox_list_append_body_and_sym() else {
+    let Some((sub_body, sym_ptr)) = orthodox_list_append_body_and_sym(ctx) else {
         return Ok(None);
     };
     // SAFETY: `sym_ptr` is non-null with a set `jitcode` (checked in the
@@ -19843,7 +19764,7 @@ fn dispatch_residual_call_iIRd_kind(
         // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
         if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(op.pc)?;
+            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
             fbw_mark_unjournaled_effect();
         }
         let resid_raised = matches!(resid_exec, Some(Err(_)));
@@ -20040,7 +19961,7 @@ fn dispatch_residual_call_iIRFd_kind(
         // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
         if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(op.pc)?;
+            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
             fbw_mark_unjournaled_effect();
         }
         let resid_raised = matches!(resid_exec, Some(Err(_)));
@@ -20222,6 +20143,9 @@ fn run_sub_jitcode_walk(
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: ctx.fbw_mode,
+            session: ctx.session,
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
@@ -20919,7 +20843,7 @@ fn handle(
                 // sub-walk that resumes at the caller's CALL boundary,
                 // `other_target` is a *callee* coordinate absent from the outer
                 // jitcode's py_pc→jitcode tables, so `branch_resume_target_stack_depth`
-                // (which maps through `FULL_BODY_SNAPSHOT_SYM`) would read a
+                // (which maps through `fbw_mode.snapshot_sym`) would read a
                 // meaningless outer depth at the coincidental offset.  The
                 // collapse guard does not resume at a callee coordinate at all:
                 // like every other single-frame sub-walk guard it collapses to
@@ -20941,15 +20865,20 @@ fn handle(
                 // callee branch guard's `other_target` is inverted through the
                 // callee's own tables rather than the outer frame's — the frame
                 // whose box collection (`collect_callee_active_boxes`) already
-                // keys off the same `FBW_INLINE_CODE_STACK` top.  The #68
+                // keys off the same framestack top. The #68
                 // multiframe path reaches this `else`; the single-frame collapse
                 // case short-circuits to `None` above.
-                let single_frame_collapse = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) && {
-                    let n_parents = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().len());
-                    let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
+                let single_frame_collapse = ctx.fbw_mode.inline_subwalk && {
+                    let session = ctx.session.borrow();
+                    let n_parents = session
+                        .framestack
+                        .iter()
+                        .filter(|frame| frame.parent.is_some())
+                        .count();
+                    let n_callees = session.framestack.len();
                     !(n_parents > 0 && n_parents == n_callees)
                 };
-                let gate_frame = ActiveResumeFrame::current();
+                let gate_frame = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym);
                 let resume_depth = if single_frame_collapse {
                     None
                 } else {
@@ -20983,13 +20912,13 @@ fn handle(
                         })
                     });
                 // `branch_resume_target_stack_depth` reads the full-body-walk-
-                // only `FULL_BODY_SNAPSHOT_SYM`, so `kept_stack` is always
+                // only `fbw_mode.snapshot_sym`, so `kept_stack` is always
                 // false in the trait leg — yet the trait leg re-executes the
                 // same not-taken arm on deopt and miscompiles the exact same
                 // boxed-int kept-stack shapes.  Probe the depth leg-
                 // independently for the unrestorable-arm decline below.
                 // `kept_stack_any_leg` and the kept-stack hazard checks below
-                // all read `FULL_BODY_SNAPSHOT_SYM`, which models the top-level
+                // all read `fbw_mode.snapshot_sym`, which models the top-level
                 // traced jitcode's register file. In an inlined-callee sub-walk
                 // (`is_top_level == false`) the current `concrete_registers_r`
                 // is the callee's, so an outer stack-slot color indexes a
@@ -21090,7 +21019,7 @@ fn handle(
                 // the decline and silently miscompile.  `kept_stack` reads the
                 // correct per-function depth and closes that gap.
                 if (kept_stack || kept_stack_any_leg) && !mirror_covers_kept {
-                    let liveness = branch_arm_resume_ref_liveness(other_target);
+                    let liveness = branch_arm_resume_ref_liveness(ctx.fbw_mode, other_target);
                     // Hazard (1): the not-taken arm reads a regular Ref register
                     // the blackhole resumes as NULL (the conditional-expression
                     // boxed-int NULL-deref crash).
@@ -21116,7 +21045,7 @@ fn handle(
                                 *num_regs_r,
                             ),
                             // Liveness unavailable (the trait leg, where
-                            // `FULL_BODY_SNAPSHOT_SYM` is null, or an unresolved
+                            // `fbw_mode.snapshot_sym` is null, or an unresolved
                             // coordinate) — cannot prove restorable, so decline.
                             None => true,
                         };
@@ -21187,7 +21116,7 @@ fn handle(
                                 op.pc,
                                 other_target,
                                 ctx.vstack_valid,
-                                INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()),
+                                ctx.fbw_mode.inline_subwalk,
                                 mirror_covers_kept,
                                 depth_gt_1,
                                 kept_stack,
@@ -21198,6 +21127,9 @@ fn handle(
                                 kept_recovered.as_deref().is_some_and(|m| !m.is_empty()),
                             );
                         }
+                        // Stamp the abort coordinate at the raise point so the
+                        // driver gate cannot observe an unrelated prior abort.
+                        ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
                         return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent {
                             pc: op.pc,
                         });
@@ -21219,7 +21151,7 @@ fn handle(
                             op.pc,
                             other_target,
                             ctx.vstack_valid,
-                            INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()),
+                            ctx.fbw_mode.inline_subwalk,
                             depth_gt_1,
                             kept_stack,
                             kept_stack_any_leg,
@@ -21505,9 +21437,9 @@ fn handle(
             // inside an inlined callee is a callee coordinate the outer
             // walk's py_pc→jitcode tables cannot resolve, so the abort-point
             // flush must
-            // decline (the sub-walk's RAII guard restores the boundary flag
-            // on unwind, so the value must be latched at the marker).
-            FBW_ABORT_IN_SUBWALK.with(|c| c.set(INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|b| b.get())));
+            // decline. Latch the value at the marker because the sub-walk's
+            // context is gone when the top-level driver reads the out-channel.
+            ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
             Err(DispatchError::AbortPermanentMarkerReached { pc: op.pc })
         }
         // Heapcache-aware getfield reads. RPython
@@ -22282,13 +22214,17 @@ fn handle(
             // closes a degenerate module-loop iteration at the inner header or
             // walks into the callee body and aborts
             // `LoopBearingCalleeInlineUnsupported`.  Firing here (only inside a
-            // sub-walk — `FBW_INLINE_CODE_STACK` non-empty — and only when a token
+            // sub-walk — the framestack is non-empty — and only when a token
             // exists) routes the inlined loop-bearing callee to its own compiled
             // loop, the trait-parity `LoopTargetDescr`/`CALL_ASSEMBLER` shape.
             if fbw_loop_callee_ca_enabled() {
-                if let Some(callee_code) =
-                    FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied())
-                {
+                let callee_code = ctx
+                    .session
+                    .borrow()
+                    .framestack
+                    .last()
+                    .map(|frame| frame.w_code);
+                if let Some(callee_code) = callee_code {
                     let callee_key =
                         crate::driver::make_green_key(callee_code as *const (), next_instr);
                     let (driver, _) = crate::driver::driver_pair();
@@ -22320,9 +22256,13 @@ fn handle(
                     // inline return site (mirror `opimpl_recursive_call_
                     // assembler`, metainterp.rs:768).
                     if fbw_loop_callee_ca_enabled() {
-                        if let Some(callee_code) =
-                            FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied())
-                        {
+                        let callee_code = ctx
+                            .session
+                            .borrow()
+                            .framestack
+                            .last()
+                            .map(|frame| frame.w_code);
+                        if let Some(callee_code) = callee_code {
                             let callee_key =
                                 crate::driver::make_green_key(callee_code as *const (), next_instr);
                             let (driver, _) = crate::driver::driver_pair();
@@ -22447,7 +22387,7 @@ fn handle(
             // fields` cannot reduce, so every interpreter entry aborts
             // (`extend_compiled_live_values` count mismatch).
             {
-                let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+                let sym_ptr = ctx.fbw_mode.snapshot_sym;
                 if !sym_ptr.is_null() && ri.is_empty() && rf.is_empty() && rr.len() == 2 {
                     let sym = unsafe { &*sym_ptr };
                     live_args[0] = sym.frame;
@@ -22762,8 +22702,12 @@ mod tests {
         // holds the mutable borrow.
         let expected: Vec<ConcreteValue> = concrete.clone();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -22828,8 +22772,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut regs_r = vec![OpRef::NONE];
         let mut regs_i = vec![OpRef::NONE];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22884,8 +22832,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut regs_r = vec![OpRef::NONE];
         let mut regs_i = vec![OpRef::NONE];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22958,8 +22910,12 @@ mod tests {
             let mut tc = fresh_trace_ctx();
             let mut regs_r = vec![OpRef::NONE];
             let mut regs_i = vec![OpRef::NONE];
+            let session = std::cell::RefCell::new(WalkSession::default());
             let mut wc = WalkContext {
                 callee_shadow: None,
+                inline_callee_consts: None,
+                fbw_mode: Default::default(),
+                session: &session,
                 registers_r: &mut regs_r,
                 registers_i: &mut regs_i,
                 registers_f: &mut [],
@@ -23143,8 +23099,12 @@ mod tests {
         let mut regs_i = vec![value];
         let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23200,8 +23160,12 @@ mod tests {
         let mut regs_i = vec![value];
         let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23256,8 +23220,12 @@ mod tests {
         let mut regs_i = vec![OpRef::input_arg_int(0)];
         let descr_pool = switch_descr_pool(&[(5, 17)]);
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23321,8 +23289,12 @@ mod tests {
         let value = tc.const_int(1);
         let mut regs_i = vec![value];
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23378,8 +23350,12 @@ mod tests {
         let value = tc.const_int(0);
         let mut regs_i = vec![value];
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23434,8 +23410,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut regs_i = vec![OpRef::input_arg_int(0)];
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23699,8 +23679,12 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -23868,8 +23852,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23985,8 +23973,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24096,8 +24088,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -24196,8 +24192,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24293,8 +24293,12 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24371,8 +24375,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24428,8 +24436,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[3] = make_jitcode_descr(999_999);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24481,8 +24493,12 @@ mod tests {
         let code = [live_byte, 0x00, 0x00];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24543,8 +24559,12 @@ mod tests {
         let expected_arg = regs[3];
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24603,8 +24623,12 @@ mod tests {
         let code = [ret_byte, 0x07]; // index 7 — registers_r is empty
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24666,8 +24690,12 @@ mod tests {
             .collect();
         let expected_arg = regs_i[2];
         let descr_int = make_fail_descr(42);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24745,8 +24773,12 @@ mod tests {
             .map(|i| tc.const_int(0xCAFE_0000 + i as i64))
             .collect();
         let expected = regs_i[1];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24812,8 +24844,12 @@ mod tests {
             .expect("`void_return/` must be in insns table");
         let code = [ret_byte];
         let mut tc = fresh_trace_ctx();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24880,8 +24916,12 @@ mod tests {
             .expect("`void_return/` must be in insns table");
         let code = [ret_byte];
         let mut tc = fresh_trace_ctx();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24936,8 +24976,12 @@ mod tests {
         let code = [raise_byte, 0x05];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24995,8 +25039,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25054,8 +25102,12 @@ mod tests {
         let code = [goto_byte, 0x02, 0x01];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25161,8 +25213,12 @@ mod tests {
         let mut regs = distinct_const_refs(&mut tc, 4);
         let active_exc = regs[0];
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25216,8 +25272,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25284,8 +25344,12 @@ mod tests {
         let descr_done = done_descr_ref_for_tests();
         let descr_exc = make_fail_descr(99);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25384,8 +25448,12 @@ mod tests {
         let descr_done = done_descr_ref_for_tests();
         let descr_exc = make_fail_descr(99);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25468,8 +25536,12 @@ mod tests {
         let descr_done = done_descr_ref_for_tests();
         let descr_exc = make_fail_descr(99);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25547,8 +25619,12 @@ mod tests {
         let code = [reraise_byte];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25601,8 +25677,12 @@ mod tests {
         let mut regs_r = distinct_const_refs(&mut tc, 4);
         let exc = regs_r[2];
         let descr_done = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25719,8 +25799,12 @@ mod tests {
         let descr_exc = make_fail_descr(99);
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[11] = make_jitcode_descr(11);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25840,8 +25924,12 @@ mod tests {
         let descr_done = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[13] = make_jitcode_descr(13);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25910,8 +25998,12 @@ mod tests {
         let mut regs_i = distinct_const_refs(&mut tc, 8);
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -25976,8 +26068,12 @@ mod tests {
             "fixture must seed src and dst with different OpRefs",
         );
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26033,8 +26129,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut regs_i = distinct_const_refs(&mut tc, 4);
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26089,8 +26189,12 @@ mod tests {
         let code = [int_copy_byte, 0x07, 0x00];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [], // empty — index 7 must surface OOR
             registers_f: &mut [],
@@ -26165,8 +26269,12 @@ mod tests {
         let mut regs_r = distinct_const_refs(&mut tc, 8);
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26229,8 +26337,12 @@ mod tests {
             "fixture must seed src and dst with different OpRefs",
         );
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26284,8 +26396,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 4);
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26338,8 +26454,12 @@ mod tests {
         let code = [ref_copy_byte, 0x07, 0x00];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [], // empty — index 7 must surface OOR
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26403,8 +26523,12 @@ mod tests {
         let dst_pre = regs_i[6];
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26594,8 +26718,12 @@ mod tests {
         let arg_b1 = regs_i[2];
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26731,8 +26859,12 @@ mod tests {
         let dst_pre = regs_f[6];
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
@@ -26820,8 +26952,12 @@ mod tests {
         let dst_pre = regs_f[5];
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
@@ -26887,8 +27023,12 @@ mod tests {
         let dst_pre = regs_i[5];
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26979,8 +27119,12 @@ mod tests {
         let dst_pre = regs_i[6];
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27051,8 +27195,12 @@ mod tests {
         let code = [byte, 0x07, 0x00, 0x00]; // src=7, registers_f empty
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27106,8 +27254,12 @@ mod tests {
         let code = [byte, 0x07, 0x00, 0x00]; // src=7, registers_i empty
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27163,8 +27315,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut regs_i = distinct_const_refs(&mut tc, 4);
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27228,8 +27384,12 @@ mod tests {
         let code = [unsupported_byte, 0, 0, 0, 0];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27285,8 +27445,12 @@ mod tests {
         let box_opref = tc.const_ref(0xdeadbeef);
         let mut regs_r = [box_opref];
         let mut regs_i = [OpRef::None];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27369,8 +27533,12 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27435,8 +27603,12 @@ mod tests {
         let mut concrete_r = [ConcreteValue::Ref(
             concrete_ptr as *mut pyre_object::pyobject::PyObject,
         )];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27517,8 +27689,12 @@ mod tests {
         let mut concrete_r = [ConcreteValue::Ref(
             0xdead_beef as *mut pyre_object::pyobject::PyObject,
         )];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27612,8 +27788,12 @@ mod tests {
         let descr_pool = vec![decoy, call_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27779,8 +27959,12 @@ mod tests {
         let descr_pool = vec![elidable_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27863,8 +28047,12 @@ mod tests {
         let mut regs_i: Vec<OpRef> = Vec::new();
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27920,8 +28108,12 @@ mod tests {
         let mut regs_i: Vec<OpRef> = Vec::new();
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27992,8 +28184,12 @@ mod tests {
         let mut regs_i: Vec<OpRef> = Vec::new();
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28088,8 +28284,12 @@ mod tests {
         let mut regs_i: Vec<OpRef> = Vec::new();
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28188,8 +28388,12 @@ mod tests {
         let mut regs_i: Vec<OpRef> = Vec::new();
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28263,8 +28467,12 @@ mod tests {
         );
         let descr_pool = vec![not_in_trace_descr];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28326,8 +28534,12 @@ mod tests {
         );
         let descr_pool = vec![force_virtual_descr];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28384,8 +28596,12 @@ mod tests {
         let descr_pool = vec![elidable_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28451,8 +28667,12 @@ mod tests {
         let descr_pool = vec![nothrow_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28520,8 +28740,12 @@ mod tests {
             majit_ir::ExtraEffect::CanRaise,
         )];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28609,8 +28833,12 @@ mod tests {
         )];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28687,8 +28915,12 @@ mod tests {
         )];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28764,8 +28996,12 @@ mod tests {
             majit_ir::ExtraEffect::CanRaise,
         )];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28823,8 +29059,12 @@ mod tests {
         let mut regs_i = distinct_const_refs(&mut tc, 1);
         let descr_pool = vec![make_fail_descr(1), make_fail_descr(1)];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28920,8 +29160,12 @@ mod tests {
         let descr_pool = vec![decoy, call_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29014,8 +29258,12 @@ mod tests {
         let descr_pool = vec![elidable_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29118,8 +29366,12 @@ mod tests {
         let descr_pool = vec![decoy, call_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29252,8 +29504,12 @@ mod tests {
         );
         let descr_pool = vec![mixed_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29322,8 +29578,12 @@ mod tests {
         let mut regs_r = distinct_const_refs(&mut tc, 1);
         let descr_pool = vec![make_fail_descr(7)];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29380,8 +29640,12 @@ mod tests {
         let mut regs_i = distinct_const_refs(&mut tc, 1);
         let descr_pool = vec![make_fail_descr(1)];
         let frame_done_descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29462,8 +29726,12 @@ mod tests {
         let pool_len = crate::jitcode_runtime::all_descrs().len();
         let descr_pool = descr_pool_with_jitcode_adapters(pool_len);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29589,8 +29857,12 @@ mod tests {
         let descr_pool = descr_pool_with_jitcode_adapters(pool_len);
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29692,8 +29964,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[5] = make_jitcode_descr(5);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29794,8 +30070,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29875,8 +30155,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29959,8 +30243,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30041,8 +30329,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30128,8 +30420,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -30213,8 +30509,12 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -30287,8 +30587,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30382,8 +30686,12 @@ mod tests {
         tc.heapcache_getfield_now_known(obj, 1, cached_field);
         let ops_before = tc.num_ops();
 
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30455,8 +30763,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30516,8 +30828,12 @@ mod tests {
         let descr = field_descr_with_index(0);
         let descr_pool = vec![descr];
         let frame_done = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30589,8 +30905,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30682,8 +31002,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30765,8 +31089,12 @@ mod tests {
         // Pre-cache valuebox as the current field value.
         tc.heapcache_getfield_now_known(obj, 1, valuebox);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30826,8 +31154,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30913,8 +31245,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30983,8 +31319,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31064,8 +31404,12 @@ mod tests {
         let cached = tc.const_ref(0xCAFE_F00D);
         tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31133,8 +31477,12 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31243,8 +31591,10 @@ mod tests {
         // `OpRef::NONE` since this fixture exercises only slot 2.
         let argboxes_r = [OpRef::NONE, OpRef::NONE, expected_arg];
         fbw_finish_payload_reset();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let (outcome, end_pc) = dispatch_via_miframe(
             &mut miframe,
+            &session,
             &code,
             0,
             &[],
@@ -31321,8 +31671,10 @@ mod tests {
         // Setup_call argbox at R[3]_r: `raise/r` reads its exc operand
         // from this slot in the fresh top-level register file.
         let argboxes_r = [OpRef::NONE, OpRef::NONE, OpRef::NONE, exc_oprep];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let (outcome, _) = dispatch_via_miframe(
             &mut miframe,
+            &session,
             &code,
             0,
             &[],
@@ -31404,8 +31756,10 @@ mod tests {
         // Setup_call argbox at R[2]_r — the `ref_return r2` walker
         // handler picks it up from the fresh top-level register file.
         let argboxes_r = [OpRef::NONE, OpRef::NONE, value];
+        let session = std::cell::RefCell::new(WalkSession::default());
         let _ = dispatch_via_miframe(
             &mut miframe,
+            &session,
             &code,
             0,
             &[],
@@ -31444,8 +31798,12 @@ mod tests {
         let code = [0xFFu8];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -31523,8 +31881,12 @@ mod tests {
         let mut regs_i = vec![next_instr];
         let mut regs_r = vec![pycode, red0, red1];
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31612,8 +31974,12 @@ mod tests {
         let jdindex = tc.const_int(0);
         let mut regs_i = vec![jdindex];
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31676,8 +32042,12 @@ mod tests {
         let mut regs_i = vec![OpRef::input_arg_int(0)];
         let mut regs_r = vec![tc.const_ref(0x1_0000)];
         let descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: Default::default(),
+            session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
