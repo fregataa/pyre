@@ -214,10 +214,15 @@ def subs_parameters(self, args, params, items):
         prepare = getattr(param, '__typing_prepare_subst__', None)
         if prepare is not None:
             items = prepare(self, items)
-    nitems = len(items)
+    # __typing_prepare_subst__ is not required to return a tuple; a non-tuple
+    # result is treated as a single argument (nitems == 1) rather than having
+    # len() taken on it.
+    is_tuple = isinstance(items, tuple)
+    nitems = len(items) if is_tuple else 1
     if nparams != nitems:
         direction = 'many' if nitems > nparams else 'few'
         raise TypeError(f"Too {direction} arguments for {self}; actual {nitems}, expected {nparams}")
+    argitems = items if is_tuple else (items,)
     newargs = []
     for i, old_arg in enumerate(args):
         if isinstance(old_arg, type):
@@ -227,10 +232,16 @@ def subs_parameters(self, args, params, items):
         meth = getattr(old_arg, '__typing_subst__', None)
         if meth is not None:
             iparam = params.index(old_arg)
-            arg = meth(items[iparam])
+            arg = meth(argitems[iparam])
         else:
-            arg = subs_tvars(old_arg, params, items)
+            arg = subs_tvars(old_arg, params, argitems)
         if unpack:
+            # __typing_subst__ must actually return a tuple when unpacking
+            # (GH-138497), otherwise extend() would iterate an arbitrary object.
+            if not isinstance(arg, tuple):
+                raise TypeError(
+                    f"expected __typing_subst__ of {type(old_arg).__name__} "
+                    f"objects to return a tuple, not {type(arg).__name__}")
             newargs.extend(arg)
         else:
             newargs.append(arg)
