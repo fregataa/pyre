@@ -5575,12 +5575,12 @@ fn try_fold_pure_call_via_executor(
         // pure shapes — skip the stamp for void.
         majit_ir::Type::Void => return,
     };
-    // Stamp only when the recorded result has a live BoxPool slot.  A deeper
-    // inlined / recursive frame's residual result may be recorded in a
-    // context whose Box is not allocated in the active recorder; stamping it
-    // would violate the `*FrontendOp(pos, value)` invariant.  Skipping leaves
-    // the result symbolic so the downstream branch aborts the trace into the
-    // trait fallback instead of crashing.
+    // Stamp only when the recorded result has a live slot in the active
+    // recorder.  A deeper inlined / recursive frame's residual result may be
+    // recorded in a context whose position is not allocated in the active
+    // recorder; stamping it would violate the `*FrontendOp(pos, value)`
+    // invariant.  Skipping leaves the result symbolic so the downstream branch
+    // aborts the trace into the trait fallback instead of crashing.
     ctx.trace_ctx.try_set_opref_concrete(recorded, result_value);
 }
 
@@ -7090,12 +7090,20 @@ fn collect_outer_active_boxes(
                             }
                         }
                     } else {
-                        // Local slot.  Written to the shadow on every
-                        // `STORE_FAST`, so the shadow is authoritative; fall
-                        // back to the walk register bank only when the shadow
-                        // slot is unset / NULL and the bank holds a real value.
+                        // At a branch guard the walk register is the live
+                        // `MIFrame.registers_r[index]` binding captured by
+                        // `_get_list_of_active_boxes`.  The virtualizable
+                        // shadow can still hold the loop-entry value for a
+                        // local overwritten earlier in this arm, so prefer the
+                        // guard-state register and retain the shadow as the
+                        // fallback.  Non-branch captures keep the shadow-first
+                        // portal-local path.
+                        let walk_is_real = walk_box
+                            .is_some_and(|b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
-                        if shadow_is_real {
+                        if guard_py_pc.is_some() && walk_is_real {
+                            walk_box.unwrap_or_else(fallback)
+                        } else if shadow_is_real {
                             vbox.unwrap_or_else(fallback)
                         } else {
                             match walk_box {
