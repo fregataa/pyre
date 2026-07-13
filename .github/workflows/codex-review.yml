@@ -37,11 +37,31 @@ jobs:
         env:
           BASE_REPO: ${{ github.event.pull_request.base.repo.clone_url }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           # `upstream` is the PR's base repository; `upstream/main` is the base
-          # branch the diff is measured against (matches the local skills' base).
+          # the diff is measured against (matches the local skills' base).
+          # Pin it to the base SHA the PR event was computed against (the merge
+          # ref's first parent), NOT the branch tip: the tip can move between
+          # the event and this fetch, and a diff against a moved tip reports
+          # base-only commits as reversals introduced by the patch.
           git remote add upstream "$BASE_REPO" 2>/dev/null || git remote set-url upstream "$BASE_REPO"
-          git fetch --no-tags upstream "$BASE_REF:refs/remotes/upstream/main"
+          git fetch --no-tags upstream "$BASE_SHA" || git fetch --no-tags upstream "$BASE_REF:refs/remotes/upstream/main"
+          if git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git update-ref refs/remotes/upstream/main "$BASE_SHA"
+          fi
+          git log -1 --oneline refs/remotes/upstream/main
+
+      - name: Compute the patch file list
+        id: diff
+        run: |
+          git diff --name-only upstream/main > changed-files.txt
+          if [ -s changed-files.txt ]; then
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "The diff against the review base is empty; nothing to review." > report.md
+          fi
 
       - name: Check Codex auth secret
         id: auth
@@ -56,16 +76,16 @@ jobs:
           fi
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        if: steps.auth.outputs.present == 'true'
+        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
         with:
           node-version: 22
 
       - name: Install Codex CLI
-        if: steps.auth.outputs.present == 'true'
+        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
         run: npm install -g @openai/codex
 
       - name: Configure Codex auth (ChatGPT token)
-        if: steps.auth.outputs.present == 'true'
+        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
         run: |
@@ -74,10 +94,13 @@ jobs:
           chmod 600 "$HOME/.codex/auth.json"
 
       - name: Run Codex review
-        if: steps.auth.outputs.present == 'true'
+        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
         run: |
           set +e
-          PROMPT="$(cat .github/codex-review-prompt.md)"
+          PROMPT="$(cat .github/codex-review-prompt.md)
+
+          Authoritative changed-file list for this patch (git diff upstream/main --name-only):
+          $(cat changed-files.txt)"
           codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.6-terra \
             --output-last-message report.md \
             "$PROMPT" </dev/null > codex.log 2>&1
@@ -107,11 +130,17 @@ jobs:
               report = report.slice(0, LIMIT) +
                 '\n\n…report truncated; see the workflow logs for the full output.';
             }
+            let files = '';
+            try { files = fs.readFileSync('changed-files.txt', 'utf8').trim(); } catch {}
+            const filesBlock = files
+              ? ['<details><summary>Files in the reviewed diff</summary>', '', '```', files, '```', '</details>', ''].join('\n')
+              : '';
             const body = [
               marker,
               '## 🤖 Codex parity review',
               `Static analysis of this diff vs the local RPython/PyPy sources (commit ${context.sha.slice(0, 7)}).`,
               '',
+              filesBlock,
               report,
             ].join('\n');
 
