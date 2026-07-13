@@ -9501,10 +9501,12 @@ fn init_bool_type(ns: &mut DictStorage) {
 ///
 /// PyPy: objectobject.py descr__new__
 fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(
-        !args.is_empty(),
-        "object.__new__() requires a type argument"
-    );
+    // objectobject.py:118 descr__new__ — `w_type` is a mandatory argument.
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "object.__new__(): not enough arguments",
+        ));
+    }
     let cls = crate::baseobjspace::unwrap_cell(args[0]);
     // cls should be a W_TypeObject — create instance of it
     if unsafe { is_type(cls) } {
