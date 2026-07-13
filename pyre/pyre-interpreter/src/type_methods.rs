@@ -1096,8 +1096,7 @@ fn format_render(
     depth: u32,
 ) -> Result<Wtf8Buf, crate::PyError> {
     use rustpython_common::format::{
-        FieldName, FieldNamePart, FieldType, FormatParseError, FormatPart, FormatString,
-        FromTemplate,
+        FieldName, FieldNamePart, FieldType, FormatParseError, FromTemplate,
     };
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if let Some(m) = mapping {
@@ -1118,15 +1117,15 @@ fn format_render(
     if depth == 0 {
         return Err(crate::PyError::value_error("Max string recursion exceeded"));
     }
-    let parsed = FormatString::from_str(fmt).map_err(|e| format_parse_err(e, fmt))?;
+    let parsed = parse_format_parts(fmt)?;
     let mut result = Wtf8Buf::new();
-    for part in &parsed.format_parts {
+    for part in &parsed {
         let (field_name, conversion_spec, format_spec) = match part {
-            FormatPart::Literal(literal) => {
+            PyPyFormatPart::Literal(literal) => {
                 result.push_wtf8(literal);
                 continue;
             }
-            FormatPart::Field {
+            PyPyFormatPart::Field {
                 field_name,
                 conversion_spec,
                 format_spec,
@@ -1266,6 +1265,146 @@ fn format_render(
         result.push_wtf8(&formatted);
     }
     Ok(result)
+}
+
+enum PyPyFormatPart {
+    Literal(Wtf8Buf),
+    Field {
+        field_name: Wtf8Buf,
+        conversion_spec: Option<CodePoint>,
+        format_spec: Wtf8Buf,
+    },
+}
+
+fn codepoint_slice(codepoints: &[CodePoint], start: usize, end: usize) -> Wtf8Buf {
+    let mut out = Wtf8Buf::new();
+    for &cp in &codepoints[start..end] {
+        out.push(cp);
+    }
+    out
+}
+
+/// `newformat.py:TemplateFormatter._do_build_string/_parse_field`.
+/// Braces inside the first-part item lookup (`{[{]}`) are ordinary key text;
+/// braces after `:`/`!` are recursive format markup.
+fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError> {
+    let s: Vec<CodePoint> = fmt.code_points().collect();
+    let end = s.len();
+    let mut parts = Vec::new();
+    let mut literal = Wtf8Buf::new();
+    let mut i = 0usize;
+    while i < end {
+        let c = s[i];
+        if c != '{' && c != '}' {
+            literal.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '}' {
+            if i + 1 == end || s[i + 1] != '}' {
+                return Err(crate::PyError::value_error(
+                    "Single '}' encountered in format string",
+                ));
+            }
+            literal.push(c);
+            i += 2;
+            continue;
+        }
+        if i + 1 == end {
+            return Err(crate::PyError::value_error(
+                "Single '{' encountered in format string",
+            ));
+        }
+        if s[i + 1] == '{' {
+            literal.push(c);
+            i += 2;
+            continue;
+        }
+        if !literal.is_empty() {
+            parts.push(PyPyFormatPart::Literal(std::mem::take(&mut literal)));
+        }
+
+        i += 1;
+        let field_start = i;
+        let mut nested = 1usize;
+        let mut in_second_part = false;
+        while i < end {
+            let c = s[i];
+            if c == '{' {
+                nested += 1;
+            } else if c == '}' {
+                nested -= 1;
+                if nested == 0 {
+                    break;
+                }
+            } else if c == '[' && !in_second_part {
+                i += 1;
+                while i < end && s[i] != ']' {
+                    i += 1;
+                }
+                continue;
+            } else if c == ':' || c == '!' {
+                in_second_part = true;
+            }
+            i += 1;
+        }
+        if nested != 0 {
+            return Err(crate::PyError::value_error(
+                "expected '}' before end of string",
+            ));
+        }
+        let field_end = i;
+
+        let mut cursor = field_start;
+        let mut field_name_end = field_end;
+        let mut conversion_spec = None;
+        let mut spec_start = field_end;
+        while cursor < field_end {
+            let c = s[cursor];
+            if c == ':' || c == '!' {
+                field_name_end = cursor;
+                if c == '!' {
+                    cursor += 1;
+                    if cursor == field_end {
+                        return Err(crate::PyError::value_error(
+                            "end of string while looking for conversion specifier",
+                        ));
+                    }
+                    conversion_spec = Some(s[cursor]);
+                    cursor += 1;
+                    if cursor < field_end {
+                        if s[cursor] != ':' {
+                            return Err(crate::PyError::value_error(
+                                "expected ':' after conversion specifier",
+                            ));
+                        }
+                        cursor += 1;
+                    }
+                } else {
+                    cursor += 1;
+                }
+                spec_start = cursor;
+                break;
+            } else if c == '[' {
+                while cursor + 1 < field_end && s[cursor + 1] != ']' {
+                    cursor += 1;
+                }
+            } else if c == '{' {
+                return Err(crate::PyError::value_error("unexpected '{' in field name"));
+            }
+            cursor += 1;
+        }
+        parts.push(PyPyFormatPart::Field {
+            field_name: codepoint_slice(&s, field_start, field_name_end),
+            conversion_spec,
+            format_spec: codepoint_slice(&s, spec_start, field_end),
+        });
+        i += 1;
+    }
+    if !literal.is_empty() {
+        parts.push(PyPyFormatPart::Literal(literal));
+    }
+    Ok(parts)
 }
 
 /// Fetch positional argument `idx`, raising the `str.format` IndexError for
@@ -2074,12 +2213,17 @@ fn encode_utf8_with_errors(
     }
     let mut out = Vec::with_capacity(s.len());
     let mut buf = [0u8; 4];
-    for (index, cp) in s.code_points().enumerate() {
+    let cps: Vec<CodePoint> = s.code_points().collect();
+    let mut i = 0usize;
+    while i < cps.len() {
+        let cp = cps[i];
         if let Some(c) = cp.to_char() {
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            i += 1;
             continue;
         }
         let code = cp.to_u32();
+        let index = i;
         match err_mode {
             // surrogatepass_errors encode branch (interp_codecs.py:455-458):
             // emit the three-byte sequence for the surrogate code point.
@@ -2118,12 +2262,37 @@ fn encode_utf8_with_errors(
             "backslashreplace" => out.extend_from_slice(format!("\\u{code:04x}").as_bytes()),
             "xmlcharrefreplace" => out.extend_from_slice(format!("&#{code};").as_bytes()),
             _ => {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown error handler name '{err_mode}'"),
-                ));
+                let (rep, newpos) = call_registered_encode_error_handler(
+                    err_mode,
+                    "utf-8",
+                    w_object,
+                    cps.len(),
+                    index,
+                    index + 1,
+                    "surrogates not allowed",
+                )?;
+                match rep {
+                    EncodeReplacement::Str(rcps) => {
+                        for rc in rcps {
+                            if rc >= 0x80 {
+                                return Err(crate::typedef::unicode_encode_error(
+                                    "utf-8",
+                                    w_object,
+                                    index,
+                                    index + 1,
+                                    "surrogates not allowed",
+                                ));
+                            }
+                            out.push(rc as u8);
+                        }
+                    }
+                    EncodeReplacement::Bytes(b) => out.extend_from_slice(&b),
+                }
+                i = newpos;
+                continue;
             }
         }
+        i += 1;
     }
     Ok(out)
 }
@@ -2187,6 +2356,30 @@ pub fn encode_object(
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    if crate::importing::dev_mode_flag()
+        && matches!(
+            enc_lower.as_str(),
+            "utf-8"
+                | "utf8"
+                | "u8"
+                | "ascii"
+                | "us-ascii"
+                | "646"
+                | "latin-1"
+                | "latin1"
+                | "iso-8859-1"
+                | "8859"
+                | "raw-unicode-escape"
+                | "utf-16"
+                | "utf-16-le"
+                | "utf-16-be"
+                | "utf-32"
+                | "utf-32-le"
+                | "utf-32-be"
+        )
+    {
+        crate::module::_codecs::validate_error_handler(errors)?;
+    }
     if matches!(enc_lower.as_str(), "utf-8" | "utf8" | "u8") {
         return encode_utf8_with_errors(w_object, errors);
     }
@@ -2244,7 +2437,7 @@ pub fn encode_raw_unicode_escape(s: &Wtf8) -> Vec<u8> {
 /// [`encode_raw_unicode_escape`].  A backslash starts a `\uXXXX` /
 /// `\UXXXXXXXX` escape; any other byte (including a lone backslash or a
 /// malformed escape) is taken as a Latin-1 code point.
-pub fn decode_raw_unicode_escape(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
+pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, crate::PyError> {
     let mut out = Wtf8Buf::new();
     let mut i = 0usize;
     while i < data.len() {
@@ -2265,21 +2458,71 @@ pub fn decode_raw_unicode_escape(data: &[u8]) -> Result<Wtf8Buf, crate::PyError>
             Some(b'U') => 8usize,
             _ => 0,
         };
-        if want != 0 && i + 2 + want <= data.len() {
-            let hex = &data[i + 2..i + 2 + want];
-            if let Ok(hs) = std::str::from_utf8(hex) {
-                if let Ok(v) = u32::from_str_radix(hs, 16) {
-                    if let Some(c) = CodePoint::from_u32(v) {
-                        out.push(c);
-                        i += 2 + want;
-                        continue;
+        if want != 0 {
+            let escape_start = i;
+            let digits_start = i + 2;
+            let available_end = (digits_start + want).min(data.len());
+            let mut hex_end = digits_start;
+            while hex_end < available_end && data[hex_end].is_ascii_hexdigit() {
+                hex_end += 1;
+            }
+            let numeric = if available_end == digits_start + want && hex_end == available_end {
+                std::str::from_utf8(&data[digits_start..available_end])
+                    .ok()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+            } else {
+                None
+            };
+            let parsed = numeric.and_then(CodePoint::from_u32);
+            if let Some(c) = parsed {
+                out.push(c);
+                i = available_end;
+                continue;
+            }
+            let error_end = if numeric.is_some() {
+                available_end
+            } else {
+                hex_end
+            };
+            let reason = if numeric.is_some() {
+                "illegal Unicode character"
+            } else if want == 4 {
+                "truncated \\uXXXX escape"
+            } else {
+                "truncated \\UXXXXXXXX escape"
+            };
+            match errors {
+                "ignore" => {}
+                "replace" => out.push_char('\u{FFFD}'),
+                "backslashreplace" => {
+                    for &byte in &data[escape_start..error_end] {
+                        out.push_str(&format!("\\x{byte:02x}"));
                     }
                 }
+                _ => {
+                    i = call_registered_decode_error_handler(
+                        errors,
+                        "rawunicodeescape",
+                        data,
+                        escape_start,
+                        error_end,
+                        reason,
+                        &mut out,
+                    )?;
+                    continue;
+                }
             }
+            i = error_end;
+            continue;
         }
-        // Not a valid escape — emit the backslash literally as Latin-1.
+        // Not a valid escape — emit both bytes literally as Latin-1.
         out.push_char(b as char);
-        i += 1;
+        if let Some(next) = kind {
+            out.push_char(next as char);
+            i += 2;
+        } else {
+            i += 1;
+        }
     }
     Ok(out)
 }
@@ -2351,10 +2594,30 @@ fn encode_narrow(
                 }
             }
             _ => {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown error handler name '{errors}'"),
-                ));
+                let (rep, newpos) = call_registered_encode_error_handler(
+                    errors,
+                    enc_name,
+                    source,
+                    cps.len(),
+                    start,
+                    end,
+                    range_msg,
+                )?;
+                match rep {
+                    EncodeReplacement::Str(rcps) => {
+                        for rc in rcps {
+                            if rc > max_cp {
+                                return Err(crate::typedef::unicode_encode_error(
+                                    enc_name, source, start, end, range_msg,
+                                ));
+                            }
+                            out.push(rc as u8);
+                        }
+                    }
+                    EncodeReplacement::Bytes(b) => out.extend_from_slice(&b),
+                }
+                i = newpos;
+                continue;
             }
         }
         i = end;
@@ -2444,12 +2707,16 @@ fn encode_utf16_32_impl(
     if bom {
         emit_scalar(&mut out, 0xFEFF, is32, big_endian);
     }
-    for (index, cp) in s.code_points().enumerate() {
-        let code = cp.to_u32();
+    let cps: Vec<u32> = s.code_points().map(|c| c.to_u32()).collect();
+    let mut i = 0usize;
+    while i < cps.len() {
+        let code = cps[i];
         if !(0xD800..=0xDFFF).contains(&code) {
             emit_scalar(&mut out, code, is32, big_endian);
+            i += 1;
             continue;
         }
+        let index = i;
         // Lone surrogate — only the utf-8/16/32 surrogatepass branch may
         // emit it, as a raw code unit (interp_codecs.py surrogatepass).
         match errors {
@@ -2487,12 +2754,49 @@ fn encode_utf16_32_impl(
                 ));
             }
             _ => {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown error handler name '{errors}'"),
-                ));
+                let (rep, newpos) = call_registered_encode_error_handler(
+                    errors,
+                    codec,
+                    w_object,
+                    cps.len(),
+                    index,
+                    index + 1,
+                    "surrogates not allowed",
+                )?;
+                match rep {
+                    EncodeReplacement::Str(rcps) => {
+                        for rc in rcps {
+                            if rc >= 0x80 {
+                                return Err(crate::typedef::unicode_encode_error(
+                                    codec,
+                                    w_object,
+                                    index,
+                                    index + 1,
+                                    "surrogates not allowed",
+                                ));
+                            }
+                            emit_scalar(&mut out, rc, is32, big_endian);
+                        }
+                    }
+                    EncodeReplacement::Bytes(b) => {
+                        let unit = if is32 { 4 } else { 2 };
+                        if b.len() % unit != 0 {
+                            return Err(crate::typedef::unicode_encode_error(
+                                codec,
+                                w_object,
+                                index,
+                                index + 1,
+                                "surrogates not allowed",
+                            ));
+                        }
+                        out.extend_from_slice(&b);
+                    }
+                }
+                i = newpos;
+                continue;
             }
         }
+        i += 1;
     }
     Ok(out)
 }
@@ -2556,6 +2860,163 @@ fn read_code_unit(data: &[u8], pos: usize, unit: usize, big_endian: bool) -> u32
             u32::from_le_bytes(arr)
         }
     }
+}
+
+/// interp_codecs.py:33-108 `call_errorhandler` (decode branch): invoke a
+/// custom handler registered through `_codecs.register_error` for a decode
+/// error position.
+pub(crate) fn call_registered_decode_error_handler(
+    err_mode: &str,
+    codec: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    out: &mut Wtf8Buf,
+) -> Result<usize, crate::PyError> {
+    let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown error handler name '{err_mode}'"),
+        )
+    })?;
+
+    let w_exc =
+        crate::typedef::unicode_decode_error(codec, data, start, end, reason).to_exc_object();
+    let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
+    if w_res.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::type_error("error handler failed")));
+    }
+
+    if !unsafe { pyre_object::is_tuple(w_res) } || unsafe { pyre_object::w_tuple_len(w_res) } != 2 {
+        return Err(crate::PyError::type_error(
+            "decoding error handler must return (str, int) tuple",
+        ));
+    }
+    let w_replace = unsafe { pyre_object::w_tuple_getitem(w_res, 0).unwrap() };
+    let w_newpos = unsafe { pyre_object::w_tuple_getitem(w_res, 1).unwrap() };
+    if !unsafe { pyre_object::is_str(w_replace) } {
+        return Err(crate::PyError::type_error(
+            "decoding error handler must return (str, int) tuple",
+        ));
+    }
+
+    // Bounds stay against original data; these loops resume into the
+    // original byte slice.
+    let length = data.len() as i64;
+    let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
+        Ok(n) => n,
+        Err(e) => {
+            if e.kind == crate::PyErrorKind::OverflowError {
+                -1
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    if newpos < 0 {
+        newpos += length;
+    }
+    if newpos < 0 || newpos > length {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            format!("position {newpos} from error handler out of bounds"),
+        ));
+    }
+
+    out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_replace) });
+    Ok(newpos as usize)
+}
+
+/// Replacement returned by a custom encode error handler: either a str
+/// (its code points, re-encoded by the codec) or raw bytes (copied
+/// verbatim). interp_codecs.py:69-72 rettype 'u' vs 'b'.
+enum EncodeReplacement {
+    Str(Vec<u32>),
+    Bytes(Vec<u8>),
+}
+
+/// interp_codecs.py:33-108 `call_errorhandler` (encode branch): invoke a
+/// custom handler registered through `_codecs.register_error` for an
+/// encode error span. `start`/`end`/`char_len` are CHARACTER (code-point)
+/// indices into the source; the returned position is a character index to
+/// resume at. The caller re-encodes an `EncodeReplacement::Str` through
+/// its own codec (raising the ORIGINAL error if a replacement code point
+/// is not encodable) and copies `EncodeReplacement::Bytes` verbatim.
+fn call_registered_encode_error_handler(
+    err_mode: &str,
+    codec: &str,
+    source: PyObjectRef,
+    char_len: usize,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Result<(EncodeReplacement, usize), crate::PyError> {
+    let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown error handler name '{err_mode}'"),
+        )
+    })?;
+
+    let w_exc =
+        crate::typedef::unicode_encode_error(codec, source, start, end, reason).to_exc_object();
+    let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
+    if w_res.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::type_error("error handler failed")));
+    }
+
+    if !unsafe { pyre_object::is_tuple(w_res) } || unsafe { pyre_object::w_tuple_len(w_res) } != 2 {
+        return Err(crate::PyError::type_error(
+            "encoding error handler must return (str/bytes, int) tuple",
+        ));
+    }
+    let w_replace = unsafe { pyre_object::w_tuple_getitem(w_res, 0).unwrap() };
+    let w_newpos = unsafe { pyre_object::w_tuple_getitem(w_res, 1).unwrap() };
+
+    let replacement = if unsafe { pyre_object::is_str(w_replace) } {
+        EncodeReplacement::Str(
+            unsafe { pyre_object::w_str_get_wtf8(w_replace) }
+                .code_points()
+                .map(|c| c.to_u32())
+                .collect(),
+        )
+    } else if unsafe { pyre_object::bytesobject::is_bytes(w_replace) } {
+        EncodeReplacement::Bytes(
+            unsafe { pyre_object::bytesobject::bytes_like_data(w_replace) }.to_vec(),
+        )
+    } else {
+        return Err(crate::PyError::type_error(
+            "encoding error handler must return (str/bytes, int) tuple",
+        ));
+    };
+
+    // newpos folds against the source CHARACTER length and resumes into the
+    // original code-point sequence.
+    let length = char_len as i64;
+    let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
+        Ok(n) => n,
+        Err(e) => {
+            if e.kind == crate::PyErrorKind::OverflowError {
+                -1
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    if newpos < 0 {
+        newpos += length;
+    }
+    if newpos < 0 || newpos > length {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            format!("position {newpos} from error handler out of bounds"),
+        ));
+    }
+
+    Ok((replacement, newpos as usize))
 }
 
 /// Decode error-handler dispatch for utf-16 / utf-32 (interp_codecs.py
@@ -2622,10 +3083,7 @@ fn utf16_32_decode_error(
             }
             Ok(start + consumed)
         }
-        _ => Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            format!("unknown error handler name '{err_mode}'"),
-        )),
+        _ => call_registered_decode_error_handler(err_mode, codec, data, start, end, reason, out),
     }
 }
 

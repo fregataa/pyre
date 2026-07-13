@@ -58,6 +58,10 @@ pub mod flags {
     pub const DUMMY: u64 = 1 << 12;
 }
 
+/// Low-level trigger stored in an RPython finalizer handler.  It must only
+/// schedule app-level work; finalizers themselves run after collection.
+pub type FinalizerTriggerFn = fn();
+
 /// True when the `gc_stress` test feature is compiled in: every allocation
 /// may then run a full collection inside `alloc_with_type`, so JIT fast
 /// paths that bypass it (inline nursery bump) must stay disabled or the
@@ -259,6 +263,26 @@ pub trait GcAllocator: Send {
     /// objects without moving the nursery). The default no-ops so a backend
     /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
     fn collect_oldgen_nonmoving(&mut self) {}
+
+    /// Toggle automatic major-collection progress. Backends without
+    /// incremental major collection ignore it.
+    fn enable(&mut self) {}
+
+    fn disable(&mut self) {}
+
+    fn isenabled(&self) -> bool {
+        true
+    }
+
+    /// rgc.py `FinalizerQueue.register_finalizer` /
+    /// framework.py `gc_fq_register`: register `obj` with one translated
+    /// finalizer handler.  Backends without finalizer queues ignore it.
+    fn register_finalizer(&mut self, _fq_index: usize, _obj: GcRef, _trigger: FinalizerTriggerFn) {}
+
+    /// rgc.py `FinalizerQueue.next_dead` / framework.py `gc_fq_next_dead`.
+    fn finalizer_next_dead(&mut self, _fq_index: usize) -> Option<GcRef> {
+        None
+    }
 
     /// minimark.py:1900-1915 `id_or_identityhash(gcobj)`.
     /// Return a stable address for the object that does not change
@@ -670,6 +694,21 @@ impl GcAllocator for GcHandle {
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
+    }
+    fn enable(&mut self) {
+        gc_sync::gc_op(|gc| gc.enable())
+    }
+    fn disable(&mut self) {
+        gc_sync::gc_op(|gc| gc.disable())
+    }
+    fn isenabled(&self) -> bool {
+        gc_sync::gc_query(|gc| gc.isenabled())
+    }
+    fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+        gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))
+    }
+    fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
+        gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index))
     }
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
@@ -1440,6 +1479,47 @@ pub fn gc_remove_root(slot: *mut GcRef) {
             f(slot)
         }
     });
+}
+
+/// rgc.py `FinalizerQueue.register_finalizer` - routed to the active backend GC.
+pub type RegisterFinalizerFn = fn(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn);
+/// rgc.py `FinalizerQueue.next_dead` - routed to the active backend GC.
+pub type FinalizerNextDeadFn = fn(fq_index: usize) -> Option<GcRef>;
+
+thread_local! {
+    static ACTIVE_REGISTER_FINALIZER: Cell<Option<RegisterFinalizerFn>> = const { Cell::new(None) };
+    static ACTIVE_FINALIZER_NEXT_DEAD: Cell<Option<FinalizerNextDeadFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's finalizer trampolines. Pass `None` to clear.
+pub fn set_active_finalizer_hooks(
+    register: Option<RegisterFinalizerFn>,
+    next_dead: Option<FinalizerNextDeadFn>,
+) {
+    ACTIVE_REGISTER_FINALIZER.with(|c| c.set(register));
+    ACTIVE_FINALIZER_NEXT_DEAD.with(|c| c.set(next_dead));
+}
+
+/// Register an object with an RPython-style finalizer queue on the active GC.
+pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+    ACTIVE_REGISTER_FINALIZER.with(|c| match c.get() {
+        Some(f) => f(fq_index, obj, trigger),
+        None => gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger)),
+    });
+}
+
+/// Pop one object from the active GC's RPython-style finalizer death queue.
+pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
+    ACTIVE_FINALIZER_NEXT_DEAD.with(|c| match c.get() {
+        Some(f) => f(fq_index),
+        None => gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index)),
+    })
+}
+
+/// rgc.enable / rgc.disable — toggle automatic major-collection progress
+/// on the process-global GC.
+pub fn gc_set_enabled(enabled: bool) {
+    gc_sync::gc_op(|gc| if enabled { gc.enable() } else { gc.disable() })
 }
 
 /// Thread-local callback that performs a host-side write barrier through

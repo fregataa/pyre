@@ -1535,20 +1535,28 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         args[0]
     };
     let value = crate::builtins::builtin_str(&args[1..])?;
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+    if cls.is_null() {
         return Ok(value);
     }
     let str_typeobj = gettypefor(&pyre_object::STR_TYPE);
     if str_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
         return Ok(value);
     }
-    let s_owned = unsafe { pyre_object::w_str_get_value(value) }.to_string();
-    let obj = pyre_object::w_str_new(&s_owned);
-    // Tag with subclass type so type(obj) returns cls.
-    unsafe {
-        (*(obj as *mut pyre_object::PyObject)).w_class = cls;
+    if !unsafe { pyre_object::is_type(cls) } {
+        return Err(crate::PyError::type_error(
+            "str.__new__(X): X is not a subtype of str",
+        ));
     }
-    Ok(obj)
+    if let Some(w_str) = str_typeobj {
+        if !unsafe { crate::baseobjspace::issubtype_w(cls, w_str) } {
+            let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
+            return Err(crate::PyError::type_error(format!(
+                "str.__new__({cls_name}): {cls_name} is not a subtype of str"
+            )));
+        }
+    }
+    let contents = unsafe { pyre_object::w_str_get_wtf8(value) }.to_wtf8_buf();
+    Ok(pyre_object::w_str_subclass_from_wtf8(contents, cls))
 }
 
 /// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
@@ -2400,6 +2408,73 @@ fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(str_descr_new));
+    // unicodeobject.py:330-338 descr_repr / descr_str.  descr_str returns an
+    // exact base str for a subtype, which is required by enum.StrEnum's
+    // inherited `str.__str__`.
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                Ok(pyre_object::w_str_new(&crate::display::format_wtf8_repr(
+                    unsafe { pyre_object::w_str_get_wtf8(args[0]) },
+                )))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function_with_arity(
+            "__str__",
+            |args| {
+                let obj = args[0];
+                if unsafe { pyre_object::pyobject::is_exact_type(obj, &pyre_object::STR_TYPE) } {
+                    Ok(obj)
+                } else {
+                    Ok(pyre_object::w_str_from_wtf8(
+                        unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf(),
+                    ))
+                }
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__sizeof__",
+        make_builtin_function_with_arity(
+            "__sizeof__",
+            |args| {
+                let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                let mut maxchar = 0u32;
+                let mut length = 0usize;
+                for cp in s.code_points() {
+                    maxchar = maxchar.max(cp.to_u32());
+                    length += 1;
+                }
+                // CPython's compact PEP 393 layout, exposed for compatibility
+                // with test_str.test_raiseMemError.  PyPy documents
+                // `__sizeof__` on str but sys.getsizeof itself remains a
+                // default-returning operation for other objects.
+                let word = std::mem::size_of::<usize>();
+                let struct_size = if maxchar < 0x80 { 5 * word } else { 7 * word };
+                let char_size = if maxchar < 0x100 {
+                    1
+                } else if maxchar < 0x10000 {
+                    2
+                } else {
+                    4
+                };
+                Ok(pyre_object::w_int_new(
+                    (struct_size + char_size * (length + 1)) as i64,
+                ))
+            },
+            1,
+        ),
+    );
     dict_storage_store(
         ns,
         "__format__",
@@ -8243,6 +8318,24 @@ type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
 fn init_int_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(int_descr_new));
+    // intobject.py descr_repr / descr_str.  IntEnum binds its __str__ to this
+    // descriptor, so it must exist in int's TypeDef rather than falling back
+    // to object.__str__.
+    let int_to_text = |args: &[PyObjectRef]| {
+        Ok(pyre_object::w_str_new(
+            &unsafe { crate::builtins::obj_to_bigint(args[0]) }.to_string(),
+        ))
+    };
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity("__repr__", int_to_text, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function_with_arity("__str__", int_to_text, 1),
+    );
     dict_storage_store(
         ns,
         "bit_length",
@@ -11920,10 +12013,9 @@ fn utf8_error_handler(
             Ok(end)
         }
         "xmlcharrefreplace" | "namereplace" => Err(decode_error_encode_only_handler()),
-        _ => Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            format!("unknown error handler name '{err_mode}'"),
-        )),
+        _ => crate::type_methods::call_registered_decode_error_handler(
+            err_mode, "utf-8", data, start, end, reason, out,
+        ),
     }
 }
 
@@ -12252,11 +12344,37 @@ pub(crate) fn decode_bytes_to_wtf8(
 ) -> Result<Wtf8Buf, crate::PyError> {
     let err_mode = errors;
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    if crate::importing::dev_mode_flag()
+        && matches!(
+            enc_lower.as_str(),
+            "utf-8"
+                | "utf8"
+                | "u8"
+                | "ascii"
+                | "us-ascii"
+                | "646"
+                | "latin-1"
+                | "latin1"
+                | "iso-8859-1"
+                | "8859"
+                | "raw-unicode-escape"
+                | "utf-16"
+                | "utf-16-le"
+                | "utf-16-be"
+                | "utf-32"
+                | "utf-32-le"
+                | "utf-32-be"
+        )
+    {
+        crate::module::_codecs::validate_error_handler(errors)?;
+    }
     let s = match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
             let mut out = Wtf8Buf::new();
-            for (i, &b) in data.iter().enumerate() {
+            let mut i = 0;
+            while i < data.len() {
+                let b = data[i];
                 if b >= 0x80 {
                     match err_mode {
                         "strict" => {
@@ -12268,15 +12386,20 @@ pub(crate) fn decode_bytes_to_wtf8(
                                 "ordinal not in range(128)",
                             ));
                         }
-                        "ignore" => continue,
+                        "ignore" => {
+                            i += 1;
+                            continue;
+                        }
                         "replace" => {
                             out.push_char('\u{FFFD}');
+                            i += 1;
                             continue;
                         }
                         // surrogateescape escapes the non-ASCII byte as a lone
                         // surrogate 0xdc00+b (interp_codecs.py:536-555).
                         "surrogateescape" => {
                             out.push(CodePoint::from_u32(0xDC00 + b as u32).unwrap());
+                            i += 1;
                             continue;
                         }
                         // surrogatepass only decodes three-byte UTF-8 surrogate
@@ -12293,27 +12416,35 @@ pub(crate) fn decode_bytes_to_wtf8(
                         }
                         "backslashreplace" => {
                             out.push_str(&format!("\\x{:02x}", b));
+                            i += 1;
                             continue;
                         }
                         "xmlcharrefreplace" | "namereplace" => {
                             return Err(decode_error_encode_only_handler());
                         }
                         _ => {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::LookupError,
-                                format!("unknown error handler name '{err_mode}'"),
-                            ));
+                            i = crate::type_methods::call_registered_decode_error_handler(
+                                err_mode,
+                                "ascii",
+                                data,
+                                i,
+                                i + 1,
+                                "ordinal not in range(128)",
+                                &mut out,
+                            )?;
+                            continue;
                         }
                     }
                 }
                 out.push_char(b as char);
+                i += 1;
             }
             out
         }
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
             Wtf8Buf::from_string(data.iter().map(|&b| b as char).collect::<String>())
         }
-        "raw-unicode-escape" => crate::type_methods::decode_raw_unicode_escape(data)?,
+        "raw-unicode-escape" => crate::type_methods::decode_raw_unicode_escape(data, err_mode)?,
         _ => {
             if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower, err_mode) {
                 result?
