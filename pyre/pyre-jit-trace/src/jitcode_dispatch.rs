@@ -609,7 +609,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// ops — an effect declined at walk time still lands exactly once
     /// (see the void gate in
     /// [`try_execute_residual_call_via_executor`] and
-    /// [`FBW_UNJOURNALED_EFFECT`]).  A per-opcode arm walk has no
+    /// [`fbw_has_unjournaled_effect`]).  A per-opcode arm walk has no
     /// replay: the interpreter advances opcode by opcode during
     /// tracing and the compiled loop is entered at the NEXT iteration,
     /// so an effect the walker declines to execute is simply lost —
@@ -1625,6 +1625,11 @@ pub fn walk(
                     // last_exc_box)` records the outermost FINISH.
                     ctx.trace_ctx
                         .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                    if let ConcreteValue::Ref(p) = exc_concrete {
+                        if !p.is_null() {
+                            fbw_finish_raise_set(exc_concrete);
+                        }
+                    }
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
@@ -5809,14 +5814,14 @@ pub fn bool_box_truth_reset() {
 /// or corrupt the live heap under the discard-the-trace probe.
 ///
 /// **Return value**:
-/// * `Ok(Some(Ok(_)))` — helper executed normally, `recorded` OpRef
+/// * `Ok(ResidualExecOutcome::Executed(Ok(_)))` — helper executed normally, `recorded` OpRef
 ///   stamped with the concrete result.
-/// * `Ok(Some(Err(bh_exc)))` — helper raised; `bh_exc` is the wrapped
+/// * `Ok(ResidualExecOutcome::Executed(Err(bh_exc)))` — helper raised; `bh_exc` is the wrapped
 ///   `PyError` pointer (from `BH_LAST_EXC_VALUE`).  Caller is
 ///   responsible for routing into `WalkContext.last_exc_value` so the
 ///   downstream `GuardNoException` walker handler picks it up; the
 ///   `recorded` OpRef is NOT stamped (no concrete result).
-/// * `Ok(None)` — fold declined (preconditions not met: not the
+/// * `Ok(ResidualExecOutcome::Declined(_))` — fold declined (preconditions not met: not the
 ///   authoritative executor, opcode out of set, funcbox non-const, arity
 ///   exceeds [`MAX_HOST_CALL_ARITY`], any operand lacks a concrete
 ///   `box_value`, or any Ref arg is NULL), or the call's result is void
@@ -5835,6 +5840,18 @@ pub fn bool_box_truth_reset() {
 /// alongside [`try_fold_pure_call_via_executor`].  The may-force /
 /// can-raise path wires the `Err` exception through
 /// `WalkContext.last_exc_value`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResidualDecline {
+    ValueUnavailable,
+    Symbolic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResidualExecOutcome {
+    Executed(Result<i64, i64>),
+    Declined(ResidualDecline),
+}
+
 fn try_execute_residual_call_via_executor(
     ctx: &mut WalkContext<'_, '_>,
     call_opcode: OpCode,
@@ -5842,7 +5859,7 @@ fn try_execute_residual_call_via_executor(
     call_descr: &dyn majit_ir::descr::CallDescr,
     recorded: OpRef,
     op_pc: usize,
-) -> Result<Option<Result<i64, i64>>, DispatchError> {
+) -> Result<ResidualExecOutcome, DispatchError> {
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
     // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
@@ -5869,7 +5886,7 @@ fn try_execute_residual_call_via_executor(
     // leave the flag `false` so the call is recorded symbolically
     // without re-running its side effects.
     if !ctx.is_authoritative_executor {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     let plain_or_loopinvariant = matches!(
         call_opcode,
@@ -5895,10 +5912,10 @@ fn try_execute_residual_call_via_executor(
             | OpCode::CallMayForceN
     );
     if !plain_or_loopinvariant && !is_may_force {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     if allboxes.is_empty() {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // Same funcbox-must-be-const invariant as `try_fold_pure_call_via_executor`:
     // a non-const funcbox carries a stale stamp and dereferencing it as a
@@ -5907,7 +5924,7 @@ fn try_execute_residual_call_via_executor(
     // implicitly requires constness too (residual_call descrs always
     // carry a fixed funcptr at translation time).
     if !allboxes[0].is_constant() {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // The LOAD_CONST helper (oopspec `LoadConst`) has a dedicated fold in the
     // residual_call dispatchers: when the const index AND the code pointer
@@ -5921,12 +5938,12 @@ fn try_execute_residual_call_via_executor(
     // `w_code_get_ptr` and faults.  Leave it symbolic, mirroring the fold's
     // "falls through to the generic record" contract.
     if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadConst {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
-        _ => return Ok(None),
+        _ => return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic)),
     };
     // Sub-slice 4 safety gate — reject `symbolic_fnaddr_for_path`
     // placeholder values that escaped runtime patching.  Pyre's
@@ -5944,7 +5961,7 @@ fn try_execute_residual_call_via_executor(
     // non-fnptr value (e.g. an int constant mistakenly routed through
     // the funcbox slot).
     if (func_ptr as u64) >> 47 != 0 {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // A residual whose funcptr is a `PyFrame` operand-stack accessor
     // (`pop`/`push`/`peek`/`peek_at`) reads or mutates the live frame's
@@ -5959,10 +5976,10 @@ fn try_execute_residual_call_via_executor(
     // frame whose operand stack the compiled trace's preceding pushes have
     // populated.
     if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // A void residual (CALL_N family) is a side effect with no result box, so
     // `do_residual_call` executes it EAGERLY during the walk and resumes the
@@ -5994,7 +6011,16 @@ fn try_execute_residual_call_via_executor(
                             arg_index,
                         });
                     }
-                    return Ok(None);
+                    if fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-resid-decline] NO_CONCRETE op_pc={op_pc} arg_index={arg_index} \
+                             helper={:?} opcode={call_opcode:?}",
+                            call_descr.get_extra_info().pyre_helper
+                        );
+                    }
+                    return Ok(ResidualExecOutcome::Declined(
+                        ResidualDecline::ValueUnavailable,
+                    ));
                 }
                 r.as_usize() as i64
             }
@@ -6007,7 +6033,16 @@ fn try_execute_residual_call_via_executor(
                         arg_index,
                     });
                 }
-                return Ok(None);
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-resid-decline] box_value=None op_pc={op_pc} arg_index={arg_index} \
+                         helper={:?} opcode={call_opcode:?}",
+                        call_descr.get_extra_info().pyre_helper
+                    );
+                }
+                return Ok(ResidualExecOutcome::Declined(
+                    ResidualDecline::ValueUnavailable,
+                ));
             }
         };
         args.push(v);
@@ -6024,7 +6059,7 @@ fn try_execute_residual_call_via_executor(
     // prepends it as arg0 only when non-null), so a concrete-NULL there
     // is the normal plain-call shape.  These exemptions MUST match
     // `walker_abort_if_mayforce_null_ref_arg`'s — otherwise a normal
-    // no-receiver keyword/star call is declined here to `Ok(None)`
+    // no-receiver keyword/star call is declined as symbolic
     // (left symbolic), which drops the recording iteration's call
     // exactly once (`g(i, d=4)` in a hot loop summed to n-1, callee
     // ran n-1 times).
@@ -6056,7 +6091,7 @@ fn try_execute_residual_call_via_executor(
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
-            return Ok(None);
+            return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
         }
     }
     // #57 (Finding #1, in-place container mutation): an in-flight FOR_ITER
@@ -6261,6 +6296,16 @@ fn try_execute_residual_call_via_executor(
     // builtin FOR_ITER stays modeled.
     let foriter_frame_snapshot = (helper == majit_ir::PyreHelperKind::ForIterNext)
         .then(pyre_interpreter::call::frame_entry_count);
+    // #493: a NEW consume attempt for a FOR_ITER whose prior item is still in
+    // flight means that item's body ran to completion — mark the entry BEFORE
+    // the call so an attempt that aborts mid-way (a kept-stack guard on the
+    // exhaustion arm) still records the completion; a successful attempt
+    // replaces the entry with a fresh one anyway.
+    if helper == majit_ir::PyreHelperKind::ForIterNext {
+        let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+            .unwrap_or(ctx.entry_py_pc as usize + 1);
+        fbw_foriter_inflight_mark_attempt(body_pc);
+    }
     // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
     // in-flight FOR_ITER) so the concrete-heap-write gate can detect a callee
     // sub-walk mutation committed through a value-returning dunder body — the
@@ -6366,6 +6411,7 @@ fn try_execute_residual_call_via_executor(
     }
     match exec_result {
         Ok(result_i64) => {
+            fbw_count_executed_residual(is_void, is_may_force);
             // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
             // success arm with `metainterp.clear_exception()` (called
             // implicitly through `do_residual_call`'s no-raise tail).
@@ -6393,9 +6439,7 @@ fn try_execute_residual_call_via_executor(
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
-            // value.  Full-body-walk Void results returned `None` above
-            // (recorded symbolically); a per-opcode arm walk reaches this
-            // arm for an executed void helper with nothing to stamp.
+            // value. An executed void helper has nothing to stamp.
             match call_descr.result_type() {
                 majit_ir::Type::Int => {
                     ctx.trace_ctx
@@ -6480,6 +6524,7 @@ fn try_execute_residual_call_via_executor(
             }
         }
         Err(bh_exc) => {
+            fbw_count_executed_residual(is_void, is_may_force);
             // pyjitpl.py:1690-1696 `metainterp.execute_raised(exception,
             // constant=False)` analogue — seed the standing exception
             // state so downstream walker chain (`reraise/`,
@@ -6514,7 +6559,7 @@ fn try_execute_residual_call_via_executor(
             }
         }
     }
-    Ok(Some(exec_result))
+    Ok(ResidualExecOutcome::Executed(exec_result))
 }
 
 /// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
@@ -7544,11 +7589,11 @@ thread_local! {
     static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
         const { std::cell::Cell::new(None) };
 
-    /// The CONCRETE return value a top-level `*_return` arm produced, set
-    /// alongside [`FBW_FINISH_PAYLOAD`] for a loop-free portal exit
-    /// (`DispatchOutcome::Terminate`).  Unlike `FBW_FINISH_PAYLOAD` (the
-    /// symbolic re-boxed `OpRef` the compile consumer records into the
-    /// trace), this holds the value the walk *concretely* computed.
+    /// The terminal disposition a top-level walk produced, set for a
+    /// loop-free portal exit (`DispatchOutcome::Terminate`).  Unlike
+    /// `FBW_FINISH_PAYLOAD` (the symbolic re-boxed `OpRef` the compile
+    /// consumer records into the trace), this holds the value the walk
+    /// *concretely* computed.
     ///
     /// A function trace that fully unrolls to `done_with_this_frame`
     /// executed every residual call concretely (consuming side-effecting
@@ -7564,7 +7609,7 @@ thread_local! {
     /// via [`fbw_finish_concrete_root_walker`].  `None` for ungated /
     /// loop-closing / float (no concrete float shadow bank) walks → the
     /// portal degrades to the legacy `ContinueRunningNormally` replay.
-    static FBW_FINISH_CONCRETE: std::cell::Cell<Option<ConcreteValue>> =
+    static FBW_FINISH_CONCRETE: std::cell::Cell<Option<FinishConcrete>> =
         const { std::cell::Cell::new(None) };
 
     /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
@@ -7575,11 +7620,25 @@ thread_local! {
     /// as `DoneWithThisFrame` instead of rewinding to the guard pc and
     /// re-interpreting the region (which would double every eagerly executed
     /// residual side effect, #177).  Only the bridge tracer sets it, and only
-    /// when the resume is single-frame and the caller can consume a concrete
-    /// result (the general guard path, not the CALL_ASSEMBLER callback), so a
-    /// committed journal never strands into a blackhole re-run.  Cleared after
+    /// when the resume is single-frame; the general guard path consumes the
+    /// kept stash as a terminal `BridgeResolution`, and the CALL_ASSEMBLER
+    /// callback hands it to its back-to-back blackhole hook, so a committed
+    /// journal never strands into a guard-state re-run.  Cleared after
     /// every bridge walk.
     static FBW_BRIDGE_NOREPLAY_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Terminal disposition of a walk kept for the no-replay exit:
+/// the top-level frame's concrete return value, or the concrete
+/// exception object of the uncaught raise that ended the walk
+/// (`opimpl_raise` → `finishframe_exception` →
+/// `compile_exit_frame_with_exception`, pyjitpl.py:1688-1698 +
+/// 3238-3242; the caller consumes it as `ExitFrameWithExceptionRef`,
+/// jitexc.py:44).
+#[derive(Clone, Copy)]
+pub enum FinishConcrete {
+    Return(ConcreteValue),
+    Raise(ConcreteValue),
 }
 
 /// Whether the slice-b Finish-portal compile route is enabled.  Cached so
@@ -7643,31 +7702,39 @@ pub(crate) fn fbw_finish_payload_take() -> Option<(OpRef, Type)> {
 /// Stash the concrete return value of a top-level value-returning
 /// `*_return` arm (see [`FBW_FINISH_CONCRETE`]).
 pub(crate) fn fbw_finish_concrete_set(value: ConcreteValue) {
-    FBW_FINISH_CONCRETE.with(|c| c.set(Some(value)));
+    FBW_FINISH_CONCRETE.with(|c| c.set(Some(FinishConcrete::Return(value))));
 }
 
-/// Peek at the stashed concrete return value without consuming it (the
+/// Stash the concrete exception object of a top-level uncaught raise.
+pub(crate) fn fbw_finish_raise_set(value: ConcreteValue) {
+    FBW_FINISH_CONCRETE.with(|c| c.set(Some(FinishConcrete::Raise(value))));
+}
+
+/// Peek at the stashed terminal disposition without consuming it (the
 /// `run_perfn_walk` epilogue uses this to decide whether to commit the
-/// store journal and keep the no-replay shortcut).
-pub(crate) fn fbw_finish_concrete_peek() -> Option<ConcreteValue> {
+/// store journal and keep the no-replay shortcut; the CALL_ASSEMBLER
+/// bridge callback uses it to leave a kept stash in its rooted cell for
+/// the back-to-back blackhole hook).
+pub fn fbw_finish_concrete_peek() -> Option<FinishConcrete> {
     FBW_FINISH_CONCRETE.with(|c| c.get())
 }
 
-/// Clear the stashed concrete return value.  The `run_perfn_walk`
+/// Clear the stashed terminal disposition.  The `run_perfn_walk`
 /// epilogue calls this when the no-replay shortcut is declined (not a
 /// `Terminate` walk, or an unjournaled effect only the replay applies) so
-/// the portal degrades to `ContinueRunningNormally`.
-pub(crate) fn fbw_finish_concrete_reset() {
+/// the portal degrades to `ContinueRunningNormally`; the CALL_ASSEMBLER
+/// blackhole hook calls it so a kept stash that cannot be consumed does
+/// not leak into a later portal take.
+pub fn fbw_finish_concrete_reset() {
     FBW_FINISH_CONCRETE.with(|c| c.set(None));
 }
 
-/// Consume the stashed concrete return value (the portal exit in
-/// `eval.rs` takes it to return the walk's result directly).
-pub fn fbw_finish_concrete_take() -> Option<ConcreteValue> {
+/// Consume the stashed terminal disposition at the portal exit.
+pub fn fbw_finish_concrete_take() -> Option<FinishConcrete> {
     FBW_FINISH_CONCRETE.with(|c| c.take())
 }
 
-/// `framework.py root_walker.walk_roots` parity for the concrete return
+/// `framework.py root_walker.walk_roots` parity for the concrete terminal
 /// value: a `Ref` payload holds a nursery-resident object across the
 /// post-walk compile (which allocates and may trigger a minor collection
 /// that moves nursery objects), so the slot is forwarded as a root.
@@ -7675,14 +7742,24 @@ pub fn fbw_finish_concrete_take() -> Option<ConcreteValue> {
 /// [`fbw_store_journal_root_walker`].
 pub fn fbw_finish_concrete_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     FBW_FINISH_CONCRETE.with(|c| {
-        if let Some(ConcreteValue::Ref(ptr)) = c.get() {
+        let Some(finish) = c.get() else {
+            return;
+        };
+        let (value, is_raise) = match finish {
+            FinishConcrete::Return(value) => (value, false),
+            FinishConcrete::Raise(value) => (value, true),
+        };
+        if let ConcreteValue::Ref(ptr) = value {
             let mut gcref = majit_ir::GcRef(ptr as usize);
             visitor(&mut gcref);
             // The visitor may forward (relocate) the ref; write it back so
             // the stashed value points at the moved object.
-            c.set(Some(ConcreteValue::Ref(
-                gcref.0 as pyre_object::PyObjectRef,
-            )));
+            let value = ConcreteValue::Ref(gcref.0 as pyre_object::PyObjectRef);
+            c.set(Some(if is_raise {
+                FinishConcrete::Raise(value)
+            } else {
+                FinishConcrete::Return(value)
+            }));
         }
     });
 }
@@ -7705,6 +7782,12 @@ struct InflightForiter {
     item: pyre_object::PyObjectRef,
     body_pc: usize,
     body_effect_since_consume: bool,
+    /// The walk re-reached this FOR_ITER's consume after the item's body ran
+    /// (a NEW `for_iter_next` attempt was dispatched for the same `body_pc`).
+    /// A completed entry must never be re-delivered — its body already ran
+    /// during the walk — but a flush may still adopt the walk end state at
+    /// the header WITHOUT delivery (the interpreter re-attempts the consume).
+    body_completed: bool,
 }
 
 thread_local! {
@@ -7786,20 +7869,22 @@ thread_local! {
     static FBW_FORITER_INFLIGHT: std::cell::RefCell<Vec<InflightForiter>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// Set when the walk records a side effect that was neither executed
-    /// at walk time nor undo-logged: a void residual call recorded
-    /// symbolically (the `try_execute_residual_call_via_executor` void
-    /// gate).  A flagged walk must not adopt its end state — the flush
-    /// site keeps the legacy replay, which is the only path that applies
-    /// the recorded effect.
-    static FBW_UNJOURNALED_EFFECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FBW_UNJOURNALED_VALUE_UNAVAILABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FBW_UNJOURNALED_SYMBOLIC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
+    static FBW_EXECUTED_RESIDUAL_VOID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FBW_EXECUTED_RESIDUAL_MAYFORCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FBW_EXECUTED_RESIDUAL_PLAIN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 
     /// gh#467 executed-effect odometer: bumped only when the walk concretely
     /// applies an effect — a store/append/cell journal push, a Void / mutator-
     /// tagged residual executed by [`try_execute_residual_call_via_executor`],
     /// or a residual whose concrete run entered a user Python frame (a value-
     /// returning dunder that may mutate).  A declined residual recorded only
-    /// symbolically sets [`FBW_UNJOURNALED_EFFECT`] but does NOT move this
+    /// symbolically sets an unjournaled flag ([`FBW_UNJOURNALED_VALUE_UNAVAILABLE`]
+    /// / [`FBW_UNJOURNALED_SYMBOLIC`]) but does NOT move this
     /// counter: no effect executed.  The inline abort-forward-flush gate
     /// (`try_walker_inline_user_call` / gh#467) snapshots both signals at the
     /// CALL.  A nonzero count delta means the callee attempt cannot be
@@ -7909,13 +7994,17 @@ fn fbw_built_exc_take(op: OpRef) -> bool {
     FBW_BUILT_EXC.with(|s| s.borrow_mut().remove(&op))
 }
 
-/// Clear the store journal and the unjournaled-effect flag before a walk
+/// Clear the store journal and residual-call census before a walk
 /// begins (mirrors [`bool_box_truth_reset`]).
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
-    FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
+    FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
+    FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(false));
+    FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.set(0));
+    FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.set(0));
+    FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.set(0));
     // gh#467: reset the executed-effect odometer and any stale
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
@@ -8017,6 +8106,7 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
             item,
             body_pc,
             body_effect_since_consume: false,
+            body_completed: false,
         };
         match stack.iter().position(|e| e.body_pc == body_pc) {
             Some(at) => {
@@ -8034,6 +8124,21 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
 /// counts as a body effect committed after the consume (Finding #1).
 pub(crate) fn fbw_foriter_inflight_active() -> bool {
     FBW_FORITER_INFLIGHT.with(|c| !c.borrow().is_empty())
+}
+
+/// Mark the in-flight entry for `body_pc` body-completed: a NEW
+/// `for_iter_next` attempt is being dispatched for the same FOR_ITER, so the
+/// prior consumed item's body has run to completion (the walk is back at the
+/// header).  Called from the residual dispatch BEFORE the call executes so an
+/// attempt that aborts mid-way (a kept-stack guard on the exhaustion arm)
+/// still leaves the completion recorded; a successful attempt replaces the
+/// entry with a fresh one anyway ([`fbw_foriter_inflight_capture`]).
+pub(crate) fn fbw_foriter_inflight_mark_attempt(body_pc: usize) {
+    FBW_FORITER_INFLIGHT.with(|c| {
+        if let Some(entry) = c.borrow_mut().iter_mut().find(|e| e.body_pc == body_pc) {
+            entry.body_completed = true;
+        }
+    });
 }
 
 /// Flag that a non-elidable concrete residual committed an irreversible heap
@@ -8072,24 +8177,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
     resume_py_pc: usize,
 ) -> Option<(pyre_object::PyObjectRef, usize)> {
     let body_pc = resume_py_pc + 1;
-    // The opcode at `resume_py_pc` must be a FOR_ITER (decoded from the live
-    // frame's code) — a non-FOR_ITER resume pc that merely happens to satisfy
-    // `body_pc == some entry.body_pc` is Shape B.
-    let frame_ptr = frame as *const u8;
-    let w_code =
-        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-    if w_code.is_null() {
-        return None;
-    }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    let is_foriter_header = matches!(
-        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, resume_py_pc),
-        Some((pyre_interpreter::Instruction::ForIter { .. }, _))
-    );
-    if !is_foriter_header {
+    if !foriter_header_at(frame, resume_py_pc) {
         return None;
     }
     FBW_FORITER_INFLIGHT.with(|c| {
@@ -8097,10 +8185,14 @@ pub fn fbw_foriter_inflight_take_for_resume(
         let at = stack.iter().position(|e| e.body_pc == body_pc)?;
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
-        // would double it — refuse delivery.  Also refuse if either journal is
-        // non-empty or an unjournaled effect stands (same signals as
-        // `fbw_foriter_inflight_take`).
+        // would double it — refuse delivery.  A body-COMPLETED entry (the walk
+        // re-reached the consume, so this item's body already ran) must never
+        // be delivered either — that is the header-flush-without-delivery
+        // shape ([`fbw_foriter_inflight_completed_at_resume`]).  Also refuse if
+        // either journal is non-empty or an unjournaled effect stands (same
+        // signals as `fbw_foriter_inflight_take`).
         if stack[at].body_effect_since_consume
+            || stack[at].body_completed
             || fbw_store_journal_len() != 0
             || FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) != 0
             || fbw_has_unjournaled_effect()
@@ -8108,6 +8200,54 @@ pub fn fbw_foriter_inflight_take_for_resume(
             return None;
         }
         Some((stack[at].item, stack[at].body_pc))
+    })
+}
+
+/// Whether the opcode at `resume_py_pc` in the live frame's code is a
+/// FOR_ITER — a non-FOR_ITER resume pc that merely happens to satisfy
+/// `body_pc == some entry.body_pc` is Shape B.
+fn foriter_header_at(frame: usize, resume_py_pc: usize) -> bool {
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return false;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    matches!(
+        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, resume_py_pc),
+        Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+    )
+}
+
+/// #493 selector for the header-flush-without-delivery shape: `resume_py_pc`
+/// is a FOR_ITER header whose in-flight entry is body-COMPLETED — the abort
+/// fired during the NEXT consume attempt (a kept-stack guard on the FOR_ITER
+/// arms after the `for_iter_next` residual), so the consumed item's body
+/// already ran during the walk.  The walk end state at the header is then the
+/// complete post-body state: the flush adopts it WITHOUT delivering the item
+/// and the interpreter re-attempts the consume against the advanced iterator.
+/// Refuses when an effect committed since the consume (re-attempting the
+/// consume could re-apply the failed attempt's effect) — same signals as the
+/// delivery selector above.
+pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usize) -> bool {
+    let body_pc = resume_py_pc + 1;
+    if !foriter_header_at(frame, resume_py_pc) {
+        return false;
+    }
+    FBW_FORITER_INFLIGHT.with(|c| {
+        let stack = c.borrow();
+        let Some(at) = stack.iter().position(|e| e.body_pc == body_pc) else {
+            return false;
+        };
+        stack[at].body_completed
+            && !stack[at].body_effect_since_consume
+            && fbw_store_journal_len() == 0
+            && FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) == 0
+            && !fbw_has_unjournaled_effect()
     })
 }
 
@@ -8297,9 +8437,14 @@ pub(crate) fn fbw_store_journal_len() -> usize {
 }
 
 /// Mark the walk as carrying a recorded-but-unexecuted side effect only
-/// the legacy replay applies (see [`FBW_UNJOURNALED_EFFECT`]).
-pub(crate) fn fbw_mark_unjournaled_effect() {
-    FBW_UNJOURNALED_EFFECT.with(|c| c.set(true));
+/// the legacy replay applies.
+pub(crate) fn fbw_mark_unjournaled_effect(cause: ResidualDecline) {
+    match cause {
+        ResidualDecline::ValueUnavailable => {
+            FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(true));
+        }
+        ResidualDecline::Symbolic => FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(true)),
+    }
 }
 
 /// gh#467 executed-effect odometer read (see [`FBW_EXECUTED_EFFECT_COUNT`]).
@@ -8436,7 +8581,7 @@ pub(crate) fn fbw_abort_carrier_clear() {
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
 }
 
-/// An unexecutable residual call (`try_execute_residual_call_via_executor`
+/// A declined residual call (`try_execute_residual_call_via_executor`
 /// returned `None`) reached during a multiframe-inlined callee sub-walk
 /// (the framestack is non-empty) cannot fall back to the walk-end
 /// legacy replay.  The replay re-enters the freshly compiled loop from the
@@ -8469,7 +8614,34 @@ fn fbw_abort_nested_unjournaled_residual(
 
 /// Whether the walk recorded an effect outside the journal's reach.
 pub(crate) fn fbw_has_unjournaled_effect() -> bool {
-    FBW_UNJOURNALED_EFFECT.with(|c| c.get())
+    let (value_unavailable, symbolic) = fbw_unjournaled_kinds();
+    value_unavailable || symbolic
+}
+
+pub(crate) fn fbw_unjournaled_kinds() -> (bool, bool) {
+    (
+        FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.get()),
+        FBW_UNJOURNALED_SYMBOLIC.with(|c| c.get()),
+    )
+}
+
+fn fbw_count_executed_residual(is_void: bool, is_may_force: bool) {
+    let counter = if is_void {
+        &FBW_EXECUTED_RESIDUAL_VOID
+    } else if is_may_force {
+        &FBW_EXECUTED_RESIDUAL_MAYFORCE
+    } else {
+        &FBW_EXECUTED_RESIDUAL_PLAIN
+    };
+    counter.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+pub(crate) fn fbw_executed_residual_counts() -> (u32, u32, u32) {
+    (
+        FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.get()),
+        FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.get()),
+        FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.get()),
+    )
 }
 
 /// `framework.py root_walker.walk_roots` parity for the store and append
@@ -12035,13 +12207,16 @@ fn direct_call_release_gil(
         recorded,
         pc,
     )?;
-    // A `None` leaves the call recorded symbolically WITHOUT running it, so
+    // A decline leaves the call recorded symbolically WITHOUT running it, so
     // the walk-end no-replay commit must stay off for this trace.
-    if resid_exec.is_none() {
-        fbw_abort_nested_unjournaled_residual(ctx, pc)?;
-        fbw_mark_unjournaled_effect();
-    }
-    let resid_raised = matches!(resid_exec, Some(Err(_)));
+    let resid_raised = match resid_exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_abort_nested_unjournaled_residual(ctx, pc)?;
+            fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
     debug_assert!(
         !resid_raised || ei.check_can_raise(false),
         "{caller}: release-gil helper raised on a `!can_raise` EI — \
@@ -13089,11 +13264,14 @@ fn try_walker_call_assembler_self_recursive(
     // A decline leaves the CALL_ASSEMBLER recorded symbolically WITHOUT
     // running it — a side effect only the legacy replay applies, so the
     // walk-end no-replay commit must stay off for this trace (see
-    // `FBW_UNJOURNALED_EFFECT`).
-    if exec.is_none() {
-        fbw_mark_unjournaled_effect();
-    }
-    let exec_raised = matches!(exec, Some(Err(_)));
+    // `fbw_has_unjournaled_effect`).
+    let exec_raised = match exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
 
     // pyjitpl.py:2072: heapcache invalidation for the escaped frame.
     ctx.trace_ctx
@@ -13253,10 +13431,13 @@ fn emit_walker_loop_callee_call_assembler(
         ca_result,
         op.pc,
     )?;
-    if exec.is_none() {
-        fbw_mark_unjournaled_effect();
-    }
-    let exec_raised = matches!(exec, Some(Err(_)));
+    let exec_raised = match exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
 
     ctx.trace_ctx
         .heap_cache_mut()
@@ -14343,6 +14524,14 @@ fn dispatch_residual_call_iRd_kind(
     ctx: &mut WalkContext<'_, '_>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // execute_varargs (pyjitpl.py:1940-1941) opens every residual call
+    // with metainterp.clear_exception(), so a caught exception's
+    // last_exc_value never survives past the next call — the
+    // opimpl_catch_exception assert (pyjitpl.py:504) relies on it.
+    // Clear at the arm entry so declined/folded paths uphold the same
+    // invariant as the concrete-execution success arm.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (r_args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
     // #62: env-gated recognition probe (no-op unless PYRE_DIAG_INLINE_RECOG
@@ -14877,16 +15066,19 @@ fn dispatch_residual_call_iRd_kind(
             recorded,
             op.pc,
         )?;
-        // A `None` leaves the call recorded symbolically WITHOUT running
+        // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
-        if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
-            fbw_mark_unjournaled_effect();
-        }
-        let resid_raised = matches!(resid_exec, Some(Err(_)));
+        let resid_raised = match resid_exec {
+            ResidualExecOutcome::Executed(result) => result.is_err(),
+            ResidualExecOutcome::Declined(cause) => {
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_mark_unjournaled_effect(cause);
+                false
+            }
+        };
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iRd_kind: helper raised on a \
@@ -19376,6 +19568,10 @@ fn dispatch_residual_call_iIRd_kind(
     ctx: &mut WalkContext<'_, '_>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every
+    // residual-call entry; see dispatch_residual_call_iRd_kind.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
@@ -19866,16 +20062,19 @@ fn dispatch_residual_call_iIRd_kind(
             recorded,
             op.pc,
         )?;
-        // A `None` leaves the call recorded symbolically WITHOUT running
+        // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
-        if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
-            fbw_mark_unjournaled_effect();
-        }
-        let resid_raised = matches!(resid_exec, Some(Err(_)));
+        let resid_raised = match resid_exec {
+            ResidualExecOutcome::Executed(result) => result.is_err(),
+            ResidualExecOutcome::Declined(cause) => {
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_mark_unjournaled_effect(cause);
+                false
+            }
+        };
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRd_kind: helper raised on a \
@@ -19950,6 +20149,10 @@ fn dispatch_residual_call_iIRFd_kind(
     ctx: &mut WalkContext<'_, '_>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every
+    // residual-call entry; see dispatch_residual_call_iRd_kind.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
@@ -20063,16 +20266,19 @@ fn dispatch_residual_call_iIRFd_kind(
             recorded,
             op.pc,
         )?;
-        // A `None` leaves the call recorded symbolically WITHOUT running
+        // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
-        if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
-            fbw_mark_unjournaled_effect();
-        }
-        let resid_raised = matches!(resid_exec, Some(Err(_)));
+        let resid_raised = match resid_exec {
+            ResidualExecOutcome::Executed(result) => result.is_err(),
+            ResidualExecOutcome::Declined(cause) => {
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_mark_unjournaled_effect(cause);
+                false
+            }
+        };
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRFd_kind: helper raised on a \
@@ -21266,6 +21472,10 @@ fn handle(
                             kept_stack_any_leg,
                         );
                     }
+                    // Stamp the abort coordinate at the raise point so the
+                    // walk-end branch-flush gate cannot flush the outer frame
+                    // from a callee-coordinate abort.
+                    ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
@@ -22135,6 +22345,11 @@ fn handle(
             if ctx.is_top_level && !fbw_raise_enabled() {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                if let ConcreteValue::Ref(p) = concrete_exc {
+                    if !p.is_null() {
+                        fbw_finish_raise_set(concrete_exc);
+                    }
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -22266,6 +22481,11 @@ fn handle(
             if ctx.is_top_level && !fbw_raise_enabled() {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                if let ConcreteValue::Ref(p) = ctx.last_exc_value_concrete {
+                    if !p.is_null() {
+                        fbw_finish_raise_set(ctx.last_exc_value_concrete);
+                    }
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -28460,7 +28680,7 @@ mod tests {
         );
         drop(wc);
         assert!(
-            matches!(result, Ok(Some(Ok(_)))),
+            matches!(result, Ok(ResidualExecOutcome::Executed(Ok(_)))),
             "non-forcing may-force call with active vable must execute normally",
         );
         assert_eq!(

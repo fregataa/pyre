@@ -2037,26 +2037,35 @@ fn run_perfn_walk(
         }
 
         // #32 S2: a kept-stack branch guard whose not-taken arm cannot be
-        // restored for the COMPILED trace aborts (`AbortPermanent`), but the
-        // authoritative walk's symbolic shadow IS complete at the abort pc (the
-        // hazard is about the JIT resume snapshot, not the interpreter-side
-        // shadow).  Flush that end state to the live frame so the interpreter
-        // resumes at the abort pc with the walked iterations already counted,
-        // instead of discarding the walk and dropping an in-flight FOR_ITER
-        // item via the conservative #30 header-guard drop.  Same
+        // restored for the COMPILED trace aborts (`AbortPermanent` for the
+        // unrestorable-Ref shape, decline + `Abort` for the depth>1
+        // invalid-mirror shape), but the authoritative walk's symbolic shadow
+        // IS complete at the abort pc (the hazard is about the JIT resume
+        // snapshot, not the interpreter-side shadow).  Flush that end state to
+        // the live frame so the interpreter resumes at the abort pc with the
+        // walked iterations already counted, instead of discarding the walk
+        // and dropping an in-flight FOR_ITER item via the conservative #30
+        // header-guard drop (or, for the `Unsupported` shape, re-executing the
+        // walk's residual effects from loop entry).  Same
         // no-unjournaled-effect / no-sub-walk predicate and same all-or-nothing
         // `flush_walk_end_state_to_frame` gate as the CloseLoop / marker legs;
         // when the flush declines (a slot the shadow cannot resolve) the legacy
         // drop stands (the residual S3 case).  `PYRE_FBW_BRANCH_FLUSH=0` opts
         // out.
         if std::env::var_os("PYRE_FBW_BRANCH_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
-            if let Err(
-                crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
+            let kept_stack_abort_pc = match &walk_result {
+                Err(
+                    crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
+                        pc,
+                    },
+                ) => Some((*pc, false)),
+                Err(crate::jitcode_dispatch::DispatchError::BranchGuardKeptStackUnsupported {
                     pc,
-                },
-            ) = &walk_result
-            {
-                let abort_jit_pc = *pc;
+                }) => Some((*pc, true)),
+                _ => None,
+            };
+            if let Some((pc, is_unsupported)) = kept_stack_abort_pc {
+                let abort_jit_pc = pc;
                 if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
                     || session.borrow().abort_in_subwalk
                 {
@@ -2090,7 +2099,24 @@ fn run_perfn_walk(
                     // and re-run the loop) keeps the legacy drop byte-identically
                     // (the residual S3 case).  So every other abort shape is
                     // untouched, including the entire flag-OFF path.
-                    let committed = push.is_some()
+                    // Shape A' (#493, `Unsupported` variant only) — the abort
+                    // resumes AT a FOR_ITER header whose in-flight entry is
+                    // body-COMPLETED: the abort fired during the NEXT consume
+                    // attempt (a kept-stack guard on the FOR_ITER arms after
+                    // the `for_iter_next` residual), so the item's body already
+                    // ran and delivery would double it.  The walk end state at
+                    // the header is the complete post-body state — adopt it
+                    // WITHOUT delivery; the interpreter re-attempts the consume
+                    // against the advanced iterator.  Replaces the legacy
+                    // replay-from-entry, which re-executes every residual the
+                    // walk already ran.
+                    let flush_completed_header = push.is_none()
+                        && is_unsupported
+                        && crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
+                            cf_addr,
+                            resume_py_pc,
+                        );
+                    let committed = (push.is_some() || flush_completed_header)
                         && crate::state::flush_walk_end_state_to_frame_with_item(
                             ctx,
                             cf_addr,
@@ -2138,11 +2164,12 @@ fn run_perfn_walk(
     // rather than rewinding the live frame to the guard pc and re-running the
     // region through the `ContinueRunningNormally` re-entry — which would
     // execute every residual a second time and double-apply any
-    // callee-internal side effect (#177).  The tracer only arms it for a
-    // single-frame resume on the general guard path (never the
-    // CALL_ASSEMBLER callback, which cannot consume a concrete result), so a
-    // committed journal never strands into a blackhole re-run; the three
-    // decisions (this predicate, the journal commit below, and the caller's
+    // callee-internal side effect (#177).  The tracer arms it for any
+    // single-frame resume: the general guard path consumes the kept stash as
+    // a terminal `BridgeResolution`, and the CALL_ASSEMBLER callback hands it
+    // to its back-to-back blackhole hook, so a committed journal never
+    // strands into a guard-state re-run; the three decisions (this
+    // predicate, the journal commit below, and the caller's
     // consume-vs-rewind) stay in agreement.  A multiframe resume is never
     // armed, so it stays on the legacy rewind-and-replay path.
     let terminate_no_replay = crate::jitcode_dispatch::fbw_no_replay_exit_enabled()
@@ -2189,10 +2216,28 @@ fn run_perfn_walk(
             outcome_kind,
         );
     }
-    if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay {
+    let committed = WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay;
+    let journal = crate::jitcode_dispatch::fbw_store_journal_len();
+    if committed {
         crate::jitcode_dispatch::fbw_store_journal_commit();
     } else {
         crate::jitcode_dispatch::fbw_store_journal_rollback();
+    }
+    if authoritative && std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+        let mut end = match &walk_result {
+            Ok((outcome, _)) => format!("{outcome:?}"),
+            Err(error) => format!("{error:?}"),
+        };
+        if let Some(at) = end.find(|c: char| matches!(c, '(' | '{' | ' ')) {
+            end.truncate(at);
+        }
+        let (unj_val, unj_sym) = crate::jitcode_dispatch::fbw_unjournaled_kinds();
+        let (exec_v, exec_mf, exec_pl) = crate::jitcode_dispatch::fbw_executed_residual_counts();
+        eprintln!(
+            "[fbw-census] end={end} committed={committed} bridge={} unj_val={unj_val} \
+             unj_sym={unj_sym} exec_v={exec_v} exec_mf={exec_mf} exec_pl={exec_pl} journal={journal}",
+            ctx.is_bridge_trace,
+        );
     }
 
     Some((entry, code_len, walk_result))
