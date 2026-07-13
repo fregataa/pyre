@@ -362,7 +362,14 @@ pub(crate) fn subs_parameters(
             items = crate::call::call_function_impl_result(prepare, &[self_, items])?;
         }
     }
-    let nitems = unsafe { w_tuple_len(items) };
+    // Non-tuple `items` (a broken `__typing_prepare_subst__`) counts as one arg
+    // per CPython `_Py_subs_parameters`; a bare `w_tuple_len` would crash on it.
+    let is_tuple_items = unsafe { is_tuple(items) };
+    let nitems = if is_tuple_items {
+        unsafe { w_tuple_len(items) }
+    } else {
+        1
+    };
     if nparams != nitems {
         let direction = if nitems > nparams { "many" } else { "few" };
         let s = unsafe { crate::display::py_repr(self_)? };
@@ -370,6 +377,13 @@ pub(crate) fn subs_parameters(
             "Too {direction} arguments for {s}; actual {nitems}, expected {nparams}"
         )));
     }
+    // `argitems` is the tuple view CPython indexes: `item` itself when it is a
+    // tuple, otherwise a 1-tuple wrapping the single non-tuple `item`.
+    let argitems = if is_tuple_items {
+        items
+    } else {
+        w_tuple_new(vec![items])
+    };
     let mut newargs: Vec<PyObjectRef> = Vec::new();
     let nargs = unsafe { w_tuple_len(args) };
     for i in 0..nargs {
@@ -394,16 +408,26 @@ pub(crate) fn subs_parameters(
         let arg = if !unsafe { pyre_object::is_none(meth) } {
             let iparam = tuple_index(params, old_arg)?
                 .ok_or_else(|| crate::PyError::value_error("tuple.index(x): x not in tuple"))?;
-            let item = unsafe { w_tuple_getitem(items, iparam as i64) }.unwrap_or_else(w_none);
+            let item = unsafe { w_tuple_getitem(argitems, iparam as i64) }.unwrap_or_else(w_none);
             crate::call::call_function_impl_result(meth, &[item])?
         } else {
-            subs_tvars(old_arg, params, items)?
+            subs_tvars(old_arg, params, argitems)?
         };
         if unpack {
-            // `newargs.extend(arg)` — splice an unpacked `TypeVarTuple`'s
-            // substituted members.
-            for x in crate::builtins::collect_iterable(arg)? {
-                newargs.push(x);
+            // GH-138497: an unpacked `__typing_subst__` must return a tuple.
+            // (authority = CPython 3.14)
+            if !unsafe { is_tuple(arg) } {
+                return Err(crate::PyError::type_error(format!(
+                    "expected __typing_subst__ of {} objects to return a tuple, not {}",
+                    crate::type_methods::arg_type_name(old_arg),
+                    crate::type_methods::arg_type_name(arg),
+                )));
+            }
+            let n = unsafe { w_tuple_len(arg) };
+            for j in 0..n {
+                if let Some(x) = unsafe { w_tuple_getitem(arg, j as i64) } {
+                    newargs.push(x);
+                }
             }
         } else {
             newargs.push(arg);
