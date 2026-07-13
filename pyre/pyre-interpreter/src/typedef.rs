@@ -9500,6 +9500,36 @@ fn init_bool_type(ns: &mut DictStorage) {
 /// `object.__new__(cls)` — allocate a bare instance of cls.
 ///
 /// PyPy: objectobject.py descr__new__
+/// objectobject.py:17-21 _abstract_method_error (CPython 3.12+ message form).
+fn abstract_instantiation_error(cls: PyObjectRef) -> crate::PyError {
+    let type_name = unsafe { pyre_object::w_type_get_name(cls) };
+    let mut methods: Vec<String> = Vec::new();
+    if let Ok(w_abstracts) = crate::baseobjspace::getattr_str(cls, "__abstractmethods__") {
+        // The setter marks any truthy value abstract without enforcing a set,
+        // so guard the unchecked casts: only iterate a genuine set of strings.
+        if unsafe { pyre_object::is_set_or_frozenset(w_abstracts) } {
+            for item in unsafe { pyre_object::w_set_items(w_abstracts) } {
+                if unsafe { pyre_object::is_str(item) } {
+                    if let Ok(s) = unsafe { pyre_object::w_str_get_wtf8(item) }.as_str() {
+                        methods.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    methods.sort();
+    let plural = if methods.len() == 1 { "" } else { "s" };
+    let joined = methods
+        .iter()
+        .map(|m| format!("'{m}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::PyError::type_error(format!(
+        "Can't instantiate abstract class {type_name} without an implementation \
+         for abstract method{plural} {joined}"
+    ))
+}
+
 fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(
         !args.is_empty(),
@@ -9508,6 +9538,10 @@ fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let cls = crate::baseobjspace::unwrap_cell(args[0]);
     // cls should be a W_TypeObject — create instance of it
     if unsafe { is_type(cls) } {
+        // objectobject.py:131 descr__new__ — abstract classes refuse instantiation.
+        if unsafe { pyre_object::w_type_is_abstract(cls) } {
+            return Err(abstract_instantiation_error(cls));
+        }
         return Ok(w_instance_new(cls));
     }
     // Fallback: create bare instance with no type

@@ -7284,8 +7284,20 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             }
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
+                // typeobject.py:1258-1261 descr_set___abstractmethods__ —
+                // evaluate truthiness BEFORE mutating the dict so a raising
+                // `__bool__` leaves the type unchanged (CPython
+                // type_set_abstractmethods).
+                let abstract_flag = if name == "__abstractmethods__" {
+                    Some(is_true(value)?)
+                } else {
+                    None
+                };
                 crate::dict_storage_store(&mut *dict_ptr, name, value);
                 pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+                if let Some(a) = abstract_flag {
+                    pyre_object::w_type_set_abstract(obj, a);
+                }
                 // typeobject.py:430 — `self.mutated(name)` after the
                 // dict_w write so cached `compares_by_identity_status`
                 // (and future per-type caches) reset on this type and
@@ -7837,6 +7849,10 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 if crate::dict_storage_delete(&mut *dict_ptr, name) {
+                    // typeobject.py:1263-1267 descr_del___abstractmethods__.
+                    if name == "__abstractmethods__" {
+                        pyre_object::w_type_set_abstract(obj, false);
+                    }
                     // typeobject.py:445 — `self.mutated(key)` mirrors the
                     // setattr branch's invalidation across the subclass
                     // tree.

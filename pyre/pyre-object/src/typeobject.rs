@@ -201,6 +201,9 @@ pub struct W_TypeObject {
     /// once after construction via `w_type_set_disallow_instantiation`;
     /// never inherited by heap subclasses (the default is `false`).
     pub flag_disallow_instantiation: std::sync::atomic::AtomicBool,
+    /// typeobject.py:166/216 `flag_abstract?` — set from the
+    /// `__abstractmethods__` setattr hook; gates `object.__new__`.
+    pub flag_abstract: std::sync::atomic::AtomicBool,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
@@ -305,6 +308,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // Heap subclasses are always instantiable (their `tp_new` is the
         // slot wrapper); only builtin disallow-types flip this.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
+        flag_abstract: std::sync::atomic::AtomicBool::new(false),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
     let (w_type, gc_managed) = if !raw.is_null() {
@@ -412,6 +416,7 @@ pub fn w_type_new_builtin(
         // generator / coroutine / frame typedefs flip it via
         // `w_type_set_disallow_instantiation`.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
+        flag_abstract: std::sync::atomic::AtomicBool::new(false),
     }) as PyObjectRef;
     // A builtin type is Box-immortal, so its namespace values, `bases`, and
     // the lazily-cached `type.__dict__` `mirror_target` are reachable only
@@ -515,6 +520,31 @@ pub unsafe fn w_type_set_disallow_instantiation(w_type: PyObjectRef) {
     let t = &*(w_type as *const W_TypeObject);
     t.flag_disallow_instantiation
         .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// `W_TypeObject.is_abstract` (typeobject.py:597-598).
+///
+/// # Safety
+/// `w_type` must point at a `W_TypeObject`.
+pub unsafe fn w_type_is_abstract(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_abstract.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `W_TypeObject.set_abstract` (typeobject.py:600-601).
+///
+/// # Safety
+/// `w_type` must point at a `W_TypeObject`.
+pub unsafe fn w_type_set_abstract(w_type: PyObjectRef, abstract_: bool) {
+    if w_type.is_null() || !is_type(w_type) {
+        return;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_abstract
+        .store(abstract_, std::sync::atomic::Ordering::Release);
 }
 
 // ── Layout accessors ─────────────────────────────────────────────────
