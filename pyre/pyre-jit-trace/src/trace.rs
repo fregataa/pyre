@@ -1726,6 +1726,33 @@ fn run_perfn_walk(
                         }
                         let color = color as u8;
                         if reserved_red_colors.contains(&color) {
+                            // `bridge_registers_r` is the authoritative guard-time
+                            // register coloring.  Free register allocation reuses
+                            // the portal EC color for a live operand at PCs where
+                            // the trace has no live EC read (the same collision the
+                            // guard-failure resume handles at
+                            // jitcode_dispatch.rs:6994 via `semantic_idx.is_none()`
+                            // — otherwise `fib(n-1) + fib(n-2)` resumes the left
+                            // operand as the EC and SIGSEGVs).  When the bridge
+                            // names a genuine operand here (an opref other than the
+                            // pre-seeded `ec_box`/`frame_box`), skipping strands the
+                            // stale `ConstPtr(ec)` in the color the resumed body
+                            // reads as its operand.  Seed the real operand.
+                            //
+                            // The FRAME color (`reserved_red_colors[0]`) keeps its
+                            // skip unconditionally: its `frame_box` is the standard
+                            // virtualizable identity and overwriting it forces every
+                            // later `vable_*` op onto the nonstandard leg (#124
+                            // `NonStandardVableFinishPortalUnsupported`).  The EC
+                            // color carries no such identity — the EC stays
+                            // recoverable from the frame — so reseeding it is safe.
+                            let is_frame_color =
+                                reserved_red_colors.first().copied() == Some(color);
+                            let bridge_names_operand =
+                                !is_frame_color && opref != ec_box && opref != frame_box;
+                            if pyre_object::tagged_int::CAN_BE_TAGGED && bridge_names_operand {
+                                seed(color, opref);
+                            }
                             continue;
                         }
                         seed(color, opref);
@@ -2417,6 +2444,13 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         visited: &mut std::collections::HashSet<*const ()>,
         queue: &mut std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)>,
     ) -> bool {
+        // A tagged immediate int is never a FUNCTION_TYPE callee; skip it
+        // before the `ob_type` deref below (which reads an even-aligned heap
+        // pointer). Reaches here via the globals-dict scan and via a cell
+        // whose contents are a tagged int.
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(cand) {
+            return false;
+        }
         // Only plain user functions inline (mirrors the inline path's exact
         // FUNCTION_TYPE gate); builtins carry no CodeObject.
         if cand.is_null() || (*cand).ob_type as *const () as usize != function_type_addr {
@@ -2491,6 +2525,13 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         let bound = cf.stack_base().min(slots.len());
         for &slot in &slots[..bound] {
             if slot.is_null() {
+                continue;
+            }
+            // A tagged immediate int is neither a cell nor a FUNCTION_TYPE
+            // callee; skip it before `is_cell(slot)` derefs its `ob_type`.
+            if pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(slot)
+            {
                 continue;
             }
             // A closure cell holds the function indirectly; unwrap it.
