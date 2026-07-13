@@ -14,6 +14,7 @@
 ///   get_scale              — regalloc.py:1239
 use indexmap::IndexMap;
 use majit_ir::IndexMapExt;
+use rustc_hash::FxBuildHasher;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
@@ -261,7 +262,7 @@ pub struct LifetimeManager {
     // ~all its backend time in `IndexMap::get_index_of` here). regalloc.py:1054
     // keys longevity by a dict (O(1)); `IndexMap` restores that O(1) lookup
     // while keeping the insertion-ordered iteration `IndexMap` provided.
-    lifetimes: indexmap::IndexMap<OpRef, Lifetime>,
+    lifetimes: indexmap::IndexMap<OpRef, Lifetime, FxBuildHasher>,
     /// regalloc.py:1064 maps register → FixedRegisterPositions
     pub fixed_register_use: IndexMap<RegLoc, FixedRegisterPositions>,
 }
@@ -269,7 +270,7 @@ pub struct LifetimeManager {
 impl LifetimeManager {
     pub fn new() -> Self {
         LifetimeManager {
-            lifetimes: indexmap::IndexMap::new(),
+            lifetimes: indexmap::IndexMap::default(),
             fixed_register_use: IndexMap::new(),
         }
     }
@@ -2339,15 +2340,24 @@ impl<'a> RegAlloc<'a> {
                 gcmap_set_bit(gcmap, val);
             }
         }
-        for (v, lifetime) in self.longevity.lifetimes_iter() {
-            if self.opref_type(*v) != Some(Type::Ref)
-                || !self.rm.is_still_alive(*v, &self.longevity)
-            {
+        // regalloc.py:36 BindingsIterItems; regalloc.py:178 bindings_iteritems.
+        let mut index = 0;
+        while index < self.fm.current_frame_depth {
+            let Some(v) = self.fm.boxes_in_frame[index] else {
+                index += 1;
                 continue;
-            }
-            if let Some(loc) = lifetime.current_frame_loc {
+            };
+            let loc = self
+                .longevity
+                .get(v)
+                .and_then(|lifetime| lifetime.current_frame_loc)
+                .expect("gcmap frame binding without current_frame_loc");
+            debug_assert_eq!(FrameManager::get_loc_index(&loc), index);
+            let size = FrameManager::frame_size(self.tp(v));
+            if self.opref_type(v) == Some(Type::Ref) && self.rm.is_still_alive(v, &self.longevity) {
                 gcmap_set_bit(gcmap, loc.position + JITFRAME_FIXED_SIZE);
             }
+            index += size;
         }
         gcmap
     }
