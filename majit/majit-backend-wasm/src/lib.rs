@@ -2383,6 +2383,10 @@ impl majit_backend::Backend for WasmBackend {
         GcRef(data.exc_value as usize)
     }
 
+    fn clear_stored_exception(&self) {
+        crate::jit_exc_clear();
+    }
+
     fn invalidate_loop(&self, _token: &JitCellToken) {
         // No native code to invalidate — wasm modules are immutable.
     }

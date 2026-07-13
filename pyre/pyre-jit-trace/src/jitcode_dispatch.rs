@@ -2565,6 +2565,17 @@ pub fn dispatch_via_miframe(
     // so `fbw_mode.snapshot_sym` is non-null on every default-JIT
     // run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
     // (the transitional trait leg), which leaves the pointer null.
+    // Recover the portal EC red off `sym.frame` before the first opcode is
+    // dispatched (thus before any guard is recorded), caching it into
+    // `sym.execution_context`.  A bridge-from-guard sym whose ec color collides
+    // with a real frame slot is left `OpRef::NONE` by `setup_bridge_sym`, which
+    // defers recovery to `ensure_execution_context`.  The walker's
+    // snapshot-capture path runs `collect_outer_active_boxes` AFTER the guard,
+    // so recovering there would record the getfield after the guard that
+    // references it (use-before-def).  Seed here — the trait's pre-guard
+    // cache-once analog — so every guard snapshot reads a real EC OpRef.
+    seed_execution_context_for_walk(sym, trace_ctx);
+
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
     // mirrors this as `Option<OpRef>` — `None` means "no active
@@ -6906,7 +6917,7 @@ fn opref_is_null_const_ptr(op: OpRef) -> bool {
 
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
-    trace_ctx: &TraceCtx,
+    trace_ctx: &mut TraceCtx,
     regs_i: &[OpRef],
     regs_r: &[OpRef],
     regs_f: &[OpRef],
@@ -7137,7 +7148,40 @@ fn collect_outer_active_boxes(
         let value = if is_portal_red_scratch {
             if color as u16 == portal_frame_reg {
                 sym.frame
+            } else if !sym.execution_context.is_none() {
+                // EC red already seeded on this snapshot path.
+                sym.execution_context
+            } else if !sym.frame.is_none() {
+                // Adapter / inline-caller snapshot path leaves
+                // `sym.execution_context` unseeded (`OpRef::NONE`).  This is the
+                // pre-guard inline-parent-frame collection (the paused caller's
+                // active boxes are built BEFORE the callee sub-walk records its
+                // guards), so recording the recovery getfield here is
+                // well-ordered.  Recover the EC from the frame the same way the
+                // trait encoder's `ensure_execution_context` does
+                // (trace_opcode.rs:1248): record `getfield
+                // frame.execution_context` and route that OpRef through as the
+                // portal EC red, so the resume snapshot never pushes NONE for
+                // `interp_jit.py:67 reds = ['frame', 'ec']`.  A NONE EC escapes
+                // as a null execution-context pointer and SIGSEGVs (rc=139) or
+                // trips the Ref-bank NONE guard (rc=101).
+                //
+                // The post-guard snapshot-capture path
+                // (`walker_capture_snapshot_for_last_guard`) reaches this fn with
+                // the outer full-body `sym`, whose EC is eagerly recovered at
+                // walk entry (`seed_execution_context_for_walk`) — so on that
+                // path `sym.execution_context` is already real above and this
+                // branch (which would record AFTER the guard, a use-before-def)
+                // is not taken.
+                trace_ctx.record_op_with_descr(
+                    OpCode::GetfieldGcR,
+                    &[sym.frame],
+                    crate::descr::pyframe_execution_context_descr(),
+                )
             } else {
+                // Neither EC nor frame is recoverable: keep the raw NONE so the
+                // downstream Ref-bank NONE guard surfaces the unrecoverable case
+                // instead of silently masking it.
                 sym.execution_context
             }
         } else if owns_vable {
@@ -7889,6 +7933,27 @@ thread_local! {
     static FBW_CELL_STORE_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for the walked region's eagerly executed
+    /// `set_current_exception` stores against the LIVE per-thread
+    /// `ExecutionContext.sys_exc_value`.  The authoritative walk lowers
+    /// PUSH_EXC_INFO / POP_EXCEPT to `set_current_exception` residuals and
+    /// applies their concrete effect at walk time
+    /// ([`try_walker_lower_exc_info_residual`]) so a following
+    /// `get_current_exception` reads the right value.  Same rationale as
+    /// [`FBW_STORE_JOURNAL`]: on a non-commit exit the legacy replay re-runs
+    /// the walked region and must find the pre-walk `sys_exc_value`.  Without
+    /// this journal an exception that propagates OUT of an except-handler
+    /// (the handler body itself raises) aborts the walk BEFORE its paired
+    /// POP_EXCEPT restore runs, leaving the live EC holding the caught
+    /// exception; the next frame reads it as the active exception and chains
+    /// it as a spurious `__context__`.  Each entry is the displaced prior
+    /// value (`get_current_exception()` read just before the eager store);
+    /// the rollback re-applies them in reverse push order so the final write
+    /// restores the walk-entry value.  Entries are GC roots via
+    /// [`fbw_store_journal_root_walker`].
+    static FBW_SYS_EXC_JOURNAL: std::cell::RefCell<Vec<pyre_object::PyObjectRef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
     /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
     /// body_pc)` stashed when the FOR_ITER `for_iter_next` residual
     /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
@@ -8070,6 +8135,7 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
     FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(false));
     FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.set(0));
@@ -8140,12 +8206,24 @@ pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intval
     fbw_bump_executed_effect();
 }
 
+/// Record the `sys_exc_value` a walked eager `set_current_exception`
+/// displaces, for the in-place restore when the walk does not commit its
+/// end state.  Pushed by [`try_walker_lower_exc_info_residual`] before it
+/// applies the concrete store.
+fn fbw_sys_exc_journal_push(displaced: pyre_object::PyObjectRef) {
+    FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().push(displaced));
+}
+
 /// Commit-path epilogue: the walk's eager stores and appends stand; drop
 /// the undo logs.
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    // A committed walk keeps its eager `sys_exc_value` store (the compiled
+    // trace or the adopted end state carries the same exception state), so
+    // drop the undo log without re-applying it.
+    FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
     // #57 Option C: a committed walk's end-flush adopts the advanced
     // iterator + the body that consumed it (counted once), so the in-flight
     // items must NOT also be delivered — drop the stash (and with it the
@@ -8499,6 +8577,19 @@ pub(crate) fn fbw_store_journal_rollback() {
             }
         }
     });
+    // Restore `sys_exc_value` to its pre-walk value.  Replaying in reverse
+    // push order makes the LAST write the value read at walk entry (the
+    // first eager store's displaced prior), so an aborted walk leaves the
+    // live per-thread EC exactly as the legacy replay-from-start expects —
+    // in particular an exception that propagated OUT of an except-handler
+    // (walk aborted before its POP_EXCEPT restore) no longer leaks the
+    // caught exception into the next frame's `__context__`.
+    FBW_SYS_EXC_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some(displaced) = entries.pop() {
+            pyre_interpreter::eval::set_current_exception(displaced);
+        }
+    });
 }
 
 /// Current journal length (commit-point diagnostics).
@@ -8754,6 +8845,17 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     for (cell, _intvalue) in cell_stores.iter_mut() {
         visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
     }
+    // The displaced `sys_exc_value` entries are exception objects that may be
+    // nursery-resident and no longer referenced elsewhere once the eager store
+    // overwrote the EC slot; forward each so a minor collection during the rest
+    // of the walk cannot free/move the value the rollback restores.
+    FBW_SYS_EXC_JOURNAL.with(|j| {
+        for displaced in j.borrow_mut().iter_mut() {
+            // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
+            // borrow keeps the Vec storage alive for the visit.
+            visitor(unsafe { &mut *(displaced as *mut pyre_object::PyObjectRef).cast() });
+        }
+    });
     // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
     // across the rest of the walk (subsequent residual calls allocate and a
     // minor collection moves nursery objects), so forward every entry's item
@@ -16016,6 +16118,43 @@ fn walker_ensure_execution_context(ctx: &mut WalkContext<'_, '_>) -> Option<OpRe
     Some(ec)
 }
 
+/// Eagerly recover the portal EC red before the full-body walk records its
+/// first guard, caching it into `sym.execution_context`.
+///
+/// The portal `[frame, ec]` reds (`interp_jit.py:67 reds = ['frame', 'ec']`)
+/// are force-alived in every `-live-` op's R-bank, so every guard's resume
+/// snapshot lists the EC color.  Loop / function-entry syms seed
+/// `sym.execution_context = InputArgRef(1)` at `create_sym`, but a
+/// bridge-from-guard sym whose ec color collides with a real frame slot is
+/// left `OpRef::NONE` by `setup_bridge_sym` (state.rs:8300-8326), which defers
+/// the recovery to `ensure_execution_context`.
+///
+/// The trait leg performs that recovery inside `get_list_of_active_boxes`,
+/// which runs BEFORE the guard is recorded, so its getfield is well-ordered.
+/// The walker's snapshot-capture path
+/// (`walker_capture_snapshot_for_last_guard` → `collect_outer_active_boxes`)
+/// runs AFTER the guard, so recording the recovery there would place the
+/// getfield after the guard that references it (a use-before-def; the resume
+/// position would also stamp onto the getfield rather than the guard, leaving
+/// the guard with `resume_pos = -1`).  Recover here instead — at walk entry,
+/// before any opcode is dispatched and thus before any guard — mirroring the
+/// trait's cache-once semantics.  When the EC is already seeded, or the frame
+/// itself is unset, this is a no-op.
+pub(crate) fn seed_execution_context_for_walk(
+    sym: &mut crate::state::PyreSym,
+    trace_ctx: &mut TraceCtx,
+) {
+    if !sym.execution_context.is_none() || sym.frame.is_none() {
+        return;
+    }
+    let ec = trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[sym.frame],
+        crate::descr::pyframe_execution_context_descr(),
+    );
+    sym.execution_context = ec;
+}
+
 /// #124: walker-native truth specialization for the `truth_fn` residual
 /// (oopspec [`majit_ir::PyreHelperKind::Truth`]).  When the sole Ref operand
 /// is a concrete boxed `W_IntObject` (excluding `W_BoolObject`, which shares
@@ -19498,7 +19637,13 @@ fn try_walker_lower_exc_info_residual(
     // The walk is authoritative: apply the concrete store the residual
     // executor would have performed, so the live EC tracks the symbolic
     // SETFIELD in lock-step (a following `get_current_exception` /
-    // POP_EXCEPT restore reads the right value).
+    // POP_EXCEPT restore reads the right value).  Journal the displaced
+    // prior value first: this store mutates the LIVE per-thread EC, so a
+    // non-commit walk exit must restore it (the store journal's discipline).
+    // Without the undo an exception propagating OUT of an except-handler
+    // aborts the walk before its POP_EXCEPT restore, leaking the caught
+    // exception into the next frame's `sys_exc_value`.
+    fbw_sys_exc_journal_push(pyre_interpreter::eval::get_current_exception());
     pyre_interpreter::eval::set_current_exception(store_concrete);
     Ok(Some(()))
 }
