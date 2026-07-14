@@ -787,6 +787,11 @@ pub fn skip_python_trivia_forward_public(
 }
 
 /// Translate a resume-frame pc word to a Python instruction coordinate.
+///
+/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; per
+/// the `decode_resume_pc` contract it passes through so the caller's `pc < 0`
+/// screen rejects it (the internal metadata lookups below are bounds-checked and
+/// never index with the word, so no wrap results).
 pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
     let fallback = majit_ir::resumedata::decode_resume_pc(pc_word).0;
     python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
@@ -5956,7 +5961,6 @@ fn reconstruct_inline_recipe(
         return Some(ReconstructRecipe {
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
-            pc: py_pc,
             jitcode_pc: frame.pc,
             nlocals,
             valuestackdepth,
@@ -6138,7 +6142,6 @@ fn reconstruct_inline_recipe(
     Some(ReconstructRecipe {
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
-        pc: py_pc,
         jitcode_pc: frame.pc,
         nlocals,
         valuestackdepth,
@@ -8982,13 +8985,13 @@ impl JitState for PyreJitState {
             );
         }
         if resume_data.frames.len() > 1 {
+            let root_jitcode_index = resume_data.frames[0].jitcode_index;
             let root_pc_valid = resume_data.frames[0].pc >= 0;
             let root_pc = if root_pc_valid {
                 resume_data.frames[0].pc as usize
             } else {
                 0
             };
-            let root_jitcode_pc = resume_data.frames[0].pc;
             let mut recipes: Vec<ReconstructRecipe> =
                 Vec::with_capacity(resume_data.frames.len() - 1);
             let mut ok = root_pc_valid;
@@ -9027,7 +9030,7 @@ impl JitState for PyreJitState {
             }
             ctx.set_bridge_inline_carrier(BridgeInlineCarrier {
                 root_pc,
-                root_jitcode_pc,
+                root_jitcode_index,
                 recipes,
             });
         }
@@ -12791,8 +12794,11 @@ pub(crate) fn assemble_bridge_inline_pending(
     for k in nlocals..valuestackdepth {
         concrete_frame.push(recipe_slot_to_pyobj(recipe.concrete_r[k]));
     }
-    // last_instr = recipe.pc - 1 so next_instr() resumes AT recipe.pc.
-    concrete_frame.set_last_instr_from_next_instr(recipe.pc);
+    // last_instr is one before the recipe's Python pc so next_instr() resumes there.
+    concrete_frame
+        .set_last_instr_from_next_instr(
+            backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize
+        );
 
     // Symbolic side: mirror the FAST branch field-for-field.
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
