@@ -1014,7 +1014,6 @@ impl TreeLoop {
                         .map(|f| crate::recorder::SnapshotFrame {
                             jitcode_index: f.jitcode_index,
                             pc: f.pc,
-                            jitcode_pc: f.jitcode_pc,
                             boxes: f.boxes.iter().map(&remap_tagged).collect(),
                         })
                         .collect(),
@@ -2230,7 +2229,6 @@ impl TraceCtx {
             active_boxes,
             jitcode_index,
             pc,
-            majit_ir::resumedata::NO_JITCODE_PC,
             &[],
             &[],
         );
@@ -2256,29 +2254,15 @@ impl TraceCtx {
         active_boxes: &[OpRef],
         jitcode_index: u32,
         pc: u32,
-        jitcode_pc: i32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
-        // A try-block after-residual-call guard folds the bit-14 marker onto
-        // its CALL pc so the resume decode routes through
-        // `after_residual_call_resume_pc_for` (the call's OWN post-call catch);
-        // `jitcode_dispatch.rs` `walker_capture_snapshot_for_last_guard_impl`
-        // produces such a pc.  Every other walker guard resumes at a plain
-        // outer-Python-opcode coordinate.  Either way the DECODED pc must leave
-        // bit 14 free, or `decode_resume_pc` mis-reads it (resumedata.rs:48-62).
-        assert!(
-            majit_ir::resumedata::decode_resume_pc(pc as i32).0
-                < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG,
-            "resume pc {pc} decodes >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-             function too large for bit-14 resume encoding"
-        );
+        // The pc word is a raw JitCode offset.
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
-                jitcode_pc,
                 boxes,
             }],
             vable_boxes: vable_boxes.to_vec(),
@@ -2297,7 +2281,6 @@ impl TraceCtx {
         active_boxes: &[OpRef],
         jitcode_index: u32,
         pc: u32,
-        jitcode_pc: i32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
@@ -2306,7 +2289,6 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
-                jitcode_pc,
                 boxes,
             }],
             vable_boxes: vable_boxes.to_vec(),
@@ -2326,19 +2308,13 @@ impl TraceCtx {
     /// (`opencoder.py:819-832`) iterates `framestack[-1] .. framestack[0]`,
     /// i.e. innermost-first, but the stored snapshot order is outermost-first.
     ///
-    /// Each frame tuple `(jitcode_index, py_pc, jitcode_pc, boxes)` is
-    /// encoded into `Snapshot.frames` verbatim in the order given;
-    /// `jitcode_pc` is the guard's JitCode byte offset for kept-stack
-    /// resume, or `NO_JITCODE_PC` for frames that resume via `py_pc`.
-    /// Callers are
+    /// Each frame tuple `(jitcode_index, pc, boxes)` is encoded into
+    /// `Snapshot.frames` verbatim in the order given. Callers are
     /// responsible for deduplicating box positions across frames
     /// (RPython's `_number_boxes` does this implicitly via the memo
     /// table; pyre's `Snapshot.encode` does the same in
     /// `resume.rs:1898 _number_boxes`).
-    pub fn capture_snapshot_for_last_guard_multi_frame(
-        &mut self,
-        frames: &[(u32, u32, i32, &[OpRef])],
-    ) {
+    pub fn capture_snapshot_for_last_guard_multi_frame(&mut self, frames: &[(u32, u32, &[OpRef])]) {
         self.capture_snapshot_for_last_guard_multi_frame_with_vable_vref(frames, &[], &[]);
     }
 
@@ -2352,27 +2328,18 @@ impl TraceCtx {
     /// it sees in the trace-time MIFrame stack.
     pub fn capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
         &mut self,
-        frames: &[(u32, u32, i32, &[OpRef])],
+        frames: &[(u32, u32, &[OpRef])],
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
-            .map(|(jitcode_index, py_pc, jitcode_pc, boxes)| {
-                // Walker-leg frames never carry the after-residual-call
-                // marker, so each raw pc must leave bit 14 free or
-                // `decode_resume_pc` mis-reads it as marked
-                // (resumedata.rs:48-62).
-                assert!(
-                    *py_pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32,
-                    "resume pc {py_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-                     function too large for bit-14 resume encoding"
-                );
+            .map(|(jitcode_index, pc, boxes)| {
+                // The pc word is a raw JitCode offset.
                 let encoded = self.encode_snapshot_boxes(boxes);
                 crate::recorder::SnapshotFrame {
                     jitcode_index: *jitcode_index,
-                    pc: *py_pc,
-                    jitcode_pc: *jitcode_pc,
+                    pc: *pc,
                     boxes: encoded,
                 }
             })
@@ -2826,7 +2793,6 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: self.last_traced_pc as u32,
-                jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                 boxes: Vec::new(),
             }],
             vable_boxes: Vec::new(),
