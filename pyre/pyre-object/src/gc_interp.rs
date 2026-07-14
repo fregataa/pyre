@@ -86,8 +86,13 @@ impl Drop for EvalActivationGuard {
 /// `sorted` key). The outer handler holds live `PyObjectRef`s on the
 /// Rust stack that the walker cannot reach — a collection would free
 /// still-reachable old-gen objects. Block the safepoint there.
-#[inline]
-fn at_outermost_activation() -> bool {
+///
+/// Reads the runtime-mutable `EVAL_NESTING` thread-local, not a build-time
+/// constant, so the JIT residualizes the call instead of tracing into it
+/// (`@dont_look_inside`, the [`enabled`] sibling). The `-> bool` return fits
+/// a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn at_outermost_activation() -> bool {
     EVAL_NESTING.with(|d| d.get() <= 2)
 }
 
@@ -155,7 +160,15 @@ pub fn note_alloc() {
 /// ([`at_outermost_activation`]) so a Python callback nested inside native
 /// module code — whose Rust-stack roots the pyframe walker cannot see — never
 /// triggers it.
-#[inline]
+///
+/// Reads the runtime-mutable `ALLOC_SINCE_GC` atomic and dispatches to the
+/// installed collection hook, neither a build-time constant, so the JIT
+/// residualizes the call instead of tracing into it (`@dont_look_inside`, the
+/// [`enabled`] sibling). A `()` return has no discriminant to erase and it
+/// cannot raise. On the cold interpreter dispatch loop its first act is
+/// already the non-inlined `enabled()` early-return; the residual adds no
+/// hot-path cost the un-residualized form did not already pay.
+#[majit_macros::dont_look_inside]
 pub fn safepoint() {
     if !enabled() {
         return;
@@ -172,8 +185,13 @@ pub fn safepoint() {
 
 /// Whether the safepoint actually collects. Off via `PYRE_GC_INTERP_COLLECT=0`
 /// to isolate the allocation routing from the collection while diagnosing.
-#[inline]
-fn collect_enabled() -> bool {
+///
+/// Reads (and lazily initialises) the runtime-mutable `COLLECT_STATE` atomic,
+/// not a build-time constant, so the JIT residualizes the call instead of
+/// tracing into it (`@dont_look_inside`, the [`enabled`] sibling). The
+/// `-> bool` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn collect_enabled() -> bool {
     match COLLECT_STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
