@@ -302,7 +302,13 @@ pub fn register_maybe_finalizer_hook(hook: MaybeRegisterFinalizerHookFn) {
     MAYBE_REGISTER_FINALIZER_HOOK.set(Some(hook));
 }
 
-pub fn maybe_register_finalizer(obj: PyObjectRef) {
+// `dont_look_inside`: the host finalizer-registration hook is a
+// process-global fn-pointer cell (`MAYBE_REGISTER_FINALIZER_HOOK`) whose
+// dispatch stays opaque to the JIT; calls residualize via the registered
+// fnaddr. The `try_gc_owns_object` twin.
+#[majit_macros::dont_look_inside]
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn maybe_register_finalizer(obj: PyObjectRef) {
     if let Some(hook) = MAYBE_REGISTER_FINALIZER_HOOK.get() {
         hook(obj);
     }
@@ -441,8 +447,12 @@ pub fn clear_gc_current_object_address_hook() {
 /// "no GC owns this pointer" and fall through to their non-GC
 /// dealloc path. This is the host-side mirror of
 /// `majit_gc::gc_owns_object`.
-#[inline]
-pub fn try_gc_owns_object(addr: *mut u8) -> bool {
+// `dont_look_inside`: host hook dispatch (a process-global
+// atomic fn-pointer cell) stays opaque to the JIT — traces never look inside a
+// GC ownership check (the backend GC rewrite owns that concern); calls
+// residualize via the registered fnaddr. The `try_gc_write_barrier` twin.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn try_gc_owns_object(addr: *mut u8) -> bool {
     match GC_OWNS_OBJECT_HOOK.get() {
         Some(f) => f(addr as usize),
         None => false,

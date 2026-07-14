@@ -190,7 +190,7 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     }
     let mro_ptr = w_type_get_mro(w_type);
     if !mro_ptr.is_null() {
-        return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
+        return (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls));
     }
     compute_default_mro(w_type)
         .iter()
@@ -1276,7 +1276,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             if let Some(v) = w_list_getitem(obj, i) {
                 items.push(v);
             }
-            i = i.saturating_add(step);
+            i += step;
         }
         return Ok(w_list_new(items));
     }
@@ -1305,7 +1305,7 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             if let Some(v) = w_tuple_getitem(obj, i) {
                 items.push(v);
             }
-            i = i.saturating_add(step);
+            i += step;
         }
         return Ok(w_tuple_new(items));
     }
@@ -1341,7 +1341,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             if i >= 0 && (i as usize) < cps.len() {
                 result.push(cps[i as usize]);
             }
-            i = i.saturating_add(step);
+            i += step;
         }
         return Ok(w_str_from_wtf8(result));
     }
@@ -1392,14 +1392,14 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 result.push(pyre_object::bytesobject::bytes_like_getitem(
                     obj, i as usize,
                 ));
-                i = i.saturating_add(step);
+                i += step;
             }
         } else {
             while i > stop {
                 result.push(pyre_object::bytesobject::bytes_like_getitem(
                     obj, i as usize,
                 ));
-                i = i.saturating_add(step);
+                i += step;
             }
         }
         return Ok(if is_bytes {
@@ -1593,14 +1593,14 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
 /// `range.count(value)` — `functional.py W_Range.descr_count`.
 fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
-    let needle = args.get(1).copied().unwrap_or(PY_NULL);
+    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
     Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
 }
 
 /// `range.index(value)` — `functional.py W_Range.descr_index`.
 fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
-    let needle = args.get(1).copied().unwrap_or(PY_NULL);
+    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
     unsafe {
         // int / bool / long needle → O(1) `(value - start) // step`.
         if is_int(needle) || is_long(needle) {
@@ -2143,7 +2143,7 @@ unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         let mut i = start;
         while (step > 0 && i < stop) || (step < 0 && i > stop) {
             items.push(w_int_new(r.current + i * r.step));
-            i = i.saturating_add(step);
+            i += step;
         }
         return Ok(w_list_new(items));
     }
@@ -2297,7 +2297,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         if i >= 0 && i < len {
             indices.push(i);
         }
-        i = i.saturating_add(step);
+        i += step;
     }
     let other_len = pyre_object::w_list_len(w_other);
     if other_len != indices.len() {
@@ -2540,7 +2540,7 @@ unsafe fn setitem_bytearray_slice(
         if i >= 0 && i < len {
             indices.push(i as usize);
         }
-        i = i.saturating_add(step);
+        i += step;
     }
     if sequence2.len() != indices.len() {
         return Err(PyError::new(
@@ -2803,7 +2803,7 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
         return false;
     }
 
-    let mro = unsafe { &*mro_ptr };
+    let mro = unsafe { (*mro_ptr).as_slice() };
     mro.iter().any(|&klass| is_w(klass, check_class))
 }
 
@@ -3303,8 +3303,10 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             let mro_ptr = w_type_get_mro(w_obj_type);
             if !mro_ptr.is_null() {
                 let mro = &*mro_ptr;
+                let mro_len = mro.len();
                 let mut past_super = false;
-                for &t in mro {
+                for i in 0..mro_len {
+                    let t = mro[i];
                     if std::ptr::eq(t, super_type) {
                         past_super = true;
                         continue;
@@ -3856,38 +3858,39 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    let result = object_getattr_miss(obj, name, call_getattr);
+    let err = match object_getattr_miss(obj, name, call_getattr) {
+        Ok(value) => return Ok(value),
+        Err(e) => e,
+    };
     // module.py:130-142 `Module.descr_getattribute` — PEP 562: after the
     // normal lookup misses with AttributeError, a module-level `__getattr__`
     // stored in the module's own dict gets the final say, called with just the
     // attribute name.  Only `space.getattr` consults it.
-    if let Err(ref e) = result {
-        if call_getattr && e.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
-            let w_dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
-            if !w_dict.is_null() {
-                if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
-                    if !mod_getattr.is_null() {
-                        let name_obj = w_str_new(name);
-                        return crate::call::call_function_impl_result(mod_getattr, &[name_obj]);
-                    }
+    if call_getattr && err.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
+        if !w_dict.is_null() {
+            if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
+                if !mod_getattr.is_null() {
+                    let name_obj = w_str_new(name);
+                    return crate::call::call_function_impl_result(mod_getattr, &[name_obj]);
                 }
-                // No module `__getattr__`: phrase the miss with the module's
-                // `__name__` (`module '<name>' has no attribute '<attr>'`, the
-                // `'%U'` form), which requires a str `__name__` and falls back
-                // to the bare form otherwise.  (The `__spec__`-based
-                // circular-import diagnostics are not ported.)
-                let msg = match finditem_str(w_dict, "__name__")? {
-                    Some(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
-                        let nm = unsafe { pyre_object::w_str_get_wtf8(w) };
-                        format!("module '{nm}' has no attribute '{name}'")
-                    }
-                    _ => format!("module has no attribute '{name}'"),
-                };
-                return Err(PyError::new(PyErrorKind::AttributeError, msg));
             }
+            // No module `__getattr__`: phrase the miss with the module's
+            // `__name__` (`module '<name>' has no attribute '<attr>'`, the
+            // `'%U'` form), which requires a str `__name__` and falls back
+            // to the bare form otherwise.  (The `__spec__`-based
+            // circular-import diagnostics are not ported.)
+            let msg = match finditem_str(w_dict, "__name__")? {
+                Some(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
+                    let nm = unsafe { pyre_object::w_str_get_wtf8(w) };
+                    format!("module '{nm}' has no attribute '{name}'")
+                }
+                _ => format!("module has no attribute '{name}'"),
+            };
+            return Err(PyError::new(PyErrorKind::AttributeError, msg));
         }
     }
-    result
+    Err(err)
 }
 
 // ─── `w_name`-taking attribute API ───
@@ -4498,7 +4501,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             if name == "__mro__" {
                 let mro_ptr = w_type_get_mro(obj);
                 if !mro_ptr.is_null() {
-                    return Ok(w_tuple_new((*mro_ptr).clone()));
+                    return Ok(w_tuple_new((*mro_ptr).to_vec()));
                 }
             }
             if name == "__flags__" {
@@ -5785,7 +5788,7 @@ pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
     let cached_mro = pyre_object::typeobject::w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached_mro.is_null() {
-        &*cached_mro
+        (*cached_mro).as_slice()
     } else {
         mro_owned = compute_mro(w_type);
         &mro_owned
@@ -5899,11 +5902,11 @@ pub(crate) unsafe fn lookup_where(
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
-    // Use cached MRO if available (PyPy: W_TypeObject.mro_w)
+    // Use cached MRO if available (W_TypeObject.mro_w)
     let cached = w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached.is_null() {
-        &*cached
+        (*cached).as_slice()
     } else {
         mro_owned = compute_mro(w_type);
         &mro_owned
@@ -6003,7 +6006,7 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
     let cached = w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached.is_null() {
-        &*cached
+        (*cached).as_slice()
     } else {
         mro_owned = compute_mro(w_type);
         &mro_owned
@@ -6559,7 +6562,7 @@ pub unsafe fn super_lookup_binding(
     };
     let mro_ptr = w_type_get_mro(w_obj_type);
     if !mro_ptr.is_null() {
-        let mro = &*mro_ptr;
+        let mro = (*mro_ptr).as_slice();
         let mut past_super = false;
         for &t in mro {
             if std::ptr::eq(t, super_type) {
@@ -6705,19 +6708,11 @@ pub unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
     if w_obj_type.is_null() {
         return false;
     }
-    if std::ptr::eq(w_obj_type, w_cls) {
-        return true;
-    }
-    // Walk MRO
-    let mro_ptr = w_type_get_mro(w_obj_type);
-    if !mro_ptr.is_null() {
-        for &t in &*mro_ptr {
-            if std::ptr::eq(t, w_cls) {
-                return true;
-            }
-        }
-    }
-    false
+    // `type(w_inst).issubtype(w_type)` (objspace.py:808 _type_isinstance).
+    // The MRO membership scan is the single home `w_type_issubtype`
+    // (self-identity is mro[0], so the `w_obj_type is w_cls` fast path is
+    // subsumed); the null-mro case walks find_best_base there.
+    w_type_issubtype(w_obj_type, w_cls)
 }
 
 /// pypy/interpreter/baseobjspace.py:419-420 DescrMismatch.
@@ -10482,7 +10477,8 @@ unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) 
 fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:274-276 `set_name(self, w_type, w_name)` — the bound
     // method receives `[property, owner, name]`.
-    if let Some(&w_name) = args.get(2) {
+    if args.len() > 2 {
+        let w_name = args[2];
         unsafe { pyre_object::descriptor::w_property_set_name(args[0], w_name) };
     }
     Ok(pyre_object::w_none())
@@ -10490,17 +10486,20 @@ fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
 
 fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:243-244 `setter` → `_copy(space, w_setter=w_setter)`
-    unsafe { property_copy(args[0], None, args.get(1).copied(), None) }
+    let w_setter = if args.len() > 1 { Some(args[1]) } else { None };
+    unsafe { property_copy(args[0], None, w_setter, None) }
 }
 
 fn property_getter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:240-241 `getter` → `_copy(space, w_getter=w_getter)`
-    unsafe { property_copy(args[0], args.get(1).copied(), None, None) }
+    let w_getter = if args.len() > 1 { Some(args[1]) } else { None };
+    unsafe { property_copy(args[0], w_getter, None, None) }
 }
 
 fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:246-247 `deleter` → `_copy(space, w_deleter=w_deleter)`
-    unsafe { property_copy(args[0], None, None, args.get(1).copied()) }
+    let w_deleter = if args.len() > 1 { Some(args[1]) } else { None };
+    unsafe { property_copy(args[0], None, None, w_deleter) }
 }
 
 /// `descriptor.py W_Property.get` as the type-dict `__get__` entry — args
@@ -10511,7 +10510,11 @@ fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let prop = args[0];
-        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let obj = if args.len() > 1 {
+            args[1]
+        } else {
+            pyre_object::PY_NULL
+        };
         // `if space.is_w(w_obj, space.w_None): return self`
         if obj.is_null() || is_none(obj) {
             return Ok(prop);
@@ -10529,7 +10532,11 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let prop = args[0];
         let obj = args[1];
-        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = if args.len() > 2 {
+            args[2]
+        } else {
+            pyre_object::PY_NULL
+        };
         let fset = w_property_get_fset(prop);
         if fset.is_null() || is_none(fset) {
             return Err(property_no_accessor(prop, obj, "setter"));
@@ -10692,20 +10699,33 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
 
 /// __next__ method wrapper
 fn generator_next_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
     generator_next(gen_obj)
 }
 
 /// Generic __next__ wrapper for iterators that delegate to `next()`.
 /// Used for itertools count/repeat etc.
 fn iter_next_method(args: &[PyObjectRef]) -> PyResult {
-    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
     next(obj)
 }
 
 /// `__iter__` for an iterator — returns the iterator itself.
 fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
-    Ok(args.first().copied().unwrap_or(pyre_object::PY_NULL))
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(obj)
 }
 
 /// `takewhile.__reduce__` — `interp_itertools.py W_TakeWhile.descr_reduce`:
@@ -10725,7 +10745,7 @@ fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// state just as `bool_w` does).
 fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_TakeWhile) };
-    it.stopped = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
+    it.stopped = int_w(if args.len() > 1 { args[1] } else { w_none() })? != 0;
     Ok(w_none())
 }
 
@@ -10743,7 +10763,7 @@ fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `takewhile_setstate_method` for the `int_w(...)? != 0` equivalence).
 fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_DropWhile) };
-    it.started = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
+    it.started = int_w(if args.len() > 1 { args[1] } else { w_none() })? != 0;
     Ok(w_none())
 }
 
@@ -10843,7 +10863,7 @@ fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
     // list reached through the tuple) survive each iteration.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_self = args[0];
-    let w_state = args.get(1).copied().unwrap_or(w_none());
+    let w_state = if args.len() > 1 { args[1] } else { w_none() };
     pyre_object::gc_roots::pin_root(w_self);
     pyre_object::gc_roots::pin_root(w_state);
     let state_w = unpackiterable(w_state, 2)?;
@@ -10895,7 +10915,7 @@ fn chain_setstate_method(args: &[PyObjectRef]) -> PyResult {
     // elements) survive each iteration.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_self = args[0];
-    let w_state = args.get(1).copied().unwrap_or(w_none());
+    let w_state = if args.len() > 1 { args[1] } else { w_none() };
     pyre_object::gc_roots::pin_root(w_self);
     pyre_object::gc_roots::pin_root(w_state);
     let state = unpackiterable(w_state, -1)?;
@@ -10923,16 +10943,32 @@ fn chain_setstate_method(args: &[PyObjectRef]) -> PyResult {
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)
 fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let value = args.get(1).copied().unwrap_or(w_none());
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = if args.len() > 1 { args[1] } else { w_none() };
     generator_send_ex(gen_obj, value, None)
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
 fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let w_type = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let w_val = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let w_type = if args.len() > 1 {
+        args[1]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let w_val = if args.len() > 2 {
+        args[2]
+    } else {
+        pyre_object::PY_NULL
+    };
     // w_tb (args[3]) ignored for now — traceback not yet supported
 
     let err = normalize_throw_args(w_type, w_val);
@@ -10941,7 +10977,11 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
 
 /// PyPy: GeneratorIterator.descr_close()
 fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
     unsafe {
         use pyre_object::generator::*;
         if w_generator_is_exhausted(gen_obj) {
@@ -11830,12 +11870,12 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 if step > 0 {
                     while i < stop {
                         indices.push(i);
-                        i = i.saturating_add(step);
+                        i += step;
                     }
                 } else {
                     while i > stop {
                         indices.push(i);
-                        i = i.saturating_add(step);
+                        i += step;
                     }
                 }
                 indices.sort_unstable_by(|a, b| b.cmp(a));
@@ -11881,12 +11921,12 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 if step > 0 {
                     while i < stop {
                         indices.push(i);
-                        i = i.saturating_add(step);
+                        i += step;
                     }
                 } else {
                     while i > stop {
                         indices.push(i);
-                        i = i.saturating_add(step);
+                        i += step;
                     }
                 }
                 indices.sort_unstable_by(|a, b| b.cmp(a));

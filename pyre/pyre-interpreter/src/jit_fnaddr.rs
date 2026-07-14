@@ -445,6 +445,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_type_set_uses_object_setattr",
         crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
     );
+    // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
+    // typeobject.py:1640), run under the JIT inside `_pure_issubtype`
+    // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
+    // residualises the call; bind the `-> bool` Rust `fn` directly by
+    // qualified path (2-pointer args, JIT-representable, no C-ABI bridge).
+    let w_type_issubtype: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> bool =
+        pyre_object::w_type_issubtype;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::typeobject::w_type_issubtype",
+        "pyre_object::w_type_issubtype",
+        w_type_issubtype as *const (),
+    );
     // `lookup_exc_class_for_kind` reads the TLS `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
     // bridge that reconstructs the `ExcKind` from the integer arg slot.
@@ -619,6 +632,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::baseobjspace::compute_default_mro",
         "pyre_interpreter::compute_default_mro",
         compute_default_mro as *const (),
+    );
+    // #346: `memoryview_gather_bytes` is the sole `.gather()` call surface —
+    // the buffer-protocol copy leaf whose geometry walk + `Vec<u8>` growth
+    // + `Range`-indexed sub-slices are opaque host plumbing. Residualized
+    // (`#[dont_look_inside]`), it is a `Vec`-returning residual like
+    // `compute_mro`; bind its `fn` directly by qualified path.
+    let memoryview_gather_bytes: unsafe fn(pyre_object::PyObjectRef) -> Vec<u8> =
+        crate::builtins::memoryview_gather_bytes;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::memoryview_gather_bytes",
+        "pyre_interpreter::memoryview_gather_bytes",
+        memoryview_gather_bytes as *const (),
     );
     // #346: `lookup_in_type_where_uncached` is the scalar-`Option` residual
     // boundary over the cold uncached MRO walk. With `compute_mro` opaque,
@@ -906,6 +932,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::gc_hook::try_gc_owns_object",
+        "pyre_object::try_gc_owns_object",
+        pyre_object::gc_hook::try_gc_owns_object as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::maybe_register_finalizer",
+        "pyre_object::maybe_register_finalizer",
+        pyre_object::gc_hook::maybe_register_finalizer as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::dict_eq_hook::has_hash_w_hook",
         "pyre_object::has_hash_w_hook",
         pyre_object::dict_eq_hook::has_hash_w_hook as *const (),
@@ -981,6 +1019,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_eq_hook::take_eq_error",
         "pyre_object::take_eq_error",
         pyre_object::dict_eq_hook::take_eq_error as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::eq_error_pending",
+        "pyre_object::eq_error_pending",
+        pyre_object::dict_eq_hook::eq_error_pending as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -1894,6 +1938,8 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "interp_itertools::PAIRWISE_TYPE",
             interp_itertools::PAIRWISE_TYPE
         ),
+        pytype_addr!("interp_itertools::CYCLE_TYPE", interp_itertools::CYCLE_TYPE),
+        pytype_addr!("interp_itertools::CHAIN_TYPE", interp_itertools::CHAIN_TYPE),
         pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
             "functional::LONG_RANGE_ITER_TYPE",
@@ -1937,6 +1983,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         (
             "pytraceback::PYTRACEBACK_TYPE",
             &crate::pytraceback::PYTRACEBACK_TYPE as *const _ as i64,
+        ),
+        (
+            "interp_buffer::PICKLEBUFFER_TYPE",
+            &crate::module::__pypy__::interp_buffer::PICKLEBUFFER_TYPE as *const _ as i64,
         ),
     ]
 }
@@ -2068,6 +2118,21 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
         // overflow clamp. Charon leaves the associated const as a global
         // accessor path, so bake the native signed max value.
         ("core::num::<Impl>::MAX", i64::MAX),
+        // `compares_by_identity_status` tri-state markers, read as opaque
+        // global accessor paths in `mutated` / the `__eq__`/`__hash__`
+        // fast paths. Bake the build-time `u8` values.
+        (
+            "typeobject::COMPARES_BY_IDENTITY_UNKNOWN",
+            pyre_object::typeobject::COMPARES_BY_IDENTITY_UNKNOWN as i64,
+        ),
+        (
+            "typeobject::COMPARES_BY_IDENTITY_YES",
+            pyre_object::typeobject::COMPARES_BY_IDENTITY_YES as i64,
+        ),
+        (
+            "typeobject::COMPARES_BY_IDENTITY_NO",
+            pyre_object::typeobject::COMPARES_BY_IDENTITY_NO as i64,
+        ),
     ]
 }
 
