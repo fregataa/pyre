@@ -1009,6 +1009,36 @@ impl GcRewriterImpl {
             .as_size_descr()
             .expect("NEW descr must be SizeDescr");
 
+        if descr.headerless() {
+            let size = round_up(descr.size());
+            let result_pos = op.pos.get();
+            let obj_ref = if self.can_use_nursery(size) {
+                // Headerless nursery allocations intentionally skip
+                // clear_gc_fields: there is no GC header/tid store, and the fast
+                // path exists for structs whose ref fields are fully initialized by
+                // immediate SETFIELD_GC ops before any can-collect operation.  A
+                // collector must never observe an uninitialized headerless ref
+                // field; keep new headerless users to that invariant instead of
+                // adding per-field zeroing here.
+                st.emitting_an_operation_that_can_collect();
+                let size_ref = st.const_int(size as i64);
+                let malloc_op = mk_op(OpCode::CallMallocNurseryHeaderless, &[size_ref]);
+                let obj_ref = st.emit_result(malloc_op, result_pos);
+                st.last_malloced_ref = obj_ref.clone();
+                st.remember_wb(&obj_ref);
+                obj_ref
+            } else {
+                // rewrite.py:884-886 parity: if nursery malloc is disallowed,
+                // decline to the same fixed-size non-nursery helper used by
+                // the headered branch below.  That helper takes the headered
+                // total size and stamps the type id itself.
+                let total_size = round_up(descr.size() + crate::header::GcHeader::SIZE);
+                self.gen_malloc_fixedsize(total_size, descr.type_id(), result_pos, st)
+            };
+            st.record_result_mapping(result_pos, obj_ref.clone());
+            return;
+        }
+
         // rewrite.py:474-484 handle_malloc_operation parity:
         // descr.size in RPython already includes the GC header (the
         // OBJECT type is built with `size = sizeof(header) + sizeof(fields)`).
@@ -3130,6 +3160,7 @@ mod tests {
         size: usize,
         type_id: u32,
         vtable: usize,
+        headerless: bool,
         gc_fields: Vec<Arc<dyn FieldDescr>>,
     }
 
@@ -3154,6 +3185,9 @@ mod tests {
         }
         fn vtable(&self) -> usize {
             self.vtable
+        }
+        fn headerless(&self) -> bool {
+            self.headerless
         }
         fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
             &self.gc_fields
@@ -3299,6 +3333,17 @@ mod tests {
             size,
             type_id,
             vtable: 0,
+            headerless: false,
+            gc_fields: Vec::new(),
+        })
+    }
+
+    fn headerless_size_descr(size: usize, type_id: u32) -> DescrRef {
+        Arc::new(TestSizeDescr {
+            size,
+            type_id,
+            vtable: 0,
+            headerless: true,
             gc_fields: Vec::new(),
         })
     }
@@ -3312,6 +3357,7 @@ mod tests {
             size,
             type_id,
             vtable: 0,
+            headerless: false,
             gc_fields,
         })
     }
@@ -3321,6 +3367,7 @@ mod tests {
             size,
             type_id,
             vtable,
+            headerless: false,
             gc_fields: Vec::new(),
         })
     }
@@ -3419,6 +3466,49 @@ mod tests {
                  for each constant it mints"
             );
         }
+    }
+
+    #[test]
+    fn test_headerless_new_declines_large_nursery_alloc() {
+        let rw = make_rewriter();
+        let payload_size = 8192;
+        let type_id = 77;
+        let ops = vec![Op::with_descr(
+            OpCode::New,
+            &[],
+            headerless_size_descr(payload_size, type_id),
+        )];
+
+        let (result, _constants, _gcrefs) =
+            rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::CallR);
+        assert_eq!(result[1].opcode, OpCode::CheckMemoryError);
+        assert_eq!(
+            result[0]
+                .arg(0)
+                .to_opref()
+                .inline_const_bits()
+                .expect("malloc_big_fixedsize fn const"),
+            TEST_MALLOC_BIG_FIXEDSIZE_FN
+        );
+        assert_eq!(
+            result[0]
+                .arg(1)
+                .to_opref()
+                .inline_const_bits()
+                .expect("headered total size const"),
+            round_up(payload_size + crate::header::GcHeader::SIZE) as i64
+        );
+        assert_eq!(
+            result[0]
+                .arg(2)
+                .to_opref()
+                .inline_const_bits()
+                .expect("type id const"),
+            type_id as i64
+        );
     }
 
     // ── Test 2: NEW_ARRAY → CALL_MALLOC_NURSERY_VARSIZE ──

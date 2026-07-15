@@ -118,8 +118,9 @@ pub struct JitInterpConfig {
     pub residual_writes: Vec<ResidualWriteEntry>,
     /// `ref(T)` state scalars that are bases of a contiguous raw-pointer array
     /// (`[*mut U; N]` at offset 0 of `T`), declared as
-    /// `pool_arrays = { <ref> => <getter>, ... }`.  The indexing marker call
-    /// `<getter>(state.<ref>, <int>)` lowers to `getarrayitem_gc_r` (a
+    /// `pool_arrays = { <ref> => <getter> [-> ElementType], ... }`.  The
+    /// indexing marker call `<getter>(state.<ref>, <int>)` lowers to
+    /// `getarrayitem_gc_r` (a
     /// re-producible heap read) instead of an opaque residual CALL_R, so the
     /// loaded element re-derives from the index each loop entry and the short
     /// preamble can re-emit it.  Selection is keyed on the `getter` function
@@ -148,6 +149,9 @@ pub struct JitInterpConfig {
     /// `allocator_func(v0, v1)`.  The JIT path already handles struct
     /// literals natively via `lower_struct_value` (New + SetfieldGc).
     pub struct_allocs: Vec<(Path, Path)>,
+    /// Structs whose `New` allocation should use the headerless nursery opcode.
+    /// `headerless_structs = { StructType, ... }`.
+    pub headerless_structs: Vec<Path>,
     /// Pure function → native IR integer binop aliases.
     /// `native_int_binops = { val_add => IntAdd, ... }`.  When the JIT-path
     /// lowerer encounters a call whose path matches a key, it emits the named
@@ -344,15 +348,20 @@ pub struct ResidualWriteEntry {
 
 /// A `ref(T)` state scalar that is the base of a contiguous raw-pointer array,
 /// paired with the marker `getter` function whose call indexes it.  Declared as
-/// `pool_arrays = { <ref> => <getter>, ... }`.  The lowering recognizes a pool
-/// read only when BOTH the call's function path matches `getter` AND arg0 is
-/// `state.<base>` — operation identity, not arg shape alone, so an unrelated
-/// helper that happens to take the same `(state.<base>, int)` shape is not
-/// miscompiled into a `getarrayitem_gc_r`.
+/// `pool_arrays = { <ref> => <getter> [-> ElementType], ... }`.  The lowering
+/// recognizes a pool read only when BOTH the call's function path matches
+/// `getter` AND arg0 is `state.<base>` — operation identity, not arg shape
+/// alone, so an unrelated helper that happens to take the same
+/// `(state.<base>, int)` shape is not miscompiled into a `getarrayitem_gc_r`.
 #[derive(Clone)]
 pub struct PoolArrayEntry {
     pub base: Ident,
     pub getter: Path,
+    /// The concrete element type each array slot points at (`pools: [*mut T; N]`),
+    /// declared as `<base> => <getter> -> T`.  Supplies `struct_type` for the
+    /// getter's ref binding so field access on a LOCAL `let x = <getter>(...)`
+    /// resolves the layout (state-field refs get this from their decl instead).
+    pub element_type: Option<Path>,
 }
 
 /// One entry in `ref_fields = { Struct::field => PointeeType, ... }`.
@@ -546,6 +555,7 @@ impl Parse for JitInterpConfig {
         let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
+        let mut headerless_structs: Vec<Path> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut native_tag_small: Vec<Path> = Vec::new();
         let mut split_dispatch = false;
@@ -611,6 +621,9 @@ impl Parse for JitInterpConfig {
                 "struct_allocs" => {
                     struct_allocs = parse_call_returns_map(input)?;
                 }
+                "headerless_structs" => {
+                    headerless_structs = parse_path_set(input)?;
+                }
                 "native_int_binops" => {
                     native_int_binops = parse_native_int_binops_map(input)?;
                 }
@@ -671,6 +684,7 @@ impl Parse for JitInterpConfig {
             ref_fields,
             call_returns,
             struct_allocs,
+            headerless_structs,
             native_int_binops,
             native_tag_small,
             split_dispatch,
@@ -706,8 +720,9 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
     Ok(entries)
 }
 
-/// Parse `pool_arrays = { <ref> => <getter>, ... }`.  Each entry maps a `ref(T)`
-/// state scalar (the array base) to the marker function whose call indexes it.
+/// Parse `pool_arrays = { <ref> => <getter> [-> ElementType], ... }`.  Each
+/// entry maps a `ref(T)` state scalar (the array base) to the marker function
+/// whose call indexes it, optionally tagging the loaded element's struct type.
 fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>> {
     let content;
     braced!(content in input);
@@ -716,7 +731,17 @@ fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>>
         let base: Ident = content.parse()?;
         content.parse::<Token![=>]>()?;
         let getter: Path = content.parse()?;
-        entries.push(PoolArrayEntry { base, getter });
+        let element_type = if content.peek(Token![->]) {
+            content.parse::<Token![->]>()?;
+            Some(content.parse::<Path>()?)
+        } else {
+            None
+        };
+        entries.push(PoolArrayEntry {
+            base,
+            getter,
+            element_type,
+        });
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)
@@ -768,26 +793,40 @@ fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
     Ok(entries)
 }
 
+fn parse_path_set(input: ParseStream) -> syn::Result<Vec<Path>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        entries.push(content.parse::<Path>()?);
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+fn split_struct_field_path(full_path: Path) -> syn::Result<(Path, Ident)> {
+    let mut segments: Vec<_> = full_path.segments.into_iter().collect();
+    if segments.len() < 2 {
+        return Err(syn::Error::new_spanned(
+            &full_path.leading_colon,
+            "entry must be `Struct::field`",
+        ));
+    }
+    let field_seg = segments.pop().unwrap();
+    let field = field_seg.ident;
+    let struct_type = syn::Path {
+        leading_colon: full_path.leading_colon,
+        segments: segments.into_iter().collect(),
+    };
+    Ok((struct_type, field))
+}
+
 fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
     while !content.is_empty() {
-        let full_path: Path = content.parse()?;
-        // Split the last segment as the field name.
-        let mut segments: Vec<_> = full_path.segments.into_iter().collect();
-        if segments.len() < 2 {
-            return Err(syn::Error::new_spanned(
-                &full_path.leading_colon,
-                "ref_fields entry must be `Struct::field => Pointee`",
-            ));
-        }
-        let field_seg = segments.pop().unwrap();
-        let field = field_seg.ident;
-        let struct_type = syn::Path {
-            leading_colon: full_path.leading_colon,
-            segments: segments.into_iter().collect(),
-        };
+        let (struct_type, field) = split_struct_field_path(content.parse::<Path>()?)?;
         content.parse::<Token![=>]>()?;
         let pointee_type: Path = content.parse()?;
         entries.push(RefFieldEntry {
@@ -1676,6 +1715,16 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         func.segments.iter().map(|s| s.ident.to_string()).collect();
                     (segs, ret_type.clone())
                 })
+                .chain(config.pool_arrays.iter().filter_map(|entry| {
+                    let ret_type = entry.element_type.clone()?;
+                    let segs: Vec<String> = entry
+                        .getter
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect();
+                    Some((segs, ret_type))
+                }))
                 .collect();
             let struct_allocs_map: std::collections::HashMap<Vec<String>, syn::Path> = config
                 .struct_allocs

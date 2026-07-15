@@ -32,6 +32,7 @@ use majit_ir::{
 const FIELD_DESCR_TAG: u32 = 0x1000_0000;
 const ARRAY_DESCR_TAG: u32 = 0x2000_0000;
 const SIZE_DESCR_TAG: u32 = 0x3000_0000;
+const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
 
 // Reserved, hand-assigned indices for mutable-cell payload fields. The
 // runtime `HeapCache` keys entries by `descr.index()`; `stable_field_index`
@@ -2755,6 +2756,7 @@ mod tests {
             type_id: 7,
             vtable: 0,
             is_gc_managed: true,
+            headerless: false,
             all_fielddescrs: vec![
                 BhFieldSpec {
                     index: 0,
@@ -3015,6 +3017,7 @@ mod tests {
             type_id: 11,
             vtable: 0,
             is_gc_managed: true,
+            headerless: false,
             all_fielddescrs: fields.clone(),
         };
         let interior_fields = vec![
@@ -3174,13 +3177,14 @@ fn simple_descr_group_from_bh_size(
         // gc_cache.init_size_descr in the canonical path; this factory
         // bypasses that, so the tid stays a path_hash-derived u32 with
         // birthday-paradox collision risk around 2^16 distinct STRUCTs).
-        majit_ir::descr::make_simple_descr_group_keyed(
+        majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
             spec.size,
             spec.type_id as u32,
             spec.type_id,
             spec.vtable as usize,
             spec.is_gc_managed,
+            spec.headerless,
             &field_specs,
         )
     };
@@ -3869,6 +3873,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             size,
             type_id,
             vtable,
+            owner,
             all_fielddescrs,
             is_gc_managed,
             ..
@@ -3911,7 +3916,8 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // `pyre-jit/src/eval.rs` (`bh_new` / `bh_new_with_vtable`
             // dispatch) carries an empty list and falls through to the
             // bare ctor, which is the existing test-helper shape.
-            if all_fielddescrs.is_empty() {
+            let headerless = owner == HEADERLESS_SIZE_OWNER_MARKER;
+            if all_fielddescrs.is_empty() && !headerless {
                 // TODO: `make_size_descr_with_type_and_vtable`
                 // takes the u32 gc tid; `*type_id` is the u64 cache key.
                 // Truncate `as u32` until gc_cache routing.
@@ -3922,6 +3928,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     type_id: *type_id,
                     vtable: *vtable,
                     is_gc_managed: *is_gc_managed,
+                    headerless,
                     all_fielddescrs: all_fielddescrs.clone(),
                 };
                 simple_descr_group_from_bh_size(&spec).size_descr.clone()

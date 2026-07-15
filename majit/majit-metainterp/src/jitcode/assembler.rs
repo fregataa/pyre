@@ -10,6 +10,8 @@ use majit_backend::JitCellToken;
 use majit_ir::OpCode;
 use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec};
 
+const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
+
 use crate::jitcode;
 
 use super::{
@@ -465,14 +467,19 @@ impl JitCodeBuilder {
         dest: u16,
         size: usize,
         type_id: u64,
+        headerless: bool,
         fields: &[(usize, bool, &str)],
     ) {
         self.touch_ref_reg(dest);
         // descr.py:108-120 get_size_descr + init_size_descr: cache the
         // full per-struct layout so the matching setfield_gc_* resolves
-        // the parent SizeDescr and field index (descr.py:238).  A JIT
-        // `new` allocates a GC-headered struct, so `is_gc_managed = true`.
-        self.register_struct_layout(size, type_id, true, fields);
+        // the parent SizeDescr and field index (descr.py:238).  Even a
+        // headerless JIT `new` keeps `is_gc_managed = true`: the result
+        // ref is still rooted by the reg/frame gcmap walk and collector
+        // traced.  It just carries no GcHeader, so it must never be
+        // subject to GUARD_GC_TYPE (which reads at `ref - GcHeader::SIZE`).
+        // `StructPtrInfo.make_guards` gates that guard on `!sd.headerless()`.
+        self.register_struct_layout(size, type_id, true, headerless, fields);
         let all_fielddescrs = self
             .struct_size_specs
             .get(&type_id)
@@ -483,7 +490,11 @@ impl JitCodeBuilder {
             size,
             type_id,
             vtable: 0,
-            owner: String::new(),
+            owner: if headerless {
+                HEADERLESS_SIZE_OWNER_MARKER.to_string()
+            } else {
+                String::new()
+            },
             all_fielddescrs,
             is_gc_managed: true,
         });
@@ -514,6 +525,7 @@ impl JitCodeBuilder {
         size: usize,
         type_id: u64,
         is_gc_managed: bool,
+        headerless: bool,
         fields: &[(usize, bool, &str)],
     ) {
         let new_fields = Self::field_specs_from_layout(fields);
@@ -548,6 +560,7 @@ impl JitCodeBuilder {
                     type_id,
                     vtable: 0,
                     is_gc_managed,
+                    headerless,
                     all_fielddescrs: new_fields,
                 },
             );
@@ -5436,7 +5449,7 @@ mod tests {
     #[test]
     fn canonical_new_struct_emit_uses_size_descr_without_vtable() {
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(3, 16, 0xCD, &[]);
+        builder.new_struct(3, 16, 0xCD, false, &[]);
         let jitcode = builder.finish();
         let opcode = jitcode::insn_byte("new/d>r");
         assert_eq!(jitcode.code, vec![opcode, 0, 0, 3]);

@@ -2740,6 +2740,14 @@ pub trait SizeDescr: Descr {
         true
     }
 
+    /// Whether `NEW` for this descr should be rewritten to a headerless
+    /// nursery allocation.  Separate from `is_gc_managed()`: headerless
+    /// allocation changes the rewriter/backend malloc shape, while
+    /// `is_gc_managed()` gates runtime type-header guards.
+    fn headerless(&self) -> bool {
+        false
+    }
+
     /// Vtable address, if is_object().
     fn vtable(&self) -> usize {
         0
@@ -3882,6 +3890,9 @@ pub struct SimpleSizeDescr {
     /// `is_object()` (`vtable != 0`) because a `new_struct` GC struct
     /// also has `vtable == 0`.
     is_gc_managed: bool,
+    /// Explicit allocation-shape bit for `NEW` rewriting.  Defaults false:
+    /// normal JIT-GC structs are headered unless an emitter opts in.
+    headerless: bool,
     /// descr.py:72 `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py:71 `self.gc_fielddescrs = gc_fielddescrs`.
@@ -3902,6 +3913,7 @@ impl Clone for SimpleSizeDescr {
             is_immutable: self.is_immutable,
             vtable: self.vtable,
             is_gc_managed: self.is_gc_managed,
+            headerless: self.headerless,
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
         }
@@ -3919,6 +3931,7 @@ impl SimpleSizeDescr {
             is_immutable: false,
             vtable: 0,
             is_gc_managed: true,
+            headerless: false,
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -3934,6 +3947,7 @@ impl SimpleSizeDescr {
             is_immutable: false,
             vtable,
             is_gc_managed: true,
+            headerless: false,
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -3952,6 +3966,11 @@ impl SimpleSizeDescr {
     /// `GuardGcType` must not be emitted for it).
     pub fn set_gc_managed(&mut self, is_gc_managed: bool) {
         self.is_gc_managed = is_gc_managed;
+    }
+
+    /// Override the allocation-shape flag (default `false`).
+    pub fn set_headerless(&mut self, headerless: bool) {
+        self.headerless = headerless;
     }
 
     /// descr.py:123-126 — `get_size_descr` calls
@@ -4020,6 +4039,9 @@ impl SizeDescr for SimpleSizeDescr {
     fn is_gc_managed(&self) -> bool {
         self.is_gc_managed
     }
+    fn headerless(&self) -> bool {
+        self.headerless
+    }
     fn vtable(&self) -> usize {
         self.vtable
     }
@@ -4071,6 +4093,28 @@ pub fn make_simple_descr_group_keyed(
     is_gc_managed: bool,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
+    make_simple_descr_group_keyed_with_headerless(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        false,
+        field_specs,
+    )
+}
+
+pub fn make_simple_descr_group_keyed_with_headerless(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    field_specs: &[SimpleFieldDescrSpec],
+) -> SimpleDescrGroup {
     let group = make_simple_descr_group_inner(
         index,
         size,
@@ -4078,6 +4122,7 @@ pub fn make_simple_descr_group_keyed(
         cache_key,
         vtable,
         is_gc_managed,
+        headerless,
         field_specs,
     );
     let struct_key = LLType::struct_key(cache_key);
@@ -4124,6 +4169,7 @@ fn make_simple_descr_group_inner(
     cache_key: u64,
     vtable: usize,
     is_gc_managed: bool,
+    headerless: bool,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
     let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
@@ -4167,6 +4213,7 @@ fn make_simple_descr_group_inner(
         // landing on a stale slot via `type_id` widening.
         sd.set_cache_key(cache_key);
         sd.set_gc_managed(is_gc_managed);
+        sd.set_headerless(headerless);
         sd.with_all_fielddescrs(all_fielddescrs)
     });
     let field_descrs = field_descrs_cell.into_inner();
@@ -4193,7 +4240,8 @@ pub fn make_simple_descr_group(
     // No-cache legacy mint sites are JIT-allocated structs; default
     // `is_gc_managed = true` (the raw-struct path goes through the keyed
     // factory with an explicit flag).
-    let group = make_simple_descr_group_inner(index, size, type_id, 0, vtable, true, field_specs);
+    let group =
+        make_simple_descr_group_inner(index, size, type_id, 0, vtable, true, false, field_specs);
     // descr.py:236-247 `get_size_descr` cache-miss branch — snapshot
     // order only.
     crate::descr_registry::register_size(group.size_descr.clone() as DescrRef);

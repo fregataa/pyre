@@ -733,6 +733,7 @@ impl<'c> Lowerer<'c> {
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         false,
+                        false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -765,6 +766,7 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
+                        false,
                         false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
@@ -834,6 +836,7 @@ impl<'c> Lowerer<'c> {
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         false,
+                        false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -865,6 +868,7 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
+                        false,
                         false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
@@ -925,13 +929,12 @@ impl<'c> Lowerer<'c> {
         // fallback (the marker function's own body) rather than miscompiling an
         // unrelated helper into a `getarrayitem_gc_r`.
         let func_segments = canonical_expr_segments(&call.func)?;
-        if !config
+        let element_type = config
             .pool_arrays
             .iter()
-            .any(|(base, getter)| base == &base_name && getter == &func_segments)
-        {
-            return None;
-        }
+            .find(|(base, getter, _)| base == &base_name && getter == &func_segments)?
+            .2
+            .clone();
         // Lower the `state.<base>` ref-scalar (declares its ref identity slot
         // live for resume) and the index, then read the pointer element.
         let base = self.lower_state_field_read(&call.args[0])?;
@@ -965,7 +968,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Ref,
             depends_on_stack: base.depends_on_stack || index.depends_on_stack,
-            struct_type: None,
+            struct_type: element_type,
         })
     }
 
@@ -1028,6 +1031,7 @@ impl<'c> Lowerer<'c> {
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         false,
+                        false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -1058,6 +1062,7 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
+                        false,
                         false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
@@ -1126,6 +1131,7 @@ impl<'c> Lowerer<'c> {
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         false,
+                        false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -1155,6 +1161,7 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
+                        false,
                         false,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),

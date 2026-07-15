@@ -181,11 +181,11 @@ pub struct LowererConfig {
     /// `getfield_gc_i`.  Source: `JitInterpConfig.residual_writes`, the struct
     /// `Path` recovered from `state_ref_scalars[ref_scalar]`.
     pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident)>,
-    /// `(pool-base ref-scalar name, getter function path segments)`.  A call
-    /// `<getter>(state.<base>, <int>)` whose function path matches `getter` AND
-    /// whose arg0 is the `base` lowers to `getarrayitem_gc_r` instead of a
-    /// residual CALL_R.  Source: `JitInterpConfig.pool_arrays`.
-    pub(super) pool_arrays: Vec<(String, Vec<String>)>,
+    /// `(pool-base ref-scalar name, getter function path segments, element type)`.
+    /// A call `<getter>(state.<base>, <int>)` whose function path matches
+    /// `getter` AND whose arg0 is the `base` lowers to `getarrayitem_gc_r`
+    /// instead of a residual CALL_R.  Source: `JitInterpConfig.pool_arrays`.
+    pub(super) pool_arrays: Vec<(String, Vec<String>, Option<syn::Path>)>,
     /// Ref-kind struct field declarations.  Key = `"StructType::field"`,
     /// value = `(struct_path, field_ident, pointee_path)`.  When the lowerer
     /// encounters a field access and the `(struct, field)` pair matches, it
@@ -196,6 +196,8 @@ pub struct LowererConfig {
     /// result is bound, the lowerer sets `Binding.struct_type` from this map
     /// so subsequent `result.field` accesses resolve through `ref_fields`.
     pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
+    /// Struct types whose `New` allocation should carry the headerless bit.
+    pub(super) headerless_structs: std::collections::HashSet<Vec<String>>,
     /// Pure function → native IR integer binop aliases.  Key = canonical func
     /// path segments, value = IR opcode name (e.g. "IntAdd").  When
     /// `lower_native_int_binop_call` encounters a call whose path matches a
@@ -828,6 +830,7 @@ impl LowererConfig {
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
         ref_fields: &[crate::jit_interp::RefFieldEntry],
         call_returns: &[(Path, Path)],
+        headerless_structs: &[Path],
         native_int_binops: &[(Path, Ident)],
         native_tag_small: &[Path],
         split_dispatch: bool,
@@ -1015,12 +1018,17 @@ impl LowererConfig {
                 .iter()
                 .map(|(func, ret_type)| (canonical_path_segments(func), ret_type.clone()))
                 .collect(),
+            headerless_structs: headerless_structs
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
             pool_arrays: pool_arrays
                 .iter()
                 .map(|entry| {
                     (
                         entry.base.to_string(),
                         canonical_path_segments(&entry.getter),
+                        entry.element_type.clone(),
                     )
                 })
                 .collect(),
@@ -1043,6 +1051,11 @@ impl LowererConfig {
             cloned.vable_input_ref_reg = Some(reg);
         }
         cloned
+    }
+
+    pub(super) fn is_headerless_struct(&self, struct_path: &syn::Path) -> bool {
+        self.headerless_structs
+            .contains(&canonical_path_segments(struct_path))
     }
 }
 
