@@ -22,6 +22,7 @@ pub static EXC_ZERO_DIVISION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("Z
 pub static EXC_TYPE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("TypeError");
 pub static EXC_VALUE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ValueError");
 pub static EXC_NAME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("NameError");
+pub static EXC_UNBOUND_LOCAL_ERROR_TYPE: PyType = crate::pyobject::new_pytype("UnboundLocalError");
 pub static EXC_INDEX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("IndexError");
 pub static EXC_KEY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("KeyError");
 pub static EXC_ATTRIBUTE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AttributeError");
@@ -87,6 +88,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::TypeError => &EXC_TYPE_ERROR_TYPE,
         ExcKind::ValueError => &EXC_VALUE_ERROR_TYPE,
         ExcKind::NameError => &EXC_NAME_ERROR_TYPE,
+        ExcKind::UnboundLocalError => &EXC_UNBOUND_LOCAL_ERROR_TYPE,
         ExcKind::IndexError => &EXC_INDEX_ERROR_TYPE,
         ExcKind::KeyError => &EXC_KEY_ERROR_TYPE,
         ExcKind::AttributeError => &EXC_ATTRIBUTE_ERROR_TYPE,
@@ -206,6 +208,8 @@ pub enum ExcKind {
     /// (`PyByteArray_Resize`: "Existing exports of data: object cannot
     /// be re-sized").  Direct subclass of Exception.
     BufferError = 31,
+    /// Subclass of NameError raised when a fast local is read while unbound.
+    UnboundLocalError = 32,
 }
 
 impl ExcKind {
@@ -571,7 +575,7 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::BufferError as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::UnboundLocalError as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
@@ -1268,6 +1272,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::ValueError => "ValueError",
         ExcKind::ZeroDivisionError => "ZeroDivisionError",
         ExcKind::NameError => "NameError",
+        ExcKind::UnboundLocalError => "UnboundLocalError",
         ExcKind::IndexError => "IndexError",
         ExcKind::KeyError => "KeyError",
         ExcKind::AttributeError => "AttributeError",
@@ -1318,6 +1323,9 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
     }
     if type_name == "RuntimeError" {
         return matches!(kind, ExcKind::RuntimeError | ExcKind::RecursionError);
+    }
+    if type_name == "NameError" {
+        return matches!(kind, ExcKind::NameError | ExcKind::UnboundLocalError);
     }
     // ImportError hierarchy — ModuleNotFoundError is-a ImportError.
     if type_name == "ImportError" {
@@ -1370,6 +1378,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "ValueError" => Some(ExcKind::ValueError),
         "ZeroDivisionError" => Some(ExcKind::ZeroDivisionError),
         "NameError" => Some(ExcKind::NameError),
+        "UnboundLocalError" => Some(ExcKind::UnboundLocalError),
         "IndexError" => Some(ExcKind::IndexError),
         "KeyError" => Some(ExcKind::KeyError),
         "AttributeError" => Some(ExcKind::AttributeError),
@@ -1450,6 +1459,16 @@ mod tests {
             "BaseException"
         ));
         assert!(!exc_kind_matches(ExcKind::ZeroDivisionError, "ValueError"));
+        assert!(exc_kind_matches(
+            ExcKind::UnboundLocalError,
+            "UnboundLocalError"
+        ));
+        assert!(exc_kind_matches(ExcKind::UnboundLocalError, "NameError"));
+        assert!(exc_kind_matches(ExcKind::UnboundLocalError, "Exception"));
+        assert!(exc_kind_matches(
+            ExcKind::UnboundLocalError,
+            "BaseException"
+        ));
     }
 
     #[test]
@@ -1470,6 +1489,7 @@ mod tests {
             ExcKind::ValueError,
             ExcKind::ZeroDivisionError,
             ExcKind::NameError,
+            ExcKind::UnboundLocalError,
             ExcKind::IndexError,
             ExcKind::KeyError,
             ExcKind::AttributeError,

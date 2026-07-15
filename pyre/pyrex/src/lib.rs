@@ -45,7 +45,7 @@ struct LaunchFlags {
     ignore_environment: bool,
     isolated: bool,
     dev_mode: bool,
-    utf8_mode: i64,
+    utf8_mode: Option<i64>,
     safe_path: bool,
 }
 
@@ -59,7 +59,7 @@ impl Default for LaunchFlags {
             ignore_environment: false,
             isolated: false,
             dev_mode: false,
-            utf8_mode: 1,
+            utf8_mode: None,
             safe_path: false,
         }
     }
@@ -105,6 +105,52 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<String>, lexopt::Error>
     Ok(rest)
 }
 
+/// Emit the `preconfig_init_utf8_mode` fatal error for an invalid PYTHONUTF8 /
+/// `-X utf8` value and exit; the value is validated during pre-init config.
+fn fatal_utf8_config_error(detail: &str) -> ! {
+    eprintln!("Fatal Python error: preconfig_init_utf8_mode: {detail}");
+    eprintln!("Python runtime state: preinitializing");
+    eprintln!();
+    std::process::exit(1);
+}
+
+fn locale_implies_utf8_mode() -> bool {
+    let locale = std::env::var("LC_ALL")
+        .ok()
+        .or_else(|| std::env::var("LC_CTYPE").ok())
+        .or_else(|| std::env::var("LANG").ok());
+    // Only the legacy C/POSIX locale — or an unset/empty locale, which resolves
+    // to C — coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …)
+    // leaves it 0.
+    matches!(
+        locale.as_deref(),
+        None | Some("") | Some("C") | Some("POSIX")
+    )
+}
+
+fn resolve_utf8_mode(flags: &LaunchFlags) -> i64 {
+    if let Some(value) = flags.utf8_mode {
+        return value;
+    }
+    if !flags.ignore_environment {
+        if let Ok(value) = std::env::var("PYTHONUTF8") {
+            if !value.is_empty() {
+                return match value.as_str() {
+                    "0" => 0,
+                    "1" => 1,
+                    _ => fatal_utf8_config_error("invalid PYTHONUTF8 environment variable value"),
+                };
+            }
+        }
+    }
+    if locale_implies_utf8_mode() { 1 } else { 0 }
+}
+
+fn finalize_flags(mut flags: LaunchFlags) -> LaunchFlags {
+    flags.utf8_mode = Some(resolve_utf8_mode(&flags));
+    flags
+}
+
 fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), lexopt::Error> {
     let mut parser = lexopt::Parser::from_env();
     let mut flags = LaunchFlags::default();
@@ -114,12 +160,12 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
             Short('c') => {
                 let cmd = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Command(cmd), flags, rest));
+                return Ok((RunMode::Command(cmd), finalize_flags(flags), rest));
             }
             Short('m') => {
                 let module = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Module(module), flags, rest));
+                return Ok((RunMode::Module(module), finalize_flags(flags), rest));
             }
             Short('h') | Long("help") => {
                 print!("{}", usage(binary_name));
@@ -139,8 +185,11 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                 let option = parser.value()?.string()?;
                 match option.as_str() {
                     "dev" => flags.dev_mode = true,
-                    "utf8" | "utf8=1" => flags.utf8_mode = 1,
-                    "utf8=0" => flags.utf8_mode = 0,
+                    "utf8" | "utf8=1" => flags.utf8_mode = Some(1),
+                    "utf8=0" => flags.utf8_mode = Some(0),
+                    _ if option.starts_with("utf8=") => {
+                        fatal_utf8_config_error("invalid -X utf8 option value")
+                    }
                     _ => {}
                 }
             }
@@ -157,18 +206,18 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                 let script = script.string()?;
                 if script == "interact" {
                     let mode = parse_interact(&mut parser)?;
-                    return Ok((mode, flags, vec![]));
+                    return Ok((mode, finalize_flags(flags), vec![]));
                 }
                 if script == "-" {
-                    return Ok((RunMode::Repl, flags, vec![]));
+                    return Ok((RunMode::Repl, finalize_flags(flags), vec![]));
                 }
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Script(script), flags, rest));
+                return Ok((RunMode::Script(script), finalize_flags(flags), rest));
             }
             _ => return Err(arg.unexpected()),
         }
     }
-    Ok((RunMode::Repl, flags, vec![]))
+    Ok((RunMode::Repl, finalize_flags(flags), vec![]))
 }
 
 /// Parse a `--heapsize` value (`pypy_interact.py:88-102`): a byte count with an
@@ -400,7 +449,7 @@ fn real_main(binary_name: &str) {
         ignore_environment,
         isolated,
         dev_mode,
-        utf8_mode,
+        utf8_mode.unwrap_or(0),
         safe_path,
     );
 
