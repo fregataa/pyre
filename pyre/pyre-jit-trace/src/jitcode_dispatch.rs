@@ -417,7 +417,6 @@ pub struct InlineFrame {
 /// Per-trace-attempt walk session, owned by the walk driver and threaded
 /// through [`WalkContext`] — `MetaInterp.framestack` (`pyjitpl.py:2475`,
 /// `:2487`; depth scan `:1390`). Innermost level last.
-#[derive(Default)]
 pub struct WalkSession {
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
@@ -428,6 +427,30 @@ pub struct WalkSession {
     /// the outer snapshot root's py_pc→jitcode translation, so abort-point
     /// flushing must decline after the sub-walk unwinds.
     pub abort_in_subwalk: bool,
+    /// Blackhole `tmpreg_r`/`tmpreg_i`/`tmpreg_f` (`blackhole.py:661-679`):
+    /// the single-slot scratch that `insert_renamings` (`flatten.py:154`)
+    /// routes a cyclic parallel move through via `*_push`/`*_pop` pairs.
+    /// `ref_push/r` writes the source Ref (+ its concrete shadow) here;
+    /// `ref_pop/>r` reads it back into a dst register.  Persisted on the
+    /// per-walk session because a push and its matching pop straddle
+    /// intervening `*_copy` ops within one trampoline.
+    pub tmpreg_r: OpRef,
+    pub tmpreg_r_concrete: ConcreteValue,
+    pub tmpreg_i: OpRef,
+    pub tmpreg_f: OpRef,
+}
+
+impl Default for WalkSession {
+    fn default() -> Self {
+        Self {
+            framestack: Vec::new(),
+            abort_in_subwalk: false,
+            tmpreg_r: OpRef::NONE,
+            tmpreg_r_concrete: ConcreteValue::Null,
+            tmpreg_i: OpRef::NONE,
+            tmpreg_f: OpRef::NONE,
+        }
+    }
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -8419,6 +8442,7 @@ struct FbwStoreJournalRootArea {
     appends: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>>,
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
+    sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
@@ -8430,6 +8454,7 @@ thread_local! {
         appends: FBW_APPEND_JOURNAL.with(|value| value as *const _),
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
+        sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
@@ -9237,13 +9262,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // nursery-resident and no longer referenced elsewhere once the eager store
     // overwrote the EC slot; forward each so a minor collection during the rest
     // of the walk cannot free/move the value the rollback restores.
-    FBW_SYS_EXC_JOURNAL.with(|j| {
-        for displaced in j.borrow_mut().iter_mut() {
-            // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
-            // borrow keeps the Vec storage alive for the visit.
-            visitor(unsafe { &mut *(displaced as *mut pyre_object::PyObjectRef).cast() });
-        }
-    });
+    let sys_exc = unsafe { &mut *(*area.sys_exc).as_ptr() };
+    for displaced in sys_exc.iter_mut() {
+        // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
+        // borrowed area keeps the Vec storage alive for the visit.
+        visitor(unsafe { &mut *(displaced as *mut pyre_object::PyObjectRef).cast() });
+    }
     // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
     // across the rest of the walk (subsequent residual calls allocate and a
     // minor collection moves nursery objects), so forward every entry's item
@@ -17392,13 +17416,28 @@ fn try_walker_specialize_load_attr(
     // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
     // (`mapdict.py:905-906`).  The map nodes are interned + immortal, so the
     // pointer is a stable identity guarded as an opaque word (object_map_descr
-    // is Int-typed).  Skipped when the field read already const-folds to the map
-    // (heapcache hit).
+    // is Int-typed).
+    //
+    // The guard may only be elided when the map read is ALREADY a compile-time
+    // constant — i.e. a prior promotion in this trace pinned it via
+    // `replace_box`.  It must NOT be elided merely because `box_value(map_op)`
+    // reports the concrete map: every traced getfield op carries its live value
+    // (`opimpl_getfield_gc_i` → `set_opref_concrete`, `history.py:803`
+    // FrontendOp), so `box_value == map` holds for the very first read and
+    // would drop the guard on the trace's entry.  A trace whose map guard is
+    // dropped reads `storage[storageindex]` off any same-class receiver whose
+    // map differs (GuardClass alone does not pin the layout), returning a wild
+    // slot value.  Pin the map with `replace_box` after guarding so a later
+    // fold on the same receiver correctly elides (matching the trait
+    // `implement_guard_value`, `trace_opcode.rs:4631-4633`).
     let map_op =
         crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
-    if ctx.trace_ctx.box_value(map_op) != Some(majit_ir::Value::Int(map as i64)) {
+    if !map_op.is_constant() {
         let map_const = ctx.trace_ctx.const_int(map as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(map_op, map_const);
     }
 
     // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
@@ -23250,6 +23289,88 @@ fn handle(
                     bank: "f",
                 })?;
             *slot = src_val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_push/r" => {
+            // Blackhole `bhimpl_ref_push` (`blackhole.py:664-666`):
+            // `self.tmpreg_r = a`.  `insert_renamings` (`flatten.py:154`)
+            // emits `*_push`/`*_pop` around a cyclic parallel move — the
+            // swap `r_a <-> r_b` lowers to `push r_b; copy r_b<-r_a;
+            // pop r_a` so the overwritten value survives in the tmpreg.
+            // Pure SSA-level scratch move, no IR op recorded.  Operand
+            // layout `r`: 1B src.
+            let src_val = read_ref_reg(code, op, 0, ctx)?;
+            let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
+            {
+                let mut sess = ctx.session.borrow_mut();
+                sess.tmpreg_r = src_val;
+                sess.tmpreg_r_concrete = src_concrete;
+            }
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_pop/>r" => {
+            // Blackhole `bhimpl_ref_pop` (`blackhole.py:674-676`):
+            // `return self.get_tmpreg_r()`.  Reads the value stashed by
+            // the matching `ref_push/r` back into a dst register, in
+            // lock-step with its concrete shadow.  Operand layout `>r`:
+            // 1B dst.
+            let (val, concrete) = {
+                let sess = ctx.session.borrow();
+                (sess.tmpreg_r, sess.tmpreg_r_concrete)
+            };
+            let dst = code[op.pc + 1] as usize;
+            write_ref_reg(ctx, op.pc, dst, val, concrete)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "int_push/i" => {
+            // Blackhole `bhimpl_int_push` (`blackhole.py:661-663`):
+            // `self.tmpreg_i = a`.  Int-bank sibling of `ref_push/r`.
+            // Operand layout `i`: 1B src.
+            let src_val = read_int_reg(code, op, 0, ctx)?;
+            ctx.session.borrow_mut().tmpreg_i = src_val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "int_pop/>i" => {
+            // Blackhole `bhimpl_int_pop` (`blackhole.py:671-673`).
+            // Operand layout `>i`: 1B dst.
+            let val = ctx.session.borrow().tmpreg_i;
+            let dst = code[op.pc + 1] as usize;
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "i",
+                })?;
+            *slot = val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "float_push/f" => {
+            // Blackhole `bhimpl_float_push` (`blackhole.py:667-669`).
+            // Operand layout `f`: 1B src.
+            let src_val = read_float_reg(code, op, 0, ctx)?;
+            ctx.session.borrow_mut().tmpreg_f = src_val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "float_pop/>f" => {
+            // Blackhole `bhimpl_float_pop` (`blackhole.py:677-679`).
+            // Operand layout `>f`: 1B dst.
+            let val = ctx.session.borrow().tmpreg_f;
+            let dst = code[op.pc + 1] as usize;
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = val;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_copy/r>r" => {
