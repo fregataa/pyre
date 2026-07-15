@@ -3452,7 +3452,14 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                             // rather than only the three builtin method
                             // wrapper shapes.  This also covers property,
                             // getset, member, and user-defined descriptors.
-                            return Ok(get(attr, bound_obj, w_obj_type)?.unwrap_or(attr));
+                            // descriptor.py:76-82 — class-mode
+                            // `super(C, C)` calls `__get__(None, C)`.
+                            let descr_obj = if std::ptr::eq(bound_obj, w_obj_type) {
+                                w_none()
+                            } else {
+                                bound_obj
+                            };
+                            return Ok(get(attr, descr_obj, w_obj_type)?.unwrap_or(attr));
                         }
                     }
                 }
@@ -4022,6 +4029,15 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
 
 /// `space.getattr(w_obj, w_name)`.
 pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
+    // `getattr` accepts a wrapped attribute name.  Validate it before the
+    // Unicode storage access below: callers such as `_abc._abc_init` can
+    // receive arbitrary objects from a user-provided iterable.
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            crate::type_methods::arg_type_name(w_name)
+        )));
+    }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     match name.as_str() {
         Ok(s) => getattr_str(obj, s),
@@ -6702,6 +6718,26 @@ pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> 
         return Ok(());
     }
     let n = w_tuple_len(bases);
+    // CPython's typeobject.c reports duplicate direct bases before the C3
+    // merge. PyPy's mro_error discovers the same case in its final list.
+    for i in 0..n {
+        let Some(base) = w_tuple_getitem(bases, i as i64) else {
+            continue;
+        };
+        if (i + 1..n)
+            .filter_map(|j| w_tuple_getitem(bases, j as i64))
+            .any(|other| std::ptr::eq(base, other))
+        {
+            let name = if is_type_like_w(base) {
+                w_type_get_name(base).to_string()
+            } else {
+                "?".to_string()
+            };
+            return Err(crate::PyError::type_error(format!(
+                "duplicate base class {name}"
+            )));
+        }
+    }
     let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
     let mut bases_list = Vec::with_capacity(n);
     for i in 0..n {
@@ -10709,7 +10745,12 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 ///
 /// Resume a generator frame: push w_arg (for send/next) or inject operr
 /// (for throw), then run the frame until YIELD_VALUE or RETURN_VALUE.
-fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyError>) -> PyResult {
+fn generator_send_ex(
+    gen_obj: PyObjectRef,
+    w_arg: PyObjectRef,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
         if w_generator_is_running(gen_obj) {
@@ -10751,7 +10792,7 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
         let mut pending_operr = operr;
         let mut delegated_completion = false;
         if already_started && !frame.w_yielding_from.is_null() {
-            match resume_yield_from(frame, w_arg, pending_operr.take()) {
+            match resume_yield_from(frame, w_arg, pending_operr.take(), throw_args) {
                 Ok(Some(value)) => {
                     w_generator_set_running(gen_obj, false);
                     return Ok(value);
@@ -10814,6 +10855,7 @@ fn resume_yield_from(
     frame: &mut crate::pyframe::PyFrame,
     w_arg: PyObjectRef,
     operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> Result<Option<PyObjectRef>, PyError> {
     let w_yf = frame.w_yielding_from;
     debug_assert!(!w_yf.is_null());
@@ -10824,7 +10866,7 @@ fn resume_yield_from(
             frame.w_yielding_from = pyre_object::PY_NULL;
             return Err(err);
         }
-        Some(err) => throw_yield_from(w_yf, err),
+        Some(err) => throw_yield_from(w_yf, err, throw_args),
         None if unsafe { pyre_object::is_none(w_arg) } => next(w_yf),
         None => {
             let send = getattr_str(w_yf, "send")?;
@@ -10848,10 +10890,14 @@ fn resume_yield_from(
 
 /// Delegate a thrown exception, preserving the original exception when the
 /// iterator has no `throw` method.
-fn throw_yield_from(w_yf: PyObjectRef, err: PyError) -> PyResult {
+fn throw_yield_from(
+    w_yf: PyObjectRef,
+    err: PyError,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator(w_yf) {
-            return generator_send_ex(w_yf, w_none(), Some(err));
+            return generator_send_ex(w_yf, w_none(), Some(err), throw_args);
         }
     }
     let throw = match getattr_str(w_yf, "throw") {
@@ -10859,6 +10905,11 @@ fn throw_yield_from(w_yf: PyObjectRef, err: PyError) -> PyResult {
         Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => return Err(err),
         Err(attr_err) => return Err(attr_err),
     };
+    if let Some((args, argc)) = throw_args {
+        // PEP 380 delegation forwards exactly the original positional throw
+        // arguments, rather than a synthesized exception instance.
+        return crate::call::call_function_impl_result(throw, &args[..argc]);
+    }
     let w_exc = err.to_exc_object();
     let w_type = crate::typedef::r#type(w_exc).unwrap_or(pyre_object::PY_NULL);
     crate::call::call_function_impl_result(throw, &[w_type, w_exc])
@@ -10870,7 +10921,7 @@ fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator(w_yf) {
             let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
-            return match generator_send_ex(w_yf, w_none(), Some(exit)) {
+            return match generator_send_ex(w_yf, w_none(), Some(exit), None) {
                 Ok(_) => Err(PyError::runtime_error("generator ignored GeneratorExit")),
                 Err(err)
                     if err.kind == PyErrorKind::StopIteration
@@ -10963,7 +11014,7 @@ unsafe fn leak_stopiteration(e: PyError) -> PyError {
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
 fn generator_next(gen_obj: PyObjectRef) -> PyResult {
-    generator_send_ex(gen_obj, w_none(), None)
+    generator_send_ex(gen_obj, w_none(), None, None)
 }
 
 /// __next__ method wrapper
@@ -11218,7 +11269,7 @@ fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     let value = if args.len() > 1 { args[1] } else { w_none() };
-    generator_send_ex(gen_obj, value, None)
+    generator_send_ex(gen_obj, value, None, None)
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
@@ -11233,15 +11284,19 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
     } else {
         pyre_object::PY_NULL
     };
-    let w_val = if args.len() > 2 {
-        args[2]
-    } else {
-        pyre_object::PY_NULL
-    };
-    // w_tb (args[3]) ignored for now — traceback not yet supported
+    let w_val = args.get(2).copied().unwrap_or_else(w_none);
+    let w_tb = args.get(3).copied().unwrap_or_else(w_none);
+    let argc = (args.len() - 1).clamp(1, 3);
 
+    // A non-exception argument or a normalization failure is raised to the
+    // caller; the generator is not resumed.
     let err = normalize_throw_args(w_type, w_val)?;
-    generator_send_ex(gen_obj, w_none(), Some(err))
+    generator_send_ex(
+        gen_obj,
+        w_none(),
+        Some(err),
+        Some(([w_type, w_val, w_tb], argc)),
+    )
 }
 
 /// PyPy: GeneratorIterator.descr_close()
@@ -11262,7 +11317,7 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    match generator_send_ex(gen_obj, w_none(), Some(err)) {
+    match generator_send_ex(gen_obj, w_none(), Some(err), None) {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError
             Err(PyError::runtime_error("generator ignored GeneratorExit"))
@@ -11272,6 +11327,31 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         }
         Err(e) => Err(e),
     }
+}
+
+/// generator.py:302 `_finalize_` — called by the GC finalizer when a suspended generator
+/// is collected. If the suspended frame is still live and its current instruction is
+/// covered by an exception-table handler (a `finally`/`except`/`with` cleanup), raise
+/// GeneratorExit into it so the cleanup runs.
+pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
+    unsafe {
+        use pyre_object::generator::*;
+        let frame_ptr = w_generator_get_frame(gen_obj);
+        if frame_ptr.is_null() {
+            return Ok(w_none()); // frame finished — nothing to close
+        }
+        let frame = &*(frame_ptr as *const crate::pyframe::PyFrame);
+        let last_instr = frame.last_instr;
+        if last_instr < 0 {
+            return Ok(w_none()); // not started — cannot be inside a handler
+        }
+        let code = frame.code();
+        let pc_bytes = (last_instr as u32) * 2; // last_instr is a word index; table is byte offsets
+        if crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes).is_some() {
+            return generator_close_method(&[gen_obj]);
+        }
+    }
+    Ok(w_none())
 }
 
 /// Normalize throw() arguments into a PyError.

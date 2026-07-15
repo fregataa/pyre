@@ -34,18 +34,25 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let Some(base) = (unsafe { w_tuple_getitem(bases, i as i64) }) else {
                     continue;
                 };
-                let Ok(names) = crate::baseobjspace::getattr_str(base, "__abstractmethods__")
-                else {
-                    continue;
+                // app_abc.py:67-71 — `getattr(..., set())` defaults only a
+                // missing attribute.  A descriptor failure is observable and
+                // any iterable, not just a set/frozenset, supplies names.
+                let names = match crate::baseobjspace::getattr_str(base, "__abstractmethods__") {
+                    Ok(names) => names,
+                    Err(err) if err.kind == crate::PyErrorKind::AttributeError => w_set_new(),
+                    Err(err) => return Err(err),
                 };
-                if !unsafe { is_set_or_frozenset(names) } {
-                    continue;
-                }
-                for name in unsafe { w_set_items(names) } {
-                    if let Some(value) = unsafe {
-                        crate::baseobjspace::lookup_in_type(cls, pyre_object::w_str_get_value(name))
-                    } && crate::baseobjspace::isabstractmethod_w(value)?
-                    {
+                for name in crate::builtins::collect_iterable(names)? {
+                    // `_py_abc.py:69` — object-level getattr validates that
+                    // every supplied abstract-method name is a string, then
+                    // lets descriptors and metaclass attributes provide an
+                    // implementation.  Only a missing attribute defaults.
+                    let value = match crate::baseobjspace::getattr(cls, name) {
+                        Ok(value) => value,
+                        Err(err) if err.kind == crate::PyErrorKind::AttributeError => w_none(),
+                        Err(err) => return Err(err),
+                    };
+                    if crate::baseobjspace::isabstractmethod_w(value)? {
                         abstract_names.push(name);
                     }
                 }
