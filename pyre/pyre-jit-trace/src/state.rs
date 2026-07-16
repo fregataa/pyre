@@ -1052,24 +1052,21 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 }
 
 /// Resolve the JitCode byte offset the full-body walk should RESUME at for a
-/// bridge whose guard carried `carried_jitcode_pc`. Mirrors the blackhole's
-/// `resolve_resume_pc_with_jitcode_pc` (`call_jit.rs` `resolve_jitcode`): a
-/// kept-stack branch guard resumes at its OWN mid-opcode jitcode offset (the
-/// `goto_if_not`), not the opcode-entry marker `pc_map[py_pc]` — re-executing
-/// the whole opcode from entry would read abstract-register colors dead at the
-/// guard. Returns `None` when no coordinate resolves (the caller keeps the
-/// caller declines).
-pub fn resolve_bridge_walk_entry_at(
-    jitcode_index: i32,
-    pc: i32,
-    carried_jitcode_pc: i32,
-) -> Option<usize> {
+/// bridge whose guard carried `carried_jitcode_pc`. Agrees with where the
+/// blackhole resumes (`call_jit.rs` `resolve_jitcode`): a kept-stack branch
+/// guard resumes at its OWN mid-opcode jitcode offset (the `goto_if_not`), not
+/// the opcode-entry marker — re-executing the whole opcode from entry would
+/// read abstract-register colors dead at the guard. The carried direct
+/// coordinate IS that offset, so no Python pc is consulted here. Returns `None`
+/// when the carried word does not name a decodable startpoint, which declines
+/// the bridge at the caller.
+pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32) -> Option<usize> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let jc = sd.jitcodes.get(jitcode_index as usize)?;
         jc.payload
-            .resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live)
+            .resolve_bridge_walk_entry_pc(carried_jitcode_pc, sd.op_live)
     })
 }
 
@@ -1545,7 +1542,12 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // they've been consumed and carry no pcdep entry.
         // Index the py_pc-keyed depth/pcdep tables at a resolved Python PC.
         let via_py_pc = |rp: usize| {
-            let depth = payload.metadata.depth_at_py_pc.get(rp).copied().unwrap_or(0) as usize;
+            let depth = payload
+                .metadata
+                .depth_at_py_pc
+                .get(rp)
+                .copied()
+                .unwrap_or(0) as usize;
             let pcdep = payload
                 .metadata
                 .pcdep_color_slots
@@ -1554,77 +1556,37 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 .unwrap_or_default();
             (depth, pcdep)
         };
-        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc
-            != majit_ir::resumedata::NO_JITCODE_PC
-            && jitcode_pc >= 0
-        {
-            let jp = jitcode_pc as usize;
-            // Validate with `can_decode_live_vars` — symmetric with the
-            // liveness decode in `resolve_resume_pc_with_jitcode_pc`.
-            // A non-decodable carried coordinate falls back to the
-            // merge-target PC so liveness and pcdep key the same point.
-            if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                // Decode-identity path: source depth/pcdep directly from the
-                // carried genuine `jitcode_pc` via the predecessor-keyed twins,
-                // bypassing the `python_pc_for_jitcode_pc` re-inversion. Valid
-                // exactly where the twins are populated (a colored jitcode); the
-                // equality with the py_pc tables is what `PYRE_PCMAP_BRIDGE_AUDIT`
-                // certifies. Empty twins fall through to the re-inversion.
-                let via_twin = match (
-                    payload.depth_for_jitcode_pc_pred(jp),
-                    payload.pcdep_for_jitcode_pc(jp),
-                ) {
-                    (Some(depth), Some(pcdep)) => Some((depth as usize, pcdep)),
-                    _ => None,
-                };
-                match via_twin {
-                    Some(pair) => pair,
-                    None => {
-                        let rp =
-                            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
-                                as usize;
-                        // task#50 phase-1: certify the predecessor-keyed jitcode-pc
-                        // twins reproduce the py_pc-indexed pcdep/depth this seam
-                        // reads via the re-inversion. When the carried `jitcode_pc`
-                        // resolves to `rp`, the twins keyed on `jp` must equal the
-                        // tables keyed on `rp` (both compile-time derivations of the
-                        // same coordinates). This is the precondition certificate for
-                        // the decode-identity path above. Off in production.
-                        if crate::jitcode_dispatch::bridge_audit_enabled() {
-                            if let Some(twin) = payload.pcdep_for_jitcode_pc(jp) {
-                                let via_py = payload
-                                    .metadata
-                                    .pcdep_color_slots
-                                    .get(rp)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                assert_eq!(
-                                    twin, via_py,
-                                    "pcdep_by_jit_pc diverges from pcdep_color_slots at jp={jp} rp={rp}"
-                                );
-                            }
-                            if let Some(twin_d) = payload.depth_for_jitcode_pc_pred(jp) {
-                                let via_py_d = payload
-                                    .metadata
-                                    .depth_at_py_pc
-                                    .get(rp)
-                                    .copied()
-                                    .unwrap_or(0);
-                                assert_eq!(
-                                    twin_d, via_py_d,
-                                    "depth_pred_by_jit_pc diverges from depth_at_py_pc at jp={jp} rp={rp}"
-                                );
-                            }
-                        }
-                        via_py_pc(rp)
+        let (stack_depth_at_pc, pcdep_entries) =
+            if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+                let jp = jitcode_pc as usize;
+                // Validate with `can_decode_live_vars` — symmetric with the
+                // liveness decode in `resolve_resume_pc_with_jitcode_pc`.
+                // A non-decodable carried coordinate falls back to the
+                // merge-target PC so liveness and pcdep key the same point.
+                if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                    // Decode-identity: source depth/pcdep from the carried genuine
+                    // `jitcode_pc` via the predecessor-keyed twins. Every real carried
+                    // coordinate is an op-start or block-head offset of a colored
+                    // jitcode, for which the codewriter seeds these twins; a twin miss
+                    // degrades to the merge-target PC (the same fallback the
+                    // non-decodable path uses below), keeping liveness and pcdep on one
+                    // coordinate. A portal bridge is uncolored — `pcdep_color_slots` /
+                    // `depth_at_py_pc` are empty, so `via_py_pc` returns `(0, empty)`
+                    // for any resolved py — so the merge-target fallback is identical
+                    // to the retired `python_pc_for_jitcode_pc` re-inversion there.
+                    match (
+                        payload.depth_for_jitcode_pc_pred(jp),
+                        payload.pcdep_for_jitcode_pc(jp),
+                    ) {
+                        (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
+                        _ => via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
                     }
+                } else {
+                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
                 }
             } else {
                 via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
-            }
-        } else {
-            via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
-        };
+            };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
             // is non-empty — the field-free replacement for the retired flat
@@ -1644,10 +1606,9 @@ pub(crate) fn bridge_semantic_maps_from_pc(jitcode_index: i32, pc: i32) -> Bridg
 /// resume PC of a jitcode. The pcdep color map records live Variables only;
 /// `reconstruct_inline_recipe` uses this to refill the registerless constant
 /// slots an inlined-callee guard resume leaves empty after the color→slot
-/// inversion. Keyed by the guard's Python PC — when the carried
-/// `jitcode_pc` is set, resolves through `python_pc_for_jitcode_pc` so
-/// the constant lookup uses the same coordinate as `pcdep_entries` and
-/// the liveness decode.
+/// inversion. When the carried `jitcode_pc` is set, sources the slots from the
+/// predecessor-keyed `const_ref_slots_by_jit_pc` twin so the constant lookup
+/// uses the same coordinate as `pcdep_entries` and the liveness decode.
 pub(crate) fn const_ref_slots_at_pc_at(
     jitcode_index: i32,
     pc: i32,
@@ -1667,20 +1628,19 @@ pub(crate) fn const_ref_slots_at_pc_at(
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
                 // gh#73 S3.2: source the const slots directly from the carried
-                // genuine `jitcode_pc` via the predecessor-keyed twin, bypassing
-                // the `python_pc_for_jitcode_pc` re-inversion — the same
+                // genuine `jitcode_pc` via the predecessor-keyed twin — the same
                 // decode-identity shape the pcdep/depth twins use at
                 // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
-                // returns `Some` (an empty slot list is a legitimate hit); an
-                // empty twin (skeleton / fixture) returns `None` and falls
-                // through to the re-inversion, which still keys the populated
-                // `const_ref_slots_at_pc`. Equal by construction (built in the
-                // same `by_off` loop, same predecessor keying, as the twins
-                // check.py certifies on the hot bridge path).
+                // returns `Some` (an empty slot list is a legitimate hit). A twin
+                // miss degrades to the merge-target PC (the same fallback the
+                // non-decodable path uses below) rather than the retired
+                // `python_pc_for_jitcode_pc` re-inversion; a skeleton / portal
+                // bridge has an empty `const_ref_slots_at_pc`, so both resolve to
+                // the same empty slot list.
                 if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
                     return slots;
                 }
-                crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, jp) as usize
+                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
             } else {
                 majit_ir::resumedata::decode_resume_pc(pc).0 as usize
             }
@@ -5800,16 +5760,15 @@ fn rd_virtual_at(
     rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
 }
 
-/// P2 multi-frame bridge drain (`PYRE_P2_DRAIN`, default OFF): gates the
-/// `trace.rs` carrier drain sub-walk+inject deviation. The carrier itself is
-/// installed for every `frames.len() > 1` resume (safety floor: a carrier routes
-/// a hot multi-frame guard to the `CarrierAbort` blackhole instead of the
-/// degenerate root-at-innermost-pc bridge); this gate only selects the drain
-/// driver over the default framestack path. Until the drain is net-positive the
-/// gate stays off so a carrier resume falls through to the framestack walk /
-/// clean abort.
+/// Multi-frame bridge drain (`PYRE_P2_DRAIN`, default ON; `=0` restores the
+/// framestack-walk bridge): routes a multi-frame carrier resume to the blackhole
+/// safety floor. The drain is now the default because the framestack-walk
+/// cross-frame bridge miscompiles a branchy inlined-callee continuation (a
+/// module-scope two-level inline with a mid-function branch), while the drain is
+/// net-positive on the full suite. The escape hatch keeps the framestack walk
+/// reachable pending the orthodox multi-frame reconstruction fix (#343).
 pub(crate) fn p2_drain_enabled() -> bool {
-    std::env::var_os("PYRE_P2_DRAIN").is_some()
+    std::env::var_os("PYRE_P2_DRAIN").as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 
 /// Decode one suspended inline-callee frame's resume section into a
@@ -12385,6 +12344,10 @@ mod tests {
                 depth_pred_by_jit_pc: vec![(0, 2)],
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(2))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(2))],
+                pcdep_trivia_marker_by_jit_pc: Vec::new(),
+                pcdep_trivia_pred_by_jit_pc: Vec::new(),
+                const_ref_trivia_marker_by_jit_pc: Vec::new(),
+                const_ref_trivia_pred_by_jit_pc: Vec::new(),
                 resume_marker_marker_by_jit_pc: Vec::new(),
                 resume_marker_pred_by_jit_pc: vec![(0, Some(0))],
                 after_residual_marker_marker_by_jit_pc: Vec::new(),

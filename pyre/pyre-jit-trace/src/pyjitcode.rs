@@ -136,6 +136,18 @@ pub struct PyJitCodeMetadata {
     /// skeleton / fixture.
     pub depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
+    /// Reproduces `pcdep_color_slots[skip_python_trivia_forward(
+    /// python_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
+    /// and predecessor-op-start tiers as the trivia-aware depth twin.
+    pub pcdep_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
+    /// Predecessor-op-start tier of the trivia-aware `pcdep_color_slots` twin.
+    pub pcdep_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
+    /// Reproduces `const_ref_slots_at_pc[skip_python_trivia_forward(
+    /// python_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
+    /// and predecessor-op-start tiers as the trivia-aware depth twin.
+    pub const_ref_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
+    /// Predecessor-op-start tier of the trivia-aware `const_ref_slots_at_pc` twin.
+    pub const_ref_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
     /// task#73 S5 phase-0: resume-marker twin split into the SAME two tiers as
     /// `python_pc_for_jitcode_pc` — an EXACT-match marker table
     /// (`resume_marker_marker_by_jit_pc`, block-head precedence) and a
@@ -614,6 +626,36 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
+    /// Trivia-aware pcdep color→slot list keyed by a JitCode byte offset,
+    /// resolved with exact-marker precedence and an op-start predecessor scan.
+    pub fn pcdep_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u8, u16, u16)]> {
+        let marker = &self.metadata.pcdep_trivia_marker_by_jit_pc;
+        let pred = &self.metadata.pcdep_trivia_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return Some(&marker[i].1);
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| pred[i].1.as_slice())
+    }
+
+    /// Trivia-aware const Ref slot list keyed by a JitCode byte offset,
+    /// resolved with exact-marker precedence and an op-start predecessor scan.
+    pub fn const_ref_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u16, i64)]> {
+        let marker = &self.metadata.const_ref_trivia_marker_by_jit_pc;
+        let pred = &self.metadata.const_ref_trivia_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return Some(&marker[i].1);
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| pred[i].1.as_slice())
+    }
+
     /// task#73 S5 phase-0: codewrite-time resume marker keyed by a JitCode byte
     /// offset, resolved with the SAME two tiers as `python_pc_for_jitcode_pc`:
     /// an EXACT marker match first (block-head precedence), else a PREDECESSOR
@@ -708,6 +750,23 @@ impl PyJitCode {
         }
     }
 
+    /// Resolve a kept-stack branch guard's resume offset from its carried
+    /// direct JitCode coordinate alone (gh#368: the direct coordinate is the
+    /// resume key). The full-body-walk bridge entry seam only ever reaches a
+    /// non-sentinel `carried` (both callers gate on `!= NO_JITCODE_PC`), and a
+    /// kept-stack branch guard's carried word is always a `-live-`-anchored
+    /// startpoint, so the stored Python pc is redundant here — the
+    /// `resume_jitcode_pc_for` fallback [`Self::resolve_resume_pc_with_jitcode_pc`]
+    /// keeps for other seams is dead at this one. `None` when the carried word
+    /// does not name a decodable startpoint (the caller keeps the pc_map entry).
+    pub fn resolve_bridge_walk_entry_pc(&self, carried: i32, op_live: u8) -> Option<usize> {
+        let carried = crate::jitcode_dispatch::expand_branch_carried(self, carried);
+        (carried != majit_ir::resumedata::NO_JITCODE_PC
+            && carried >= 0
+            && self.jitcode.can_decode_live_vars(carried as usize, op_live))
+        .then_some(carried as usize)
+    }
+
     /// Skeleton slot inserted by [`Self::skeleton`] — neither `code`
     /// nor the per-Python-PC maps populated yet. See the discriminator
     /// table on the module doc.
@@ -743,6 +802,10 @@ impl PyJitCode {
                 depth_pred_by_jit_pc: Vec::new(),
                 depth_trivia_marker_by_jit_pc: Vec::new(),
                 depth_trivia_pred_by_jit_pc: Vec::new(),
+                pcdep_trivia_marker_by_jit_pc: Vec::new(),
+                pcdep_trivia_pred_by_jit_pc: Vec::new(),
+                const_ref_trivia_marker_by_jit_pc: Vec::new(),
+                const_ref_trivia_pred_by_jit_pc: Vec::new(),
                 resume_marker_marker_by_jit_pc: Vec::new(),
                 resume_marker_pred_by_jit_pc: Vec::new(),
                 after_residual_marker_marker_by_jit_pc: Vec::new(),
