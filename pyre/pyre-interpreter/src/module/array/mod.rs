@@ -10,10 +10,7 @@
 
 use crate::baseobjspace::{float_w, int_w, uint_w};
 use crate::objspace::descroperation::{CompareOp, compare};
-use crate::{
-    DictStorage, PyError, PyErrorKind, PyResult, dict_storage_store,
-    make_builtin_function_with_arity,
-};
+use crate::{PyError, PyErrorKind, PyResult, make_builtin_function_with_arity, module_ns_store};
 use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
@@ -982,17 +979,22 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Register all `array.array` methods/getsets into the type namespace.
-pub fn init_array_type(ns: &mut DictStorage) {
-    dict_storage_store(
-        ns,
-        "__new__",
-        crate::typedef::make_new_descr(array_descr_new),
-    );
-    let m = |ns: &mut DictStorage,
-             name: &'static str,
-             f: fn(&[PyObjectRef]) -> PyResult,
-             arity: u16| {
-        dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
+pub fn init_array_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            crate::typedef::make_new_descr(array_descr_new),
+        )
+    };
+    let m = |ns: PyObjectRef, name: &'static str, f: fn(&[PyObjectRef]) -> PyResult, arity: u16| {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, f, arity),
+            )
+        };
     };
     m(ns, "__len__", array_len, 1);
     m(ns, "__iter__", array_iter, 1);
@@ -1019,11 +1021,13 @@ pub fn init_array_type(ns: &mut DictStorage) {
     m(ns, "insert", array_insert_method, 3);
     m(ns, "remove", array_remove_method, 2);
     // `index` accepts optional start/stop.
-    dict_storage_store(
-        ns,
-        "index",
-        crate::make_builtin_function("index", array_index_method),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "index",
+            crate::make_builtin_function("index", array_index_method),
+        )
+    };
     m(ns, "count", array_count_method, 2);
     m(ns, "clear", array_clear_method, 1);
     m(ns, "reverse", array_reverse_method, 1);
@@ -1038,54 +1042,60 @@ pub fn init_array_type(ns: &mut DictStorage) {
     m(ns, "__copy__", array_copy_method, 1);
     m(ns, "__deepcopy__", array_copy_method, 2);
     // `pop` accepts an optional index.
-    dict_storage_store(
-        ns,
-        "pop",
-        crate::make_builtin_function("pop", array_pop_method),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "pop",
+            crate::make_builtin_function("pop", array_pop_method),
+        )
+    };
     // typecode / itemsize read-only properties.
-    dict_storage_store(
-        ns,
-        "typecode",
-        pyre_object::w_property_new(
-            make_builtin_function_with_arity(
-                "typecode",
-                |args| {
-                    let tc = unsafe { arr::w_array_typecode(args[0]) } as char;
-                    Ok(pyre_object::w_str_new(&tc.to_string()))
-                },
-                1,
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "typecode",
+            pyre_object::w_property_new(
+                make_builtin_function_with_arity(
+                    "typecode",
+                    |args| {
+                        let tc = unsafe { arr::w_array_typecode(args[0]) } as char;
+                        Ok(pyre_object::w_str_new(&tc.to_string()))
+                    },
+                    1,
+                ),
+                PY_NULL,
+                PY_NULL,
             ),
-            PY_NULL,
-            PY_NULL,
-        ),
-    );
-    dict_storage_store(
-        ns,
-        "itemsize",
-        pyre_object::w_property_new(
-            make_builtin_function_with_arity(
-                "itemsize",
-                |args| {
-                    Ok(pyre_object::w_int_new(
-                        unsafe { arr::w_array_itemsize(args[0]) } as i64,
-                    ))
-                },
-                1,
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "itemsize",
+            pyre_object::w_property_new(
+                make_builtin_function_with_arity(
+                    "itemsize",
+                    |args| {
+                        Ok(pyre_object::w_int_new(
+                            unsafe { arr::w_array_itemsize(args[0]) } as i64,
+                        ))
+                    },
+                    1,
+                ),
+                PY_NULL,
+                PY_NULL,
             ),
-            PY_NULL,
-            PY_NULL,
-        ),
-    );
+        )
+    };
 }
 
 /// `array` module init — `moduledef.py interpleveldefs`.
-pub fn init_array_module(ns: &mut DictStorage) {
+pub fn init_array_module(ns: pyre_object::PyObjectRef) {
     let type_obj = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-    dict_storage_store(ns, "array", type_obj);
-    dict_storage_store(ns, "ArrayType", type_obj);
-    dict_storage_store(ns, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
-    dict_storage_store(
+    module_ns_store(ns, "array", type_obj);
+    module_ns_store(ns, "ArrayType", type_obj);
+    module_ns_store(ns, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
+    module_ns_store(
         ns,
         "_array_reconstructor",
         crate::make_builtin_function("_array_reconstructor", array_reconstructor),

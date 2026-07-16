@@ -356,16 +356,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
         }
     }
-    if unsafe { pyre_object::w_type_is_heaptype(obj_addr as pyre_object::PyObjectRef) } {
-        f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    } else {
-        pyre_interpreter::eval::type_walk_namespace_values(
-            obj_addr as pyre_object::PyObjectRef,
-            &mut |slot: &mut pyre_object::PyObjectRef| {
-                f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-            },
-        );
-    }
+    f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Reclaim the two Rust-owned, out-of-line containers of a swept heap type.
@@ -479,6 +470,14 @@ unsafe fn dict_object_destructor(obj_addr: usize) {
     }
 }
 
+/// Sweep-time destructor for `W_ModuleDictObject`: reclaim the three
+/// off-GC storage Boxes (`dstorage`/`mstrategy`/`object_storage`) the GC
+/// does not own.  Mirrors `dict_object_destructor`.
+unsafe fn module_dict_object_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    unsafe { pyre_object::dictmultiobject::w_module_dict_dealloc_storage(obj) };
+}
+
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
@@ -542,10 +541,6 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///     Rc<RefCell<GlobalCache>>>>) — every live cache's `cell`
 ///   * `object_storage` → post-`switch_to_object_strategy`
 ///     Vec<(PyObjectRef, PyObjectRef)> — both halves of every entry
-///
-/// `dict_storage_proxy` points at a `DictStorage` (interpreter-side
-/// allocation, not GC-managed) and is traced through its W_DictObject
-/// counterpart, not from here.
 unsafe fn module_dict_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
@@ -1918,11 +1913,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // after `switch_to_object_strategy`).  Register a custom trace
     // hook so the GC walks all three indirect storages — matching
     // the W_DictObject pattern at line 851.
-    let w_module_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
-        object_tid,
-        module_dict_object_custom_trace,
-    ));
+    let w_module_dict_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
+            object_tid,
+            module_dict_object_custom_trace,
+        )
+        .with_destructor_fn(module_dict_object_destructor),
+    );
     debug_assert_eq!(w_module_dict_tid, W_MODULE_DICT_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,

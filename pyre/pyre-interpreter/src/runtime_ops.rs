@@ -11,8 +11,8 @@ use pyre_object::{
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::{
-    DictStorage, PyError, PyErrorKind, builtin_code_get, function_get_code, is_builtin_code,
-    is_function, w_code_get_ptr,
+    PyError, PyErrorKind, builtin_code_get, function_get_code, is_builtin_code, is_function,
+    w_code_get_ptr,
 };
 
 /// `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the new
@@ -118,7 +118,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     // varname)`.  Dispatch through the dict strategy on the object
     // (`dictmultiobject.py:113-115 getitem_str`) so module dicts
     // (celldict cells) and plain dicts (exec/eval globals) are both
-    // handled without requiring a dict_storage_proxy.  Mirrors the
+    // handled directly. Mirrors the
     // interpreter `load_global_value` (eval.rs).
     if !w_globals.is_null() {
         if let Some(v) =
@@ -1023,31 +1023,39 @@ pub fn flat_build_helper(kind: FlatBuildKind, count: usize) -> Option<*const ()>
     }
 }
 
-pub fn dict_storage_get(namespace: &DictStorage, name: &str) -> Option<PyObjectRef> {
-    namespace.get(name).copied()
+/// Look up an entry in a proxy-free GC module/namespace dict.
+pub fn module_ns_get(ns: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(ns, name) }
 }
 
-pub fn dict_storage_load(namespace: &DictStorage, name: &str) -> Result<PyObjectRef, PyError> {
-    dict_storage_get(namespace, name)
-        .ok_or_else(|| PyError::name_error_with_name(format!("name '{name}' is not defined"), name))
+/// Store into a proxy-free GC module/namespace dict (successor to
+/// `dict_storage_store` for migrated namespaces). `ns` must be a
+/// non-moving module dict so the by-value handle stays valid across stores.
+pub fn module_ns_store(ns: PyObjectRef, name: &str, value: PyObjectRef) {
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) }
 }
 
-pub fn dict_storage_store(namespace: &mut DictStorage, name: &str, value: PyObjectRef) {
-    namespace.insert(name.to_string(), value);
+pub fn module_ns_store_wtf8(ns: PyObjectRef, name: &Wtf8, value: PyObjectRef) {
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(ns, name, value) }
 }
 
-/// WTF-8 keyed store — surrogate-safe sibling of [`dict_storage_store`].
-pub fn dict_storage_store_wtf8(namespace: &mut DictStorage, name: &Wtf8, value: PyObjectRef) {
-    namespace.insert_wtf8(name.to_wtf8_buf(), value);
+pub fn module_ns_delete(ns: PyObjectRef, name: &str) -> bool {
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, name) }
 }
 
-pub fn dict_storage_delete(namespace: &mut DictStorage, name: &str) -> bool {
-    namespace.remove(name).is_some()
+/// WTF-8 keyed delete from a proxy-free GC module/namespace dict.
+pub fn module_ns_delete_wtf8(ns: PyObjectRef, name: &Wtf8) -> bool {
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_wtf8_no_proxy(ns, name) }
 }
 
-/// WTF-8 keyed deletion — surrogate-safe sibling of [`dict_storage_delete`].
-pub fn dict_storage_delete_wtf8(namespace: &mut DictStorage, name: &Wtf8) -> bool {
-    namespace.remove_wtf8(name).is_some()
+/// Run and store `f()` only when `name` is absent from a GC namespace dict.
+pub fn module_ns_get_or_insert_with(ns: PyObjectRef, name: &str, f: impl FnOnce() -> PyObjectRef) {
+    unsafe {
+        if pyre_object::dictmultiobject::w_dict_getitem_str(ns, name).is_none() {
+            let value = f();
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value);
+        }
+    }
 }
 
 fn type_dict_ptr(cls: PyObjectRef) -> *mut u8 {
@@ -1063,11 +1071,7 @@ pub fn type_dict_lookup(cls: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if dict.is_null() {
         return None;
     }
-    let value = if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-        unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name)? }
-    } else {
-        unsafe { (*(dict as *mut DictStorage)).get(name).copied()? }
-    };
+    let value = unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name)? };
     if value.is_null() { None } else { Some(value) }
 }
 
@@ -1076,11 +1080,7 @@ pub fn type_dict_lookup_wtf8(cls: PyObjectRef, name: &Wtf8) -> Option<PyObjectRe
     if dict.is_null() {
         return None;
     }
-    let value = if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-        unsafe { pyre_object::w_dict_getitem_wtf8(dict as PyObjectRef, name)? }
-    } else {
-        unsafe { (*(dict as *mut DictStorage)).get_wtf8(name).copied()? }
-    };
+    let value = unsafe { pyre_object::w_dict_getitem_wtf8(dict as PyObjectRef, name)? };
     if value.is_null() { None } else { Some(value) }
 }
 
@@ -1089,11 +1089,7 @@ pub fn type_dict_contains(cls: PyObjectRef, name: &str) -> bool {
     if dict.is_null() {
         return false;
     }
-    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-        unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name).is_some() }
-    } else {
-        unsafe { (*(dict as *mut DictStorage)).get(name).is_some() }
-    }
+    unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name).is_some() }
 }
 
 pub fn type_dict_store(cls: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
@@ -1101,11 +1097,7 @@ pub fn type_dict_store(cls: PyObjectRef, name: &str, value: PyObjectRef) -> bool
     if dict.is_null() {
         return false;
     }
-    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict as PyObjectRef, name, value) };
-    } else {
-        unsafe { dict_storage_store(&mut *(dict as *mut DictStorage), name, value) };
-    }
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict as PyObjectRef, name, value) };
     true
 }
 
@@ -1114,11 +1106,7 @@ pub fn type_dict_store_wtf8(cls: PyObjectRef, name: &Wtf8, value: PyObjectRef) -
     if dict.is_null() {
         return false;
     }
-    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-        unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(dict as PyObjectRef, name, value) };
-    } else {
-        unsafe { dict_storage_store_wtf8(&mut *(dict as *mut DictStorage), name, value) };
-    }
+    unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(dict as PyObjectRef, name, value) };
     true
 }
 
@@ -1127,11 +1115,7 @@ pub fn type_dict_delete(cls: PyObjectRef, name: &str) -> bool {
     if dict.is_null() {
         return false;
     }
-    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-        unsafe { pyre_object::w_dict_delitem_str_no_proxy(dict as PyObjectRef, name) }
-    } else {
-        unsafe { dict_storage_delete(&mut *(dict as *mut DictStorage), name) }
-    }
+    unsafe { pyre_object::w_dict_delitem_str_no_proxy(dict as PyObjectRef, name) }
 }
 
 pub fn type_dict_delete_wtf8(cls: PyObjectRef, name: &Wtf8) -> bool {
@@ -1139,11 +1123,7 @@ pub fn type_dict_delete_wtf8(cls: PyObjectRef, name: &Wtf8) -> bool {
     if dict.is_null() {
         return false;
     }
-    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-        unsafe { pyre_object::w_dict_delitem_wtf8_no_proxy(dict as PyObjectRef, name) }
-    } else {
-        unsafe { dict_storage_delete_wtf8(&mut *(dict as *mut DictStorage), name) }
-    }
+    unsafe { pyre_object::w_dict_delitem_wtf8_no_proxy(dict as PyObjectRef, name) }
 }
 
 pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
