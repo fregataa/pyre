@@ -8207,6 +8207,24 @@ fn fbw_loadattr_fold_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_STOREATTR_FOLD` — gate the full-body-walker STORE_ATTR fast path
+/// ([`try_walker_specialize_store_attr`]).  When on, a plain same-type unboxed
+/// integer store folds to guards + a non-forcing raw longlong-list write
+/// instead of the forcing `setattr_fn` residual (dropping the force token,
+/// vable spill, and the value re-box).  Default ON (`0`/`false` opts out as the
+/// kill switch, independent of the read fold since the write executes a
+/// concrete heap mutation).
+fn fbw_storeattr_fold_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STOREATTR_FOLD") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_LOADMETHOD_FOLD` — gate the full-body-walker method-cache fold.
 /// When on, a monomorphic `obj.method(...)` dispatch folds the LOAD_ATTR
 /// method lookup to a constant descriptor plus guards, and folds the paired
@@ -17900,67 +17918,19 @@ fn try_walker_specialize_unpack(
     }
 }
 
-/// `mapdict.py:1479-1537 LOAD_ATTR_caching` full-body-walker fast path for a
-/// plain (non-method) instance attribute.  When the concrete receiver is a
-/// monomorphic instance whose attribute resolves to a boxed plain storage slot,
-/// emit the inline read PyPy compiles LOAD_ATTR to under the JIT —
-///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
-///     (so the `map`/`storage` field reads below are valid; `mapdict.py:1495`
-///     `if map is not None:` also filters non-instances at trace time).
-///   * `guard_value(getfield_gc_i(w_type, version_tag), C_version_tag)` — pins
-///     the class lookup result so a later descriptor or `__getattribute__`
-///     mutation deopts on trace re-entry.
-///   * `guard_value(getfield_gc_i(obj, map), C_map)` — `jit.promote(self.map)`
-///     (`mapdict.py:905`); pins the exact instance shape so `find_map_attr`
-///     const-folds `storageindex` to a green constant.
-///   * `getfield_gc_r(obj, storage)` + `getarrayitem_gc_r(block, C_index)` —
-///     the inline value read `mapdict.py:914-916 _mapdict_read_storage`.
-/// — instead of the opaque `getattr_fn` `CALL_MAY_FORCE` MRO-walk residual.
-///
-/// Returns `Some(())` after writing the dst; `None` (fall through to the
-/// residual) for every shape [`load_attr_fast_path`] declines: non-instance
-/// receiver, missing map, custom `__getattribute__`, uncacheable `version_tag`,
-/// a data-descriptor / `INVALID` classification, an attribute not on this
-/// instance's map, or an unboxed slot (whose read boxes a longlong, not a plain
-/// fetch).  The map `guard_value` proves the attribute is present on this shape,
-/// so a successful fold provably cannot raise `AttributeError` — dropping the
-/// residual's exception guard is sound even in a handler-bearing body (same
-/// reasoning as the LoadGlobal fold).
-#[allow(clippy::too_many_arguments)]
-fn try_walker_specialize_load_attr(
+/// Guard the fixed-layout instance representation, the receiver type's live
+/// version tag, and the exact map shape used by the mapdict attribute folds.
+/// `INSTANCE_TYPE` proves the receiver has `W_ObjectObject` fields; the
+/// promoted map identity pins its class and storage coordinates
+/// (mapdict.py:905-906).
+fn walker_guard_mapdict_instance_shape(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
     obj: OpRef,
-    w_code_ptr: usize,
-    name_idx: usize,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
-        return Ok(None);
-    }
-    // The receiver must be a concrete instance for the map/storageindex
-    // resolution below; a non-concrete or non-instance receiver declines.
-    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
-        return Ok(None);
-    };
-    // Resolve the attribute name from the jitcode's own PyCode `co_names`
-    // (mirrors `bh_load_attr_fn`; the codewriter passes the raw co_names index).
-    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
-        return Ok(None);
-    };
-    // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
-    // read is left to the caller so it can be folded to a guarded inline read).
-    let Some((w_type, version_tag, map, storageindex)) = (unsafe {
-        pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
-    }) else {
-        return Ok(None);
-    };
-
-    // guard_class(obj, &INSTANCE_TYPE): the receiver is a `W_ObjectObject`, so
-    // its `map`/`storage` fields lie at the fixed offsets read below.  Instances
-    // all share `ob_type == &INSTANCE_TYPE` (the class identity lives in
-    // `w_class`); the map `guard_value` then pins the exact class + layout.
+    w_type: pyre_object::PyObjectRef,
+    version_tag: u64,
+    map: pyre_interpreter::objspace::std::mapdict::MapRef,
+) -> Result<(), DispatchError> {
     let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(instance_type_addr);
@@ -17972,8 +17942,8 @@ fn try_walker_specialize_load_attr(
 
     // The instance map pins the storage layout, but class mutation can change
     // lookup precedence without changing that map. Re-read the receiver type's
-    // live version tag at every trace entry and deopt before the inline storage
-    // read when it changes.
+    // live version tag at every trace entry and deopt before the folded storage
+    // access when it changes.
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     let version_op = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
@@ -18000,14 +17970,14 @@ fn try_walker_specialize_load_attr(
     // constant — i.e. a prior promotion in this trace pinned it via
     // `replace_box`.  It must NOT be elided merely because `box_value(map_op)`
     // reports the concrete map: every traced getfield op carries its live value
-    // (`opimpl_getfield_gc_i` → `set_opref_concrete`, `history.py:803`
+    // (`opimpl_getfield_gc_i` -> `set_opref_concrete`, `history.py:803`
     // FrontendOp), so `box_value == map` holds for the very first read and
     // would drop the guard on the trace's entry.  A trace whose map guard is
     // dropped reads `storage[storageindex]` off any same-class receiver whose
     // map differs (GuardClass alone does not pin the layout), returning a wild
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
-    // `implement_guard_value`, `trace_opcode.rs:4631-4633`).
+    // `implement_guard_value`).
     let map_op =
         crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
     if !map_op.is_constant() {
@@ -18017,19 +17987,153 @@ fn try_walker_specialize_load_attr(
             .heap_cache_mut()
             .replace_box(map_op, map_const);
     }
+    Ok(())
+}
 
-    // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
-    // the inline value read (`mapdict.py:914-916`).  `storageindex` is a green
-    // constant (the map guard pinned it); `trace_items_block_getitem_value`
-    // stamps the dst's concrete shadow from the live block slot.
-    let block = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        obj,
-        crate::descr::object_storage_descr(),
-    );
-    let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
-    let value = crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+/// `mapdict.py:1479-1537 LOAD_ATTR_caching` full-body-walker fast path for a
+/// plain (non-method) instance attribute.  When the concrete receiver is a
+/// monomorphic instance whose attribute resolves to a boxed plain storage slot
+/// or an unboxed integer/float slot, emit the guarded read PyPy compiles
+/// LOAD_ATTR to under the JIT —
+///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
+///     (so the `map`/`storage` field reads below are valid; `mapdict.py:1495`
+///     `if map is not None:` also filters non-instances at trace time).
+///   * `guard_value(getfield_gc_i(w_type, version_tag), C_version_tag)` — pins
+///     the class lookup result so a later descriptor or `__getattribute__`
+///     mutation deopts on trace re-entry.
+///   * `guard_value(getfield_gc_i(obj, map), C_map)` — `jit.promote(self.map)`
+///     (`mapdict.py:905`); pins the exact instance shape so `find_map_attr`
+///     const-folds `storageindex` to a green constant.
+///   * boxed: `getfield_gc_r(obj, storage)` +
+///     `getarrayitem_gc_r(block, C_index)` for
+///     `mapdict.py:914-916 _mapdict_read_storage`;
+///   * unboxed int/float: a non-forcing typed read plus `wrapint`/`wrapfloat`,
+///     matching `_prim_direct_read` (mapdict.py:577-584, 600-601).
+/// — instead of the opaque `getattr_fn` `CALL_MAY_FORCE` MRO-walk residual.
+///
+/// Returns `Some(())` after writing the dst; `None` (fall through to the
+/// residual) for every shape [`load_attr_fast_path`] declines: non-instance
+/// receiver, missing map, custom `__getattribute__`, uncacheable `version_tag`,
+/// a data-descriptor / `INVALID` classification, or an attribute not on this
+/// instance's map.  The map `guard_value` proves the attribute is present on
+/// this shape, so a successful fold provably cannot raise `AttributeError` —
+/// dropping the residual's exception guard is sound even in a handler-bearing
+/// body (same reasoning as the LoadGlobal fold).
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_load_attr(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+        return Ok(None);
+    }
+    // The receiver must be a concrete instance for the map/storageindex
+    // resolution below; a non-concrete or non-instance receiver declines.
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    // Resolve the attribute name from the jitcode's own PyCode `co_names`
+    // (mirrors `bh_load_attr_fn`; the codewriter passes the raw co_names index).
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
+    // read is left to the caller so it can be folded to a guarded inline read).
+    if let Some((w_type, version_tag, map, storageindex)) = unsafe {
+        pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
+    } {
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+
+        // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
+        // the inline value read (`mapdict.py:914-916`).  `storageindex` is a green
+        // constant (the map guard pinned it); `trace_items_block_getitem_value`
+        // stamps the dst's concrete shadow from the live block slot.
+        let block = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            obj,
+            crate::descr::object_storage_descr(),
+        );
+        let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
+        let value = crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
+    }
+
+    let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+
+    // `_prim_direct_read` (mapdict.py:600-601): read the raw longlong from the
+    // shared list through a non-forcing, non-elidable residual.  Both indices
+    // are green constants pinned by the map guard; keeping boxing in the trace
+    // lets an immediate integer consumer virtualize it away.
+    let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
+    let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
+    let live = unsafe {
+        pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
+            concrete_obj,
+            storageindex,
+            listindex,
+        )
+    };
+    let boxed = match unbox_type {
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+            let raw = crate::helpers::emit_trace_call_int_typed(
+                ctx.trace_ctx,
+                crate::helpers::jit_mapdict_unboxed_read_raw as *const (),
+                &[obj, storageindex_const, listindex_const],
+                &[
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ],
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(live));
+            let boxed = walker_box_int(ctx, op_pc, raw, live)?;
+            // The `wrapint` op is a heap box, so its concrete must be a heap ptr too:
+            // box the raw longlong through the same `w_int_new` the unboxed read uses
+            // (mapdict.py:579-584 `_box`); `box_int_concrete` re-homes a tagged small
+            // int to a fresh heap `W_IntObject` so op(NewWithVtable) == concrete(heap).
+            // Without this stamp the boxed result carries no concrete, so a downstream
+            // eager void residual (e.g. the STORE_ATTR that writes `self.value`) cannot
+            // resolve its value arg and the walk aborts `ResidualCallArgUnbound`.
+            let live_ptr = pyre_object::w_int_new(live) as i64;
+            ctx.trace_ctx
+                .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+            boxed
+        }
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+            let raw = crate::helpers::emit_trace_call_float_typed(
+                ctx.trace_ctx,
+                crate::helpers::jit_mapdict_unboxed_read_f as *const (),
+                &[obj, storageindex_const, listindex_const],
+                &[
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ],
+            );
+            let live_f = f64::from_bits(live as u64);
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
+            let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::w_float_new(live_f) as usize)),
+            );
+            boxed
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
 
@@ -18267,6 +18371,148 @@ fn try_walker_fold_load_method_self(
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, bound_op)?;
     Ok(Some(()))
+}
+
+/// STORE_ATTR mirror of [`try_walker_specialize_load_attr`] for an existing
+/// unboxed integer or float slot.  Recognition proves the plain mapdict write
+/// cannot invoke Python or raise; the returned descriptor/arglist replaces only
+/// the residual helper and effect.  The caller deliberately continues through
+/// the generic residual recorder/executor so concrete execution, body-effect
+/// tracking, and rollback semantics remain identical to the generic setattr
+/// path (mapdict.py:577-584, 615-619).
+fn try_walker_specialize_store_attr(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    value: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    original_effect: &majit_ir::EffectInfo,
+) -> Result<Option<(DescrRef, Vec<OpRef>)>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk {
+        return Ok(None);
+    }
+    let (Some(concrete_obj), Some(concrete_value)) = (
+        walker_concrete_ref_object(ctx, obj),
+        walker_concrete_ref_object(ctx, value),
+    ) else {
+        return Ok(None);
+    };
+    let name = unsafe {
+        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+        if code_ptr.is_null() {
+            return Ok(None);
+        }
+        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
+            Some(n) => n.to_string(),
+            None => return Ok(None),
+        }
+    };
+    if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = unsafe {
+        pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
+    } {
+        match unbox_type {
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+                // `type(w_value) is space.IntObjectCls` (mapdict.py:615): reject bool
+                // and every type-changing value before emitting any guards.
+                if unsafe {
+                    pyre_object::pyobject::is_bool(concrete_value)
+                        || !pyre_object::pyobject::is_int(concrete_value)
+                } {
+                    return Ok(None);
+                }
+            }
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+                // A non-float changes the slot to boxed storage and freezes further
+                // unboxing (mapdict.py:615-619), so retain setattr.
+                if !unsafe { pyre_object::pyobject::is_float(concrete_value) } {
+                    return Ok(None);
+                }
+            }
+        }
+
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+        let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
+        let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
+        let (helper_fn, raw, value_type) = match unbox_type {
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
+                (
+                    crate::helpers::jit_mapdict_unboxed_write_raw as *const (),
+                    raw,
+                    majit_ir::Type::Int,
+                )
+            }
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+                let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+                let raw = walker_unbox_float(ctx, op_pc, value, float_type_addr)?;
+                let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
+                (
+                    crate::helpers::jit_mapdict_unboxed_write_f as *const (),
+                    raw,
+                    majit_ir::Type::Float,
+                )
+            }
+        };
+        let helper = ctx.trace_ctx.const_int(helper_fn as usize as i64);
+
+        let mut effect = original_effect.clone();
+        effect.extraeffect = majit_ir::ExtraEffect::CannotRaise;
+        effect.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
+        let descr = majit_metainterp::make_call_descr_with_effect(
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                value_type,
+            ],
+            majit_ir::Type::Void,
+            effect,
+        );
+        // ABI order follows the write helpers: receiver and the two guarded green
+        // coordinates, then the raw symbolic value in its own bank.  No box is
+        // materialized for this write.
+        return Ok(Some((
+            descr,
+            vec![helper, obj, storageindex_const, listindex_const, raw],
+        )));
+    }
+
+    let Some((w_type, version_tag, map, storageindex)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::store_attr_boxed_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+    let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
+    let helper = ctx
+        .trace_ctx
+        .const_int(crate::helpers::jit_mapdict_boxed_write as *const () as usize as i64);
+
+    // Unlike the unboxed arm, this write stores a GC reference, so the
+    // residual's original may-force effect is kept: only the opaque `setattr_fn`
+    // MRO walk is replaced by the direct slot write, while the force token, the
+    // virtualizable spill, and the trailing force/exception guards stay exactly
+    // as the generic setattr emitted them.
+    let mut effect = original_effect.clone();
+    effect.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
+    let descr = majit_metainterp::make_call_descr_with_effect(
+        &[
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Ref,
+        ],
+        majit_ir::Type::Void,
+        effect,
+    );
+    // ABI order follows `jit_mapdict_boxed_write`: receiver, guarded green
+    // storage index, and the original symbolic object reference.  The value is
+    // neither unboxed nor guarded by type.
+    Ok(Some((descr, vec![helper, obj, storageindex_const, value])))
 }
 
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`
@@ -21761,13 +22007,14 @@ fn dispatch_residual_call_iIRd_kind(
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
     let descr_offset = 1 + i_width + r_width;
     let descr_index = decode_descr_index(code, op, descr_offset);
-    let descr = read_descr(code, op, descr_offset, ctx)?;
-    let call_descr = descr
-        .as_call_descr()
-        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
-            pc: op.pc,
-            descr_index,
-        })?;
+    let mut descr = read_descr(code, op, descr_offset, ctx)?;
+    let original_call_descr =
+        descr
+            .as_call_descr()
+            .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+                pc: op.pc,
+                descr_index,
+            })?;
     let descr_key = descr.index();
     // Void shape `_ir_v/iIRd` (`pyjitpl.py:1351 opimpl_residual_call_ir_v =
     // _opimpl_residual_call2`) has no `>X` dst byte; see
@@ -21787,7 +22034,58 @@ fn dispatch_residual_call_iIRd_kind(
     argbox_types.extend(std::iter::repeat(Type::Int).take(i_args.len()));
     argboxes.extend_from_slice(&r_args);
     argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
-    let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
+    let mut allboxes = build_allboxes(
+        funcptr,
+        &argboxes,
+        &argbox_types,
+        original_call_descr.arg_types(),
+    );
+
+    // STORE_ATTR fold (mapdict.py:1591-1653): recognize an existing unboxed
+    // integer slot and replace only the generic setattr residual's helper,
+    // arguments, and effect.  The transformed CallN continues through the
+    // ordinary record + concrete-execute path below; unsupported receivers,
+    // descriptors, custom hooks, absent/boxed/float slots, and type-changing
+    // values retain the original CallMayForceN unchanged.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && original_call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreAttr
+        && fbw_storeattr_fold_enabled()
+    {
+        if let (Some(&obj_opref), Some(&value_opref), Some(&code_opref), Some(&namei_opref)) =
+            (r_args.first(), r_args.get(1), r_args.get(2), i_args.first())
+        {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+                Some(majit_ir::Value::Int(namei)),
+            ) = (
+                ctx.trace_ctx.box_value(code_opref),
+                ctx.trace_ctx.box_value(namei_opref),
+            ) {
+                if let Some((specialized_descr, specialized_allboxes)) =
+                    try_walker_specialize_store_attr(
+                        ctx,
+                        op.pc,
+                        obj_opref,
+                        value_opref,
+                        w_code_ptr,
+                        namei as usize,
+                        original_call_descr.get_extra_info(),
+                    )?
+                {
+                    descr = specialized_descr;
+                    allboxes = specialized_allboxes;
+                }
+            }
+        }
+    }
+
+    let call_descr = descr
+        .as_call_descr()
+        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
 
     let ei = call_descr.get_extra_info();
     clear_walk_exception(ctx);

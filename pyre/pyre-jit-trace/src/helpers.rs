@@ -62,6 +62,19 @@ pub fn emit_trace_call_int_typed(
     ctx.call_int_typed_with_effect(helper, args, arg_types, default_effect_info())
 }
 
+/// Float-bank counterpart of [`emit_trace_call_int_typed`], recording a `CallF`
+/// for a helper whose C ABI returns its `f64` in a floating-point register.
+/// Carries the same conservative `default_effect_info()`, so the two differ only
+/// in the result bank.
+pub fn emit_trace_call_float_typed(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+) -> OpRef {
+    ctx.call_float_typed_with_effect(helper, args, arg_types, default_effect_info())
+}
+
 /// `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes, descr,
 /// exc=False, pure=True)` parity for direct trace emit paths.
 ///
@@ -243,6 +256,117 @@ pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
     unsafe {
         pyre_interpreter::objspace::std::mapdict::read_boxed_storage(w_obj, storageindex as usize)
             as i64
+    }
+}
+
+/// Non-forcing boxed write for an existing mapdict attribute.  The guarded
+/// instance class and exact map pin the storage index, and a boxed slot accepts
+/// the incoming object reference directly (mapdict.py:446-447).  A torn
+/// recording with a null/non-instance receiver is a defensive no-op.
+pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: i64) {
+    let w_obj = w_obj as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::write_boxed_storage(
+            w_obj,
+            storageindex as usize,
+            value as PyObjectRef,
+        );
+    }
+}
+
+/// Raw unboxed counterpart of [`jit_mapdict_read`].  The guarded map pins the
+/// shared longlong-list coordinates, so this non-forcing helper performs only
+/// `_prim_direct_read`'s storage read (mapdict.py:600-601); boxing stays in the
+/// trace so an immediate consumer can virtualize it away.  Null receiver /
+/// non-instance returns zero only for a torn recording.
+pub extern "C" fn jit_mapdict_unboxed_read_raw(
+    w_obj: i64,
+    storageindex: i64,
+    listindex: i64,
+) -> i64 {
+    let w_obj = w_obj as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return 0;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
+            w_obj,
+            storageindex as usize,
+            listindex as usize,
+        )
+    }
+}
+
+/// Float-bank counterpart of [`jit_mapdict_unboxed_read_raw`].  Unboxed float
+/// storage already contains the value's IEEE-754 bit pattern, so this helper
+/// performs the raw read and reconstructs the float (mapdict.py:577-584).
+/// Null receiver / non-instance returns zero only for a torn recording.
+pub extern "C" fn jit_mapdict_unboxed_read_f(w_obj: i64, storageindex: i64, listindex: i64) -> f64 {
+    let w_obj = w_obj as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return 0.0;
+    }
+    unsafe {
+        f64::from_bits(
+            pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
+                w_obj,
+                storageindex as usize,
+                listindex as usize,
+            ) as u64,
+        )
+    }
+}
+
+/// Non-forcing raw write for a mapdict unboxed attribute.  The full-body
+/// walker has already guarded the receiver's instance class and exact map,
+/// and proved that the incoming value is an integer, so this is only the
+/// same-type longlong-list update (mapdict.py:615-619).  A torn recording can
+/// reach the wrapper with a null/non-instance receiver; keep that defensive
+/// path a no-op.
+pub extern "C" fn jit_mapdict_unboxed_write_raw(
+    w_obj: i64,
+    storageindex: i64,
+    listindex: i64,
+    raw: i64,
+) {
+    let w_obj = w_obj as usize as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::write_unboxed_storage_raw(
+            w_obj,
+            storageindex as usize,
+            listindex as usize,
+            raw,
+        );
+    }
+}
+
+/// Float-bank counterpart of [`jit_mapdict_unboxed_write_raw`].  A same-type
+/// float update writes its IEEE-754 bit pattern to the existing longlong-list
+/// slot (mapdict.py:615-619).  A torn recording with a null/non-instance
+/// receiver is a defensive no-op.
+pub extern "C" fn jit_mapdict_unboxed_write_f(
+    w_obj: i64,
+    storageindex: i64,
+    listindex: i64,
+    value: f64,
+) {
+    let w_obj = w_obj as usize as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::write_unboxed_storage_raw(
+            w_obj,
+            storageindex as usize,
+            listindex as usize,
+            value.to_bits() as i64,
+        );
     }
 }
 
