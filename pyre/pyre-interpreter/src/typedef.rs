@@ -8420,12 +8420,25 @@ fn init_staticmethod_type(ns: PyObjectRef) {
             "__new__",
             make_builtin_function("__new__", |args| {
                 // staticmethod(func) — args[0] is cls (staticmethod type), args[1] is func
+                let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let func = if args.len() > 1 {
                     args[1]
                 } else {
                     pyre_object::w_none()
                 };
-                Ok(pyre_object::function::w_staticmethod_new(func))
+                let sm = pyre_object::function::w_staticmethod_new(func);
+                // function.py `allocate_instance(StaticMethod, w_subtype)` —
+                // honour the subtype so `abstractstaticmethod(func)` yields an
+                // `abstractstaticmethod` instance, not a bare `staticmethod`.
+                let staticmethod_type =
+                    crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
+                if !cls.is_null() && !std::ptr::eq(cls, staticmethod_type) {
+                    check_user_subclass(staticmethod_type, cls)?;
+                    unsafe {
+                        (*sm).w_class = cls;
+                    }
+                }
+                Ok(sm)
             }),
         )
     };
@@ -8540,12 +8553,25 @@ fn init_classmethod_type(ns: PyObjectRef) {
             ns,
             "__new__",
             make_builtin_function("__new__", |args| {
+                let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let func = if args.len() > 1 {
                     args[1]
                 } else {
                     pyre_object::w_none()
                 };
-                Ok(pyre_object::function::w_classmethod_new(func))
+                let cm = pyre_object::function::w_classmethod_new(func);
+                // function.py `allocate_instance(ClassMethod, w_subtype)` —
+                // honour the subtype so `abstractclassmethod(func)` yields an
+                // `abstractclassmethod` instance, not a bare `classmethod`.
+                let classmethod_type =
+                    crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
+                if !cls.is_null() && !std::ptr::eq(cls, classmethod_type) {
+                    check_user_subclass(classmethod_type, cls)?;
+                    unsafe {
+                        (*cm).w_class = cls;
+                    }
+                }
+                Ok(cm)
             }),
         )
     };
@@ -8747,6 +8773,41 @@ fn init_property_type(ns: PyObjectRef) {
                 "__delete__",
                 crate::baseobjspace::property_descr_delete_impl,
             ),
+        )
+    };
+    // descriptor.py `__isabstractmethod__` — `isabstract(fget) or
+    // isabstract(fset) or isabstract(fdel)`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__isabstractmethod__",
+            make_getset_descriptor(make_builtin_function_with_arity(
+                "__isabstractmethod__",
+                |args| {
+                    let prop = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                    if !unsafe { pyre_object::descriptor::is_property(prop) } {
+                        return Ok(pyre_object::w_bool_from(false));
+                    }
+                    // A missing accessor is `PY_NULL`; treat it as not-abstract.
+                    let is_abstract = |f: PyObjectRef| -> Result<bool, crate::PyError> {
+                        if f.is_null() {
+                            Ok(false)
+                        } else {
+                            crate::baseobjspace::isabstractmethod_w(f)
+                        }
+                    };
+                    let result =
+                        is_abstract(unsafe { pyre_object::descriptor::w_property_get_fget(prop) })?
+                            || is_abstract(unsafe {
+                                pyre_object::descriptor::w_property_get_fset(prop)
+                            })?
+                            || is_abstract(unsafe {
+                                pyre_object::descriptor::w_property_get_fdel(prop)
+                            })?;
+                    Ok(pyre_object::w_bool_from(result))
+                },
+                2,
+            )),
         )
     };
 }
