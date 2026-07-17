@@ -481,6 +481,13 @@ pub struct FbwWalkMode {
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
     pub carrier_resume: bool,
+    /// Bridge-entry view of `ExecutionContext.sys_exc_value` reconstructed
+    /// from the failing guard's pending setfield.  The walk is temporally
+    /// displaced from the guard failure, so live TLS is not a valid source
+    /// until a walked SETFIELD replaces this seed.
+    pub current_exception_seed: Option<OpRef>,
+    /// Concrete shadow paired with [`FbwWalkMode::current_exception_seed`].
+    pub current_exception_seed_concrete: pyre_object::PyObjectRef,
 }
 
 impl Default for FbwWalkMode {
@@ -489,6 +496,8 @@ impl Default for FbwWalkMode {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
             carrier_resume: false,
+            current_exception_seed: None,
+            current_exception_seed_concrete: pyre_object::PY_NULL,
         }
     }
 }
@@ -2719,6 +2728,13 @@ pub fn dispatch_via_miframe(
             inline_callee_consts: None,
             fbw_mode: FbwWalkMode {
                 snapshot_sym: sym_ptr,
+                current_exception_seed: (trace_ctx.is_bridge_trace && !sym.last_exc_box.is_none())
+                    .then_some(sym.last_exc_box),
+                current_exception_seed_concrete: if trace_ctx.is_bridge_trace {
+                    sym.last_exc_value
+                } else {
+                    pyre_object::PY_NULL
+                },
                 ..Default::default()
             },
             session,
@@ -3233,6 +3249,9 @@ fn drive_bridge_frame_subwalk(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
+                current_exception_seed: (!root_sym.last_exc_box.is_none())
+                    .then_some(root_sym.last_exc_box),
+                current_exception_seed_concrete: root_sym.last_exc_value,
             },
             session,
             registers_r: &mut regs_r,
@@ -3576,6 +3595,9 @@ pub(crate) fn drive_outer_frame_continuation(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
+                current_exception_seed: (!root_sym.last_exc_box.is_none())
+                    .then_some(root_sym.last_exc_box),
+                current_exception_seed_concrete: root_sym.last_exc_value,
             },
             session,
             registers_r: &mut regs_r,
@@ -9672,6 +9694,12 @@ thread_local! {
     /// pyre's nested-residual decline below is a local protection for
     /// FOREIGN unjournaled residuals.
     static SELFREC_CA_FOLD_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The bounded `str(exc)` / `repr(exc)` descriptor inline may retain an
+    /// interior residual such as `repr(self.args)`. The caller's original
+    /// iteration already supplied the concrete result, while the compiled
+    /// trace executes that residual once on later iterations, so the generic
+    /// nested-replay decline does not apply to this resolved descriptor path.
+    static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Scoped setter for [`SELFREC_CA_FOLD_ACTIVE`]. Restores the prior value so
@@ -9697,6 +9725,27 @@ impl Drop for SelfRecCaFoldGuard {
     }
 }
 
+struct ExceptionStringInlineGuard {
+    prior: bool,
+}
+
+impl ExceptionStringInlineGuard {
+    fn enter() -> Self {
+        let prior = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| {
+            let prior = c.get();
+            c.set(true);
+            prior
+        });
+        Self { prior }
+    }
+}
+
+impl Drop for ExceptionStringInlineGuard {
+    fn drop(&mut self) {
+        EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.set(self.prior));
+    }
+}
+
 fn fbw_abort_nested_unjournaled_residual(
     ctx: &WalkContext<'_, '_>,
     pc: usize,
@@ -9713,7 +9762,12 @@ fn fbw_abort_nested_unjournaled_residual(
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
     // nested-decline guard, which is for FOREIGN unjournaled residuals.
     let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
-    if enabled && !in_selfrec_fold && !ctx.session.borrow().framestack.is_empty() {
+    let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
+    if enabled
+        && !in_selfrec_fold
+        && !in_exception_string_inline
+        && !ctx.session.borrow().framestack.is_empty()
+    {
         let (outer_resume_py_pc, stack_overrides) = {
             let session = ctx.session.borrow();
             match session.framestack.first().and_then(|f| f.parent.as_ref()) {
@@ -14316,6 +14370,58 @@ fn method_form_callee_body_supported(body_code: &[u8], callee_descr_refs: &[Desc
     true
 }
 
+/// Whether sampling an exception string override before recording can have no
+/// app-visible effect. Portal-frame vable traffic and constant/int boxing are
+/// local; branches, other calls, and live-heap writes decline the sample.
+fn exception_string_override_sample_safe(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            return false;
+        }
+        if d.opname.starts_with("residual_call") {
+            let kind = residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs);
+            if !matches!(
+                kind,
+                Some(majit_ir::PyreHelperKind::LoadConst | majit_ir::PyreHelperKind::BoxInt)
+            ) {
+                return false;
+            }
+        } else if d.opname.starts_with("setfield_gc")
+            || d.opname.starts_with("setarrayitem_gc")
+            || d.opname.starts_with("setinteriorfield_gc")
+            || d.opname.starts_with("raw_store")
+            || d.opname.starts_with("cond_call")
+            || d.opname.starts_with("call_assembler")
+            || d.opname.starts_with("inline_call")
+        {
+            return false;
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
+/// The bounded builtin-dispatch route only admits a straight-line app-level
+/// override. A control-flow-bearing method stays on the original residual
+/// dispatch path, where the interpreter owns its frame and branch semantics.
+fn exception_string_override_straight_line(body_code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            return false;
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
 /// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
 /// (#68).  The fast-path inline predicate guarantees the callee does not own a
 /// virtualizable (any vable op declines the inline), so the owns_vable /
@@ -15126,6 +15232,66 @@ fn try_walker_inline_user_call(
     else {
         return Ok(None);
     };
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        callable,
+        r_args[0],
+        callable,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        method_form,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        false,
+        false,
+    )
+}
+
+type ExceptionInlineReceiverGuard = (
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    u64,
+);
+
+/// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
+/// resolve their callee from the CALL operand; builtin-dispatch specializers
+/// resolve an app-level descriptor first and enter here with that function as
+/// the callee while independently pinning the original builtin callable.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_resolved_user_call(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    callable: pyre_object::PyObjectRef,
+    callable_guard_op: OpRef,
+    callable_guard_value: pyre_object::PyObjectRef,
+    arg_concretes: Vec<ConcreteValue>,
+    callee_args: Vec<OpRef>,
+    callee_arg_concretes: Vec<ConcreteValue>,
+    method_form: bool,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+    exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
+    allow_method_load_attr: bool,
+    require_str_result: bool,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Only exact-positional, closure-free calls: every callee local [0..nparams]
     // is bound from a passed arg, none from defaults/varargs/cells.
     if has_closure || callee_args.len() != nparams {
@@ -15181,7 +15347,10 @@ fn try_walker_inline_user_call(
     {
         return Ok(None);
     }
-    if method_form && !method_form_callee_body_supported(body.code, callee_descr_refs) {
+    if method_form
+        && !allow_method_load_attr
+        && !method_form_callee_body_supported(body.code, callee_descr_refs)
+    {
         return Ok(None);
     }
     if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
@@ -15342,11 +15511,26 @@ fn try_walker_inline_user_call(
     // CALL boundary (single outer Python frame — re-execute the whole
     // call on deopt), captured via `fbw_mode.inline_subwalk` for
     // the sub-walk guards below.
-    let callable_opref = r_args[0];
-    let callable_expected = ctx.trace_ctx.const_ref(callable as usize as i64);
-    if !callable_opref.is_constant() {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_opref, callable_expected], 0);
+    if let Some((receiver, concrete_receiver, w_class, version_tag)) = exception_receiver_guard {
+        walker_guard_exception_attr_slot(
+            ctx,
+            op.pc,
+            receiver,
+            concrete_receiver,
+            w_class,
+            version_tag,
+        )?;
+    }
+
+    let callable_expected = ctx
+        .trace_ctx
+        .const_ref(callable_guard_value as usize as i64);
+    if !callable_guard_op.is_constant() {
+        ctx.trace_ctx.record_guard(
+            OpCode::GuardValue,
+            &[callable_guard_op, callable_expected],
+            0,
+        );
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
@@ -16040,6 +16224,29 @@ fn try_walker_inline_user_call(
             result: Some(value),
         } => {
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+            if require_str_result
+                && !matches!(
+                    concrete_for_shadow,
+                    ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) }
+                )
+            {
+                // descroperation.py checks the app-level result before
+                // returning from `space.str` / `space.repr`. Re-run the
+                // original builtin call at the caller boundary so the
+                // interpreter raises its faithful TypeError; the inlined
+                // body has no committed concrete effect at this point.
+                if is_top_inline
+                    && !unjournaled_before_subwalk
+                    && fbw_executed_effect_count() == executed_effects_before
+                {
+                    if let Some(call_pc) = abort_flush_call_py_pc {
+                        if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
+                            fbw_set_abort_call_resume(call_pc, stack);
+                        }
+                    }
+                }
+                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            }
             match dst_bank {
                 'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
                 'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
@@ -16099,6 +16306,154 @@ fn try_walker_inline_user_call(
         }
         other => Ok(Some((other, op.next_pc))),
     }
+}
+
+/// Route `str(exc)` / `repr(exc)` through an app-level exception override.
+/// Pyre's exact `str` type call follows `str_descr_new` → `builtin_str` →
+/// `exc_user_dunder_obj`; the builtin `repr` follows `builtin_repr` →
+/// `py_repr_obj`. Both paths look up the receiver dunder before builtin
+/// exception formatting. This is the walker counterpart of
+/// `descroperation.py`'s `space.lookup` + `get_and_call_function`: pin the
+/// promoted exception class, then enter the ordinary resolved-callee inline
+/// plumbing with the receiver as `self`.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_exception_string_override(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let Some(concrete_callable) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if walker_concrete_ref_object(ctx, r_args[1]).is_some() {
+        return Ok(None);
+    }
+    let Some(concrete_receiver) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_exception(concrete_receiver) } {
+        return Ok(None);
+    }
+
+    let dunder = if std::ptr::eq(
+        concrete_callable,
+        pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::STR_TYPE),
+    ) {
+        "__str__"
+    } else if pyre_interpreter::builtins::is_builtin_repr_function(concrete_callable) {
+        "__repr__"
+    } else {
+        return Ok(None);
+    };
+
+    let w_class = unsafe { (*concrete_receiver).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return Ok(None);
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
+    else {
+        return Ok(None);
+    };
+    let Some(base_exception) = pyre_interpreter::builtins::lookup_exc_class("BaseException") else {
+        return Ok(None);
+    };
+    let Some(default_method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base_exception, dunder) })
+    else {
+        return Ok(None);
+    };
+    if std::ptr::eq(method, default_method) {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !exception_string_override_straight_line(body.code) {
+        return Ok(None);
+    }
+
+    // A straight-line, effect-free override can be sampled before any IR is
+    // emitted. If its observed result is not a string, decline to the original
+    // builtin residual so the interpreter's result check raises TypeError and
+    // the exception-handler loop remains traceable. More complex bodies are
+    // not executed speculatively; their inlined result is guarded below.
+    if let (Some(body), Some((callee_descr_refs, _, _))) = (
+        crate::state::sub_jitcode_body_for_code(w_code),
+        crate::state::sub_jitcode_descr_pool_for_code(w_code),
+    ) {
+        if exception_string_override_sample_safe(body.code, callee_descr_refs) {
+            let sampled = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(method, &[concrete_receiver])
+            };
+            let sampled_is_acceptable = matches!(sampled, Ok(result)
+                if !result.is_null() && unsafe { pyre_object::is_str(result) });
+            if !sampled_is_acceptable {
+                return Ok(None);
+            }
+        }
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_receiver),
+    ];
+    let _exception_string_inline = ExceptionStringInlineGuard::enter();
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        r_args[0],
+        concrete_callable,
+        arg_concretes,
+        vec![r_args[2]],
+        vec![ConcreteValue::Ref(concrete_receiver)],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((r_args[2], concrete_receiver, w_class, version_tag)),
+        true,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        let result = ctx.registers_r[dst];
+        let str_type = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+        let str_type_const = ctx.trace_ctx.const_int(str_type);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[result, str_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(result, str_type);
+    }
+    Ok(Some(inlined))
 }
 
 fn dispatch_residual_call_iRd_kind(
@@ -16175,6 +16530,18 @@ fn dispatch_residual_call_iRd_kind(
         dst,
     )? {
         return Ok(inlined);
+    }
+
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+    {
+        if let Some(inlined) = try_walker_inline_exception_string_override(
+            ctx, op, code, funcptr, &r_args, call_descr, dst,
+        )? {
+            return Ok(inlined);
+        }
     }
 
     // #62: a self-recursive call the inline path declined (e.g. the
@@ -16558,6 +16925,30 @@ fn dispatch_residual_call_iRd_kind(
         && try_walker_trace_exception_new(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && fbw_raise_enabled()
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
+        && r_args.is_empty()
+        && ctx.fbw_mode.current_exception_seed.is_some()
+    {
+        let seed = ctx.fbw_mode.current_exception_seed.unwrap();
+        let concrete = ctx.fbw_mode.current_exception_seed_concrete;
+        if !concrete.is_null() && unsafe { pyre_object::is_exception(concrete) } {
+            // `RAISE_VARARGS 0` may use the normalizing nullary helper rather
+            // than the raw current-exception helper.  A bridge seed is already
+            // a live BaseException, so the helper's successful result is the
+            // pending fieldbox itself; retaining that OpRef keeps the value
+            // loop-variant in the bridge namespace.
+            ctx.trace_ctx.set_opref_concrete(
+                seed,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+            );
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', seed)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
     }
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
@@ -18374,6 +18765,110 @@ fn try_walker_specialize_load_attr(
         return Ok(Some(()));
     }
 
+    if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
+        pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, false)
+    } {
+        if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args
+            && unsafe { (*(stored as *const pyre_object::listobject::W_ListObject)).strategy }
+                != pyre_object::listobject::ListStrategy::Object
+        {
+            return Ok(None);
+        }
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let raw_value = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            obj,
+            crate::descr::w_exception_slot_descr(kind, slot),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
+        ctx.trace_ctx.set_opref_concrete(
+            raw_value,
+            majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
+        );
+        let value = if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
+            let list = unsafe { &*(stored as *const pyre_object::listobject::W_ListObject) };
+            if list.strategy != pyre_object::listobject::ListStrategy::Object {
+                return Ok(None);
+            }
+            let list_type = &pyre_object::LIST_TYPE as *const pyre_object::PyType as i64;
+            if !ctx.trace_ctx.heap_cache().is_class_known(raw_value) {
+                let type_const = ctx.trace_ctx.const_int(list_type);
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardClass,
+                    &[raw_value, type_const],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(raw_value, list_type);
+            }
+            walker_guard_exact_w_class(
+                ctx,
+                op_pc,
+                raw_value,
+                pyre_object::get_instantiate(&pyre_object::LIST_TYPE),
+            )?;
+            let strategy = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                raw_value,
+                crate::descr::list_strategy_descr(),
+            );
+            let object_strategy = ctx
+                .trace_ctx
+                .const_int(pyre_object::listobject::ListStrategy::Object as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[strategy, object_strategy],
+            )?;
+            let len = unsafe { pyre_object::w_list_len(stored) };
+            let length = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                raw_value,
+                crate::descr::list_length_descr(),
+            );
+            let len_const = ctx.trace_ctx.const_int(len as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[length, len_const],
+            )?;
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                raw_value,
+                crate::descr::list_items_descr(),
+            );
+            let mut items = Vec::with_capacity(len);
+            let mut concrete_items = Vec::with_capacity(len);
+            for index in 0..len {
+                let index_op = ctx.trace_ctx.const_int(index as i64);
+                items.push(crate::state::trace_items_block_getitem_value(
+                    ctx.trace_ctx,
+                    block,
+                    index_op,
+                ));
+                concrete_items.push(
+                    unsafe { pyre_object::w_list_getitem(stored, index as i64) }
+                        .unwrap_or(pyre_object::PY_NULL),
+                );
+            }
+            let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items);
+            let concrete_tuple = pyre_object::w_tuple_new(concrete_items);
+            ctx.trace_ctx.set_opref_concrete(
+                tuple,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
+            );
+            tuple
+        } else {
+            raw_value
+        };
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
+    }
+
     let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, &name)
     }) else {
@@ -18445,6 +18940,61 @@ fn try_walker_specialize_load_attr(
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
+}
+
+/// Pin every branch input preceding a raw typed exception-slot arm.
+/// `GuardClass` fixes the kind-specific `W_BaseException` layout and kind tag;
+/// `GuardValue(getfield(w_class))` distinguishes heap subclasses sharing that
+/// layout; and the class `version_tag` guard pins the preceding type-dict miss.
+/// Exception `w_dict` lookup follows these arms in `baseobjspace.rs`, so it is
+/// intentionally not part of the guard set.  This is the same promoted-class
+/// lookup shape used by the mapdict folds (`mapdict.py`).
+fn walker_guard_exception_attr_slot(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    version_tag: u64,
+) -> Result<(), DispatchError> {
+    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(physical_type);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, physical_type);
+    }
+    let live_w_class =
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
+    let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[live_w_class, w_class_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(live_w_class, w_class_const);
+
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let live_version = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[live_version, version_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(live_version, version_const);
+    Ok(())
 }
 
 fn walker_load_name_from_code(w_code_ptr: usize, name_idx: usize) -> Option<String> {
@@ -18690,6 +19240,11 @@ fn try_walker_fold_load_method_self(
 /// the generic residual recorder/executor so concrete execution, body-effect
 /// tracking, and rollback semantics remain identical to the generic setattr
 /// path (mapdict.py:577-584, 615-619).
+enum WalkerStoreAttrSpecialization {
+    Residual(DescrRef, Vec<OpRef>),
+    Direct,
+}
+
 fn try_walker_specialize_store_attr(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -18698,7 +19253,7 @@ fn try_walker_specialize_store_attr(
     w_code_ptr: usize,
     name_idx: usize,
     original_effect: &majit_ir::EffectInfo,
-) -> Result<Option<(DescrRef, Vec<OpRef>)>, DispatchError> {
+) -> Result<Option<WalkerStoreAttrSpecialization>, DispatchError> {
     if !ctx.is_authoritative_executor || !ctx.is_full_body_walk {
         return Ok(None);
     }
@@ -18786,10 +19341,144 @@ fn try_walker_specialize_store_attr(
         // ABI order follows the write helpers: receiver and the two guarded green
         // coordinates, then the raw symbolic value in its own bank.  No box is
         // materialized for this write.
-        return Ok(Some((
+        return Ok(Some(WalkerStoreAttrSpecialization::Residual(
             descr,
             vec![helper, obj, storageindex_const, listindex_const, raw],
         )));
+    }
+
+    if let Some((slot, kind, w_type, version_tag, _stored)) = unsafe {
+        pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, true)
+    } {
+        if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
+            let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType;
+            let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+            if !unsafe {
+                std::ptr::eq((*concrete_value).ob_type, tuple_type)
+                    && std::ptr::eq((*concrete_value).w_class, canonical_tuple_class)
+            } {
+                return Ok(None);
+            }
+        }
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let (stored_value, concrete_stored) =
+            if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
+                let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType;
+                let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+                if !unsafe {
+                    std::ptr::eq((*concrete_value).ob_type, tuple_type)
+                        && std::ptr::eq((*concrete_value).w_class, canonical_tuple_class)
+                } {
+                    return Ok(None);
+                }
+                let tuple_type_addr = tuple_type as i64;
+                if !ctx.trace_ctx.heap_cache().is_class_known(value) {
+                    let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op_pc,
+                        OpCode::GuardClass,
+                        &[value, type_const],
+                    )?;
+                    ctx.trace_ctx
+                        .heap_cache_mut()
+                        .class_now_known(value, tuple_type_addr);
+                }
+                walker_guard_exact_w_class(ctx, op_pc, value, canonical_tuple_class)?;
+                let block = crate::state::opimpl_getfield_gc_r(
+                    ctx.trace_ctx,
+                    value,
+                    crate::descr::tuple_wrappeditems_descr(),
+                );
+                let len = unsafe { pyre_object::w_tuple_len(concrete_value) };
+                let length = crate::state::opimpl_arraylen_gc(
+                    ctx.trace_ctx,
+                    block,
+                    crate::state::pyobject_gcarray_descr(),
+                );
+                let len_const = ctx.trace_ctx.const_int(len as i64);
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardValue,
+                    &[length, len_const],
+                )?;
+                let mut items = Vec::with_capacity(len);
+                let mut concrete_items = Vec::with_capacity(len);
+                for index in 0..len {
+                    let index_op = ctx.trace_ctx.const_int(index as i64);
+                    items.push(crate::state::trace_items_block_getitem_value(
+                        ctx.trace_ctx,
+                        block,
+                        index_op,
+                    ));
+                    concrete_items.push(
+                        unsafe { pyre_object::w_tuple_getitem(concrete_value, index as i64) }
+                            .unwrap_or(pyre_object::PY_NULL),
+                    );
+                }
+                let list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &items);
+                let concrete_list = pyre_object::w_list_new_object(concrete_items);
+                ctx.trace_ctx.set_opref_concrete(
+                    list,
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_list as usize)),
+                );
+                (list, concrete_list)
+            } else {
+                (value, concrete_value)
+            };
+        let field_descr = crate::descr::w_exception_slot_descr(kind, slot);
+        let field_index = field_descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[obj, stored_value], field_descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(obj, field_index, stored_value);
+        // The walk is the authoritative execution path.  Apply the same raw
+        // slot writer now so interpreter execution after a side exit observes
+        // the store; the writer supplies the host-side remembered-set barrier.
+        // Compiled SetfieldGc reference stores receive CondCallGcWb from
+        // majit-gc's rewrite pass, consumed by both dynasm and cranelift.
+        unsafe {
+            match slot {
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args => {
+                    pyre_object::interp_exceptions::w_exception_set_args(
+                        concrete_obj,
+                        concrete_stored,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => {
+                    pyre_object::interp_exceptions::w_exception_set_code(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Errno => {
+                    pyre_object::interp_exceptions::w_exception_set_errno(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Strerror => {
+                    pyre_object::interp_exceptions::w_exception_set_strerror(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename => {
+                    pyre_object::interp_exceptions::w_exception_set_filename(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename2 => {
+                    pyre_object::interp_exceptions::w_exception_set_filename2(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+            }
+        }
+        return Ok(Some(WalkerStoreAttrSpecialization::Direct));
     }
 
     let Some((w_type, version_tag, map, storageindex)) = (unsafe {
@@ -18822,7 +19511,10 @@ fn try_walker_specialize_store_attr(
     // ABI order follows `jit_mapdict_boxed_write`: receiver, guarded green
     // storage index, and the original symbolic object reference.  The value is
     // neither unboxed nor guarded by type.
-    Ok(Some((descr, vec![helper, obj, storageindex_const, value])))
+    Ok(Some(WalkerStoreAttrSpecialization::Residual(
+        descr,
+        vec![helper, obj, storageindex_const, value],
+    )))
 }
 
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`
@@ -20195,7 +20887,8 @@ fn try_walker_specialize_subscr_tuple(
     Ok(Some(()))
 }
 
-/// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject`:
+/// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject` /
+/// `W_TupleObject`:
 /// lower the opaque `bh_call_fn(len_builtin, PY_NULL, x)` residual to the
 /// inline length read the meta-tracer produces upstream
 /// (descroperation.py:294 `_len`): `guard_value(callable)` +
@@ -20203,14 +20896,16 @@ fn try_walker_specialize_subscr_tuple(
 /// `wrapint`.  For a list this reads `W_ListObject.length()` →
 /// `strategy.length`, so it additionally emits `guard_value(strategy)`
 /// (rlist.py); for a str it reads the codepoint field directly
-/// (`W_UnicodeObject.len` → `bh_unicodelen`, no storage strategy).  The
+/// (`W_UnicodeObject.len` → `bh_unicodelen`, no storage strategy); for a
+/// tuple it reads `wrappeditems` and applies `arraylen_gc`, matching
+/// `tupleobject.py` where the tuple carries no separate length field. The
 /// exact `w_class` guard is required because a SUBCLASS shares
-/// `ob_type == &LIST_TYPE`/`&STR_TYPE` but may override `__len__`
+/// `ob_type == &LIST_TYPE`/`&STR_TYPE`/`&TUPLE_TYPE` but may override `__len__`
 /// (`baseobjspace::len` dispatches `subclass_special_override`); it
 /// side-exits to the generic residual.
 ///
 /// Returns `None` (fall through to the generic residual, SAFE) for any
-/// other shape: non-list/str arg, a subclass, empty-strategy list, a
+/// other shape: non-list/str/tuple arg, a subclass, empty-strategy list, a
 /// bound receiver, or wrong arity.
 fn try_walker_specialize_builtin_len(
     ctx: &mut WalkContext<'_, '_>,
@@ -20240,10 +20935,10 @@ fn try_walker_specialize_builtin_len(
     if !pyre_interpreter::builtins::is_builtin_len_function(concrete_callable) {
         return Ok(None);
     }
-    // Exact canonical list / str only (see the doc comment on the subclass
+    // Exact canonical list / str / tuple only (see the doc comment on the subclass
     // `__len__` hazard).  `arg_type_addr` / `exact_w_class` pin the guard
-    // target; `is_str` selects the length path.
-    let (arg_type_addr, exact_w_class, is_str) = unsafe {
+    // target; the booleans select the length path.
+    let (arg_type_addr, exact_w_class, is_str, is_tuple) = unsafe {
         if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::LIST_TYPE)
             && std::ptr::eq(
                 (*list_obj).w_class,
@@ -20253,6 +20948,7 @@ fn try_walker_specialize_builtin_len(
             (
                 &pyre_object::pyobject::LIST_TYPE as *const _ as i64,
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+                false,
                 false,
             )
         } else if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
@@ -20265,17 +20961,32 @@ fn try_walker_specialize_builtin_len(
                 &pyre_object::pyobject::STR_TYPE as *const _ as i64,
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
                 true,
+                false,
+            )
+        } else if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE)
+            && std::ptr::eq(
+                (*list_obj).w_class,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+            )
+        {
+            (
+                &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+                false,
+                true,
             )
         } else {
             return Ok(None);
         }
     };
     // Length source: str reads the codepoint field directly (no storage
-    // strategy); list resolves its storage strategy (guarded below).  `sid`
-    // is `None` for str.
+    // strategy); tuple reads the wrappeditems GcArray header; list resolves
+    // its storage strategy (guarded below). `sid` is `None` for str/tuple.
     let (sid, concrete_len) = unsafe {
         if is_str {
             (None, pyre_object::w_str_len(list_obj))
+        } else if is_tuple {
+            (None, pyre_object::w_tuple_len(list_obj))
         } else {
             let concrete_len = pyre_object::w_list_len(list_obj);
             let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
@@ -20331,7 +21042,7 @@ fn try_walker_specialize_builtin_len(
     // strategy's length field (rlist.py:116 inline field for object storage;
     // typed items-block length for int/float storage).  str: a plain
     // codepoint-length getfield (no strategy, `bh_unicodelen`).
-    let len_descr = if let Some(sid) = sid {
+    let raw_len = if let Some(sid) = sid {
         let strategy = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
             list_op,
@@ -20344,15 +21055,26 @@ fn try_walker_specialize_builtin_len(
         ctx.trace_ctx
             .heap_cache_mut()
             .replace_box(strategy, sid_const);
-        match sid {
+        let len_descr = match sid {
             0 => crate::descr::list_length_descr(),
             1 => crate::descr::list_int_items_len_descr(),
             _ => crate::descr::list_float_items_len_descr(),
-        }
+        };
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr)
+    } else if is_tuple {
+        let wrappeditems = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::tuple_wrappeditems_descr(),
+        );
+        crate::state::opimpl_arraylen_gc(
+            ctx.trace_ctx,
+            wrappeditems,
+            crate::state::pyobject_gcarray_descr(),
+        )
     } else {
-        crate::descr::str_len_descr()
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, crate::descr::str_len_descr())
     };
-    let raw_len = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     ctx.trace_ctx
         .set_opref_concrete(raw_len, majit_ir::Value::Int(concrete_len as i64));
     let boxed = walker_box_int(ctx, op.pc, raw_len, concrete_len as i64)?;
@@ -20860,9 +21582,9 @@ fn try_walker_orthodox_list_append_opcode(
     Ok(Some(()))
 }
 
-/// B3 (`PYRE_FBW_RAISE`): walker-native port of the trait's
-/// [`try_trace_exception_new`] (`trace_opcode.rs:7228`).  A `Type(args)`
-/// `CallFn` residual for a *canonical* builtin exception class becomes a
+/// B3 (`PYRE_FBW_RAISE`): walker-native exception-construction fold.  A
+/// `Type(args)` `CallFn` residual for a canonical builtin exception class or
+/// a heap subclass with the same `__new__` / `__init__` descriptors becomes a
 /// traced `NewWithVtable` + `SetfieldGc` (kind / w_class / args_w) the
 /// optimizer can virtualize when the exception never escapes, instead of
 /// the opaque `bh_call_fn` constructor residual + its
@@ -20876,10 +21598,16 @@ fn try_walker_orthodox_list_append_opcode(
 /// fast path; writes the trace-time concrete exception into the dst
 /// shadow so the `raise/r` GUARD_CLASS reads it.
 ///
-/// Returns `None` (fall through to the generic residual) for any
-/// non-matching shape: a user subclass (whose `__init__` may run Python
-/// code), a non-trivial-args kind (OSError / Unicode errors store extra
-/// fields), or a null concrete arg.
+/// PyPy's `W_TypeObject.descr_call` promotes the class, then resolves
+/// `__new__` and `__init__` through its versioned MRO
+/// (`typeobject.py:703-735`).  When both resolve to
+/// `W_BaseException.descr_new` / `descr_init`
+/// (`interp_exceptions.py:76-126`), a trivial subclass has the same traced
+/// allocation and `args_w` store as its builtin base; only `w_class` differs.
+///
+/// Returns `None` (fall through to the generic residual) for any non-matching
+/// shape: an overriding or uncacheable subclass, a non-trivial-args kind
+/// (OSError / Unicode errors store extra fields), or a null concrete arg.
 fn try_walker_trace_exception_new(
     ctx: &mut WalkContext<'_, '_>,
     code: &[u8],
@@ -20921,12 +21649,70 @@ fn try_walker_trace_exception_new(
     if !is_exc_class || concrete_args.iter().any(|a| a.is_null()) {
         return Ok(None);
     }
-    // Reject user subclasses: their Python `__init__` would run
-    // concretely an extra time per trace attempt (a user-visible side
-    // effect).  Canonical per-kind classes have a pure Rust `descr_init`.
-    if !pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable) {
-        return Ok(None);
+
+    // Decide the final runtime `args_w` list strategy and extract typed
+    // payloads.  OSError can rebind the list after parsing a filename, so its
+    // final slice is selected below after the concrete constructor exposes the
+    // value-dependent branch result.  The shared typed-list emitter reproduces
+    // `w_list_new`'s Integer layout, allowing the common `SystemExit(i)` shape
+    // to virtualize alongside message-bearing Object lists.  Other strategies
+    // retain the safe residual fallback.
+    enum ArgsEmit {
+        Object,
+        Int(Vec<i64>),
     }
+
+    let is_canonical = pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable);
+    let mut subclass_lookups = None;
+    let subclass_version_tag = if is_canonical {
+        None
+    } else {
+        // A heap subclass is safe to construct concretely only after both MRO
+        // lookups have been proved identical to a canonical exception class.
+        // Consequently force_plain_eval below can execute only the builtin
+        // Rust `descr_new` / `descr_init`, never user Python code.  This is the
+        // promoted-class lookup contract of typeobject.py:703-735.
+        if !unsafe { pyre_object::typeobject::w_type_is_heaptype(concrete_callable) } {
+            return Ok(None);
+        }
+        let version_tag =
+            unsafe { pyre_object::typeobject::w_type_get_version_tag(concrete_callable) };
+        if version_tag == 0 {
+            return Ok(None);
+        }
+        let Some(class_new) = (unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(concrete_callable, "__new__")
+        }) else {
+            return Ok(None);
+        };
+        let Some(class_init) = (unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(concrete_callable, "__init__")
+        }) else {
+            return Ok(None);
+        };
+        let matches_canonical = (0..pyre_object::interp_exceptions::EXC_KIND_COUNT).any(|disc| {
+            // ExcKind is repr(u8) with contiguous discriminants through
+            // EXC_KIND_COUNT, as required by the kind-indexed registry.
+            let candidate_kind: pyre_object::interp_exceptions::ExcKind =
+                unsafe { std::mem::transmute(disc as u8) };
+            let candidate =
+                pyre_object::interp_exceptions::lookup_exc_class_for_kind(candidate_kind);
+            if candidate.is_null() {
+                return false;
+            }
+            unsafe {
+                pyre_interpreter::baseobjspace::lookup_in_type(candidate, "__new__")
+                    == Some(class_new)
+                    && pyre_interpreter::baseobjspace::lookup_in_type(candidate, "__init__")
+                        == Some(class_init)
+            }
+        });
+        if !matches_canonical {
+            return Ok(None);
+        }
+        subclass_lookups = Some((class_new, class_init));
+        Some(version_tag)
+    };
     // Build the exception concretely on the plain eval loop (no tracer
     // re-entry) to read its kind and confirm a flat builtin instance.
     // Trace-time only; discarded after the read.
@@ -20941,30 +21727,135 @@ fn try_walker_trace_exception_new(
         }
         pyre_object::interp_exceptions::w_exception_get_kind(exc)
     };
-    // Only the canonical per-kind builtin class maps to the flat
-    // NewWithVtable layout.
-    if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_callable {
+    let canonical_class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
+    if is_canonical {
+        // Preserve the canonical arm's registry identity check.
+        if canonical_class != concrete_callable {
+            return Ok(None);
+        }
+    } else {
+        // The pre-construction descriptor check excludes Python execution;
+        // repeat it for the concrete result's eventual kind so aliases whose
+        // builtin wrapper produces a different physical kind still decline.
+        let Some((class_new, class_init)) = subclass_lookups else {
+            return Ok(None);
+        };
+        if canonical_class.is_null()
+            || unsafe {
+                pyre_interpreter::baseobjspace::lookup_in_type(canonical_class, "__new__")
+                    != Some(class_new)
+                    || pyre_interpreter::baseobjspace::lookup_in_type(canonical_class, "__init__")
+                        != Some(class_init)
+            }
+        {
+            return Ok(None);
+        }
+    }
+    // `exc_new_wrapper` retags only `w_class`; the physical layout remains
+    // the eventual kind's builtin pytype for canonical classes and subclasses.
+    let exc_type_ptr = unsafe {
+        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+            .ob_header
+            .ob_type
+    };
+    if !std::ptr::eq(
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+    ) {
         return Ok(None);
     }
-    // Kinds whose `descr_init` stores extra fields (OSError errno /
-    // strerror / filename; Unicode errors' object / start / end / reason
-    // / encoding) cannot be rebuilt from kind / w_class / args_w alone.
-    if !kind.has_trivial_args_constructor() {
-        return Ok(None);
-    }
-    // The walker builds `args_w` inline only for the Object strategy (the
-    // whole list virtualizes alongside the exception).  Empty / Integer /
-    // Float strategies would need a residual `trace_build_list` (a fresh
-    // may-force) the walker has no helper for, so decline them BEFORE
-    // emitting any IR — they fall through to the generic constructor
-    // residual (SAFE, just unoptimized).  `ValueError("msg")` and the
-    // common message-bearing builtins use the Object strategy.
-    if pyre_object::listobject::list_strategy_for(&concrete_args)
-        != pyre_object::listobject::ListStrategy::Object
-    {
+    let is_os_error_family = matches!(
+        kind,
+        pyre_object::interp_exceptions::ExcKind::OSError
+            | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+    );
+    // `W_OSError._parse_init_args` / `_init_error`
+    // (`interp_exceptions.py`) fill the flattened slots only for 2..=5
+    // arguments.  Outside that range the ordinary args-only emit is exact.
+    // Unicode constructors still require their dedicated parsing and remain
+    // residual.
+    let fills_os_error_slots = is_os_error_family && (2..=5).contains(&args.len());
+    if !kind.has_trivial_args_constructor() && !is_os_error_family {
         return Ok(None);
     }
 
+    let exact_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
+        .is_some_and(|w_os_error| std::ptr::eq(concrete_callable, w_os_error));
+    if fills_os_error_slots && exact_os_error {
+        // PyPy traces the errno-to-subclass lookup with a loop-variant errno.
+        // The flat NewWithVtable emit needs a constant w_class, so pinning the
+        // unboxed errno deliberately creates per-errno traces/bridges.
+        let errno = concrete_args[0];
+        let exact_int = pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(errno)
+            || unsafe {
+                pyre_object::is_plain_int1(errno)
+                    && std::ptr::eq(
+                        (*errno).ob_type,
+                        &pyre_object::pyobject::INT_TYPE as *const _,
+                    )
+            };
+        if !exact_int {
+            return Ok(None);
+        }
+    }
+
+    let concrete_w_class = unsafe { (*exc).w_class };
+    let is_blocking_io_error = pyre_interpreter::builtins::lookup_exc_class("BlockingIOError")
+        .is_some_and(|blocking| std::ptr::eq(concrete_w_class, blocking));
+    // `W_OSError._init_error` gives an exact BlockingIOError's numeric third
+    // argument the characters_written meaning.  Keep every three-or-more-arg
+    // instance of that concrete class on the complete runtime path.
+    if fills_os_error_slots && args.len() >= 3 && is_blocking_io_error {
+        return Ok(None);
+    }
+
+    let has_filename = fills_os_error_slots
+        && args.len() >= 3
+        && !unsafe { pyre_object::is_none(concrete_args[2]) };
+    let final_args_len = if has_filename { 2 } else { args.len() };
+    let final_args = &args[..final_args_len];
+    let final_concrete_args = &concrete_args[..final_args_len];
+    let args_emit = match pyre_object::listobject::list_strategy_for(final_concrete_args) {
+        pyre_object::listobject::ListStrategy::Object => ArgsEmit::Object,
+        pyre_object::listobject::ListStrategy::Integer => {
+            let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
+            let mut values = Vec::with_capacity(final_concrete_args.len());
+            for &arg in final_concrete_args {
+                if pyre_object::tagged_int::CAN_BE_TAGGED
+                    && pyre_object::tagged_int::is_tagged_int(arg)
+                {
+                    return Ok(None);
+                }
+                let exact_int = unsafe {
+                    pyre_object::is_plain_int1(arg) && std::ptr::eq((*arg).ob_type, int_ty)
+                };
+                if !exact_int {
+                    return Ok(None);
+                }
+                values.push(unsafe { pyre_object::w_int_get_value(arg) });
+            }
+            ArgsEmit::Int(values)
+        }
+        pyre_object::listobject::ListStrategy::Empty
+        | pyre_object::listobject::ListStrategy::Float => return Ok(None),
+    };
+
+    // GuardClass pins each None-sensitive `_init_error` branch.  A tagged
+    // immediate cannot be consumed by GuardClass; retain the residual path for
+    // that uncommon filename shape.
+    if fills_os_error_slots {
+        for index in [2usize, 4] {
+            if index >= args.len() || (index == 4 && args.len() != 5) {
+                continue;
+            }
+            if pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(concrete_args[index])
+            {
+                return Ok(None);
+            }
+        }
+    }
     // --- commit to the specialization: emit IR (no further declines) ---
     // Pin the callable identity so the trace-time kind / vtable stay
     // valid across iterations (`implement_guard_value`).
@@ -20978,27 +21869,149 @@ fn try_walker_trace_exception_new(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
+    if let Some(version_tag) = subclass_version_tag {
+        // Guard the promoted class version that made both MRO descriptor
+        // identities constant.  `W_TypeObject.mutated` recursively changes
+        // subclass tags (`typeobject.py:266-291`), so mutating this class or a
+        // base side-exits before reusing the folded constructor.
+        let class_const = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        let live_version = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            class_const,
+            crate::descr::type_version_tag_descr(),
+        );
+        let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[live_version, version_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(live_version, version_const);
+    }
 
-    // Build `args_w` inline (Object strategy) so the whole list
-    // (W_ListObject + ItemsBlock) virtualizes alongside the exception.
-    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, args);
+    if fills_os_error_slots && exact_os_error {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        let raw_errno = walker_unbox_int(ctx, op.pc, args[0], int_type_addr)?;
+        let errno_value = unsafe { pyre_object::w_int_get_value(concrete_args[0]) };
+        let errno_const = ctx.trace_ctx.const_int(errno_value);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[raw_errno, errno_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(raw_errno, errno_const);
+    }
+    if fills_os_error_slots {
+        for index in [2usize, 4] {
+            if index >= args.len() || (index == 4 && args.len() != 5) {
+                continue;
+            }
+            let arg = args[index];
+            if !ctx.trace_ctx.heap_cache().is_class_known(arg) {
+                let physical_type = unsafe { (*concrete_args[index]).ob_type } as i64;
+                let type_const = ctx.trace_ctx.const_int(physical_type);
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op.pc,
+                    OpCode::GuardClass,
+                    &[arg, type_const],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(arg, physical_type);
+            }
+        }
+    }
 
+    // Build `args_w` inline so its wrapper and backing block virtualize
+    // alongside the exception.
+    let args_list = match args_emit {
+        ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args),
+        ArgsEmit::Int(values) => {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let mut raws = Vec::with_capacity(final_args.len());
+            for (&arg, value) in final_args.iter().zip(values) {
+                let raw = walker_unbox_int(ctx, op.pc, arg, int_type_addr)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Int(value));
+                raws.push(raw);
+            }
+            crate::helpers::emit_typed_list_inline(
+                ctx.trace_ctx,
+                &raws,
+                crate::state::int_gcarray_descr(),
+                crate::descr::list_int_items_len_descr(),
+                crate::descr::list_int_items_block_descr(),
+                pyre_object::listobject::ListStrategy::Integer,
+            )
+        }
+    };
+    // A raised exception can keep args_w live through the execution-context
+    // slot, forcing the otherwise-virtual list.  Stamp the canonical list
+    // class just as w_list_new does so that materialization preserves the
+    // `space.type(args_w) is list` branch used by descr_getargs.
+    let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
+    let list_w_class_descr = crate::descr::list_w_class_descr();
+    let list_w_class_index = list_w_class_descr.index();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[args_list, list_w_class],
+        list_w_class_descr,
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(args_list, list_w_class_index, list_w_class);
+
+    // `W_OSError.descr_new` can retag exact OSError by errno while retaining
+    // the OSError physical kind.  The guarded errno makes the concrete final
+    // class a valid constant; dedicated classes and subclasses keep the called
+    // class operand as in the ordinary constructor emit.
+    let emitted_w_class = if fills_os_error_slots && exact_os_error {
+        ctx.trace_ctx.const_ref(concrete_w_class as i64)
+    } else {
+        callable_op
+    };
     let new_op =
-        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, callable_op, args_list);
+        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, emitted_w_class, args_list);
+
+    if fills_os_error_slots {
+        use pyre_interpreter::baseobjspace::ExceptionAttrSlot;
+        let mut stores = vec![
+            (ExceptionAttrSlot::Errno, args[0]),
+            (ExceptionAttrSlot::Strerror, args[1]),
+        ];
+        if has_filename {
+            stores.push((ExceptionAttrSlot::Filename, args[2]));
+            // The fourth positional argument is winerror and is ignored on
+            // non-Windows builds, matching W_OSError._parse_init_args.
+            if args.len() == 5 && !unsafe { pyre_object::is_none(concrete_args[4]) } {
+                stores.push((ExceptionAttrSlot::Filename2, args[4]));
+            }
+        }
+        for (slot, value) in stores {
+            let descr = crate::descr::w_exception_slot_descr(kind, slot);
+            let descr_index = descr.index();
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+            ctx.trace_ctx
+                .heapcache_setfield_cached(new_op, descr_index, value);
+        }
+    }
 
     // Mark the class known so the following `raise/r` skips its
     // redundant GUARD_CLASS (mirrors `seed_raised_exception`'s
     // `heapcache.class_now_known`).  The vtable on the NewWithVtable
     // already pins the class for the optimizer; this keeps the heapcache
     // model in agreement.
-    let exc_class_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
     ctx.trace_ctx
         .heap_cache_mut()
-        .class_now_known(new_op, exc_class_ptr as usize as i64);
+        .class_now_known(new_op, exc_type_ptr as usize as i64);
 
     // Record the fresh instance so a following `RaiseVarargs` recovers
     // the concrete and takes the instance fast path; stamp the dst shadow
@@ -21123,6 +22136,19 @@ fn try_walker_trace_raise_builtin(
         &[exc_op, active],
         crate::descr::w_exception_context_descr(kind),
     );
+    // The full-body walk is also the authoritative execution of the
+    // tracing iteration.  Apply the same context write to its concrete,
+    // freshly-built exception that the recorded SETFIELD performs on later
+    // compiled iterations; otherwise Python code reached later in this walk
+    // observes a missing __context__ exactly once, while the trace itself is
+    // correct.  This object is private to the inline construction, so no
+    // rollback journal is needed.
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
 
     // The normalized publish result is the same flat builtin instance;
     // forward the inline-built exc OpRef (carrying its concrete shadow)
@@ -21168,17 +22194,25 @@ fn try_walker_lower_exc_info_residual(
         if !r_args.is_empty() || dst_bank != 'r' {
             return Ok(None);
         }
-        let Some(ec) = walker_ensure_execution_context(ctx) else {
-            return Ok(None);
+        let (prev, prev_obj) = if let Some(seed) = ctx.fbw_mode.current_exception_seed {
+            // resume.py:993-1007 applies pending fields before resumed
+            // execution.  Bridge tracing does not mutate the live EC, so use
+            // the decoded fieldbox directly; a runtime GETFIELD here would
+            // read the pre-guard TLS value before the bridge applies anything.
+            (seed, ctx.fbw_mode.current_exception_seed_concrete)
+        } else {
+            let Some(ec) = walker_ensure_execution_context(ctx) else {
+                return Ok(None);
+            };
+            let prev = ctx.trace_ctx.record_op_with_descr(
+                OpCode::GetfieldGcR,
+                &[ec],
+                crate::descr::ec_sys_exc_value_descr(),
+            );
+            (prev, pyre_interpreter::eval::get_current_exception())
         };
-        let prev = ctx.trace_ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[ec],
-            crate::descr::ec_sys_exc_value_descr(),
-        );
-        // Stamp the live `prev` concrete (the residual executor would return
-        // it), so a downstream concrete read of the dst sees the right value.
-        let prev_obj = pyre_interpreter::eval::get_current_exception();
+        // Stamp the concrete `prev` so a downstream read sees the value the
+        // residual executor would have returned at this resume point.
         ctx.trace_ctx.set_opref_concrete(
             prev,
             majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
@@ -21275,6 +22309,8 @@ fn try_walker_lower_exc_info_residual(
     // exception into the next frame's `sys_exc_value`.
     fbw_sys_exc_journal_push(pyre_interpreter::eval::get_current_exception());
     pyre_interpreter::eval::set_current_exception(store_concrete);
+    ctx.fbw_mode.current_exception_seed = Some(store_op);
+    ctx.fbw_mode.current_exception_seed_concrete = store_concrete;
     Ok(Some(()))
 }
 
@@ -22375,19 +23411,27 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.box_value(code_opref),
                 ctx.trace_ctx.box_value(namei_opref),
             ) {
-                if let Some((specialized_descr, specialized_allboxes)) =
-                    try_walker_specialize_store_attr(
-                        ctx,
-                        op.pc,
-                        obj_opref,
-                        value_opref,
-                        w_code_ptr,
-                        namei as usize,
-                        original_call_descr.get_extra_info(),
-                    )?
-                {
-                    descr = specialized_descr;
-                    allboxes = specialized_allboxes;
+                if let Some(specialization) = try_walker_specialize_store_attr(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    value_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    original_call_descr.get_extra_info(),
+                )? {
+                    match specialization {
+                        WalkerStoreAttrSpecialization::Residual(
+                            specialized_descr,
+                            specialized_allboxes,
+                        ) => {
+                            descr = specialized_descr;
+                            allboxes = specialized_allboxes;
+                        }
+                        WalkerStoreAttrSpecialization::Direct => {
+                            return Ok((DispatchOutcome::Continue, op.next_pc));
+                        }
+                    }
                 }
             }
         }

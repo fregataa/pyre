@@ -1561,6 +1561,25 @@ fn handler_entry_has_lasti_exception_slots(
     })
 }
 
+/// True when an explicit raise can enter this cleanup handler.  Its
+/// propagated value is already in the durable frame stack slot; a reraise
+/// instead continues to use the live exception payload supplied by the
+/// exception edge.
+fn handler_entry_has_explicit_raise_source(
+    code: &CodeObject,
+    catch_sites: &[ExceptionCatchSite],
+    handler_py_pc: usize,
+) -> bool {
+    catch_sites.iter().any(|site| {
+        site.handler_py_pc == handler_py_pc
+            && site.push_lasti
+            && matches!(
+                pyre_interpreter::decode_instruction_at(code, site.lasti_py_pc),
+                Some((Instruction::RaiseVarargs { .. }, _))
+            )
+    })
+}
+
 fn initialize_spam_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -3095,6 +3114,37 @@ fn attach_catch_exception_edge(
     link
 }
 
+fn carry_explicit_raise_value_on_catch_stack(
+    link: &super::flow::LinkRef,
+    target: &SpamBlockRef,
+    raised_value: super::flow::FlowValue,
+) {
+    let target_state = target
+        .framestate()
+        .expect("explicit raise catch landing must carry a FrameState");
+    let stack_value = target_state
+        .stack
+        .last()
+        .and_then(super::flow::FlowValue::as_variable)
+        .expect("catch landing must end its stack with the raised value");
+    let input_index = target
+        .block()
+        .borrow()
+        .inputargs
+        .iter()
+        .position(|value| value.as_variable().is_some_and(|v| v.id == stack_value.id))
+        .expect("catch stack value must appear in landing inputargs");
+    link.borrow_mut().args[input_index] = Some(raised_value);
+    let mut link = link.borrow_mut();
+    // Replacing the handler-stack alias changes the exception pair's
+    // positional mapping to value/type order. Keep the Link metadata aligned
+    // so `generate_last_exc` writes `last_exception` to the Int destination
+    // and `last_exc_value` to the Ref destination.
+    let last_exception = link.last_exception;
+    link.last_exception = link.last_exc_value;
+    link.last_exc_value = last_exception;
+}
+
 fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
     let mut block_mut = block.borrow_mut();
     if block_mut.exits.len() < 2 {
@@ -3332,6 +3382,7 @@ struct FnPtrIndices {
     call_kw_fn_11: HelperHandle,
     call_kw_fn_12: HelperHandle,
     call_kw_fn_13: HelperHandle,
+    unbound_local_error_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3960,6 +4011,14 @@ fn register_helper_fn_pointers(
         cpu.set_function_attribute_fn as *const (),
         CallFlavor::Plain,
     );
+    // DELETE_FAST's unbound arm constructs the exception value without
+    // publishing it or running user code. Allocation touches the heap, so use
+    // `PlainCannotRaise`. Bound last to preserve every existing fn_ptr index.
+    let unbound_local_error_fn = bind(
+        assembler,
+        cpu.unbound_local_error_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4051,6 +4110,7 @@ fn register_helper_fn_pointers(
         call_kw_fn_13,
         make_function_fn,
         set_function_attribute_fn,
+        unbound_local_error_fn,
     }
 }
 
@@ -5757,6 +5817,11 @@ impl CodeWriter {
                     idx: set_function_attribute_fn_idx,
                     flavor: _set_function_attribute_fn_flavor,
                 },
+            unbound_local_error_fn:
+                HelperHandle {
+                    idx: unbound_local_error_fn_idx,
+                    flavor: _unbound_local_error_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -5856,6 +5921,7 @@ impl CodeWriter {
                 call_function_ex_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
+                unbound_local_error_fn_idx,
                 list_extend_fn_idx,
                 set_add_fn_idx,
                 set_update_fn_idx,
@@ -7334,13 +7400,46 @@ impl CodeWriter {
                         && handler_entry_has_lasti_exception_slots(&catch_sites, py_pc)
                     {
                         if let Some(exc_value) = current_state.stack.last().cloned() {
-                            record_graph_op(
-                                &current_block.block(),
-                                "last_exc_value",
-                                Vec::new(),
-                                Some(exc_value),
-                                py_pc as i64,
-                            );
+                            if matches!(
+                                pyre_interpreter::decode_instruction_at(code, py_pc),
+                                Some((Instruction::Copy { .. }, _))
+                            ) && handler_entry_has_explicit_raise_source(
+                                code,
+                                &catch_sites,
+                                py_pc,
+                            ) {
+                                // Catch dispatch has already stored the
+                                // propagated exception in the frame's top stack
+                                // slot.  Reload that durable slot while giving
+                                // the shadow graph the definition it needs to
+                                // keep the exception and lasti colours distinct.
+                                // Re-reading `last_exc_value` is not sound after
+                                // a clearing residual, and the current-exception
+                                // slot can still name the older exception whose
+                                // handler raised this one.
+                                let stack_slot =
+                                    stack_base_absolute + current_depth.saturating_sub(1) as usize;
+                                let stack_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(stack_slot as i64).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        stack_idx.into(),
+                                    ),
+                                    Some(exc_value),
+                                    py_pc as i64,
+                                );
+                            } else {
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "last_exc_value",
+                                    Vec::new(),
+                                    Some(exc_value),
+                                    py_pc as i64,
+                                );
+                            }
                         }
                     }
                     // The walker emits one block-identity `Label(block)`
@@ -11327,7 +11426,6 @@ impl CodeWriter {
                                     emit_abort_permanent!(py_pc);
                                     continue;
                                 }
-                                let idx_u16 = idx as u16;
                                 let local_slot = local_to_vable_slot(idx) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -11339,50 +11437,19 @@ impl CodeWriter {
                                     .into();
                                 let name_idx_const: super::flow::FlowValue =
                                     super::flow::Constant::signed(idx as i64).into();
-                                emit_load_fast_ref!(current_depth, idx_u16, py_pc);
-                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                let checked_value = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "load_fast_check",
-                                    vec![
-                                        value_value.into(),
-                                        code_const.into(),
-                                        name_idx_const.into(),
-                                    ],
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
-                                let checked_flow: super::flow::FlowValue = checked_value.into();
-                                let is_null = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "ptr_iszero",
-                                    vec![checked_flow.clone().into()],
-                                    Kind::Int,
-                                    py_pc as i64,
-                                );
-                                current_block.block().borrow_mut().exitswitch =
-                                    Some(super::flow::ExitSwitch::Value(is_null.into()));
-                                let abort_state = current_state.clone();
-                                let abort_block = SpamBlockRef::new(
-                                    graph.new_block(Vec::new()),
-                                    Some(abort_state.clone()),
-                                );
-                                abort_block.block().borrow_mut().inputargs =
-                                    abort_state.getvariables();
-                                all_walker_blocks.push(abort_block.clone());
-                                append_exit(
-                                    &current_block.block(),
-                                    output_link(&current_state, &abort_state, abort_block.block()),
-                                );
-                                set_last_bool_exitcase(&current_block.block(), true);
-                                {
+                                // pyopcode.py:998 DELETE_FAST checks for an
+                                // unbound local before clearing its slot. A
+                                // statically unbound slot therefore raises
+                                // unconditionally and performs no write.
+                                if matches!(
+                                    current_state.local_value_at(idx),
+                                    Some(super::flow::FlowValue::Constant(c))
+                                        if c.value == super::flow::ConstantValue::None
+                                ) {
                                     let v_li: super::flow::FlowValue =
                                         super::flow::Constant::signed(py_pc as i64 - 1).into();
                                     record_graph_op(
-                                        &abort_block.block(),
+                                        &current_block.block(),
                                         "setfield_vable_i",
                                         vable_setfield_int_graph_args(
                                             frame_var.into(),
@@ -11392,56 +11459,121 @@ impl CodeWriter {
                                         None,
                                         py_pc as i64,
                                     );
-                                    record_graph_op(
-                                        &abort_block.block(),
-                                        "abort_permanent",
-                                        Vec::new(),
-                                        None,
+                                    let exc_value = emit_graph_op_with_result(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        "unbound_local_error",
+                                        vec![code_const.into(), name_idx_const.into()],
+                                        Kind::Ref,
                                         py_pc as i64,
                                     );
-                                    append_exit(
-                                        &abort_block.block(),
-                                        super::flow::Link::new(
-                                            vec![super::flow::Constant::none().into()],
-                                            Some(graph.returnblock.clone()),
-                                            None,
-                                        )
-                                        .into_ref(),
-                                    );
+                                    let exc_flow: super::flow::FlowValue = exc_value.into();
+                                    emit_raise!(0u16, exc_flow, py_pc as i64, true);
+                                    continue;
                                 }
-                                let continue_state = current_state.clone();
-                                let continue_block = SpamBlockRef::new(
-                                    graph.new_block(Vec::new()),
-                                    Some(continue_state.clone()),
+                                let idx_u16 = idx as u16;
+                                emit_load_fast_ref!(current_depth, idx_u16, py_pc);
+                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let is_null = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "ptr_iszero",
+                                    vec![value_value.into()],
+                                    Kind::Int,
+                                    py_pc as i64,
                                 );
-                                continue_block.block().borrow_mut().inputargs =
-                                    continue_state.getvariables();
-                                all_walker_blocks.push(continue_block.clone());
+                                current_block.block().borrow_mut().exitswitch =
+                                    Some(super::flow::ExitSwitch::Value(is_null.into()));
+                                let unbound_state = current_state.clone();
+                                let unbound_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(unbound_state.clone()),
+                                );
+                                unbound_block.block().borrow_mut().inputargs =
+                                    unbound_state.getvariables();
+                                all_walker_blocks.push(unbound_block.clone());
                                 append_exit(
                                     &current_block.block(),
                                     output_link(
                                         &current_state,
-                                        &continue_state,
-                                        continue_block.block(),
+                                        &unbound_state,
+                                        unbound_block.block(),
                                     ),
                                 );
+                                set_last_bool_exitcase(&current_block.block(), true);
+                                let bound_state = current_state.clone();
+                                let bound_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(bound_state.clone()),
+                                );
+                                bound_block.block().borrow_mut().inputargs =
+                                    bound_state.getvariables();
+                                all_walker_blocks.push(bound_block.clone());
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(&current_state, &bound_state, bound_block.block()),
+                                );
                                 set_last_bool_exitcase(&current_block.block(), false);
-                                current_block = continue_block;
+
+                                // The unbound arm raises before any clear,
+                                // matching pyopcode.py:998 DELETE_FAST. Keep
+                                // last_instr at the deleting instruction so
+                                // exception unwind and deopt share its frame
+                                // coordinate.
+                                current_block = unbound_block;
+                                current_state = unbound_state;
+                                let v_li: super::flow::FlowValue =
+                                    super::flow::Constant::signed(py_pc as i64 - 1).into();
                                 record_graph_op(
                                     &current_block.block(),
-                                    "setarrayitem_vable_r",
-                                    vable_setarrayitem_ref_graph_args(
+                                    "setfield_vable_i",
+                                    vable_setfield_int_graph_args(
                                         frame_var.into(),
-                                        v_idx.clone().into(),
-                                        checked_flow.into(),
+                                        v_li.into(),
+                                        VABLE_LAST_INSTR_FIELD_IDX,
                                     ),
                                     None,
                                     py_pc as i64,
                                 );
-                                // eval.rs:delete_fast writes PY_NULL into the
-                                // locals slot. Mirror STORE_FAST's
-                                // `setarrayitem_vable_r` local write with the
-                                // unbound sentinel as the value.
+                                let exc_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "unbound_local_error",
+                                    vec![code_const.into(), name_idx_const.into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                let exc_flow: super::flow::FlowValue = exc_value.into();
+                                emit_raise!(0u16, exc_flow.clone(), py_pc as i64, true);
+                                if let Some(catch_label) =
+                                    catch_for_pc.get(py_pc).copied().flatten()
+                                {
+                                    let site = catch_sites
+                                        .iter()
+                                        .find(|site| site.landing_label == catch_label)
+                                        .expect("catch site for DELETE_FAST raise");
+                                    let link = current_block
+                                        .block()
+                                        .borrow()
+                                        .exits
+                                        .last()
+                                        .cloned()
+                                        .expect("DELETE_FAST raise catch edge");
+                                    carry_explicit_raise_value_on_catch_stack(
+                                        &link,
+                                        &site.landing,
+                                        exc_flow,
+                                    );
+                                }
+
+                                // The bound arm is the continuing block. The
+                                // clear is one PY_NULL write, matching
+                                // pyopcode.py:998 DELETE_FAST's single slot
+                                // assignment after the check succeeds.
+                                current_block = bound_block;
+                                current_state = bound_state;
+                                needs_fallthrough = true;
                                 record_graph_op(
                                     &current_block.block(),
                                     "setarrayitem_vable_r",
@@ -11460,9 +11592,59 @@ impl CodeWriter {
                             }
                         }
 
+                        // DELETE_DEREF clears the cell contents after checking
+                        // that they are bound (pyopcode.py:597 DELETE_DEREF).
+                        Instruction::DeleteDeref { i } => {
+                            let idx = i.get(op_arg).as_usize() as u16;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let deref_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(idx as i64).into();
+                            emit_load_fast_ref!(current_depth, idx, py_pc);
+                            let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _checked = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_deref_value",
+                                vec![
+                                    cell_value.clone().into(),
+                                    code_const.into(),
+                                    deref_idx_const.into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "store_deref_value",
+                                vec![cell_value.into(), super::flow::Constant::none().into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            let local_slot = local_to_vable_slot(idx as usize) as i64;
+                            let v_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(local_slot).into();
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    v_idx.into(),
+                                    super::flow::FlowValue::from(result_value).into(),
+                                ),
+                                None,
+                                py_pc as i64,
+                            );
+                            current_state.store_local_value(idx as usize, result_value.into());
+                        }
+
                         // Instructions that don't touch the operand stack (locals/cells only).
-                        Instruction::DeleteDeref { .. }
-                        | Instruction::DeleteGlobal { .. }
+                        Instruction::DeleteGlobal { .. }
                         | Instruction::DeleteName { .. }
                         | Instruction::SetupAnnotations => {
                             emit_abort_permanent!(py_pc);
