@@ -184,6 +184,85 @@ fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> boo
     })
 }
 
+/// `PYRE_PCMAP_MIDBODY_AUDIT` now certifies only identity resolution: after
+/// the Python-PC carrier fields were deleted, the flush words are derived once
+/// here from the carried native coordinates.
+fn audit_midbody_carrier_resolution(site: &'static str, resolved: bool) {
+    if !crate::jitcode_dispatch::pcmap_midbody_audit_enabled() {
+        return;
+    }
+    crate::jitcode_dispatch::pcmap_midbody_audit_probe(
+        site,
+        if resolved { "resolve" } else { "unresolved" },
+    );
+    assert!(
+        resolved,
+        "PCMAP_MIDBODY carried jitcode identity must resolve: {site}"
+    );
+}
+
+fn resolve_entry_carrier_call_py_pc(
+    outer_jitcode_index: u32,
+    call_jitcode_pc: usize,
+) -> Option<usize> {
+    let outer = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32);
+    let resolved = outer
+        .as_ref()
+        .is_some_and(|payload| !payload.code_ptr.is_null());
+    audit_midbody_carrier_resolution("entry_flush_call_py_pc", resolved);
+    let outer = outer.filter(|payload| !payload.code_ptr.is_null())?;
+    let call_py_pc =
+        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&outer.metadata, call_jitcode_pc)
+            as usize;
+    Some(crate::jitcode_dispatch::skip_python_trivia_forward(
+        unsafe { &*outer.code_ptr },
+        call_py_pc,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct MidBodyFlushWords {
+    call_py_pc: usize,
+    post_call_py_pc: usize,
+    callee_py_pc: usize,
+}
+
+fn resolve_midbody_flush_words(
+    payload: &crate::jitcode_dispatch::MidBodyPayload,
+) -> Option<MidBodyFlushWords> {
+    let outer = crate::state::pyjitcode_for_jitcode_index(payload.outer_jitcode_index as i32);
+    let outer_resolved = outer
+        .as_ref()
+        .is_some_and(|payload| !payload.code_ptr.is_null());
+    audit_midbody_carrier_resolution("flush_outer_call_py_pc", outer_resolved);
+    audit_midbody_carrier_resolution("flush_outer_post_call_py_pc", outer_resolved);
+    let callee = crate::state::pyjitcode_for_jitcode_index(payload.callee_jitcode_index as i32);
+    let callee_resolved = callee
+        .as_ref()
+        .is_some_and(|payload| !payload.code_ptr.is_null());
+    audit_midbody_carrier_resolution("flush_callee_py_pc", callee_resolved);
+    let outer = outer.filter(|payload| !payload.code_ptr.is_null())?;
+    let callee = callee.filter(|payload| !payload.code_ptr.is_null())?;
+    let call_py_pc =
+        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&outer.metadata, payload.call_jitcode_pc)
+            as usize;
+    let call_py_pc = crate::jitcode_dispatch::skip_python_trivia_forward(
+        unsafe { &*outer.code_ptr },
+        call_py_pc,
+    );
+    Some(MidBodyFlushWords {
+        call_py_pc,
+        post_call_py_pc: crate::jitcode_dispatch::skip_python_trivia_forward(
+            unsafe { &*outer.code_ptr },
+            call_py_pc + 1,
+        ),
+        callee_py_pc: crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+            &callee.metadata,
+            payload.abort_jitcode_pc,
+        ) as usize,
+    })
+}
+
 fn exception_delivery_stack_is_sourceable(
     handler_depth: u32,
     array_len: usize,
@@ -196,12 +275,13 @@ fn try_commit_midbody_abort(
     ctx: &TraceCtx,
     cf_addr: usize,
     payload: &crate::jitcode_dispatch::MidBodyPayload,
+    words: MidBodyFlushWords,
 ) -> bool {
     if !crate::state::can_flush_walk_end_state_after_outer_call(
         ctx,
         cf_addr,
-        payload.call_py_pc,
-        payload.post_call_py_pc,
+        words.call_py_pc,
+        words.post_call_py_pc,
         payload.call_stack_len,
     ) {
         return false;
@@ -219,7 +299,7 @@ fn try_commit_midbody_abort(
     // an effectful Err into replay.
     if !WALK_END_PROPAGATE_ALLOWED.with(|c| c.get())
         && (!code.exceptiontable.is_empty()
-            || !midbody_post_marker_is_effect_free(code, payload.callee_py_pc))
+            || !midbody_post_marker_is_effect_free(code, words.callee_py_pc))
     {
         return false;
     }
@@ -237,7 +317,7 @@ fn try_commit_midbody_abort(
     let outer_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(outer) };
     let outer_handler = pyre_interpreter::pycode::lookup_exceptiontable(
         &outer_code.exceptiontable,
-        (payload.call_py_pc as u32) * 2,
+        (words.call_py_pc as u32) * 2,
     );
     if propagate_allowed {
         // E-G2: this specialization reconstructs only the exact empty
@@ -319,7 +399,7 @@ fn try_commit_midbody_abort(
         };
     }
     frame.valuestackdepth = stack_base + current.live_stack.len();
-    frame.last_instr = current.callee_py_pc as isize - 1;
+    frame.last_instr = words.callee_py_pc as isize - 1;
     let sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
     match frame.execute_frame(None, None) {
         Ok(mut retval) => {
@@ -328,8 +408,8 @@ fn try_commit_midbody_abort(
             crate::state::flush_walk_end_state_after_outer_call(
                 ctx,
                 cf_addr,
-                current.call_py_pc,
-                current.post_call_py_pc,
+                words.call_py_pc,
+                words.post_call_py_pc,
                 current.call_stack_len,
                 retval,
             )
@@ -344,9 +424,9 @@ fn try_commit_midbody_abort(
                 return false;
             }
             let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
-            outer.last_instr = current.call_py_pc as isize;
+            outer.last_instr = words.call_py_pc as isize;
             outer.valuestackdepth = outer_stack_base;
-            let mut next_instr = current.call_py_pc;
+            let mut next_instr = words.call_py_pc;
             if pyre_interpreter::eval::handle_exception(outer, &mut operr, &mut next_instr) {
                 outer.last_instr = next_instr as isize - 1;
             } else {
@@ -1442,7 +1522,7 @@ fn run_perfn_walk(
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[walk-perfn] no jitcode entry for start_pc={start_pc} (pc_map_len={}); declining walk",
-                pjc.metadata.first_jit_pc_by_py_pc.len()
+                pjc.metadata.n_py_instrs as usize
             );
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
@@ -1504,8 +1584,8 @@ fn run_perfn_walk(
 
     // setup_call argbox: seed r0 = the standard virtualizable identity box
     // (`virtualizable_boxes[-1]`, the `InputArgRef(SYM_FRAME_IDX)` that
-    // `init_symbolic` seeded) — the SAME OpRef production's arm entry uses
-    // (`dispatch_via_miframe_at_opcode_entry` seeds r0 = `sym.frame`, and
+    // `init_symbolic` seeded) — the SAME OpRef the retired per-opcode arm
+    // entry seeded as r0 (= `sym.frame`, and
     // `sym.frame == OpRef::input_arg_typed(SYM_FRAME_IDX, Ref)`).  A fresh
     // `const_ref(cf_addr)` would be a DIFFERENT OpRef than the identity box,
     // so `concrete_of_opref`'s standard-vable resolution (trace_ctx.rs:1842,
@@ -1817,6 +1897,28 @@ fn run_perfn_walk(
     // the virtualizable shadow to the concrete frame heap, which the
     // read-only probe (trace discarded) must not do.
     if authoritative {
+        let close_loop_restart_pc = match &walk_result {
+            Ok((
+                crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
+                    loop_header_pc,
+                    loop_header_marker_jit_pc,
+                    ..
+                },
+                _end_pc,
+            )) => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
+                let marker_py =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
+                        as usize;
+                if marker_py == *loop_header_pc
+                    && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
+                {
+                    *loop_header_pc + 1
+                } else {
+                    marker_py
+                }
+            })),
+            _ => None,
+        };
         if let Ok((
             crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
                 jump_args,
@@ -1827,18 +1929,7 @@ fn run_perfn_walk(
         )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
-            let restart_pc = loop_header_marker_jit_pc.map_or(loop_header_pc, |marker| {
-                let marker_py =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
-                        as usize;
-                if marker_py == loop_header_pc
-                    && pjc.merge_entry_for(loop_header_pc) != Some(marker)
-                {
-                    loop_header_pc + 1
-                } else {
-                    marker_py
-                }
-            });
+            let restart_pc = close_loop_restart_pc.expect("close loop has a restart pc");
             WALK_END_RESTART_PC.with(|c| c.set(Some(restart_pc)));
             // `close_loop_args_at` reads `self.orgpc` for the last_instr anchor; the merge point
             // closes at the loop header, so anchor orgpc there.
@@ -1867,23 +1958,9 @@ fn run_perfn_walk(
         if std::env::var_os("PYRE_FBW_END_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
             if let Ok((outcome, _end_pc)) = &walk_result {
                 let header_pc = match outcome {
-                    crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
-                        loop_header_pc,
-                        loop_header_marker_jit_pc,
-                        ..
-                    } => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
-                        let marker_py = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
-                            &pjc.metadata,
-                            marker,
-                        ) as usize;
-                        if marker_py == *loop_header_pc
-                            && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
-                        {
-                            *loop_header_pc + 1
-                        } else {
-                            marker_py
-                        }
-                    })),
+                    crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. } => {
+                        close_loop_restart_pc
+                    }
                     crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
                         loop_header_pc,
                     } => Some(*loop_header_pc),
@@ -1964,30 +2041,39 @@ fn run_perfn_walk(
                 let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
                 match carrier.as_ref() {
                     Some(crate::jitcode_dispatch::InlineAbortCarrier::Entry {
-                        call_py_pc,
+                        outer_jitcode_index,
+                        call_jitcode_pc,
                         call_stack,
                     }) => {
-                        entry_carrier_call_py_pc = Some(*call_py_pc);
-                        if crate::state::flush_walk_end_state_at_outer_call(
-                            ctx,
-                            cf_addr,
-                            *call_py_pc,
-                            call_stack,
-                        ) {
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        if let Some(call_py_pc) =
+                            resolve_entry_carrier_call_py_pc(*outer_jitcode_index, *call_jitcode_pc)
+                        {
+                            entry_carrier_call_py_pc = Some(call_py_pc);
+                            if crate::state::flush_walk_end_state_at_outer_call(
+                                ctx, cf_addr, call_py_pc, call_stack,
+                            ) {
+                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                    eprintln!(
+                                        "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
+                                         abort_jit_pc={abort_jit_pc} call_py_pc={call_py_pc} \
+                                         stack_depth={}",
+                                        call_stack.len()
+                                    );
+                                }
+                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                                 eprintln!(
-                                    "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
-                                     abort_jit_pc={abort_jit_pc} call_py_pc={call_py_pc} \
-                                     stack_depth={}",
-                                    call_stack.len()
+                                    "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                                     call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
+                                     lastblock) — legacy replay kept"
                                 );
                             }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                                 call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
-                                 lastblock) — legacy replay kept"
+                                 abort_jit_pc={abort_jit_pc} (unresolved outer jitcode_index={} \
+                                 or null code ptr) — legacy replay kept",
+                                outer_jitcode_index,
                             );
                         }
                     }
@@ -1999,23 +2085,29 @@ fn run_perfn_walk(
                                 && payload.abort_kind
                                     == crate::jitcode_dispatch::MidBodyAbortKind::Structural) =>
                     {
-                        if try_commit_midbody_abort(ctx, cf_addr, payload) {
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        if let Some(words) = resolve_midbody_flush_words(payload) {
+                            if try_commit_midbody_abort(ctx, cf_addr, payload, words) {
+                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                    eprintln!(
+                                        "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
+                                         abort_jit_pc={abort_jit_pc} callee_py_pc={} \
+                                         call_py_pc={} post_call_py_pc={}",
+                                        words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
+                                    );
+                                }
+                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                                 eprintln!(
-                                    "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
-                                     abort_jit_pc={abort_jit_pc} callee_py_pc={} \
-                                     call_py_pc={} post_call_py_pc={}",
-                                    payload.callee_py_pc,
-                                    payload.call_py_pc,
-                                    payload.post_call_py_pc,
+                                    "[fbw-abort-flush] gh#467 callee-rebuild declined at \
+                                     callee_py_pc={} — legacy replay kept",
+                                    words.callee_py_pc,
                                 );
                             }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] gh#467 callee-rebuild declined at \
-                                 callee_py_pc={} — legacy replay kept",
-                                payload.callee_py_pc,
+                                 abort_jit_pc={abort_jit_pc} (unresolved carried jitcode identity \
+                                 or null code ptr) — legacy replay kept",
                             );
                         }
                     }
@@ -2083,47 +2175,79 @@ fn run_perfn_walk(
                              (unjournaled effect) — legacy replay kept"
                         );
                     }
-                } else if let Some(resume_py_pc) =
+                } else if let Some((jitcode_index, call_jitcode_pc)) =
                     crate::jitcode_dispatch::fbw_abort_outer_resume_take()
                 {
-                    if entry_carrier_call_py_pc == Some(resume_py_pc) {
+                    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32);
+                    if crate::jitcode_dispatch::pcmap_callpc_audit_enabled() {
+                        if let Some(path) = std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT_PROBE") {
+                            use std::io::Write;
+
+                            if let Ok(mut probe) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                            {
+                                let _ = writeln!(probe, "fbw_abort_outer_resume\tresolve");
+                            }
+                        }
+                        assert!(
+                            pjc.is_some(),
+                            "PCMAP_CALLPC carried jitcode index must resolve: jitcode_index={jitcode_index} call_jitcode_pc={call_jitcode_pc}",
+                        );
+                    }
+                    if let Some(pjc) = pjc {
+                        let resume_py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                            &pjc.metadata,
+                            call_jitcode_pc,
+                        ) as usize;
+                        if entry_carrier_call_py_pc == Some(resume_py_pc) {
+                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] skipped at resume_py_pc={resume_py_pc} \
+                                     (entry carrier already handled same resume)"
+                                );
+                            }
+                        } else {
+                            // Flush while the overrides stay rooted in
+                            // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
+                            // locals — an allocation that can move the nursery-resident
+                            // override refs; the area walker forwards them in place),
+                            // then clear the cell.
+                            let committed =
+                                crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
+                                    |stack_overrides| {
+                                        crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
+                                            ctx,
+                                            cf_addr,
+                                            resume_py_pc,
+                                            stack_overrides,
+                                        )
+                                    },
+                                );
+                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                            if committed {
+                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                    eprintln!(
+                                        "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                         resume_py_pc={resume_py_pc} (nested inline decline)"
+                                    );
+                                }
+                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                );
+                            }
+                        }
+                    } else {
                         crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
                         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
-                                "[fbw-abort-flush] skipped at resume_py_pc={resume_py_pc} \
-                                 (entry carrier already handled same resume)"
-                            );
-                        }
-                    } else {
-                        // Flush while the overrides stay rooted in
-                        // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
-                        // locals — an allocation that can move the nursery-resident
-                        // override refs; the area walker forwards them in place),
-                        // then clear the cell.
-                        let committed =
-                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
-                                |stack_overrides| {
-                                    crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
-                                        ctx,
-                                        cf_addr,
-                                        resume_py_pc,
-                                        stack_overrides,
-                                    )
-                                },
-                            );
-                        crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                        if committed {
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                     resume_py_pc={resume_py_pc} (nested inline decline)"
-                                );
-                            }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                 (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                                 (unresolved outer jitcode_index={jitcode_index}) — legacy replay kept"
                             );
                         }
                     }
@@ -2761,7 +2885,7 @@ fn full_body_walk_trace(
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
     crate::jitcode_dispatch::fbw_executed_body_residual_reset();
-    crate::jitcode_dispatch::fbw_abort_outer_resume_py_pc_reset();
+    crate::jitcode_dispatch::fbw_abort_outer_resume_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     // A continuation keeps them instead: see [`WalkJournals`].
@@ -2985,7 +3109,7 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
          num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \
          built_as_portal={}",
         code.len(),
-        pjc.metadata.first_jit_pc_by_py_pc.len(),
+        pjc.metadata.n_py_instrs as usize,
         start_pc,
         entry,
         pjc.jitcode.num_regs_r(),

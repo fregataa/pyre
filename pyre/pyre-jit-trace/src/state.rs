@@ -1045,7 +1045,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
              all known triggers — further hits are bugs.",
             jitcode_index,
             pc,
-            payload.metadata.first_jit_pc_by_py_pc.len(),
+            payload.metadata.n_py_instrs as usize,
             sd.liveness_info.len(),
         );
     })
@@ -1195,7 +1195,6 @@ pub fn frame_liveness_reg_indices_by_bank_at(
 /// the SAME carried word so their register color sets agree.
 pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
     jitcode_index: i32,
-    pc: i32,
     carried_jitcode_pc: i32,
 ) -> FrameLivenessRegIndices {
     ensure_finish_setup();
@@ -1254,7 +1253,7 @@ pub(crate) fn frame_liveness_reg_indices_by_bank_from_pc(
     jitcode_index: i32,
     pc: i32,
 ) -> FrameLivenessRegIndices {
-    frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(jitcode_index, pc, pc)
+    frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(jitcode_index, pc)
 }
 
 /// Whether the resume frame's pc word names a resolved JitCode `-live-` offset
@@ -12466,9 +12465,9 @@ mod tests {
             crate::PyJitCodeMetadata {
                 after_residual_call_resume_marker_by_jit_pc: Vec::new(),
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
-                first_jit_pc_by_py_pc: vec![0],
+                n_py_instrs: 0,
                 block_head_py_by_jit_pc: vec![(0, 0)],
-                carryfwd_resume_pc: Vec::new(),
+                py_floor_by_jit_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
                 depth_pred_by_jit_pc: vec![(0, 2)],

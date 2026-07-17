@@ -4221,7 +4221,7 @@ fn filter_liveness_in_place(
     // `compute_liveness` rewrites the stream; remapped through the same
     // `remove_repeated_live` remap below.  This is the exact
     // jitcode-pc → Python-opcode inverse the full-body walk consumes
-    // (`PyJitCodeMetadata::first_jit_pc_by_py_pc`) — `pc_map`'s
+    // (formerly stored in runtime metadata) — `pc_map`'s
     // nearest-marker carry-forward shares positions across PCs and is
     // not invertible.
     let mut first_insn_pre_merge: Vec<Option<usize>> = vec![None; walker_tracked.len()];
@@ -12315,8 +12315,8 @@ impl CodeWriter {
         // The stream's first marker is a leading-guard / trailing-canraise
         // marker INTERIOR to a block, whose backward-liveness includes
         // block-interior stack temps; but the runtime snapshots the outer
-        // frame at EVERY opcode entry (`dispatch_via_miframe_at_opcode_entry`
-        // resumes at `entry_py_pc = miframe.orgpc`), so the entry PC and the
+        // frame at EVERY opcode entry (walk roots resume at
+        // `entry_py_pc = miframe.orgpc`), so the entry PC and the
         // leading run before that interior marker ARE runtime resume targets.
         // Forward-carrying the interior marker for them would hand
         // `collect_outer_active_boxes` a stack-temp ref color that is
@@ -12826,8 +12826,10 @@ impl CodeWriter {
         };
         let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
-        // folded); see `PyJitCodeMetadata::first_jit_pc_by_py_pc`.
+        // folded). This local build-time table seeds the floor and marker twins.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
+        let n_py_instrs = u32::try_from(first_jit_pc_by_py_pc.len())
+            .expect("Python instruction count must fit metadata");
         let first_insn_base = pc_map.len() + after_call_some.len();
         for (k, (py_pc, _)) in first_insn_some.iter().enumerate() {
             first_jit_pc_by_py_pc[*py_pc] = combined_bytes[first_insn_base + k];
@@ -12852,6 +12854,47 @@ impl CodeWriter {
             }
             block_head_py_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        }
+
+        // Build the JitCode-PC floor tier from the py-indexed predecessor
+        // source. Exact block-head marker precedence remains a separate lookup
+        // in `block_head_py_by_jit_pc`; a marker is not part of the containing
+        // opcode's floor segment.
+        let mut floor_boundaries: Vec<(usize, u32)> = first_jit_pc_by_py_pc
+            .iter()
+            .enumerate()
+            .filter_map(|(py, &pos)| {
+                (pos != usize::MAX).then_some((
+                    pos,
+                    u32::try_from(py).expect("Python PC must fit the JitCode pivot"),
+                ))
+            })
+            .collect();
+        floor_boundaries.sort_unstable_by_key(|&(pos, py)| (pos, py));
+        let mut unique_floor_boundaries: Vec<(usize, u32)> =
+            Vec::with_capacity(floor_boundaries.len());
+        for (pos, py) in floor_boundaries {
+            if let Some((previous_pos, previous_py)) = unique_floor_boundaries.last_mut()
+                && *previous_pos == pos
+            {
+                // The legacy scan updates on `pos >= best`, so the later py
+                // wins when multiple Python PCs begin at one JitCode offset.
+                *previous_py = py;
+            } else {
+                unique_floor_boundaries.push((pos, py));
+            }
+        }
+        let mut py_floor_by_jit_pc: Vec<(u32, u32)> = unique_floor_boundaries
+            .into_iter()
+            .map(|(off, py)| {
+                (
+                    u32::try_from(off).expect("JitCode PC must fit the floor pivot"),
+                    py,
+                )
+            })
+            .collect();
+        if py_floor_by_jit_pc.first().is_none_or(|&(off, _)| off != 0) {
+            py_floor_by_jit_pc.insert(0, (0, 0));
         }
 
         // task#50 sparse carry-forward sidecar: capture ONLY the py_pcs whose
@@ -13155,9 +13198,9 @@ impl CodeWriter {
         let metadata = PyJitCodeMetadata {
             after_residual_call_resume_marker_by_jit_pc,
             after_residual_call_resume_pred_by_jit_pc,
-            first_jit_pc_by_py_pc,
+            n_py_instrs,
             block_head_py_by_jit_pc,
-            carryfwd_resume_pc,
+            py_floor_by_jit_pc,
             merge_entry_by_green,
             depth_at_py_pc: depth_at_pc,
             pcdep_by_jit_pc,
@@ -13190,6 +13233,14 @@ impl CodeWriter {
             const_ref_slots_by_jit_pc,
             is_drained: true,
         };
+
+        if pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+            assert_eq!(
+                n_py_instrs as usize,
+                first_jit_pc_by_py_pc.len(),
+                "PCMAP_PIVOT Python instruction count diverges from first-jit map",
+            );
+        }
 
         PyJitCode::from_parts(
             std::sync::Arc::new(jitcode),

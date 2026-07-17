@@ -490,6 +490,25 @@ pub struct FbwWalkMode {
     pub current_exception_seed_concrete: pyre_object::PyObjectRef,
 }
 
+/// The outer snapshot's Python-PC coordinate. Non-root producers preserve the
+/// raw JitCode offset that produced the Python word, postponing the exact
+/// `backxlat_py_pc` inversion until a consumer needs it. Root entries and test
+/// fixtures have no such native coordinate and retain their Python value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntryPyPc {
+    Py(u32),
+    Jit(usize),
+}
+
+impl EntryPyPc {
+    fn audit_variant(self) -> &'static str {
+        match self {
+            Self::Py(_) => "py",
+            Self::Jit(_) => "jit",
+        }
+    }
+}
+
 impl Default for FbwWalkMode {
     fn default() -> Self {
         Self {
@@ -631,8 +650,10 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     pub is_authoritative_executor: bool,
     /// Whether this walk is a full-body walk (`dispatch_via_miframe`
     /// rooted, including its inline sub-walks) as opposed to a
-    /// per-opcode arm walk (`dispatch_via_miframe_at_opcode_entry`
-    /// rooted).
+    /// per-opcode arm walk (whose production root, the retired
+    /// `dispatch_via_miframe_at_opcode_entry`, is deleted; arm-style
+    /// contexts survive in test fixtures and the guard-capture arm
+    /// path).
     ///
     /// The distinction decides who applies a recorded-but-unexecuted
     /// side effect.  A full-body walk is replay-backed: the walk is
@@ -730,16 +751,13 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// or means the trait-path seeded only the symbolic OpRef without
     /// a concrete (e.g. a synthetic test fixture).
     pub last_exc_value_concrete: ConcreteValue,
-    /// Python bytecode PC of the opcode whose per-opcode arm the
-    /// walker is currently executing.  Mirrors `MIFrame.orgpc`
-    /// (`pyjitpl.py:151 setposition` parity).  Production entry seeds
-    /// from `miframe.orgpc as u32`; sub-walks inherit the caller's
-    /// `entry_py_pc` (a sub-jitcode invocation does not advance the
-    /// outer Python PC); test fixtures default to `0`.
+    /// Outer snapshot coordinate. Root entries keep `MIFrame.orgpc`; every
+    /// coordinate-native producer stores its raw JitCode offset and resolves
+    /// the matching Python PC lazily at the consumer boundary.
     ///
     /// Read by [`walker_capture_snapshot_for_last_guard`] to stamp the
     /// snapshot frame's Python PC.
-    pub entry_py_pc: u32,
+    pub entry_py_pc: EntryPyPc,
     /// Codewrite-time resume-marker twin for the outer snapshot coordinate
     /// (`entry_py_pc`), carried by the arm-path snapshot word under
     /// `PYRE_M73_ARMPATH_CARRY`. `None` when the creation site has no
@@ -752,18 +770,21 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// pyjitcode regardless of how deep the walker's sub-walk nesting
     /// is.
     ///
-    /// Read from `(*sym.jitcode).index()` at production entry
-    /// ([`dispatch_via_miframe_at_opcode_entry`]); sub-walks inherit
-    /// the parent's value (sub-walks don't change the outer Python
+    /// The retired per-opcode arm entry read this from
+    /// `(*sym.jitcode).index()`; inline sub-walks seed it from the
+    /// CALL-site capture (sub-walks don't change the outer Python
     /// opcode).  Test fixtures + [`dispatch_via_miframe`] default to
-    /// `0`.
+    /// `0` — the full-body guard capture reads `sym.jitcode` directly
+    /// instead of this field.
     pub outer_jitcode_index: u32,
     /// Frozen `PyFrame` state at the outer Python opcode boundary —
     /// `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
-    /// captured at [`dispatch_via_miframe_at_opcode_entry`] entry,
+    /// captured at walk entry (the retired per-opcode arm entry did
+    /// this; inline sub-walks seed it from the CALL-site capture; the
+    /// full-body root leaves it empty and collects at guard capture),
     /// filtered by `OpRef::is_none()`.  This is what
     /// [`walker_capture_snapshot_for_last_guard`] passes as the
-    /// snapshot frame's active boxes.
+    /// snapshot frame's active boxes on the arm path.
     ///
     /// Sub-walks clone the parent's Vec — outer active-box count is
     /// small (a Python frame's live locals + stack tail) and walker
@@ -777,13 +798,11 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// emitted by `codewriter.rs:7042
     /// build_store_subscr_fn_residual_call_r_v_insn`.
     ///
-    /// Populated by the production entry caller
-    /// (`dispatch_via_miframe` →
-    /// `dispatch_via_miframe_at_opcode_entry`) which reaches the
-    /// address through pyre-jit's `cpu.store_subscr_fn`.  Sub-walks
-    /// inherit the parent's value.  `None` disables the field-based
-    /// specialization gate (test fixtures, default-test entries, or
-    /// production paths where the address hasn't been plumbed yet).
+    /// Every root entry currently passes `None` (the retired
+    /// per-opcode arm entry was the caller that plumbed the address
+    /// through pyre-jit's `cpu.store_subscr_fn`).  Sub-walks inherit
+    /// the parent's value.  `None` disables the field-based
+    /// specialization gate.
     ///
     /// `PYRE_WALKER_STORE_SUBSCR_FNADDR` is read as the fallback when this
     /// field is `None`, keeping test fixtures and runtime overrides from
@@ -850,6 +869,19 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// residual-call guard resume reads at `self.pc`).  Maintained purely
     /// from `DecodedOp` by the walk; `usize::MAX` until set.  Side-data only.
     pub live_after_jit_pc: usize,
+}
+
+impl WalkContext<'_, '_> {
+    /// Resolve the outer snapshot coordinate at the exact consumer boundary.
+    fn entry_py_pc(&self) -> u32 {
+        match self.entry_py_pc {
+            EntryPyPc::Py(py_pc) => py_pc,
+            EntryPyPc::Jit(jitcode_pc) => {
+                crate::state::backxlat_py_pc(self.outer_jitcode_index as i32, jitcode_pc as i32)
+                    as u32
+            }
+        }
+    }
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -2578,7 +2610,7 @@ pub fn dispatch_via_miframe(
     // means dereferencing both simultaneously is sound.
     let ctx_ptr = miframe.ctx;
     let sym_ptr = miframe.sym;
-    let entry_py_pc = miframe.orgpc as u32;
+    let entry_py_pc = EntryPyPc::Py(miframe.orgpc as u32);
     // SAFETY: both pointers were initialized at MIFrame
     // construction time and outlive this call (TraceCtx and
     // PyreSym are pinned by the surrounding tracing session).
@@ -2597,7 +2629,7 @@ pub fn dispatch_via_miframe(
     // so guard snapshots can resolve a per-guard resume coordinate from
     // `op_pc`.  Set `fbw_mode.snapshot_sym` for the walk's lifetime;
     // `walker_capture_snapshot_for_last_guard` and
-    // `fbw_foriter_body_pc_from_op_pc` read it.  This is the PRODUCTION
+    // `fbw_foriter_body_from_op_pc` read it.  This is the PRODUCTION
     // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
     // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
     // so `fbw_mode.snapshot_sym` is non-null on every default-JIT
@@ -2768,8 +2800,8 @@ pub fn dispatch_via_miframe(
             // This entry (test/fixture) hard-codes
             // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
             // rather than seeding them from `sym.jitcode` /
-            // `collect_outer_active_boxes` like
-            // `dispatch_via_miframe_at_opcode_entry` does.  A specialized
+            // `collect_outer_active_boxes` like the retired per-opcode
+            // arm entry did.  A specialized
             // `generated_store_subscr_value` guard captured via
             // `walker_capture_snapshot_for_last_guard` would attach
             // resume data pointing at the wrong frame, so keep
@@ -2857,9 +2889,11 @@ fn compute_bridge_root_parent_frame(
     }
     let jitcode_index = unsafe { (*root_sym.jitcode).index as u32 };
     // `root_pc` (`resume_data.frames[0].pc`) is already the post-call resume
-    // point — the slot the inner frame's result lands in — so it is the
-    // fallthrough `resume_py_pc` directly (no `semantic_fallthrough_pc`).
-    let resume_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as u32;
+    // point — the slot the inner frame's result lands in — so its Python
+    // coordinate is a direct backtranslation (no `semantic_fallthrough_pc`).
+    // This local remains needed by the outer-active-box collector; the paused
+    // parent frame itself carries `ParentResumeCoord::Backxlat(root_pc)`.
+    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as u32;
     // Null the not-yet-produced call-result slot before collecting the active
     // boxes (the reconstructed callee supplies it on `SubReturn`), mirroring
     // `compute_inline_caller_frame`.  Operate on a clone so `root_sym` stays a
@@ -2920,12 +2954,13 @@ fn compute_bridge_root_parent_frame(
         &regs_r,
         &root_sym.registers_f,
         jitcode_index,
-        resume_py_pc,
+        root_py_pc,
         None,
         // Key the query off the same carried root-frame word the snapshot and
         // decode side read from `frames[0].jitcode_pc`, so both resolve the
         // identical liveness window. `PYRE_M73_OUTERCAP_CARRY=0` falls back to
         // the sentinel-based decode path.
+        root_liveness_word,
         root_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
         "bridge_root_parent",
@@ -2934,9 +2969,9 @@ fn compute_bridge_root_parent_frame(
     );
     Some(InlineParentFrame {
         jitcode_index,
-        call_py_pc: None,
+        call_jitcode_pc: None,
         call_stack_overrides: Vec::new(),
-        resume_py_pc,
+        resume_coord: ParentResumeCoord::Backxlat(root_pc),
         // Parent-frame words are never branch-tagged; negative tags belong to
         // a branch guard's own top-frame word.
         resume_marker_jit_pc: root_word,
@@ -3015,6 +3050,21 @@ fn recipe_parent_frame_from_recipe(
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
     let sentinel = u32::from(u16::MAX);
     let result_color = crate::state::result_color_at_pc_at(recipe.jitcode_index, py_pc);
+    if pcmap_recipe_resultcolor_audit_enabled() {
+        // `recipe.jitcode_pc` is the reconstructed frame's resolved RESUME
+        // coordinate. The trivia twin has the same marker/predecessor anchor
+        // tiers as that coordinate's inversion and includes its forward-trivia
+        // semantics, so it is the candidate native replacement for this read.
+        let twin = pjc
+            .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
+            .map(|color| color as usize)
+            .filter(|&color| color != u16::MAX as usize);
+        pcmap_recipe_resultcolor_audit_probe("recipe_parent_result_color", "fire");
+        pcmap_recipe_resultcolor_audit_probe(
+            "recipe_parent_result_color",
+            if twin == result_color { "eq" } else { "di" },
+        );
+    }
 
     let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
         recipe.jitcode_index,
@@ -3082,9 +3132,11 @@ fn recipe_parent_frame_from_recipe(
 
     Some(InlineParentFrame {
         jitcode_index: recipe.jitcode_index as u32,
-        call_py_pc: call_jit_pc.map(|pc| python_pc_for_jitcode_pc(&pjc.metadata, pc)),
+        call_jitcode_pc: call_jit_pc,
         call_stack_overrides: Vec::new(),
-        resume_py_pc: py_pc as u32,
+        // The recipe's resolved word was `backxlat_py_pc(jitcode_index,
+        // jitcode_pc)` by construction, exactly the bridge-root flavor.
+        resume_coord: ParentResumeCoord::Backxlat(recipe.jitcode_pc as usize),
         resume_marker_jit_pc,
         boxes,
     })
@@ -3295,8 +3347,7 @@ fn drive_bridge_frame_subwalk(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             // The outer Python frame is the root, paused at `root_pc`.
-            entry_py_pc: crate::state::backxlat_py_pc(outer_jitcode_index as i32, root_pc as i32)
-                as u32,
+            entry_py_pc: EntryPyPc::Jit(root_pc),
             outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,
@@ -3510,7 +3561,6 @@ pub(crate) fn drive_outer_frame_continuation(
         // Mirror `compute_bridge_root_parent_frame` so scatter reads the banks in collection order.
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             outer_jitcode_index as i32,
-            crate::state::backxlat_py_pc(outer_jitcode_index as i32, root_pc as i32),
             match root_word.filter(|_| m73_outercap_carry_enabled()) {
                 Some(w) => w as i32,
                 None => majit_ir::resumedata::NO_JITCODE_PC,
@@ -3628,8 +3678,7 @@ pub(crate) fn drive_outer_frame_continuation(
             sub_jitcode_lookup: lookup_ref,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: crate::state::backxlat_py_pc(outer_jitcode_index as i32, root_pc as i32)
-                as u32,
+            entry_py_pc: EntryPyPc::Jit(root_pc),
             outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,
@@ -3641,232 +3690,6 @@ pub(crate) fn drive_outer_frame_continuation(
         walk(root_code, entry, &mut outer_wc)
     };
     Some(outcome)
-}
-
-/// Orthodox entry: walk a per-opcode arm jitcode with
-/// **fresh per-jitcode register banks** sized to the entry jitcode's
-/// declared `num_regs_<i|r|f>() + len(constants_<i|r|f>)`, with `r0`
-/// pre-seeded to the live PyFrame OpRef (`sym.frame`).
-///
-/// RPython line-by-line parity:
-///
-/// * Allocation + constant copy: `MIFrame.setup(jitcode)` at
-///   `pyjitpl.py:74-91` calls `copy_constants` for each of the three
-///   register banks, producing fresh per-frame lists of length
-///   `num_regs_X + len(constants_X)`.  `allocate_callee_register_banks`
-///   below ports that shape (`pyjitpl.py:97-119 copy_constants`).
-/// * `r0 = frame`: every helper body accepted by this legacy entry
-///   treats register 0 as the implicit PyFrame argument (verified for
-///   `execute_pop_top` — `inline_call_r_r/dR>r [r0]` invokes the
-///   `pop_value` sub-jitcode with `r0` = caller's r0).  This matches
-///   RPython's convention where the topmost call site provides the
-///   PyFrame as the first argument to the jitdriver's portal jitcode
-///   (`call.py:148 portal_runner`).  The concrete frame address comes
-///   from `MIFrame.concrete_frame_addr`, populated by the production
-///   tracer at `trace_opcode.rs:768`.
-///
-/// The semantic frame mirror (`sym.registers_r`) and the per-jitcode
-/// arm-local banks are now distinct universes: this entry no longer
-/// aliases `sym.registers_r` as the walker's `registers_r`.  Closes
-/// the structural blocker documented in
-/// `project_issue73_phase5_design.md` for opcodes whose arm uses
-/// `r0 = frame`.
-///
-/// `last_exc_value` / `last_exc_box` / `class_of_last_exc_is_const`
-/// writeback to `sym` mirrors `dispatch_via_miframe` byte-for-byte —
-/// the symbolic exception state survives across per-opcode dispatches
-/// at the production tracer's contract.
-pub fn dispatch_via_miframe_at_opcode_entry<'a>(
-    miframe: &mut crate::state::MIFrame,
-    session: &'a std::cell::RefCell<WalkSession>,
-    entry_jitcode: &'static majit_translate::jitcode::JitCode,
-    descr_refs: &'a [DescrRef],
-    sub_jitcode_lookup: &'a SubJitCodeLookup,
-    done_with_this_frame_descr_ref: DescrRef,
-    done_with_this_frame_descr_int: DescrRef,
-    done_with_this_frame_descr_float: DescrRef,
-    done_with_this_frame_descr_void: DescrRef,
-    exit_frame_with_exception_descr_ref: DescrRef,
-) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let ctx_ptr = miframe.ctx;
-    let sym_ptr = miframe.sym;
-    let concrete_frame_addr = miframe.concrete_frame_addr;
-    let entry_py_pc = miframe.orgpc as u32;
-    // SAFETY: both pointers were initialized at MIFrame construction
-    // time and outlive this call (parity with dispatch_via_miframe).
-    let trace_ctx = unsafe { &mut *ctx_ptr };
-    let sym = unsafe { &mut *sym_ptr };
-
-    // Per-opcode arm entry: start with `last_exc_value = None`.
-    //
-    // RPython parity: each Python opcode dispatch invokes a self-
-    // contained arm jitcode whose IR body never observes an inherited
-    // `metainterp.last_exc_value`.  The `catch_exception/L` ops the
-    // codewriter emits around a residual_call exist solely to catch
-    // exceptions raised BY that residual_call inside the arm — they
-    // are not meant to fire on a pre-existing pending exception from
-    // a prior Python opcode.  Python-level exception state survives
-    // across opcodes through `sym.last_exc_box` + the runtime's
-    // exception table, which the JIT recorder bridges through the
-    // `exception_target` mechanism rather than `WalkContext.
-    // last_exc_value`.  Seeding to `None` here matches that boundary.
-    //
-    // The post-walk writeback below preserves any pre-existing
-    // `sym.last_exc_box` because it only OVERWRITES when the walker
-    // arm itself produced a `Some(exc)` via `raise/r` — a per-opcode
-    // arm without a `raise/r` leaves `sym.last_exc_box` untouched.
-    let initial_last_exc_value: Option<OpRef> = None;
-    let initial_last_exc_value_concrete = ConcreteValue::Null;
-    let frame_opref = sym.frame;
-
-    // Snapshot the outer PyFrame state for walker-emitted guards.
-    // `pyjitpl.py:218-225 _get_list_of_active_boxes` reads
-    // `MIFrame.registers_{i,r,f}` filtered by JitCode-liveness for the
-    // outer `(jitcode_index, pc)`.  `frame_liveness_reg_indices_by_bank_at`
-    // resolves the same `all_liveness` byte stream the decoder consumes
-    // at resume (`state::frame_value_count_at` /
-    // `frame_liveness_reg_indices_by_bank_at`), so encoder and decoder
-    // agree byte-for-byte on which register slots populate the snapshot.
-    //
-    // Outer pyjitcode index: `sym.jitcode` points at the
-    // `majit_metainterp::jitcode::JitCode` for the user Python
-    // function being traced — its `.index()` is what RPython's
-    // `framestack[-1].jitcode.index` returns for the top frame
-    // (`pyjitpl.py:2586 capture_resumedata` reads it as the snapshot
-    // frame's `jitcode_index`).  Snapshot frames stamped with this
-    // index resolve to a valid `MetaInterpStaticData.jitcodes[idx]`
-    // entry whose `.code` is the Python `CodeObject`, so
-    // `build_resumed_frames` finds the PyFrame for resume.
-    let outer_jitcode_index = if sym.jitcode.is_null() {
-        0
-    } else {
-        unsafe { (*sym.jitcode).index as u32 }
-    };
-    let outer_active_boxes = collect_outer_active_boxes(
-        sym,
-        trace_ctx,
-        &sym.registers_i,
-        &sym.registers_r,
-        &sym.registers_f,
-        outer_jitcode_index,
-        entry_py_pc,
-        None,
-        majit_ir::resumedata::NO_JITCODE_PC,
-        OuterActiveBoxesEntryTwin::PyPc,
-        "opcode_entry",
-        None,
-        &[],
-    );
-
-    // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
-    // `copy_constants(registers, constants, num_regs_X, ConstClass)`.
-    // `allocate_callee_register_banks` ports this for sub-jitcode
-    // entries; reuse it here for the per-opcode entry too, sharing the
-    // exact byte-shape: registers `[0..num_regs_X)` are zero/None, the
-    // constants pool occupies `[num_regs_X..num_regs_X+len(constants))`.
-    let body = SubJitCodeBody {
-        code: entry_jitcode.code.as_slice(),
-        num_regs_r: entry_jitcode.num_regs_r(),
-        num_regs_i: entry_jitcode.num_regs_i(),
-        num_regs_f: entry_jitcode.num_regs_f(),
-        constants_i: entry_jitcode.constants_i.as_slice(),
-        constants_r: entry_jitcode.constants_r.as_slice(),
-        constants_f: entry_jitcode.constants_f.as_slice(),
-    };
-    let (mut regs_r, mut regs_i, mut regs_f, mut concrete_r, mut concrete_i) =
-        allocate_callee_register_banks(&body, trace_ctx);
-
-    // r0 = frame OpRef.  Mirror RPython's portal-runner contract where
-    // the topmost frame's `registers_r[0]` carries the PyFrame argument.
-    // Skeleton arms with `num_regs_r() == 0` (no Ref bank, e.g. trivial
-    // pass-through opcodes) simply skip the seed.
-    //
-    // Epic #245 (per-frame frame-identity): this `regs_r[0] = sym.frame`
-    // write IS the runtime seed of the universal `self`(frame) red arg.
-    // `frame_opref` is the *per-callee* frame — `sym.frame` is set to the
-    // inlined callee's `callee_frame_opref` (`trace_opcode.rs`
-    // `sym.frame = callee_frame_opref`), so each frame's r0 already
-    // resolves to its own PyFrame.  Slice 1 appended a graph-level
-    // `frame_var` start-block inputarg to non-portal callee jitcode, but
-    // that Variable currently shares a color with the single
-    // `portal_frame_reg` (the unconditional `pin!(frame_var,
-    // portal_frame_reg)` in `codewriter.rs`), so there is no distinct
-    // slot to seed separately — the per-callee frame seed lives here.
-    // Un-aliasing `frame_var` (its own color) and flipping the non-portal
-    // namespace/pycode readers off the shared `portal_frame_reg` onto it
-    // is the coupled Slice 3a step (#240 LoadGlobal namespace cutover).
-    if entry_jitcode.num_regs_r() > 0 {
-        regs_r[0] = frame_opref;
-        concrete_r[0] = if concrete_frame_addr != 0 {
-            ConcreteValue::Ref(concrete_frame_addr as pyre_object::PyObjectRef)
-        } else {
-            ConcreteValue::Null
-        };
-    }
-
-    let result = {
-        let mut wc = WalkContext {
-            callee_shadow: None,
-            inline_callee_consts: None,
-            fbw_mode: Default::default(),
-            session,
-            registers_r: &mut regs_r,
-            registers_i: &mut regs_i,
-            registers_f: &mut regs_f,
-            concrete_registers_r: &mut concrete_r,
-            concrete_registers_i: &mut concrete_i,
-            descr_refs,
-            raw_descrs: RawDescrPool::Global,
-            // The per-opcode arm walk is the sole concrete-execution leg for
-            // the traced iteration: the synchronous marker walk returns its
-            // terminal outcome without re-running `execute_opcode_step`, so
-            // nothing else applies the arm's
-            // residual-call effects.  Tracing executes as it records
-            // (`pyjitpl.py:1995 do_residual_call` →
-            // `executor.execute_varargs`).
-            is_authoritative_executor: true,
-            // No replay backs this walk: the interpreter advances
-            // opcode by opcode and the compiled loop enters at the
-            // NEXT iteration, so declined effects would be lost, not
-            // deferred (see the field doc).
-            is_full_body_walk: false,
-            trace_ctx,
-            done_with_this_frame_descr_ref,
-            done_with_this_frame_descr_int,
-            done_with_this_frame_descr_float,
-            done_with_this_frame_descr_void,
-            exit_frame_with_exception_descr_ref,
-            is_top_level: false,
-            sub_jitcode_lookup,
-            last_exc_value: initial_last_exc_value,
-            last_exc_value_concrete: initial_last_exc_value_concrete,
-            entry_py_pc,
-            // `entry_py_pc` is `miframe.orgpc` — an interpreter-driven Python
-            // pc with no jitcode-native producer at this seam, so the outer
-            // coordinate has no twin here.
-            outer_resume_marker_jit_pc: None,
-            outer_jitcode_index,
-            outer_active_boxes,
-            store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
-            pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
-            live_before_jit_pc: usize::MAX,
-            live_after_jit_pc: usize::MAX,
-        };
-        let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
-        let final_last_exc = wc.last_exc_value;
-        drop(wc);
-        if let Some(exc) = final_last_exc {
-            sym.last_exc_box = exc;
-            sym.class_of_last_exc_is_const = true;
-        }
-        outcome
-    };
-    result
 }
 
 /// `getarrayitem_gc_<i|r|f>/rid>X` handler. Operand layout `rid>X`:
@@ -6869,9 +6692,12 @@ fn try_execute_residual_call_via_executor(
     // exhaustion arm) still records the completion; a successful attempt
     // replaces the entry with a fresh one anyway.
     if helper == majit_ir::PyreHelperKind::ForIterNext {
-        let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
-            .unwrap_or(ctx.entry_py_pc as usize + 1);
-        fbw_foriter_inflight_mark_attempt(body_pc);
+        let body =
+            fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc).unwrap_or_else(|| {
+                pcmap_entrypc_audit_ctx_read(ctx, "foriter_attempt_fallback");
+                InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1)
+            });
+        fbw_foriter_inflight_mark_attempt(body);
     }
     // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
     // in-flight FOR_ITER) so the concrete-heap-write gate can detect a callee
@@ -7053,12 +6879,12 @@ fn try_execute_residual_call_via_executor(
                 // body and deliver to the wrong pc.  The fallback (no outer
                 // full-body sym / metadata) keeps the entry coordinate, which
                 // is correct for the loop-header FOR_ITER.
-                let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
-                    .unwrap_or(ctx.entry_py_pc as usize + 1);
-                fbw_foriter_inflight_capture(
-                    result_i64 as usize as pyre_object::PyObjectRef,
-                    body_pc,
-                );
+                let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+                    .unwrap_or_else(|| {
+                        pcmap_entrypc_audit_ctx_read(ctx, "foriter_capture_fallback");
+                        InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1)
+                    });
+                fbw_foriter_inflight_capture(result_i64 as usize as pyre_object::PyObjectRef, body);
                 // #73/#267: the item lands on the operand-stack TOS through the
                 // codewriter's `pin!` slot binding (FOR_ITER lowering), not a
                 // `setarrayitem_vable_r` push, and the residual result is
@@ -7074,6 +6900,7 @@ fn try_execute_residual_call_via_executor(
                 // valid).
                 ctx.vstack_last_ref = recorded;
                 if fbw_debug_abort_enabled() {
+                    pcmap_entrypc_audit_ctx_read(ctx, "foriter_debug");
                     let item = result_i64 as usize as pyre_object::PyObjectRef;
                     let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
                         Some(unsafe { pyre_object::w_int_get_value(item) })
@@ -7081,10 +6908,10 @@ fn try_execute_residual_call_via_executor(
                         None
                     };
                     eprintln!(
-                        "[fbw-foriter] capture item=0x{:x} intval={intval:?} foriter_pc={} body_pc={body_pc} \
+                        "[fbw-foriter] capture item=0x{:x} intval={intval:?} foriter_pc={} body={body:?} \
                          store_journal_len={} append_journal_len={} unjournaled={}",
                         result_i64 as usize,
-                        ctx.entry_py_pc,
+                        ctx.entry_py_pc(),
                         fbw_store_journal_len(),
                         FBW_APPEND_JOURNAL.with(|j| j.borrow().len()),
                         fbw_has_unjournaled_effect(),
@@ -7511,7 +7338,7 @@ fn audit_outer_active_boxes_entry_twin(
     assert_eq!(
         twin_pcdep,
         table_pcdep,
-        "PCMAP_ENTRY pcdep mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc}",
+        "PCMAP_ENTRY pcdep mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc} twin_pcdep={twin_pcdep:?} table_pcdep={table_pcdep:?}",
         twin.name(),
     );
     if !payload.code_ptr.is_null() {
@@ -7523,7 +7350,7 @@ fn audit_outer_active_boxes_entry_twin(
         assert_eq!(
             twin_depth,
             table_depth,
-            "PCMAP_ENTRY depth mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc}",
+            "PCMAP_ENTRY depth mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc} twin_depth={twin_depth} table_depth={table_depth} twin_pcdep={twin_pcdep:?} table_pcdep={table_pcdep:?}",
             twin.name(),
         );
     }
@@ -7538,7 +7365,11 @@ fn collect_outer_active_boxes(
     outer_jitcode_index: u32,
     entry_py_pc: u32,
     guard_py_pc: Option<u32>,
+    // The resume-carried coordinate remains the bank-liveness source. Entry
+    // metadata can be derived from an earlier raw operation coordinate, so it
+    // must travel independently rather than inheriting that marker word.
     carried_jitcode_pc: i32,
+    entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
     entry_caller: &'static str,
     vstack: Option<&[OpRef]>,
@@ -7551,7 +7382,6 @@ fn collect_outer_active_boxes(
     // this is the plain py_pc→jitcode-translation query.
     let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         outer_jitcode_index as i32,
-        entry_py_pc as i32,
         carried_jitcode_pc,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
@@ -7584,7 +7414,7 @@ fn collect_outer_active_boxes(
                 audit_outer_active_boxes_entry_twin(
                     payload,
                     entry_py_pc,
-                    carried_jitcode_pc,
+                    entry_jitcode_pc,
                     entry_twin,
                     entry_caller,
                 );
@@ -7602,20 +7432,26 @@ fn collect_outer_active_boxes(
                 let stack_depth_at_pc = if payload.code_ptr.is_null() {
                     0usize
                 } else {
-                    match (entry_twin, carried_jitcode_pc >= 0) {
+                    match (entry_twin, entry_jitcode_pc >= 0) {
                         (OuterActiveBoxesEntryTwin::Plain, true) => payload
-                            .depth_for_jitcode_pc_pred(carried_jitcode_pc as usize)
+                            .depth_for_jitcode_pc_pred(entry_jitcode_pc as usize)
                             .unwrap_or(0)
                             as usize,
                         (OuterActiveBoxesEntryTwin::Trivia, true) => payload
-                            .depth_trivia_for_jitcode_pc(carried_jitcode_pc as usize)
+                            .depth_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                             .unwrap_or(0)
                             as usize,
-                        _ => crate::liveness::liveness_for(payload.code_ptr)
-                            .depth_at_py_pc()
-                            .get(entry_py_pc as usize)
-                            .copied()
-                            .unwrap_or(0) as usize,
+                        _ => {
+                            pcmap_pivot_audit_record_fire(
+                                "collect_outer_active_boxes_depth",
+                                "py_pc_entry",
+                            );
+                            crate::liveness::liveness_for(payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(entry_py_pc as usize)
+                                .copied()
+                                .unwrap_or(0) as usize
+                        }
                     }
                 };
                 (
@@ -7643,23 +7479,28 @@ fn collect_outer_active_boxes(
     } else {
         unsafe {
             let jc = &*sym.jitcode;
-            match (entry_twin, carried_jitcode_pc >= 0) {
+            match (entry_twin, entry_jitcode_pc >= 0) {
                 (OuterActiveBoxesEntryTwin::Plain, true) => jc
                     .payload
-                    .pcdep_for_jitcode_pc(carried_jitcode_pc as usize)
+                    .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
                     .unwrap_or_default(),
                 (OuterActiveBoxesEntryTwin::Trivia, true) => jc
                     .payload
-                    .pcdep_trivia_for_jitcode_pc(carried_jitcode_pc as usize)
+                    .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                     .map(ToOwned::to_owned)
                     .unwrap_or_default(),
-                _ => jc
-                    .payload
-                    .metadata
-                    .pcdep_color_slots
-                    .get(entry_py_pc as usize)
-                    .cloned()
-                    .unwrap_or_default(),
+                _ => {
+                    pcmap_pivot_audit_record_fire(
+                        "collect_outer_active_boxes_pcdep",
+                        "py_pc_entry",
+                    );
+                    jc.payload
+                        .metadata
+                        .pcdep_color_slots
+                        .get(entry_py_pc as usize)
+                        .cloned()
+                        .unwrap_or_default()
+                }
             }
         }
     };
@@ -8168,25 +8009,35 @@ fn fbw_strict_fold_frame_reg(ctx: &WalkContext<'_, '_>) -> u16 {
 struct InlineParentFrame {
     /// The caller's jitcode index (`(*JitCode).index`).
     jitcode_index: u32,
-    /// The caller CALL opcode's Python pc. A nested inline-capture abort
-    /// resumes the top-level frame here so the declined callee executes once.
-    call_py_pc: Option<u32>,
-    /// Concrete operand-stack slots at `call_py_pc`, keyed by absolute
+    /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
+    /// carries this native coordinate to the interpreter-flush boundary.
+    call_jitcode_pc: Option<usize>,
+    /// Concrete operand-stack slots at the caller CALL, keyed by absolute
     /// `locals_cells_stack_w` index. Used only by the abort-point flush.
     call_stack_overrides: Vec<(usize, pyre_object::PyObjectRef)>,
-    /// The caller's resume Python pc: the CALL's return point (fallthrough),
-    /// where the next opcode pops the call result.  First slice keeps this a
-    /// plain py_pc (`< AFTER_RESIDUAL_CALL_PC_FLAG`); a CALL inside a
-    /// try-block (catch marker) declines multi-frame.
-    resume_py_pc: u32,
+    /// Authoritative derivation of the caller's Python resume pc.  The
+    /// Python-native consumers resolve this at their boundary; a CALL inside
+    /// a try-block (catch marker) still declines multi-frame.
+    resume_coord: ParentResumeCoord,
     /// Codewrite-time jitcode-keyed marker for the CALL fallthrough resume
     /// point, queried at the CALL site.  Bridge-root frames have no CALL
     /// offset in hand and carry `None`.
     resume_marker_jit_pc: Option<usize>,
-    /// The caller's `in_a_call` active boxes at `resume_py_pc` — the liveness
+    /// The caller's `in_a_call` active boxes at its resolved resume pc — the liveness
     /// at the return point with the not-yet-produced call-result slot nulled
     /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs:1779).
     boxes: Vec<OpRef>,
+}
+
+/// The derivation flavor of a paused caller frame's Python resume pc.
+#[derive(Clone, Copy)]
+enum ParentResumeCoord {
+    /// `resume_py_pc = backxlat_py_pc(jitcode_index, jitcode_pc)`. Used by
+    /// both bridge-root and reconstructed-recipe parent frames.
+    Backxlat(usize),
+    /// `resume_py_pc = semantic_fallthrough_pc(code,
+    /// python_pc_for_jitcode_pc(metadata, call_jitcode_pc))`.
+    CallFallthrough(usize),
 }
 
 /// RAII guard for one framestack level. Pop on drop so `?` and nested
@@ -8194,11 +8045,12 @@ struct InlineParentFrame {
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
 
 thread_local! {
-    /// Top-level caller CALL pc and its concrete operand-stack slots stashed
-    /// by [`fbw_abort_nested_unjournaled_residual`] at the nested-inline
-    /// decline, read back by the trace loop after the walk unwinds
+    /// Top-level caller CALL native JitCode coordinate and concrete
+    /// operand-stack slots stashed by
+    /// [`fbw_abort_nested_unjournaled_residual`] at the nested-inline decline,
+    /// read back by the trace loop after the walk unwinds
     /// ([`fbw_abort_outer_resume_take`]) to drive the abort-point flush.
-    static FBW_ABORT_OUTER_RESUME_PY_PC: std::cell::Cell<Option<usize>> =
+    static FBW_ABORT_OUTER_RESUME: std::cell::Cell<Option<(u32, usize)>> =
         const { std::cell::Cell::new(None) };
     static FBW_ABORT_OUTER_STACK_OVERRIDES: std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -8815,7 +8667,8 @@ pub unsafe fn fbw_finish_concrete_root_walker_area(
 
 /// One in-flight FOR_ITER continuation entry (#57 Option C): the item the
 /// FOR_ITER `for_iter_next` residual consumed on the authoritative walk, the
-/// body pc to resume at (the FOR_ITER `py_pc + 1` continue-arm fallthrough),
+/// body coordinate to resume at (the FOR_ITER `py_pc + 1` continue-arm
+/// fallthrough, resolved only at a match point),
 /// and whether a body effect committed since THIS consume.
 ///
 /// `body_effect_since_consume` is the R1 double-apply guard, per entry: an
@@ -8826,13 +8679,26 @@ pub unsafe fn fbw_finish_concrete_root_walker_area(
 /// in flight is "after" every one of them (re-running ANY of their bodies
 /// re-applies it), so the executor marks the flag on EVERY active entry; a
 /// fresh consume's own entry starts clear.
+#[derive(Clone, Copy, Debug)]
+enum InflightForiterBody {
+    /// Legacy entry-PC fallback for a per-opcode walk or fixture with no
+    /// full-body JitCode coordinate.
+    Py(usize),
+    /// The outer Python JitCode identity and the `for_iter_next` residual's
+    /// own JitCode pc. The body fallthrough is derived only at a match point.
+    Jit {
+        outer_jitcode_index: u32,
+        op_pc: usize,
+    },
+}
+
 #[derive(Clone, Copy)]
 struct InflightForiter {
     item: pyre_object::PyObjectRef,
-    body_pc: usize,
+    body: InflightForiterBody,
     body_effect_since_consume: bool,
     /// The walk re-reached this FOR_ITER's consume after the item's body ran
-    /// (a NEW `for_iter_next` attempt was dispatched for the same `body_pc`).
+    /// (a NEW `for_iter_next` attempt was dispatched for the same body).
     /// A completed entry must never be re-delivered — its body already ran
     /// during the walk — but a flush may still adopt the walk end state at
     /// the header WITHOUT delivery (the interpreter re-attempts the consume).
@@ -8908,7 +8774,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 
     /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
-    /// body_pc)` stashed when the FOR_ITER `for_iter_next` residual
+    /// body coordinate)` stashed when the FOR_ITER `for_iter_next` residual
     /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
     /// authoritative walk and advances the real shared heap iterator.  The
     /// advance is an irreversible side effect with no journal undo
@@ -8917,18 +8783,18 @@ thread_local! {
     /// ([`fbw_store_journal_commit`]).  On a trace ABORT the walk discards
     /// its recording but the iterator stays advanced — so the stash is
     /// DELIVERED to the live frame (the consumed item pushed, the frame
-    /// repositioned at `body_pc`) instead of dropping the iteration, the
+    /// repositioned at its resolved body pc) instead of dropping the iteration, the
     /// `_copy_data_from_miframe` continue-forward analog (blackhole.py:1711).
-    /// `body_pc` is the FOR_ITER continue-arm fallthrough (`py_pc + 1`,
-    /// codewriter.rs continue arm).  The item ref is a GC root via
+    /// The body coordinate represents the FOR_ITER continue-arm fallthrough
+    /// (`py_pc + 1`, codewriter.rs continue arm). The item ref is a GC root via
     /// [`fbw_store_journal_root_walker`].  Cleared at walk start
     /// ([`fbw_store_journal_reset`]).
     ///
     /// A LIFO stack, not a single slot: a walk that descends into a NESTED
     /// FOR_ITER has BOTH the outer loop's consumed item and the inner loop's
     /// consumed item in flight at once.  Each [`InflightForiter`] is keyed by
-    /// its `body_pc` (the FOR_ITER's own pc + 1, derived from the consuming
-    /// op's pc), so a re-consume of the SAME FOR_ITER (the prior iteration's
+    /// its resolved body pc (the FOR_ITER's own pc + 1, derived from the
+    /// consuming op's pc), so a re-consume of the SAME FOR_ITER (the prior iteration's
     /// body completed) replaces that loop's entry while a consume of a
     /// DIFFERENT (nested) FOR_ITER pushes a new entry — the outer entry is no
     /// longer destroyed by the inner consume.  The abort delivery
@@ -9020,7 +8886,10 @@ thread_local! {
 #[derive(Clone, Debug)]
 pub(crate) enum InlineAbortCarrier {
     Entry {
-        call_py_pc: usize,
+        /// The outer CALL's native coordinate, resolved at the interpreter
+        /// flush boundary.
+        outer_jitcode_index: u32,
+        call_jitcode_pc: usize,
         call_stack: Vec<pyre_object::PyObjectRef>,
     },
     MidBody(MidBodyPayload),
@@ -9035,10 +8904,15 @@ pub(crate) enum MidBodyAbortKind {
 #[derive(Clone, Debug)]
 pub(crate) struct MidBodyPayload {
     pub abort_kind: MidBodyAbortKind,
-    pub call_py_pc: usize,
-    pub post_call_py_pc: usize,
+    /// The outer CALL's native coordinate, resolved at the interpreter flush
+    /// boundary.
+    pub outer_jitcode_index: u32,
+    pub call_jitcode_pc: usize,
     pub call_stack_len: usize,
-    pub callee_py_pc: usize,
+    /// The rebuilt callee's native abort coordinate, resolved at the
+    /// interpreter flush boundary.
+    pub callee_jitcode_index: u32,
+    pub abort_jitcode_pc: usize,
     pub w_code: pyre_object::PyObjectRef,
     pub w_globals: pyre_object::PyObjectRef,
     pub x_arg: pyre_object::PyObjectRef,
@@ -9191,8 +9065,8 @@ pub(crate) fn fbw_store_journal_commit() {
 }
 
 /// Record the in-flight FOR_ITER continuation (#57 Option C): the consumed
-/// item the `for_iter_next` residual produced and the FOR_ITER body pc
-/// (`py_pc + 1`, the continue-arm fallthrough).  Called from the residual
+/// item the `for_iter_next` residual produced and its FOR_ITER body coordinate.
+/// Called from the residual
 /// executor's success arm when the helper is [`PyreHelperKind::ForIterNext`]
 /// and it produced a non-null item (a null item is the exhaustion arm — no
 /// body runs, nothing to deliver).  The stack mirrors loop nesting: a consume
@@ -9203,7 +9077,10 @@ pub(crate) fn fbw_store_journal_commit() {
 /// are popped, and the loop's own entry is replaced (a fresh body-effect
 /// window).  The outer loop's in-flight item is thus no longer destroyed by an
 /// inner consume, and a completed inner loop leaves no stale entry.
-pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_pc: usize) {
+pub(crate) fn fbw_foriter_inflight_capture(
+    item: pyre_object::PyObjectRef,
+    body: InflightForiterBody,
+) {
     FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
         // The "body effect since consume" window restarts at each consume:
@@ -9211,11 +9088,21 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
         // THIS iteration's body (Finding #1).  A fresh entry starts clear.
         let entry = InflightForiter {
             item,
-            body_pc,
+            body,
             body_effect_since_consume: false,
             body_completed: false,
         };
-        match stack.iter().position(|e| e.body_pc == body_pc) {
+        let Some(body_pc) = inflight_foriter_body_pc("capture", body) else {
+            // An unresolvable native coordinate cannot identify an existing
+            // loop. Keep this item as a distinct entry; later consumers also
+            // refuse it conservatively instead of guessing a Python pc.
+            stack.push(entry);
+            return;
+        };
+        match stack
+            .iter()
+            .position(|e| inflight_foriter_body_pc("capture", e.body) == Some(body_pc))
+        {
             Some(at) => {
                 stack.truncate(at + 1);
                 stack[at] = entry;
@@ -9233,16 +9120,23 @@ pub(crate) fn fbw_foriter_inflight_active() -> bool {
     FBW_FORITER_INFLIGHT.with(|c| !c.borrow().is_empty())
 }
 
-/// Mark the in-flight entry for `body_pc` body-completed: a NEW
+/// Mark the in-flight entry for `body` body-completed: a NEW
 /// `for_iter_next` attempt is being dispatched for the same FOR_ITER, so the
 /// prior consumed item's body has run to completion (the walk is back at the
 /// header).  Called from the residual dispatch BEFORE the call executes so an
 /// attempt that aborts mid-way (a kept-stack guard on the exhaustion arm)
 /// still leaves the completion recorded; a successful attempt replaces the
 /// entry with a fresh one anyway ([`fbw_foriter_inflight_capture`]).
-pub(crate) fn fbw_foriter_inflight_mark_attempt(body_pc: usize) {
+pub(crate) fn fbw_foriter_inflight_mark_attempt(body: InflightForiterBody) {
     FBW_FORITER_INFLIGHT.with(|c| {
-        if let Some(entry) = c.borrow_mut().iter_mut().find(|e| e.body_pc == body_pc) {
+        let Some(body_pc) = inflight_foriter_body_pc("mark_attempt", body) else {
+            return;
+        };
+        if let Some(entry) = c
+            .borrow_mut()
+            .iter_mut()
+            .find(|e| inflight_foriter_body_pc("mark_attempt", e.body) == Some(body_pc))
+        {
             entry.body_completed = true;
         }
     });
@@ -9289,7 +9183,9 @@ pub fn fbw_foriter_inflight_take_for_resume(
     }
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
-        let at = stack.iter().position(|e| e.body_pc == body_pc)?;
+        let at = stack
+            .iter()
+            .position(|e| inflight_foriter_body_pc("take_for_resume", e.body) == Some(body_pc))?;
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
         // would double it — refuse delivery.  A body-COMPLETED entry (the walk
@@ -9306,13 +9202,13 @@ pub fn fbw_foriter_inflight_take_for_resume(
         {
             return None;
         }
-        Some((stack[at].item, stack[at].body_pc))
+        Some((stack[at].item, body_pc))
     })
 }
 
 /// Whether the opcode at `resume_py_pc` in the live frame's code is a
 /// FOR_ITER — a non-FOR_ITER resume pc that merely happens to satisfy
-/// `body_pc == some entry.body_pc` is Shape B.
+/// `body_pc == some entry's resolved body pc` is Shape B.
 fn foriter_header_at(frame: usize, resume_py_pc: usize) -> bool {
     let frame_ptr = frame as *const u8;
     let w_code =
@@ -9347,7 +9243,10 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
     }
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
-        let Some(at) = stack.iter().position(|e| e.body_pc == body_pc) else {
+        let Some(at) = stack
+            .iter()
+            .position(|e| inflight_foriter_body_pc("completed_at_resume", e.body) == Some(body_pc))
+        else {
             return false;
         };
         stack[at].body_completed
@@ -9423,6 +9322,9 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
     });
     let stash = stash?;
     let body_effect = stash.body_effect_since_consume;
+    let Some(body_pc) = inflight_foriter_body_pc("take", stash.body) else {
+        return None;
+    };
     let store_len = fbw_store_journal_len();
     let append_len = FBW_APPEND_JOURNAL.with(|j| j.borrow().len());
     let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
@@ -9434,7 +9336,7 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
                  — keeping legacy drop-on-abort to avoid a double-apply (R1)",
-                stash.body_pc
+                body_pc
             );
         }
         return None;
@@ -9443,10 +9345,10 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
         eprintln!(
             "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={store_len} \
              unjournaled={unjournaled}",
-            stash.item as usize, stash.body_pc,
+            stash.item as usize, body_pc,
         );
     }
-    Some((stash.item, stash.body_pc))
+    Some((stash.item, body_pc))
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -9576,8 +9478,13 @@ fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
 }
 
-fn exact_first_jit_anchor(first_jit_pc_by_py_pc: &[usize], py_pc: usize, jit_pc: usize) -> bool {
-    first_jit_pc_by_py_pc.get(py_pc).copied() == Some(jit_pc)
+fn exact_floor_segment_anchor(
+    metadata: &crate::PyJitCodeMetadata,
+    py_pc: usize,
+    jit_pc: usize,
+) -> bool {
+    crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+        .is_some_and(|(start, py)| start == jit_pc && py as usize == py_pc)
 }
 
 /// Admit a marker at the semantic head of a portal-shaped Python opcode.
@@ -9588,7 +9495,7 @@ fn exact_first_jit_anchor(first_jit_pc_by_py_pc: &[usize], py_pc: usize, jit_pc:
 /// unsupported opcode. Anything except that same-pc write to this portal
 /// frame declines.
 fn portal_marker_first_jit_anchor(
-    first_jit_pc_by_py_pc: &[usize],
+    metadata: &crate::PyJitCodeMetadata,
     built_as_portal: bool,
     portal_frame_reg: u16,
     perfn_descrs: &[majit_metainterp::jitcode::RuntimeBhDescr],
@@ -9597,16 +9504,18 @@ fn portal_marker_first_jit_anchor(
     jit_pc: usize,
     mut python_pc_for_op: impl FnMut(usize) -> usize,
 ) -> bool {
-    if exact_first_jit_anchor(first_jit_pc_by_py_pc, py_pc, jit_pc) {
+    if exact_floor_segment_anchor(metadata, py_pc, jit_pc) {
         return true;
     }
     if !built_as_portal || portal_frame_reg > u8::MAX as u16 {
         return false;
     }
-    let Some(mut pc) = first_jit_pc_by_py_pc.get(py_pc).copied() else {
+    let Some((mut pc, floor_py_pc)) =
+        crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+    else {
         return false;
     };
-    if pc == usize::MAX || pc >= jit_pc {
+    if floor_py_pc as usize != py_pc || pc >= jit_pc {
         return false;
     }
     while pc < jit_pc {
@@ -9672,10 +9581,15 @@ pub(crate) fn fbw_bump_executed_effect() {
 }
 
 /// gh#467 latch the inline-abort forward-flush carrier (see [`FBW_ABORT_CALL_RESUME`]).
-pub(crate) fn fbw_set_abort_call_resume(call_pc: usize, stack: Vec<pyre_object::PyObjectRef>) {
+pub(crate) fn fbw_set_abort_call_resume(
+    outer_jitcode_index: u32,
+    call_jitcode_pc: usize,
+    stack: Vec<pyre_object::PyObjectRef>,
+) {
     FBW_ABORT_CALL_RESUME.with(|c| {
         *c.borrow_mut() = Some(InlineAbortCarrier::Entry {
-            call_py_pc: call_pc,
+            outer_jitcode_index,
+            call_jitcode_pc,
             call_stack: stack,
         })
     });
@@ -9795,14 +9709,19 @@ fn fbw_abort_nested_unjournaled_residual(
         && !in_exception_string_inline
         && !ctx.session.borrow().framestack.is_empty()
     {
-        let (outer_resume_py_pc, stack_overrides) = {
+        let (outer_resume, stack_overrides) = {
             let session = ctx.session.borrow();
             match session.framestack.first().and_then(|f| f.parent.as_ref()) {
-                Some(frame) => (frame.call_py_pc, frame.call_stack_overrides.clone()),
+                Some(frame) => (
+                    frame
+                        .call_jitcode_pc
+                        .map(|jit_pc| (frame.jitcode_index, jit_pc)),
+                    frame.call_stack_overrides.clone(),
+                ),
                 None => (None, Vec::new()),
             }
         };
-        FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.set(outer_resume_py_pc.map(|pc| pc as usize)));
+        FBW_ABORT_OUTER_RESUME.with(|c| c.set(outer_resume));
         FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
             *c.borrow_mut() = stack_overrides;
         });
@@ -9811,14 +9730,14 @@ fn fbw_abort_nested_unjournaled_residual(
     Ok(())
 }
 
-/// Take the outer-caller resume pc stashed by
+/// Take the outer-caller CALL JitCode coordinate stashed by
 /// [`fbw_abort_nested_unjournaled_residual`].  The stack overrides stay in
 /// `FBW_ABORT_OUTER_STACK_OVERRIDES` (rooted by the #447 area walker,
 /// `abort_overrides`) until [`fbw_abort_outer_stack_overrides_clear`]; the
 /// flush reads them in place from the rooted cell so a minor collection while
 /// boxing Int/Float locals forwards the very refs it writes.
-pub(crate) fn fbw_abort_outer_resume_take() -> Option<usize> {
-    FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.replace(None))
+pub(crate) fn fbw_abort_outer_resume_take() -> Option<(u32, usize)> {
+    FBW_ABORT_OUTER_RESUME.with(|c| c.replace(None))
 }
 
 /// Run `f` with the rooted outer-frame stack overrides borrowed in place.
@@ -9836,8 +9755,8 @@ pub(crate) fn fbw_abort_outer_stack_overrides_clear() {
 }
 
 /// Clear the nested inline abort resume latch at a walk boundary.
-pub(crate) fn fbw_abort_outer_resume_py_pc_reset() {
-    FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.set(None));
+pub(crate) fn fbw_abort_outer_resume_reset() {
+    FBW_ABORT_OUTER_RESUME.with(|c| c.set(None));
     FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| c.borrow_mut().clear());
 }
 
@@ -10562,42 +10481,18 @@ fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) ->
 /// opcode (where the walk physically is), not the resume block-head a
 /// `-live-` marker names — the marker case returns an EARLIER py_pc and
 /// makes the mirror's boundary detection oscillate.  Uses only the
-/// `first_jit_pc_by_py_pc` containment table (largest `py` with
-/// `first_jit[py] <= jit_pc`); falls back to the nearest-`-live-`-marker
-/// heuristic (reconstructed via [`pc_map_marker_for`])
-/// when that table is empty (skeleton / fixture installs).
+/// JitCode-PC floor pivot (largest floor boundary at-or-before `jit_pc`).
 fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
-    let first_jit = &metadata.first_jit_pc_by_py_pc;
-    if !first_jit.is_empty() {
-        let mut best: Option<(usize, u32)> = None;
-        for (py, &pos) in first_jit.iter().enumerate() {
-            if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
-                best = Some((pos, py as u32));
-            }
-        }
-        if let Some((_, py)) = best {
-            return py;
-        }
+    if !metadata.py_floor_by_jit_pc.is_empty() {
+        return crate::pyjitcode::floor_segment_for_jitcode_pc(
+            &metadata.py_floor_by_jit_pc,
+            jit_pc,
+        )
+        .expect("drained JitCode PC floor pivot must begin at byte offset zero")
+        .1;
     }
-    // Nearest-`-live-`-marker fallback (skeleton / fixture / a coordinate
-    // preceding the first op — verified to fire only at `jit_pc == 0`): the
-    // largest `py` whose resume marker offset is `<= jit_pc`, ties → larger
-    // `py`.  Reconstructs each `py`'s marker via the two surviving tables (the
-    // block-head predecessor derivation, else the sparse carry-forward
-    // sidecar) instead of the retired dense `pc_map` — identical for drained
-    // installs, where `derived.or(sidecar)` equals the dense value at every
-    // `py` by construction.
-    let mut best_py = 0u32;
-    let mut best_jc = 0usize;
-    for py in 0..first_jit.len() {
-        if let Some(jc) = pc_map_marker_for(metadata, py) {
-            if jc <= jit_pc && jc >= best_jc {
-                best_jc = jc;
-                best_py = py as u32;
-            }
-        }
-    }
-    best_py
+    pcmap_pivot_audit_record_fire("vstack_containing_py_pc", "empty_pivot_fallback");
+    0
 }
 
 fn vstack_initial_py_pc(
@@ -10630,27 +10525,6 @@ fn vstack_step_py_pc(
     } else {
         vstack_containing_py_pc(metadata, jit_pc)
     }
-}
-
-/// Reconstruct `pc_map[py]` — the `-live-` resume marker byte offset for
-/// Python PC `py` — from the two surviving tables plus the sparse carry-forward
-/// sidecar, WITHOUT the retired dense `pc_map` Vec.  Same resolution as
-/// the historical dense-map rule: the sidecar takes precedence (it holds the
-/// non-derivable divergences), everything else derives via
-/// [`crate::pyjitcode::derive_resume_marker`].  `None` when `py` is out of
-/// range or the tables are empty (skeleton / fixture).
-pub(crate) fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<usize> {
-    if let Ok(i) = metadata
-        .carryfwd_resume_pc
-        .binary_search_by_key(&(py as u32), |&(p, _)| p)
-    {
-        return Some(metadata.carryfwd_resume_pc[i].1);
-    }
-    crate::pyjitcode::derive_resume_marker(
-        &metadata.first_jit_pc_by_py_pc,
-        &metadata.block_head_py_by_jit_pc,
-        py,
-    )
 }
 
 /// Map an `abort_permanent` marker's jitcode pc back to the Python opcode
@@ -10927,6 +10801,104 @@ pub(crate) fn result_color_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RESULT_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT` is a report-only census for the
+/// recipe resume-coordinate result-color reader and the multi-frame callee
+/// diagnostic's inversion. The optional `_PROBE` receives a fire row followed
+/// by its verdict, since `check.py` discards diagnostic stderr.
+fn pcmap_recipe_resultcolor_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT").is_some())
+}
+
+fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "recipe_resultcolor\t{site}\t{verdict}");
+        }
+    }
+}
+
+/// `PYRE_PCMAP_PFRESUME_AUDIT` records paused-parent-frame coordinate
+/// resolution variants and retains the nested builder's twin assertions.
+/// Diagnostic only; phase 2 makes `ParentResumeCoord` authoritative.
+fn pcmap_pfresume_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_PFRESUME_AUDIT").is_some())
+}
+
+/// Append one paused-parent-frame resume audit result. `check.py` discards
+/// diagnostic stderr, so the optional probe receives one row per resolution
+/// or nested-twin assertion.
+fn pcmap_pfresume_audit_probe(site: &'static str, verdict: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_PFRESUME_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "pfresume\t{site}\t{verdict}");
+        }
+    }
+}
+
+/// Resolve the authoritative paused-parent coordinate at a Python-native
+/// consumer. A missing JitCode/code object is reported to the caller as the
+/// same multi-frame snapshot decline used by nearby unavailable-coordinate
+/// paths; it is never a panic.
+fn resolve_parent_resume_py_pc(parent: &InlineParentFrame, site: &'static str) -> Option<u32> {
+    match parent.resume_coord {
+        ParentResumeCoord::Backxlat(jitcode_pc) => {
+            if pcmap_pfresume_audit_enabled() {
+                pcmap_pfresume_audit_probe(site, "backxlat");
+            }
+            Some(
+                crate::state::backxlat_py_pc(parent.jitcode_index as i32, jitcode_pc as i32) as u32,
+            )
+        }
+        ParentResumeCoord::CallFallthrough(call_jit_pc) => {
+            let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+            else {
+                if pcmap_pfresume_audit_enabled() {
+                    pcmap_pfresume_audit_probe(site, "unavailable");
+                }
+                return None;
+            };
+            if pjc.code_ptr.is_null() {
+                if pcmap_pfresume_audit_enabled() {
+                    pcmap_pfresume_audit_probe(site, "unavailable");
+                }
+                return None;
+            }
+            if pcmap_pfresume_audit_enabled() {
+                pcmap_pfresume_audit_probe(site, "call_fallthrough");
+            }
+            let call_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
+            let code = unsafe { &*pjc.code_ptr };
+            Some(crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc) as u32)
+        }
+    }
+}
+
+/// Retained only for the unobserved nested builder: its marker construction is
+/// line-identical to the certified top-level M73_PFMARKER identity, and this
+/// assertion self-checks any future execution.
+fn audit_pfresume_twin<T: PartialEq>(site: &'static str, twin: T, table: T) {
+    if !pcmap_pfresume_audit_enabled() {
+        return;
+    }
+    let verdict = if twin == table { "eq" } else { "di" };
+    pcmap_pfresume_audit_probe(site, verdict);
+    assert!(twin == table, "PFRESUME {site} JitCode-PC twin diverges");
+}
+
 /// `PYRE_PCMAP_GUARD_KEPT_AUDIT` enables assertions that the guard-kept
 /// recovery's plain JitCode-PC pcdep and predecessor-depth twins reproduce
 /// their Python-PC tables at the guard's own emitted opcode. Diagnostic only;
@@ -10934,6 +10906,137 @@ pub(crate) fn result_color_audit_enabled() -> bool {
 pub(crate) fn pcmap_guard_kept_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_GUARD_KEPT_AUDIT").is_some())
+}
+
+/// `PYRE_PCMAP_CALLPC_AUDIT` certifies that a nested-inline abort's carried
+/// caller CALL JitCode coordinate resolves at the interpreter-flush boundary.
+/// Diagnostic only; off in production.
+pub(crate) fn pcmap_callpc_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT").is_some())
+}
+
+/// `PYRE_PCMAP_MIDBODY_AUDIT` certifies carried inline-abort identities at
+/// the interpreter-flush boundary and retains the deferred plain JitCode-PC
+/// producer-twin census.
+pub(crate) fn pcmap_midbody_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_MIDBODY_AUDIT").is_some())
+}
+
+/// `PYRE_PCMAP_GUARDCAP_AUDIT` records the selected JitCode-PC depth twin at
+/// each full-body guard capture. Diagnostic only; the Python-PC table remains
+/// authoritative while the census establishes its coordinate coverage.
+fn pcmap_guardcap_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_GUARDCAP_AUDIT").is_some())
+}
+
+/// Append one guard-capture depth census result. `check.py` discards
+/// diagnostic stderr, so the audit writes to an explicitly supplied probe.
+fn pcmap_guardcap_audit_probe(flavor: &'static str, verdict: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_GUARDCAP_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "guardcap_depth\t{flavor}\t{verdict}");
+        }
+    }
+}
+
+/// Record one mid-body pc-map audit result. `check.py` discards diagnostic
+/// stderr, so the optional probe receives one row per attempted comparison.
+pub(crate) fn pcmap_midbody_audit_probe(site: &'static str, verdict: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_MIDBODY_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "{site}\t{verdict}");
+        }
+    }
+}
+
+/// Audit the mid-body producer's legacy Python-PC metadata reads against the
+/// plain (no trivia skip) JitCode-PC twins at the callee abort opcode.
+fn audit_midbody_abort_plain_twins(
+    payload: &crate::pyjitcode::PyJitCode,
+    callee_py_pc: usize,
+    abort_jitcode_pc: usize,
+) {
+    if !pcmap_midbody_audit_enabled() {
+        return;
+    }
+    let table_depth = payload.metadata.depth_at_py_pc.get(callee_py_pc).copied();
+    let twin_depth = payload.depth_for_jitcode_pc_pred(abort_jitcode_pc);
+    let depth_verdict = if twin_depth == table_depth {
+        "eq"
+    } else {
+        "di"
+    };
+    pcmap_midbody_audit_probe("producer_depth_plain", depth_verdict);
+    assert_eq!(
+        twin_depth, table_depth,
+        "PCMAP_MIDBODY depth mismatch abort_jitcode_pc={abort_jitcode_pc} callee_py_pc={callee_py_pc} twin_depth={twin_depth:?} table_depth={table_depth:?}",
+    );
+
+    let table_pcdep = payload
+        .metadata
+        .pcdep_color_slots
+        .get(callee_py_pc)
+        .cloned();
+    let twin_pcdep = payload.pcdep_for_jitcode_pc(abort_jitcode_pc);
+    let pcdep_verdict = if twin_pcdep == table_pcdep {
+        "eq"
+    } else {
+        "di"
+    };
+    pcmap_midbody_audit_probe("producer_pcdep_plain", pcdep_verdict);
+    assert_eq!(
+        twin_pcdep, table_pcdep,
+        "PCMAP_MIDBODY pcdep mismatch abort_jitcode_pc={abort_jitcode_pc} callee_py_pc={callee_py_pc} twin_pcdep={twin_pcdep:?} table_pcdep={table_pcdep:?}",
+    );
+}
+
+/// `PYRE_PCMAP_ENTRYPC_AUDIT` records every remaining consumer of
+/// `WalkContext::entry_py_pc` against its marker twin. Diagnostic only; off
+/// in production.
+pub(crate) fn pcmap_entrypc_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_ENTRYPC_AUDIT").is_some())
+}
+
+/// Append one report-only `entry_py_pc` consumer census row. `check.py`
+/// discards diagnostic stderr, so the audit writes to an explicitly supplied
+/// probe file instead.
+fn pcmap_entrypc_audit_probe(site: &'static str, relation: &str, extra: &str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_ENTRYPC_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "entrypc\t{site}\t{relation}\t{extra}");
+        }
+    }
+}
+
+/// Audit a genuine `WalkContext::entry_py_pc` read. The channel variant is
+/// diagnostic-only; consumers retain their existing Python-PC behavior.
+fn pcmap_entrypc_audit_ctx_read(ctx: &WalkContext<'_, '_>, site: &'static str) {
+    if !pcmap_entrypc_audit_enabled() {
+        return;
+    }
+    pcmap_entrypc_audit_probe(site, ctx.entry_py_pc.audit_variant(), "-");
 }
 
 /// `PYRE_PCMAP_ENTRY_AUDIT` enables assertions that each carried
@@ -11124,89 +11227,149 @@ fn m73_outercap_carry_enabled() -> bool {
     })
 }
 
-pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
-    // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
-    // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
-    // no jitcode of its own), so the containing opcode is the largest `py`
-    // whose first offset is at-or-before `jit_pc`.  The resume-marker
-    // resolution cannot serve
-    // here: it resolves each PC to its nearest `-live-` marker at-or-before
-    // (sparse markers, carry-forward repeats), so whole PC runs share one
-    // value and the inverse is ambiguous.
-    // A coordinate that lands exactly on a `-live-` marker is a block
-    // head (branch target / catch target, reached via
-    // `resolve_branch_target_through_trampoline`): it belongs to the
-    // FIRST Python opcode that resumes at that marker — the start of the
-    // marker's carry-forward run — not to the preceding opcode whose
-    // emitted region the marker byte happens to fall inside.  Real op
-    // positions never collide with marker positions (each byte belongs
-    // to exactly one instruction), so this test only fires for block
-    // heads.
-    //
-    // The `block_head_py_by_jit_pc` table is the precomputed inverse of this
-    // block-head case (marker byte offset → Python block entry), built from
-    // the same block-head marker bytes at compile time. A no-JitCode prefix is
-    // included in the entry coordinate, so a CACHE / NOT_TAKEN run followed by
-    // constant-folded loads cannot move the inverse into the middle of an arm.
-    // Drained installs carry it; skeleton / fixture installs
-    // leave it empty.
-    if !metadata.block_head_py_by_jit_pc.is_empty() {
-        if let Ok(i) = metadata
-            .block_head_py_by_jit_pc
-            .binary_search_by_key(&jit_pc, |&(off, _)| off)
-        {
-            return metadata.block_head_py_by_jit_pc[i].1;
-        }
-    }
-    let first_jit = &metadata.first_jit_pc_by_py_pc;
-    let mut best: Option<(usize, u32)> = None;
-    for (py, &pos) in first_jit.iter().enumerate() {
-        if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
-            best = Some((pos, py as u32));
-        }
-    }
-    // Both live tiers missed (skeleton / fixture, or a
-    // coordinate preceding the first op): resume at the first opcode.
-    best.map_or(0, |(_, py)| py)
+/// `PYRE_PCMAP_PIVOT_AUDIT` records PC-pivot census counters. Off by default.
+pub fn pcmap_pivot_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT").is_some())
 }
 
-/// #57 Option C (Finding #2): derive the FOR_ITER body pc — the continue-arm
-/// fallthrough — from the `for_iter_next` residual op's OWN JitCode pc.
-///
-/// `op_pc` is the JitCode byte offset of the `for_iter_next` residual; its
-/// containing Python opcode is the FOR_ITER itself (the codewriter emits the
-/// residual at `py_pc as i64`, codewriter.rs:9066), so the FOR_ITER body is
-/// `python_pc_for_jitcode_pc(op_pc) + 1` (the continue-arm fallthrough,
-/// `opcode_for_iter`'s `next_instr() == opcode_pc + 1`).
-///
-/// Deriving from the op's own pc — instead of the walk-ENTRY coordinate
-/// (`entry_py_pc + 1`) — keeps the body pc correct for a FOR_ITER that is NOT
-/// the walk entry (a second/nested FOR_ITER reached deeper in a traced body):
-/// the entry coordinate equals the FOR_ITER fallthrough only when FOR_ITER is
-/// the loop-header / walk-entry opcode.
-///
-/// Returns `None` when the outer full-body-walk sym / metadata is unavailable
-/// (per-opcode arm walk, test fixture); the caller then keeps the legacy
-/// walk-entry coordinate, which is correct for the loop-header FOR_ITER.
-fn fbw_foriter_body_pc_from_op_pc(
+/// Append a report-only runtime/build-time PC-map census fire.  The probe is
+/// intentionally shared by the trace crate and codewriter so a corpus run can
+/// distinguish derivation work done while building metadata from runtime
+/// fallback use.
+pub fn pcmap_pivot_audit_record_fire(site: &'static str, arm: &'static str) {
+    if !pcmap_pivot_audit_enabled() {
+        return;
+    }
+    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
+        return;
+    };
+    use std::io::Write;
+
+    if let Ok(mut probe) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(probe, "pcmap_fire\t{site}\t{arm}");
+    }
+}
+
+fn floor_boundary_at_or_after(
+    metadata: &crate::PyJitCodeMetadata,
+    jit_pc: usize,
+) -> Option<(usize, u32)> {
+    let table = &metadata.py_floor_by_jit_pc;
+    let idx = table.partition_point(|&(off, _)| (off as usize) < jit_pc);
+    table.get(idx).map(|&(off, py)| (off as usize, py))
+}
+
+fn first_floor_boundary_for_py(
+    metadata: &crate::PyJitCodeMetadata,
+    py_pc: u32,
+) -> Option<(usize, u32)> {
+    metadata
+        .py_floor_by_jit_pc
+        .iter()
+        .find(|&&(_, py)| py == py_pc)
+        .map(|&(off, py)| (off as usize, py))
+}
+
+pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
+    if !metadata.py_floor_by_jit_pc.is_empty() {
+        let pivot = metadata
+            .block_head_py_by_jit_pc
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+            .ok()
+            .map(|i| metadata.block_head_py_by_jit_pc[i].1)
+            .or_else(|| {
+                crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+                    .map(|(_, py)| py)
+            })
+            .expect("drained JitCode PC floor pivot must begin at byte offset zero");
+        return pivot;
+    }
+    pcmap_pivot_audit_record_fire("python_pc_for_jitcode_pc", "empty_pivot_production");
+    0
+}
+
+/// `PYRE_PCMAP_INFLIGHT_AUDIT` records the final in-flight FOR_ITER body
+/// channel's variant and resolution outcome at each match point. Diagnostic
+/// only; a native-coordinate resolution failure is a conservative no-match.
+fn pcmap_inflight_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_INFLIGHT_AUDIT").is_some())
+}
+
+/// Append one report-only in-flight FOR_ITER pc-map census row. `check.py`
+/// discards diagnostic stderr, so the audit writes to an explicitly supplied
+/// probe file instead.
+fn pcmap_inflight_audit_probe(site: &'static str, variant: &'static str, outcome: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_INFLIGHT_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "inflight\t{site}\t{variant}\t{outcome}");
+        }
+    }
+}
+
+/// Resolve an in-flight body channel exactly where a stash match needs its
+/// Python body pc. A missing JitCode entry is deliberately `None`: callers
+/// treat it as no match and retain the legacy replay/delivery fallback.
+fn inflight_foriter_body_pc(site: &'static str, body: InflightForiterBody) -> Option<usize> {
+    match body {
+        InflightForiterBody::Py(body_pc) => {
+            if pcmap_inflight_audit_enabled() {
+                pcmap_inflight_audit_probe(site, "py", "native");
+            }
+            Some(body_pc)
+        }
+        InflightForiterBody::Jit {
+            outer_jitcode_index,
+            op_pc,
+        } => {
+            let body_pc = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
+                .map(|jc| python_pc_for_jitcode_pc(&jc.metadata, op_pc) as usize + 1);
+            if pcmap_inflight_audit_enabled() {
+                pcmap_inflight_audit_probe(
+                    site,
+                    "jit",
+                    if body_pc.is_some() {
+                        "resolved"
+                    } else {
+                        "unresolved"
+                    },
+                );
+            }
+            body_pc
+        }
+    }
+}
+
+/// Capture the native coordinates that identify a `for_iter_next` residual.
+/// The Python continue-arm fallthrough is intentionally not derived here.
+fn fbw_foriter_body_from_op_pc(
     snapshot_sym: *const crate::state::PyreSym,
     op_pc: usize,
-) -> Option<usize> {
-    let full_body_sym = snapshot_sym;
-    if full_body_sym.is_null() {
+) -> Option<InflightForiterBody> {
+    if snapshot_sym.is_null() {
         return None;
     }
-    // SAFETY: the pointer is live for the full-body walk's lifetime
-    // (`snapshot-root mode`); only its `jitcode` metadata is read.
-    let sym = unsafe { &*full_body_sym };
+    // SAFETY: the snapshot root stays live for the full-body walk. Only the
+    // immutable JitCode identity is read here.
+    let sym = unsafe { &*snapshot_sym };
     if sym.jitcode.is_null() {
         return None;
     }
-    let foriter_py_pc = unsafe {
-        let jc = &*sym.jitcode;
-        python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc) as usize
-    };
-    Some(foriter_py_pc + 1)
+    Some(InflightForiterBody::Jit {
+        outer_jitcode_index: unsafe { (*sym.jitcode).index as u32 },
+        op_pc,
+    })
 }
 
 /// Forward-skip Python trivia (`Cache` / `ExtendedArg` / `Resume` / `Nop`
@@ -12012,7 +12175,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // pyjitcode coordinates.  `ctx.outer_jitcode_index` +
     // `ctx.entry_py_pc` track those coordinates; `outer_active_boxes`
     // carries the `PyFrame` state at the Python opcode boundary
-    // (snapshotted once at `dispatch_via_miframe_at_opcode_entry` from
+    // (snapshotted once at walk entry — the retired per-opcode arm
+    // entry, or the inline CALL-site capture — from
     // `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
     // via `collect_outer_active_boxes` / `frame_liveness_reg_indices_
     // by_bank_at`).
@@ -12100,11 +12264,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
         // (fresh `top_regs`), not in `sym.registers_*`.
         let sym = unsafe { &*full_body_sym };
         if !sym.jitcode.is_null() {
-            // Set to `Some(call_py_pc)` when an after-residual-call guard's
-            // residual call sits inside a try-block (its per-CodeObject jitcode
-            // emitted a post-call catch); the snapshot resume pc is then the
-            // bit-14-marked CALL pc so the blackhole resumes at that catch.
-            let mut marker_call_py_pc: Option<u32> = None;
+            // Set when an after-residual-call guard's residual call sits inside
+            // a try-block (its per-CodeObject jitcode emitted a post-call
+            // catch); the JitCode resume coordinate then selects that catch.
             let mut marker_call_jit_pc: Option<usize> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
@@ -12140,9 +12302,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // FOR_ITER-next residual guard is being captured
                     // (`GuardCaptureScope::foriter_next_catch_resume`) and the
                     // call's CALL pc has a post-call catch, fold the bit-14
-                    // marker onto the CALL pc
-                    // (handled at `resume_py_pc` below) so the blackhole resumes
-                    // at the call's OWN catch and routes the raise to the
+                    // marker onto the CALL pc so the blackhole resumes at the
+                    // call's OWN catch and routes the raise to the
                     // enclosing handler instead of escaping the frame.
                     if after_residual_call {
                         let call_py_pc = py;
@@ -12155,7 +12316,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                 .after_residual_call_resume_for_jitcode_pc(op_pc)
                                 .is_some()
                         {
-                            marker_call_py_pc = Some(call_py_pc);
                             marker_call_jit_pc = Some(op_pc);
                         }
                     }
@@ -12163,16 +12323,80 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 (
                     py,
                     jc.index as u32,
-                    jc.payload.metadata.first_jit_pc_by_py_pc.len(),
+                    jc.payload.metadata.n_py_instrs as usize,
                 )
             };
             // #67/#124: synthetic loop-close guard pc overshoots past the last
             // Python opcode → resume at the trace's entry py (loop header).
-            let py_pc = if py_pc as usize >= num_instrs {
-                ctx.entry_py_pc
+            let loop_close_overshoot = py_pc as usize >= num_instrs;
+            let py_pc = if loop_close_overshoot {
+                pcmap_entrypc_audit_ctx_read(ctx, "loop_close_overshoot");
+                ctx.entry_py_pc()
             } else {
                 py_pc
             };
+            // The three resume-depth consumers below (vstack reconcile,
+            // valuestackdepth publication, and vable stack sync) share one
+            // JitCode-PC twin. Plain guards key their trivia twin at `op_pc`;
+            // after-residual guards key the same family at their post-call
+            // marker. A loop-close overshoot falls back to entry_py_pc and has
+            // no corresponding op_pc-derived twin, so it retains the legacy
+            // Python-PC lookup below.
+            let resume_depth_twin: Option<u16> = unsafe {
+                let jc = &*sym.jitcode;
+                if loop_close_overshoot {
+                    None
+                } else if after_residual_call {
+                    jc.payload
+                        .after_residual_marker_for_jitcode_pc(op_pc)
+                        .and_then(|marker| jc.payload.depth_trivia_for_jitcode_pc(marker))
+                } else {
+                    jc.payload.depth_trivia_for_jitcode_pc(op_pc)
+                }
+            };
+            if pcmap_guardcap_audit_enabled() {
+                let jc = unsafe { &*sym.jitcode };
+                let table_depth = if jc.payload.code_ptr.is_null() {
+                    None
+                } else {
+                    crate::liveness::liveness_for(jc.payload.code_ptr)
+                        .depth_at_py_pc()
+                        .get(py_pc as usize)
+                        .copied()
+                };
+                let (flavor, verdict) = if loop_close_overshoot {
+                    (
+                        if after_residual_call {
+                            "after_residual"
+                        } else {
+                            "plain"
+                        },
+                        "overshoot",
+                    )
+                } else if after_residual_call
+                    && jc
+                        .payload
+                        .after_residual_marker_for_jitcode_pc(op_pc)
+                        .is_none()
+                {
+                    ("after_residual", "no_marker")
+                } else {
+                    let twin_depth = resume_depth_twin;
+                    assert_eq!(
+                        twin_depth, table_depth,
+                        "PCMAP_GUARDCAP depth mismatch op_pc={op_pc} py_pc={py_pc} twin_depth={twin_depth:?} table_depth={table_depth:?}",
+                    );
+                    (
+                        if after_residual_call {
+                            "after_residual"
+                        } else {
+                            "plain"
+                        },
+                        "eq",
+                    )
+                };
+                pcmap_guardcap_audit_probe(flavor, verdict);
+            }
             // `capture_resumedata(after_residual_call=True)` snapshots the
             // trailing `-live-`, after the residual result has replaced the
             // Python opcode's consumed operands (pyjitpl.py:177-198,
@@ -12188,11 +12412,20 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 let jc = unsafe { &*sym.jitcode };
                 let code_ptr = jc.payload.code_ptr;
                 if !code_ptr.is_null() {
-                    let resume_depth = crate::liveness::liveness_for(code_ptr)
-                        .depth_at_py_pc()
-                        .get(py_pc as usize)
-                        .copied()
-                        .unwrap_or(0) as usize;
+                    let resume_depth = match resume_depth_twin {
+                        Some(depth) => depth as usize,
+                        None => {
+                            pcmap_pivot_audit_record_fire(
+                                "guard_capture_depth",
+                                "vstack_reconcile_twin_none",
+                            );
+                            crate::liveness::liveness_for(code_ptr)
+                                .depth_at_py_pc()
+                                .get(py_pc as usize)
+                                .copied()
+                                .unwrap_or(0) as usize
+                        }
+                    };
                     let code = unsafe { &*code_ptr };
                     reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth);
                 }
@@ -12243,10 +12476,20 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     if jc.payload.code_ptr.is_null() {
                         sym.valuestackdepth as i64
                     } else {
-                        let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-                        match lv.depth_at_py_pc().get(py_pc as usize).copied() {
+                        match resume_depth_twin {
                             Some(d) => (sym.nlocals + d as usize) as i64,
-                            None => sym.valuestackdepth as i64,
+                            None => {
+                                pcmap_pivot_audit_record_fire(
+                                    "guard_capture_depth",
+                                    "valuestackdepth_twin_none",
+                                );
+                                crate::liveness::liveness_for(jc.payload.code_ptr)
+                                    .depth_at_py_pc()
+                                    .get(py_pc as usize)
+                                    .copied()
+                                    .map(|d| (sym.nlocals + d as usize) as i64)
+                                    .unwrap_or(sym.valuestackdepth as i64)
+                            }
                         }
                     }
                 };
@@ -12280,17 +12523,33 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 let jc = &*sym.jitcode;
                 python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc)
             });
+            if pcmap_guardcap_audit_enabled() {
+                assert_eq!(
+                    guard_py_pc.is_some(),
+                    scope.branch_guard_jitcode_pc.is_some(),
+                    "PCMAP_GUARDCAP F3 selector diverges",
+                );
+            }
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
                     let jc = &*sym.jitcode;
                     if jc.payload.code_ptr.is_null() {
                         0usize
                     } else {
-                        crate::liveness::liveness_for(jc.payload.code_ptr)
-                            .depth_at_py_pc()
-                            .get(py_pc as usize)
-                            .copied()
-                            .unwrap_or(0) as usize
+                        match resume_depth_twin {
+                            Some(depth) => depth as usize,
+                            None => {
+                                pcmap_pivot_audit_record_fire(
+                                    "guard_capture_depth",
+                                    "stack_sync_twin_none",
+                                );
+                                crate::liveness::liveness_for(jc.payload.code_ptr)
+                                    .depth_at_py_pc()
+                                    .get(py_pc as usize)
+                                    .copied()
+                                    .unwrap_or(0) as usize
+                            }
+                        }
                     }
                 };
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
@@ -12700,30 +12959,41 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // `collect_outer_active_boxes`.  A non-branch guard carries no guard
             // pc, so it keeps the merge `py_pc` and its exact resume-translation.
             let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
-            // The snapshot resume pc folds in the bit-14 marker for a try-block
-            // residual call so the decode routes through
-            // the post-call catch marker (the call's OWN post-call
-            // `-live-`/catch), mirroring the trait leg's `marker_aware_resume_pc`.
-            // Liveness / depth / `last_instr` (above) and `collect_outer_active_boxes`
-            // (below) keep the plain (fallthrough) `liveness_py_pc` — the same
-            // split the trait leg keeps between `snapshot_live_pc` (marked) and
-            // `saved_orgpc` (plain) — so the active-box layout stays consistent
-            // with what the decoder reads.
-            let resume_py_pc = match marker_call_py_pc {
-                Some(call_py_pc) => {
-                    majit_ir::resumedata::encode_after_residual_call_pc(call_py_pc as i32) as u32
-                }
-                None => liveness_py_pc,
-            };
-            let (entry_twin, entry_caller) = if guard_py_pc.is_some() {
-                (OuterActiveBoxesEntryTwin::Plain, "guard_snapshot_guard_pc")
-            } else {
+            let (entry_jitcode_pc, entry_twin, entry_caller) = if guard_py_pc.is_some() {
+                let entry_jitcode_pc = unsafe {
+                    let metadata = &(&*sym.jitcode).payload.metadata;
+                    (guard_jitcode_pc >= 0)
+                        .then(|| {
+                            crate::pyjitcode::floor_segment_for_jitcode_pc(
+                                &metadata.py_floor_by_jit_pc,
+                                guard_jitcode_pc as usize,
+                            )
+                        })
+                        .flatten()
+                        .map_or(majit_ir::resumedata::NO_JITCODE_PC, |(pc, _)| pc as i32)
+                };
                 (
-                    // Both plain and trivia twins diverged from this
-                    // fallthrough coordinate in the entry census.
-                    OuterActiveBoxesEntryTwin::PyPc,
-                    "guard_snapshot_fallthrough",
+                    entry_jitcode_pc,
+                    OuterActiveBoxesEntryTwin::Plain,
+                    "guard_snapshot_guard_pc",
                 )
+            } else {
+                let entry = unsafe {
+                    first_floor_boundary_for_py(&(&*sym.jitcode).payload.metadata, liveness_py_pc)
+                        .map(|(pc, _)| pc)
+                };
+                match entry {
+                    Some(pc) => (
+                        pc as i32,
+                        OuterActiveBoxesEntryTwin::Plain,
+                        "guard_snapshot_fallthrough",
+                    ),
+                    None => (
+                        majit_ir::resumedata::NO_JITCODE_PC,
+                        OuterActiveBoxesEntryTwin::PyPc,
+                        "guard_snapshot_fallthrough",
+                    ),
+                }
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -12735,6 +13005,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 liveness_py_pc,
                 guard_py_pc,
                 guard_jitcode_pc,
+                entry_jitcode_pc,
                 entry_twin,
                 entry_caller,
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
@@ -12850,7 +13121,7 @@ fn concrete_ref_for_opref(
 fn collect_call_stack_overrides(
     caller_sym: &crate::state::PyreSym,
     ctx: &WalkContext<'_, '_>,
-    call_py_pc: usize,
+    call_jitcode_pc: usize,
 ) -> Vec<(usize, pyre_object::PyObjectRef)> {
     if caller_sym.jitcode.is_null() {
         return Vec::new();
@@ -12860,17 +13131,16 @@ fn collect_call_stack_overrides(
         if jc.payload.code_ptr.is_null() {
             return Vec::new();
         }
-        let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
-            .depth_at_py_pc()
-            .get(call_py_pc)
-            .copied()
+        // The caller CALL key is a plain JitCode→Python inversion, so use the
+        // certified predecessor twins rather than the marker/trivia flavor
+        // reserved for the CALL fallthrough below.
+        let depth = jc
+            .payload
+            .depth_for_jitcode_pc_pred(call_jitcode_pc)
             .unwrap_or(0) as usize;
         let pcdep = jc
             .payload
-            .metadata
-            .pcdep_color_slots
-            .get(call_py_pc)
-            .cloned()
+            .pcdep_for_jitcode_pc(call_jitcode_pc)
             .unwrap_or_default();
         (caller_sym.nlocals, depth, pcdep)
     };
@@ -12960,7 +13230,7 @@ fn compute_inline_caller_frame(
     if caller_sym.jitcode.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let (jitcode_index, call_py_pc, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
+    let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return Err(InlineCallerFrameDecline::Unavailable);
@@ -12977,19 +13247,26 @@ fn compute_inline_caller_frame(
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
         (
             jc.index as u32,
-            call_py as u32,
             fallthrough,
             jc.payload.after_residual_marker_for_jitcode_pc(call_jit_pc),
             jc.payload.code_ptr,
         )
     };
     // The call result is the top operand-stack slot at the return point.
-    let depth = unsafe {
-        crate::liveness::liveness_for(code_ptr)
-            .depth_at_py_pc()
-            .get(fallthrough_py_pc as usize)
-            .copied()
-            .unwrap_or(0) as usize
+    let depth = match resume_marker_jit_pc {
+        Some(marker) => unsafe { &(*caller_sym.jitcode).payload }
+            .depth_trivia_for_jitcode_pc(marker)
+            .unwrap_or(0) as usize,
+        // A missing marker has no fallthrough-native key. Preserve the
+        // existing Python-keyed path rather than declining a formerly valid
+        // caller frame.
+        None => unsafe {
+            crate::liveness::liveness_for(code_ptr)
+                .depth_at_py_pc()
+                .get(fallthrough_py_pc as usize)
+                .copied()
+                .unwrap_or(0) as usize
+        },
     };
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
@@ -13005,14 +13282,22 @@ fn compute_inline_caller_frame(
             );
         }
     }
-    let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_py_pc as usize);
+    let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc);
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
     // `stack_slot_color_map` — the result is not a live Variable here, so it
     // carries no pcdep entry.
-    let result_color =
-        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
-            .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    let result_color = match resume_marker_jit_pc {
+        Some(marker) => unsafe { &(*caller_sym.jitcode).payload }
+            .result_color_for_jitcode_pc_pred(marker)
+            .filter(|&color| color != u16::MAX)
+            .map(|color| color as usize),
+        // Keep the legacy table only for the unkeyed marker-miss fallback.
+        None => {
+            crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
+        }
+    }
+    .ok_or(InlineCallerFrameDecline::Unavailable)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume).
@@ -13038,6 +13323,7 @@ fn compute_inline_caller_frame(
         fallthrough_py_pc,
         None,
         caller_liveness_word,
+        caller_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
         "inline_caller",
         None,
@@ -13048,9 +13334,9 @@ fn compute_inline_caller_frame(
     }
     Ok(InlineParentFrame {
         jitcode_index,
-        call_py_pc: Some(call_py_pc),
+        call_jitcode_pc: Some(call_jit_pc),
         call_stack_overrides,
-        resume_py_pc: fallthrough_py_pc,
+        resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,
     })
@@ -13075,26 +13361,48 @@ fn compute_nested_inline_caller_frame(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
     let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
     let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
     // A CALL inside a try-block resumes at its own catch via a bit-14 marker
     // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
     decline_inline_caller_frame_for_catch_marker(after_residual_call_resume)?;
-    let fallthrough_py_pc = unsafe {
+    let legacy_fallthrough_py_pc = || unsafe {
+        let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;
         crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
     };
     // The call result is the top operand-stack slot at the return point.
-    let depth = unsafe {
-        crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(fallthrough_py_pc as usize)
-            .copied()
-            .unwrap_or(0) as usize
+    let depth = match resume_marker_jit_pc {
+        Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
+        None => {
+            let fallthrough_py_pc = legacy_fallthrough_py_pc();
+            unsafe {
+                crate::liveness::liveness_for(pjc.code_ptr)
+                    .depth_at_py_pc()
+                    .get(fallthrough_py_pc as usize)
+                    .copied()
+                    .unwrap_or(0) as usize
+            }
+        }
     };
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
+    }
+    if pcmap_pfresume_audit_enabled() {
+        if let Some(marker) = resume_marker_jit_pc {
+            let fallthrough_py_pc = legacy_fallthrough_py_pc();
+            let table_depth = unsafe {
+                crate::liveness::liveness_for(pjc.code_ptr)
+                    .depth_at_py_pc()
+                    .get(fallthrough_py_pc as usize)
+                    .copied()
+            };
+            audit_pfresume_twin(
+                "inline_nested_depth_trivia",
+                pjc.depth_trivia_for_jitcode_pc(marker),
+                table_depth,
+            );
+        }
     }
     if result_color_audit_enabled() {
         if let Some(jit_pc) = resume_marker_jit_pc {
@@ -13108,9 +13416,30 @@ fn compute_nested_inline_caller_frame(
     }
     // #73: result slot color from the precomputed `result_color_at_pc`, not
     // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
-    let result_color =
-        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
-            .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    let result_color = match resume_marker_jit_pc {
+        Some(marker) => pjc
+            .result_color_for_jitcode_pc_pred(marker)
+            .filter(|&color| color != u16::MAX)
+            .map(|color| color as usize),
+        None => crate::state::result_color_at_pc_at(
+            jitcode_index as i32,
+            legacy_fallthrough_py_pc() as usize,
+        ),
+    }
+    .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    if pcmap_pfresume_audit_enabled() {
+        if let Some(marker) = resume_marker_jit_pc {
+            let fallthrough_py_pc = legacy_fallthrough_py_pc();
+            audit_pfresume_twin(
+                "inline_nested_result_color_pred",
+                pjc.result_color_for_jitcode_pc_pred(marker),
+                pjc.metadata
+                    .result_color_at_pc
+                    .get(fallthrough_py_pc as usize)
+                    .copied(),
+            );
+        }
+    }
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume) — same as the top-level
@@ -13146,9 +13475,9 @@ fn compute_nested_inline_caller_frame(
     };
     Ok(InlineParentFrame {
         jitcode_index,
-        call_py_pc: Some(call_py as u32),
+        call_jitcode_pc: Some(call_jit_pc),
         call_stack_overrides: Vec::new(),
-        resume_py_pc: fallthrough_py_pc,
+        resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,
     })
@@ -13192,7 +13521,9 @@ fn walker_capture_multi_frame_inline_snapshot(
     if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     }
-    if std::env::var_os("PYRE_FBW_MF_DIAG").is_some() {
+    let mf_diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
+    let recipe_resultcolor_audit = pcmap_recipe_resultcolor_audit_enabled();
+    if mf_diag || recipe_resultcolor_audit {
         let callee_py_pc = unsafe {
             let code = &*callee_pjc.code_ptr;
             let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
@@ -13202,56 +13533,89 @@ fn walker_capture_multi_frame_inline_snapshot(
             }
             py
         };
-        let pcdep = callee_pjc
-            .metadata
-            .pcdep_color_slots
-            .get(callee_py_pc as usize)
-            .cloned()
-            .unwrap_or_default();
-        let depth = callee_pjc
-            .metadata
-            .depth_at_py_pc
-            .get(callee_py_pc as usize)
-            .copied()
-            .unwrap_or(0);
-        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
-            callee_jitcode_index as i32,
-            callee_op_pc as i32,
-        );
-        eprintln!(
-            "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
+        if recipe_resultcolor_audit {
+            // The snapshot selects this native resume coordinate below. For
+            // non-branch captures, its marker construction already applies
+            // the same trivia (and, after a residual call, semantic
+            // fallthrough) transform as the diagnostic inversion above.
+            let (site, native_marker) = match scope.branch_guard_jitcode_pc {
+                Some(_) => ("mf_callee_inversion_branch_external", None),
+                None if after_residual_call => (
+                    "mf_callee_inversion_after_residual",
+                    callee_pjc.after_residual_marker_for_jitcode_pc(callee_op_pc),
+                ),
+                None => (
+                    "mf_callee_inversion_plain",
+                    callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc),
+                ),
+            };
+            pcmap_recipe_resultcolor_audit_probe(site, "fire");
+            let verdict = match (scope.branch_guard_jitcode_pc, native_marker) {
+                (Some(_), _) => "branch_external",
+                (None, Some(marker)) => {
+                    let native_py = python_pc_for_jitcode_pc(&callee_pjc.metadata, marker) as usize;
+                    if native_py == callee_py_pc as usize {
+                        "eq"
+                    } else {
+                        "di"
+                    }
+                }
+                (None, None) => "native_miss",
+            };
+            pcmap_recipe_resultcolor_audit_probe(site, verdict);
+        }
+        if mf_diag {
+            let pcdep = callee_pjc
+                .metadata
+                .pcdep_color_slots
+                .get(callee_py_pc as usize)
+                .cloned()
+                .unwrap_or_default();
+            let depth = callee_pjc
+                .metadata
+                .depth_at_py_pc
+                .get(callee_py_pc as usize)
+                .copied()
+                .unwrap_or(0);
+            let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+                callee_jitcode_index as i32,
+                callee_op_pc as i32,
+            );
+            eprintln!(
+                "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
              py_pc={callee_py_pc} after_residual={after_residual_call} depth={depth} \
              pcdep_color_slots={pcdep:?}"
-        );
-        eprintln!(
-            "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",
-            banks.int, banks.ref_, banks.float
-        );
-        for &c in &banks.ref_ {
-            eprintln!(
-                "[fbw-mf-diag]   regs_r[{c}] = {:?}",
-                ctx.registers_r.get(c as usize)
             );
-        }
-        for &c in &banks.int {
             eprintln!(
-                "[fbw-mf-diag]   regs_i[{c}] = {:?}",
-                ctx.registers_i.get(c as usize)
+                "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",
+                banks.int, banks.ref_, banks.float
             );
-        }
-        unsafe {
-            let code = &*callee_pjc.code_ptr;
-            let lo = callee_py_pc.saturating_sub(3);
-            for py in lo..callee_py_pc + 5 {
-                if let Some((instr, arg)) =
-                    pyre_interpreter::decode_instruction_at(code, py as usize)
-                {
-                    let mark = if py == callee_py_pc {
-                        " <== resume"
-                    } else {
-                        ""
-                    };
-                    eprintln!("[fbw-mf-diag]   py{py}: {instr:?} arg={arg:?}{mark}");
+            for &c in &banks.ref_ {
+                eprintln!(
+                    "[fbw-mf-diag]   regs_r[{c}] = {:?}",
+                    ctx.registers_r.get(c as usize)
+                );
+            }
+            for &c in &banks.int {
+                eprintln!(
+                    "[fbw-mf-diag]   regs_i[{c}] = {:?}",
+                    ctx.registers_i.get(c as usize)
+                );
+            }
+            unsafe {
+                let code = &*callee_pjc.code_ptr;
+                let lo = callee_py_pc.saturating_sub(3);
+                for py in lo..callee_py_pc + 5 {
+                    if let Some((instr, arg)) =
+                        pyre_interpreter::decode_instruction_at(code, py as usize)
+                    {
+                        let mark = if py == callee_py_pc {
+                            " <== resume"
+                        } else {
+                            ""
+                        };
+                        eprintln!("[fbw-mf-diag]   py{py}: {instr:?} arg={arg:?}{mark}");
+                    }
                 }
             }
         }
@@ -13293,7 +13657,9 @@ fn walker_capture_multi_frame_inline_snapshot(
     if !caller_sym_ptr.is_null() {
         let caller_sym = unsafe { &*caller_sym_ptr };
         if caller_sym.owns_virtualizable_shadow() && !caller_sym.jitcode.is_null() {
-            let last_instr_value = outer.resume_py_pc as i64 - 1;
+            let resume_py_pc = resolve_parent_resume_py_pc(outer, "vable_last_instr")
+                .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
+            let last_instr_value = resume_py_pc as i64 - 1;
             let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
             crate::trace_opcode::mirror_vable_static_to_boxes(
                 ctx.trace_ctx,
@@ -13301,17 +13667,15 @@ fn walker_capture_multi_frame_inline_snapshot(
                 last_instr_op,
                 Value::Int(last_instr_value),
             );
+            let resume_py_pc = resolve_parent_resume_py_pc(outer, "vable_stack_depth")
+                .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
             let vsd_value = unsafe {
                 let jc = &*caller_sym.jitcode;
                 if jc.payload.code_ptr.is_null() {
                     caller_sym.valuestackdepth as i64
                 } else {
                     let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-                    match lv
-                        .depth_at_py_pc()
-                        .get(outer.resume_py_pc as usize)
-                        .copied()
-                    {
+                    match lv.depth_at_py_pc().get(resume_py_pc as usize).copied() {
                         Some(d) => (caller_sym.nlocals + d as usize) as i64,
                         None => caller_sym.valuestackdepth as i64,
                     }
@@ -15777,29 +16141,25 @@ fn try_walker_inline_resolved_user_call(
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
     let executed_effects_before = fbw_executed_effect_count();
     let is_top_inline = !ctx.fbw_mode.inline_subwalk;
-    let abort_flush_call_py_pc: Option<usize> = if ctx.is_full_body_walk && is_top_inline {
-        let sym_ptr = ctx.fbw_mode.snapshot_sym;
-        if sym_ptr.is_null() {
-            None
-        } else {
-            let sym = unsafe { &*sym_ptr };
-            if sym.jitcode.is_null() {
+    let abort_flush_call_jitcode_coord: Option<(u32, usize)> =
+        if ctx.is_full_body_walk && is_top_inline {
+            let sym_ptr = ctx.fbw_mode.snapshot_sym;
+            if sym_ptr.is_null() {
                 None
             } else {
-                unsafe {
-                    let jc = &*sym.jitcode;
-                    let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-                    if !jc.payload.code_ptr.is_null() {
-                        let codeobj = &*jc.payload.code_ptr;
-                        py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                let sym = unsafe { &*sym_ptr };
+                if sym.jitcode.is_null() {
+                    None
+                } else {
+                    unsafe {
+                        let jc = &*sym.jitcode;
+                        Some((jc.index as u32, op.pc))
                     }
-                    Some(py as usize)
                 }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // #68: a forward-branch callee inlined under the multi-frame path needs a
     // paused caller frame on the framestack so its in-callee guards
@@ -15819,11 +16179,11 @@ fn try_walker_inline_resolved_user_call(
                     && !unjournaled_before_subwalk
                     && fbw_executed_effect_count() == executed_effects_before
                 {
-                    if let (Some(call_pc), Some(stack)) = (
-                        abort_flush_call_py_pc,
+                    if let (Some((outer_jitcode_index, call_jitcode_pc)), Some(stack)) = (
+                        abort_flush_call_jitcode_coord,
                         reconstructed_all_ref_call_stack(code, op, ctx),
                     ) {
-                        fbw_set_abort_call_resume(call_pc, stack);
+                        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
                     }
                 }
                 return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
@@ -15895,7 +16255,7 @@ fn try_walker_inline_resolved_user_call(
     // to the header alongside the boxes.
     let (
         inline_outer_active_boxes,
-        inline_outer_py_pc,
+        inline_outer_entry_py_pc,
         inline_outer_jc_index,
         inline_outer_resume_marker_jit_pc,
     ) = if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
@@ -15926,16 +16286,13 @@ fn try_walker_inline_resolved_user_call(
                 // snapshot encodes the wrong frame boxes.  Derive the
                 // coordinate from the snapshot sym's jitcode at the CALL op's
                 // pc, matching `orthodox_list_append_commit`.
-                let (call_site_py_pc, call_site_jc_index, call_site_marker) = unsafe {
+                let (call_site_jc_index, call_site_marker) = unsafe {
                     let jc = &*sym.jitcode;
                     let jc_index = jc.index as u32;
-                    let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-                    if !jc.payload.code_ptr.is_null() {
-                        let codeobj = &*jc.payload.code_ptr;
-                        py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                    }
-                    (py, jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
+                    (jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
                 };
+                let call_site_py_pc =
+                    crate::state::backxlat_py_pc(call_site_jc_index as i32, op.pc as i32) as u32;
                 let call_site_word = match call_site_marker.filter(|_| m73_outercap_carry_enabled())
                 {
                     Some(m) => m as i32,
@@ -15951,14 +16308,21 @@ fn try_walker_inline_resolved_user_call(
                     call_site_py_pc,
                     None,
                     call_site_word,
-                    // The trivia twin diverged at this capture coordinate in
-                    // the entry census.
-                    OuterActiveBoxesEntryTwin::PyPc,
+                    // Keep the marker for the liveness-bank query, but key
+                    // entry metadata to the raw CALL offset that produced the
+                    // pre-adjustment Python coordinate.
+                    op.pc as i32,
+                    OuterActiveBoxesEntryTwin::Plain,
                     "call_site_capture",
                     None,
                     &[],
                 );
-                (boxes, call_site_py_pc, call_site_jc_index, call_site_marker)
+                (
+                    boxes,
+                    EntryPyPc::Jit(op.pc),
+                    call_site_jc_index,
+                    call_site_marker,
+                )
             }
         }
     } else {
@@ -16019,7 +16383,7 @@ fn try_walker_inline_resolved_user_call(
             sub_jitcode_lookup: callee_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: inline_outer_py_pc,
+            entry_py_pc: inline_outer_entry_py_pc,
             outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
             outer_jitcode_index: inline_outer_jc_index,
             outer_active_boxes: inline_outer_active_boxes,
@@ -16077,18 +16441,17 @@ fn try_walker_inline_resolved_user_call(
                 && fbw_executed_effect_count() != executed_effects_before
             {
                 let payload = (|| {
-                    let call_py_pc = abort_flush_call_py_pc?;
+                    let (outer_jitcode_index, call_jitcode_pc) = abort_flush_call_jitcode_coord?;
                     let callee_pjc = crate::state::pyjitcode_for_code(w_code)?;
                     let metadata = &callee_pjc.metadata;
                     let callee_py_pc = python_pc_for_jitcode_pc(metadata, abort_pc) as usize;
+                    audit_midbody_abort_plain_twins(&callee_pjc, callee_py_pc, abort_pc);
                     let anchor_ok = match abort_kind {
-                        MidBodyAbortKind::Structural => exact_first_jit_anchor(
-                            &metadata.first_jit_pc_by_py_pc,
-                            callee_py_pc,
-                            abort_pc,
-                        ),
+                        MidBodyAbortKind::Structural => {
+                            exact_floor_segment_anchor(metadata, callee_py_pc, abort_pc)
+                        }
                         MidBodyAbortKind::Marker => portal_marker_first_jit_anchor(
-                            &metadata.first_jit_pc_by_py_pc,
+                            metadata,
                             metadata.built_as_portal,
                             metadata.portal_frame_reg,
                             callee_perfn_descrs,
@@ -16116,19 +16479,37 @@ fn try_walker_inline_resolved_user_call(
                     {
                         return None;
                     }
-                    let Some(depth) = metadata.depth_at_py_pc.get(callee_py_pc).copied() else {
+                    let depth_twin = callee_pjc.depth_for_jitcode_pc_pred(abort_pc);
+                    if depth_twin.is_none() {
+                        pcmap_pivot_audit_record_fire(
+                            "midbody_producer_depth",
+                            "py_pc_legacy_or_else",
+                        );
+                    }
+                    let Some(depth) =
+                        depth_twin.or_else(|| metadata.depth_at_py_pc.get(callee_py_pc).copied())
+                    else {
                         return None;
                     };
                     let depth = depth as usize;
                     let nlocals = callee_code.varnames.len();
-                    let Some(entries) = metadata.pcdep_color_slots.get(callee_py_pc) else {
+                    let pcdep_twin = callee_pjc.pcdep_for_jitcode_pc(abort_pc);
+                    if pcdep_twin.is_none() {
+                        pcmap_pivot_audit_record_fire(
+                            "midbody_producer_pcdep",
+                            "py_pc_legacy_or_else",
+                        );
+                    }
+                    let Some(entries) = pcdep_twin
+                        .or_else(|| metadata.pcdep_color_slots.get(callee_py_pc).cloned())
+                    else {
                         return None;
                     };
                     let mut live_stack = Vec::with_capacity(depth);
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| sub_wc.concrete_registers_r.get(color).copied());
                         let value = register_value.or_else(|| {
                             (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
@@ -16174,28 +16555,17 @@ fn try_walker_inline_resolved_user_call(
                         }
                         *dst = Some(value);
                     }
-                    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-                    if sym_ptr.is_null() {
-                        return None;
-                    }
-                    let outer_jc = unsafe { &*(*sym_ptr).jitcode };
-                    if outer_jc.payload.code_ptr.is_null() {
-                        return None;
-                    }
-                    let post_call_py_pc = skip_python_trivia_forward(
-                        unsafe { &*outer_jc.payload.code_ptr },
-                        call_py_pc + 1,
-                    );
                     let Some(ConcreteValue::Ref(x_arg)) = callee_arg_concretes.first().copied()
                     else {
                         return None;
                     };
                     Some(MidBodyPayload {
                         abort_kind,
-                        call_py_pc,
-                        post_call_py_pc,
+                        outer_jitcode_index,
+                        call_jitcode_pc,
                         call_stack_len: arg_concretes.len(),
-                        callee_py_pc,
+                        callee_jitcode_index: callee_pjc.jitcode.index() as u32,
+                        abort_jitcode_pc: abort_pc,
                         w_code: w_code as pyre_object::PyObjectRef,
                         w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) },
                         x_arg,
@@ -16241,9 +16611,10 @@ fn try_walker_inline_resolved_user_call(
                 && !unjournaled_before_subwalk
                 && fbw_executed_effect_count() == executed_effects_before
             {
-                if let Some(call_pc) = abort_flush_call_py_pc {
+                if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
+                {
                     if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
-                        fbw_set_abort_call_resume(call_pc, stack);
+                        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
                     }
                 }
             }
@@ -16271,9 +16642,11 @@ fn try_walker_inline_resolved_user_call(
                     && !unjournaled_before_subwalk
                     && fbw_executed_effect_count() == executed_effects_before
                 {
-                    if let Some(call_pc) = abort_flush_call_py_pc {
+                    if let Some((outer_jitcode_index, call_jitcode_pc)) =
+                        abort_flush_call_jitcode_coord
+                    {
                         if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
-                            fbw_set_abort_call_resume(call_pc, stack);
+                            fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
                         }
                     }
                 }
@@ -21481,8 +21854,10 @@ fn orthodox_list_append_commit(
         call_site_py_pc,
         None,
         call_site_word,
-        // This caller did not fire in the entry census.
-        OuterActiveBoxesEntryTwin::PyPc,
+        // As above, entry metadata is keyed by the append op itself; its
+        // liveness-bank query remains keyed by the resume marker.
+        op.pc as i32,
+        OuterActiveBoxesEntryTwin::Plain,
         "w_list_append_call_site",
         None,
         &[],
@@ -21501,7 +21876,7 @@ fn orthodox_list_append_commit(
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
-    ctx.entry_py_pc = call_site_py_pc;
+    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.outer_active_boxes = active;
@@ -22601,9 +22976,11 @@ fn try_walker_specialize_for_iter_next(
 
     // A new consume attempt completes the prior in-flight iteration before
     // this irreversible concrete advance, matching the residual executor.
-    let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
-        .unwrap_or(ctx.entry_py_pc as usize + 1);
-    fbw_foriter_inflight_mark_attempt(body_pc);
+    let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc).unwrap_or_else(|| {
+        pcmap_entrypc_audit_ctx_read(ctx, "range_foriter_attempt_fallback");
+        InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1)
+    });
+    fbw_foriter_inflight_mark_attempt(body);
 
     // guard_class W_IntRangeIterator, unless the operand is already known.
     let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
@@ -22733,7 +23110,7 @@ fn try_walker_specialize_for_iter_next(
     );
 
     if concrete_continues {
-        fbw_foriter_inflight_capture(concrete_item_ptr, body_pc);
+        fbw_foriter_inflight_capture(concrete_item_ptr, body);
         // Range iteration stays at the C level, so the operand-stack mirror
         // remains valid and must receive the item produced by FOR_ITER.
         ctx.vstack_last_ref = masked_item;
@@ -27064,10 +27441,9 @@ mod tests {
     #[test]
     fn vstack_permuted_for_iter_entry_uses_block_head_target() {
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
-        pyjit.metadata.first_jit_pc_by_py_pc = vec![usize::MAX; 19];
-        pyjit.metadata.first_jit_pc_by_py_pc[17] = 100;
-        pyjit.metadata.first_jit_pc_by_py_pc[18] = 120;
+        pyjit.metadata.n_py_instrs = 19;
         pyjit.metadata.block_head_py_by_jit_pc = vec![(110, 18)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (100, 17), (120, 18)];
 
         assert_eq!(vstack_containing_py_pc(&pyjit.metadata, 110), 17);
         assert_eq!(vstack_initial_py_pc(&pyjit.metadata, 110, true), 18);
@@ -27214,7 +27590,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27285,7 +27661,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27346,7 +27722,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27422,7 +27798,7 @@ mod tests {
                 sub_jitcode_lookup: &no_sub_jitcodes,
                 last_exc_value: None,
                 last_exc_value_concrete: ConcreteValue::Null,
-                entry_py_pc: 0,
+                entry_py_pc: EntryPyPc::Py(0),
                 outer_resume_marker_jit_pc: None,
                 outer_jitcode_index: 0,
                 raw_descrs: RawDescrPool::Global,
@@ -27615,7 +27991,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27677,7 +28053,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27738,7 +28114,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27808,7 +28184,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27870,7 +28246,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -27931,7 +28307,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28201,7 +28577,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28375,7 +28751,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28497,7 +28873,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28613,7 +28989,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28718,7 +29094,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28820,7 +29196,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28903,7 +29279,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -28965,7 +29341,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29023,7 +29399,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29090,7 +29466,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29155,7 +29531,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29223,7 +29599,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29307,7 +29683,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29379,7 +29755,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29452,7 +29828,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29513,7 +29889,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29577,7 +29953,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29641,7 +30017,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29753,7 +30129,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29813,7 +30189,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29886,7 +30262,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -29991,7 +30367,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30082,7 +30458,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30166,7 +30542,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30225,7 +30601,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30348,7 +30724,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30475,7 +30851,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30549,7 +30925,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30620,7 +30996,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30682,7 +31058,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30743,7 +31119,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30824,7 +31200,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30893,7 +31269,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -30953,7 +31329,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31012,7 +31388,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31082,7 +31458,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31278,7 +31654,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31420,7 +31796,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31514,7 +31890,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31586,7 +31962,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31683,7 +32059,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31760,7 +32136,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31820,7 +32196,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31882,7 +32258,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -31952,7 +32328,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32014,7 +32390,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32103,7 +32479,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32174,7 +32550,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32263,7 +32639,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32363,7 +32739,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32537,7 +32913,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32628,7 +33004,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32690,7 +33066,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32767,7 +33143,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32868,7 +33244,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -32973,7 +33349,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33053,7 +33429,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33121,7 +33497,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33184,7 +33560,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33258,7 +33634,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33334,7 +33710,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33430,7 +33806,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33515,7 +33891,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33599,7 +33975,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33663,7 +34039,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33765,7 +34141,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33866,7 +34242,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -33975,7 +34351,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34116,7 +34492,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34193,7 +34569,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34256,7 +34632,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34343,7 +34719,7 @@ mod tests {
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34475,7 +34851,7 @@ mod tests {
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34583,7 +34959,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34690,7 +35066,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34776,7 +35152,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34865,7 +35241,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -34952,7 +35328,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35044,7 +35420,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35134,7 +35510,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35213,7 +35589,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35313,7 +35689,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35391,7 +35767,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35457,7 +35833,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35535,7 +35911,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35633,7 +36009,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35721,7 +36097,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35787,7 +36163,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35879,7 +36255,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -35954,7 +36330,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -36040,7 +36416,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -36114,7 +36490,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -36439,7 +36815,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -36523,7 +36899,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -36618,7 +36994,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -36687,7 +37063,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
+            entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
@@ -36708,13 +37084,12 @@ mod tests {
     }
 
     #[test]
-    fn structural_midbody_anchor_requires_exact_first_jit_pc() {
-        let mut first = vec![usize::MAX; 30];
-        first[28] = 101;
-        first[29] = 115;
-        assert!(super::exact_first_jit_anchor(&first, 28, 101));
-        assert!(!super::exact_first_jit_anchor(&first, 28, 102));
-        assert!(!super::exact_first_jit_anchor(&first, 27, 101));
+    fn structural_midbody_anchor_requires_exact_floor_segment_start() {
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (101, 28), (115, 29)];
+        assert!(super::exact_floor_segment_anchor(&pyjit.metadata, 28, 101));
+        assert!(!super::exact_floor_segment_anchor(&pyjit.metadata, 28, 102));
+        assert!(!super::exact_floor_segment_anchor(&pyjit.metadata, 27, 101));
     }
 
     #[test]
@@ -36732,12 +37107,12 @@ mod tests {
             .get("int_copy/c>i")
             .expect("int_copy/c>i must exist");
         let descrs = [RuntimeBhDescr::Descr(BhDescr::VableField { index: 0 })];
-        let mut first = vec![usize::MAX; 30];
-        first[29] = 0;
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 29)];
         let portal_gap = [setfield, 1, 7, 0, 0, abort];
 
         assert!(super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             true,
             1,
             &descrs,
@@ -36747,7 +37122,7 @@ mod tests {
             |_| 29,
         ));
         assert!(!super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             true,
             1,
             &descrs,
@@ -36759,7 +37134,7 @@ mod tests {
 
         let computation_gap = [int_copy, 1, 7, abort];
         assert!(!super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             true,
             1,
             &descrs,
@@ -36769,9 +37144,9 @@ mod tests {
             |_| 29,
         ));
 
-        first[29] = 5;
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (5, 29)];
         assert!(super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             false,
             u16::MAX,
             &[],

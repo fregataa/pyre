@@ -7285,8 +7285,8 @@ impl MIFrame {
         // The auto-gen arm jitcode for `LoadConst` residualises
         // `opcode_load_const(frame, &ConstantData)` — the `&ConstantData`
         // operand is oparg-derived (resolved from `consti` against the
-        // code's constant pool), but the per-opcode arm entry
-        // (`dispatch_via_miframe_at_opcode_entry`) seeds only `r0 = frame`,
+        // code's constant pool), but the per-opcode arm entry (the retired
+        // `dispatch_via_miframe_at_opcode_entry`) seeded only `r0 = frame`,
         // leaving that operand register unbound — the walk aborts with
         // `ResidualCallArgUnbound { arg_index: 2 }`.  (A const-specialising
         // JIT wants the constant BAKED into the IR, not threaded as a
@@ -9980,8 +9980,9 @@ mod tests {
         };
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
-        pyjit.metadata.first_jit_pc_by_py_pc = vec![0];
+        pyjit.metadata.n_py_instrs = 1;
         pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 0)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0)];
         pyjit.metadata.is_drained = true;
         let inner_jc = crate::state::JitCode {
             index: 0,
@@ -10063,8 +10064,9 @@ mod tests {
         };
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
-        pyjit.metadata.first_jit_pc_by_py_pc = vec![0];
+        pyjit.metadata.n_py_instrs = 1;
         pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 0)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0)];
         pyjit.metadata.is_drained = true;
         pyjit.metadata.depth_at_py_pc.push(1);
         // Per-PC (color, slot) entries the codewriter publishes at pc 0:
