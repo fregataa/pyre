@@ -8685,27 +8685,32 @@ pub fn iterator_greenkey(w_iterable: PyObjectRef) -> PyObjectRef {
     crate::typedef::r#type(w_iterable).unwrap_or(pyre_object::PY_NULL)
 }
 
-/// pypy/interpreter/baseobjspace.py:1010 `unpackiterable_driver`
-/// JitDriver merge-point hint.
+/// pypy/interpreter/baseobjspace.py:29-32
+/// `unpackiterable_driver = JitDriver(greens=['greenkey'], reds='auto',
+/// name='unpackiterable')`.
 ///
-/// PyPy declares `unpackiterable_driver = JitDriver(greens=['greenkey'],
-/// reds='auto', name='unpackiterable')` and calls
-/// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)` once per
-/// loop turn so the JIT specialises the loop trace per
-/// `iterator_greenkey(w_iterator)` value.
-///
-/// Pyre's metainterp drives compilation from bytecode-level
-/// `BC_JIT_MERGE_POINT` opcodes; an in-Rust `_unpackiterable_unknown_length`
-/// is residual-call'd from the JIT'd interpreter loop, so the merge-point
-/// inside this body is not visible to the live tracer.  The structural
-/// port keeps the greenkey computation + the call so the per-greenkey
-/// dispatch contract is documented at the call site; the runtime hook
-/// is a no-op until the metainterp grows a Rust-callee merge-point
-/// observer.
-#[inline]
-fn unpackiterable_driver_jit_merge_point(_greenkey: PyObjectRef) {
-    // No-op: see doc comment above.
+/// The metainterp recognizes `unpackiterable_driver.jit_merge_point(greenkey)`
+/// (a `CallTarget::Method` on this receiver type) and lowers it to a
+/// `BC_JIT_MERGE_POINT` once this graph is registered as a portal.
+struct UnpackIterableJitDriver;
+
+impl UnpackIterableJitDriver {
+    /// pypy/interpreter/baseobjspace.py:1012
+    /// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
+    #[inline]
+    fn jit_merge_point(&self, greenkey: PyObjectRef) {
+        let _ = greenkey;
+    }
 }
+
+/// pypy/interpreter/baseobjspace.py:29 `unpackiterable_driver`.
+#[allow(non_upper_case_globals)]
+const unpackiterable_driver: UnpackIterableJitDriver = UnpackIterableJitDriver;
+
+/// pypy/interpreter/generator.py:330
+/// `jitdriver.jit_merge_point(pycode=pycode)`, with `greens=['pycode']`.
+#[inline]
+fn generator_unpack_driver_jit_merge_point(_pycode: PyObjectRef) {}
 
 /// pypy/interpreter/generator.py:317-343 `_create_unpack_into` body.
 ///
@@ -8761,7 +8766,7 @@ fn generator_unpack_into(
         let pycode = frame.pycode as PyObjectRef;
         loop {
             // generator.py:330 `jitdriver.jit_merge_point(pycode=pycode)`.
-            unpackiterable_driver_jit_merge_point(pycode);
+            generator_unpack_driver_jit_merge_point(pycode);
             // generator.py:331 `space = self.space`.
             // generator.py:332-336 `try: w_result =
             //   self._invoke_execute_frame(space.w_None)`.
@@ -8846,27 +8851,29 @@ fn _unpackiterable_unknown_length(
     w_iterable: PyObjectRef,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     // baseobjspace.py:1005-1008 — `try: items = newlist_hint(length_hint(...))
-    // except MemoryError: items = []`.  Mirror with try_reserve_exact so a
-    // hostile / huge `__length_hint__` does not turn into a Rust panic
-    // (Vec::with_capacity aborts on capacity overflow).
-    let hint = length_hint(w_iterable, 0)?;
-    let mut items: Vec<PyObjectRef> = Vec::new();
-    if hint > 0 {
-        let _ = items.try_reserve_exact(hint as usize);
-    }
+    // except MemoryError: items = []`.
+    let _ = length_hint(w_iterable, 0)?;
+    let items = pyre_object::listobject::w_list_new_object(Vec::new());
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(items);
     // baseobjspace.py:1010 `greenkey = self.iterator_greenkey(w_iterator)`.
     let greenkey = iterator_greenkey(w_iterator);
     loop {
         // baseobjspace.py:1012
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
-        unpackiterable_driver_jit_merge_point(greenkey);
+        unpackiterable_driver.jit_merge_point(greenkey);
         match next(w_iterator) {
-            Ok(w_item) => items.push(w_item),
+            Ok(w_item) => unsafe { pyre_object::listobject::w_list_append(items, w_item) },
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
-    Ok(items)
+    let n = unsafe { pyre_object::listobject::w_list_len(items) };
+    let mut out: Vec<PyObjectRef> = Vec::with_capacity(n);
+    for i in 0..n as i64 {
+        out.push(unsafe { pyre_object::listobject::w_list_getitem(items, i).unwrap() });
+    }
+    Ok(out)
 }
 
 /// pypy/interpreter/baseobjspace.py:1080-1108 `length_hint`.
