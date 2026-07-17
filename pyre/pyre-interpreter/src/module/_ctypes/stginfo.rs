@@ -9,6 +9,7 @@
 //! GC-correct with no Rust-side side tables.
 
 use pyre_object::PyObjectRef;
+use std::sync::OnceLock;
 
 /// Reserved key under which the carrier lives in a ctypes type's own dict.
 const STGINFO_KEY: &str = "__stginfo__";
@@ -31,20 +32,15 @@ const K_FORMAT: &str = "format";
 const K_POINTER_TYPE: &str = "pointer_type";
 const K_BIG_ENDIAN: &str = "big_endian";
 
-thread_local! {
-    static STGINFO_TYPE_OBJ: std::cell::OnceCell<PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+static STGINFO_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
 /// The private `StgInfo` carrier type (`hasdict=true`, never registered).
 fn stginfo_type() -> PyObjectRef {
-    STGINFO_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("StgInfo", |_| {});
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    *STGINFO_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("StgInfo", |_| {});
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 /// Field values for [`stginfo_new`].
@@ -166,6 +162,22 @@ pub(super) fn stginfo_paramfunc(info: PyObjectRef) -> String {
             unsafe { pyre_object::w_str_get_value(o) }.to_string()
         }
         _ => String::new(),
+    }
+}
+
+pub(super) fn stginfo_format(info: PyObjectRef) -> Option<String> {
+    match unsafe { pyre_object::w_dict_getitem_str(dict_of(info), K_FORMAT) } {
+        Some(o) if unsafe { pyre_object::is_str(o) } => {
+            Some(unsafe { pyre_object::w_str_get_value(o) }.to_string())
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn stginfo_big_endian(info: PyObjectRef) -> bool {
+    match unsafe { pyre_object::w_dict_getitem_str(dict_of(info), K_BIG_ENDIAN) } {
+        Some(value) => crate::baseobjspace::is_true(value).unwrap_or(false),
+        None => false,
     }
 }
 

@@ -12,7 +12,6 @@
 //! All host/FFI work is delegated to `rustpython_host_env::ctypes`; the module
 //! contains no direct `libc::` FFI.
 
-
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(all(unix, feature = "host_env"))]
     register_host_ctypes(ns);
@@ -67,7 +66,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if pyre_object::is_none(args[0]) {
                     // dlopen(None) → process handle
                     let mode = if args.len() >= 2 {
-                        pyre_object::w_int_get_value(args[1]) as libc::c_int
+                        crate::baseobjspace::int_w(args[1])? as libc::c_int
                     } else {
                         libc::RTLD_NOW
                     };
@@ -76,15 +75,19 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     let h = rustpython_host_env::ctypes::insert_raw_library_handle(ptr);
                     return Ok(pyre_object::w_int_new(h as i64));
                 }
-                if !pyre_object::is_str(args[0]) {
+                if pyre_object::is_bytes(args[0]) {
+                    String::from_utf8_lossy(pyre_object::bytesobject::w_bytes_data(args[0]))
+                        .into_owned()
+                } else if pyre_object::is_str(args[0]) {
+                    pyre_object::w_str_get_value(args[0]).to_string()
+                } else {
                     return Err(crate::PyError::type_error(
-                        "dlopen: name must be a string or None",
+                        "dlopen: name must be a string, bytes or None",
                     ));
                 }
-                pyre_object::w_str_get_value(args[0]).to_string()
             };
             let mode = if args.len() >= 2 {
-                (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32
+                crate::baseobjspace::int_w(args[1])? as i32
             } else {
                 rustpython_host_env::ctypes::dlopen_mode(None)
             };
@@ -104,7 +107,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("dlsym() needs 2 arguments"));
                 }
-                let h = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+                let h = crate::baseobjspace::int_w(args[0])? as usize;
                 let name = unsafe {
                     if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error("dlsym: name must be a string"));
@@ -138,7 +141,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("dlclose() needs handle"));
                 }
-                let h = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+                let h = crate::baseobjspace::int_w(args[0])? as usize;
                 rustpython_host_env::ctypes::drop_library(h);
                 Ok(pyre_object::w_none())
             },
@@ -169,7 +172,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("set_errno() needs value"));
                 }
-                let v = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let v = crate::baseobjspace::int_w(args[0])? as i32;
                 let prev = rustpython_host_env::ctypes::set_errno(v);
                 Ok(pyre_object::w_int_new(prev as i64))
             },
@@ -231,9 +234,9 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             if args.is_empty() {
                 return Err(crate::PyError::type_error("string_at() needs ptr"));
             }
-            let ptr = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+            let ptr = crate::baseobjspace::int_w(args[0])? as usize;
             let size = if args.len() >= 2 {
-                unsafe { pyre_object::w_int_get_value(args[1]) }
+                crate::baseobjspace::int_w(args[1])?
             } else {
                 -1
             };
@@ -264,6 +267,28 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "FUNCFLAG_PYTHONAPI", pyre_object::w_int_new(0x4));
     crate::module_ns_store(ns, "FUNCFLAG_USE_ERRNO", pyre_object::w_int_new(0x8));
     crate::module_ns_store(ns, "FUNCFLAG_USE_LASTERROR", pyre_object::w_int_new(0x10));
+    crate::module_ns_store(ns, "CTYPES_MAX_ARGCOUNT", pyre_object::w_int_new(1024));
+
+    #[cfg(target_os = "macos")]
+    crate::module_ns_store(
+        ns,
+        "_dyld_shared_cache_contains_path",
+        crate::make_builtin_function("_dyld_shared_cache_contains_path", |args| {
+            let Some(&path) = args.first() else {
+                return Ok(pyre_object::w_bool_from(false));
+            };
+            if unsafe { pyre_object::is_none(path) } {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            if !unsafe { pyre_object::is_str(path) } {
+                return Err(crate::PyError::type_error("path must be a string"));
+            }
+            let path = unsafe { pyre_object::w_str_get_value(path) };
+            let found = host_ctypes::dyld_shared_cache_contains_path(path)
+                .map_err(|_| crate::PyError::value_error("path contains null byte"))?;
+            Ok(pyre_object::w_bool_from(found))
+        }),
+    );
 
     // Real addresses so `memmove`/`memset = CFUNCTYPE(...)(_memmove_addr)`
     // build callable foreign functions; the other three are import-only
@@ -279,8 +304,11 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         "_memset_addr",
         pyre_object::w_int_new(host_ctypes::memset_addr() as i64),
     );
+    // RustPython's internal non-FFI targets.  CFuncPtr.__call__ recognizes
+    // these values before entering libffi, exactly like function.rs.
     crate::module_ns_store(ns, "_cast_addr", pyre_object::w_int_new(1));
     crate::module_ns_store(ns, "_string_at_addr", pyre_object::w_int_new(2));
+    crate::module_ns_store(ns, "_wstring_at_addr", pyre_object::w_int_new(3));
     crate::module_ns_store(ns, "_memoryview_at_addr", pyre_object::w_int_new(4));
 
     // ── ArgumentError — a real Exception subclass ──
@@ -315,12 +343,8 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     // through `PyCSimpleType.__new__` (validation + StgInfo).
     unsafe { (*simplecdata_tp).w_class = metaclass::pycsimpletype_type() };
     crate::module_ns_store(ns, "_SimpleCData", simplecdata_tp);
-    crate::module_ns_store(ns, "CFuncPtr", super::funcptr::cfuncptr_type());
-
-    // Widen `is_cdata_instance` (sizeof/addressof/byref) to every CData base.
-    for base in [simplecdata_tp, structure_tp, union_tp, array_tp, pointer_tp] {
-        super::cdata::register_cdata_base(base);
-    }
+    let cfuncptr_tp = super::funcptr::cfuncptr_type();
+    crate::module_ns_store(ns, "CFuncPtr", cfuncptr_tp);
 
     // ── sizeof / addressof / byref / alignment / resize ──
     crate::module_ns_store(
@@ -356,22 +380,18 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
 fn ctypes_sizeof(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    use super::{cdata, stginfo};
-    use rustpython_host_env::ctypes as host_ctypes;
+    use super::cdata;
     let obj = *args
         .first()
         .ok_or_else(|| crate::PyError::type_error("sizeof() missing argument"))?;
     if unsafe { pyre_object::is_type(obj) } {
-        if let Some(info) = stginfo::stginfo_of(obj) {
-            return Ok(pyre_object::w_int_new(stginfo::stginfo_size(info) as i64));
+        if let Some(size) = cdata::ctype_size_of(obj) {
+            return Ok(pyre_object::w_int_new(size as i64));
         }
-        // Simple type without a StgInfo yet: derive from `_type_`.
-        return match cdata::type_code_of(obj) {
-            Some(tc) => match host_ctypes::simple_type_size(&tc) {
-                Some(sz) => Ok(pyre_object::w_int_new(sz as i64)),
-                None => Err(cdata::invalid_type_code_error()),
-            },
-            None => Err(crate::PyError::type_error("this type has no size")),
+        return if cdata::type_code_of(obj).is_some() {
+            Err(cdata::invalid_type_code_error())
+        } else {
+            Err(crate::PyError::type_error("this type has no size"))
         };
     }
     if cdata::is_cdata_instance(obj) {
@@ -457,7 +477,8 @@ fn ctypes_byref(
 fn ctypes_resize(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    use super::cdata;
+    use super::{cdata, stginfo};
+    use rustpython_host_env::ctypes as host_ctypes;
     if args.len() < 2 {
         return Err(crate::PyError::type_error("resize() needs (obj, size)"));
     }
@@ -470,17 +491,23 @@ fn ctypes_resize(
             "Memory cannot be resized because this object doesn't own it",
         ));
     }
-    let size = crate::baseobjspace::int_w(args[1])? as usize;
-    let cur = cdata::cdata_len(obj).unwrap_or(0);
-    if size < cur {
+    // The floor is the type's natural size, not the current buffer length, so a
+    // previously enlarged object can be shrunk back down to it.  A negative
+    // request would wrap to a huge `usize`, so reject the signed value first.
+    let requested = crate::baseobjspace::int_w(args[1])?;
+    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let min = stginfo::stginfo_of(cls)
+        .map(stginfo::stginfo_size)
+        .or_else(|| cdata::type_code_of(cls).and_then(|tc| host_ctypes::simple_type_size(&tc)))
+        .unwrap_or(0);
+    if requested < min as i64 {
         return Err(crate::PyError::value_error(format!(
-            "minimum size is {cur}"
+            "minimum size is {min}"
         )));
     }
-    if size > cur {
-        if let Some(ba) = cdata::cdata_buffer(obj) {
-            unsafe { pyre_object::w_bytearray_vec_mut(ba).resize(size, 0) };
-        }
+    let size = requested as usize;
+    if let Some(ba) = cdata::cdata_buffer(obj) {
+        unsafe { pyre_object::w_bytearray_vec_mut(ba).resize(size, 0) };
     }
     Ok(pyre_object::w_none())
 }
@@ -488,27 +515,35 @@ fn ctypes_resize(
 // ── byref carrier ──────────────────────────────────────────────────────
 
 #[cfg(all(unix, feature = "host_env"))]
-thread_local! {
-    static CARG_TYPE_OBJ: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+static CARG_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// The minimal `byref` carrier type — holds `_ptr` (address) and `_obj`
 /// (the referenced instance, kept alive).  Foreign-call consumption of the
 /// carrier (the CArgObject P-tag path) is a later slice.
 #[cfg(all(unix, feature = "host_env"))]
 fn carg_type() -> pyre_object::PyObjectRef {
-    CARG_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("CArgObject", |_| {});
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    let raw = *CARG_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("CArgObject", |ns| {
+            super::type_ns_store(
+                ns,
+                "__repr__",
+                crate::make_builtin_function("__repr__", |args| {
+                    let d = crate::baseobjspace::getdict(args[0]);
+                    let value = unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
+                        .unwrap_or_else(pyre_object::w_none);
+                    let rendered = unsafe { crate::display::py_repr(value) }?;
+                    Ok(pyre_object::w_str_new(&format!("<cparam {rendered}>")))
+                }),
+            );
+        });
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    });
+    raw as pyre_object::PyObjectRef
 }
 
 #[cfg(all(unix, feature = "host_env"))]
-fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+pub(super) fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     let carg = pyre_object::w_instance_new(carg_type());
     let d = crate::baseobjspace::getdict(carg);
     if !d.is_null() {
