@@ -923,29 +923,21 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 ///
 /// `make_result_of_lastop` writes the result to the residual-call body's
 /// trailing `>r` destination byte, so use that register when the call ending at
-/// `root_pc` can be decoded.  Fall back to the precomputed result-color table
-/// for older shapes that lack the canonical residual-call encoding.  Returns
-/// `false` (caller declines the compile) when the register is unresolved.
+/// `root_pc` can be decoded.  Fall back to the codewriter-baked result-color
+/// trivia twin keyed by the call's JitCode pc for older shapes that lack the
+/// canonical residual-call encoding.  Returns `false` (caller declines the
+/// compile) when the register is unresolved.
 fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
     if sym.jitcode.is_null() {
         return false;
     }
     let payload = unsafe { &(*sym.jitcode).payload };
-    let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
     let result_reg = residual_ref_call_dst_before(payload.jitcode.code.as_slice(), root_pc)
         .or_else(|| {
-            let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
-            if crate::jitcode_dispatch::result_color_audit_enabled() {
-                let py_pc =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc)
-                        as usize;
-                assert_eq!(
-                    payload.result_color_for_jitcode_pc_pred(root_pc),
-                    payload.metadata.result_color_at_pc.get(py_pc).copied(),
-                    "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
-                );
-            }
-            crate::state::result_color_at_pc_at(jitcode_index, root_py_pc)
+            payload
+                .result_color_trivia_for_jitcode_pc(root_pc)
+                .map(|c| c as usize)
+                .filter(|&c| c != u16::MAX as usize)
         });
     let Some(result_reg) = result_reg else {
         return false;

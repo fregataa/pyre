@@ -3073,25 +3073,6 @@ fn compute_bridge_root_parent_frame(
         .bridge_registers_r
         .clone()
         .unwrap_or_else(|| root_sym.registers_r.clone());
-    if result_color_audit_enabled() {
-        let payload = unsafe { &(*root_sym.jitcode).payload };
-        let root_py_pc =
-            crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as usize;
-        let py_pc = python_pc_for_jitcode_pc(&payload.metadata, root_pc) as usize;
-        assert_eq!(
-            payload.result_color_for_jitcode_pc_pred(root_pc),
-            payload.metadata.result_color_at_pc.get(py_pc).copied(),
-            "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
-        );
-        assert_eq!(
-            payload
-                .result_color_trivia_for_jitcode_pc(root_pc)
-                .map(|c| c as usize)
-                .filter(|&c| c != u16::MAX as usize),
-            crate::state::result_color_at_pc_at(jitcode_index as i32, root_py_pc),
-            "result_color trivia twin vs backxlat consumer diverges at jit_pc={root_pc}"
-        );
-    }
     if let Some(result_color) = unsafe { &(*root_sym.jitcode).payload }
         .result_color_trivia_for_jitcode_pc(root_pc)
         .map(|c| c as usize)
@@ -3177,7 +3158,6 @@ fn recipe_parent_frame_from_recipe(
     recipe: &majit_metainterp::ReconstructRecipe,
     root_ec: *const pyre_interpreter::PyExecutionContext,
 ) -> Option<InlineParentFrame> {
-    let py_pc = crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize;
     let pjc = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return None;
@@ -3210,22 +3190,10 @@ fn recipe_parent_frame_from_recipe(
     let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(recipe.jitcode_index);
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
     let sentinel = u32::from(u16::MAX);
-    let result_color = crate::state::result_color_at_pc_at(recipe.jitcode_index, py_pc);
-    if pcmap_recipe_resultcolor_audit_enabled() {
-        // `recipe.jitcode_pc` is the reconstructed frame's resolved RESUME
-        // coordinate. The trivia twin has the same marker/predecessor anchor
-        // tiers as that coordinate's inversion and includes its forward-trivia
-        // semantics, so it is the candidate native replacement for this read.
-        let twin = pjc
-            .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
-            .map(|color| color as usize)
-            .filter(|&color| color != u16::MAX as usize);
-        pcmap_recipe_resultcolor_audit_probe("recipe_parent_result_color", "fire");
-        pcmap_recipe_resultcolor_audit_probe(
-            "recipe_parent_result_color",
-            if twin == result_color { "eq" } else { "di" },
-        );
-    }
+    let result_color = pjc
+        .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
+        .map(|c| c as usize)
+        .filter(|&c| c != u16::MAX as usize);
 
     let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
         recipe.jitcode_index,
@@ -11028,15 +10996,6 @@ fn vstack_enter_exception_handler(
     let _ = reseed_vstack_from_shadow(ctx, handler_depth);
 }
 
-/// `PYRE_PCMAP_RESULT_AUDIT` enables assertions that the audit-only
-/// `result_color_by_jit_pc` twin reproduces `result_color_at_pc` at seams
-/// already carrying a genuine JitCode byte offset. Diagnostic only; off in
-/// production while #73 retains the py_pc-keyed reader.
-pub(crate) fn result_color_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RESULT_AUDIT").is_some())
-}
-
 /// `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT` is a report-only census for the
 /// recipe resume-coordinate result-color reader and the multi-frame callee
 /// diagnostic's inversion. The optional `_PROBE` receives a fire row followed
@@ -11158,30 +11117,6 @@ pub(crate) fn pcmap_callpc_audit_enabled() -> bool {
 pub(crate) fn pcmap_midbody_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_MIDBODY_AUDIT").is_some())
-}
-
-/// `PYRE_PCMAP_GUARDCAP_AUDIT` records the selected JitCode-PC depth twin at
-/// each full-body guard capture. Diagnostic only; the Python-PC table remains
-/// authoritative while the census establishes its coordinate coverage.
-fn pcmap_guardcap_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_GUARDCAP_AUDIT").is_some())
-}
-
-/// Append one guard-capture depth census result. `check.py` discards
-/// diagnostic stderr, so the audit writes to an explicitly supplied probe.
-fn pcmap_guardcap_audit_probe(flavor: &'static str, verdict: &'static str) {
-    if let Some(path) = std::env::var_os("PYRE_PCMAP_GUARDCAP_AUDIT_PROBE") {
-        use std::io::Write;
-
-        if let Ok(mut probe) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(probe, "guardcap_depth\t{flavor}\t{verdict}");
-        }
-    }
 }
 
 /// Record one mid-body pc-map audit result. `check.py` discards diagnostic
@@ -12614,49 +12549,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     jc.payload.depth_trivia_for_jitcode_pc(op_pc)
                 }
             };
-            if pcmap_guardcap_audit_enabled() {
-                let jc = unsafe { &*sym.jitcode };
-                let table_depth = if jc.payload.code_ptr.is_null() {
-                    None
-                } else {
-                    crate::liveness::liveness_for(jc.payload.code_ptr)
-                        .depth_at_py_pc()
-                        .get(py_pc as usize)
-                        .copied()
-                };
-                let (flavor, verdict) = if loop_close_overshoot {
-                    (
-                        if after_residual_call {
-                            "after_residual"
-                        } else {
-                            "plain"
-                        },
-                        "overshoot",
-                    )
-                } else if after_residual_call
-                    && jc
-                        .payload
-                        .after_residual_marker_for_jitcode_pc(op_pc)
-                        .is_none()
-                {
-                    ("after_residual", "no_marker")
-                } else {
-                    let twin_depth = resume_depth_twin;
-                    assert_eq!(
-                        twin_depth, table_depth,
-                        "PCMAP_GUARDCAP depth mismatch op_pc={op_pc} py_pc={py_pc} twin_depth={twin_depth:?} table_depth={table_depth:?}",
-                    );
-                    (
-                        if after_residual_call {
-                            "after_residual"
-                        } else {
-                            "plain"
-                        },
-                        "eq",
-                    )
-                };
-                pcmap_guardcap_audit_probe(flavor, verdict);
-            }
             // `capture_resumedata(after_residual_call=True)` snapshots the
             // trailing `-live-`, after the residual result has replaced the
             // Python opcode's consumed operands (pyjitpl.py:177-198,
@@ -12783,13 +12675,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 let jc = &*sym.jitcode;
                 python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc)
             });
-            if pcmap_guardcap_audit_enabled() {
-                assert_eq!(
-                    guard_py_pc.is_some(),
-                    scope.branch_guard_jitcode_pc.is_some(),
-                    "PCMAP_GUARDCAP F3 selector diverges",
-                );
-            }
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
                     let jc = &*sym.jitcode;
@@ -13547,17 +13432,6 @@ fn compute_inline_caller_frame(
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    if result_color_audit_enabled() {
-        if let Some(jit_pc) = resume_marker_jit_pc {
-            let payload = unsafe { &(*caller_sym.jitcode).payload };
-            let py_pc = python_pc_for_jitcode_pc(&payload.metadata, jit_pc) as usize;
-            assert_eq!(
-                payload.result_color_for_jitcode_pc_pred(jit_pc),
-                payload.metadata.result_color_at_pc.get(py_pc).copied(),
-                "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={jit_pc}"
-            );
-        }
-    }
     let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc);
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
@@ -13677,16 +13551,6 @@ fn compute_nested_inline_caller_frame(
                 "inline_nested_depth_trivia",
                 pjc.depth_trivia_for_jitcode_pc(marker),
                 table_depth,
-            );
-        }
-    }
-    if result_color_audit_enabled() {
-        if let Some(jit_pc) = resume_marker_jit_pc {
-            let py_pc = python_pc_for_jitcode_pc(&pjc.metadata, jit_pc) as usize;
-            assert_eq!(
-                pjc.result_color_for_jitcode_pc_pred(jit_pc),
-                pjc.metadata.result_color_at_pc.get(py_pc).copied(),
-                "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={jit_pc}"
             );
         }
     }
