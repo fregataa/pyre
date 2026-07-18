@@ -424,29 +424,32 @@ pub fn init_typeobjects() {
         // semantics, so the per-typedef init body stays empty for
         // now — what matters is that `type(d.keys())` resolves to
         // the right W_TypeObject (otherwise `builtin_type` falls
-        // back to a str return).  Mark these non-base-acceptable to
-        // mirror PyPy's `acceptable_as_base_class = False`.
+        // back to a str return).  All three view typedefs carry
+        // `__new__ = interp2app(new_dict_*)`, so `acceptable_as_base_class`
+        // is True (`'__new__' in rawdict`): `class Sub(dict_keys)` is
+        // allowed, which `collections.OrderedDict`'s reversed-view
+        // classes rely on.
         // dict_keys / dict_items get the SetLikeDictView surface
         // per dictmultiobject.py:1802-1829 / 1773-1800; dict_values
         // stops at the common slots per dictmultiobject.py:1831-1840
         // (values views are intentionally NOT set-like).
         let dict_keys_type =
-            new_typeobject_with_base("dict_keys", init_dict_view_keys_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_keys_type, false) };
+            new_typeobject_with_base("dict_keys", init_dict_keys_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_keys_type, true) };
         reg.insert(
             &pyre_object::dictmultiobject::DICT_KEYS_TYPE as *const PyType as usize,
             dict_keys_type as usize,
         );
         let dict_values_type =
-            new_typeobject_with_base("dict_values", init_dict_view_values_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_values_type, false) };
+            new_typeobject_with_base("dict_values", init_dict_values_type_with_new, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_values_type, true) };
         reg.insert(
             &pyre_object::dictmultiobject::DICT_VALUES_TYPE as *const PyType as usize,
             dict_values_type as usize,
         );
         let dict_items_type =
-            new_typeobject_with_base("dict_items", init_dict_view_items_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_items_type, false) };
+            new_typeobject_with_base("dict_items", init_dict_items_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_items_type, true) };
         reg.insert(
             &pyre_object::dictmultiobject::DICT_ITEMS_TYPE as *const PyType as usize,
             dict_items_type as usize,
@@ -5333,6 +5336,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         true,
                         "dict",
                         &pyre_object::DICT_TYPE,
+                        true,
                     )?;
                     let d = crate::type_methods::resolve_dict_backing(args[0]);
                     Ok(
@@ -5365,11 +5369,10 @@ fn init_dict_type(ns: PyObjectRef) {
                     // regardless of key type by dispatching through the
                     // strategy's `clear` (`celldict.py:162-164` for
                     // module dicts).  `w_dict_clear` does the dispatch.
-                    if !args.is_empty() {
-                        let d = crate::type_methods::resolve_dict_backing(args[0]);
-                        if !d.is_null() {
-                            unsafe { pyre_object::dictmultiobject::w_dict_clear(d) };
-                        }
+                    crate::type_methods::arity_no_args(args, "dict.clear")?;
+                    let d = crate::type_methods::resolve_dict_backing(args[0]);
+                    if !d.is_null() {
+                        unsafe { pyre_object::dictmultiobject::w_dict_clear(d) };
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -5386,6 +5389,7 @@ fn init_dict_type(ns: PyObjectRef) {
                 // classmethod: args[0] is the bound cls; the user arguments are
                 // fromkeys(iterable, value=None).
                 let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                crate::type_methods::arity_at_most(args, "fromkeys", 2)?;
                 let (iterable, value) = if args.len() >= 3 {
                     (args[1], args[2])
                 } else if args.len() == 2 {
@@ -5469,7 +5473,7 @@ fn dict_view_reversed(
     expected: &'static PyType,
     kind: pyre_object::dictmultiobject::DictViewKind,
 ) -> crate::PyResult {
-    let view = dict_iterator_receiver(args, "__reversed__", true, owner, expected)?;
+    let view = dict_iterator_receiver(args, "__reversed__", true, owner, expected, false)?;
     let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
     Ok(pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(dict, kind))
 }
@@ -5580,6 +5584,132 @@ fn init_dict_view_common_slots(
             ),
         )
     };
+    // `_dict = interp_attrproperty_w('w_dict')` — the underlying dict.
+    // `collections.OrderedDict`'s reversed-view classes read `self._dict`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "_dict",
+            make_getset_property_named_doc(
+                make_builtin_function_with_arity(
+                    "_dict",
+                    |args| {
+                        let view = args[1];
+                        if view.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        let dict =
+                            unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
+                        if dict.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        Ok(dict)
+                    },
+                    2,
+                ),
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "the dict this view refers to",
+                "_dict",
+            ),
+        )
+    };
+}
+
+/// Shared `__new__` for the three dict views — `new_dict_keys` /
+/// `new_dict_items` / `new_dict_values` (`dictmultiobject.py`).  Each
+/// takes the dict positionally and allocates a view over it; the
+/// Python-visible class is re-pointed to the caller's subtype so
+/// `class _OrderedDictKeysView(dict_keys)` instances see themselves.
+fn dict_view_descr_new(
+    args: &[PyObjectRef],
+    kind: pyre_object::dictmultiobject::DictViewKind,
+    static_tp: &'static pyre_object::PyType,
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() missing required argument: the source dict"
+        )));
+    }
+    let cls = args[0];
+    // `interp_w(W_DictMultiObject, w_dict)` — accept a dict or any dict
+    // subclass (e.g. an `OrderedDict` passing itself to the view).
+    let dict_type = gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if !unsafe { crate::baseobjspace::isinstance_w(args[1], dict_type) } {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() argument must be a dict"
+        )));
+    }
+    // A dict subclass keeps its entries in a native backing dict; the view
+    // binds to that, exactly as `dict.keys()`/`values()`/`items()` do.
+    let w_dict = crate::type_methods::resolve_dict_backing(args[1]);
+    let view = pyre_object::dictmultiobject::w_dict_view_new(w_dict, kind);
+    // Re-point the Python-visible class to a subtype when one was passed
+    // (mirrors the `__new__` subtype fix-up applied to native builtins).
+    let static_obj = gettypeobject(static_tp);
+    if cls != static_obj && unsafe { pyre_object::is_type(cls) } {
+        unsafe { (*view).w_class = cls };
+    }
+    Ok(view)
+}
+
+fn dict_keys_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_view_descr_new(
+        args,
+        pyre_object::dictmultiobject::DictViewKind::Keys,
+        &pyre_object::dictmultiobject::DICT_KEYS_TYPE,
+        "dict_keys",
+    )
+}
+
+fn dict_values_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_view_descr_new(
+        args,
+        pyre_object::dictmultiobject::DictViewKind::Values,
+        &pyre_object::dictmultiobject::DICT_VALUES_TYPE,
+        "dict_values",
+    )
+}
+
+fn dict_items_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_view_descr_new(
+        args,
+        pyre_object::dictmultiobject::DictViewKind::Items,
+        &pyre_object::dictmultiobject::DICT_ITEMS_TYPE,
+        "dict_items",
+    )
+}
+
+fn register_dict_view_new(
+    ns: PyObjectRef,
+    new_fn: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            pyre_object::w_staticmethod_new(make_builtin_function("__new__", new_fn)),
+        )
+    };
+}
+
+/// `dict_keys` typedef body — set-like surface plus `__new__`.
+fn init_dict_keys_type(ns: PyObjectRef) {
+    init_dict_view_keys_type(ns);
+    register_dict_view_new(ns, dict_keys_descr_new);
+}
+
+/// `dict_items` typedef body — set-like surface plus `__new__`.
+fn init_dict_items_type(ns: PyObjectRef) {
+    init_dict_view_items_type(ns);
+    register_dict_view_new(ns, dict_items_descr_new);
+}
+
+/// `dict_values` typedef body — common slots plus `__new__`.
+fn init_dict_values_type_with_new(ns: PyObjectRef) {
+    init_dict_view_values_type(ns);
+    register_dict_view_new(ns, dict_values_descr_new);
 }
 
 /// `dictmultiobject.py` `W_DictViewKeysObject` /
@@ -6895,6 +7025,7 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     true,
                     "mappingproxy",
                     &pyre_object::MAPPING_PROXY_TYPE,
+                    false,
                 )?;
                 let dict = crate::type_methods::resolve_dict_backing(args[0]);
                 Ok(
@@ -14605,7 +14736,7 @@ fn init_object_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__reduce_ex__",
                 |args| {
-                    let proto = unsafe { pyre_object::w_int_get_value(args[1]) };
+                    let proto = crate::builtins::space_index_w(args[1])?;
                     crate::reduce_protocol::descr_reduce_ex(args[0], proto)
                 },
                 2,
@@ -17835,7 +17966,7 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `bytearrayobject.py:descr_append` — append one byte in place.
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "append", 1)?;
+    crate::type_methods::arity_exact(args, "bytearray.append", 1)?;
     unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let b = bytearray_byte_arg(args[1])?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
@@ -17961,6 +18092,7 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `bytearrayobject.py:descr_reverse` — reverse the bytes in place.
 fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "reverse")?;
+    crate::type_methods::arity_no_args(args, "bytearray.reverse")?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).reverse() };
     Ok(pyre_object::w_none())
 }
@@ -17968,6 +18100,7 @@ fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "clear")?;
+    crate::type_methods::arity_no_args(args, "bytearray.clear")?;
     unsafe {
         crate::builtins::bytearray_check_exports(args[0])?;
         pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear();
@@ -17979,6 +18112,7 @@ fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// same bytes.
 fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "copy")?;
+    crate::type_methods::arity_no_args(args, "bytearray.copy")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
 }
@@ -18891,6 +19025,12 @@ fn setlike_descr_isdisjoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 fn setlike_descr_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.copy"
+    } else {
+        "set.copy"
+    };
+    crate::type_methods::arity_no_args(args, name)?;
     if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::setobject::FROZENSET_TYPE) } {
         return Ok(args[0]);
     }
@@ -20040,23 +20180,22 @@ fn init_set_type(ns: PyObjectRef) {
                 "add",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "add", true)?;
-                    if args.len() >= 2 {
-                        // `try_hash_value` may run a user `__hash__` that
-                        // allocates and triggers a moving minor collection;
-                        // root `self` and the element across it, then reload.
-                        // Its digest keys the store, so the element is hashed
-                        // once.
-                        unsafe {
-                            let _roots = pyre_object::gc_roots::push_roots();
-                            let sp = pyre_object::gc_roots::shadow_stack_len();
-                            pyre_object::gc_roots::pin_root(args[0]);
-                            pyre_object::gc_roots::pin_root(args[1]);
-                            let hash = crate::builtins::try_hash_value(args[1])?;
-                            let set = pyre_object::gc_roots::shadow_stack_get(sp);
-                            let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_set_add_hashed_checked(set, item, hash)
-                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
-                        }
+                    crate::type_methods::arity_exact(args, "set.add", 1)?;
+                    // `try_hash_value` may run a user `__hash__` that
+                    // allocates and triggers a moving minor collection;
+                    // root `self` and the element across it, then reload.
+                    // Its digest keys the store, so the element is hashed
+                    // once.
+                    unsafe {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let sp = pyre_object::gc_roots::shadow_stack_len();
+                        pyre_object::gc_roots::pin_root(args[0]);
+                        pyre_object::gc_roots::pin_root(args[1]);
+                        let hash = crate::builtins::try_hash_value(args[1])?;
+                        let set = pyre_object::gc_roots::shadow_stack_get(sp);
+                        let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                        pyre_object::w_set_add_hashed_checked(set, item, hash)
+                            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -20072,9 +20211,8 @@ fn init_set_type(ns: PyObjectRef) {
                 "discard",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "discard", true)?;
-                    if args.len() >= 2 {
-                        set_discard_from_set(args[0], args[1])?;
-                    }
+                    crate::type_methods::arity_exact(args, "set.discard", 1)?;
+                    set_discard_from_set(args[0], args[1])?;
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -20089,9 +20227,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "remove",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "remove", true)?;
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error("remove() requires an argument"));
-                    }
+                    crate::type_methods::arity_exact(args, "set.remove", 1)?;
                     if !set_discard_from_set(args[0], args[1])? {
                         return Err(crate::PyError::key_error_with_key(args[1]));
                     }
@@ -20109,6 +20245,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "pop",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "pop", true)?;
+                    crate::type_methods::arity_no_args(args, "set.pop")?;
                     if let Some(item) = unsafe { pyre_object::w_set_popitem(args[0]) } {
                         return Ok(item);
                     }
@@ -20129,6 +20266,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "clear",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "clear", true)?;
+                    crate::type_methods::arity_no_args(args, "set.clear")?;
                     unsafe { pyre_object::w_set_clear(args[0]) };
                     Ok(pyre_object::w_none())
                 },
@@ -20610,6 +20748,7 @@ fn dict_iterator_receiver(
     method_descriptor: bool,
     owner: &str,
     expected: &'static PyType,
+    allow_subclass: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let Some(&receiver) = args.first() else {
         let message = if method_descriptor {
@@ -20619,7 +20758,15 @@ fn dict_iterator_receiver(
         };
         return Err(crate::PyError::type_error(message));
     };
-    if !unsafe { pyre_object::py_type_check(receiver, expected) } {
+    // `dict` method descriptors bind to any dict subclass (an `OrderedDict`
+    // passed to `dict.__reversed__`); the concrete iterator typedefs are not
+    // subclassable, so they keep the exact-type check on the hot path.
+    let matches = if allow_subclass {
+        unsafe { crate::baseobjspace::isinstance_w(receiver, gettypeobject(expected)) }
+    } else {
+        unsafe { pyre_object::py_type_check(receiver, expected) }
+    };
+    if !matches {
         let received = crate::baseobjspace::object_functionstr_type_name(receiver);
         let message = if method_descriptor {
             format!(
@@ -20639,21 +20786,21 @@ fn dict_iterator_receiver(
 macro_rules! define_dict_iterator_type {
     ($init:ident, $self_fn:ident, $next_fn:ident, $len_fn:ident, $reduce_fn:ident, $owner:literal, $expected:path) => {
         fn $self_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__iter__", false, $owner, &$expected)
+            dict_iterator_receiver(args, "__iter__", false, $owner, &$expected, false)
         }
 
         fn $next_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__next__", false, $owner, &$expected)?;
+            dict_iterator_receiver(args, "__next__", false, $owner, &$expected, false)?;
             crate::baseobjspace::next(args[0])
         }
 
         fn $len_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__length_hint__", true, $owner, &$expected)?;
+            dict_iterator_receiver(args, "__length_hint__", true, $owner, &$expected, false)?;
             crate::baseobjspace::dict_view_iter_length_hint_method(args)
         }
 
         fn $reduce_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__reduce__", true, $owner, &$expected)?;
+            dict_iterator_receiver(args, "__reduce__", true, $owner, &$expected, false)?;
             crate::baseobjspace::dict_view_iter_reduce_method(args)
         }
 

@@ -5,10 +5,10 @@
 //! by a list payload field; semantically correct for
 //! `collections.py`'s `MutableSequence` consumers but not performant
 //! (PyPy's `W_Deque` is a doubly-linked block list — porting that needs
-//! a separate algorithm migration).  `defaultdict` is the
-//! app-level `dict` subclass in `app_defaultdict.py`, mirroring PyPy's
-//! `app_defaultdict.py` (neither runtime can subclass the app-level
-//! `dict` from interp-level).
+//! a separate algorithm migration).  `defaultdict` and `OrderedDict` are
+//! app-level `dict` subclasses in `app_defaultdict.py` / `app_odict.py`,
+//! mirroring PyPy (neither runtime can subclass the app-level `dict` from
+//! interp-level).
 
 use pyre_object::*;
 
@@ -427,6 +427,30 @@ impl W_Deque {
         }
         Ok(())
     }
+    fn insert(&mut self, i: PyObjectRef, x: PyObjectRef) -> Result<(), crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
+        // `W_Deque.insert(i, x)` — the index goes through `__index__` (converted
+        // before the deque is inspected), then a bounded deque that is already
+        // full raises before the element is placed.
+        let index = crate::builtins::getindex_w(i)?;
+        let mut items = snapshot(self_obj);
+        if maxlen_bound(self_obj).is_some_and(|m| items.len() >= m) {
+            return Err(crate::PyError::index_error(
+                "deque already at its maximum size",
+            ));
+        }
+        let len = items.len() as i64;
+        // list.insert clamping: a negative index counts from the end and an
+        // out-of-range index clamps to the near edge.
+        let pos = if index < 0 {
+            (index + len).max(0)
+        } else {
+            index.min(len)
+        } as usize;
+        items.insert(pos, x);
+        store(self_obj, items);
+        Ok(())
+    }
     fn index(
         &self,
         x: PyObjectRef,
@@ -637,13 +661,12 @@ crate::py_module! {
     interpleveldefs: {
         "deque"           => type_object(),
         "_deque_iterator" => crate::typedef::w_object(),
-        // `OrderedDict` is a dict subclass; alias to the dict type
-        // object so `isinstance(d, OrderedDict)` matches dict instances.
-        "OrderedDict"     => crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE),
     },
-    // `defaultdict` is an app-level `dict` subclass — see the module
-    // header and `app_defaultdict.py` (PyPy `app_defaultdict.defaultdict`).
+    // `defaultdict` and `OrderedDict` are app-level `dict` subclasses —
+    // see the module header and `app_defaultdict.py` / `app_odict.py`
+    // (PyPy `app_defaultdict.defaultdict` / `app_odict.OrderedDict`).
     appleveldefs: {
         "app_defaultdict.py" => ["defaultdict"],
+        "app_odict.py" => ["OrderedDict"],
     },
 }

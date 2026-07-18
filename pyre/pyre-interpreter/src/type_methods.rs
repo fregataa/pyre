@@ -520,6 +520,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// PyPy: listobject.py descr_clear — list.clear()
 pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "clear", true)?;
+    arity_no_args(args, "list.clear")?;
     unsafe { pyre_object::listobject::w_list_clear(args[0]) };
     Ok(w_none())
 }
@@ -527,6 +528,7 @@ pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// PyPy: listobject.py descr_copy — list.copy()
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "copy", true)?;
+    arity_no_args(args, "list.copy")?;
     let list = args[0];
     unsafe {
         let n = w_list_len(list);
@@ -543,6 +545,7 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// PyPy: listobject.py descr_reverse — list.reverse()
 pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "reverse", true)?;
+    arity_no_args(args, "list.reverse")?;
     unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
     Ok(w_none())
 }
@@ -4917,8 +4920,15 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
         // on `type.__dict__` without per-method proxy plumbing.
         if pyre_object::is_dict_proxy(obj) {
             let inner = pyre_object::w_dict_proxy_get_mapping(obj);
-            if !inner.is_null() && pyre_object::is_dict(inner) {
-                return inner;
+            // The wrapped mapping may itself be a dict subclass (e.g. a
+            // class whose namespace is an `OrderedDict`), which keeps its
+            // entries in a native backing dict — resolve through to that
+            // rather than requiring `inner` to be an exact dict.
+            if !inner.is_null() && inner != obj {
+                let backing = resolve_dict_backing(inner);
+                if !backing.is_null() {
+                    return backing;
+                }
             }
         }
         if is_instance(obj) {
@@ -5004,6 +5014,7 @@ pub(crate) fn set_contains_checked(
 
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;
+    arity_at_most(args, "get", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
@@ -5316,6 +5327,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// so popping the last entry matches the spec.
 pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "popitem")?;
+    arity_no_args(args, "dict.popitem")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
         return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
@@ -5339,6 +5351,7 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `strategy.setdefault` as a single atomic operation (one hash).
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "setdefault", 1)?;
+    arity_at_most(args, "setdefault", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
@@ -5436,7 +5449,7 @@ mod dict_method_tests {
 
 // ── Tuple methods ────────────────────────────────────────────────────
 
-/// PyPy: tupleobject.py descr_index — tuple.index(value)
+/// tupleobject.py descr_index — tuple.index(value[, start[, stop]]).
 pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_tuple_receiver(args, "index", true)?;
     if args.len() < 2 {
@@ -5453,15 +5466,40 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let tup = args[0];
     let value = args[1];
-    let length = unsafe { w_tuple_len(tup) } as i64;
-    let w_start = args.get(2).copied().unwrap_or_else(|| w_int_new(0));
-    let w_stop = args.get(3).copied().unwrap_or_else(|| w_int_new(i64::MAX));
-    let (start, stop) = crate::sliceobject::unwrap_start_stop(length, w_start, w_stop)?;
-    for i in start..stop.min(length) {
-        if let Some(item) = unsafe { w_tuple_getitem(tup, i) } {
-            if crate::baseobjspace::eq_w(item, value)? {
-                return Ok(w_int_new(i));
+    // descr_index defaults: w_start=0, w_stop=maxint; unwrap_start_stop does
+    // negative normalization and __index__ coercion.
+    let size = unsafe { w_tuple_len(tup) } as i64;
+    let w_start = if args.len() >= 3 {
+        args[2]
+    } else {
+        w_int_new(0)
+    };
+    let w_stop = if args.len() >= 4 {
+        args[3]
+    } else {
+        w_int_new(i64::MAX)
+    };
+    // A user __eq__ (or an __index__ on start/stop) may allocate and move the
+    // tuple / search value across a minor collection; root both and reload.
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(tup);
+        pyre_object::gc_roots::pin_root(value);
+        let (start, stop) = crate::sliceobject::unwrap_start_stop(size, w_start, w_stop)?;
+        let mut i = start.max(0);
+        while i < stop {
+            let tup = pyre_object::gc_roots::shadow_stack_get(sp);
+            if i >= w_tuple_len(tup) as i64 {
+                break;
             }
+            if let Some(item) = w_tuple_getitem(tup, i) {
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                if crate::baseobjspace::eq_w(item, value)? {
+                    return Ok(w_int_new(i));
+                }
+            }
+            i += 1;
         }
     }
     Err(crate::PyError::value_error(
@@ -5481,14 +5519,26 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let tup = args[0];
     let value = args[1];
     let mut count: i64 = 0;
+    // A user __eq__ may allocate and move the tuple / value across a minor
+    // collection; root both and reload after each comparison.
     unsafe {
-        let n = w_tuple_len(tup);
-        for i in 0..n {
-            if let Some(item) = w_tuple_getitem(tup, i as i64) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(tup);
+        pyre_object::gc_roots::pin_root(value);
+        let mut i = 0i64;
+        loop {
+            let tup = pyre_object::gc_roots::shadow_stack_get(sp);
+            if i >= w_tuple_len(tup) as i64 {
+                break;
+            }
+            if let Some(item) = w_tuple_getitem(tup, i) {
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                 if crate::baseobjspace::eq_w(item, value)? {
                     count += 1;
                 }
             }
+            i += 1;
         }
     }
     Ok(w_int_new(count))
