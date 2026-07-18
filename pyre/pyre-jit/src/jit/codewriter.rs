@@ -1580,6 +1580,23 @@ fn handler_entry_has_explicit_raise_source(
     })
 }
 
+fn next_non_aux_instruction(code: &CodeObject, mut pc: usize) -> Option<(usize, Instruction)> {
+    while pc < code.instructions.len() {
+        let (instruction, _) = pyre_interpreter::decode_instruction_at(code, pc)?;
+        if !matches!(
+            instruction,
+            Instruction::Nop
+                | Instruction::Cache
+                | Instruction::NotTaken
+                | Instruction::ExtendedArg
+        ) {
+            return Some((pc, instruction));
+        }
+        pc += 1;
+    }
+    None
+}
+
 fn initialize_spam_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -5498,7 +5515,7 @@ impl CodeWriter {
                 },
             build_slice_fn:
                 HelperHandle {
-                    idx: _build_slice_fn_idx,
+                    idx: build_slice_fn_idx,
                     flavor: _build_slice_fn_flavor,
                 },
             normalize_raise_varargs_fn:
@@ -5957,6 +5974,7 @@ impl CodeWriter {
                 store_attr_fn_idx,
                 build_map_from_array_fn_idx,
                 binary_slice_fn_idx,
+                build_slice_fn_idx,
                 delete_subscr_fn_idx,
                 delete_attr_fn_idx,
                 build_set_from_array_fn_idx,
@@ -8319,23 +8337,25 @@ impl CodeWriter {
                             // non-portal callee instead keeps the
                             // `flowcontext.py:856-859 find_global` const-fold,
                             // which the inliner needs as a foldable constant call
-                            // target — EXCEPT when the resolved global is a
-                            // mutable container (dict / list / set).  Such a
-                            // container is grown in place and relocates
-                            // nursery->oldgen after the jitcode is built, so its
-                            // const-folded address dangles when the blackhole
-                            // resumes the unfused callee (dynasm SIGSEGVs;
-                            // cranelift null-softens the read).  Resolve those
-                            // through the `bh_load_global_fn` residual whose
-                            // namespace operand is the callee's module dict
-                            // object, built eagerly at `PyFrame.__init__` so it reaches the non-moving
-                            // oldgen before any jitcode build): the cell-fold
-                            // then reads the container value live through that
-                            // stable dict every iteration instead of baking the
-                            // relocating value.  Functions / classes / modules
-                            // are created at module load and promoted to the
-                            // non-moving oldgen before any jitcode build, so
-                            // const-folding them stays GC-safe.
+                            // target — EXCEPT for a mutable container (dict /
+                            // list / set) or a function.  A container is grown
+                            // in place and relocates nursery->oldgen after the
+                            // jitcode is built, so its const-folded address
+                            // dangles when the blackhole resumes the unfused
+                            // callee (dynasm SIGSEGVs; cranelift null-softens the
+                            // read).  A function global can be rebound through
+                            // its module cell after the jitcode is built, so a
+                            // baked callable goes stale.  Resolve both through
+                            // the `bh_load_global_fn` residual whose namespace
+                            // operand is the callee's module dict object, built
+                            // eagerly at `PyFrame.__init__` so it reaches the
+                            // non-moving oldgen before any jitcode build: the
+                            // cell-fold then reads the value live through that
+                            // stable dict every iteration, giving the optimizer a
+                            // guarded value instead of baking a relocating or
+                            // rebindable one.  Classes / modules are created at
+                            // module load and are neither grown nor rebound, so
+                            // const-folding them stays safe.
                             let result_value: super::flow::FlowValue = if is_true_portal {
                                 let ns_var = emit_graph_op_with_result(
                                     &mut graph,
@@ -8373,30 +8393,33 @@ impl CodeWriter {
                                 let name = code.names.get(name_idx).map(|name| name.as_str());
                                 // Classify the FINAL resolved global — module
                                 // globals OR `__builtins__`.  Only a
-                                // module-load-immortal call target (function,
-                                // class, module) is safe to const-fold: it is
-                                // promoted to the non-moving oldgen before any
-                                // jitcode build, and the inliner needs it as a
+                                // module-load-immortal, non-rebindable call
+                                // target (a class or a module) is safe to
+                                // const-fold: it is promoted to the non-moving
+                                // oldgen before any jitcode build and is not
+                                // rebound in place, and the inliner needs it as a
                                 // foldable constant call target.  Every other
-                                // resolved global is a relocatable value (an
+                                // resolved global is either relocatable (an
                                 // `int`/`str` built at run time, or a mutable
-                                // dict/list/set) whose const-folded address
+                                // dict/list/set whose const-folded address
                                 // dangles once the moving GC relocates it — the
                                 // baked pointer then crashes the blackhole
-                                // resume.  Route those through the live residual
+                                // resume) or rebindable (a function whose module
+                                // cell can be reassigned after the jitcode is
+                                // built, so a baked callable goes stale).  Route
+                                // those through the live residual
                                 // (`bh_load_global_fn` resolves the value from
                                 // the frame's own globals every iteration, never
-                                // baking the relocating pointer); `LOAD_GLOBAL`
-                                // under the JIT always resolves through
-                                // `get_w_globals()` live (celldict.py:287), so
-                                // the residual is the orthodox shape and the
-                                // const-fold is the optimization carve-out.
+                                // baking the relocating or rebindable pointer);
+                                // `LOAD_GLOBAL` under the JIT always resolves
+                                // through `get_w_globals()` live
+                                // (celldict.py:287), so the residual is the
+                                // orthodox shape and the const-fold is the
+                                // optimization carve-out.
                                 let global_is_const_foldable = name
                                     .and_then(|nm| frontend_global_object(w_code, nm))
                                     .is_some_and(|obj| unsafe {
-                                        pyre_interpreter::is_function(obj)
-                                            || pyre_object::is_type(obj)
-                                            || pyre_object::is_module(obj)
+                                        pyre_object::is_type(obj) || pyre_object::is_module(obj)
                                     });
                                 if !global_is_const_foldable {
                                     // The namespace operand is the callee's
@@ -8445,12 +8468,15 @@ impl CodeWriter {
                                         .map(super::flow::FlowValue::from)
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                                 } else {
-                                    // Module-load-immortal call target
-                                    // (function / class / module): const-fold so
+                                    // Module-load-immortal, non-rebindable call
+                                    // target (a class or a module): const-fold so
                                     // the inliner sees a foldable constant call
                                     // target.  Such objects reach the non-moving
-                                    // oldgen before any jitcode build, so the
-                                    // baked pointer stays GC-stable.
+                                    // oldgen before any jitcode build and are not
+                                    // rebound, so the baked pointer stays stable.
+                                    // Function globals take the residual path
+                                    // above because rebinding can change their
+                                    // module-cell payload.
                                     name.and_then(|nm| frontend_global_flow_value(w_code, nm))
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                                 }
@@ -11518,6 +11544,47 @@ impl CodeWriter {
                             if fbw_delete_fast_enabled() {
                                 let idx = var_num.get(op_arg).as_usize();
                                 if current_state.local_value_at(idx).is_none() {
+                                    emit_abort_permanent!(py_pc);
+                                    continue;
+                                }
+                                // The implicit cleanup of a named `except E as m:`
+                                // whose body bare-re-raises compiles to
+                                // `DELETE_FAST m; RERAISE` immediately followed by
+                                // a sibling clause's `LOAD_GLOBAL <T>; CHECK_EXC_MATCH`.
+                                // The covered RERAISE must route to the outer
+                                // re-raise landing, but the walker-native bound
+                                // continuation of this DELETE_FAST falls through
+                                // into that sibling type check with the current
+                                // exception not re-seeded, so CHECK_EXC_MATCH peeks
+                                // a null operand. Decline this shape — and any
+                                // catch-covered DELETE_FAST in a function that
+                                // contains it — so the interpreter runs it.
+                                let cleanup_reraise_to_sibling = |delete_pc: usize| {
+                                    let next = next_non_aux_instruction(code, delete_pc + 1);
+                                    let after_next = next
+                                        .and_then(|(pc, _)| next_non_aux_instruction(code, pc + 1));
+                                    let after_after_next = after_next
+                                        .and_then(|(pc, _)| next_non_aux_instruction(code, pc + 1));
+                                    next.is_some_and(|(pc, instruction)| {
+                                        catch_for_pc.get(pc).copied().flatten().is_some()
+                                            && matches!(instruction, Instruction::Reraise { .. })
+                                    }) && after_next.is_some_and(|(_, instruction)| {
+                                        matches!(instruction, Instruction::LoadGlobal { .. })
+                                    }) && after_after_next.is_some_and(|(_, instruction)| {
+                                        matches!(instruction, Instruction::CheckExcMatch)
+                                    })
+                                };
+                                let function_has_cleanup_reraise_to_sibling =
+                                    (0..num_instrs).any(|pc| {
+                                        matches!(
+                                            pyre_interpreter::decode_instruction_at(code, pc),
+                                            Some((Instruction::DeleteFast { .. }, _))
+                                        ) && cleanup_reraise_to_sibling(pc)
+                                    });
+                                if cleanup_reraise_to_sibling(py_pc)
+                                    || (catch_for_pc.get(py_pc).copied().flatten().is_some()
+                                        && function_has_cleanup_reraise_to_sibling)
+                                {
                                     emit_abort_permanent!(py_pc);
                                     continue;
                                 }
