@@ -7025,6 +7025,7 @@ const PYCF_IGNORE_COOKIE: i64 = 0x0800;
 const PYCF_TYPE_COMMENTS: i64 = 0x4000_0000;
 const PYCF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
 const PYCF_ALLOW_INCOMPLETE_INPUT: i64 = 0x4000;
+const PYCF_OPTIMIZED_AST: i64 = 0x8000;
 const PYCF_ACCEPT_NULL_BYTES: i64 = 0x1000_0000;
 /// `future.py` `allowed_flags` — the union of the `__future__`
 /// `compiler_flag` bits (`CO_FUTURE_DIVISION` … `CO_FUTURE_ANNOTATIONS`),
@@ -7035,8 +7036,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // `compile(source, filename, mode, flags=0, dont_inherit=False,
     // optimize=-1, *, _feature_version=-1)`: the three required parameters and
     // flags/dont_inherit/optimize are positional-or-keyword; _feature_version
-    // is keyword-only and accepted but unused (pyre has no AST surface, so the
-    // PyCF_ONLY_AST feature-version gate never fires).
+    // is keyword-only.  PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
     let (pos, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(
         kwargs,
@@ -7066,27 +7066,6 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             pyre_object::w_str_get_value(filename_obj).to_string()
         } else {
             "<string>".to_string()
-        }
-    };
-    let source_str = unsafe {
-        if pyre_object::is_str(source) {
-            // The source is decoded to UTF-8 for the tokenizer; a lone
-            // surrogate raises `UnicodeEncodeError` (strict) rather than
-            // panicking in `w_str_get_value`.
-            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
-            String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8")
-        } else if pyre_object::bytesobject::is_bytes_like(source) {
-            // A bytes-like source honours the PEP 263 coding cookie and raises
-            // SyntaxError on undecodable bytes rather than lossily replacing.
-            crate::compile::decode_source_bytes(
-                pyre_object::bytesobject::bytes_like_data(source),
-                &filename,
-                false,
-            )?
-        } else {
-            return Err(crate::PyError::type_error(
-                "compile() arg 1 must be a string or bytes",
-            ));
         }
     };
     let mode = unsafe {
@@ -7120,6 +7099,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         | PYCF_TYPE_COMMENTS
         | PYCF_ALLOW_TOP_LEVEL_AWAIT
         | PYCF_ALLOW_INCOMPLETE_INPUT
+        | PYCF_OPTIMIZED_AST
         | PYCF_IGNORE_COOKIE;
     if flags & !recognized != 0 {
         return Err(crate::PyError::value_error("compile(): unrecognised flags"));
@@ -7163,6 +7143,47 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         optimize = 0;
     }
 
+    let source_str = unsafe {
+        if pyre_object::is_str(source) {
+            // The source is decoded to UTF-8 for the tokenizer; a lone
+            // surrogate raises `UnicodeEncodeError` (strict) rather than
+            // panicking in `w_str_get_value`.
+            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
+            String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8")
+        } else if pyre_object::bytesobject::is_bytes_like(source) {
+            // A bytes-like source honours the PEP 263 coding cookie and raises
+            // SyntaxError on undecodable bytes rather than lossily replacing.
+            crate::compile::decode_source_bytes(
+                pyre_object::bytesobject::bytes_like_data(source),
+                &filename,
+                false,
+            )?
+        } else {
+            // PyPy returns an AST input unchanged when ONLY_AST is requested.
+            // Keep this check at the public `_ast.AST` boundary so subclasses
+            // behave the same way as native nodes.
+            let ast_module = crate::importing::importhook(
+                "_ast",
+                PY_NULL,
+                PY_NULL,
+                0,
+                crate::call::take_last_exec_ctx(),
+            )?;
+            let ast_type = crate::baseobjspace::getattr_str(ast_module, "AST")?;
+            if crate::baseobjspace::isinstance_w(source, ast_type) {
+                if flags & PYCF_ONLY_AST != 0 {
+                    return Ok(source);
+                }
+                return Err(crate::PyError::not_implemented(
+                    "compiling an AST object is not implemented",
+                ));
+            }
+            return Err(crate::PyError::type_error(
+                "compile() arg 1 must be a string, bytes or AST object",
+            ));
+        }
+    };
+
     // Assemble CompileOpts: the __future__ feature bits, the two PyCF_*
     // bits the codegen honours, and the optimisation level.
     let opts = crate::compile::CompileOpts {
@@ -7172,6 +7193,9 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         future_features: crate::CodeFlags::from_bits_truncate((flags & COMPILER_FLAGS) as u32),
         ..Default::default()
     };
+    if flags & PYCF_ONLY_AST != 0 {
+        return crate::module::_ast::convert::parse_to_object(&source_str, mode);
+    }
     let code = crate::compile::compile_source_with_opts(&source_str, mode, &filename, opts)
         .map_err(compile_err_to_syntax_error)?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
@@ -9074,20 +9098,19 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// as instance attributes, matching the PyPy FileIO/TextIOWrapper
 /// duck-typing surface without a dedicated W_FileObject.
 pub fn file_wrapper_type() -> PyObjectRef {
-    thread_local! {
-        static FILE_WRAPPER_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    FILE_WRAPPER_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // A Python type is process-global, exactly as PyPy's W_TypeObject is.
+    // Storing it in TLS would manufacture one incompatible TextIOWrapper type
+    // per host thread and break cross-thread isinstance/type identity.
+    static FILE_WRAPPER_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FILE_WRAPPER_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 /// PyPy: pypy/module/_io/interp_iobase.py W_IOBase.
-fn init_file_wrapper_type(ns: PyObjectRef) {
+pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -9198,6 +9221,7 @@ fn init_file_wrapper_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "readable",
                 |args| {
+                    file_check_closed(args[0])?;
                     let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
                         .ok()
                         .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
@@ -9215,6 +9239,7 @@ fn init_file_wrapper_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "writable",
                 |args| {
+                    file_check_closed(args[0])?;
                     let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
                         .ok()
                         .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
@@ -9240,6 +9265,7 @@ fn init_file_wrapper_type(ns: PyObjectRef) {
                 // file does, a pipe/socket fails with ESPIPE.  The in-memory
                 // path wrapper is always seekable.
                 |args| {
+                    file_check_closed(args[0])?;
                     if let Some(fd) = file_get_fd(args[0]) {
                         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                         {
@@ -9269,15 +9295,16 @@ fn init_file_wrapper_type(ns: PyObjectRef) {
             ns,
             "seek",
             make_builtin_function("seek", |args| {
+                file_check_closed(args[0])?;
+                let offset = args
+                    .get(1)
+                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
+                    .unwrap_or(0);
+                let whence = args
+                    .get(2)
+                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
+                    .unwrap_or(0) as i32;
                 if let Some(fd) = file_get_fd(args[0]) {
-                    let offset = args
-                        .get(1)
-                        .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
-                        .unwrap_or(0);
-                    let whence = args
-                        .get(2)
-                        .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
-                        .unwrap_or(0) as i32;
                     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                     {
                         #[cfg(not(feature = "sandbox"))]
@@ -9301,10 +9328,18 @@ fn init_file_wrapper_type(ns: PyObjectRef) {
                         ));
                     }
                 }
-                if args.len() >= 2 {
-                    let _ = crate::baseobjspace::setattr_str(args[0], "__file_pos__", args[1]);
-                }
-                Ok(w_none())
+                let base = match whence {
+                    0 => 0,
+                    1 => file_get_pos(args[0]) as i64,
+                    2 => file_get_data(args[0]).len() as i64,
+                    _ => return Err(crate::PyError::value_error("invalid whence")),
+                };
+                let pos = base
+                    .checked_add(offset)
+                    .filter(|pos| *pos >= 0)
+                    .ok_or_else(|| crate::PyError::value_error("negative seek position"))?;
+                file_set_pos(args[0], pos as usize);
+                Ok(w_int_new(pos))
             }),
         )
     };
@@ -9315,6 +9350,7 @@ fn init_file_wrapper_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "tell",
                 |args| {
+                    file_check_closed(args[0])?;
                     if let Some(fd) = file_get_fd(args[0]) {
                         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                         {
@@ -9346,6 +9382,128 @@ fn init_file_wrapper_type(ns: PyObjectRef) {
             ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "isatty",
+            make_builtin_function_with_arity("isatty", file_method_isatty, 1),
+        )
+    };
+}
+
+/// `_io.FileIO.__init__` — PyPy `W_FileIO.descr_init`.
+///
+/// The existing file helpers keep their state in reserved instance slots; a
+/// FileIO instance uses the same slots but always exposes a binary raw stream.
+pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["file", "mode", "closefd", "opener"], "FileIO")?;
+    let self_obj = pos
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("FileIO.__init__() missing self"))?;
+    let file = bind_pos_or_kw(pos, kwargs, 1, "file", "FileIO", 1)?
+        .ok_or_else(|| crate::PyError::type_error("FileIO() missing required argument 'file'"))?;
+    let mode_obj =
+        bind_pos_or_kw(pos, kwargs, 2, "mode", "FileIO", 2)?.unwrap_or_else(|| w_str_new("r"));
+    if !unsafe { pyre_object::is_str(mode_obj) } {
+        return Err(crate::PyError::type_error(
+            "FileIO() argument 'mode' must be str",
+        ));
+    }
+    let mode = unsafe { pyre_object::w_str_get_value(mode_obj) };
+    let mut primary = None;
+    let mut updating = false;
+    let mut binary_seen = false;
+    for ch in mode.chars() {
+        match ch {
+            'r' | 'w' | 'a' | 'x' => {
+                if primary.replace(ch).is_some() {
+                    return Err(crate::PyError::value_error("invalid mode"));
+                }
+            }
+            '+' if !updating => updating = true,
+            'b' if !binary_seen => binary_seen = true,
+            _ => return Err(crate::PyError::value_error("invalid mode")),
+        }
+    }
+    let primary = primary.ok_or_else(|| crate::PyError::value_error("invalid mode"))?;
+    let binary_mode = format!("{primary}b{}", if updating { "+" } else { "" });
+
+    let closefd_obj = bind_pos_or_kw(pos, kwargs, 3, "closefd", "FileIO", 3)?
+        .unwrap_or_else(|| w_bool_from(true));
+    let closefd = crate::baseobjspace::is_true(closefd_obj)?;
+    if !unsafe { pyre_object::is_int(file) } && !closefd {
+        return Err(crate::PyError::value_error(
+            "Cannot use closefd=False with file name",
+        ));
+    }
+    let opener = bind_pos_or_kw(pos, kwargs, 4, "opener", "FileIO", 4)?.unwrap_or_else(w_none);
+    let opened = builtin_open(&[
+        file,
+        w_str_new(&binary_mode),
+        w_int_new(-1),
+        w_none(),
+        w_none(),
+        w_none(),
+        closefd_obj,
+        opener,
+    ])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_obj);
+    pyre_object::gc_roots::pin_root(opened);
+    for name in [
+        "__file_data__",
+        "__file_pos__",
+        "__file_name__",
+        "__file_mode__",
+        "__file_binary__",
+        "__file_fd__",
+        "__file_dirty__",
+        "name",
+        "encoding",
+        "errors",
+    ] {
+        if let Ok(value) = crate::baseobjspace::getattr_str(opened, name) {
+            crate::baseobjspace::setattr_str(self_obj, name, value)?;
+        }
+    }
+    crate::baseobjspace::setattr_str(self_obj, "mode", w_str_new(&binary_mode))?;
+    crate::baseobjspace::setattr_str(self_obj, "closefd", w_bool_from(closefd))?;
+    crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(false))?;
+    Ok(w_none())
+}
+
+fn file_check_closed(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
+    let closed = crate::baseobjspace::getattr_str(self_obj, "closed")
+        .ok()
+        .map(|value| unsafe { pyre_object::is_bool(value) && pyre_object::w_bool_get_value(value) })
+        .unwrap_or(false);
+    if closed {
+        Err(crate::PyError::value_error("I/O operation on closed file"))
+    } else {
+        Ok(())
+    }
+}
+
+fn file_method_isatty(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("isatty() requires self"))?;
+    file_check_closed(self_obj)?;
+    let Some(fd) = file_get_fd(self_obj) else {
+        return Ok(w_bool_from(false));
+    };
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    {
+        return Ok(w_bool_from(unsafe { libc::isatty(fd) } != 0));
+    }
+    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+    {
+        let _ = fd;
+        Ok(w_bool_from(false))
+    }
 }
 
 /// The path-backed file object's buffered contents as raw bytes.  Binary and
@@ -9489,6 +9647,7 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     if args.is_empty() {
         return Err(crate::PyError::type_error("read() requires self"));
     }
+    file_check_closed(args[0])?;
     if let Some(fd) = file_get_fd(args[0]) {
         let n = args.get(1).and_then(|&o| unsafe {
             if pyre_object::is_int(o) {
@@ -9535,6 +9694,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if args.is_empty() {
         return Err(crate::PyError::type_error("readline() requires self"));
     }
+    file_check_closed(args[0])?;
     // Optional size cap (`readline(size)`): stop after `size` bytes even
     // before a newline. A missing or negative size means no cap.
     let max = args.get(1).and_then(|&o| unsafe {
@@ -9622,6 +9782,7 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if args.len() < 2 {
         return Err(crate::PyError::type_error("write() requires (self, data)"));
     }
+    file_check_closed(args[0])?;
     if let Some(fd) = file_get_fd(args[0]) {
         let bytes: Vec<u8> = unsafe {
             if pyre_object::is_str(args[1]) {
@@ -9712,6 +9873,15 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             // close reports an error, then surface that error (matching
             // _io.FileIO.close).
             let _ = crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true));
+            let closefd = crate::baseobjspace::getattr_str(args[0], "closefd")
+                .ok()
+                .map(|value| unsafe {
+                    !pyre_object::is_bool(value) || pyre_object::w_bool_get_value(value)
+                })
+                .unwrap_or(true);
+            if !closefd {
+                return Ok(w_none());
+            }
             #[cfg(all(
                 feature = "host_env",
                 not(target_arch = "wasm32"),
@@ -9735,6 +9905,7 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // If the file was opened in a writable mode, flush the in-memory
     // buffer to disk.
     file_flush_dirty(args[0])?;
+    crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true))?;
     Ok(w_none())
 }
 
@@ -9859,6 +10030,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let encoding_obj =
         resolve_pos_or_kw(open_pos.get(3).copied(), open_kwargs, "encoding", "open", 4)?;
     let errors_obj = resolve_pos_or_kw(open_pos.get(4).copied(), open_kwargs, "errors", "open", 5)?;
+    let opener_obj = resolve_pos_or_kw(open_pos.get(7).copied(), open_kwargs, "opener", "open", 8)?;
     let str_or_none =
         |obj: Option<PyObjectRef>, name: &str| -> Result<Option<String>, crate::PyError> {
             match obj {
@@ -9944,7 +10116,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // (e.g. `tempfile.NamedTemporaryFile` creates the temp file and records
     // its name in the opener). Call it with `(file, flags)` and wrap the
     // returned fd directly.
-    if let Some(opener) = kwarg_get(open_kwargs, "opener") {
+    if let Some(opener) = opener_obj {
         if !unsafe { pyre_object::is_none(opener) } {
             let flags = open_flags_for_mode(&mode);
             let fd_obj = crate::call::call_function_impl_result(
