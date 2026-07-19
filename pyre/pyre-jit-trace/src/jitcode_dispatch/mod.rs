@@ -991,9 +991,8 @@ pub enum DispatchOutcome {
     /// RPython parity: `pyjitpl.py:3002-3030 reached_loop_header` "found"
     /// branch → `compile_trace`/close-loop. The production driver maps
     /// this to `TraceAction::CloseLoopWithArgs { jump_args, loop_header_pc }`
-    /// (`lib.rs:145`); the trait-path counterpart is
-    /// `close_loop_args`'s `Ok(Some(live_args))`
-    /// (`opcode_handler_impls.rs` `close_loop_args`).
+    /// (`lib.rs:145`); the retired trait-path counterpart was
+    /// `close_loop_args`'s `Ok(Some(live_args))`.
     CloseLoop {
         jump_args: Vec<OpRef>,
         loop_header_pc: usize,
@@ -5156,10 +5155,10 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// through the call's OWN post-call `catch_exception` instead of the
     /// generic post-call fallthrough. The snapshot helper only acts on this
     /// when the call's CALL pc is directly covered by an enclosing
-    /// exception-table handler: it then folds the bit-14 after-residual-call
-    /// marker onto the CALL pc so a deopt resumes at the call's own catch —
-    /// the blackhole's `handle_exception_in_frame` routes the raise to the
-    /// enclosing handler instead of escaping the frame. Without this, a
+    /// exception-table handler: it then carries the CALL jitcode offset so a
+    /// deopt resumes at the call's own catch. The blackhole's
+    /// `handle_exception_in_frame` routes the raise to the enclosing handler
+    /// instead of escaping the frame. Without this, a
     /// residual resumes at the NEXT opcode, whose own catch receives only a
     /// raise from that opcode, not from the call itself; a residual whose CALL
     /// pc sits directly under a try (its fallthrough may leave the covered
@@ -11551,11 +11550,11 @@ fn dispatch_residual_call_iRd_kind(
                 // Request that this residual call's no-exception-guard resume
                 // route through the call's OWN post-call catch
                 // (`GuardCaptureScope::residual_call_catch_resume`).  The
-                // snapshot helper folds the marker only when the call's CALL pc
-                // is actually covered by the code's exception table (checked in
-                // `walker_capture_snapshot_for_last_guard_impl`); an uncovered
-                // residual keeps the generic fallthrough resume.  See the scope
-                // field's doc.
+                // snapshot helper carries the call's jitcode offset only when
+                // the CALL pc is actually covered by the code's exception table
+                // (checked in `walker_capture_snapshot_for_last_guard_impl`);
+                // an uncovered residual keeps the generic fallthrough resume.
+                // See the scope field's doc.
                 walker_capture_snapshot_for_last_guard_scoped(
                     ctx,
                     op.pc,
@@ -17534,8 +17533,8 @@ fn try_walker_specialize_compare_op_float(
     Ok(Some(()))
 }
 
-/// #62 LoadGlobal cell-cache fold — walker mirror of the trait LOAD_GLOBAL
-/// fast path (`opcode_handler_impls.rs` `load_global_value`).
+/// #62 LoadGlobal cell-cache fold — walker mirror of the retired trait
+/// LOAD_GLOBAL fast path.
 ///
 /// When `ns` is a `W_ModuleDictObject` still in `ModuleDictStrategy` mode
 /// whose slot for `name` holds a raw value or an `ObjectMutableCell`, emit
@@ -21279,9 +21278,8 @@ fn handle(
         }
         "jit_merge_point/cIRFIRF" => {
             // RPython parity: `pyjitpl.py:1530 opimpl_jit_merge_point` →
-            // `reached_loop_header` (`pyjitpl.py:2950-3036`). pyre's trait
-            // mirror is `close_loop_args`
-            // (`opcode_handler_impls.rs` `close_loop_args`).
+            // `reached_loop_header` (`pyjitpl.py:2950-3036`). pyre's retired
+            // trait mirror was `close_loop_args`.
             //
             // The JitCode merge point carries its greens + reds inline
             // (`blackhole.rs:1726 bhimpl_jit_merge_point` decodes the same
@@ -21613,8 +21611,8 @@ fn handle(
                 }
             }
 
-            // pyjitpl.py:3003-3007 compile_trace attempt (trait mirror
-            // `opcode_handler_impls.rs` `close_loop_args`): when the
+            // pyjitpl.py:3003-3007 compile_trace attempt (retired trait
+            // mirror `close_loop_args`): when the
             // crossed green key already has compiled targets and no
             // retrace is in progress, close the trace-so-far as a bridge
             // (guard origin) / entry bridge (interp origin,

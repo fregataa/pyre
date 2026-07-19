@@ -567,23 +567,6 @@ pub fn take_trace_abort_requested() -> bool {
     TRACE_ABORT_REQUESTED.with(|c| c.replace(false))
 }
 
-/// Request a trace abort and return a bit-14-encodable stand-in for a resume
-/// pc that does not fit the marker scheme (`>= AFTER_RESIDUAL_CALL_PC_FLAG`).
-///
-/// The bit-14 resume asserts (`trace_opcode.rs marker_aware_*_resume_pc`)
-/// document that an unencodable pc is meant to fall back to the interpreter
-/// via the recording loop's `catch_unwind` — but the pyre tracer runs its own
-/// `metainterp::interpret`, which has no such catch, so the bare assert
-/// crashed the process instead.  The cross-frame snapshot coordinate gap
-/// (#124/#130) can hand such a pc (e.g. one already carrying the marker bit
-/// from a corrupted cross-frame coordinate).  Requesting an abort discards the
-/// guard with the (pre-install) trace, so the clamped value is never decoded.
-pub fn abort_unencodable_resume_pc(pc: usize) -> usize {
-    let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
-    request_trace_abort();
-    pc & (flag - 1)
-}
-
 /// pyjitpl.py:2255 `MetaInterpStaticData.finish_setup` parity entry point.
 ///
 /// RPython runs `finish_setup` once per `MetaInterpStaticData` object. Pyre's
@@ -788,12 +771,12 @@ pub fn skip_python_trivia_forward_public(
 
 /// Translate a resume-frame pc word to a Python instruction coordinate.
 ///
-/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; per
-/// the `decode_resume_pc` contract it passes through so the caller's `pc < 0`
-/// screen rejects it (the internal metadata lookups below are bounds-checked and
-/// never index with the word, so no wrap results).
+/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; it
+/// passes through so the caller's `pc < 0` screen rejects it (the internal
+/// metadata lookups below are bounds-checked and never index with the word, so
+/// no wrap results).
 pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
-    let fallback = majit_ir::resumedata::decode_resume_pc(pc_word).0;
+    let fallback = pc_word;
     match python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
         .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
         .map(|(py_pc, _)| py_pc)
@@ -1468,28 +1451,8 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // usize would otherwise be a huge OOB index. No-op for offsets /
         // NO_JITCODE_PC (flip-off), so byte-identical when off.
         let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(payload, jitcode_pc);
-        // The rd_numb pc word may carry an after-residual-call marker;
-        // recover the plain Python PC for the py_pc-keyed liveness/depth
-        // tables (same decode as
-        // `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`).
-        //
-        // Coordinate note (#423): the Ref bank is decoded marker-aware (at the
-        // post-call jitcode pc via the carried `jitcode_pc`), but `pcdep_entries`
-        // / `stack_depth_at_pc` / `live_locals` here key by the marker-STRIPPED
-        // `real_pc` (= the CALL `orgpc` for an after-residual-call guard). The
-        // encode side (`get_list_of_active_boxes`) keys its pcdep by
-        // `live_pc = fallthrough_pc` (the post-call pc). For a kept operand-stack
-        // Ref below the call window the slot index and the (flat-base) color are
-        // identical at `orgpc` and `fallthrough_pc`, and the entries that DO
-        // differ (the call-window arg slots present only at the pre-call depth)
-        // sit above the post-call `valuestackdepth` and are clamped out by the
-        // `s >= semantic_prefix_len` bound in `setup_bridge_sym`, so the
-        // inversion agrees in practice (residual-call-in-try kept-Ref corpus is
-        // byte-exact gate-on vs gate-off on both backends). A confirmed trigger
-        // would be fixed by keying these three tables off the same post-call
-        // coordinate the Ref bank uses when the marker is set; that change is
-        // deferred to the symbolic-stack work (#423) since an unvalidated
-        // resume-coordinate flip can itself miscompile.
+        // The rd_numb pc word is already the published resume coordinate. Use
+        // it directly for the py_pc-keyed liveness/depth table fallback.
         //
         // When the carried `jitcode_pc` is set (kept-stack branch
         // guard), resolve the guard's Python PC from the jitcode coordinate
@@ -1527,18 +1490,12 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 payload.pcdep_for_jitcode_pc(jp),
             ) {
                 (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                _ => (
-                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
-                    Vec::new(),
-                ),
+                _ => (via_py_pc(pc as usize), Vec::new()),
             }
         } else {
             // A non-decodable carried coordinate falls back to the merge-target
             // PC so liveness and pcdep key the same point.
-            (
-                via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
-                Vec::new(),
-            )
+            (via_py_pc(pc as usize), Vec::new())
         };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
@@ -1555,18 +1512,14 @@ pub(crate) fn bridge_semantic_maps_from_pc(jitcode_index: i32, pc: i32) -> Bridg
     bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, pc, pc)
 }
 
-/// Per-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`) at the
-/// resume PC of a jitcode. The pcdep color map records live Variables only;
+/// Operand-stack Ref constants (`(semantic_slot, raw_ref)`) at the resume PC of
+/// a jitcode. The pcdep color map records live Variables only;
 /// `reconstruct_inline_recipe` uses this to refill the registerless constant
 /// slots an inlined-callee guard resume leaves empty after the color→slot
-/// inversion. When the carried `jitcode_pc` is set, sources the slots from the
-/// predecessor-keyed `const_ref_slots_by_jit_pc` twin so the constant lookup
-/// uses the same coordinate as `pcdep_entries` and the liveness decode.
-pub(crate) fn const_ref_slots_at_pc_at(
-    jitcode_index: i32,
-    pc: i32,
-    jitcode_pc: i32,
-) -> Vec<(u16, i64)> {
+/// inversion. Sources the slots from the predecessor-keyed
+/// `const_ref_slots_by_jit_pc` twin so the constant lookup uses the same
+/// coordinate as `pcdep_entries` and the liveness decode.
+pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> Vec<(u16, i64)> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -1577,40 +1530,25 @@ pub(crate) fn const_ref_slots_at_pc_at(
         // before the `>= 0` / offset uses below. No-op for offsets /
         // NO_JITCODE_PC (flip-off), so byte-identical when off.
         let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(&jc.payload, jitcode_pc);
-        let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+        if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
                 // gh#73 S3.2: source the const slots directly from the carried
                 // genuine `jitcode_pc` via the predecessor-keyed twin — the same
                 // decode-identity shape the pcdep/depth twins use at
                 // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
-                // returns `Some` (an empty slot list is a legitimate hit). A twin
-                // miss degrades to the merge-target PC (the same fallback the
-                // non-decodable path uses below) rather than the retired
-                // `python_pc_for_jitcode_pc` re-inversion; a skeleton / portal
-                // bridge has an empty `const_ref_slots_at_pc`, so both resolve to
-                // the same empty slot list.
+                // returns `Some` (an empty slot list is a legitimate hit).
                 if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
                     return slots;
                 }
-                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
-            } else {
-                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
             }
-        } else {
-            majit_ir::resumedata::decode_resume_pc(pc).0 as usize
-        };
-        jc.payload
-            .metadata
-            .const_ref_slots_at_pc
-            .get(real_pc)
-            .cloned()
-            .unwrap_or_default()
+        }
+        Vec::new()
     })
 }
 
 pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
-    const_ref_slots_at_pc_at(jitcode_index, pc, pc)
+    const_ref_slots_at_pc_at(jitcode_index, pc)
 }
 
 /// Return the post-regalloc Ref-bank colors of the portal red args
@@ -2531,11 +2469,6 @@ pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     boxed
 }
 
-/// pyjitpl.py:3514 find_biggest_function
-pub(crate) fn biggest_inline_trace_key(state: &mut MIFrame) -> Option<u64> {
-    state.with_ctx(|_, ctx| ctx.find_biggest_function())
-}
-
 pub(crate) fn note_root_trace_too_long(green_key: u64) {
     let (driver, _) = crate::driver::driver_pair();
     let warm_state = driver.meta_interp_mut().warm_state_mut();
@@ -2551,14 +2484,6 @@ pub(crate) fn note_root_trace_too_long(green_key: u64) {
 
 pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
-}
-
-pub(crate) fn ensure_boxed_for_ca(ctx: &mut TraceCtx, state: &MIFrame, value: OpRef) -> OpRef {
-    match state.value_type(value) {
-        Type::Int => wrapint(ctx, value),
-        Type::Float => wrapfloat(ctx, value),
-        Type::Ref | Type::Void => value,
-    }
 }
 
 pub(crate) fn box_value_for_python_helper(
@@ -9996,12 +9921,9 @@ mod tests {
     use crate::helpers::TraceHelperAccess;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
-    use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ConstantData, Instruction};
+    use pyre_interpreter::bytecode::{CodeObject, ConstantData, Instruction};
     use pyre_interpreter::pyopcode::decode_instruction_at;
-    use pyre_interpreter::{
-        LocalOpcodeHandler, Mode, OpcodeStepExecutor, PyErrorKind, SharedOpcodeHandler,
-        compile_exec, compile_source,
-    };
+    use pyre_interpreter::{Mode, compile_exec, compile_source};
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
@@ -10661,526 +10583,6 @@ mod tests {
         }));
     }
 
-    /// Seed `sym` with `slots` on the symbolic value stack (TOS last).
-    ///
-    /// Mirrors the invariant a real trace would carry into RERAISE:
-    /// `pyopcode.py:1361` reads `peekvalue(oparg)` and `:1364` does
-    /// `popvalue()`, both of which require the stack to be populated with
-    /// the saved lasti (when `oparg != 0`) and the exception object on
-    /// top.  Sets `concrete_stack`, `symbolic_stack_types`, `registers_r`,
-    /// and `valuestackdepth` in lockstep.
-    fn seed_stack(
-        ctx: &mut TraceCtx,
-        sym: &mut PyreSym,
-        slots: &[(OpRef, ConcreteValue, majit_ir::Type)],
-    ) {
-        sym.nlocals = 0;
-        sym.valuestackdepth = slots.len();
-        sym.concrete_stack = slots.iter().map(|(_, cv, _)| *cv).collect();
-        sym.symbolic_stack_types = slots.iter().map(|(_, _, t)| *t).collect();
-        sym.registers_r = slots.iter().map(|(op, _, _)| *op).collect();
-        // Tests don't exercise the vable shadow path; pop_value's
-        // `is_active_vable_owner` branch stays inactive.
-        sym.locals_cells_stack_array_ref = ctx.const_ref(0);
-    }
-
-    #[test]
-    fn test_reraise_reuses_last_exception_object() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
-        let exc_opref = ctx.const_ref(exc as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.last_exc_value = exc;
-        sym.last_exc_box = exc_opref;
-        // pyopcode.py:1353 — for `RERAISE 0`, stack is `[..., exc]`.
-        seed_stack(
-            &mut ctx,
-            &mut sym,
-            &[(exc_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref)],
-        );
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let err = OpcodeStepExecutor::reraise(&mut state, 0).expect_err("reraise should raise");
-        assert_eq!(err.to_exc_object(), exc);
-        // pyopcode.py:1363 — oparg==0 → reraise_lasti = -1.
-        assert_eq!(err.reraise_lasti, -1);
-        // pyopcode.py:1376 — RaiseWithExplicitTraceback → attach_tb=False.
-        assert!(!err.attach_tb);
-    }
-
-    #[test]
-    fn test_reraise_nonzero_oparg_threads_saved_lasti() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
-        let exc_opref = ctx.const_ref(exc as i64);
-        // pyopcode.py:165-170 lasti push synthesizes
-        // `space.newint(lasti_value)` — a fresh W_IntObject.
-        let saved_lasti_value: i64 = 42;
-        let saved_lasti_obj = pyre_object::w_int_new(saved_lasti_value);
-        let lasti_opref = ctx.const_ref(saved_lasti_obj as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.last_exc_value = exc;
-        sym.last_exc_box = exc_opref;
-        // pyopcode.py:1353 — for `RERAISE 1`, stack is `[..., lasti, exc]`.
-        seed_stack(
-            &mut ctx,
-            &mut sym,
-            &[
-                (
-                    lasti_opref,
-                    ConcreteValue::Ref(saved_lasti_obj),
-                    majit_ir::Type::Ref,
-                ),
-                (exc_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
-            ],
-        );
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
-        assert_eq!(err.to_exc_object(), exc);
-        // pyopcode.py:1361 — `reraise_lasti = self.space.int_w(self.peekvalue(oparg))`.
-        assert_eq!(err.reraise_lasti, saved_lasti_value as i32);
-        assert!(!err.attach_tb);
-    }
-
-    #[test]
-    fn test_reraise_nonconst_lasti_signals_abort_to_dispatcher() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
-        let exc_opref = ctx.const_ref(exc as i64);
-        // Non-Int slot at peek(oparg): an exception object stands in for
-        // any non-Int concrete value (a const-int box is the only shape
-        // the trace can fold at compile time).
-        let non_int_opref = ctx.const_ref(exc as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.last_exc_value = exc;
-        sym.last_exc_box = exc_opref;
-        seed_stack(
-            &mut ctx,
-            &mut sym,
-            &[
-                (non_int_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
-                (exc_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
-            ],
-        );
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
-        // Non-Int lasti slot → reraise_lasti < 0; dispatcher detects the
-        // combination `oparg != 0 && reraise_lasti < 0` and routes to
-        // TraceAction::Abort, letting the interpreter handle the rare
-        // non-const case via the concrete-frame fallback.
-        assert!(err.reraise_lasti < 0);
-    }
-
-    #[test]
-    fn test_raise_varargs_zero_reuses_last_exception_object() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.last_exc_value = exc;
-        sym.last_exc_box = ctx.const_ref(exc as i64);
-        pyre_interpreter::eval::set_current_exception(PY_NULL);
-        pyre_interpreter::eval::set_current_exception(exc);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let err =
-            OpcodeStepExecutor::raise_varargs(&mut state, 0).expect_err("bare raise should raise");
-        assert_eq!(err.to_exc_object(), exc);
-        pyre_interpreter::eval::set_current_exception(PY_NULL);
-    }
-
-    #[test]
-    fn test_raise_varargs_seeds_last_exception_box_for_finishframe_exception() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
-        let exc_ref = ctx.const_ref(exc as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(exc_ref, ConcreteValue::Ref(exc)),
-        )
-        .expect("push exception");
-
-        let err = OpcodeStepExecutor::raise_varargs(&mut state, 1)
-            .expect_err("explicit raise should raise");
-        assert_eq!(state.sym().last_exc_value, exc);
-        assert_eq!(state.sym().last_exc_box, exc_ref);
-        assert!(state.sym().class_of_last_exc_is_const);
-        assert_eq!(err.to_exc_object(), exc);
-    }
-
-    #[test]
-    fn test_raise_varargs_rejects_non_exception_values_like_interpreter() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let bad = pyre_object::w_int_new(7);
-        let bad_ref = ctx.const_ref(bad as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(bad_ref, ConcreteValue::Ref(bad)),
-        )
-        .expect("push invalid raise value");
-
-        let err = OpcodeStepExecutor::raise_varargs(&mut state, 1)
-            .expect_err("invalid raise should fail");
-        assert_eq!(err.kind, PyErrorKind::TypeError);
-        assert_eq!(err.message, "exceptions must derive from BaseException");
-        assert_eq!(state.sym().last_exc_value, PY_NULL);
-        assert_eq!(state.sym().last_exc_box, OpRef::NONE);
-    }
-
-    #[test]
-    fn test_raise_varargs_rejects_non_exception_types_like_interpreter() {
-        let code = compile_exec("x = int\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code);
-        frame
-            .execute_frame(None, None)
-            .expect("module body should execute");
-        let ty = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
-            .expect("namespace should contain x");
-
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let ty_ref = ctx.const_ref(ty as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(ty_ref, ConcreteValue::Ref(ty)),
-        )
-        .expect("push non-exception type");
-
-        let err =
-            OpcodeStepExecutor::raise_varargs(&mut state, 1).expect_err("raising int should fail");
-        assert_eq!(err.kind, PyErrorKind::TypeError);
-        assert_eq!(err.message, "exceptions must derive from BaseException");
-        assert_eq!(state.sym().last_exc_value, PY_NULL);
-        assert_eq!(state.sym().last_exc_box, OpRef::NONE);
-    }
-
-    #[test]
-    fn test_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
-        let code = compile_exec("x = len\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code);
-        frame
-            .execute_frame(None, None)
-            .expect("module body should execute");
-        let callable = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
-            .expect("namespace should contain x");
-
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let callable_ref = ctx.const_ref(callable as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(callable_ref, ConcreteValue::Ref(callable)),
-        )
-        .expect("push builtin callable");
-
-        let err =
-            OpcodeStepExecutor::raise_varargs(&mut state, 1).expect_err("raising len should fail");
-        assert_eq!(err.kind, PyErrorKind::TypeError);
-        assert_eq!(err.message, "exceptions must derive from BaseException");
-        assert_eq!(state.sym().last_exc_value, PY_NULL);
-        assert_eq!(state.sym().last_exc_box, OpRef::NONE);
-    }
-
-    #[test]
-    fn test_raise_varargs_sets_cause_like_interpreter() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
-        let cause = pyre_interpreter::PyError::value_error("root").to_exc_object();
-        let exc_ref = ctx.const_ref(exc as i64);
-        let cause_ref = ctx.const_ref(cause as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(exc_ref, ConcreteValue::Ref(exc)),
-        )
-        .expect("push exception");
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(cause_ref, ConcreteValue::Ref(cause)),
-        )
-        .expect("push cause");
-
-        let err =
-            OpcodeStepExecutor::raise_varargs(&mut state, 2).expect_err("raise from should raise");
-        assert_eq!(err.to_exc_object(), exc);
-        assert_eq!(
-            pyre_interpreter::getattr_str(exc, "__cause__").expect("read cause"),
-            cause
-        );
-    }
-
-    #[test]
-    fn test_raise_varargs_rejects_invalid_cause_like_interpreter() {
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
-        let cause = pyre_object::w_int_new(5);
-        let exc_ref = ctx.const_ref(exc as i64);
-        let cause_ref = ctx.const_ref(cause as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(exc_ref, ConcreteValue::Ref(exc)),
-        )
-        .expect("push exception");
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(cause_ref, ConcreteValue::Ref(cause)),
-        )
-        .expect("push invalid cause");
-
-        let err = OpcodeStepExecutor::raise_varargs(&mut state, 2)
-            .expect_err("invalid cause should fail");
-        assert_eq!(err.kind, PyErrorKind::TypeError);
-        assert_eq!(
-            err.message,
-            "exception cause must be None or derive from BaseException"
-        );
-        assert_eq!(state.sym().last_exc_value, PY_NULL);
-        assert_eq!(state.sym().last_exc_box, OpRef::NONE);
-    }
-
-    #[test]
-    fn test_push_exc_info_and_pop_except_preserve_symbolic_previous_exception() {
-        let code = compile_exec("try:\n    raise ValueError\nexcept Exception:\n    pass\n")
-            .expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code);
-        let prev_exc = pyre_interpreter::PyError::value_error("prev").to_exc_object();
-        let caught_exc = pyre_interpreter::PyError::runtime_error("caught").to_exc_object();
-
-        // get/set_current_exception read/write `(*ec).sys_exc_value` on the
-        // thread's current EC; production establishes it via
-        // `set_last_exec_ctx(frame.execution_context)` (eval.rs:841). Mirror
-        // that here so the save/restore round-trips like a real frame.  The
-        // prior ctx is restored on Drop so an assert failure mid-test still
-        // unwinds without leaking the frame's EC into sibling tests.
-        struct ExecCtxRestore(*const pyre_interpreter::PyExecutionContext);
-        impl Drop for ExecCtxRestore {
-            fn drop(&mut self) {
-                pyre_interpreter::call::set_last_exec_ctx(self.0);
-            }
-        }
-        let _saved_ctx = ExecCtxRestore(pyre_interpreter::call::take_last_exec_ctx());
-        pyre_interpreter::call::set_last_exec_ctx(frame.execution_context);
-
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let prev_exc_ref = ctx.const_ref(prev_exc as i64);
-        let caught_exc_ref = ctx.const_ref(caught_exc as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.current_exc_value = prev_exc;
-        sym.current_exc_box = prev_exc_ref;
-        pyre_interpreter::eval::set_current_exception(prev_exc);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        frame.push(caught_exc);
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(caught_exc_ref, ConcreteValue::Ref(caught_exc)),
-        )
-        .expect("push caught exception");
-
-        OpcodeStepExecutor::push_exc_info(&mut state).expect("push_exc_info should succeed");
-        assert_eq!(state.sym().current_exc_value, caught_exc);
-        assert_eq!(state.sym().current_exc_box, caught_exc_ref);
-
-        let pushed_exc = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
-            .expect("caught exception should remain on stack");
-        assert_eq!(pushed_exc.opref, caught_exc_ref);
-        let restored_prev = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
-            .expect("previous exception should be underneath the caught exception");
-        // push_exc_info emits `GetfieldGcR(ec)` on `ec.sys_exc_value`
-        // (pyopcode.py:786 runtime save-restore parity), so the previous-
-        // exception slot carries that op's OpRef and its concrete value is
-        // read back from the EC field — `prev_exc`, which the test seeded.
-        assert_ne!(restored_prev.opref, OpRef::NONE);
-        assert_eq!(restored_prev.concrete.to_pyobj(), prev_exc);
-
-        <MIFrame as SharedOpcodeHandler>::push_value(&mut state, restored_prev.clone())
-            .expect("restore previous exception for POP_EXCEPT");
-        OpcodeStepExecutor::pop_except(&mut state).expect("pop_except should succeed");
-        assert_eq!(state.sym().current_exc_value, prev_exc);
-        assert_eq!(state.sym().current_exc_box, restored_prev.opref);
-        assert_eq!(pyre_interpreter::eval::get_current_exception(), prev_exc);
-        pyre_interpreter::eval::set_current_exception(PY_NULL);
-    }
-
     #[test]
     fn test_trace_ob_type_descr_uses_immutable_header_field_descr() {
         let descr = crate::descr::ob_type_descr();
@@ -11543,63 +10945,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_method_accepts_plain_python_instance_method() {
-        install_test_hash_hook();
-        let code = compile_exec("class C:\n    def f(self):\n        return self\nc = C()\n")
-            .expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code.clone());
-        frame
-            .execute_frame(None, None)
-            .expect("class body should execute");
-        let instance = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "c") }
-            .expect("namespace should contain c");
-
-        install_test_jitcode(&code, frame.pycode);
-        let mut ctx = crate::trace_ctx_for_test(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.jitcode = jitcode_for(frame.pycode);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let instance_ref = ctx.const_ref(instance as i64);
-        <MIFrame as SharedOpcodeHandler>::push_value(
-            &mut state,
-            FrontendOp::new(instance_ref, ConcreteValue::Ref(instance)),
-        )
-        .expect("push instance");
-
-        state.load_method("f").expect("load_method should succeed");
-        let receiver = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
-            .expect("receiver should be present");
-        let callable = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
-            .expect("callable should be present");
-
-        // callmethod.py:66-68 fast path — a plain function found through the
-        // type, not shadowed by an instance attribute, is pushed unbound as
-        // `[w_descr, w_obj]`; the receiver slot carries the instance.
-        assert_eq!(receiver.concrete.to_pyobj(), instance);
-        unsafe {
-            assert!(pyre_interpreter::function::is_function(
-                callable.concrete.to_pyobj()
-            ));
-        }
-    }
-
-    #[test]
     fn test_init_symbolic_skips_heap_array_read_for_standard_virtualizable() {
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -11857,49 +11202,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
-                debug-only fallback was removed; needs a populated-jitcode harness."]
-    fn test_load_local_checked_value_respects_symbolic_local_type() {
-        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
-            let mut ctx = crate::trace_ctx_for_test(1);
-            // The slot type matches `symbolic_type` (resoperation.py:719/727/739
-            // InputArg{Int,Float,Ref}); Void has no inputarg variant in RPython.
-            let local = OpRef::input_arg_typed(0, symbolic_type);
-            let mut sym = PyreSym::new_uninit(OpRef::NONE);
-            sym.registers_r = vec![local];
-            sym.symbolic_local_types = vec![symbolic_type];
-            sym.nlocals = 1;
-
-            let mut state = MIFrame {
-                ctx: &mut ctx,
-                sym: &mut sym,
-                fallthrough_pc: 0,
-                parent_frames: Vec::new(),
-                pending_result_stack_idx: None,
-                pending_result_type: None,
-                pending_inline_frame: None,
-                residual_call_pc: None,
-                loop_close_marker_jit_pc: None,
-                orgpc: 0,
-                concrete_frame_addr: 0,
-                pre_opcode_registers_r: None,
-                pre_opcode_semantic_depth: None,
-            };
-
-            let loaded =
-                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
-                    .expect("local should load");
-            assert_eq!(loaded.opref, local);
-
-            let tree_loop = ctx.into_tree_loop();
-            assert_eq!(tree_loop.ops.last().map(|op| op.opcode), expected_guard);
-        };
-
-        run_case(Type::Int, "j", None);
-        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
-    }
-
-    #[test]
     fn test_store_local_value_preserves_ref_slot_without_reboxing() {
         // RPython Box.type parity: `_opimpl_setarrayitem_vable`
         // (pyjitpl.py:1242-1247) writes the value's Ref box directly —
@@ -11949,72 +11251,6 @@ mod tests {
             "Ref value must be stored as-is, not reboxed",
         );
         assert_eq!(state.sym().symbolic_local_types[0], Type::Ref);
-    }
-
-    #[test]
-    fn test_trace_binary_value_boxes_typed_raw_operands_for_python_helper() {
-        let code = compile_exec("x = 1.0 ** 2").expect("test code should compile");
-        let code_ref =
-            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
-                as *const ();
-        install_test_jitcode(&code, code_ref);
-        let mut ctx = crate::trace_ctx_for_test(2);
-        let lhs = OpRef::input_arg_float(0);
-        let rhs = OpRef::input_arg_int(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.jitcode = jitcode_for(code_ref);
-        sym.registers_r = vec![lhs, rhs];
-        sym.symbolic_local_types = vec![Type::Float, Type::Int];
-        sym.nlocals = 2;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let _ = <MIFrame as TraceHelperAccess>::trace_binary_value(
-            &mut state,
-            lhs,
-            rhs,
-            BinaryOperator::Power,
-        )
-        .expect("generic helper call should box raw operands first");
-
-        let recorder = ctx.into_recorder();
-        // GuardNotForced (pyjitpl.py:2079) + GuardNoException (pyjitpl.py:2082)
-        // follow the residual may-force Call*, so look up the Call* op
-        // explicitly rather than via `ops().last()`.
-        let call = recorder
-            .ops()
-            .iter()
-            .rev()
-            .find(|op| {
-                matches!(
-                    op.opcode,
-                    OpCode::CallI
-                        | OpCode::CallR
-                        | OpCode::CallF
-                        | OpCode::CallN
-                        | OpCode::CallMayForceI
-                        | OpCode::CallMayForceR
-                        | OpCode::CallMayForceF
-                        | OpCode::CallMayForceN
-                )
-            })
-            .expect("call op should be present");
-        assert_ne!(call.arg(0).to_opref(), lhs);
-        assert_ne!(call.arg(1).to_opref(), rhs);
     }
 
     #[test]
@@ -12540,7 +11776,6 @@ mod tests {
                 built_as_portal: true,
                 stack_base: 1,
                 max_stackdepth: 0,
-                const_ref_slots_at_pc: Vec::new(),
                 const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: true,
             },
@@ -12734,7 +11969,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
 
         assert_eq!(jump_args.len(), 11);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -12848,7 +12083,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
 
         assert_eq!(
             jump_args.len(),

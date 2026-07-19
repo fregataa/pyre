@@ -1042,7 +1042,7 @@ fn derive_pc_live_indices_from_sparse(
 /// Per-`py_pc` pre-merge index of the post-`residual_call` `-live-` that
 /// immediately precedes a `catch_exception`, derived from a SPLICED
 /// (canonical) SSARepr.  These after-residual-call resume anchors feed the
-/// runtime's post-call catch-marker twin (the bit-14 flagged resume path once
+/// runtime's post-call catch-marker twin once
 /// `compute_liveness_with_pc_anchors` remaps them (`liveness.rs:78-81`) into
 /// the spliced bytes.  For each `catch_exception`, the bare `-live-` directly
 /// before it is the anchor, keyed to the canraise opcode that owns the call
@@ -13481,7 +13481,6 @@ impl CodeWriter {
             built_as_portal: true,
             stack_base: frame_stack_base,
             max_stackdepth: code.max_stackdepth as usize,
-            const_ref_slots_at_pc,
             const_ref_slots_by_jit_pc,
             is_drained: true,
         };
