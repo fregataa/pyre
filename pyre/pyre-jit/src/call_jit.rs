@@ -4264,18 +4264,32 @@ bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 /// execution context's top frame (`space.getexecutioncontext()
 /// .gettopframe()`), matching the upstream frame-less ABI.
 fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyObjectRef]) -> i64 {
+    // RPython's blackhole residual-call thunk is itself translated, so its
+    // incoming GCREF arguments are shadowstack roots for the whole helper
+    // call.  This Rust ABI boundary is outside that transform: the backend
+    // gcmap keeps the caller objects alive, but a moving collection cannot
+    // rewrite these copied native parameters.  Root them immediately and
+    // dispatch only values reloaded from the forwarded slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    pyre_object::gc_roots::pin_root(null_or_self);
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
     // eval.rs:3216-3226 — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
     // as `callable(null_or_self, *args)`.
-    let full_args;
-    let args = if null_or_self.is_null() {
-        args
-    } else {
-        let mut v = Vec::with_capacity(1 + args.len());
-        v.push(null_or_self);
-        v.extend_from_slice(args);
-        full_args = v;
-        &full_args
+    let reload_args = || {
+        let null_or_self = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let mut values = Vec::with_capacity(args.len() + usize::from(!null_or_self.is_null()));
+        if !null_or_self.is_null() {
+            values.push(null_or_self);
+        }
+        values.extend(
+            (0..args.len()).map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i)),
+        );
+        values
     };
     // `space.getexecutioncontext()` (call.rs:198 → TLS-pinned EC the eval
     // loop stamps on entry) `.gettopframe()` is the active caller frame —
@@ -4295,7 +4309,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
          getexecutioncontext().gettopframe(); the eval loop must pin the \
          execution context before any residual call"
     );
-    if callable.is_null() {
+    if pyre_object::gc_roots::shadow_stack_get(root_base).is_null() {
         let err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
             "call on null callable".to_string(),
@@ -4310,12 +4324,14 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // Cold path: type/method/staticmethod/classmethod/callable-instance are
     // delegated to call_function_impl_result under ForcePlainEvalGuard, which
     // mirrors baseobjspace.py:1155 dispatch without re-entering the JIT.
+    let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
     if unsafe { is_function(callable) } {
         let code = unsafe { pyre_interpreter::getcode(callable) };
         if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
             let func =
                 unsafe { pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef) };
-            return match func(args) {
+            let call_args = reload_args();
+            return match func(&call_args) {
                 Ok(result) if !result.is_null() => result as i64,
                 Ok(_) => 0,
                 Err(err) => {
@@ -4324,7 +4340,9 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
                 }
             };
         }
-        if let Some(result) = bh_call_self_recursive_portal(parent_frame_ptr, callable, args) {
+        let call_args = reload_args();
+        if let Some(result) = bh_call_self_recursive_portal(parent_frame_ptr, callable, &call_args)
+        {
             return result;
         }
         let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
@@ -4342,7 +4360,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             // the portal runner, so nested Python CALLs from this residual
             // path must stay on eval_frame_plain as well.
             let _plain_guard = pyre_interpreter::call::force_plain_eval();
-            pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args)
+            pyre_interpreter::call::call_user_function_plain(parent_frame, callable, &call_args)
         };
         pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
         return match result {
@@ -4367,7 +4385,9 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         }
     }
     let _plain_guard = pyre_interpreter::call::force_plain_eval();
-    let result = pyre_interpreter::call::call_function_impl_result(callable, args);
+    let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let call_args = reload_args();
+    let result = pyre_interpreter::call::call_function_impl_result(callable, &call_args);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,

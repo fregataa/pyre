@@ -10392,6 +10392,8 @@ fn reconcile_vstack_at_boundary(
         ctx.vstack_reorder_ceiling = prev_pypc as u32;
     }
     let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
+    let (fallthrough_depth, branch_depth) =
+        crate::liveness::stack_effects(&instr, op_arg, ctx.vstack_depth);
     if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
         eprintln!(
             "[vstack-reconcile] prev_pypc={prev_pypc} new_pypc={new_pypc} \
@@ -10400,6 +10402,20 @@ fn reconcile_vstack_at_boundary(
             ctx.vstack_depth, ctx.vstack_last_ref
         );
     }
+    // A JitCode's block layout can visit source-PC floor segments out of
+    // Python bytecode order.  In that case `vstack_cur_pypc` is only the
+    // preceding layout segment, not the opcode whose stack effect produced
+    // this boundary.  Applying its effect is unsound: a LOAD_FAST segment
+    // whose expected depth is `d + 1` can otherwise overwrite a surviving
+    // FOR_ITER iterator when the observed depth stayed at `d`.
+    //
+    // RPython reads the live MIFrame registers and never reconstructs this
+    // transition from source PCs.  Preserve the slots that demonstrably
+    // survive at the observed depth whenever neither real successor depth
+    // matches; holes remain conservative and are handled by the shadow fill
+    // below.
+    let layout_only_boundary = new_depth != fallthrough_depth && new_depth != branch_depth;
+
     // PER-OP RECONCILE.  In the SEQUENTIAL case the previous opcode's stack
     // effect explains the depth change: a producer (`ResultToTos`) lands its
     // result box (`vstack_last_ref`) on the new TOS; a pop / side-store just
@@ -10415,6 +10431,17 @@ fn reconcile_vstack_at_boundary(
         class
     };
     match effective_class {
+        // A layout-only boundary (the observed depth matches neither real
+        // successor of the previous opcode) means the per-op effect cannot
+        // explain this transition; preserve the surviving slots instead of
+        // replaying a stale effect.  The reorder region is already served by
+        // the `ShadowReseed` arm, so exclude it here.
+        _ if layout_only_boundary && !in_reorder_region => {
+            ctx.vstack_boxes.truncate(new_depth);
+            if ctx.vstack_boxes.len() < new_depth {
+                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            }
+        }
         VstackOpClass::ResultToTos => {
             ctx.vstack_boxes.truncate(new_depth);
             if ctx.vstack_boxes.len() < new_depth {

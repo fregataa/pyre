@@ -5145,27 +5145,47 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     if dict.is_null() {
         return Ok(());
     }
-    let other_raw = resolve_dict_backing(w_data);
+    // RPython's shadowstack transform keeps both operands live across
+    // `keys`, iteration, `__getitem__`, hashing, and equality calls.  Those
+    // are arbitrary Python collection points; without the explicit roots an
+    // otherwise-unreachable destination dict can be swept while this Rust
+    // frame still holds its raw pointer.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(dict);
+    pyre_object::gc_roots::pin_root(w_data);
+    let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     unsafe {
-        let fast_path_eligible = other_raw.is_null() == false
-            && pyre_object::is_dict(other_raw)
-            && dict_subclass_uses_default_iter(w_data);
+        let fast_path_eligible = !resolve_dict_backing(data()).is_null()
+            && pyre_object::is_dict(resolve_dict_backing(data()))
+            && dict_subclass_uses_default_iter(data());
         if fast_path_eligible {
             // `dictmultiobject.py:1401-1406 update1_dict_dict`
-            let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict);
+            let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict());
             if dst_is_empty {
-                let w_copy = pyre_object::dictmultiobject::w_dict_copy(other_raw);
+                let w_copy =
+                    pyre_object::dictmultiobject::w_dict_copy(resolve_dict_backing(data()));
                 pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
-                    dict, w_copy,
+                    dict(),
+                    w_copy,
                 );
             } else {
-                for (k, v) in pyre_object::w_dict_items(other_raw) {
-                    dict_store_checked(dict, k, v)?;
+                let items = pyre_object::w_dict_items(resolve_dict_backing(data()));
+                let item_base = pyre_object::gc_roots::shadow_stack_len();
+                for &(k, v) in &items {
+                    pyre_object::gc_roots::pin_root(k);
+                    pyre_object::gc_roots::pin_root(v);
+                }
+                for i in 0..items.len() {
+                    let k = pyre_object::gc_roots::shadow_stack_get(item_base + i * 2);
+                    let v = pyre_object::gc_roots::shadow_stack_get(item_base + i * 2 + 1);
+                    dict_store_checked(dict(), k, v)?;
                 }
             }
         } else {
             // `dictmultiobject.py:1388-1398 update1`
-            let w_keys_method = match crate::baseobjspace::getattr_str(w_data, "keys") {
+            let w_keys_method = match crate::baseobjspace::getattr_str(data(), "keys") {
                 Ok(value) => Some(value),
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
                 Err(e) => return Err(e),
@@ -5174,14 +5194,28 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 // `dictmultiobject.py:1421-1424 update1_keys`
                 let w_keys_view = crate::call::call_function_impl_result(w_method, &[])?;
                 let keys = crate::builtins::collect_iterable(w_keys_view)?;
-                for k in keys {
-                    let v = crate::baseobjspace::getitem(w_data, k)?;
-                    dict_store_checked(dict, k, v)?;
+                let keys_base = pyre_object::gc_roots::shadow_stack_len();
+                for &key in &keys {
+                    pyre_object::gc_roots::pin_root(key);
+                }
+                for i in 0..keys.len() {
+                    let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+                    let v = crate::baseobjspace::getitem(data(), k)?;
+                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(v);
+                    let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+                    let v = pyre_object::gc_roots::shadow_stack_get(value_slot);
+                    dict_store_checked(dict(), k, v)?;
                 }
             } else {
                 // `dictmultiobject.py:1410-1418 update1_pairs`
-                let pairs = crate::builtins::collect_iterable(w_data)?;
-                for (idx, pair) in pairs.into_iter().enumerate() {
+                let pairs = crate::builtins::collect_iterable(data())?;
+                let pairs_base = pyre_object::gc_roots::shadow_stack_len();
+                for &pair in &pairs {
+                    pyre_object::gc_roots::pin_root(pair);
+                }
+                for idx in 0..pairs.len() {
+                    let pair = pyre_object::gc_roots::shadow_stack_get(pairs_base + idx);
                     let entries = crate::builtins::collect_iterable(pair)?;
                     if entries.len() != 2 {
                         return Err(crate::PyError::value_error(format!(
@@ -5189,7 +5223,12 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                             entries.len()
                         )));
                     }
-                    dict_store_checked(dict, entries[0], entries[1])?;
+                    let entry_base = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(entries[0]);
+                    pyre_object::gc_roots::pin_root(entries[1]);
+                    let k = pyre_object::gc_roots::shadow_stack_get(entry_base);
+                    let v = pyre_object::gc_roots::shadow_stack_get(entry_base + 1);
+                    dict_store_checked(dict(), k, v)?;
                 }
             }
         }
@@ -5209,19 +5248,33 @@ pub fn dict_init_or_update(
     args: &[PyObjectRef],
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "update")?;
-    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(args);
+    // `dictmultiobject.py:1430 init_or_update` receives an `Arguments`
+    // object whose `arguments_w` entries are roots in translated RPython.
+    // Keep the flat Rust ABI's equivalent slots live before inspecting the
+    // trailing kwargs vehicle or passing an operand to `update1`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let rooted_args = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
+        .collect::<Vec<_>>();
+    require_receiver(&rooted_args, "update")?;
+    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&rooted_args);
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected at most 1 argument, got {}",
             positional.len() - 1
         )));
     }
-    let dict = positional[0];
-    if let Some(other) = positional.get(1).copied() {
-        dict_update1(dict, other)?;
+    if positional.len() > 1 {
+        dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        )?;
     }
-    let backing = resolve_dict_backing(dict);
+    let backing = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(root_base));
     if backing.is_null() {
         // A dict subclass declared with `__slots__` has no attribute storage
         // for its item backing (pyre keeps a dict subclass's items in an
@@ -5229,7 +5282,8 @@ pub fn dict_init_or_update(
         // slotted-dict-subclass support needs intrinsic dict backing.
         return Ok(w_none());
     }
-    if let Some(kwargs) = kwargs_dict {
+    if kwargs_dict.is_some() {
+        let kwargs = pyre_object::gc_roots::shadow_stack_get(root_base + args.len() - 1);
         unsafe {
             for (k, v) in pyre_object::w_dict_items(kwargs) {
                 if pyre_object::is_str(k)
