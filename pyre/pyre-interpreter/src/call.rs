@@ -84,6 +84,26 @@ pub fn clear_call_error() {
     });
 }
 
+/// Root the deferred call error stashed in `PENDING_CALL_ERROR`. Its `PyError`
+/// holds up to three GC-managed references — the cached exception object and
+/// the lazy NameError/AttributeError name/obj context — none reached by the
+/// precise collector through the raw `RefCell`. Forward each non-null slot in
+/// place; the context slots may hold movable str/obj, so the store-back the
+/// visitor performs matters. Never materialise the lazy-null `exc_object`.
+/// The `PyErrorKind` enum carries no object payload (all unit variants), so
+/// these three fields are the complete set of GC refs a `PyError` holds.
+pub fn walk_pending_call_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    PENDING_CALL_ERROR.with(|slot| {
+        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
+        // holds the only reference for its duration and does not re-borrow the
+        // cell, so no borrow-flag conflict with a walker-triggered path.
+        let opt = unsafe { &mut *slot.as_ptr() };
+        if let Some(err) = opt.as_mut() {
+            err.walk_gc_refs(visitor);
+        }
+    });
+}
+
 /// Cold debug flag probe for `call_function_impl_raw`. This is a
 /// `dont_look_inside` scalar wrapper so the two-phase rtyper sees a plain
 /// bool residual instead of `std::env::var`'s `Result<String, VarError>` ABI.

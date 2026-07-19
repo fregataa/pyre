@@ -364,6 +364,28 @@ pub struct PyError {
     pub w_obj_context: PyObjectRef,
 }
 
+impl PyError {
+    /// Forward the up-to-three GC-managed references a `PyError` holds — the
+    /// cached exception object and the lazy NameError/AttributeError name/obj
+    /// context — to a root-walk visitor. The precise collector does not reach
+    /// these through the Rust struct, so any `PyError` parked in a TLS slot
+    /// across a collection must be walked through here. Each non-null slot is
+    /// forwarded BY ADDRESS so the visitor relocates a moved child in place;
+    /// the lazy-null `exc_object` is never materialised. `PyErrorKind` carries
+    /// no object payload, so these three fields are the complete GC-ref set.
+    pub fn walk_gc_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        let mut forward = |r: &mut PyObjectRef| {
+            if !r.is_null() {
+                // SAFETY: `PyObjectRef` and `GcRef` are layout-compatible.
+                unsafe { visitor(&mut *(r as *mut PyObjectRef as *mut majit_ir::GcRef)) };
+            }
+        };
+        forward(&mut self.exc_object);
+        forward(&mut self.w_name_context);
+        forward(&mut self.w_obj_context);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PyErrorKind {
     TypeError,
@@ -685,7 +707,24 @@ impl PyError {
         if !self.exc_object.is_null() {
             return self.exc_object;
         }
+        // Root the deferred name/obj context references across the exception
+        // allocation below: they live only in this Rust `PyError`, which the
+        // precise collector does not scan, so a collection inside
+        // `w_exception_new` could sweep them before they are stamped onto `exc`
+        // at the `set_name` / `set_attr_obj` calls.
+        let _roots = pyre_object::gc_roots::push_roots();
+        if !self.w_name_context.is_null() {
+            pyre_object::gc_roots::pin_root(self.w_name_context);
+        }
+        if !self.w_obj_context.is_null() {
+            pyre_object::gc_roots::pin_root(self.w_obj_context);
+        }
         let exc = w_exception_new(self.to_exc_kind(), &self.message);
+        // Root the fresh managed exception across the message/context stamping
+        // below: `exc` lives only in this Rust local while `w_list_new` (and the
+        // setters) run, so a collection there could sweep the unrooted
+        // (non-moving oldgen) exception before it is written through.
+        pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg = pyre_object::w_str_new(&self.message);
             let args_list = pyre_object::w_list_new(vec![msg]);

@@ -114,6 +114,24 @@ pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
     LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
+/// Root the exception parked in `LAST_CA_EXCEPTION` across the call-assembler
+/// FFI boundary. Compiled code runs between `set_pending_ca_exception` and
+/// `take_ca_exception` — it can drive a major collection and can overwrite the
+/// single in-flight-exception cell with a later raise — so the parked
+/// `PyError`'s GC refs must be forwarded here or the stashed exception is swept
+/// before it surfaces. Never materialises the lazy-null `exc_object`.
+pub fn walk_last_ca_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    LAST_CA_EXCEPTION.with(|c| {
+        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
+        // holds the only reference for its duration and does not re-borrow the
+        // cell, so no borrow-flag conflict with a walker-triggered path.
+        let opt = unsafe { &mut *c.as_ptr() };
+        if let Some(err) = opt.as_mut() {
+            err.walk_gc_refs(visitor);
+        }
+    });
+}
+
 /// Park a Python exception that needs to surface across an FFI boundary
 /// (callback emitted by compiled code → here → eventually picked up by
 /// `take_ca_exception` in the eval loop).
@@ -530,7 +548,7 @@ extern "C" fn jit_call_user_function_from_frame(
             // PyError through a side channel — that would let the
             // interpreter-side eval loop surface it before the guard
             // machinery sees it, bypassing try/except.
-            let exc_obj = err.exc_object;
+            let exc_obj = err.to_exc_object();
             if exc_obj != pyre_object::PY_NULL {
                 store_jit_exception(exc_obj as i64);
             }
@@ -572,6 +590,11 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
 /// cells (`jit_exc_raise`).  Writing only `BH_LAST_EXC_VALUE` leaves
 /// `GUARD_NO_EXCEPTION` reading a stale 0, so the guard wrongly passes and the
 /// helper's NULL result flows to the consumer — keep both states in sync.
+///
+/// Both cells this writes — `BH_LAST_EXC_VALUE` and the backend `JIT_EXC_VALUE`
+/// (via `store_jit_exception`) — are GC-rooted by their respective extra-root
+/// walkers (`walk_bh_last_exception`, `walk_jit_exc_value`), so this writer
+/// needs no rooting of its own.
 fn publish_residual_call_exception(exc_obj: i64) {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
     store_jit_exception(exc_obj);
@@ -837,7 +860,8 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     match crate::eval::portal_runner_result(frame) {
         Ok(result) => result as i64,
         Err(err) => {
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.exc_object as i64));
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                .with(|c| c.set(err.to_exc_object() as i64));
             pyre_object::PY_NULL as i64
         }
     }
@@ -1527,7 +1551,7 @@ fn jit_blackhole_resume_from_guard(
         return match crate::eval::portal_runner_result(frame) {
             Ok(result) => Some(result as i64),
             Err(err) => {
-                let exc_obj = err.exc_object;
+                let exc_obj = err.to_exc_object();
                 if exc_obj != pyre_object::PY_NULL {
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
                     store_jit_exception(exc_obj as i64);
@@ -2288,7 +2312,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] ExitFrameWithExceptionRef → raise");
             }
-            let exc_obj = err.exc_object;
+            let exc_obj = err.to_exc_object();
             if exc_obj != pyre_object::PY_NULL {
                 // Symmetric with the regular-exception fall-through
                 // below (line 2120-2122) and with `lib.rs::jit_exc_raise`
@@ -2350,7 +2374,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             match crate::eval::portal_runner_result(frame) {
                 Ok(result) => Some(result as i64),
                 Err(err) => {
-                    let exc_obj = err.exc_object;
+                    let exc_obj = err.to_exc_object();
                     if exc_obj != pyre_object::PY_NULL {
                         majit_metainterp::blackhole::BH_LAST_EXC_VALUE
                             .with(|c| c.set(exc_obj as i64));

@@ -2566,11 +2566,63 @@ fn install_gc_into_backend() {
     majit_backend_dynasm::runner::install_gc_standalone();
 }
 
+/// Non-destructive read of the active backend's `JIT_EXC_VALUE` cell for the
+/// GC root walker. Mirrors `install_gc_into_backend`'s backend-selection cfg
+/// (cranelift wins over dynasm when both features are on; wasm on wasm32).
+#[cfg(target_arch = "wasm32")]
+fn jit_exc_value_peek_backend() -> i64 {
+    majit_backend_wasm::jit_exc_value_peek()
+}
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+fn jit_exc_value_peek_backend() -> i64 {
+    majit_backend_cranelift::jit_exc_value_peek()
+}
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
+fn jit_exc_value_peek_backend() -> i64 {
+    majit_backend_dynasm::jit_exc_value_peek()
+}
+#[cfg(not(any(target_arch = "wasm32", feature = "cranelift", feature = "dynasm")))]
+fn jit_exc_value_peek_backend() -> i64 {
+    0
+}
+
+/// Root the pending compiled-trace raise held in the backend `JIT_EXC_VALUE`
+/// cell. A can-raise helper publishes the exception's raw pointer there
+/// (`store_jit_exception` / `publish_residual_call_exception`); between that
+/// store and the `GuardNoException` / bridge that drains it, the exception is
+/// reachable only through this raw `i64` static, invisible to the precise
+/// collector.
+fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let exc = jit_exc_value_peek_backend();
+    if exc == 0 {
+        return;
+    }
+    // A GC-managed exception (post-#18) marked here has its registered child
+    // offsets traced by the collector; the exception is oldgen-stable so a
+    // bare mark suffices. (The off-GC child-walk fallback is intentionally
+    // omitted — it only matters with no collector installed, and reaching the
+    // private `walk_raw_exception_roots` from this crate is unnecessary.)
+    let mut gcref = majit_ir::GcRef(exc as usize);
+    visitor(&mut gcref);
+}
+
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
 /// mapdict side table, etc.).  Called on first eval entry, after the
 /// interpreter is initialized.
 fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_pyframe_root_walker();
+    majit_gc::shadow_stack::register_extra_root_walker(walk_jit_exc_value);
+    // Stored `PyError` carriers whose GC refs the precise collector cannot
+    // reach through their raw TLS cells: the call-assembler FFI stash and the
+    // no-handler trace→portal stash. Mirrors `walk_pending_call_error`.
+    majit_gc::shadow_stack::register_extra_root_walker(crate::call_jit::walk_last_ca_exception);
+    majit_gc::shadow_stack::register_extra_root_walker(
+        pyre_jit_trace::trace::walk_walk_end_propagated_exception,
+    );
 }
 
 fn register_thread_root_areas() {
@@ -4725,7 +4777,7 @@ pub(crate) fn pyre_portal_runner(
     match portal_runner_result(frame) {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
         Err(err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
-            err.exc_object as usize,
+            err.to_exc_object() as usize,
         ))),
     }
 }
@@ -4828,7 +4880,7 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     match portal_runner_result(frame) {
         Ok(r) => r,
         Err(err) => {
-            crate::call_jit::store_jit_exception(err.exc_object as i64);
+            crate::call_jit::store_jit_exception(err.to_exc_object() as i64);
             pyre_object::PY_NULL
         }
     }
