@@ -39,10 +39,10 @@ mod reexports {
         expr_has_loop_control, extract_block_tail_int, extract_bool_branch_values,
         extract_branch_int, extract_pat_literals, extract_pat_switch_case_tokens,
         extract_pat_value_tokens, extract_stmts, inline_builder_path, inline_call_tokens,
-        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
-        inline_ref_arg_tokens, int_arg_regs, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop, stmt_has_loop_control,
-        typed_call_arg_tokens,
+        inline_call_tokens_void, inline_float_arg_tokens, inline_int_arg_tokens,
+        inline_prebuild_path, inline_ref_arg_tokens, int_arg_regs, is_supported_float_type,
+        is_supported_int_cast, is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop,
+        stmt_has_loop_control, typed_call_arg_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -294,6 +294,7 @@ pub(crate) enum InlineReturnKind {
     Int,
     Ref,
     Float,
+    Void,
 }
 
 #[derive(Clone)]
@@ -482,6 +483,7 @@ pub(super) fn call_policy_effect_slot(
         | K::InlineInt
         | K::InlineRef
         | K::InlineFloat
+        | K::InlineVoid
         | K::InlinePipelineInt
         | K::InlinePipelineRef
         | K::InlinePipelineFloat
@@ -498,7 +500,9 @@ pub(super) fn call_policy_effect_slot(
 /// can-raise classification decides.  MayForce / ReleaseGil have no
 /// conditional-call slot but force / may raise, so they keep the marker.
 pub(super) fn explicit_call_emits_post_live(kind: crate::jit_interp::CallPolicyKind) -> bool {
-    if binding_kind_for_inline_policy(kind).is_some() {
+    if binding_kind_for_inline_policy(kind).is_some()
+        || matches!(kind, crate::jit_interp::CallPolicyKind::InlineVoid)
+    {
         return false;
     }
     if matches!(kind, crate::jit_interp::CallPolicyKind::ConcreteOnlyVoid) {
@@ -524,6 +528,7 @@ pub(super) fn call_policy_result_kind(
         | K::ReleaseGilVoidWrapped
         | K::LoopInvariantVoid
         | K::LoopInvariantVoidWrapped
+        | K::InlineVoid
         | K::ConcreteOnlyVoid => Some(CallResultKind::Void),
 
         K::ResidualInt
@@ -815,6 +820,70 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
 }
 
 impl LowererConfig {
+    pub fn inline_helper(
+        ref_fields: &[crate::jit_interp::RefFieldEntry],
+        native_int_binops: &[(syn::Path, syn::Ident)],
+        native_tag_small: &[syn::Path],
+        headerless_structs: &[syn::Path],
+    ) -> Self {
+        let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
+            .iter()
+            .map(|entry| {
+                let struct_name = entry
+                    .struct_type
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let key = format!("{}::{}", struct_name, entry.field);
+                (
+                    key,
+                    (
+                        entry.struct_type.clone(),
+                        entry.field.clone(),
+                        entry.pointee_type.clone(),
+                    ),
+                )
+            })
+            .collect();
+        Self {
+            io_shims: Vec::new(),
+            calls: Vec::new(),
+            auto_calls: false,
+            vable_var: None,
+            vable_input_ref_reg: None,
+            vable_fields: HashMap::new(),
+            vable_arrays: HashMap::new(),
+            state_scalars: HashMap::new(),
+            state_arrays: HashMap::new(),
+            state_virt_arrays: HashMap::new(),
+            state_ref_scalars: HashMap::new(),
+            greens: Vec::new(),
+            green_type_tags: Vec::new(),
+            reds: Vec::new(),
+            state_type_name: String::new(),
+            env_type_name: String::new(),
+            residual_writes: Vec::new(),
+            pool_arrays: Vec::new(),
+            ref_fields: ref_fields_map,
+            call_returns: HashMap::new(),
+            headerless_structs: headerless_structs
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
+            native_int_binops: native_int_binops
+                .iter()
+                .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
+                .collect(),
+            native_tag_small: native_tag_small
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
+            split_dispatch: false,
+            switch_dispatch: false,
+        }
+    }
+
     pub fn new(
         io_shims: &[(Path, Ident)],
         calls: &[crate::jit_interp::CallEntry],
@@ -2382,6 +2451,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2401,6 +2475,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2420,6 +2499,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");

@@ -1028,6 +1028,21 @@ where
         resume_pc: usize,
         after_residual_call: bool,
     ) -> OpRef {
+        // pyjitpl.py:2582-2584 generate_guard parity:
+        //     if isinstance(box, Const):    # no need for a guard
+        //         return
+        // The first arg of every DATA guard (GuardTrue/False, GuardValue,
+        // GuardClass, ...) is the box being checked; box-less guards pass
+        // args=&[] (gate is a no-op). GuardException is the extraarg-only guard
+        // (RPython records it with box=None) -- its args[0] is the exception-class
+        // Const, not a checked box, so the gate must NOT apply to it.
+        if opcode != OpCode::GuardException {
+            if let Some(&first) = args.first() {
+                if first.is_constant() {
+                    return first;
+                }
+            }
+        }
         if let Some(fail_args) = sym.fail_args_with_ctx(ctx) {
             let fail_types = sym.fail_args_types();
             // slice 3a: snapshot is the source of truth — the
@@ -1076,6 +1091,13 @@ where
             // marker that `get_list_of_active_boxes` (frame.rs:628) reads.
             // The snapshot's liveness decode REQUIRES this to be a JitCode
             // PC; using an interpreter PC underflows `pc - SIZE_LIVE_OP`.
+            // For an `after_residual_call` guard
+            // (`finish_residual_call_exception_path`) `resume_pc` is instead
+            // the post-call `code_cursor` itself: it already points AT that
+            // residual call's trailing LIVE marker, so the snapshot reads it
+            // directly (frame.rs:846-849) WITHOUT the `- SIZE_LIVE_OP`
+            // step-back. `MIFrame::pc` (the saved resume position) stays 0 in
+            // an inline sub-frame, so it must not be used here.
             self.frames.frames[top_idx].pc = resume_pc;
             // RPython only swaps the top frame pc before
             // `capture_resumedata`; it never writes portal state into an
@@ -1733,10 +1755,11 @@ where
         // GUARD_ALWAYS_FAILS) `after_residual_call=True` so the snapshot
         // walks `frame.pc` directly instead of stepping back to the
         // preceding LIVE marker (frame.rs:626-630 / pyjitpl.py:194-198).
-        // `resumepc=-1` (the default for these guards) keeps `frame.pc`
-        // unchanged — pyre's current `frame.pc` is already past the
-        // residual_call's bytecode operands.
-        let resume_pc = self.frames.current_mut().pc;
+        // `next_u*()` advances `code_cursor`; unlike RPython's single `pc`,
+        // `MIFrame::pc` is only the saved resume position.  Capture the
+        // post-call bytecode cursor so the snapshot reads the trailing
+        // `-live-` marker for this residual call.
+        let resume_pc = self.frames.current_mut().code_cursor;
 
         if exc == 0 {
             self.record_state_guard(
@@ -1786,7 +1809,11 @@ where
         sym: &mut S,
     ) -> TraceAction {
         let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-        let resume_pc = self.frames.current_mut().pc;
+        // `code_cursor` is post-call and points at this CALL_ASSEMBLER's
+        // trailing `-live-` marker. `MIFrame::pc` is only the saved resume
+        // position and stays 0 in an inline sub-frame, so do not use it for
+        // this after-residual-call snapshot.
+        let resume_pc = self.frames.current_mut().code_cursor;
 
         if exc == 0 {
             self.record_state_guard(
@@ -9015,6 +9042,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn goto_if_not_const_condition_records_no_guard_and_takes_branch() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.load_const_i_value(0, 0);
+        builder.goto_if_not_int_is_true(0, target);
+        builder.load_const_i_value(1, 10);
+        builder.int_return(1);
+        builder.mark_label(target);
+        builder.load_const_i_value(1, 20);
+        builder.int_return(1);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            } => finish_args,
+            other => panic!("expected const false goto_if_not to finish via target, got {other:?}"),
+        };
+        assert_eq!(ctx.const_value(finish_args[0]), Some(20));
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(
+            recorder.num_ops(),
+            0,
+            "Const GuardFalse/GuardTrue must be skipped at record_state_guard",
+        );
+    }
+
+    #[test]
+    fn int_guard_value_const_register_records_no_guard_and_returns_const() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 42);
+        builder.int_guard_value(0);
+        builder.int_return(0);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            } => finish_args,
+            other => panic!("expected int_guard_value const path to finish, got {other:?}"),
+        };
+        assert_eq!(ctx.const_value(finish_args[0]), Some(42));
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(
+            recorder.num_ops(),
+            0,
+            "Const GuardValue must be skipped at record_state_guard",
+        );
+    }
+
+    #[test]
+    fn guard_exception_const_exception_class_still_records_guard_and_snapshot() {
+        struct SnapshotSym;
+        impl JitCodeSym for SnapshotSym {
+            fn total_slots(&self) -> usize {
+                1
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+            fn fail_args(&self) -> Option<Vec<OpRef>> {
+                Some(vec![OpRef::int_op(50)])
+            }
+            fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
+                frame.int_regs[0] = Some(OpRef::int_op(50));
+                frame.int_values[0] = Some(500);
+            }
+        }
+
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let live_pc = builder.current_pos();
+        builder.live(&mut asm, &[0], &[], &[]);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let frame = MIFrame::new(jitcode, live_pc);
+        let mut stack = MIFrameStack::empty();
+        stack.frames.push(frame);
+
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
+        staticdata.liveness_info = asm.all_liveness().to_vec();
+        let recorder = crate::recorder::Trace::new();
+        let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
+        let mut sym = SnapshotSym;
+        let exc_class = ctx.const_int(0xc1a55);
+        let mut machine =
+            JitCodeMachine::<SnapshotSym, ClosureRuntime<fn(usize) -> usize>>::with_framestack(
+                &mut stack,
+                &[],
+                &[],
+            );
+        let guard_op = machine.record_state_guard(
+            &mut ctx,
+            &mut sym,
+            OpCode::GuardException,
+            &[exc_class],
+            live_pc,
+            /* after_residual_call */ true,
+        );
+        assert!(!guard_op.is_constant());
+
+        let snapshots = ctx.snapshots().to_vec();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "GuardException must still capture resumedata despite Const exc class",
+        );
+        assert_eq!(snapshots[0].frames.len(), 1);
+
+        let recorder = ctx.into_recorder();
+        let guards: Vec<_> = recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode.is_guard())
+            .collect();
+        assert_eq!(
+            guards.len(),
+            1,
+            "only the GuardException should be recorded"
+        );
+        assert_eq!(guards[0].opcode, OpCode::GuardException);
+        assert_eq!(
+            guards[0].rd_resume_position.get(),
+            0,
+            "GuardException should carry the captured snapshot id",
+        );
+    }
+
     // ── canonical residual_call_*_{i,r,f} may_force tests ──
     //
     // The legacy non-Pure walker arms
@@ -9392,20 +9561,29 @@ mod tests {
         caller.mark_label(handler);
         caller.last_exc_value(0);
         caller.ref_guard_value(0);
+        caller.ref_return(0);
         let jitcode = caller.finish();
 
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
-        assert!(matches!(action, TraceAction::Continue));
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            } => finish_args,
+            other => panic!("expected handler to return last_exc_value, got {other:?}"),
+        };
+        assert_eq!(ctx.const_value(finish_args[0]), Some(exc_raw));
 
         let recorder = ctx.into_recorder();
         assert!(
-            recorder
+            !recorder
                 .ops()
                 .iter()
                 .any(|op| op.opcode == OpCode::GuardValue),
-            "handler must see last_exc_value and be able to promote it",
+            "Const last_exc_value promotion must skip GuardValue",
         );
     }
 
@@ -9426,20 +9604,29 @@ mod tests {
         caller.mark_label(handler);
         caller.last_exception(0);
         caller.int_guard_value(0);
+        caller.int_return(0);
         let jitcode = caller.finish();
 
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
-        assert!(matches!(action, TraceAction::Continue));
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            } => finish_args,
+            other => panic!("expected handler to return last_exception, got {other:?}"),
+        };
+        assert_eq!(ctx.const_value(finish_args[0]), Some(0xc1a55));
 
         let recorder = ctx.into_recorder();
         assert!(
-            recorder
+            !recorder
                 .ops()
                 .iter()
                 .any(|op| op.opcode == OpCode::GuardValue),
-            "handler must see last_exception and be able to promote it",
+            "Const last_exception promotion must skip GuardValue",
         );
     }
 

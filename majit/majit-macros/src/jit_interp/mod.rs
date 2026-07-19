@@ -458,6 +458,7 @@ pub(crate) enum CallPolicyKind {
     InlineInt,
     InlineRef,
     InlineFloat,
+    InlineVoid,
     /// `BC_INLINE_CALL` ('j' argcode) into a pipeline-built sub-jitcode
     /// resolved by name through the host's `__majit_pipeline_jitcode`, rather
     /// than a macro-generated `__majit_inline_jitcode_<name>` helper. Int /
@@ -529,6 +530,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "inline_int" => CallPolicyKind::InlineInt,
         "inline_ref" => CallPolicyKind::InlineRef,
         "inline_float" => CallPolicyKind::InlineFloat,
+        "inline_void" => CallPolicyKind::InlineVoid,
         "inline_pipeline_int" => CallPolicyKind::InlinePipelineInt,
         "inline_pipeline_ref" => CallPolicyKind::InlinePipelineRef,
         "inline_pipeline_float" => CallPolicyKind::InlinePipelineFloat,
@@ -753,7 +755,7 @@ fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>>
 /// a single `Path` and then split: the last segment is the field name, the
 /// remaining prefix is the struct type.
 /// Parse `call_returns = { func_path => StructType, ... }`.
-fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> {
+pub(crate) fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
@@ -767,7 +769,7 @@ fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> 
     Ok(entries)
 }
 
-fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
+pub(crate) fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
@@ -781,7 +783,7 @@ fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ide
     Ok(entries)
 }
 
-fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
+pub(crate) fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
@@ -793,7 +795,7 @@ fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
     Ok(entries)
 }
 
-fn parse_path_set(input: ParseStream) -> syn::Result<Vec<Path>> {
+pub(crate) fn parse_path_set(input: ParseStream) -> syn::Result<Vec<Path>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
@@ -821,7 +823,7 @@ fn split_struct_field_path(full_path: Path) -> syn::Result<(Path, Ident)> {
     Ok((struct_type, field))
 }
 
-fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
+pub(crate) fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
