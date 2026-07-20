@@ -51,8 +51,10 @@ pub mod _socket;
 pub mod _sre;
 #[allow(non_snake_case)]
 pub mod _template;
+pub mod _tokenize;
 #[allow(non_snake_case)]
 pub mod _typing;
+pub mod _warnings;
 pub mod _weakref;
 pub mod array;
 pub mod atexit;
