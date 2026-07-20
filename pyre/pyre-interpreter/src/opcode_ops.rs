@@ -529,7 +529,7 @@ pub fn dict_merge_value(
 pub extern "C" fn jit_truth_value(value: i64) -> i64 {
     match truth_value(value as PyObjectRef) {
         Ok(truth) => truth as i64,
-        Err(err) => {
+        Err(mut err) => {
             // A raising `__bool__` / `__len__` publishes into the backend
             // exception cells so the trailing GuardNoException deopts and
             // re-raises through the blackhole (llmodel.py:194-199
@@ -554,7 +554,7 @@ pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
 pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match binary_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
-        Err(err) => {
+        Err(mut err) => {
             // llmodel.py:194-199 _store_exception: publish into the backend
             // exception cells so the trailing GuardNoException deopts and
             // re-raises through the blackhole.  Return null — the guard fires
@@ -569,7 +569,7 @@ pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 
 pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match compare_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
-        Err(err) => {
+        Err(mut err) => {
             // Publish + null so the trailing GuardNoException deopts and
             // re-raises (llmodel.py:194-199 _store_exception).
             crate::runtime_ops::jit_publish_exception(err.to_exc_object());
@@ -582,7 +582,7 @@ pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64
 pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
     match unary_negative_value(value as PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             // Publish + null so the trailing GuardNoException deopts and
             // re-raises (llmodel.py:194-199 _store_exception).
             crate::runtime_ops::jit_publish_exception(err.to_exc_object());
@@ -595,7 +595,7 @@ pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
 pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
     match unary_invert_value(value as PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             // Publish + null so the trailing GuardNoException deopts and
             // re-raises (llmodel.py:194-199 _store_exception).
             crate::runtime_ops::jit_publish_exception(err.to_exc_object());
@@ -608,7 +608,7 @@ pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
         Ok(value) => value as i64,
-        Err(err) => {
+        Err(mut err) => {
             // llmodel.py:194-199 _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after BINARY_SUBSCR (instruction_may_raise) deopts and re-raises
@@ -630,7 +630,7 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
         // STORE_SUBSCR drops `space.setitem`'s result; this void shim does
         // the same so the recorded residual is a void `CALL_N`.
         Ok(_) => {}
-        Err(err) => {
+        Err(mut err) => {
             // llmodel.py:194-199 _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after STORE_SUBSCR (instruction_may_raise) deopts and re-raises
@@ -646,7 +646,7 @@ pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     match crate::getattr_str(obj as PyObjectRef, name) {
         Ok(value) => value as i64,
-        Err(err) => {
+        Err(mut err) => {
             // llmodel.py:194-199 _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after LOAD_ATTR (instruction_may_raise) deopts and re-raises
@@ -664,7 +664,7 @@ pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     match crate::setattr_str(obj as PyObjectRef, name, value as PyObjectRef) {
         Ok(_) => 0,
-        Err(err) => {
+        Err(mut err) => {
             // llmodel.py:194-199 _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after STORE_ATTR (instruction_may_raise) deopts and re-raises
@@ -689,7 +689,7 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
     let executor = unsafe { &mut *(executor_ptr as *mut crate::pyframe::PyFrame) };
     match crate::pyopcode::execute_store_subscr(executor) {
         Ok(_step_result) => 1,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
             0
@@ -729,7 +729,7 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     let obj = obj as pyre_object::PyObjectRef;
     let key = key as pyre_object::PyObjectRef;
     let value = value as pyre_object::PyObjectRef;
-    if let Err(err) = crate::baseobjspace::setitem(obj, key, value) {
+    if let Err(mut err) = crate::baseobjspace::setitem(obj, key, value) {
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
         crate::runtime_ops::jit_publish_exception(exc_obj);
