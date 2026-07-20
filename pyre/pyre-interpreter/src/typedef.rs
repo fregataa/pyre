@@ -39,10 +39,21 @@ pub struct Member;
 #[derive(Debug, Default)]
 pub struct ClassAttr;
 
-pub fn default_identity_hash(_space: PyObjectRef, _w_obj: PyObjectRef) -> PyObjectRef {
-    let _ = _space;
-    let _ = _w_obj;
-    0 as *mut pyre_object::PyObject
+/// `pypy/interpreter/typedef.py:138-143 default_identity_hash`.
+///
+/// Exact immutable builtin values use their value-derived unique id; ordinary
+/// objects use RPython's `compute_identity_hash`, whose translated minimark
+/// implementation is `mangle_hash(id_or_identityhash(obj))`.
+pub fn default_identity_hash_value(w_obj: PyObjectRef) -> i64 {
+    if let Some(w_unique_id) = crate::function::immutable_unique_id(w_obj) {
+        return crate::builtins::hash_value(w_unique_id);
+    }
+    let identity = pyre_object::gc_hook::gc_identity_hash(w_obj as usize) as i64;
+    identity ^ (identity >> 4)
+}
+
+pub fn default_identity_hash(_space: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
+    pyre_object::w_int_new(default_identity_hash_value(w_obj))
 }
 
 pub fn get_unique_interplevel_subclass(_space: PyObjectRef, cls: PyObjectRef) -> PyObjectRef {
@@ -2597,6 +2608,11 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         unsafe {
             (*value).w_class = sub;
         }
+        // objspace.py `allocate_instance`: a builtin-layout subclass still
+        // participates in the user-finalizer queue when its Python type has
+        // `__del__`. Registration must follow `w_class` tagging so the hook
+        // sees the subclass rather than the canonical list type.
+        pyre_object::gc_hook::maybe_register_finalizer(value);
     }
     Ok(value)
 }
@@ -2604,7 +2620,22 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let list = crate::type_methods::require_list_receiver(params, "__init__", false)?;
-    if crate::builtins::has_real_kwargs(kwargs) {
+    // CPython 3.14 clinic/listobject.c.h `list___init__`: keywords are
+    // rejected for exact list and subclasses which inherit list.__new__, but
+    // ignored here when the subclass overrides __new__ (that override already
+    // received them through type.__call__).
+    let list_type = gettypeobject(&pyre_object::LIST_TYPE);
+    let instance_type = crate::typedef::r#type(list).unwrap_or(list_type);
+    let inherits_list_new = unsafe {
+        match (
+            crate::baseobjspace::lookup_in_type(instance_type, "__new__"),
+            crate::baseobjspace::lookup_in_type(list_type, "__new__"),
+        ) {
+            (Some(instance_new), Some(list_new)) => std::ptr::eq(instance_new, list_new),
+            _ => true,
+        }
+    };
+    if inherits_list_new && crate::builtins::has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
             "list() takes no keyword arguments",
         ));
@@ -2650,6 +2681,7 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         unsafe {
             (*fresh).w_class = sub;
         }
+        pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }
     Ok(value)
@@ -3580,10 +3612,60 @@ fn set_init_from_iterable(
     // must still be marked live instead of being swept while Rust holds the
     // only reference.
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let set_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_set);
-    let items = crate::builtins::collect_iterable(w_iterable)?;
-    let w_set = pyre_object::gc_roots::shadow_stack_get(sp);
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iterable);
+    // Python 3.14 `set_update_dict_lock_held`: an exact dict is walked
+    // through its key table and each cached hash is handed directly to the
+    // set.  This is observable when a key's `__hash__` has side effects, and
+    // it is the cached-hash shape of PyPy's
+    // `DictStrategy.getiteritems_with_hash`.  A dict subclass must still use
+    // normal iteration because it may override `__iter__`.
+    if unsafe {
+        pyre_object::is_exact_type(
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+            &pyre_object::DICT_TYPE,
+        )
+    } {
+        let mut index = 0usize;
+        let mut copied_hashed_key = false;
+        while let Some(key) = unsafe {
+            pyre_object::dictmultiobject::w_dict_nth_hashed_key(
+                pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+                index,
+            )
+        } {
+            unsafe {
+                pyre_object::setobject::w_set_insert_key_checked(
+                    pyre_object::gc_roots::shadow_stack_get(set_slot),
+                    key,
+                )
+            }
+            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            copied_hashed_key = true;
+            index += 1;
+        }
+        // Empty object-shaped dicts and non-empty ones both finish here.  For
+        // an empty dict the active Object/Unicode strategy is detected by a
+        // zero length; typed/Empty strategies deliberately fall through.
+        let strategy = unsafe {
+            pyre_object::w_dict_get_strategy(pyre_object::gc_roots::shadow_stack_get(iterable_slot))
+                .strategy_kind()
+        };
+        if copied_hashed_key
+            || matches!(
+                strategy,
+                pyre_object::dictmultiobject::StrategyKind::Object
+                    | pyre_object::dictmultiobject::StrategyKind::Unicode
+            )
+        {
+            return Ok(());
+        }
+    }
+    let items =
+        crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+    let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
     crate::builtins::builtin_set_add_items(w_set, &items)
 }
 
@@ -5064,7 +5146,9 @@ fn init_dict_type(ns: PyObjectRef) {
                                             args[0], args[1],
                                         ),
                                         Err(_) => {
-                                            Err(crate::baseobjspace::take_pending_hash_error())
+                                            Err(crate::baseobjspace::take_pending_dict_key_error(
+                                                args[1],
+                                            ))
                                         }
                                     };
                                 }
@@ -5091,11 +5175,13 @@ fn init_dict_type(ns: PyObjectRef) {
                             pyre_object::dictmultiobject::w_dict_lookup_checked(dict, args[1])
                         } {
                             Ok(v) => Ok(pyre_object::w_bool_from(v.is_some())),
-                            Err(_) => Err(crate::baseobjspace::take_pending_hash_error()),
+                            Err(_) => {
+                                Err(crate::baseobjspace::take_pending_dict_key_error(args[1]))
+                            }
                         };
                     }
                     Ok(pyre_object::w_bool_from(
-                        crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
+                        crate::baseobjspace::contains_slot(args[0], args[1])?,
                     ))
                 },
                 2,
@@ -5467,7 +5553,6 @@ fn init_dict_type(ns: PyObjectRef) {
                         "fromkeys expected at least 1 argument, got 0",
                     ));
                 };
-                let items = crate::builtins::collect_iterable(iterable)?;
                 // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
                 // fill a fresh dict through the dict's own setitem, which hashes
                 // each key; for a dict subclass, construct an instance via `cls()`
@@ -5476,6 +5561,45 @@ fn init_dict_type(ns: PyObjectRef) {
                 let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
                 if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
                     let d = pyre_object::w_dict_new();
+                    // Python 3.14's exact-set/frozenset fast path carries each
+                    // entry's cached hash into the new exact dict.  This is the
+                    // reverse of `set_update_dict_lock_held` and avoids a
+                    // second observable `__hash__` call.  Subclasses still go
+                    // through their iterator below.
+                    if unsafe {
+                        pyre_object::is_exact_type(iterable, &pyre_object::setobject::SET_TYPE)
+                            || pyre_object::is_exact_type(
+                                iterable,
+                                &pyre_object::setobject::FROZENSET_TYPE,
+                            )
+                    } {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let sp = pyre_object::gc_roots::shadow_stack_len();
+                        pyre_object::gc_roots::pin_root(d);
+                        pyre_object::gc_roots::pin_root(value);
+                        pyre_object::gc_roots::pin_root(iterable);
+                        let mut index = 0usize;
+                        loop {
+                            let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+                            let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, index) })
+                            else {
+                                break;
+                            };
+                            let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                            unsafe {
+                                pyre_object::w_dict_store_hashed_checked(
+                                    d, key.obj, value, key.hash,
+                                )
+                            }
+                            .map_err(|_| {
+                                crate::baseobjspace::take_pending_dict_key_error(key.obj)
+                            })?;
+                            index += 1;
+                        }
+                        return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
+                    }
+                    let items = crate::builtins::collect_iterable(iterable)?;
                     // `try_hash_value` may run a user `__hash__` that allocates
                     // and triggers a moving minor collection; `d`, the shared
                     // `value` (reused across every key), and every not-yet-added
@@ -5493,17 +5617,21 @@ fn init_dict_type(ns: PyObjectRef) {
                         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
                         for i in 0..key_len {
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                            let hash = crate::builtins::try_hash_value(key)?;
+                            let hash = crate::builtins::try_hash_value(key).map_err(|err| {
+                                crate::baseobjspace::wrap_dict_key_hash_error(key, err)
+                            })?;
                             let d = pyre_object::gc_roots::shadow_stack_get(sp);
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
                             let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_dict_store_hashed_checked(d, key, value, hash)
-                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                            pyre_object::w_dict_store_hashed_checked(d, key, value, hash).map_err(
+                                |_| crate::baseobjspace::take_pending_dict_key_error(key),
+                            )?;
                         }
                         pyre_object::gc_roots::shadow_stack_get(sp)
                     };
                     Ok(d)
                 } else {
+                    let items = crate::builtins::collect_iterable(iterable)?;
                     let d = crate::call::call_function_impl_result(cls, &[])?;
                     for key in items {
                         crate::baseobjspace::setitem(d, key, value)?;
@@ -5824,6 +5952,17 @@ fn init_dict_view_set_like_type(
                 },
                 2,
             ),
+        )
+    };
+    // The keys and items views are set-like and therefore unhashable
+    // (`dictmultiobject.py:1626 _is_set_like`); the values view is not and
+    // keeps `object.__hash__`.  Declare the slot `None` so a `hash()` finds it
+    // and rejects the view instead of falling back to the identity hash.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            pyre_object::w_none(),
         )
     };
     register_dict_view_set_operators(ns);
@@ -7362,7 +7501,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                     crate::type_methods::require_tuple_receiver(args, "__contains__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     Ok(pyre_object::w_bool_from(
-                        crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
+                        crate::baseobjspace::contains_slot(args[0], args[1])?,
                     ))
                 },
                 2,
@@ -7541,35 +7680,119 @@ fn slice_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate
 }
 
 /// sliceobject.py:148 `W_SliceObject.descr_indices`.
+fn slice_eval_index_big(value: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyError> {
+    match crate::baseobjspace::space_index(value) {
+        Ok(indexed) => Ok(unsafe { pyre_object::range_obj_to_bigint(indexed) }),
+        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
+            Err(crate::PyError::type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = slice_receiver(args, "indices")?;
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "slice.indices() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(self_);
-    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_object::gc_roots::pin_root(args[1]);
-    let length_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let length = crate::builtins::getindex_w(unsafe {
-        pyre_object::gc_roots::shadow_stack_get(length_slot)
+    // sliceobject.py app-level `indices`: unlike the machine-word
+    // `indices3()` used by concrete sequence operations, this rarely-used
+    // public method deliberately keeps start/stop/step/length unbounded.
+    let indexed_length = crate::baseobjspace::space_index(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(roots + 1)
     })?;
-    if length < 0 {
+    let length = unsafe { pyre_object::range_obj_to_bigint(indexed_length) };
+    let zero = malachite_bigint::BigInt::from(0);
+    let one = malachite_bigint::BigInt::from(1);
+    if length < zero {
         return Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
             "length should not be negative".to_string(),
         ));
     }
-    let self_ = unsafe { pyre_object::gc_roots::shadow_stack_get(self_slot) };
-    let (start, stop, step) = unsafe {
-        crate::sliceobject::indices3(
-            pyre_object::sliceobject::w_slice_get_start(self_),
-            pyre_object::sliceobject::w_slice_get_stop(self_),
-            pyre_object::sliceobject::w_slice_get_step(self_),
-            length,
-        )?
+    let w_step = unsafe {
+        pyre_object::sliceobject::w_slice_get_step(pyre_object::gc_roots::shadow_stack_get(roots))
     };
+    let step = if unsafe { pyre_object::is_none(w_step) } {
+        one.clone()
+    } else {
+        let step = slice_eval_index_big(w_step)?;
+        if step == zero {
+            return Err(crate::PyError::value_error("slice step cannot be zero"));
+        }
+        step
+    };
+    let negative_step = step < zero;
+    let lower = if negative_step {
+        -one.clone()
+    } else {
+        zero.clone()
+    };
+    let upper = if negative_step {
+        &length - &one
+    } else {
+        length.clone()
+    };
+
+    let w_start = unsafe {
+        pyre_object::sliceobject::w_slice_get_start(pyre_object::gc_roots::shadow_stack_get(roots))
+    };
+    let start = if unsafe { pyre_object::is_none(w_start) } {
+        if negative_step {
+            upper.clone()
+        } else {
+            lower.clone()
+        }
+    } else {
+        let mut start = slice_eval_index_big(w_start)?;
+        if start < zero {
+            start += &length;
+            if start < lower {
+                start = lower.clone();
+            }
+        } else if start > upper {
+            start = upper.clone();
+        }
+        start
+    };
+
+    let w_stop = unsafe {
+        pyre_object::sliceobject::w_slice_get_stop(pyre_object::gc_roots::shadow_stack_get(roots))
+    };
+    let stop = if unsafe { pyre_object::is_none(w_stop) } {
+        if negative_step { lower } else { upper }
+    } else {
+        let mut stop = slice_eval_index_big(w_stop)?;
+        if stop < zero {
+            stop += &length;
+            if stop < lower {
+                stop = lower;
+            }
+        } else if stop > upper {
+            stop = upper;
+        }
+        stop
+    };
+
+    let w_start = pyre_object::range_bigint_to_obj(start);
+    pyre_object::gc_roots::pin_root(w_start);
+    let w_stop = pyre_object::range_bigint_to_obj(stop);
+    pyre_object::gc_roots::pin_root(w_stop);
+    let w_step = pyre_object::range_bigint_to_obj(step);
+    pyre_object::gc_roots::pin_root(w_step);
     Ok(w_tuple_new(vec![
-        pyre_object::w_int_new(start),
-        pyre_object::w_int_new(stop),
-        pyre_object::w_int_new(step),
+        unsafe { pyre_object::gc_roots::shadow_stack_get(roots + 2) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(roots + 3) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(roots + 4) },
     ]))
 }
 
@@ -13026,9 +13249,9 @@ fn init_int_type(ns: PyObjectRef) {
     // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
     // implementation delegates virtually to this repr slot.
     let int_to_text = |args: &[PyObjectRef]| {
-        Ok(pyre_object::w_str_new(
-            &unsafe { crate::builtins::obj_to_bigint(args[0]) }.to_string(),
-        ))
+        Ok(pyre_object::w_str_new(&unsafe {
+            crate::builtins::int_to_decimal_string(args[0])?
+        }))
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -13576,6 +13799,11 @@ fn init_complex_type(ns: PyObjectRef) {
             pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
                 "from_number",
                 |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "complex.from_number() missing required argument 'number' (pos 1)",
+                        ));
+                    }
                     let value = args[1];
                     if unsafe {
                         pyre_object::is_str(value)
@@ -13587,7 +13815,11 @@ fn init_complex_type(ns: PyObjectRef) {
                             crate::type_methods::arg_type_name(value)
                         )));
                     }
-                    crate::builtins::builtin_complex(&[value])
+                    // Reuse complex.__new__'s exact-base identity and subclass
+                    // allocation.  The constructor's numeric-only path runs
+                    // __complex__, __float__, then __index__ without parsing
+                    // text because those inputs were rejected above.
+                    complex_descr_new(&[args[0], value])
                 },
                 2,
             )),
@@ -13618,7 +13850,7 @@ fn init_complex_type(ns: PyObjectRef) {
                         )
                     };
                     Ok(pyre_object::w_int_new(
-                        crate::objspace::descroperation::complex_hash(re, im),
+                        crate::objspace::descroperation::complex_hash(args[0], re, im),
                     ))
                 },
                 1,
@@ -13650,15 +13882,7 @@ fn init_complex_type(ns: PyObjectRef) {
             "__abs__",
             make_builtin_function_with_arity(
                 "__abs__",
-                |args| {
-                    let (re, im) = unsafe {
-                        (
-                            pyre_object::w_complex_get_real(args[0]),
-                            pyre_object::w_complex_get_imag(args[0]),
-                        )
-                    };
-                    Ok(pyre_object::w_float_new(re.hypot(im)))
-                },
+                |args| crate::objspace::descroperation::complex_abs(args[0]),
                 1,
             ),
         )
@@ -13737,9 +13961,12 @@ fn init_complex_type(ns: PyObjectRef) {
                             pyre_object::w_complex_get_imag(args[0]),
                         )
                     };
-                    Ok(pyre_object::w_tuple_new(vec![pyre_object::w_complex_new(
-                        re, im,
-                    )]))
+                    // complexobject.py descr___getnewargs__: two base floats,
+                    // preserving the sign bits of zero components.
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_float_new(re),
+                        pyre_object::w_float_new(im),
+                    ]))
                 },
                 1,
             ),
@@ -13869,7 +14096,32 @@ fn init_float_type(ns: PyObjectRef) {
             "from_number",
             pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
                 "from_number",
-                |args| Ok(w_float_new(crate::baseobjspace::float_w(args[1])?)),
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "float.from_number() missing required argument 'number' (pos 1)",
+                        ));
+                    }
+                    let value = args[1];
+                    // Python 3.14 float.from_number uses the numeric
+                    // conversion protocol (__float__, then __index__) but,
+                    // unlike float(), never accepts textual inputs.
+                    if unsafe {
+                        pyre_object::is_str(value)
+                            || pyre_object::is_bytes(value)
+                            || pyre_object::is_bytearray(value)
+                            || pyre_object::is_complex(value)
+                    } {
+                        return Err(crate::PyError::type_error(format!(
+                            "must be real number, not {}",
+                            crate::type_methods::arg_type_name(value)
+                        )));
+                    }
+                    // Reuse float.__new__'s exact base/subclass allocation:
+                    // exact base floats retain identity, while a classmethod
+                    // invoked on a float subclass returns that subclass.
+                    float_descr_new(&[args[0], value])
+                },
                 2,
             )),
         )
@@ -13931,43 +14183,54 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "fromhex",
-            make_builtin_function("fromhex", |args| {
-                // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
-                // Parse hexadecimal floating-point literals like '0x1.8p3'.
-                let s_arg = args
-                    .iter()
-                    .find_map(|&a| unsafe {
-                        if pyre_object::is_str(a) {
-                            Some(pyre_object::w_str_get_value(a).to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| {
-                        crate::PyError::type_error("fromhex() requires a string argument")
-                    })?;
-                // Delegate parsing to the shared hex-float reader, which rounds
-                // round-half-even over the full exponent range (subnormals down to
-                // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
-                // ASCII whitespace itself, and flags overflow distinctly.
-                match rustpython_common::float_ops::from_hex(&s_arg) {
-                    Ok(v) => Ok(pyre_object::w_float_new(v)),
-                    Err(e) => {
-                        use rustpython_common::float_ops::HexFloatError;
-                        Err(match e {
-                            HexFloatError::Overflow => crate::PyError::overflow_error(
-                                "hexadecimal value too large to represent as a float",
-                            ),
-                            HexFloatError::TooLong => crate::PyError::value_error(
-                                "hexadecimal string too long to convert",
-                            ),
-                            HexFloatError::Invalid => crate::PyError::value_error(
-                                "invalid hexadecimal floating-point string",
-                            ),
-                        })
+            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
+                "fromhex",
+                |args| {
+                    // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
+                    // Parse hexadecimal floating-point literals like '0x1.8p3'.
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "fromhex() requires a string argument",
+                        ));
                     }
-                }
-            }),
+                    let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
+                        unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
+                    } else {
+                        return Err(crate::PyError::type_error(
+                            "fromhex() requires a string argument",
+                        ));
+                    };
+                    // Delegate parsing to the shared hex-float reader, which rounds
+                    // round-half-even over the full exponent range (subnormals down to
+                    // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
+                    // ASCII whitespace itself, and flags overflow distinctly.
+                    match rustpython_common::float_ops::from_hex(&s_arg) {
+                        Ok(v) => {
+                            let w_float = pyre_object::w_float_new(v);
+                            // floatobject.py:419: return
+                            // space.call_function(w_cls, w_float).  This runs a
+                            // subclass's __new__ and __init__ rather than merely
+                            // retagging the parsed base float.
+                            crate::call::call_function_impl_result(args[0], &[w_float])
+                        }
+                        Err(e) => {
+                            use rustpython_common::float_ops::HexFloatError;
+                            Err(match e {
+                                HexFloatError::Overflow => crate::PyError::overflow_error(
+                                    "hexadecimal value too large to represent as a float",
+                                ),
+                                HexFloatError::TooLong => crate::PyError::value_error(
+                                    "hexadecimal string too long to convert",
+                                ),
+                                HexFloatError::Invalid => crate::PyError::value_error(
+                                    "invalid hexadecimal floating-point string",
+                                ),
+                            })
+                        }
+                    }
+                },
+                2,
+            )),
         )
     };
     unsafe {
@@ -14791,13 +15054,7 @@ fn init_object_type(ns: PyObjectRef) {
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
-                |args| {
-                    Ok(pyre_object::w_int_new(if args.is_empty() {
-                        0
-                    } else {
-                        args[0] as i64
-                    }))
-                },
+                |args| Ok(default_identity_hash(pyre_object::PY_NULL, args[0])),
                 1,
             ),
         )
@@ -19844,8 +20101,9 @@ fn set_intersect_update(
             if pyre_object::w_set_contains_key_checked(probe, key)
                 .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
-                let key = pyre_object::w_set_key_at(keep, i)
-                    .expect("probing a set cannot shorten the set being walked");
+                let Some(key) = pyre_object::w_set_key_at(keep, i) else {
+                    break;
+                };
                 pyre_object::w_set_insert_key_checked(result, key)
                     .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
             }
@@ -20240,8 +20498,9 @@ fn set_symmetric_difference_storage(
                 {
                     // The probe's `eq_w` can move the element, so the key is
                     // re-read from the table the collector rewrites.
-                    let key = pyre_object::w_set_key_at(walk, i)
-                        .expect("probing a set cannot shorten the set being walked");
+                    let Some(key) = pyre_object::w_set_key_at(walk, i) else {
+                        break;
+                    };
                     pyre_object::w_set_insert_key_checked(w_new, key)
                         .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                 }
@@ -20359,7 +20618,12 @@ fn init_set_type(ns: PyObjectRef) {
                         let sp = pyre_object::gc_roots::shadow_stack_len();
                         pyre_object::gc_roots::pin_root(args[0]);
                         pyre_object::gc_roots::pin_root(args[1]);
-                        let hash = crate::builtins::try_hash_value(args[1])?;
+                        let hash = crate::builtins::try_hash_value(args[1]).map_err(|err| {
+                            crate::baseobjspace::wrap_set_element_hash_error(
+                                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                                err,
+                            )
+                        })?;
                         let set = pyre_object::gc_roots::shadow_stack_get(sp);
                         let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                         pyre_object::w_set_add_hashed_checked(set, item, hash)

@@ -1743,8 +1743,9 @@ fn format_parse_err(
     crate::PyError::value_error(msg)
 }
 
-/// Geometry of a format spec: `[fill][align][sign][#][0][width][grouping]
-/// [.precision][type]`.  Only the presentation types the shared engine
+/// Geometry of a Python 3.14 format spec:
+/// `[fill][align][sign][#][0][width][grouping][.precision[grouping]][type]`.
+/// Only the presentation types the shared engine
 /// cannot format correctly — integer `c` and non-finite floats — read
 /// this back; every other case parses through `FormatSpec` directly.
 struct ParsedSpec {
@@ -1754,8 +1755,15 @@ struct ParsedSpec {
     alt_form: bool,
     width: usize,
     grouping: Option<char>,
+    fractional_grouping: Option<char>,
     precision: Option<usize>,
     ty: char,
+    /// The equivalent pre-3.14 spec accepted by rustpython-common's format
+    /// engine (the fractional grouping marker, and its otherwise-empty dot,
+    /// are removed).
+    engine_spec: String,
+    width_start: usize,
+    width_end: usize,
 }
 
 fn parse_spec(spec: &str) -> ParsedSpec {
@@ -1792,27 +1800,59 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         }
         i += 1;
     }
+    let width_start = i;
     let mut width = 0usize;
     while i < n && chars[i].is_ascii_digit() {
         width = width * 10 + (chars[i] as u8 - b'0') as usize;
         i += 1;
     }
+    let width_end = i;
     let mut grouping: Option<char> = None;
     if i < n && matches!(chars[i], ',' | '_') {
         grouping = Some(chars[i]);
         i += 1;
     }
     let mut precision: Option<usize> = None;
+    let mut fractional_grouping: Option<char> = None;
+    let mut empty_precision_dot: Option<usize> = None;
+    let mut fractional_grouping_index: Option<usize> = None;
     if i < n && chars[i] == '.' {
+        let dot = i;
         i += 1;
         let mut p = 0usize;
+        let precision_start = i;
         while i < n && chars[i].is_ascii_digit() {
             p = p * 10 + (chars[i] as u8 - b'0') as usize;
             i += 1;
         }
-        precision = Some(p);
+        if i < n && matches!(chars[i], ',' | '_') {
+            fractional_grouping = Some(chars[i]);
+            fractional_grouping_index = Some(i);
+            if i == precision_start {
+                // Python 3.14's `._f` means default precision plus
+                // fractional grouping, not precision zero.
+                empty_precision_dot = Some(dot);
+                precision = None;
+            } else {
+                precision = Some(p);
+            }
+            i += 1;
+        } else {
+            precision = Some(p);
+        }
     }
     let ty = if i < n { chars[i] } else { '\0' };
+    let engine_spec = chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ch)| {
+            if Some(index) == fractional_grouping_index || Some(index) == empty_precision_dot {
+                None
+            } else {
+                Some(*ch)
+            }
+        })
+        .collect();
     ParsedSpec {
         fill,
         align,
@@ -1820,9 +1860,122 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         alt_form,
         width,
         grouping,
+        fractional_grouping,
         precision,
         ty,
+        engine_spec,
+        width_start,
+        width_end,
     }
+}
+
+/// Component spec used by CPython's complex advanced formatter.  Width and
+/// alignment belong to the joined complex value; every remaining numeric flag
+/// is repeated for the real and imaginary float components.
+fn complex_component_spec(p: &ParsedSpec, sign: char) -> String {
+    let mut spec = String::new();
+    if sign != '-' {
+        spec.push(sign);
+    }
+    if p.alt_form {
+        spec.push('#');
+    }
+    if let Some(grouping) = p.grouping {
+        spec.push(grouping);
+    }
+    if let Some(precision) = p.precision {
+        spec.push('.');
+        spec.push_str(&precision.to_string());
+        if let Some(grouping) = p.fractional_grouping {
+            spec.push(grouping);
+        }
+    } else if let Some(grouping) = p.fractional_grouping {
+        spec.push('.');
+        spec.push(grouping);
+    }
+    if p.ty != '\0' {
+        spec.push(p.ty);
+    }
+    spec
+}
+
+/// Format one real/imaginary lane.  Complex's omitted presentation type is
+/// repr-like (integral doubles lose float's trailing `.0`); an alternate form
+/// deliberately retains it.
+fn format_complex_component(
+    value: f64,
+    spec: &str,
+    default_type: bool,
+    alternate: bool,
+) -> Result<String, crate::PyError> {
+    let rendered = if value.is_nan() || value.is_infinite() {
+        format_nonfinite(value, spec)?
+    } else {
+        format_finite_float(value, spec)?
+    };
+    let mut text = rendered
+        .as_str()
+        .expect("numeric formatting always produces UTF-8")
+        .to_string();
+    if default_type && !alternate && text.ends_with(".0") {
+        text.truncate(text.len() - 2);
+    }
+    Ok(text)
+}
+
+/// Return the normalized engine spec with its width replaced.  Fractional
+/// grouping is applied after rustpython-common has rounded the number; reducing
+/// the engine width by the number of inserted separators keeps Python's width
+/// measured against the final grouped result.
+fn float_engine_spec_with_width(p: &ParsedSpec, width: Option<usize>) -> String {
+    let chars: Vec<char> = p.engine_spec.chars().collect();
+    let mut out = String::new();
+    for ch in &chars[..p.width_start] {
+        out.push(*ch);
+    }
+    if let Some(width) = width
+        && width != 0
+    {
+        out.push_str(&width.to_string());
+    }
+    for ch in &chars[p.width_end..] {
+        out.push(*ch);
+    }
+    out
+}
+
+fn fractional_digit_count(s: &str) -> usize {
+    let Some(dot) = s.find('.') else {
+        return 0;
+    };
+    s[dot + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count()
+}
+
+fn group_fractional_digits(s: String, separator: char, digits: usize) -> String {
+    if digits < 4 {
+        return s;
+    }
+    let Some(dot) = s.find('.') else {
+        return s;
+    };
+    let fraction_start = dot + 1;
+    let fraction_end = fraction_start + digits;
+    let mut out = String::with_capacity(s.len() + (digits - 1) / 3);
+    out.push_str(&s[..fraction_start]);
+    for (index, byte) in s.as_bytes()[fraction_start..fraction_end]
+        .iter()
+        .enumerate()
+    {
+        if index != 0 && index % 3 == 0 {
+            out.push(separator);
+        }
+        out.push(*byte as char);
+    }
+    out.push_str(&s[fraction_end..]);
+    out
 }
 
 /// Pad `body` to `width` characters with `fill`, honouring the numeric
@@ -2155,26 +2308,40 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                 ));
             }
             let align = p.align.unwrap_or('>');
-            // No presentation type and no precision: pad str(self), which
-            // already carries the parentheses / bare-imaginary form.
-            if p.ty == '\0' && p.precision.is_none() {
+            // With no component-affecting flags, the default presentation is
+            // exactly str(self), padded as a single complex value.
+            if p.ty == '\0'
+                && p.precision.is_none()
+                && p.fractional_grouping.is_none()
+                && p.grouping.is_none()
+                && !p.alt_form
+                && !matches!(p.sign, Some('+') | Some(' '))
+            {
                 let body = Wtf8Buf::from_string(crate::py_str(val)?);
                 return Ok(pad_wtf8(&body, p.fill, align, p.width));
             }
-            // A presentation type or precision formats the real and imaginary
-            // parts as floats and joins them; the imaginary part always
-            // carries an explicit sign and the whole ends in `j`.
-            let prec = p
-                .precision
-                .map(|precision| format!(".{precision}"))
-                .unwrap_or_default();
-            let ty = if p.ty == '\0' { 'f' } else { p.ty };
-            let re_spec = format!("{prec}{ty}");
-            let im_spec = format!("+{prec}{ty}");
-            let mut body = format_finite_float(re, &re_spec)?;
-            let im_str = format_finite_float(im, &im_spec)?;
-            body.push_wtf8(&im_str);
-            body.push_char('j');
+            // CPython _PyComplex_FormatAdvancedWriter: component flags
+            // (sign / alternate / grouping / precision / type) are applied
+            // to each float, while alignment and width pad the joined value.
+            let default_type = p.ty == '\0';
+            let real_sign = p.sign.unwrap_or('-');
+            let real_spec = complex_component_spec(&p, real_sign);
+            let imag_sign = if default_type && re == 0.0 && re.is_sign_positive() {
+                p.sign.unwrap_or('-')
+            } else {
+                '+'
+            };
+            let imag_spec = complex_component_spec(&p, imag_sign);
+            let real_text = format_complex_component(re, &real_spec, default_type, p.alt_form)?;
+            let imag_text = format_complex_component(im, &imag_spec, default_type, p.alt_form)?;
+            let text = if default_type && re == 0.0 && re.is_sign_positive() {
+                format!("{imag_text}j")
+            } else if default_type {
+                format!("({real_text}{imag_text}j)")
+            } else {
+                format!("{real_text}{imag_text}j")
+            };
+            let body = Wtf8Buf::from_string(text);
             return Ok(pad_wtf8(&body, p.fill, align, p.width));
         }
         if pyre_object::is_str(val) {
@@ -2425,7 +2592,7 @@ fn format_nonfinite(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
 /// for their exact messages; the type and grouping-with-`n` checks are
 /// applied on top.
 fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError> {
-    rustpython_common::format::FormatSpec::parse(spec)
+    rustpython_common::format::FormatSpec::parse(p.engine_spec.as_str())
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     if !matches!(p.ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
         return Err(crate::PyError::value_error(format!(
@@ -2434,6 +2601,13 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
         )));
     }
     if let Some(sep) = p.grouping
+        && p.ty == 'n'
+    {
+        return Err(crate::PyError::value_error(format!(
+            "Cannot specify '{sep}' with 'n'."
+        )));
+    }
+    if let Some(sep) = p.fractional_grouping
         && p.ty == 'n'
     {
         return Err(crate::PyError::value_error(format!(
@@ -2450,7 +2624,25 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
 fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     validate_float_spec(spec, &p)?;
-    let parsed = rustpython_common::format::FormatSpec::parse(spec)
+    if let Some(separator) = p.fractional_grouping {
+        let unpadded_spec = float_engine_spec_with_width(&p, None);
+        let unpadded = rustpython_common::format::FormatSpec::parse(unpadded_spec.as_str())
+            .map_err(|e| format_spec_err(e, spec, "float", false))?
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        let digits = fractional_digit_count(&unpadded);
+        let separators = digits.saturating_sub(1) / 3;
+        let adjusted_width = p.width.saturating_sub(separators);
+        let adjusted_spec = float_engine_spec_with_width(&p, Some(adjusted_width));
+        let rendered = rustpython_common::format::FormatSpec::parse(adjusted_spec.as_str())
+            .map_err(|e| format_spec_err(e, spec, "float", false))?
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        return Ok(Wtf8Buf::from_string(group_fractional_digits(
+            rendered, separator, digits,
+        )));
+    }
+    let parsed = rustpython_common::format::FormatSpec::parse(p.engine_spec.as_str())
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     let s = parsed
         .format_float(v)
@@ -4948,7 +5140,7 @@ fn dict_lookup_checked(
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
         pyre_object::dictmultiobject::w_dict_lookup_checked(dict, key)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
     }
 }
 
@@ -4959,7 +5151,7 @@ pub(crate) fn dict_store_checked(
 ) -> Result<(), crate::PyError> {
     unsafe {
         pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
     }
 }
 
@@ -4982,7 +5174,13 @@ unsafe fn set_lookup_checked(
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(item);
-    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))?;
+    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
+        .map_err(|err| {
+            crate::baseobjspace::wrap_set_element_hash_error(
+                pyre_object::gc_roots::shadow_stack_get(sp),
+                err,
+            )
+        })?;
     let key = pyre_object::dictmultiobject::object_key_hashed(
         pyre_object::gc_roots::shadow_stack_get(sp),
         hash,
@@ -5031,6 +5229,7 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// mutations on the dict are visible through the view, matching
 /// `W_DictViewKeysObject`'s behaviour.
 pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    arity_exact(args, "keys", 0)?;
     require_receiver(args, "keys")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
@@ -5052,6 +5251,7 @@ pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `pypy/objspace/std/dictmultiobject.py:descr_values` parity — same
 /// shape as `descr_keys`, kind tag `Values`.
 pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    arity_exact(args, "values", 0)?;
     require_receiver(args, "values")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
@@ -5069,6 +5269,7 @@ pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// `pypy/objspace/std/dictmultiobject.py:descr_items` parity — same
 /// shape as `descr_keys`, kind tag `Items`.
 pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    arity_exact(args, "items", 0)?;
     require_receiver(args, "items")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
@@ -5123,9 +5324,7 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
 /// `dict.copy()` and (via `resolve_dict_backing` proxy unwrap) by
 /// `mappingproxy.copy()` (`dictproxyobject.py:84 copy_w`).
 pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Ok(pyre_object::w_dict_new());
-    }
+    arity_exact(args, "copy", 0)?;
     let src = resolve_dict_backing(args[0]);
     if src.is_null() {
         return Ok(pyre_object::w_dict_new());
@@ -5171,15 +5370,30 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     w_copy,
                 );
             } else {
-                let items = pyre_object::w_dict_items(resolve_dict_backing(data()));
-                let item_base = pyre_object::gc_roots::shadow_stack_len();
-                for &(k, v) in &items {
-                    pyre_object::gc_roots::pin_root(k);
-                    pyre_object::gc_roots::pin_root(v);
-                }
-                for i in 0..items.len() {
-                    let k = pyre_object::gc_roots::shadow_stack_get(item_base + i * 2);
-                    let v = pyre_object::gc_roots::shadow_stack_get(item_base + i * 2 + 1);
+                // `create_iterator_classes.rev_update1_dict_dict` keeps the
+                // source strategy's live `iteritems_with_hash` iterator while
+                // storing into the destination.  A key comparison may mutate
+                // the source; the following iterator step must then raise.
+                let iter = pyre_object::dictmultiobject::w_dict_view_iterator_new(
+                    resolve_dict_backing(data()),
+                    pyre_object::dictmultiobject::DictViewKind::Items,
+                );
+                let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(iter);
+                loop {
+                    let pair = match crate::baseobjspace::next(
+                        pyre_object::gc_roots::shadow_stack_get(iter_slot),
+                    ) {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                        Err(e) => return Err(e),
+                    };
+                    let _iteration_roots = pyre_object::gc_roots::push_roots();
+                    let iteration_roots = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(pyre_object::w_tuple_getitem(pair, 0).unwrap());
+                    pyre_object::gc_roots::pin_root(pyre_object::w_tuple_getitem(pair, 1).unwrap());
+                    let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
+                    let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
                     dict_store_checked(dict(), k, v)?;
                 }
             }
@@ -5208,7 +5422,9 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     dict_store_checked(dict(), k, v)?;
                 }
             } else {
-                // `dictmultiobject.py:1410-1418 update1_pairs`
+                // PyPy `dictmultiobject.py:update1_pairs`, with Python 3.14
+                // `merge_from_seq2_lock_held`'s PySequence_Fast error/note
+                // semantics where the versions differ.
                 let pairs = crate::builtins::collect_iterable(data())?;
                 let pairs_base = pyre_object::gc_roots::shadow_stack_len();
                 for &pair in &pairs {
@@ -5216,7 +5432,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 }
                 for idx in 0..pairs.len() {
                     let pair = pyre_object::gc_roots::shadow_stack_get(pairs_base + idx);
-                    let entries = crate::builtins::collect_iterable(pair)?;
+                    let entries = dict_update_pair_entries(pair, idx)?;
                     if entries.len() != 2 {
                         return Err(crate::PyError::value_error(format!(
                             "dictionary update sequence element #{idx} has length {}; 2 is required",
@@ -5234,6 +5450,77 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
         }
     }
     Ok(())
+}
+
+/// CPython 3.14 `merge_from_seq2_lock_held`'s
+/// `PySequence_Fast(item, "object is not iterable")` conversion.  An exact
+/// list/tuple is already a fast sequence; for other objects, only a TypeError
+/// from obtaining the iterator is replaced.  A TypeError raised later by the
+/// iterator keeps its original message.
+fn dict_update_pair_entries(
+    pair: PyObjectRef,
+    idx: usize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pair_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pair);
+    let pair = pyre_object::gc_roots::shadow_stack_get(pair_slot);
+    unsafe {
+        if is_exact_list(pair) {
+            let len = w_list_len(pair);
+            return Ok((0..len)
+                .filter_map(|i| w_list_getitem(pair, i as i64))
+                .collect());
+        }
+        if is_exact_tuple(pair) {
+            let len = w_tuple_len(pair);
+            return Ok((0..len)
+                .filter_map(|i| w_tuple_getitem(pair, i as i64))
+                .collect());
+        }
+    }
+    let iter = match crate::baseobjspace::iter(pair) {
+        Ok(iter) => iter,
+        Err(err) if err.kind == crate::PyErrorKind::TypeError => {
+            return Err(dict_update_pair_note(
+                crate::PyError::type_error("object is not iterable"),
+                idx,
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    crate::builtins::collect_iterator(iter).map_err(|err| dict_update_pair_note(err, idx))
+}
+
+/// CPython 3.14 `_PyErr_FormatNote` / `_PyException_AddNote` parity for a
+/// failed dict sequence-pair conversion.  Notes live directly in the
+/// exception instance dict, so an overridden Python-level `add_note` method
+/// cannot intercept this internal operation.
+fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError {
+    if err.kind != crate::PyErrorKind::TypeError {
+        return err;
+    }
+    let exc = err.to_exc_object();
+    err.exc_object = exc;
+    let note = w_str_new(&format!(
+        "Cannot convert dictionary update sequence element #{idx} to a sequence"
+    ));
+    unsafe {
+        let dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
+        let notes = match w_dict_getitem_str(dict, "__notes__") {
+            Some(notes) if crate::baseobjspace::isinstance_list_w(notes) => notes,
+            Some(_) => {
+                return crate::PyError::type_error("Cannot add note: __notes__ is not a list");
+            }
+            None => {
+                let notes = w_list_new(Vec::new());
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, "__notes__", notes);
+                notes
+            }
+        };
+        w_list_append(notes, note);
+    }
+    err
 }
 
 /// `dictmultiobject.py:1430-1443 init_or_update` — shared by `dict.__init__`
@@ -5358,7 +5645,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             match pyre_object::dictmultiobject::w_dict_pop_checked(dict, key) {
                 Ok(Some(val)) => return Ok(val),
                 Ok(None) => {}
-                Err(_) => return Err(crate::baseobjspace::take_pending_hash_error()),
+                Err(_) => return Err(crate::baseobjspace::take_pending_dict_key_error(key)),
             }
         }
     }
@@ -5412,7 +5699,7 @@ pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     if !dict.is_null() {
         unsafe {
             return pyre_object::dictmultiobject::w_dict_setdefault_checked(dict, key, default)
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error());
+                .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key));
         }
     }
     Ok(default)
@@ -5424,14 +5711,20 @@ mod dict_method_tests {
 
     use crate::test_hooks::install_hash_hook;
 
+    fn init_dict_test_runtime() {
+        crate::typedef::init_typeobjects();
+        install_hash_hook();
+    }
+
     fn assert_type_error<T: std::fmt::Debug>(result: Result<T, crate::PyError>) {
         let err = result.expect_err("operation should reject unhashable dict key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(err.message, "unhashable type: 'list'");
     }
 
     #[test]
     fn dict_get_rejects_unhashable_key() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5441,7 +5734,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_setitem_rejects_unhashable_key_without_inserting() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5457,7 +5750,7 @@ mod dict_method_tests {
         // `w_dict.setitem` hashes the key via the object strategy's
         // `space.hash_w`, so an unhashable key raises TypeError before
         // anything is stored — the dict stays empty.
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5467,7 +5760,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_pop_empty_returns_default_without_hashing_key() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
         let default = w_int_new(42);
@@ -5479,7 +5772,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_pop_empty_without_default_raises_keyerror_not_typeerror() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5490,7 +5783,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_update_pairs_rejects_unhashable_key() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
         let pair = w_tuple_new(vec![key, w_int_new(1)]);

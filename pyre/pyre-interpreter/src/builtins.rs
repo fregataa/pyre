@@ -2869,10 +2869,7 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             return Ok(w_float_new(w_float_get_value(obj).abs()));
         }
         if pyre_object::is_complex(obj) {
-            // abs(complex) → the float magnitude.
-            let re = pyre_object::w_complex_get_real(obj);
-            let im = pyre_object::w_complex_get_imag(obj);
-            return Ok(w_float_new(re.hypot(im)));
+            return crate::objspace::descroperation::complex_abs(obj);
         }
     }
     // Instance __abs__ — PyPy: baseobjspace.py abs
@@ -5958,6 +5955,16 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // only one accepted), `base` is positional-or-keyword at position 2
     // (intobject.py descr_new).
     let (pos, kwargs) = split_builtin_kwargs(args);
+    // `descr_new(space, w_inttype, w_x, __posonly__, w_base=None)` has two
+    // user-visible slots.  PyPy's gateway rejects surplus positionals while
+    // binding that signature, before `_new_int` runs; pyre's flat builtin
+    // ABI must perform the same gateway check explicitly.
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "int expected at most 2 arguments, got {}",
+            pos.len()
+        )));
+    }
     kwarg_reject_unknown(kwargs, &["base"], "int")?;
     let w_base = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "base", "int", 2)?;
     let obj = match pos.first().copied() {
@@ -5979,63 +5986,32 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             return Ok(obj);
         }
         // intobject.py:994: space.lookup(w_value, '__int__')
-        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__int__") } {
+        if unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some() {
             // intobject.py:995: w_intvalue = space.int(w_value)
-            let w_intvalue = call_and_check(method, &[obj])?;
+            let w_intvalue = crate::baseobjspace::space_int(obj)?;
             return ensure_baseint_result(w_intvalue, obj);
         }
-        // intobject.py:997: space.lookup(w_value, '__trunc__')
-        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__trunc__") } {
-            // intobject.py:998-999: DeprecationWarning
-            crate::warn::warn_deprecation("The delegation of int() to __trunc__ is deprecated.");
-            // intobject.py:1001: w_obj = space.trunc(w_value)
-            let w_obj = call_and_check(method, &[obj])?;
-            // intobject.py:1002: if not space.isinstance_w(w_obj, space.w_int)
-            if !unsafe { pyre_object::pyobject::is_int_or_long(w_obj) } {
-                // intobject.py:1003-1004: try: w_obj = space.index(w_obj)
-                if let Some(idx_method) = unsafe { crate::baseobjspace::lookup(w_obj, "__index__") }
-                {
-                    let w_indexed = call_and_check(idx_method, &[w_obj])?;
-                    return ensure_baseint_result(w_indexed, obj);
-                }
-                // intobject.py:1008-1011
-                return Err(crate::PyError::type_error(
-                    "__trunc__ returned non-Integral (type '%T')",
-                ));
-            }
-            return ensure_baseint_result(w_obj, obj);
-        }
+        // Python 3.14 difference: the deprecated `__trunc__` delegation in
+        // this PyPy source was removed from `int()` after Python 3.11.  Our
+        // language target is 3.14, so proceed directly to `__index__`.
         // intobject.py:1015: space.lookup(w_value, '__index__')
-        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__index__") } {
+        if unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_some() {
             // intobject.py:1016: w_obj = space.index(w_value)
-            let w_obj = call_and_check(method, &[obj])?;
-            // intobject.py:1017: if not space.is_w(space.type(w_obj), space.w_int)
-            let w_obj_type = crate::typedef::r#type(w_obj);
-            if w_obj_type != w_int {
-                // intobject.py:1018: if space.isinstance_w(w_obj, space.w_int)
-                if unsafe { pyre_object::pyobject::is_int_or_long(w_obj) } {
-                    // intobject.py:1019: w_obj = space.int(w_obj)
-                    return ensure_baseint_result(w_obj, obj);
-                }
-                // intobject.py:1020-1023
-                return Err(crate::PyError::type_error(format!(
-                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-                    crate::type_methods::arg_type_name(obj)
-                )));
-            }
+            let w_obj = crate::baseobjspace::space_index(obj)?;
             return ensure_baseint_result(w_obj, obj);
         }
         // intobject.py:1047 — unicode is normalized through
         // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
         if unsafe { is_str(obj) } {
-            return parse_int_from_str(&unicode_to_decimal_w(obj)?, 10);
+            let normalized = unicode_to_decimal_w(obj).map_err(|_| invalid_int_literal(obj, 10))?;
+            return parse_int_from_str(obj, &normalized, 10);
         }
         // intobject.py:1056-1070 — bytes / bytearray, then any object
         // exposing a readable buffer (`space.charbuf_w`).
         if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
             let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
             let s = String::from_utf8_lossy(data);
-            return parse_int_from_str(&s, 10);
+            return parse_int_from_str(obj, &s, 10);
         }
         return Err(crate::PyError::type_error(format!(
             "int() argument must be a string, a bytes-like object or a real number, not '{}'",
@@ -6048,13 +6024,15 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     unsafe {
         // intobject.py:1079 — unicode normalized through `unicode_to_decimal_w`.
         if is_str(obj) {
-            return parse_int_from_str(&unicode_to_decimal_w(obj)?, base);
+            let normalized =
+                unicode_to_decimal_w(obj).map_err(|_| invalid_int_literal(obj, base))?;
+            return parse_int_from_str(obj, &normalized, base);
         }
         // With an explicit base only str / bytes / bytearray are accepted.
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
             let s = String::from_utf8_lossy(data);
-            return parse_int_from_str(&s, base);
+            return parse_int_from_str(obj, &s, base);
         }
     }
     Err(crate::PyError::type_error(
@@ -6206,8 +6184,23 @@ fn unicode_to_decimal_w(
     Ok(std::borrow::Cow::Owned(out))
 }
 
+/// `wrap_parsestringerror(space, e, w_source)` — report the original Python
+/// source object, not the whitespace-trimmed or Unicode-normalized buffer the
+/// number parser consumes internally.
+fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
+    let source_repr = unsafe { crate::display::py_repr(w_source) }
+        .unwrap_or_else(|_| "<unprintable>".to_string());
+    crate::PyError::value_error(format!(
+        "invalid literal for int() with base {base}: {source_repr}"
+    ))
+}
+
 /// Parse an integer from a string with the given base.
-fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError> {
+fn parse_int_from_str(
+    w_source: PyObjectRef,
+    s: &str,
+    base: u32,
+) -> Result<PyObjectRef, crate::PyError> {
     let s = s.trim();
     let (sign, rest) = if let Some(r) = s.strip_prefix('-') {
         (-1i64, r)
@@ -6216,15 +6209,21 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
     } else {
         (1i64, s)
     };
-    let (radix, digits, had_base_prefix) = if base == 0 {
+    let (radix, digits, had_base_prefix, implicit_zero_only) = if base == 0 {
         if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
-            (16u32, r, true)
+            (16u32, r, true, false)
         } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
-            (2u32, r, true)
+            (2u32, r, true, false)
         } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
-            (8u32, r, true)
+            (8u32, r, true, false)
+        } else if rest.starts_with('0') {
+            // `NumberStringParser(..., no_implicit_octal=True)`: base 0
+            // plus an unprefixed leading zero selects pseudo-base 1, which
+            // makes only digit zero valid. Keep radix 10 for BigInt parsing
+            // after enforcing that digit rule below.
+            (10u32, rest, false, true)
         } else {
-            (10u32, rest, false)
+            (10u32, rest, false, false)
         }
     } else {
         let (stripped, had_base_prefix) = match base {
@@ -6242,9 +6241,15 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
             },
             _ => (rest, false),
         };
-        (base, stripped, had_base_prefix)
+        (base, stripped, had_base_prefix, false)
     };
-    let is_digit = |c: char| c.to_digit(radix).is_some();
+    let is_digit = |c: char| {
+        if implicit_zero_only {
+            c == '0'
+        } else {
+            c.to_digit(radix).is_some()
+        }
+    };
     let digit_chars: Vec<char> = digits.chars().collect();
     let mut cleaned = String::with_capacity(digits.len());
     for (i, &c) in digit_chars.iter().enumerate() {
@@ -6255,10 +6260,10 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
             if next_is_digit && (prev_is_digit || after_prefix) {
                 continue;
             }
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                format!("invalid literal for int() with base {base}: '{s}'"),
-            ));
+            return Err(invalid_int_literal(w_source, base));
+        }
+        if implicit_zero_only && c != '0' {
+            return Err(invalid_int_literal(w_source, base));
         }
         cleaned.push(c);
     }
@@ -6285,10 +6290,36 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
         let signed = if sign < 0 { -big } else { big };
         return Ok(w_long_new(signed));
     }
-    Err(crate::PyError::new(
-        crate::PyErrorKind::ValueError,
-        format!("invalid literal for int() with base {base}: '{s}'"),
-    ))
+    Err(invalid_int_literal(w_source, base))
+}
+
+/// PyPy `W_AbstractLongObject.descr_str` / Python 3.14 integer-to-decimal
+/// conversion guard. The bit-length lower bound rejects enormous values
+/// before the quadratic decimal conversion; the resulting string supplies
+/// the exact boundary check.
+pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let value = obj_to_bigint(obj);
+    let maxdigits = crate::module::sys::state::int_max_str_digits();
+    if maxdigits != 0 {
+        let bits = value.bits();
+        let decimal_digits_lower_bound = if bits == 0 {
+            1
+        } else {
+            ((bits - 1).saturating_mul(30_103) / 100_000) + 1
+        };
+        if decimal_digits_lower_bound > maxdigits as u64 {
+            return Err(crate::PyError::value_error(format!(
+                "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+            )));
+        }
+    }
+    let text = value.to_string();
+    if maxdigits != 0 && text.trim_start_matches('-').len() > maxdigits as usize {
+        return Err(crate::PyError::value_error(format!(
+            "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+        )));
+    }
+    Ok(text)
 }
 
 /// Remove PEP 515 underscore digit separators, rejecting any underscore
@@ -6382,28 +6413,6 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }
             return Ok(floatobject::w_float_new(v));
         }
-        if is_str(obj) {
-            // floatobject.py:242 — unicode is normalized through
-            // `unicode_to_decimal_w` before `_string_to_float`, so non-ASCII
-            // decimal digits parse.
-            let s = unicode_to_decimal_w(obj)?;
-            // The strict conversion above rejected any surrogate, so the
-            // original object now has a valid UTF-8 view for the error text.
-            let raw = w_str_get_value(obj);
-            // `float_from_string` strips PEP 515 underscore separators
-            // (between digits only) before parsing; the numeric conversion
-            // uses the Python-literal float grammar.
-            if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
-                if let Some(v) = rustpython_literal::float::parse_str(&cleaned) {
-                    return Ok(floatobject::w_float_new(v));
-                }
-            }
-            // `floatobject.py:descr_new` — message uses single-quoted str:
-            // "could not convert string to float: '<s>'".
-            return Err(crate::PyError::value_error(format!(
-                "could not convert string to float: '{raw}'"
-            )));
-        }
     }
     // descroperation.py float — type-MRO __float__ then __index__
     if let Some(tp) = crate::typedef::r#type(obj) {
@@ -6436,10 +6445,13 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         }
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__index__") } {
             let r = crate::call::call_function_impl_result(method, &[obj])?;
-            // descroperation.py:609 — exact int or bool (int subclass)
+            // descroperation.py:609 `space.index` returns an arbitrary-size
+            // Python int.  Accept both the machine-word and W_LongObject
+            // layouts, then reuse the integer float conversion so an
+            // out-of-range bigint raises `OverflowError`.
             unsafe {
-                if is_int(r) || is_bool(r) {
-                    return Ok(floatobject::w_float_new(w_int_get_value(r) as f64));
+                if is_int(r) || is_bool(r) || pyre_object::is_long(r) {
+                    return builtin_float(&[r]);
                 }
             }
             let result_type = unsafe { (*(*r).ob_type).name };
@@ -6447,6 +6459,25 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 "__index__ returned non-int (type '{result_type}')",
             )));
         }
+    }
+    // floatobject.py:242 — only after the `__float__` / `__index__` lookup,
+    // unicode (including subclasses without a numeric override) is normalized
+    // through `unicode_to_decimal_w` before `_string_to_float`.
+    if unsafe { is_str(obj) } {
+        let s = unsafe { unicode_to_decimal_w(obj)? };
+        // `float_from_string` strips PEP 515 underscore separators (between
+        // digits only) before parsing the Python-literal float grammar.
+        if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
+            if let Some(v) = rustpython_literal::float::parse_str(&cleaned) {
+                return Ok(floatobject::w_float_new(v));
+            }
+        }
+        // floatobject.py `_string_to_float`: `%R` uses the original source's
+        // repr, preserving quotes and escaping controls/NUL/non-ASCII text.
+        let source_repr = unsafe { crate::py_repr(obj)? };
+        return Err(crate::PyError::value_error(format!(
+            "could not convert string to float: {source_repr}"
+        )));
     }
     // floatobject.py:247-255 — a readable buffer (`charbuf_w`: bytes /
     // bytearray / array / memoryview) is decoded and parsed like a str; an
@@ -6661,6 +6692,15 @@ pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyE
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
     let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    collect_iterator(it)
+}
+
+/// Consume an iterator that has already been obtained.  Kept separate from
+/// [`collect_iterable`] for CPython `PySequence_Fast` parity: callers such as
+/// dict sequence-pair conversion must distinguish an error from `iter(obj)`
+/// from an error raised later by `next()`.
+pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     // Each `next` runs arbitrary allocating code (a generator body, a JIT
     // callee that boxes a fresh int) which can trigger a moving minor
     // collection. A raw `Vec<PyObjectRef>` on the malloc heap is invisible to
@@ -6741,7 +6781,12 @@ pub fn builtin_set_add_items(
         let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
         for i in 0..item_len {
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-            let hash = try_hash_value(item)?;
+            let hash = try_hash_value(item).map_err(|err| {
+                crate::baseobjspace::wrap_set_element_hash_error(
+                    pyre_object::gc_roots::shadow_stack_get(item_base + i),
+                    err,
+                )
+            })?;
             let set = pyre_object::gc_roots::shadow_stack_get(sp);
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             pyre_object::w_set_add_hashed_checked(set, item, hash)
@@ -8005,6 +8050,18 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             None
         };
         if let Some(name) = kind {
+            // The concrete builtin advertises `__hash__ = None`, but a user
+            // subclass may replace that slot.  PyPy's normal special-method
+            // lookup reaches the subclass entry before the inherited typedef
+            // value (Bug #1257731 in CPython's set tests), so only reject the
+            // object after giving a non-None override the call.
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+                    if !pyre_object::is_none(method) {
+                        return hash_call_normalize(method, obj);
+                    }
+                }
+            }
             return Err(crate::PyError::type_error(&format!(
                 "unhashable type: '{}'",
                 name
@@ -8188,8 +8245,9 @@ pub(crate) fn _hash_long(v: &BigInt) -> i64 {
 /// reduces the mantissa/exponent modulo the Mersenne prime
 /// `HASH_MODULUS = 2**61 - 1` (keeping the sign), so `hash(2.0) == hash(2)`
 /// and the `±inf` sentinels are `±314159`; subnormals decompose exactly.
-/// It returns `None` for NaN, and the sole caller (`hash_value`) reaches
-/// here without a prior NaN check, so map that to `HASH_NAN`.
+/// It returns `None` for NaN.  Object-aware callers replace that case with
+/// `default_identity_hash`; `_hash_float` retains PyPy's internal sentinel
+/// for call sites that have no wrapped object.
 #[inline]
 pub(crate) fn _hash_float(v: f64) -> i64 {
     rustpython_common::hash::hash_float(v).unwrap_or(HASH_NAN)
@@ -8338,10 +8396,16 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return _hash_long(pyre_object::w_long_get_value(obj));
         }
         if is_float(obj) {
-            return _hash_float(pyre_object::w_float_get_value(obj));
+            let value = pyre_object::w_float_get_value(obj);
+            return if value.is_nan() {
+                crate::typedef::default_identity_hash_value(obj)
+            } else {
+                _hash_float(value)
+            };
         }
         if pyre_object::is_complex(obj) {
             return crate::objspace::descroperation::complex_hash(
+                obj,
                 pyre_object::w_complex_get_real(obj),
                 pyre_object::w_complex_get_imag(obj),
             );
@@ -8432,7 +8496,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
                 }
             }
         }
-        obj as i64
+        crate::typedef::default_identity_hash_value(obj)
     }
 }
 
@@ -10712,7 +10776,17 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                     if !v.is_finite() {
                         Ok(floatobject::w_float_new(v))
                     } else {
-                        Ok(floatobject::w_float_new(float_round_ndigits(v, n)))
+                        let rounded = float_round_ndigits(v, n);
+                        if rounded.is_infinite() {
+                            // CPython 3.14 `double_round`: PyPy performs the
+                            // same post-rounding infinity check, but retains
+                            // its older error text.
+                            Err(crate::PyError::overflow_error(
+                                "rounded value too large to represent",
+                            ))
+                        } else {
+                            Ok(floatobject::w_float_new(rounded))
+                        }
                     }
                 }
                 // `floatobject.py:954-960 _round_float`: single-argument
@@ -10928,6 +11002,36 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
 fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
+        if is_exact_type(obj, &COMPLEX_TYPE) {
+            return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
+        }
+    }
+    // CPython 3.14 try_complex_special_method runs before the complex-subclass
+    // fallback, so a subclass override is honored instead of reading its raw
+    // lanes.  The inherited complex.__complex__ returns an exact base value.
+    if unsafe { crate::baseobjspace::lookup(obj, "__complex__") }.is_some() {
+        let res = crate::baseobjspace::call_method(obj, "__complex__", &[]);
+        if res.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::type_error("__complex__ call failed")));
+        }
+        unsafe {
+            if is_complex(res) {
+                if !is_exact_type(res, &COMPLEX_TYPE) {
+                    crate::warn::warn_deprecation(&format!(
+                        "__complex__ returned non-complex (type {}). The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
+                        crate::type_methods::arg_type_name(res)
+                    ));
+                }
+                return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
+            }
+        }
+        return Err(crate::PyError::type_error(format!(
+            "__complex__ returned non-complex (type {})",
+            crate::type_methods::arg_type_name(res)
+        )));
+    }
+    unsafe {
         if is_complex(obj) {
             return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
         }
@@ -10944,30 +11048,36 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
             return Ok((w_float_get_value(obj), 0.0));
         }
     }
-    // `__complex__` then `__float__` (complexobject.c try_complex_special_method).
-    unsafe {
-        if is_instance(obj) {
-            let t = w_instance_get_type(obj);
-            if crate::baseobjspace::lookup_in_type(t, "__complex__").is_some() {
-                let res = crate::baseobjspace::call_method(obj, "__complex__", &[]);
-                if res.is_null() {
-                    return Err(crate::call::take_call_error()
-                        .unwrap_or_else(|| crate::PyError::type_error("__complex__ call failed")));
-                }
-                if is_complex(res) {
-                    return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
-                }
-                return Err(crate::PyError::type_error(
-                    "__complex__ should return a complex object",
-                ));
-            }
-        }
+    // `complexobject.py unpackcomplex`: after `__complex__`, conversion uses
+    // the real-number protocol.  Reuse float's `__float__` then `__index__`
+    // ladder so an index-only object is accepted without admitting strings.
+    if unsafe { is_str(obj) || pyre_object::is_bytes(obj) || pyre_object::is_bytearray(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "must be real number, not {}",
+            crate::type_methods::arg_type_name(obj)
+        )));
     }
-    let f = crate::baseobjspace::float_w(obj)?;
-    Ok((f, 0.0))
+    let w_float = builtin_float(&[obj])?;
+    Ok((unsafe { w_float_get_value(w_float) }, 0.0))
 }
 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
+unsafe fn complex_constructor_has_real_protocol(obj: PyObjectRef) -> bool {
+    is_bool(obj)
+        || is_int(obj)
+        || is_long(obj)
+        || is_float(obj)
+        || crate::baseobjspace::lookup(obj, "__float__").is_some()
+        || crate::baseobjspace::lookup(obj, "__index__").is_some()
+}
+
+fn complex_constructor_argument_error(name: &str, obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "complex() argument '{name}' must be a real number, not {}",
+        crate::type_methods::arg_type_name(obj)
+    ))
+}
+
 pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::*;
     // `complex(real=0, imag=0)` — both arguments are positional-or-keyword
@@ -10976,15 +11086,22 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
     let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
     let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+    let simple_single_positional = pos.len() == 1 && !has_real_kwargs(kwargs);
+
+    // `complex.__new__`: an exact complex passed as the sole argument is
+    // returned unchanged.  A strict subclass continues through coercion and
+    // is copied into a base complex.
+    if simple_single_positional && w_imag.is_none() {
+        if let Some(a) = w_real {
+            if unsafe { is_exact_type(a, &COMPLEX_TYPE) } {
+                return Ok(a);
+            }
+        }
+    }
 
     // String form accepts only the real argument.
     if let Some(a) = w_real {
-        if unsafe { is_str(a) } {
-            if w_imag.is_some() {
-                return Err(crate::PyError::type_error(
-                    "complex() can't take second arg if first is a string",
-                ));
-            }
+        if unsafe { is_str(a) } && simple_single_positional {
             // complexobject.py:342 applies `unicode_to_decimal_w` before
             // underscore removal and parsing, including strict surrogate
             // rejection.
@@ -10998,23 +11115,58 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
+    let mut real_is_complex = false;
     let (mut real, mut imag) = match w_real {
-        Some(a) => complex_coerce(a)?,
+        Some(a) => {
+            let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
+            let has_complex_protocol =
+                unsafe { is_complex(a) || crate::baseobjspace::lookup(a, "__complex__").is_some() };
+            if !has_real_protocol && !has_complex_protocol {
+                if simple_single_positional {
+                    return Err(crate::PyError::type_error(format!(
+                        "complex() argument must be a string or a number, not {}",
+                        crate::type_methods::arg_type_name(a)
+                    )));
+                }
+                return Err(complex_constructor_argument_error("real", a));
+            }
+            let value = complex_coerce(a)?;
+            // CPython 3.14 complex_new_impl: using a complex-valued real
+            // argument in the general (keyword/two-argument) constructor is
+            // deprecated unless the original object also has a real-number
+            // conversion protocol.  The single-positional conversion path is
+            // intentionally exempt.
+            if !simple_single_positional && has_complex_protocol && !has_real_protocol {
+                crate::warn::warn_deprecation(&format!(
+                    "complex() argument 'real' must be a real number, not {}",
+                    crate::type_methods::arg_type_name(a)
+                ));
+            }
+            real_is_complex = has_complex_protocol;
+            value
+        }
         None => (0.0, 0.0),
     };
     if let Some(b) = w_imag {
-        if unsafe { is_str(b) } {
-            return Err(crate::PyError::type_error(
-                "complex() second arg can't be a string",
+        let (br, bi, imag_is_complex) = if unsafe { is_complex(b) } {
+            crate::warn::warn_deprecation(&format!(
+                "complex() argument 'imag' must be a real number, not {}",
+                crate::type_methods::arg_type_name(b)
             ));
-        }
-        // complexobject.py:370-377 preserves signed zeroes by checking the
-        // numeric components, not whether either operand is a complex object.
-        let (br, bi) = complex_coerce(b)?;
-        if bi != 0.0 {
+            unsafe { (w_complex_get_real(b), w_complex_get_imag(b), true) }
+        } else {
+            if !unsafe { complex_constructor_has_real_protocol(b) } {
+                return Err(complex_constructor_argument_error("imag", b));
+            }
+            let converted = builtin_float(&[b])?;
+            (unsafe { w_float_get_value(converted) }, 0.0, false)
+        };
+        // CPython 3.14 complex_new_impl: only genuinely complex arguments
+        // contribute the cross lanes; real inputs leave those lanes absent.
+        if imag_is_complex {
             real -= bi;
         }
-        if imag != 0.0 {
+        if real_is_complex {
             imag += br;
         } else {
             imag = br;
@@ -11254,6 +11406,7 @@ mod tests {
 
     #[test]
     fn test_hash_rejects_tuple_containing_unhashable_key() {
+        crate::typedef::init_typeobjects();
         let value = w_tuple_new(vec![w_list_new(vec![])]);
         let err = builtin_hash(&[value]).expect_err("tuple hash should reject list element");
 
@@ -11276,7 +11429,8 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_complex_preserves_imag_arg_negative_zero_with_complex_real() {
+    fn test_builtin_complex_uses_python314_signed_zero_with_complex_real() {
+        crate::typedef::init_typeobjects();
         let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
             unsafe { w_complex_get_real(result).to_bits() },
@@ -11284,7 +11438,7 @@ mod tests {
         );
         assert_eq!(
             unsafe { w_complex_get_imag(result).to_bits() },
-            (-0.0f64).to_bits()
+            0.0f64.to_bits()
         );
     }
 

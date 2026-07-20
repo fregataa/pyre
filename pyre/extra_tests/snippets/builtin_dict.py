@@ -408,3 +408,108 @@ expected_keys = ["x", "y", "w", "z"]
 assert list(result.keys()) == expected_keys, (
     f"Expected {expected_keys}, got {list(result.keys())}"
 )
+
+
+class DictContainsError(Exception):
+    pass
+
+
+class RaisingDictKey:
+    def __hash__(self):
+        raise DictContainsError
+
+
+assert_raises(DictContainsError, {}.__contains__, RaisingDictKey())
+
+
+arity_dict = {"key": "value"}
+assert_raises(TypeError, arity_dict.copy, None)
+assert_raises(TypeError, arity_dict.keys, None)
+assert_raises(TypeError, arity_dict.values, None)
+assert_raises(TypeError, arity_dict.items, None)
+
+
+class DictKeyCallbackError(Exception):
+    pass
+
+
+class FailingDictKey:
+    fail = False
+
+    def __hash__(self):
+        if self.fail:
+            raise DictKeyCallbackError
+        return 42
+
+
+failing_dict_key = FailingDictKey()
+callback_dict = {failing_dict_key: 1}
+failing_dict_key.fail = True
+assert_raises(DictKeyCallbackError, callback_dict.setdefault, failing_dict_key, 2)
+assert_raises(DictKeyCallbackError, callback_dict.pop, failing_dict_key)
+
+
+iterator_mutation_dict = {0: 0}
+iterator_mutation_iter = iter(iterator_mutation_dict)
+assert next(iterator_mutation_iter) == 0
+del iterator_mutation_dict[0]
+iterator_mutation_dict[0] = 1
+assert_raises(RuntimeError, next, iterator_mutation_iter)
+
+iterator_value_dict = {0: 0}
+iterator_value_iter = iter(iterator_value_dict)
+iterator_value_dict[0] = 1
+assert next(iterator_value_iter) == 0
+
+
+# A dict operation that hashes an unhashable key raises a TypeError carrying
+# `unhashable type: 'list'`. PyPy raises it bare; CPython 3.14
+# (`dict_unhashable_type`) prefixes the key type, so match on the substring.
+unhashable_key_message = "unhashable type: 'list'"
+unhashable_dict = {"present": 1}
+for operation in (
+    lambda: [] in unhashable_dict,
+    lambda: unhashable_dict[[]],
+    lambda: unhashable_dict.__setitem__([], 1),
+    lambda: unhashable_dict.setdefault([], 1),
+    lambda: unhashable_dict.pop([]),
+    lambda: unhashable_dict.get([]),
+):
+    with assert_raises(TypeError) as cm:
+        operation()
+    assert unhashable_key_message in str(cm.exception)
+
+
+class DictHashTypeErrorSubclass(TypeError):
+    pass
+
+
+class DictKeyWithTypeErrorSubclass:
+    def __hash__(self):
+        raise DictHashTypeErrorSubclass("keep me")
+
+
+with assert_raises(DictHashTypeErrorSubclass) as cm:
+    unhashable_dict.get(DictKeyWithTypeErrorSubclass())
+assert str(cm.exception) == "keep me"
+
+
+with assert_raises(TypeError) as cm:
+    {}.update([object()])
+assert str(cm.exception) == "object is not iterable"
+assert cm.exception.__notes__ == [
+    "Cannot convert dictionary update sequence element #0 to a sequence"
+]
+
+
+def failing_dict_pair():
+    yield "key"
+    raise TypeError("pair iteration failed")
+
+
+with assert_raises(TypeError) as cm:
+    dict([failing_dict_pair()])
+assert str(cm.exception) == "pair iteration failed"
+assert cm.exception.__notes__ == [
+    "Cannot convert dictionary update sequence element #0 to a sequence"
+]

@@ -9,7 +9,7 @@
 
 use malachite_bigint::BigInt;
 use num_integer::Integer;
-use num_traits::ToPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 
 use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
@@ -1228,6 +1228,11 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     let cap = len
         .checked_mul(count)
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "list is too large"))?;
+    // CPython 3.14 `list_resize`: the element count may fit Py_ssize_t while
+    // `new_allocated * sizeof(PyObject*)` does not (gh-97616).
+    if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
     let mut items: Vec<PyObjectRef> = Vec::new();
     items
         .try_reserve_exact(cap)
@@ -1256,8 +1261,12 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     if count == 1 || len == 0 {
         return Ok(());
     }
-    len.checked_mul(count)
+    let cap = len
+        .checked_mul(count)
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "list is too large"))?;
+    if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
     // Snapshot the original items so the growing list is not re-read while
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
@@ -1385,40 +1394,208 @@ unsafe fn is_complex_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
 unsafe fn complex_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
     let (br, bi) = complex_val(b).unwrap();
-    Ok(w_complex_new(ar + br, ai + bi))
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    // CPython 3.14 complexobject.c COMPLEX_BINOP(add, sum): mixed real /
+    // complex addition uses _Py_cr_sum / _Py_rc_sum and leaves the complex
+    // imaginary lane untouched.  Besides matching C11 Annex G mixed-mode
+    // arithmetic, this preserves the sign of an imaginary zero.
+    if is_complex(a) && is_complex(b) {
+        Ok(w_complex_new(ar + br, ai + bi))
+    } else if is_complex(a) {
+        Ok(w_complex_new(ar + br, ai))
+    } else {
+        Ok(w_complex_new(ar + br, bi))
+    }
 }
 
 unsafe fn complex_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
     let (br, bi) = complex_val(b).unwrap();
-    Ok(w_complex_new(ar - br, ai - bi))
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    // CPython 3.14 _Py_c_diff / _Py_cr_diff / _Py_rc_diff.  In the mixed
+    // cases only the real lane is combined; real-complex negates the complex
+    // imaginary lane directly instead of subtracting it from +0.0.
+    if is_complex(a) && is_complex(b) {
+        Ok(w_complex_new(ar - br, ai - bi))
+    } else if is_complex(a) {
+        Ok(w_complex_new(ar - br, ai))
+    } else {
+        Ok(w_complex_new(ar - br, -bi))
+    }
 }
 
 unsafe fn complex_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
     let (br, bi) = complex_val(b).unwrap();
-    Ok(w_complex_new(ar * br - ai * bi, ar * bi + ai * br))
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    if is_complex(a) && is_complex(b) {
+        Ok(complex_prod(ar, ai, br, bi))
+    } else if is_complex(a) {
+        // CPython 3.14 _Py_cr_prod: multiply each existing complex lane by
+        // the real operand, without manufacturing a zero imaginary lane.
+        Ok(w_complex_new(ar * br, ai * br))
+    } else {
+        // _Py_rc_prod(a, b) delegates to _Py_cr_prod(b, a).
+        Ok(w_complex_new(br * ar, bi * ar))
+    }
 }
 
-/// `complexobject.c _Py_c_quot` — Smith's algorithm for numerical stability.
-unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let (ar, ai) = complex_val(a).unwrap();
-    let (br, bi) = complex_val(b).unwrap();
+/// CPython 3.14 `complexobject.c _Py_c_prod`, including the C11 Annex G.5.1
+/// recovery for infinities that first produce `nan+nanj`.
+unsafe fn complex_prod(mut a: f64, mut b: f64, mut c: f64, mut d: f64) -> PyObjectRef {
+    let ac = a * c;
+    let bd = b * d;
+    let ad = a * d;
+    let bc = b * c;
+    let mut real = ac - bd;
+    let mut imag = ad + bc;
+    if real.is_nan() && imag.is_nan() {
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            a = float_copysign(if a.is_infinite() { 1.0 } else { 0.0 }, a);
+            b = float_copysign(if b.is_infinite() { 1.0 } else { 0.0 }, b);
+            if c.is_nan() {
+                c = float_copysign(0.0, c);
+            }
+            if d.is_nan() {
+                d = float_copysign(0.0, d);
+            }
+            recalc = true;
+        }
+        if c.is_infinite() || d.is_infinite() {
+            c = float_copysign(if c.is_infinite() { 1.0 } else { 0.0 }, c);
+            d = float_copysign(if d.is_infinite() { 1.0 } else { 0.0 }, d);
+            if a.is_nan() {
+                a = float_copysign(0.0, a);
+            }
+            if b.is_nan() {
+                b = float_copysign(0.0, b);
+            }
+            recalc = true;
+        }
+        if !recalc && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite())
+        {
+            if a.is_nan() {
+                a = float_copysign(0.0, a);
+            }
+            if b.is_nan() {
+                b = float_copysign(0.0, b);
+            }
+            if c.is_nan() {
+                c = float_copysign(0.0, c);
+            }
+            if d.is_nan() {
+                d = float_copysign(0.0, d);
+            }
+            recalc = true;
+        }
+        if recalc {
+            real = f64::INFINITY * (a * c - b * d);
+            imag = f64::INFINITY * (a * d + b * c);
+        }
+    }
+    w_complex_new(real, imag)
+}
+
+/// CPython 3.14 `complexobject.c _Py_c_quot`: Smith's stable division plus
+/// the C11 Annex G.5.2 recovery for infinite numerators and denominators.
+unsafe fn complex_quot(ar: f64, ai: f64, br: f64, bi: f64) -> PyObjectRef {
     let abs_br = br.abs();
     let abs_bi = bi.abs();
-    let (real, imag) = if abs_br >= abs_bi {
+    let mut real: f64;
+    let mut imag: f64;
+    if abs_br >= abs_bi {
         if abs_br == 0.0 {
-            return Err(PyError::zero_division("complex division by zero"));
+            // `_Py_c_quot` writes 0+0j and signals EDOM through errno.  The
+            // caller performs that side-channel check before using the pair.
+            return w_complex_new(0.0, 0.0);
         }
         let ratio = bi / br;
         let denom = br + bi * ratio;
-        ((ar + ai * ratio) / denom, (ai - ar * ratio) / denom)
-    } else {
+        real = (ar + ai * ratio) / denom;
+        imag = (ai - ar * ratio) / denom;
+    } else if abs_bi >= abs_br {
         let ratio = br / bi;
         let denom = br * ratio + bi;
-        ((ar * ratio + ai) / denom, (ai * ratio - ar) / denom)
-    };
-    Ok(w_complex_new(real, imag))
+        real = (ar * ratio + ai) / denom;
+        imag = (ai * ratio - ar) / denom;
+    } else {
+        real = f64::NAN;
+        imag = f64::NAN;
+    }
+    if real.is_nan() && imag.is_nan() {
+        if (ar.is_infinite() || ai.is_infinite()) && br.is_finite() && bi.is_finite() {
+            let x = float_copysign(if ar.is_infinite() { 1.0 } else { 0.0 }, ar);
+            let y = float_copysign(if ai.is_infinite() { 1.0 } else { 0.0 }, ai);
+            real = f64::INFINITY * (x * br + y * bi);
+            imag = f64::INFINITY * (y * br - x * bi);
+        } else if (abs_br.is_infinite() || abs_bi.is_infinite()) && ar.is_finite() && ai.is_finite()
+        {
+            let x = float_copysign(if br.is_infinite() { 1.0 } else { 0.0 }, br);
+            let y = float_copysign(if bi.is_infinite() { 1.0 } else { 0.0 }, bi);
+            real = 0.0 * (ar * x + ai * y);
+            imag = 0.0 * (ai * x - ar * y);
+        }
+    }
+    w_complex_new(real, imag)
+}
+
+/// CPython 3.14 `_Py_rc_quot`: real divided by complex, with its distinct
+/// signed-zero recovery when the denominator contains an infinity.
+unsafe fn real_complex_quot(a: f64, br: f64, bi: f64) -> PyObjectRef {
+    let abs_br = br.abs();
+    let abs_bi = bi.abs();
+    let mut real: f64;
+    let mut imag: f64;
+    if abs_br >= abs_bi {
+        if abs_br == 0.0 {
+            return w_complex_new(0.0, 0.0);
+        }
+        let ratio = bi / br;
+        let denom = br + bi * ratio;
+        real = a / denom;
+        imag = (-a * ratio) / denom;
+    } else if abs_bi >= abs_br {
+        let ratio = br / bi;
+        let denom = br * ratio + bi;
+        real = (a * ratio) / denom;
+        imag = (-a) / denom;
+    } else {
+        real = f64::NAN;
+        imag = f64::NAN;
+    }
+    if real.is_nan()
+        && imag.is_nan()
+        && a.is_finite()
+        && (abs_br.is_infinite() || abs_bi.is_infinite())
+    {
+        let x = float_copysign(if br.is_infinite() { 1.0 } else { 0.0 }, br);
+        let y = float_copysign(if bi.is_infinite() { 1.0 } else { 0.0 }, bi);
+        real = 0.0 * (a * x);
+        imag = 0.0 * (-a * y);
+    }
+    w_complex_new(real, imag)
+}
+
+unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    if br == 0.0 && bi == 0.0 {
+        return Err(PyError::zero_division("complex division by zero"));
+    }
+    if is_complex(a) && is_complex(b) {
+        Ok(complex_quot(ar, ai, br, bi))
+    } else if is_complex(a) {
+        // CPython 3.14 _Py_cr_quot.
+        Ok(w_complex_new(ar / br, ai / br))
+    } else {
+        Ok(real_complex_quot(ar, br, bi))
+    }
 }
 
 unsafe fn complex_powi(a: PyObjectRef, exponent: i64) -> PyResult {
@@ -1428,24 +1605,34 @@ unsafe fn complex_powi(a: PyObjectRef, exponent: i64) -> PyResult {
     let mut n = exponent.unsigned_abs();
     while n != 0 {
         if n & 1 != 0 {
-            let real = result_real * base_real - result_imag * base_imag;
-            result_imag = result_real * base_imag + result_imag * base_real;
-            result_real = real;
+            // CPython 3.14 c_powu calls _Py_c_prod for every multiply, so
+            // the Annex G infinity recovery is shared with ordinary `*`.
+            let product = complex_prod(result_real, result_imag, base_real, base_imag);
+            result_real = w_complex_get_real(product);
+            result_imag = w_complex_get_imag(product);
         }
         n >>= 1;
         if n != 0 {
-            let real = base_real * base_real - base_imag * base_imag;
-            base_imag = base_real * base_imag + base_imag * base_real;
-            base_real = real;
+            let square = complex_prod(base_real, base_imag, base_real, base_imag);
+            base_real = w_complex_get_real(square);
+            base_imag = w_complex_get_imag(square);
         }
     }
-    if exponent < 0 {
+    let result = if exponent < 0 {
         complex_truediv(
             w_complex_new(1.0, 0.0),
             w_complex_new(result_real, result_imag),
-        )
+        )?
     } else {
-        Ok(w_complex_new(result_real, result_imag))
+        w_complex_new(result_real, result_imag)
+    };
+    // complexobject.c complex_pow: `_Py_ADJUST_ERANGE2` forces ERANGE when
+    // either component is infinite; the numeric slot reports that as
+    // `OverflowError("complex exponentiation")`.
+    if w_complex_get_real(result).is_infinite() || w_complex_get_imag(result).is_infinite() {
+        Err(PyError::overflow_error("complex exponentiation"))
+    } else {
+        Ok(result)
     }
 }
 
@@ -1473,7 +1660,11 @@ unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         (len * phase.cos(), len * phase.sin())
     };
-    Ok(w_complex_new(real, imag))
+    if real.is_infinite() || imag.is_infinite() {
+        Err(PyError::overflow_error("complex exponentiation"))
+    } else {
+        Ok(w_complex_new(real, imag))
+    }
 }
 
 unsafe fn complex_neg(a: PyObjectRef) -> PyResult {
@@ -1482,29 +1673,64 @@ unsafe fn complex_neg(a: PyObjectRef) -> PyResult {
 }
 
 /// `abs(complex)` → the float magnitude `hypot(real, imag)`.
-unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
-    Ok(w_float_new(ar.hypot(ai)))
+    let result = ar.hypot(ai);
+    if result.is_infinite() && ar.is_finite() && ai.is_finite() {
+        return Err(PyError::overflow_error("absolute value too large"));
+    }
+    Ok(w_float_new(result))
 }
 
 /// Complex equality: `==`/`!=` only (no ordering).  Mixed numeric
 /// operands compare equal when the imaginary part is zero.
 unsafe fn complex_richcompare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
-    let (ar, ai) = complex_val(a).unwrap();
-    let (br, bi) = complex_val(b).unwrap();
-    match op {
-        CompareOp::Eq => Ok(w_bool_from(ar == br && ai == bi)),
-        CompareOp::Ne => Ok(w_bool_from(ar != br || ai != bi)),
-        _ => Err(PyError::type_error(
-            "'<' not supported between instances of 'complex' and 'complex'",
-        )),
+    if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        return Ok(w_not_implemented());
     }
+    let equal = if is_complex(a) && is_complex(b) {
+        w_complex_get_real(a) == w_complex_get_real(b)
+            && w_complex_get_imag(a) == w_complex_get_imag(b)
+    } else {
+        // `complexobject.py descr_eq`: compare a real-only complex through
+        // float/int equality.  Do not round an arbitrary-size integer to f64;
+        // convert the integral float lane to BigInt and compare exactly.
+        let (z, other) = if is_complex(a) { (a, b) } else { (b, a) };
+        let real = w_complex_get_real(z);
+        if w_complex_get_imag(z) != 0.0 {
+            false
+        } else if is_float(other) {
+            real == w_float_get_value(other)
+        } else if is_int(other) || is_long(other) || is_bool(other) {
+            real.is_finite()
+                && real.fract() == 0.0
+                && BigInt::from_f64(real).is_some_and(|value| value == as_bigint(other))
+        } else {
+            return Ok(w_not_implemented());
+        }
+    };
+    Ok(w_bool_from(if matches!(op, CompareOp::Eq) {
+        equal
+    } else {
+        !equal
+    }))
 }
 
 /// `complexobject.c complex_hash` — `hash(real) + _PyHASH_IMAG * hash(imag)`.
-pub(crate) fn complex_hash(real: f64, imag: f64) -> i64 {
-    let hr = crate::builtins::_hash_float(real);
-    let hi = crate::builtins::_hash_float(imag);
+pub(crate) fn complex_hash(obj: PyObjectRef, real: f64, imag: f64) -> i64 {
+    // `complexobject.py descr_hash`: each NaN lane uses the containing
+    // complex object's identity hash, not the float HASH_NAN sentinel.
+    let identity = || crate::typedef::default_identity_hash_value(obj);
+    let hr = if real.is_nan() {
+        identity()
+    } else {
+        crate::builtins::_hash_float(real)
+    };
+    let hi = if imag.is_nan() {
+        identity()
+    } else {
+        crate::builtins::_hash_float(imag)
+    };
     let combined = hr.wrapping_add(hi.wrapping_mul(HASH_IMAG));
     if combined == -1 { -2 } else { combined }
 }
@@ -1980,6 +2206,12 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // tupleobject.py descr_mul
         if is_tuple(a) && is_int_or_long(b) {
             let n = repeat_count(b)?;
+            // tupleobject.py: `if times == 1 and space.type(self) ==
+            // space.w_tuple: return self`. Subclasses must still be copied to
+            // a base tuple.
+            if n == 1 && is_exact_tuple(a) {
+                return Ok(a);
+            }
             let len = w_tuple_len(a);
             let cap = len
                 .checked_mul(n)
@@ -3150,7 +3382,10 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => float_ne(a, b),
             };
         }
-        if is_complex_pair(a, b) {
+        // complexobject.py only implements equality here.  Its ordering
+        // dunders return NotImplemented, which must continue through the
+        // reflected comparison and the generic TypeError fallback below.
+        if is_complex_pair(a, b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
             return complex_richcompare(a, b, op);
         }
         if is_str(a) && is_str(b) {
@@ -3224,7 +3459,9 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             let mut equal = la == lb;
             if equal {
                 for (k, v) in pyre_object::w_dict_items(a) {
-                    match pyre_object::w_dict_lookup(b, k) {
+                    match pyre_object::dictmultiobject::w_dict_lookup_checked(b, k)
+                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))?
+                    {
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,
                             // w_rightval): return space.w_False`
@@ -3319,28 +3556,46 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Gt => la > lb && b_subset_a()?,
             }));
         }
-        // List lexicographic comparison — same logic as tuple.
+        // List comparison. Unlike tuples, element comparison may mutate either
+        // operand, so every loop boundary and the final size comparison read
+        // the live lists (CPython 3.14 `list_richcompare_impl`; PyPy
+        // `list_eq` / `_compare_unwrappeditems`).
         if is_list(a) && is_list(b) {
-            let la = pyre_object::w_list_len(a);
-            let lb = pyre_object::w_list_len(b);
-            let min_len = la.min(lb);
-            for i in 0..min_len {
+            if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                && pyre_object::w_list_len(a) != pyre_object::w_list_len(b)
+            {
+                return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+            }
+
+            let mut i = 0usize;
+            while i < pyre_object::w_list_len(a) && i < pyre_object::w_list_len(b) {
                 let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
                 let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
-                // listobject.py:590 `if not space.eq_w(w_item1, w_item2):
-                //     return getattr(space, name)(w_item1, w_item2)`
                 if !crate::baseobjspace::eq_w(ea, eb)? {
-                    return compare(ea, eb, op);
+                    break;
                 }
+                i += 1;
             }
-            return Ok(w_bool_from(match op {
-                CompareOp::Lt => la < lb,
-                CompareOp::Le => la <= lb,
-                CompareOp::Gt => la > lb,
-                CompareOp::Ge => la >= lb,
-                CompareOp::Eq => la == lb,
-                CompareOp::Ne => la != lb,
-            }));
+            let la = pyre_object::w_list_len(a);
+            let lb = pyre_object::w_list_len(b);
+            if i >= la || i >= lb {
+                return Ok(w_bool_from(match op {
+                    CompareOp::Lt => la < lb,
+                    CompareOp::Le => la <= lb,
+                    CompareOp::Eq => la == lb,
+                    CompareOp::Ne => la != lb,
+                    CompareOp::Gt => la > lb,
+                    CompareOp::Ge => la >= lb,
+                }));
+            }
+            if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+                return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+            }
+            // CPython deliberately fetches the live items again: equality may
+            // have replaced either element before the ordering comparison.
+            let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
+            let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
+            return compare(ea, eb, op);
         }
         // range value comparison — functional.py W_Range.descr_eq:
         // two ranges are equal iff they generate the same sequence

@@ -896,3 +896,113 @@ class poc:
 list1 = rewrite_list_eq([poc()])
 list1.remove(list1)
 assert list1 == []
+
+
+class ClearOther:
+    def __eq__(self, other):
+        list2.clear()
+        return NotImplemented
+
+
+class ClearFirst:
+    def __eq__(self, other):
+        list1.clear()
+        return NotImplemented
+
+
+list1 = [ClearOther()]
+list2 = [ClearFirst()]
+assert list1 == list2
+
+
+class ClearSelfList:
+    def __eq__(self, other):
+        list3.clear()
+        return NotImplemented
+
+
+list3 = [ClearSelfList()]
+list4 = [1]
+assert not list3 == list4
+
+
+same = list(range(4))
+same[::-1] = same
+assert same == [3, 2, 1, 0]
+
+
+class ClearAssignedList:
+    def __init__(self, target):
+        self.target = target
+
+    def __iter__(self):
+        yield from self.target
+        self.target.clear()
+
+
+assigned = list(range(5))
+try:
+    assigned[::-1] = ClearAssignedList(assigned)
+except ValueError:
+    pass
+else:
+    raise AssertionError("mutating extended-slice operand must raise ValueError")
+
+
+class ListSubclassWithNew(list):
+    def __new__(cls, seq, newarg=None):
+        self = super().__new__(cls, seq)
+        self.newarg = newarg
+        return self
+
+
+subclass_with_new = ListSubclassWithNew([1, 2], newarg=3)
+assert type(subclass_with_new) is ListSubclassWithNew
+assert subclass_with_new == [1, 2]
+assert subclass_with_new.newarg == 3
+
+
+class StaticReprPoppingList:
+    @staticmethod
+    def __repr__():
+        try:
+            repr_mutating_list.pop()
+        except IndexError:
+            pass
+        return "obj"
+
+
+repr_mutating_list = [StaticReprPoppingList() for _ in range(5)]
+assert repr(repr_mutating_list) == "[obj, obj, obj]"
+
+
+import gc
+
+finalized_list_subclasses = []
+
+
+class FinalizedListSubclass(list):
+    def __del__(self):
+        finalized_list_subclasses.append(True)
+
+
+finalized = FinalizedListSubclass()
+del finalized
+gc.collect()
+assert finalized_list_subclasses == [True]
+
+
+import sys
+
+resize_overflow = [0] * 65
+del resize_overflow[1:]
+assert len(resize_overflow) == 1
+assert_raises((MemoryError, OverflowError), lambda: resize_overflow * sys.maxsize)
+
+
+def inplace_resize_overflow():
+    value = resize_overflow.copy()
+    value *= sys.maxsize
+
+
+assert_raises((MemoryError, OverflowError), inplace_resize_overflow)

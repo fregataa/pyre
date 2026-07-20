@@ -36,16 +36,28 @@ pub use crate::objspace::descroperation::*;
 // `DictKeyError` to recover whichever exception was raised.
 thread_local! {
     static PENDING_HASH_ERROR: Cell<Option<PyError>> = const { Cell::new(None) };
+    static PENDING_ERROR_FROM_HASH: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Store an error raised by the equality half of the dict `r_dict` callback
+/// pair.  The historical name is retained for existing callers; hash
+/// callbacks use [`set_pending_dict_hash_error`] so Python 3.14's hash-only
+/// dict-key error remapping does not rewrite equality errors.
 pub fn set_pending_hash_error(e: PyError) {
     PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
+    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
+}
+
+pub fn set_pending_dict_hash_error(e: PyError) {
+    PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
+    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(true));
 }
 
 /// `dont_look_inside`: the `PENDING_HASH_ERROR` thread-local `.with`
 /// read has no extractable graph; the call stays a residual.
 #[majit_macros::dont_look_inside]
 pub fn take_pending_hash_error() -> PyError {
+    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
     PENDING_HASH_ERROR.with(|cell| {
         cell.take()
             .unwrap_or_else(|| PyError::type_error("unhashable type"))
@@ -67,6 +79,39 @@ pub fn walk_pending_hash_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             err.walk_gc_refs(visitor);
         }
     });
+}
+
+/// CPython 3.14 `dict_unhashable_type` (`Objects/dictobject.c`) parity.
+/// Only an exact `TypeError` raised while hashing is replaced; equality
+/// callback errors, non-TypeError exceptions, and TypeError subclasses pass
+/// through unchanged.
+#[majit_macros::dont_look_inside]
+pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
+    let from_hash = PENDING_ERROR_FROM_HASH.with(|cell| cell.replace(false));
+    let err = PENDING_HASH_ERROR.with(|cell| {
+        cell.take()
+            .unwrap_or_else(|| PyError::type_error("unhashable type"))
+    });
+    if !from_hash {
+        return err;
+    }
+    wrap_dict_key_hash_error(key, err)
+}
+
+/// The direct-hash counterpart of [`take_pending_dict_key_error`], used by
+/// bytecode paths which compute the key hash before entering `r_dict`.
+///
+/// A bad dict key raises the bare `unhashable type: '<type>'` TypeError from
+/// hashing, with no container-specific prefix, so the error passes through.
+pub fn wrap_dict_key_hash_error(_key: PyObjectRef, err: PyError) -> PyError {
+    err
+}
+
+/// The set-element counterpart of [`wrap_dict_key_hash_error`]: a bad element
+/// raises the bare `unhashable type: '<type>'` TypeError from hashing, so the
+/// error passes through unchanged.
+pub fn wrap_set_element_hash_error(_item: PyObjectRef, err: PyError) -> PyError {
+    err
 }
 
 /// Compatibility alias for PyPy's base-object type.
@@ -1191,7 +1236,7 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                     // __missing__ dispatch before KeyError
                     dict_missing_or_key_error(obj, index)
                 }
-                Err(_) => Err(take_pending_hash_error()),
+                Err(_) => Err(take_pending_dict_key_error(index)),
             };
         }
         if is_str(obj) {
@@ -1240,6 +1285,18 @@ fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
     PyError::type_error(format!(
         "{descr} indices must be integers or slices, not '{tp}'"
     ))
+}
+
+/// Python 3.14 string-subscript wording.  Unlike this PyPy source's generic
+/// `getindex_w(..., "string")` remap, 3.14 omits "or slices" after the slice
+/// case has already been handled and preserves errors raised by `__index__`.
+fn string_index_type_error(index: PyObjectRef) -> PyError {
+    let tp = if index.is_null() {
+        "NULL".to_string()
+    } else {
+        object_functionstr_type_name(index)
+    };
+    PyError::type_error(format!("string indices must be integers, not '{tp}'"))
 }
 
 /// `getindex_w` remaps a `TypeError` raised while coercing a subscript key
@@ -1421,7 +1478,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
         let indexed = match space_index(index) {
             Ok(w) => w,
-            Err(e) => return Err(remap_getindex_type_error(e, "string", index)),
+            Err(e) => return Err(e),
         };
         if is_int(indexed) {
             w_int_get_value(indexed)
@@ -1440,7 +1497,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             }
         }
     } else {
-        return Err(index_type_error("string", index));
+        return Err(string_index_type_error(index));
     };
     let actual_idx = if idx < 0 { cps.len() as i64 + idx } else { idx } as usize;
     if actual_idx < cps.len() {
@@ -1682,13 +1739,11 @@ unsafe fn compute_slice_indices3_big(
 /// `functional.py W_Range._compute_slice` — build the NEW `range`
 /// a slice of `obj` denotes.
 unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
-    use num_traits::Zero;
     let len_b = pyre_object::range_obj_to_bigint(pyre_object::w_range_length(obj));
     let (sl_start, sl_stop, sl_step) = compute_slice_indices3_big(slice, &len_b)?;
     let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
     let rstart_b = pyre_object::range_obj_to_bigint(rstart);
     let rstep_b = pyre_object::range_obj_to_bigint(rstep);
-    let stop_is_zero = sl_stop.is_zero();
     let substart = &rstart_b + &sl_start * &rstep_b;
     let substep = &rstep_b * &sl_step;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1696,31 +1751,74 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     pyre_object::gc_roots::pin_root(w_substart);
     let w_substep = pyre_object::range_bigint_to_obj(substep);
     pyre_object::gc_roots::pin_root(w_substep);
-    let w_substop = if stop_is_zero {
-        w_substart
-    } else {
-        let substop = &rstart_b + &sl_stop * &rstep_b;
-        let o = pyre_object::range_bigint_to_obj(substop);
-        pyre_object::gc_roots::pin_root(o);
-        o
-    };
+    // functional.py:523-526 tests `if w_stop`, i.e. whether the wrapped
+    // pointer exists, not whether its integer payload is zero.  The wrapped
+    // result of compute_slice_indices3 is always present, so compute the stop
+    // lane even when its value is 0 (notably for `r[-1:-3:-1]`).
+    let substop = &rstart_b + &sl_stop * &rstep_b;
+    let w_substop = pyre_object::range_bigint_to_obj(substop);
+    pyre_object::gc_roots::pin_root(w_substop);
     Ok(pyre_object::w_range_new(w_substart, w_substop, w_substep))
+}
+
+/// `space.type(w_item) is space.w_int or space.w_bool` used by
+/// `W_Range.descr_contains/count/index`.  BigInt-backed exact ints share the
+/// canonical `int` class through `is_exact_type`; an int subclass must take
+/// the elementwise comparison path so its `__eq__` override is honored.
+unsafe fn range_integer_fast_path(item: PyObjectRef) -> bool {
+    is_bool(item) || pyre_object::is_exact_type(item, &pyre_object::INT_TYPE)
 }
 
 /// `range.count(value)` — `functional.py W_Range.descr_count`.
 pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "range.count() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let obj = args[0];
-    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
-    Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
+    let needle = args[1];
+    unsafe {
+        if range_integer_fast_path(needle) {
+            let item = pyre_object::range_obj_to_bigint(needle);
+            return Ok(w_int_new(
+                pyre_object::w_range_contains_bigint(obj, &item) as i64
+            ));
+        }
+    }
+    // `space.sequence_count(self, w_item)` — scan the whole sequence, not
+    // merely until the first match.  Keep the counter unbounded like PyPy's
+    // wrapped integer accumulator.
+    let it = iter(obj)?;
+    let mut count = malachite_bigint::BigInt::from(0);
+    loop {
+        match next(it) {
+            Ok(item) => {
+                if is_true(compare(item, needle, CompareOp::Eq)?)? {
+                    count += malachite_bigint::BigInt::from(1);
+                }
+            }
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(pyre_object::range_bigint_to_obj(count))
 }
 
 /// `range.index(value)` — `functional.py W_Range.descr_index`.
 pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "range.index() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let obj = args[0];
-    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
+    let needle = args[1];
     unsafe {
         // int / bool / long needle → O(1) `(value - start) // step`.
-        if is_int(needle) || is_long(needle) {
+        if range_integer_fast_path(needle) {
             let item = pyre_object::range_obj_to_bigint(needle);
             if pyre_object::w_range_contains_bigint(obj, &item) {
                 return Ok(pyre_object::w_range_index_of(obj, &item));
@@ -2822,7 +2920,7 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
         if is_dict(obj) {
             return match pyre_object::dictmultiobject::w_dict_store_checked(obj, index, value) {
                 Ok(()) => Ok(w_none()),
-                Err(_) => Err(take_pending_hash_error()),
+                Err(_) => Err(take_pending_dict_key_error(index)),
             };
         }
         if pyre_object::bytearrayobject::is_bytearray(obj) {
@@ -2894,19 +2992,31 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
 
 #[inline(never)]
 unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
-    let len = w_list_len(obj) as i64;
-    let (start, stop, step) = normalize_slice(index, len)?;
-    // listobject.py:709-714 wraps non-list iterables into a
-    // temporary W_ListObject so the strategy-aware setslice
-    // (`listobject.py:1746-1758`) and extended-slice
-    // (`listobject.py:descr_setitem` step != 1 branch) paths
-    // see a list operand.
-    let w_other = if pyre_object::is_list(value) {
+    // CPython 3.14 `list_ass_subscript_lock_held`: unpack the slice first,
+    // materialize the replacement next, and only then adjust the bounds
+    // against the list's live length. Materializing an arbitrary iterable may
+    // mutate `obj` (gh-120384), so using its earlier length is incorrect.
+    let (raw_start, raw_stop, step) = crate::sliceobject::slice_unpack(
+        w_slice_get_start(index),
+        w_slice_get_stop(index),
+        w_slice_get_step(index),
+    )?;
+    // PyPy listobject.py:709-714 wraps non-list iterables into a temporary
+    // W_ListObject so the strategy-aware setslice path sees a list operand.
+    // CPython additionally protects `a[::-1] = a` with a shallow copy.
+    let w_other = if obj == value {
+        pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec(
+            value,
+        ))
+    } else if pyre_object::is_list(value) {
         value
     } else {
         let items = crate::builtins::collect_iterable(value)?;
         pyre_object::listobject::w_list_new(items)
     };
+    let len = w_list_len(obj) as i64;
+    let (start, stop, step, slicelength) =
+        crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
     if step == 1 {
         let s_lo = start.max(0) as usize;
         // listobject.py passes `(start, step, slicelength)` to `setslice`;
@@ -2923,13 +3033,15 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     // W_ListObject.descr_setitem` enforces equal length
     // ("attempt to assign sequence of size %d to extended
     // slice of size %d") and writes positions in order.
-    let mut indices = Vec::new();
+    let mut indices = Vec::with_capacity(slicelength as usize);
     let mut i = start;
-    while (step > 0 && i < stop) || (step < 0 && i > stop) {
-        if i >= 0 && i < len {
-            indices.push(i);
+    for n in 0..slicelength {
+        indices.push(i);
+        // Do not compute an unused successor: `step` may have been clamped
+        // from an arbitrarily large Python integer to i64::MAX.
+        if n + 1 < slicelength {
+            i += step;
         }
-        i += step;
     }
     let other_len = pyre_object::w_list_len(w_other);
     if other_len != indices.len() {
@@ -6015,12 +6127,26 @@ pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     };
     // baseobjspace.py:324 `w_result = space.get_and_call_function(w_impl, self)`
     let w_result = crate::builtins::call_and_check(method, &[obj])?;
-    // baseobjspace.py:326-337 validate that w_result is a W_AbstractIntObject.
-    if unsafe { pyre_object::pyobject::is_int_or_long(w_result) } {
+    // baseobjspace.py:326-327 — an exact int returns directly.
+    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE);
+    if crate::typedef::r#type(w_result) == w_int {
+        return Ok(w_result);
+    }
+    // baseobjspace.py:328-336 — a strict int subclass is accepted for now,
+    // with the deprecation warning consumed by CPython's int tests.
+    if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }
+    {
+        let tp = crate::type_methods::arg_type_name(w_result);
+        crate::warn::warn_deprecation(&format!(
+            "__int__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
+        ));
         return Ok(w_result);
     }
     // baseobjspace.py:338-339 non-int result → TypeError.
-    Err(PyError::type_error("__int__ returned non-int"))
+    Err(PyError::type_error(format!(
+        "__int__ returned non-int (type {})",
+        object_functionstr_type_name(w_result),
+    )))
 }
 
 /// baseobjspace.py:1811-1824 `ObjSpace.int_w(w_obj,
@@ -9407,8 +9533,33 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         )));
     };
     let w_result = crate::builtins::call_and_check(method, &[obj])?;
-    if unsafe { pyre_object::pyobject::is_int_or_long(w_result) } {
+    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE);
+    if crate::typedef::r#type(w_result) == w_int {
         return Ok(w_result);
+    }
+    if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }
+    {
+        let tp = crate::type_methods::arg_type_name(w_result);
+        crate::warn::warn_deprecation(&format!(
+            "__index__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
+        ));
+        // descroperation.py:622-627 `space.index` — return a base int,
+        // never the strict subclass supplied by `__index__`.
+        unsafe {
+            if pyre_object::is_bool(w_result) {
+                return Ok(pyre_object::w_int_new(
+                    pyre_object::w_bool_get_value(w_result) as i64,
+                ));
+            }
+            if pyre_object::is_int(w_result) {
+                return Ok(pyre_object::w_int_new(pyre_object::w_int_get_value(
+                    w_result,
+                )));
+            }
+            return Ok(pyre_object::w_long_new(
+                pyre_object::w_long_get_value(w_result).clone(),
+            ));
+        }
     }
     Err(PyError::type_error(format!(
         "__index__ returned non-int (type {})",
@@ -11326,6 +11477,16 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     "dictionary changed size during iteration".to_string(),
                 ));
             }
+            // PyPy's strategy iterator retains its native mutation state even
+            // when a delete+insert restores the original length.  Pyre's
+            // compacting IndexMap needs the equivalent explicit stamp.
+            let start_keys_version = dv::w_dict_view_iterator_get_start_keys_version(obj);
+            if start_keys_version != dv::w_dict_keys_version(dict) {
+                return Err(PyError::new(
+                    PyErrorKind::RuntimeError,
+                    "dictionary keys changed during iteration".to_string(),
+                ));
+            }
             let index = dv::w_dict_view_iterator_get_index(obj);
             if index >= startlen {
                 return Err(PyError::stop_iteration());
@@ -12792,7 +12953,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         pyre_object::dictmultiobject::w_dict_lookup_checked(dict, needle)
                     } {
                         Ok(v) => Ok(v.is_some()),
-                        Err(_) => Err(take_pending_hash_error()),
+                        Err(_) => Err(take_pending_dict_key_error(needle)),
                     };
                 }
                 pyre_object::dictmultiobject::DictViewKind::Items => {
@@ -12812,7 +12973,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                     } {
                         Ok(Some(have)) => eq_w(have, want),
                         Ok(None) => Ok(false),
-                        Err(_) => Err(take_pending_hash_error()),
+                        Err(_) => Err(take_pending_dict_key_error(k)),
                     };
                 }
                 pyre_object::dictmultiobject::DictViewKind::Values => {
@@ -12831,7 +12992,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     // an int/long needle; any other type falls back to an elementwise scan.
     unsafe {
         if pyre_object::is_w_range(haystack) {
-            if is_int(needle) || is_long(needle) {
+            if range_integer_fast_path(needle) {
                 let item = pyre_object::range_obj_to_bigint(needle);
                 return Ok(pyre_object::w_range_contains_bigint(haystack, &item));
             }
@@ -12853,15 +13014,14 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     }
     unsafe {
         if is_list(haystack) {
-            let len = w_list_len(haystack);
-            for i in 0..len {
-                if let Some(item) = w_list_getitem(haystack, i as i64) {
-                    if eq_w(item, needle)? {
-                        return Ok(true);
-                    }
-                }
-            }
-            return Ok(false);
+            // `W_ListObject.descr_contains`: membership is the same
+            // strategy-aware `find_or_count` operation used by count/index.
+            // In particular FloatListStrategy preserves an erased NaN's
+            // identity shortcut with its bit-pattern comparison.
+            return Ok(matches!(
+                crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false,)?,
+                crate::listobject::FindOrCountResult::Index(_)
+            ));
         }
         if is_tuple(haystack) {
             let len = w_tuple_len(haystack);
@@ -12927,7 +13087,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         if is_dict(haystack) {
             return match pyre_object::dictmultiobject::w_dict_lookup_checked(haystack, needle) {
                 Ok(v) => Ok(v.is_some()),
-                Err(_) => Err(take_pending_hash_error()),
+                Err(_) => Err(take_pending_dict_key_error(needle)),
             };
         }
         // set / frozenset (setobject.py W_BaseSetObject.descr_contains)
@@ -13001,10 +13161,10 @@ pub fn hash_w(obj: PyObjectRef) -> i64 {
 /// silently returning a sentinel hash.  Shares the single dispatch with
 /// the `hash()` entry point (`builtins::builtin_hash`): `try_hash_value`
 /// covers the unhashable ladder (dict / list / set / bytearray / dict
-/// view / slice per `dictmultiobject.py:1431` + `listobject.py` +
-/// `setobject.py`), memoryview, tuple / frozenset / GenericAlias /
-/// UnionType, and user-class + typed-payload `__hash__` overrides (e.g.
-/// `class D(deque): __hash__ = ...`) before the `hash_value` fallback.
+/// view), Python 3.14's hashable slice, memoryview, tuple / frozenset /
+/// GenericAlias / UnionType, and user-class + typed-payload `__hash__`
+/// overrides (e.g. `class D(deque): __hash__ = ...`) before the
+/// `hash_value` fallback.
 /// Callers that must surface the `TypeError` directly (EmptyDictStrategy
 /// `getitem` / ObjectDictStrategy lookups per `dictmultiobject.py:738-743`)
 /// reuse it here rather than duplicating a subset of the ladder that would
@@ -13013,37 +13173,11 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("hash() argument is null"));
     }
-    unsafe {
-        let kind = if pyre_object::is_dict(obj) {
-            Some("dict")
-        } else if pyre_object::is_list(obj) {
-            Some("list")
-        } else if pyre_object::is_set(obj) {
-            Some("set")
-        } else if pyre_object::is_bytearray(obj) {
-            Some("bytearray")
-        } else if pyre_object::dictmultiobject::is_dict_view_keys(obj) {
-            // `dictmultiobject.py:1626 _is_set_like` — only the keys and items
-            // views are set-like: they define `__eq__` and so are unhashable.
-            // The values view keeps `object.__hash__`.
-            Some("dict_keys")
-        } else if pyre_object::dictmultiobject::is_dict_view_items(obj) {
-            Some("dict_items")
-        } else if pyre_object::sliceobject::is_slice(obj) {
-            Some("slice")
-        } else {
-            None
-        };
-        if let Some(name) = kind {
-            return Err(PyError::type_error(format!("unhashable type: '{}'", name)));
-        }
-        // A released or writable memoryview is unhashable; route through the
-        // fallible hasher so it raises the proper ValueError instead of an
-        // infallible identity hash (`memoryobject.py descr_hash`).
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            return crate::builtins::try_hash_value(obj);
-        }
-    }
+    // Keep a single special-method dispatch.  `try_hash_value` distinguishes
+    // exact unhashable builtin containers from subclasses that override
+    // `__hash__`, and also carries Python 3.14's hashable-slice semantics plus
+    // memoryview's released/writable errors.  Pre-rejecting by payload layout
+    // here would bypass all three observable cases.
     crate::builtins::try_hash_value(obj)
 }
 
@@ -13052,34 +13186,8 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
 ///   `self.is_w(w_obj1, w_obj2) or self.is_true(self.eq(w_obj1, w_obj2))`.
 /// A raising `__eq__` or a raising `__bool__` on its result propagates.
 pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
-    if a == b {
+    if is_w(a, b) {
         return Ok(true);
-    }
-    unsafe {
-        use pyre_object::*;
-        // The by-value fast paths assume exact builtin operands; a subclass
-        // overriding `__eq__` must dispatch through `compare` instead.
-        if is_exact_builtin_instance(a) && is_exact_builtin_instance(b) {
-            if (is_int(a) || is_bool(a)) && (is_int(b) || is_bool(b)) {
-                let av = if is_bool(a) {
-                    w_bool_get_value(a) as i64
-                } else {
-                    w_int_get_value(a)
-                };
-                let bv = if is_bool(b) {
-                    w_bool_get_value(b) as i64
-                } else {
-                    w_int_get_value(b)
-                };
-                return Ok(av == bv);
-            }
-            if is_str(a) && is_str(b) {
-                // Compare WTF-8 bytes so lone-surrogate strings compare by
-                // content instead of panicking in `w_str_get_value`.
-                return Ok(pyre_object::w_str_get_wtf8(a).as_bytes()
-                    == pyre_object::w_str_get_wtf8(b).as_bytes());
-            }
-        }
     }
     Ok(is_true(compare(a, b, CompareOp::Eq)?)?)
 }
@@ -13136,8 +13244,14 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
     unsafe {
         if is_list(obj) {
             if is_slice(index) {
+                let (raw_start, raw_stop, step) = crate::sliceobject::slice_unpack(
+                    w_slice_get_start(index),
+                    w_slice_get_stop(index),
+                    w_slice_get_step(index),
+                )?;
                 let len = w_list_len(obj) as i64;
-                let (start, stop, step) = normalize_slice(index, len)?;
+                let (start, stop, step, slicelength) =
+                    crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
                 if step == 1 {
                     w_list_delslice(obj, start.max(0) as usize, stop.max(start) as usize);
                     return Ok(());
@@ -13145,16 +13259,13 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 // Extended-slice delete: gather the selected indices, then
                 // pop them in descending order so earlier removals do not
                 // shift the positions of later targets.
-                let mut indices: Vec<i64> = Vec::new();
+                let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
                 let mut i = start;
-                if step > 0 {
-                    while i < stop {
-                        indices.push(i);
-                        i += step;
-                    }
-                } else {
-                    while i > stop {
-                        indices.push(i);
+                for n in 0..slicelength {
+                    indices.push(i);
+                    // Like PyPy's range over the computed slice length, avoid
+                    // forming a successor after the final selected item.
+                    if n + 1 < slicelength {
                         i += step;
                     }
                 }
@@ -13297,7 +13408,7 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
         match pyre_object::dictmultiobject::w_dict_delitem_checked(obj, key) {
             Ok(true) => Ok(()),
             Ok(false) => Err(PyError::key_error_with_key(key)),
-            Err(_) => Err(take_pending_hash_error()),
+            Err(_) => Err(take_pending_dict_key_error(key)),
         }
     }
 }
