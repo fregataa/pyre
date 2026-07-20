@@ -2344,7 +2344,12 @@ fn emit_frontend_buildslice_shadow_graph(
     let step = match argc {
         BuildSliceArgCount::Two => {
             debug_assert!(step.is_none(), "BUILD_SLICE argc=2 must synthesize None");
-            super::flow::Constant::none().into()
+            // `space.w_None`, not the null Ref sentinel used by `Constant::none()`.
+            super::flow::Constant::new(
+                super::flow::ConstantValue::Signed(pyre_object::w_none() as i64),
+                Some(Kind::Ref),
+            )
+            .into()
         }
         BuildSliceArgCount::Three => step.expect("BUILD_SLICE argc=3 must preserve explicit step"),
     };
@@ -4557,6 +4562,61 @@ fn filter_liveness_in_place(
             union_r.extend(pc_live_r);
             union_f.extend(pc_live_f);
         }
+        // `liveness.py:67-75` keeps Ref values read by the instructions after
+        // this marker. Pyre's frame-slot filter normally removes scratch Ref
+        // colors, but LOAD_ATTR's in-place residual receiver/result is a live
+        // operand populated by the tracer and must be seeded before blackhole
+        // executes the call.
+        for next in ssarepr.insns.iter().skip(insn_idx + 1) {
+            if next.is_live() {
+                break;
+            }
+            let super::flatten::Insn::Op {
+                opname: _,
+                args,
+                result,
+            } = next
+            else {
+                continue;
+            };
+            // A sparse opcode-start marker can also precede the residual op
+            // that consumes the prior opcode's result (for example
+            // LOAD_NAME(r) followed by LOAD_ATTR). Those Ref arguments are
+            // real SSA-live values populated by the tracer, not disposable
+            // scratch, and must be seeded before blackhole executes the call.
+            let is_load_attr_call = args.iter().any(|arg| {
+                matches!(
+                    arg,
+                    SsaOperand::Descr(descr)
+                        if matches!(
+                            &**descr,
+                            super::flatten::DescrOperand::CallDescrStub(stub)
+                                if stub.effect_info.pyre_helper
+                                    == majit_ir::PyreHelperKind::LoadAttr
+                        )
+                )
+            });
+            if is_load_attr_call && let Some(result) = result.filter(|reg| reg.kind == SsaKind::Ref)
+            {
+                for arg in args {
+                    match arg {
+                        SsaOperand::Register(reg) if *reg == result => {
+                            union_r.insert(reg.index);
+                        }
+                        SsaOperand::ListOfKind(list) if list.kind == SsaKind::Ref => {
+                            for item in &list.content {
+                                if let SsaOperand::Register(reg) = item
+                                    && *reg == result
+                                {
+                                    union_r.insert(reg.index);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // #348 Part (2): the marker's Ref colors are now final in `union_r`.
         // Collect the group's `(color, slot)` entries (union of member PCs'
@@ -5370,7 +5430,7 @@ impl CodeWriter {
     /// Python bytecodes serve as the "graph". Since they are already linear
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
-    pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> PyJitCode {
+    pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> Option<PyJitCode> {
         // Recover the live globals-stamped PyCode wrapper for `code` from the
         // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
         // per-code wrapper that every compiled code has stamped (during the
@@ -7452,6 +7512,19 @@ impl CodeWriter {
                 // every new block iteration so a previous block's
                 // queued switch doesn't bleed into this one.
                 block_switch_pending = false;
+                // Blocks are dequeued in a non-sequential order, so the
+                // running EXTENDED_ARG accumulator must not persist across
+                // block boundaries: a block that ends on an EXTENDED_ARG
+                // code unit would otherwise fold its stale high bits into
+                // the next dequeued block's first instruction argument
+                // (e.g. COMPARE_OP 148 decoded as (1 << 8) | 148 = 404,
+                // rejected by Arg<ComparisonOperator>::try_from). Within a
+                // block the walk is sequential (start_pc..num_instrs) and
+                // every branch/handler target lands on an instruction start
+                // (the EXTENDED_ARG prefix is included), so a clean reset at
+                // block entry keeps in-block prefixes intact while cutting
+                // the cross-block leak.
+                arg_state.reset();
                 // Note — upstream `flowcontext.py:407-416`
                 // drives per-block op accumulation via `while True:
                 // handle_bytecode(...)` until a terminator, then
@@ -8308,7 +8381,12 @@ impl CodeWriter {
                                     // the target's `jit_merge_point` treats
                                     // this arrival as a loop crossing
                                     // (pyjitpl.py:1527-1562).
-                                    if let Some(jdindex) = portal_jd_index {
+                                    if !backward_jump_is_handler_only_target(
+                                        code,
+                                        py_pc,
+                                        target_py_pc,
+                                    ) && let Some(jdindex) = portal_jd_index
+                                    {
                                         emit_loop_header(
                                             &graph,
                                             &current_block,
@@ -8734,7 +8812,12 @@ impl CodeWriter {
                                     // Same `can_enter_jit` → `loop_header`
                                     // lowering as the JumpBackward arm above
                                     // (jtransform.py:1714-1723).
-                                    if let Some(jdindex) = portal_jd_index {
+                                    if !backward_jump_is_handler_only_target(
+                                        code,
+                                        py_pc,
+                                        target_py_pc,
+                                    ) && let Some(jdindex) = portal_jd_index
+                                    {
                                         emit_loop_header(
                                             &graph,
                                             &current_block,
@@ -9704,6 +9787,43 @@ impl CodeWriter {
                             let tuple_value = tuple_var
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // This opcode lowers to more than one residual call,
+                            // but only the validator can raise for a validated
+                            // built-in sequence.  Its trailing `-live-` must be
+                            // immediately followed by `catch_exception`: a
+                            // specialization guard can resume at this call and
+                            // discover a different runtime arity.  Split the
+                            // successful continuation before emitting the item
+                            // reads so blackhole exception dispatch sees the
+                            // validator's own exception edge.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception!(catch_label);
+                                exception_edge_handled = true;
+
+                                // Carry the normalized tuple across the graph
+                                // edge as a temporary FrameState value.  It is
+                                // not part of the Python operand stack, so remove
+                                // it again as soon as the continuation starts.
+                                current_state.stack.push(tuple_value.clone());
+                                let mut next_state = current_state.clone();
+                                next_state.next_offset = py_pc;
+                                next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                                let next_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(next_state.clone()),
+                                );
+                                all_walker_blocks.push(next_block.clone());
+                                next_block.block().borrow_mut().inputargs =
+                                    next_state.getvariables();
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(&current_state, &next_state, next_block.block()),
+                                );
+                                restore_canraise_exit_order(&current_block.block());
+                                current_block = next_block;
+                                current_state = next_state;
+                                current_state.stack.pop();
+                            }
                             // Push the items in reverse so the stack top is item[0]
                             // (opcode_unpack_sequence pushes `items.into_iter().rev()`).
                             for k in (0..n).rev() {
@@ -11060,6 +11180,35 @@ impl CodeWriter {
                             let tuple_value = tuple_var
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // Keep the raising validator's exception edge
+                            // adjacent to its trailing `-live-`; the item-reader
+                            // residuals belong to the successful continuation.
+                            // This is the starred-unpack sibling of the
+                            // UNPACK_SEQUENCE split above.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception!(catch_label);
+                                exception_edge_handled = true;
+
+                                current_state.stack.push(tuple_value.clone());
+                                let mut next_state = current_state.clone();
+                                next_state.next_offset = py_pc;
+                                next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                                let next_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(next_state.clone()),
+                                );
+                                all_walker_blocks.push(next_block.clone());
+                                next_block.block().borrow_mut().inputargs =
+                                    next_state.getvariables();
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(&current_state, &next_state, next_block.block()),
+                                );
+                                restore_canraise_exit_order(&current_block.block());
+                                current_block = next_block;
+                                current_state = next_state;
+                                current_state.stack.pop();
+                            }
                             // Push the slots in reverse so the stack top is
                             // slot[0] (unpack_ex pushes head items last).
                             for k in (0..total).rev() {
@@ -12027,6 +12176,38 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
+                        // MatchMapping: peeks TOS (subject), pushes bool. Net: +1.
+                        Instruction::MatchMapping => {
+                            push_fresh_ref(&mut current_state, &mut graph);
+                            current_depth += 1;
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // MatchKeys: peeks subject + keys tuple (TOS), pushes a
+                        // values tuple or None. Net: +1.
+                        Instruction::MatchKeys => {
+                            push_fresh_ref(&mut current_state, &mut graph);
+                            current_depth += 1;
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // MatchClass: pops subject, type and the keyword-names
+                        // tuple (3), pushes the extracted-attrs tuple or None (1).
+                        // Net: -2. The stack effect MUST be modelled even though
+                        // the trace aborts: an unmodelled MATCH_CLASS (via the
+                        // catch-all below) left the operand-stack depth 2 too high,
+                        // so the enclosing block's return link carried stale pattern
+                        // temporaries and tripped `make_return`'s arity assert in
+                        // the flatten pass.
+                        Instruction::MatchClass { .. } => {
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            push_fresh_ref(&mut current_state, &mut graph);
+                            current_depth += 1;
+                            emit_abort_permanent!(py_pc);
+                        }
+
                         // Catch-all: unknown instruction.
                         _other => {
                             emit_abort_permanent!(py_pc);
@@ -12553,6 +12734,21 @@ impl CodeWriter {
                     &splice_pairs,
                     &splice_interference,
                 );
+            // `interp_jit.py:67 reds = ['frame', 'ec']`: both portal inputs
+            // are live in every MIFrame at every guard. Give them dedicated
+            // Ref colors above the ordinary allocator range so neither can be
+            // coalesced with a local/stack value at an interior resume point.
+            // This is the post-color equivalent of adding interference edges
+            // from the always-live reds to every Ref, without perturbing the
+            // coloring of the body itself.
+            {
+                let ref_alloc = &mut splice_regallocs[Kind::Ref.index()];
+                let frame_color = ref_alloc.num_colors;
+                let ec_color = frame_color + 1;
+                ref_alloc.coloring.insert(frame_var.id, frame_color);
+                ref_alloc.coloring.insert(ec_var.id, ec_color);
+                ref_alloc.num_colors = ec_color + 1;
+            }
             let ssarepr = super::flatten::flatten_graph(
                 &graph,
                 &mut splice_regallocs,
@@ -13049,7 +13245,7 @@ impl CodeWriter {
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
-    ) -> PyJitCode {
+    ) -> Option<PyJitCode> {
         // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
         // before assembly so `JitCodeBuilder::finish()` can stamp them
@@ -13094,7 +13290,7 @@ impl CodeWriter {
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
-        };
+        }?;
         let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
@@ -13511,12 +13707,12 @@ impl CodeWriter {
             is_drained: true,
         };
 
-        PyJitCode::from_parts(
+        Some(PyJitCode::from_parts(
             std::sync::Arc::new(jitcode),
             metadata,
             code as *const CodeObject,
             has_abort,
-        )
+        ))
     }
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
@@ -13594,7 +13790,9 @@ impl CodeWriter {
             // replaces the cached skeleton's payload in place. That
             // matches RPython's "same JitCode object is filled later"
             // identity flow even after other stores cloned the Arc.
-            let pyjitcode = self.transform_graph_to_jitcode(unsafe { &*code_ptr });
+            let Some(pyjitcode) = self.transform_graph_to_jitcode(unsafe { &*code_ptr }) else {
+                continue;
+            };
             let key = code_ptr as usize;
             let pyjitcode = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
@@ -13688,6 +13886,36 @@ fn backward_jump_target(
     }
 }
 
+/// True when a backward bytecode jump is only a control-flow return from an
+/// out-of-line exception handler to earlier mainline code, rather than a loop
+/// backedge.  Python 3.14 lays handler cleanup blocks after the protected
+/// body, so a `break` in a handler can be encoded as `JUMP_BACKWARD` even
+/// though its landing is after the source loop.  `interp_jit.py:103-114`
+/// attaches `loop_header` / `can_enter_jit` to semantic loop backedges; do not
+/// manufacture a JIT loop header for this layout-only backward coordinate.
+fn backward_jump_is_handler_only_target(
+    code: &CodeObject,
+    source_pc: usize,
+    target_pc: usize,
+) -> bool {
+    let handler_boundary = pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+        .map(|entry| entry.target as usize / 2)
+        .filter(|&handler_pc| target_pc < handler_pc && handler_pc <= source_pc)
+        .min();
+    let Some(handler_boundary) = handler_boundary else {
+        return false;
+    };
+
+    let mut arg_state = OpArgState::default();
+    for pc in 0..handler_boundary.min(code.instructions.len()) {
+        let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
+        if backward_jump_target(code, pc, instruction, op_arg) == Some(target_pc) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Match pyre-interpreter/pyopcode.rs:skip_caches.
 fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
     let mut state = OpArgState::default();
@@ -13722,8 +13950,9 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// `assign_portal_jitdriver_indices`. The resulting list is published
 /// whole to trace-side `MetaInterpStaticData`, matching
 /// `warmspot.py:281-282`. Runtime trace-side lookup must observe this
-/// installed result; it must not compile missing callees lazily.
-pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) {
+/// installed result. A false result declines the portal and leaves execution
+/// in the interpreter.
+pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
     let writer = CodeWriter::instance();
     // codewriter.py:96-99 `setup_jitdriver(jd)` — register the
     // portal so `grab_initial_jitcodes` finds it.
@@ -13749,7 +13978,7 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) {
     writer
         .callcontrol()
         .find_compiled_jitcode_arc(code as *const pyre_interpreter::CodeObject)
-        .expect("make_jitcodes must populate the registered portal jitcode");
+        .is_some()
 }
 
 /// Callee compile path: `CallControl.get_jitcode(graph)` followed by the
@@ -13965,7 +14194,7 @@ pub fn find_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize
     for scan_pc in 0..num_instrs {
         let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
         if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
-            if target < num_instrs {
+            if target < num_instrs && !backward_jump_is_handler_only_target(code, scan_pc, target) {
                 loop_header_pcs.insert(target);
             }
         }
@@ -14078,8 +14307,8 @@ mod tests {
     use crate::jit::assembler::ArcByPtr;
     use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr};
     use crate::jit::flow::{
-        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, SpaceOperationArg, Variable,
-        VariableId, c_last_exception,
+        Block, Constant, ConstantValue, ExitSwitch, FlowValue, FunctionGraph, Link,
+        SpaceOperationArg, Variable, VariableId, c_last_exception,
     };
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
@@ -14492,9 +14721,15 @@ mod tests {
             .expect("BUILD_SLICE argc=2 should record newslice");
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 47);
+        assert_eq!(op.args[0], w_start.into());
+        assert_eq!(op.args[1], w_stop.into());
         assert_eq!(
-            op.args,
-            vec![w_start.into(), w_stop.into(), Constant::none().into()],
+            op.args[2],
+            Constant::new(
+                ConstantValue::Signed(pyre_object::w_none() as i64),
+                Some(Kind::Ref),
+            )
+            .into(),
         );
         assert_eq!(op.result, Some(result.into()));
         assert_eq!(result.kind, Some(Kind::Ref));
@@ -15402,6 +15637,37 @@ mod tests {
         assert_eq!(blocks[0].handler_offset, first.target as usize / 2);
         assert_eq!(blocks[0].stack_depth, first.depth as u16);
         assert_eq!(blocks[0].push_lasti, first.lasti);
+    }
+
+    #[test]
+    fn handler_break_backward_jump_is_not_a_loop_header() {
+        let code = first_nested_function_code(
+            "def f():\n    total = 0\n    for _ in range(3):\n        value = 0\n        while True:\n            try:\n                value = may_raise()\n            except Exception as exc:\n                value = exc.value\n                break\n        total += value\n    return total\n",
+        );
+        let mut arg_state = OpArgState::default();
+        let mut handler_only_targets = Vec::new();
+        let mut ordinary_targets = Vec::new();
+        for pc in 0..code.instructions.len() {
+            let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
+            let Some(target) = backward_jump_target(&code, pc, instruction, op_arg) else {
+                continue;
+            };
+            if backward_jump_is_handler_only_target(&code, pc, target) {
+                handler_only_targets.push(target);
+            } else {
+                ordinary_targets.push(target);
+            }
+        }
+
+        assert_eq!(handler_only_targets.len(), 1);
+        assert!(!ordinary_targets.is_empty());
+        let loop_headers = find_loop_header_pcs(&code);
+        assert!(!loop_headers.contains(&handler_only_targets[0]));
+        assert!(
+            ordinary_targets
+                .iter()
+                .all(|target| loop_headers.contains(target))
+        );
     }
 
     #[test]

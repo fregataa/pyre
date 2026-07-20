@@ -4066,9 +4066,12 @@ fn init_callbacks() {
                 driver_pair: || driver_pair() as *mut JitDriverPair as *mut u8,
                 ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
-                        let _ =
-                            crate::jit::codewriter::ensure_trace_jitcode_for_w_code(code, w_code);
+                        return crate::jit::codewriter::ensure_trace_jitcode_for_w_code(
+                            code, w_code,
+                        )
+                        .is_some();
                     }
+                    false
                 },
                 drain_backend_jit_exc: crate::call_jit::drain_backend_jit_exc,
             }));
@@ -5096,6 +5099,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // on the Rust stack that walk_pyframe_roots cannot reach).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    let semantic_loop_headers = crate::jit::codewriter::find_loop_header_pcs(code);
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
@@ -5269,6 +5273,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 driver.blackhole_if_trace_too_long();
             }
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
+                if !semantic_loop_headers.contains(&loop_header_pc) {
+                    driver.blackhole_if_trace_too_long();
+                    continue;
+                }
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
                 let marker_ec = frame_root.frame().execution_context as *const PyExecutionContext;
@@ -6154,7 +6162,9 @@ fn compile_and_run_once(
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
     // when it constructs the root MIFrame.
-    crate::jit::codewriter::register_portal_jitdriver(code);
+    if !crate::jit::codewriter::register_portal_jitdriver(code) {
+        return None;
+    }
     let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
         .expect("registered portal must have a drained PyJitCode");
     pjc.merge_entry_for(target_pc)
