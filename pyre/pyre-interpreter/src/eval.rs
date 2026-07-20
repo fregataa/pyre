@@ -1443,7 +1443,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         frame.last_instr = err.reraise_lasti as isize;
     }
     err.reraise_lasti = -1;
-    frame.frame_finished_execution = true;
+    frame.set_frame_finished_execution(true);
 
     false
 }
@@ -2448,7 +2448,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
                 );
             }
         }
-        self.frame_finished_execution = true;
+        self.set_frame_finished_execution(true);
         Ok(StepResult::Return(value))
     }
 }
