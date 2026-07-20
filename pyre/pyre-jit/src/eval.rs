@@ -991,6 +991,20 @@ impl Drop for GcMutatorRegistration {
     }
 }
 
+fn write_subclass_ranges<I, F>(classptrs: I, mut range_for: F)
+where
+    I: IntoIterator<Item = usize>,
+    F: FnMut(usize) -> Option<(i64, i64)>,
+{
+    let _range_guard = pyre_object::pyobject::subclass_range_write_guard();
+    for classptr in classptrs {
+        if let Some((min, max)) = range_for(classptr) {
+            let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
+            pyre_object::pyobject::assign_subclass_range(tp, min, max);
+        }
+    }
+}
+
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
@@ -1859,6 +1873,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         <pyre_interpreter::module::_collections::W_DequeRevIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        // `_tokenize.TokenizerIter` holds the callable source in an inline
+        // `readline` field and is `allocate`-immortal, so its offsets are
+        // registered here rather than through the managed marker.
+        <pyre_interpreter::module::_tokenize::W_TokenizerIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     ] {
         pyre_object::gc_hook::register_pyre_class_offsets(
             descr.pytype_ptr as usize,
@@ -2652,31 +2671,6 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::_collections::W_Deque
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `interp_deque.py` W_DequeIter / W_DequeRevIter each carry the source
-    // deque in an inline `deque` field. They use the same managed
-    // `#[pyre_class]::allocate` path as W_Deque, so register their payload
-    // layouts with the marker instead of treating them as immortal wrappers.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_collections::W_DequeIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_collections::W_DequeRevIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // RustPython `_tokenize::PyTokenizerIter` keeps the callable source on
-    // the iterator.  The pyre adapter has the same ownership shape, so its
-    // inline `readline` field must be traced while tokenization is suspended.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_tokenize::W_TokenizerIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
@@ -2742,24 +2736,42 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // (normalizecalls.py:373-389), then we write the computed ranges
     // back into the static PyType structs so that ll_issubclass
     // (rclass.py:1133-1137) can read them directly from the typeptr.
+    let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
+    let interpreter_aliases = pyre_interpreter::all_subclass_range_aliases();
+    let mut expected_aliases: Vec<_> = object_aliases
+        .iter()
+        .chain(interpreter_aliases.iter())
+        .map(|alias| (alias.pytype as *const _ as usize, alias.type_id))
+        .collect();
+    expected_aliases.sort_unstable();
+    let mut actual_aliases: Vec<_> = pytype_to_tid
+        .iter()
+        .map(|(&classptr, &type_id)| (classptr, type_id))
+        .collect();
+    actual_aliases.sort_unstable();
+    assert_eq!(
+        actual_aliases, expected_aliases,
+        "GC vtable registrations must match the shared subclass-range alias census",
+    );
+
+    let actual_hierarchy: Vec<_> = (0..gc.types.len())
+        .filter_map(|id| {
+            let info = gc.types.get(id as u32);
+            info.is_object.then_some((id as u32, info.parent))
+        })
+        .collect();
+    assert_eq!(
+        actual_hierarchy,
+        pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY,
+        "GC rclass.OBJECT registration order must match the shared subclass-range census",
+    );
     gc.freeze_types();
-    // This writeback replaces every static `subclassrange_{min,max}`
-    // with the GC-tid numbering, which differs from the preorder
-    // numbering the interpreter seeds via `compute_subclass_ranges_from`.
-    // Publish the whole batch inside one seqlock write section so a
-    // concurrent interpreter `ll_issubclass` observes either the
-    // all-preorder or the all-GC set, never a half-swapped mix — a mixed
-    // read makes `ll_issubclass(TypeError, BaseException)` spuriously
-    // false.
-    {
-        let _range_guard = pyre_object::pyobject::subclass_range_write_guard();
-        for (&classptr, &_tid) in &pytype_to_tid {
-            if let Some((min, max)) = gc.subclass_range(classptr) {
-                let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
-                pyre_object::pyobject::assign_subclass_range(tp, min, max);
-            }
-        }
-    }
+    // Publish the byte-identical GC-side recomputation inside one seqlock
+    // write section so a concurrent interpreter `ll_issubclass` never sees a
+    // partially restamped hierarchy.
+    write_subclass_ranges(pytype_to_tid.keys().copied(), |classptr| {
+        gc.subclass_range(classptr)
+    });
     Box::new(gc)
 }
 
@@ -3115,6 +3127,17 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
     d.meta_interp_mut().register_jitdriver_sd(jd);
+    // baseobjspace.py:29 `unpackiterable_driver = JitDriver(greens=['greenkey'],
+    // reds='auto', ...)` — the second portal driver (jd1) for the
+    // unknown-length unpack loop `_unpackiterable_unknown_length`. Registered
+    // here, right after jd0, so it lands at `jitdrivers_sd[2]` and inherits the
+    // same `portal_finishtoken` / `propagate_exc_descr` via the
+    // `finish_setup_descrs_for_jitdrivers` tail. jd1 is novable
+    // (`virtualizable_info` stays `None`), so `elect_active_jitdriver_sd`'s
+    // vinfo-scan keeps electing jd0 and jd1 stays inert until its merge point
+    // is traced in a later slice.
+    let jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
+    d.meta_interp_mut().register_jitdriver_sd(jd1);
     // rlib/jit.py:842 set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -4207,6 +4230,273 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
         .set_param(name, value);
 }
 
+/// WIP gate for jd1 (`unpackiterable_driver`) live-path residual execution.
+/// OFF by default: the merge-point hook stays inert so the second driver does
+/// not perturb jd0 until the full activation slice (blackhole entry +
+/// compiled-loop reuse) lands. `PYRE_JD1=1` opts into driving the
+/// `JitCodeMachine` trace of `_unpackiterable_unknown_length` on the live
+/// unpack path.
+fn jd1_experiment_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_JD1").is_some())
+}
+
+thread_local! {
+    /// Scaffold jd1 warmup counter keyed by the iterator-type green key.
+    /// `unpackiterable_driver` in PyPy is gated by the per-driver `JitCounter`;
+    /// pyre's single `WarmState` is jd0-owned, so jd1 keeps its own tick until
+    /// it gets a dedicated warmstate. Fires once an iterator type's unpack loop
+    /// is hot.
+    static JD1_LOOP_COUNTER: std::cell::RefCell<std::collections::HashMap<u64, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Merge-point crossings for one iterator type before jd1 drives a trace.
+/// Above trivial fixed-size unpacks (`a, b = pair`) so only genuinely long
+/// drains warm it, matching the hot-loop intent of `unpackiterable_driver`.
+const JD1_TRACE_THRESHOLD: u32 = 100;
+
+/// Effective threshold; overridable via `PYRE_JD1_THRESHOLD` for experiments
+/// (e.g. `=1` to drive on the first crossing of every iterator type).
+fn jd1_trace_threshold() -> u32 {
+    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("PYRE_JD1_THRESHOLD")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(JD1_TRACE_THRESHOLD)
+    })
+}
+
+fn jd1_counter_tick(green_key: u64) -> bool {
+    let threshold = jd1_trace_threshold();
+    JD1_LOOP_COUNTER.with(|c| {
+        let mut map = c.borrow_mut();
+        let n = map.entry(green_key).or_insert(0);
+        *n += 1;
+        if *n >= threshold {
+            *n = 0;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// jd1 (`unpackiterable_driver`) merge-point hook body. On the hot iterator
+/// type, drives one `JitCodeMachine` trace of the extracted
+/// `_unpackiterable_unknown_length` loop with `w_iterator`/`items` as the two
+/// `reds='auto'` values. Inert unless `PYRE_JD1=1`.
+fn unpack_merge_point_jit(
+    greenkey: pyre_object::PyObjectRef,
+    w_iterator: pyre_object::PyObjectRef,
+    items: pyre_object::PyObjectRef,
+) {
+    if std::env::var_os("PYRE_JD1_DEBUG").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed);
+        if n < 3 || n.is_multiple_of(500) {
+            eprintln!(
+                "[jd1] hook hit #{n} enabled={} gk_null={} it_null={} items_null={}",
+                jd1_experiment_enabled(),
+                greenkey.is_null(),
+                w_iterator.is_null(),
+                items.is_null(),
+            );
+        }
+    }
+    if !jd1_experiment_enabled() {
+        return;
+    }
+    if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
+        return;
+    }
+    // baseobjspace.py:368 iterator_greenkey → space.type(w_iterable): a per-type
+    // singleton, so its address hashes to one stable green key per iterator type
+    // (`pc = 0`, novable — no bytecode offset).
+    let green_key = make_green_key(greenkey as *const (), 0);
+    if !jd1_counter_tick(green_key) {
+        return;
+    }
+    if std::env::var_os("PYRE_JD1_DEBUG").is_some() {
+        eprintln!("[jd1] counter fired for green_key={green_key}");
+    }
+    drive_unpack_iterable_trace(green_key, greenkey, w_iterator, items);
+}
+
+/// Drive one jd1 trace of `_unpackiterable_unknown_length`. The tracer executes
+/// each residual (`self.next`, `items.append`) concretely on the shared reds,
+/// so this advances the live iterator and grows the live list in place; the
+/// Rust caller loop then resumes from the advanced state (cooperative drain).
+/// Slice-1 discards the recorded trace — compiled-loop reuse and blackhole
+/// entry are later activation slices.
+fn drive_unpack_iterable_trace(
+    green_key: u64,
+    greenkey_raw: pyre_object::PyObjectRef,
+    w_iterator: pyre_object::PyObjectRef,
+    items: pyre_object::PyObjectRef,
+) {
+    use majit_metainterp::BackEdgeAction;
+
+    // jd1's extracted portal jitcode carries an empty per-jitcode descr pool;
+    // its inline-call / residual-call `d`/`j` argcodes resolve through the
+    // shared global build-time pool, so install it before the walk reads the
+    // first descr (idempotent OnceLock).
+    let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+        "baseobjspace::_unpackiterable_unknown_length",
+    ) {
+        Some(jc) => jc,
+        None => {
+            if dbg {
+                eprintln!("[jd1] portal_jitcode_for_key returned None");
+            }
+            return;
+        }
+    };
+    // The build-time canonical body has an empty per-jitcode descr pool; the
+    // runtime `JitCode` resolves its `d`/`j` argcodes through the shared global
+    // pool installed above (`descr_at`).
+    let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+
+    // Diagnostic: dump the extracted jd1 body's op layout (pc / opname /
+    // argcodes / raw operand bytes) so the merge-point register operands are
+    // visible for wiring the merge-point trace entry. Returns before any
+    // tracing state is established.
+    if std::env::var_os("PYRE_JD1_DUMP").is_some() {
+        for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code) {
+            let end = op.next_pc.min(canonical.code.len());
+            let operands = &canonical.code[(op.pc + 1).min(end)..end];
+            eprintln!(
+                "[jd1dump] pc={} {} /{} operands={:?}",
+                op.pc, op.opname, op.argcodes, operands
+            );
+        }
+        return;
+    }
+
+    let (driver, _) = driver_pair();
+    let meta = driver.meta_interp_mut();
+    // The shared `MetaInterp.tracing` slot holds exactly one ctx; never nest a
+    // jd1 trace inside an active (jd0 or jd1) session.
+    if meta.is_tracing() {
+        if dbg {
+            eprintln!("[jd1] bail: meta.is_tracing()");
+        }
+        return;
+    }
+
+    // baseobjspace.py:31 reds='auto' → `w_iterator`, `items` as the two Ref
+    // input args, in the order `create_sym`/`collect_jump_args` use.
+    let live_values = [
+        majit_ir::Value::Ref(majit_ir::GcRef(w_iterator as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(items as usize)),
+    ];
+
+    // jd1's registered descriptor lives at `jitdrivers_sd[2]` (registered right
+    // after jd0 in `build_jit_driver_pair`). `elect_active_jitdriver_sd` honours
+    // `descriptor.index` first, which is how the novable jd1 is elected over jd0
+    // (whose `virtualizable_info` would otherwise win the fallback scan). Only
+    // the index is read here; the wired descriptor at that slot carries the
+    // finish/exc tokens.
+    let mut descriptor =
+        pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
+    descriptor.index = Some(2);
+
+    let action = meta.force_start_tracing(green_key, (0, 0), Some(descriptor), &live_values);
+    if dbg {
+        let name = match action {
+            BackEdgeAction::Interpret => "Interpret",
+            BackEdgeAction::StartedTracing => "StartedTracing",
+            BackEdgeAction::AlreadyTracing => "AlreadyTracing",
+            BackEdgeAction::RunCompiled => "RunCompiled",
+        };
+        eprintln!("[jd1] force_start_tracing -> {name}");
+    }
+    if !matches!(action, BackEdgeAction::StartedTracing) {
+        return;
+    }
+
+    // reds='auto' as the merge-point InputArgs: (w_iterator, items) in the
+    // order `collect_jump_args` returns, seeded onto the registers the
+    // `jit_merge_point` op names (decoded inside
+    // `trace_jitcode_from_merge_point`) so each residual runs on the shared
+    // heap objects the caller loop holds.
+    let red_refs = [
+        (
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+            w_iterator as usize as i64,
+        ),
+        (
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+            items as usize as i64,
+        ),
+    ];
+    // baseobjspace.py:1012 green `greenkey` = `iterator_greenkey(w_iterator)`,
+    // a per-type singleton pointer — seeded as the merge-point green Const.
+    let green_ref = greenkey_raw as usize as i64;
+
+    let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
+        greenkey: pyre_object::PY_NULL,
+        w_iterator: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+        items: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+    };
+
+    // Enter the trace AT the merge point (pc `0x5c`), not the jitcode entry:
+    // the extracted body's prologue (`length_hint`/`newlist`/
+    // `iterator_greenkey`) takes `w_iterable`, which the merge-point hook does
+    // not carry, so replaying from pc 0 would run `length_hint` on the wrong
+    // red. Drive through the production resolver runtime (the same closures
+    // jd0's live dispatch uses) so any CALL_ASSEMBLER / recursive-portal op
+    // resolves against real compiled-loop / warmstate state.
+    let drove = meta.with_trace_ctx_and_token_resolver(
+        |ctx,
+         resolve_token,
+         recursive_target,
+         recursive_decision,
+         recursive_exec,
+         recursive_exec_ref,
+         recursive_exec_float,
+         recursive_exec_void| {
+            let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                |_pc: usize| 0usize,
+                resolve_token,
+                recursive_target,
+                recursive_decision,
+                recursive_exec,
+                recursive_exec_ref,
+                recursive_exec_float,
+                recursive_exec_void,
+            );
+            majit_metainterp::trace_jitcode_from_merge_point(
+                ctx,
+                &mut sym,
+                &jitcode,
+                JD1_LOOP_HEADER_PC,
+                &runtime,
+                green_ref,
+                &red_refs,
+            );
+        },
+    );
+    if dbg {
+        eprintln!("[jd1] trace_jitcode drove={}", drove.is_some());
+    }
+
+    // The residual side effects already landed on the shared reds; drop the
+    // recorded trace (non-permanent so the cell's abort budget self-limits
+    // retrace storms) without compiling.
+    meta.abort_trace(false);
+}
+
+/// The single `jit_merge_point` pc in jd1's extracted
+/// `_unpackiterable_unknown_length` body — matches `UnpackSym::loop_header_pc`
+/// (asserted in `unpack_state::jd1_build_time_descrs_resolve_through_global_pool`).
+const JD1_LOOP_HEADER_PC: usize = 0x5c;
+
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
 /// like `sys.settrace` see the JIT side from the very first user call,
 /// not only after the first JIT-eligible eval.  Idempotent (the
@@ -4224,6 +4514,7 @@ pub fn init_jit_hooks() {
     init_gc_subsystem();
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
+    pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
     // also registered inside the `JIT_DRIVER` initializer for the
@@ -11416,6 +11707,62 @@ while i < 40:
             &FLOAT_TYPE,
             &INT_TYPE
         ));
+    }
+
+    #[test]
+    fn test_interpreter_and_gc_subclass_ranges_match_in_both_orders() {
+        use pyre_object::pyobject::compute_subclass_ranges_from;
+        use std::sync::atomic::Ordering;
+
+        let _ = driver_pair();
+
+        let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
+        let interpreter_aliases = pyre_interpreter::all_subclass_range_aliases();
+        let aliases: Vec<_> = object_aliases
+            .iter()
+            .chain(interpreter_aliases.iter())
+            .copied()
+            .collect();
+        let expected: Vec<_> = aliases
+            .iter()
+            .map(|alias| {
+                majit_gc::subclass_range(alias.pytype as *const _ as usize)
+                    .expect("every subclass-range alias must be registered with the GC")
+            })
+            .collect();
+
+        let assert_matches_gc = || {
+            for (alias, &(gc_min, gc_max)) in aliases.iter().zip(&expected) {
+                assert_eq!(
+                    alias.pytype.subclassrange_min.load(Ordering::Relaxed),
+                    gc_min,
+                    "{} subclassrange_min",
+                    alias.pytype.name,
+                );
+                assert_eq!(
+                    alias.pytype.subclassrange_max.load(Ordering::Relaxed),
+                    gc_max,
+                    "{} subclassrange_max",
+                    alias.pytype.name,
+                );
+            }
+        };
+
+        // GC init ran in `driver_pair`; the interpreter writer must leave
+        // every object- and interpreter-owned alias byte-identical.
+        compute_subclass_ranges_from(&[&object_aliases, &interpreter_aliases]);
+        assert_matches_gc();
+
+        // Re-run the interpreter writer first, then the same batched GC
+        // writeback helper production init uses.
+        compute_subclass_ranges_from(&[&object_aliases, &interpreter_aliases]);
+        write_subclass_ranges(
+            aliases
+                .iter()
+                .map(|alias| alias.pytype as *const _ as usize),
+            majit_gc::subclass_range,
+        );
+        assert_matches_gc();
     }
 
     #[test]

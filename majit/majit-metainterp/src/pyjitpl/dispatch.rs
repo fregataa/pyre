@@ -1976,6 +1976,21 @@ where
                 sym.abort_portal_op();
                 return TraceAction::Abort;
             }
+            if crate::optrace_enabled() {
+                let fr = self.frames.current_mut();
+                let cur = fr.code_cursor;
+                let anchor_pc = fr.pc;
+                let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
+                let name = fr.jitcode.name.clone();
+                eprintln!(
+                    "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
+                    self.frames.len(),
+                    cur,
+                    anchor_pc,
+                    opcode,
+                    name
+                );
+            }
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
             let action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3734,8 +3749,12 @@ where
                         frame.next_u16() as usize,
                     )
                 };
-                let descr = self.frames.current_mut().jitcode.exec.descrs[descr_idx]
-                    .as_bh_descr()
+                let descr = self
+                    .frames
+                    .current_mut()
+                    .jitcode
+                    .descr_at(descr_idx)
+                    .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                     .unwrap_or_else(|| panic!("BC_SWITCH descrs[{descr_idx}] is not a BhDescr"))
                     .clone();
                 let (value_box, concrete_value) = self.read_int_reg(value_idx);
@@ -4671,9 +4690,7 @@ where
                     .frames
                     .current_mut()
                     .jitcode
-                    .exec
-                    .descrs
-                    .get(sub_idx)
+                    .descr_at(sub_idx)
                     .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
                     .unwrap_or_else(|| {
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
@@ -4705,6 +4722,21 @@ where
                 sub_frame.return_r = return_r;
                 sub_frame.return_f = return_f;
                 self.frames.push(sub_frame);
+            }
+            jitcode::insns::BC_INLINE_CALL_R_I
+            | jitcode::insns::BC_INLINE_CALL_R_R
+            | jitcode::insns::BC_INLINE_CALL_R_V
+            | jitcode::insns::BC_INLINE_CALL_IR_I
+            | jitcode::insns::BC_INLINE_CALL_IR_R
+            | jitcode::insns::BC_INLINE_CALL_IR_V
+            | jitcode::insns::BC_INLINE_CALL_IRF_F
+            | jitcode::insns::BC_INLINE_CALL_IRF_R
+            | jitcode::insns::BC_INLINE_CALL_IRF_I
+            | jitcode::insns::BC_INLINE_CALL_IRF_V => {
+                match self.exec_typed_inline_call(ctx, bytecode) {
+                    TraceAction::Continue => {}
+                    action => return action,
+                }
             }
             // Recursive portal call (self-recursion).  Unlike
             // BC_INLINE_CALL — which resolves its callee from the parent
@@ -4931,8 +4963,10 @@ where
                         }
                     }
                     let calldescr_idx = frame.next_u16();
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_V descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -5249,8 +5283,10 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_u8() as usize;
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_I descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -5546,8 +5582,10 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_u8() as usize;
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_R descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -5793,8 +5831,10 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_u8() as usize;
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_IRF_F descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -6657,6 +6697,109 @@ where
         TraceAction::Continue
     }
 
+    /// Trace the canonical `inline_call_{r,ir,irf}_*` family by entering a
+    /// callee frame.  RPython `rpython/jit/metainterp/pyjitpl.py:1266-1332`
+    /// enters the frame, and `:144-160` copies each grouped argument
+    /// positionally.
+    fn exec_typed_inline_call(&mut self, ctx: &mut TraceCtx, bytecode: u8) -> TraceAction {
+        let (has_i_list, has_f_list, return_kind) = match bytecode {
+            jitcode::insns::BC_INLINE_CALL_R_I => (false, false, Some(JitArgKind::Int)),
+            jitcode::insns::BC_INLINE_CALL_R_R => (false, false, Some(JitArgKind::Ref)),
+            jitcode::insns::BC_INLINE_CALL_R_V => (false, false, None),
+            jitcode::insns::BC_INLINE_CALL_IR_I => (true, false, Some(JitArgKind::Int)),
+            jitcode::insns::BC_INLINE_CALL_IR_R => (true, false, Some(JitArgKind::Ref)),
+            jitcode::insns::BC_INLINE_CALL_IR_V => (true, false, None),
+            jitcode::insns::BC_INLINE_CALL_IRF_F => (true, true, Some(JitArgKind::Float)),
+            jitcode::insns::BC_INLINE_CALL_IRF_R => (true, true, Some(JitArgKind::Ref)),
+            jitcode::insns::BC_INLINE_CALL_IRF_I => (true, true, Some(JitArgKind::Int)),
+            jitcode::insns::BC_INLINE_CALL_IRF_V => (true, true, None),
+            _ => unreachable!("typed inline-call dispatch arm passed bytecode {bytecode}"),
+        };
+
+        let (sub_idx, args_i, args_r, args_f, result_dst) = {
+            let frame = self.frames.current_mut();
+            let sub_idx = frame.next_u16() as usize;
+            let mut read_list = |frame: &mut MIFrame| {
+                let count = frame.next_u8() as usize;
+                let mut regs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    regs.push(frame.next_u8() as usize);
+                }
+                regs
+            };
+            let args_i = has_i_list.then(|| read_list(frame)).unwrap_or_default();
+            let args_r = read_list(frame);
+            let args_f = has_f_list.then(|| read_list(frame)).unwrap_or_default();
+            let result_dst = return_kind.map(|_| frame.next_u8() as usize);
+            frame._result_argcode = match return_kind {
+                Some(JitArgKind::Int) => b'i',
+                Some(JitArgKind::Ref) => b'r',
+                Some(JitArgKind::Float) => b'f',
+                None => b'v',
+            };
+            frame.result_arg_index = result_dst;
+            frame.pc = frame.code_cursor;
+            (sub_idx, args_i, args_r, args_f, result_dst)
+        };
+
+        let pc = self.frames.current_mut().pc;
+        // `descr_at` resolves the callee from the per-jitcode `exec.descrs`
+        // pool (runtime-built jitcodes) or the shared global build-time pool
+        // (LLBC-extracted jitcodes, whose per-jitcode pool is empty).
+        let sub_jitcode = self
+            .frames
+            .current_mut()
+            .jitcode
+            .descr_at(sub_idx)
+            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+            .cloned();
+        let Some(sub_jitcode) = sub_jitcode else {
+            // The callee is in neither pool; abort the trace instead of
+            // crashing the process.
+            return TraceAction::Abort;
+        };
+        let mut sub_frame = MIFrame::setup(sub_jitcode, 0, None, Some(ctx));
+        ctx.push_inline_frame((sub_idx, pc), u32::MAX);
+        sub_frame.inline_frame = true;
+
+        for (callee_dst, caller_src) in args_i.into_iter().enumerate() {
+            let (value, concrete) = self.read_int_reg(caller_src);
+            sub_frame.int_regs[callee_dst] = Some(value);
+            sub_frame.int_values[callee_dst] = Some(concrete);
+        }
+        for (callee_dst, caller_src) in args_r.into_iter().enumerate() {
+            let (value, concrete) = self.read_ref_reg(caller_src);
+            sub_frame.ref_regs[callee_dst] = Some(value);
+            sub_frame.ref_values[callee_dst] = Some(concrete);
+        }
+        for (callee_dst, caller_src) in args_f.into_iter().enumerate() {
+            let (value, concrete) = self.read_float_reg(caller_src);
+            sub_frame.float_regs[callee_dst] = Some(value);
+            sub_frame.float_values[callee_dst] = Some(concrete);
+        }
+
+        sub_frame.return_i = None;
+        sub_frame.return_r = None;
+        sub_frame.return_f = None;
+        match return_kind {
+            Some(JitArgKind::Int) => {
+                sub_frame.return_i =
+                    Some(result_dst.expect("BC_INLINE_CALL_*_I must encode an int destination"));
+            }
+            Some(JitArgKind::Ref) => {
+                sub_frame.return_r =
+                    Some(result_dst.expect("BC_INLINE_CALL_*_R must encode a ref destination"));
+            }
+            Some(JitArgKind::Float) => {
+                sub_frame.return_f =
+                    Some(result_dst.expect("BC_INLINE_CALL_IRF_F must encode a float destination"));
+            }
+            None => {}
+        }
+        self.frames.push(sub_frame);
+        TraceAction::Continue
+    }
+
     fn set_int_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
         let frame = self.frames.current_mut();
         frame.int_regs[reg] = opref;
@@ -7040,6 +7183,86 @@ where
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_pc);
+    machine.run_to_end(ctx, sym, runtime)
+}
+
+/// Enter a trace at a JitDriver merge point rather than the jitcode's entry.
+///
+/// `trace_jitcode_with_args_and_runtime` starts the walk at pc 0 (setup_call
+/// resets it), so it replays the portal function's prologue. A `reds='auto'`
+/// driver whose portal carries a prologue — jd1's
+/// `_unpackiterable_unknown_length` builds `items` and computes `greenkey`
+/// before its loop — cannot re-run that prologue: the merge-point hook holds
+/// only the loop-carried reds (`w_iterator`, `items`), not the original
+/// prologue inputs (`w_iterable`). Replaying from pc 0 would call
+/// `length_hint(w_iterable)` on a red that is not `w_iterable`.
+///
+/// This entry seeds the reds/green directly into the registers the
+/// `jit_merge_point` op at `header_pc` names, then begins the walk AT
+/// `header_pc` so the recorded trace is exactly the loop body. The op payload
+/// (`blackhole.py:1066` `@arguments("i","I","R","F","I","R","F")`) lists the
+/// green {I,R,F} register slots then the red {I,R,F} slots, each as
+/// `[len:u8][reg:u8 * len]`. The green ref is seeded as a `Const`
+/// (verify_green_args); each red ref as its InputArg, paired positionally with
+/// the op's red-ref list (the `collect_jump_args` order). Reds are Ref-typed
+/// to match the `reds='auto'` pointer set; int/float reds are unimplemented
+/// (no such driver exists yet).
+pub fn trace_jitcode_from_merge_point<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    header_pc: usize,
+    runtime: &R,
+    green_ref: i64,
+    red_refs: &[(OpRef, i64)],
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    let jitcode_arc = Arc::new(jitcode.clone());
+    // Decode the six register lists of the `jit_merge_point` op at
+    // `header_pc`: opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` per
+    // slot in (green I, green R, green F, red I, red R, red F) order.
+    let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+    {
+        let code = &jitcode_arc.code;
+        let mut cur = header_pc + 2;
+        for regs in slot_regs.iter_mut() {
+            let len = code[cur] as usize;
+            cur += 1;
+            for _ in 0..len {
+                regs.push(code[cur] as usize);
+                cur += 1;
+            }
+        }
+    }
+    let green_r = std::mem::take(&mut slot_regs[1]);
+    let red_r = std::mem::take(&mut slot_regs[4]);
+
+    let mut frame = MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
+    // The green ref must be a Const at trace time (verify_green_args).
+    if let Some(&greg) = green_r.first() {
+        let gconst = ctx.const_ref(green_ref);
+        frame.ref_regs[greg] = Some(gconst);
+        frame.ref_values[greg] = Some(green_ref);
+    }
+    // Each loop-carried red into the register the op names, paired
+    // positionally with the driver's `collect_jump_args` red order.
+    for (&reg, &(opref, value)) in red_r.iter().zip(red_refs.iter()) {
+        frame.ref_regs[reg] = Some(opref);
+        frame.ref_values[reg] = Some(value);
+    }
+    // The walker reads from `code_cursor`; `pc` is only the portal anchor.
+    // Start both at the merge point so the first executed op is the loop
+    // header itself.
+    frame.code_cursor = header_pc;
+    frame.pc = header_pc;
+
+    let mut standalone = StandaloneFrameStack::new();
+    standalone.frames.push(frame);
+    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
+    machine.set_outer_program_pc(header_pc);
     machine.run_to_end(ctx, sym, runtime)
 }
 
