@@ -1806,6 +1806,50 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             &pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS,
         );
     }
+    // Immortal `#[pyre_class]` iterator / sequence wrappers whose managed
+    // children are held SOLELY through the immortal object.  The marker never
+    // scans a `malloc_typed`-immortal, so without a registered offset set the
+    // generic immortal-root walker (`walk_raw_immortal_roots`) cannot forward
+    // the child, and a collection reachable only through the wrapper frees it —
+    // e.g. `enumerate(list)` whose source list-iterator sits on a caller frame
+    // across a hot inner loop's collection, surfacing as
+    // `TypeError: not an iterator` on the next `__next__`.  These have no GC
+    // vtable site (immortal, keyed by `pytype_ptr`), so register the
+    // descriptor's `ptr_offsets` directly like the dict-view offsets above.
+    // The explicit `type_id`s never reach a GC arena, so no `register_type` /
+    // drift-check is involved.  This is the complete set of immortal
+    // `#[pyre_class]` wrappers with managed children that the
+    // `register_pyre_class` list above does not already cover; every other
+    // iterator family (map/filter/zip/cycle/chain/count/repeat, the four
+    // seq/list/tuple/set iterators, reversed, the SRE scanner) is registered
+    // there, and `W_Deque` is `allocate_stable` (GC-managed, not immortal).
+    for descr in [
+        <pyre_object::functional::W_Enumerate
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::functional::W_Range
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::functional::W_LongRangeIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_TakeWhile
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_DropWhile
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_FilterFalse
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_Pairwise
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::operation::_CallableIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::module::r#struct::W_Struct
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::module::r#struct::unpack_iter::W_UnpackIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    ] {
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+    }
     // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
     // — fget/fset/fdel/doc/reqcls/name are W_Root references.
     // Pyre's `GetSetProperty` ports them as inline fields; the
@@ -2577,6 +2621,81 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             w_dict_view_iterator_tid,
         );
         pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_iterator_tid);
+    }
+    // `collections.deque` W_Deque — AUTO-ID typed payload allocated via
+    // `allocate_stable` (GC-managed old-gen).  Managed only means the marker
+    // *scans* it; tracing its `data` backing list still needs a registered tid
+    // + offsets.  Unregistered, its cell stays UNASSIGNED and
+    // `malloc_typed_stable` stamps tid 0 (= `object`: empty offsets, no custom
+    // trace), so the marker forwards none of its children and `data` is swept
+    // while the deque is live — use-after-free on the next `len`/index/iterate.
+    // Register at the absolute tail like the auto-id iterators above so no
+    // earlier fixed slot shifts.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_collections::W_Deque
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // ── GC-root registration completeness oracle ─────────────────────────
+    // Every `#[pyre_class]` type appends its descriptor to the whole-program
+    // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
+    // (non-empty `ptr_offsets`) whose children are reachable by NEITHER the
+    // marker (its resolved tid's `TypeInfo` traces those offsets or carries a
+    // custom trace) NOR the immortal-root walker (`register_pyre_class_offsets`)
+    // has its backing list / source iterator dropped on the next moving
+    // collection — the recurring unregistered-GC-root bug (the PR#628 hand
+    // walker, the immortal iterator triad, `collections.deque` W_Deque).  Assert
+    // completeness here, before `freeze_types()`, so a newly-added managed-child
+    // type that misses `build_gc` fails loudly at init instead of silently at
+    // the next collection.  Read-only over already-registered state; the slice
+    // is an oracle only (see its docs), so link-section under-population can only
+    // weaken the check, never false-alarm.  Native only: the guard reads
+    // `PYRE_CLASS_DESCRIPTORS`, whose wasm link-section population is not
+    // guaranteed, and the recurring bug is caught on the native CI backends.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut unregistered: Vec<&'static str> = Vec::new();
+        for descr in pyre_object::lltype::PYRE_CLASS_DESCRIPTORS {
+            if descr.ptr_offsets.is_empty() {
+                // No inline managed children the GC must forward.
+                continue;
+            }
+            // Path 1 — immortal-root walker / closure offset registry.
+            let in_offset_registry =
+                unsafe { pyre_object::gc_hook::offsets_for_pytype(descr.pytype_ptr) }
+                    .is_some_and(|o| !o.is_empty());
+            if in_offset_registry {
+                continue;
+            }
+            // Path 2 — the marker traces the type's own resolved tid.  The
+            // descriptor's `gc_type_id` cell is the real tid (pre-set for
+            // `type_id = N` types, stamped by `register_pyre_class` for auto-id
+            // ones); an unregistered type is `UNASSIGNED` or out of range.
+            let tid = descr.gc_type_id.get();
+            let marker_traced = tid != pyre_object::lltype::TypeIdCell::UNASSIGNED
+                && (tid as usize) < gc.types.len()
+                && {
+                    let ti = gc.types.get(tid);
+                    ti.custom_trace.is_some()
+                        || descr
+                            .ptr_offsets
+                            .iter()
+                            .all(|off| ti.gc_ptr_offsets.contains(off))
+                };
+            if marker_traced {
+                continue;
+            }
+            unregistered.push(descr.pyname);
+        }
+        assert!(
+            unregistered.is_empty(),
+            "GC-root registration gap: #[pyre_class] type(s) with managed \
+             children were never wired into build_gc — neither a marker tid \
+             tracing their inline `PyObjectRef` offsets nor \
+             register_pyre_class_offsets — so their children are dropped on the \
+             next collection.  Register each in build_gc: {unregistered:?}",
+        );
     }
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
