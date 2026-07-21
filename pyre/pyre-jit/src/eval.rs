@@ -332,6 +332,15 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
+    // epic S5) for a mortal heap type; forward the field slot so a major GC greys
+    // the box, and the box tid's drop glue reclaims the buffer on sweep. An
+    // immortal type's `malloc_raw` name is not collector-owned, so the guard
+    // skips it.
+    if !t.name.is_null() && pyre_object::gc_hook::try_gc_owns_object(t.name as *mut u8) {
+        let name_slot = std::ptr::addr_of_mut!(t.name);
+        f(name_slot as *mut majit_ir::GcRef);
+    }
     if !t.mro_w.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(t.mro_w as *mut u8) {
             // GC-owned type-9 block: forward the `mro_w` field slot; the
@@ -359,17 +368,15 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
-/// Reclaim the two Rust-owned, out-of-line containers of a swept heap type.
-/// `mro_w` is a GC-managed `FixedObjectArray` reclaimed by the collector and
-/// must not be freed here. The managed namespace object is also reclaimed by
-/// the collector, while the shared/uncertain `terminator` ownership remains
-/// deferred by #528.
+/// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
+/// heap type. `name` is a GC-managed leaf storage box (`NameStorage`, off-GC
+/// storage epic S5) reclaimed by its own box tid's drop glue — freeing it here
+/// too would double-free a box swept before its owner. `mro_w` is a GC-managed
+/// `FixedObjectArray` reclaimed by the collector and must not be freed here. The
+/// managed namespace object is also reclaimed by the collector, while the
+/// shared/uncertain `terminator` ownership remains deferred by #528.
 unsafe fn type_object_destructor(obj_addr: usize) {
     let t = obj_addr as *const pyre_object::typeobject::W_TypeObject;
-    let name = unsafe { (*t).name };
-    if !name.is_null() {
-        drop(unsafe { Box::from_raw(name) });
-    }
     let weak_subclasses = unsafe { (*t).weak_subclasses };
     if !weak_subclasses.is_null() {
         drop(unsafe { Box::from_raw(weak_subclasses) });
@@ -446,6 +453,24 @@ unsafe fn pytraceback_object_custom_trace(
 }
 
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let w_dict = obj_addr as pyre_object::PyObjectRef;
+    let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
+    // Keep the stable leaf storage box alive by forwarding its owning
+    // `dstorage` field slot (off-GC storage epic S2). The box has no walker
+    // of its own; `walk_gc_refs` below forwards the interior PyObjectRef
+    // slots, matching the mapdict / set-items leaf-storage pattern. Only the
+    // storage-box strategies own their `dstorage`: a MapDictStrategy
+    // `dstorage` is instead the backing instance (a GC edge that its own
+    // `walk_gc_refs` forwards), and the off-GC side-table storage
+    // (`w_dict_new_unmanaged_side_table_value`) is not collector-owned —
+    // both are skipped (Map by kind, the side table by `try_gc_owns_object`).
+    if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map {
+        let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
+        if !dict.dstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(dict.dstorage) {
+            let dstorage_slot = std::ptr::addr_of_mut!(dict.dstorage);
+            f(dstorage_slot as *mut majit_ir::GcRef);
+        }
+    }
     // Strategy-side dispatch — `W_DictObject.dstorage: *mut u8` erases
     // the storage layout, so each strategy walks its own native shape
     // through `DictStrategy::walk_gc_refs` (`dictmultiobject.rs`).  PyPy's
@@ -453,56 +478,33 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // `new_erasing_pair("name")` at translation time
     // (`rpython/rlib/rerased.py:24-72`); the trait method is pyre's
     // runtime dispatch equivalent.
-    let w_dict = obj_addr as pyre_object::PyObjectRef;
-    let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
     let mut adapter = |slot: *mut pyre_object::PyObjectRef| {
         f(slot as *mut majit_ir::GcRef);
     };
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
 }
 
-/// Reclaim the Rust-owned erased storage container of a swept regular dict.
-/// The strategy reconstructs the exact Box type; contained PyObjectRefs remain
-/// collector-owned.  MapDictStrategy's dstorage is a borrowed GC edge and its
-/// strategy deallocator is deliberately a no-op.
-unsafe fn dict_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    let dict = unsafe { &*(obj as *const pyre_object::dictmultiobject::W_DictObject) };
-    if !dict.dstorage.is_null() {
-        unsafe { dict.dstrategy.dealloc_storage(obj) };
+/// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
+/// box (`Vec<u8>`, no inner refs, off-GC storage epic S4). Forward the field
+/// slot so a major GC greys the box; the box tid's own drop glue reclaims the
+/// buffer on sweep. A no-GC-hook fallback allocation is not collector-owned, so
+/// the guard skips it.
+unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let bytes = unsafe { &mut *(obj_addr as *mut pyre_object::bytesobject::W_BytesObject) };
+    if !bytes.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(bytes.data as *mut u8) {
+        let data_slot = std::ptr::addr_of_mut!(bytes.data);
+        f(data_slot as *mut majit_ir::GcRef);
     }
 }
 
-/// Sweep-time destructor for `W_ModuleDictObject`: reclaim the three
-/// off-GC storage Boxes (`dstorage`/`mstrategy`/`object_storage`) the GC
-/// does not own.  Mirrors `dict_object_destructor`.
-unsafe fn module_dict_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_object::dictmultiobject::w_module_dict_dealloc_storage(obj) };
-}
-
-/// Reclaim the off-GC byte buffer of a swept bytes object.
-unsafe fn bytes_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_object::bytesobject::w_bytes_dealloc(obj) };
-}
-
-/// Reclaim the off-GC byte buffer of a swept bytearray object.
-unsafe fn bytearray_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_object::bytearrayobject::w_bytearray_dealloc(obj) };
-}
-
-/// Reclaim the off-GC item container of a swept set object.
-unsafe fn set_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_object::setobject::w_set_dealloc_items(obj) };
-}
-
-/// Reclaim the off-GC name string of a swept function object.
-unsafe fn function_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_interpreter::function::function_dealloc_name(obj) };
+/// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
+/// `W_BytesObject` (off-GC storage epic S4).
+unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
+    if !ba.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(ba.data as *mut u8) {
+        let data_slot = std::ptr::addr_of_mut!(ba.data);
+        f(data_slot as *mut majit_ir::GcRef);
+    }
 }
 
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
@@ -559,7 +561,7 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 /// RPython `{str: cell_or_value}` dict) plus
 /// `ModuleDictStrategy.caches` (the per-name `GlobalCache` registry
 /// whose `cell` fields hold live values).  Pyre's W_ModuleDictObject
-/// carries four indirect storages behind raw pointers — none of them
+/// carries three indirect storages behind raw pointers — none of them
 /// reachable through inline `gc_ptr_offsets`:
 ///
 ///   * `dstorage` → `ModuleDictStorage.entries` (Vec<(String,
@@ -568,10 +570,41 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///     Rc<RefCell<GlobalCache>>>>) — every live cache's `cell`
 ///   * `object_storage` → post-`switch_to_object_strategy`
 ///     Vec<(PyObjectRef, PyObjectRef)> — both halves of every entry
+///
+/// Each of the three is now a GC-managed non-moving storage box (off-GC
+/// storage epic S3), so this trace does two things: it forwards each
+/// box-pointer field slot to grey the box (keeping it off the sweep list,
+/// as `object_object_custom_trace` does for `storage`), then walks the box
+/// interiors to forward their movable values.  The interior walk lives in
+/// the shared `w_module_dict_walk_gc_cells` (also driven by
+/// `walk_pyframe_roots`' Box-immortal path); the field-slot greying stays
+/// here because that shared walk takes an interior-value visitor and its
+/// frame-path caller runs `walk_raw_function_roots` on every forwarded
+/// slot — sound for a dict value, but a type-confused read for a
+/// box-payload pointer.
 unsafe fn module_dict_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    // Grey each GC-managed storage box through its field slot so a major GC
+    // keeps it live; the box interiors are GC leaves, so the walk below is
+    // the only thing that forwards their element slots.  Non-moving, so the
+    // minor-GC forward is a no-op.  Guard on GC ownership: a `tid == 0`
+    // `malloc_raw` fallback box (unit tests / pre-init) has no GC hook.
+    if pyre_object::dictmultiobject::is_module_dict(obj) {
+        let md = &mut *(obj as *mut pyre_object::dictmultiobject::W_ModuleDictObject);
+        for field in [
+            std::ptr::addr_of_mut!(md.dstorage) as *mut *mut u8,
+            std::ptr::addr_of_mut!(md.object_storage) as *mut *mut u8,
+            std::ptr::addr_of_mut!(md.mstrategy) as *mut *mut u8,
+        ] {
+            let boxed = *field;
+            if !boxed.is_null() && pyre_object::gc_hook::try_gc_owns_object(boxed) {
+                f(field as *mut majit_ir::GcRef);
+            }
+        }
+    }
     // Delegate to the shared module-dict walk so this (GC-managed dict)
     // path and `walk_pyframe_roots`' Box-immortal path forward exactly
     // the same movable slots — including unwrapping the Box-immortal
@@ -581,15 +614,20 @@ unsafe fn module_dict_object_custom_trace(
         f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     };
     unsafe {
-        pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
-            obj_addr as pyre_object::PyObjectRef,
-            &mut forward,
-        );
+        pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(obj, &mut forward);
     }
 }
 
 unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let set = unsafe { &mut *(obj_addr as *mut pyre_object::setobject::W_SetObject) };
+    // Keep the stable leaf storage box alive by forwarding its owning field
+    // slot. The box has no walker of its own; this trace also walks its inner
+    // ObjectKey slots below, matching the mapdict leaf-storage pattern.
+    // A no-GC-hook fallback allocation is not collector-owned.
+    if !set.items.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.items as *mut u8) {
+        let items_slot = std::ptr::addr_of_mut!(set.items);
+        f(items_slot as *mut majit_ir::GcRef);
+    }
     let entries = unsafe { &mut *set.items };
     for (key, _) in entries.iter_mut() {
         // ObjectKey.hash is identity-stable across GC moves, so writing the
@@ -1005,6 +1043,47 @@ where
     }
 }
 
+/// Register a leaf storage-box type whose host container has no inner GC
+/// references (for example bytes/str/long-style storage). The auto-assigned id
+/// is published to pyre-object through `set_id`. This is the generic form of
+/// the raw `BigInt` registration at the tail of [`build_gc`].
+///
+/// Callers must register storage boxes only at the absolute tail of the type-id
+/// sequence, after every fixed-const type registration. S0 deliberately has no
+/// caller; S1 will publish the first live storage-box id.
+fn register_leaf_storage_box<T: 'static>(
+    gc: &mut dyn majit_gc::GcAllocator,
+    destructor: majit_gc::trace::DestructorFn,
+    set_id: impl FnOnce(u32),
+) {
+    let tid = gc.register_type(majit_gc::trace::TypeInfo::with_destructor(
+        std::mem::size_of::<T>(),
+        destructor,
+    ));
+    set_id(tid);
+}
+
+/// Register a storage-box type whose host container holds GC references walked
+/// by `custom_trace`. Composes the custom trace with the generic drop-glue
+/// destructor, as `TypeInfo::with_custom_trace(...).with_destructor_fn(...)`
+/// does for other traced owners of off-GC allocations.
+///
+/// As with [`register_leaf_storage_box`], callers must add registrations only
+/// at the absolute tail of [`build_gc`], after all fixed-const type ids. S0 has
+/// no caller so the existing registration order remains unchanged.
+fn register_traced_storage_box<T: 'static>(
+    gc: &mut dyn majit_gc::GcAllocator,
+    custom_trace: majit_gc::trace::CustomTraceFn,
+    destructor: majit_gc::trace::DestructorFn,
+    set_id: impl FnOnce(u32),
+) {
+    let tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_custom_trace(std::mem::size_of::<T>(), custom_trace)
+            .with_destructor_fn(destructor),
+    );
+    set_id(tid);
+}
+
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
@@ -1352,21 +1431,22 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         builtin_code_tid,
     );
     // Function carries inline `PyObjectRef` fields (code / closure /
-    // defs_w / w_kw_defs / w_module / cached metadata) that the
-    // collector must walk — `object_subclass_with_gc_ptrs` records
-    // the offsets so mark traversal reaches them. `BUILTIN_FUNCTION_TYPE`
-    // is a separate static `PyType` for module-level builtins
-    // (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
+    // defs_w / w_kw_defs / w_module / cached metadata) plus its `name`
+    // GC-managed storage box that the collector must walk —
+    // `object_subclass_with_gc_ptrs` records the offsets (including
+    // `FUNCTION_NAME_OFFSET`) so mark traversal reaches them.
+    // `BUILTIN_FUNCTION_TYPE` is a separate static `PyType` for module-level
+    // builtins (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
     // instances are the same Rust struct, so the vtable map sends
-    // both PyTypes to `function_tid`.
-    let function_tid = gc.register_type(
-        TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_interpreter::function::Function>(),
-            object_tid,
-            pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
-        )
-        .with_destructor_fn(function_object_destructor),
-    );
+    // both PyTypes to `function_tid`. No `.with_destructor_fn`: a mortal
+    // function's `name` box is reclaimed by its own tid's drop glue (off-GC
+    // storage epic S5); a holder destructor would double-free a box swept before
+    // its owner.
+    let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        std::mem::size_of::<pyre_interpreter::function::Function>(),
+        object_tid,
+        pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
+    ));
     debug_assert_eq!(function_tid, FUNCTION_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1481,18 +1561,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &mut pytype_to_tid,
         <pyre_object::typedef::W_MemberDescr as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // W_BytesObject (immutable byte sequence) carries a raw
-    // `*const Vec<u8>` (`data`) and a `usize` length, neither a
-    // `PyObjectRef`. Pre-registered with `object_subclass(size, ...)`
-    // so the foreign-pytype loop's `sizeof(PyObject)` approximation
-    // does not under-count the payload.
-    let w_bytes_tid = gc.register_type(
-        TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::bytesobject::W_BytesObject>(),
-            object_tid,
-        )
-        .with_destructor_fn(bytes_object_destructor),
-    );
+    // W_BytesObject (immutable byte sequence) carries `data`, a `*const Vec<u8>`
+    // GC-managed storage box (off-GC storage epic S4). The custom trace forwards
+    // that field slot so the box stays live; no `.with_destructor_fn` — the box
+    // tid's drop glue is the sole reclaimer, exactly as the set-items box owns
+    // its reclamation. A sweep-time bytes destructor would put two reclaimers on
+    // the destructor list and double-free a box swept before its owner.
+    let w_bytes_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::bytesobject::W_BytesObject>(),
+        object_tid,
+        bytes_object_custom_trace,
+    ));
     debug_assert_eq!(w_bytes_tid, W_BYTES_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1503,16 +1582,13 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &pyre_object::bytesobject::BYTES_TYPE as *const _ as usize,
         w_bytes_tid,
     );
-    // W_BytearrayObject (mutable byte sequence) carries a raw
-    // `*mut Vec<u8>` (`data`). Same registration shape as
-    // W_BytesObject.
-    let w_bytearray_tid = gc.register_type(
-        TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
-            object_tid,
-        )
-        .with_destructor_fn(bytearray_object_destructor),
-    );
+    // W_BytearrayObject (mutable byte sequence) carries `data`, a `*mut Vec<u8>`
+    // GC-managed storage box. Same registration shape as W_BytesObject.
+    let w_bytearray_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
+        object_tid,
+        bytearray_object_custom_trace,
+    ));
     debug_assert_eq!(w_bytearray_tid, W_BYTEARRAY_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1527,14 +1603,20 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // PyObjectRef)>` behind a raw pointer. Register a custom trace
     // hook so the GC updates those indirect key/value slots just as it
     // updates inline object fields.
-    let w_dict_tid = gc.register_type(
-        TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::dictmultiobject::W_DictObject>(),
-            object_tid,
-            dict_object_custom_trace,
-        )
-        .with_destructor_fn(dict_object_destructor),
-    );
+    // No `.with_destructor_fn`: a regular dict's `dstorage` is a GC-managed
+    // storage box (off-GC storage epic S2) whose own tid drop glue
+    // (`storage_box_destructor`) is the sole reclaimer, exactly as the set
+    // items box owns its reclamation. A sweep-time dict destructor would race
+    // that box on the destructor list — freeing `dstorage` after the box was
+    // already swept out of oldgen makes the `try_gc_owns_object` guard read
+    // false and double-free the container's heap buffer. The one off-GC
+    // `dstorage` (`w_dict_new_unmanaged_side_table_value`) rides an immortal
+    // `malloc_typed` holder that is never swept, so it never needed this hook.
+    let w_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::dictmultiobject::W_DictObject>(),
+        object_tid,
+        dict_object_custom_trace,
+    ));
     debug_assert_eq!(w_dict_tid, W_DICT_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1545,14 +1627,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // W_SetObject carries `items: *mut IndexMap<ObjectKey, ()>`. Register a
     // custom trace hook so GC forwarding updates indirect key object slots.
     // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
-    let w_set_tid = gc.register_type(
-        TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
-            object_tid,
-            set_object_custom_trace,
-        )
-        .with_destructor_fn(set_object_destructor),
-    );
+    let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
+        object_tid,
+        set_object_custom_trace,
+    ));
     debug_assert_eq!(w_set_tid, W_SET_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1685,17 +1764,24 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_type_tid,
     );
     pytype_to_tid.insert(&pyre_object::TYPE_TYPE as *const _ as usize, w_type_tid);
-    // W_UnicodeObject carries an off-heap WTF-8 buffer. Managed subclass
-    // instances additionally need the header's `w_class` traced, matching
-    // W_ObjectObject's instance-class edge; exact strings remain immortal.
-    let w_str_tid = gc.register_type(
-        TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
-            object_tid,
-            vec![pyre_object::pyobject::W_CLASS_OFFSET],
-        )
-        .with_destructor_fn(pyre_object::unicodeobject::unicode_object_destructor),
-    );
+    // W_UnicodeObject carries an off-heap WTF-8 `value` buffer. A mortal
+    // subclass instance's `value` is a GC-managed storage box (off-GC storage
+    // epic S5), traced through the `value` gc-pointer edge; the box tid's drop
+    // glue reclaims it on sweep. An exact string keeps a `malloc_raw` immortal
+    // value (an immortal holder cannot grey an old-gen box), which the
+    // `is_managed_heap_object` guard on the edge skips. Managed subclass
+    // instances also need the header's `w_class` traced, matching
+    // W_ObjectObject's instance-class edge. No `.with_destructor_fn`: the box
+    // tid's drop glue is the sole reclaimer (a holder destructor would
+    // double-free a box swept before its owner).
+    let w_str_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
+        object_tid,
+        vec![
+            pyre_object::pyobject::W_CLASS_OFFSET,
+            pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
+        ],
+    ));
     debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -2001,15 +2087,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `object_storage: *mut Vec<(PyObjectRef, PyObjectRef)>` (active
     // after `switch_to_object_strategy`).  Register a custom trace
     // hook so the GC walks all three indirect storages — matching
-    // the W_DictObject pattern at line 851.
-    let w_module_dict_tid = gc.register_type(
-        TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
-            object_tid,
-            module_dict_object_custom_trace,
-        )
-        .with_destructor_fn(module_dict_object_destructor),
-    );
+    // the W_DictObject pattern.
+    // No `.with_destructor_fn`: all three storages are now GC-managed storage
+    // boxes (off-GC storage epic S3) whose own tid drop glue
+    // (`storage_box_destructor`) is the sole reclaimer. A sweep-time module-dict
+    // destructor would race those boxes on the destructor list and double-free —
+    // exactly the regular-dict case above.
+    let w_module_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
+        object_tid,
+        module_dict_object_custom_trace,
+    ));
     debug_assert_eq!(w_module_dict_tid, W_MODULE_DICT_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -2780,6 +2868,107 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
              next collection.  Register each in build_gc: {unregistered:?}",
         );
     }
+    // PyPy setobject.py:875/963 stores a copied r_dict behind the set's GC
+    // pointer field; rdict.py:210 makes that table a GcStruct("dicttable").
+    // The box is a leaf because `set_object_custom_trace` owns both edges:
+    // it greys this box through `items` and forwards every ObjectKey.obj slot.
+    // Keep this runtime id at the absolute registration tail.
+    register_leaf_storage_box::<pyre_object::setobject::SetItemsStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::SetItemsStorage>,
+        pyre_object::setobject::set_set_items_gc_type_id,
+    );
+    // Regular-dict `dstorage` storage boxes (off-GC storage epic S2).
+    // dictmultiobject.py:47 `dstorage` erases an `r_dict` = GcStruct("dicttable")
+    // (rdict.py:210); each concrete strategy backs it with a native container
+    // now living in a GC-managed leaf box. `dict_object_custom_trace` greys the
+    // box through the `dstorage` field slot and `DictStrategy::walk_gc_refs`
+    // forwards the interior PyObjectRef slots — same leaf contract as the set
+    // items box. Keep these runtime ids at the absolute registration tail.
+    register_leaf_storage_box::<pyre_object::dictmultiobject::ObjectDictStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<
+            pyre_object::dictmultiobject::ObjectDictStorage,
+        >,
+        pyre_object::dictmultiobject::set_object_dict_storage_gc_type_id,
+    );
+    register_leaf_storage_box::<pyre_object::dictmultiobject::IntDictStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<
+            pyre_object::dictmultiobject::IntDictStorage,
+        >,
+        pyre_object::dictmultiobject::set_int_dict_storage_gc_type_id,
+    );
+    register_leaf_storage_box::<pyre_object::dictmultiobject::BytesDictStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<
+            pyre_object::dictmultiobject::BytesDictStorage,
+        >,
+        pyre_object::dictmultiobject::set_bytes_dict_storage_gc_type_id,
+    );
+    register_leaf_storage_box::<pyre_object::identitydict::IdentityDictStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<
+            pyre_object::identitydict::IdentityDictStorage,
+        >,
+        pyre_object::identitydict::set_identity_dict_storage_gc_type_id,
+    );
+    register_leaf_storage_box::<pyre_object::kwargsdict::KwargsDictStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::kwargsdict::KwargsDictStorage>,
+        pyre_object::kwargsdict::set_kwargs_dict_storage_gc_type_id,
+    );
+    // Module-dict `dstorage` and `mstrategy` storage boxes (off-GC storage
+    // epic S3). `module_dict_object_custom_trace` greys each box through its
+    // field slot and `w_module_dict_walk_gc_cells` forwards the interior
+    // PyObjectRef slots — same leaf contract as the regular-dict boxes above.
+    // The post-switch `object_storage` reuses the ObjectDictStorage box tid
+    // registered above (identical `IndexMap<ObjectKey, PyObjectRef>` type), so
+    // it needs no separate registration. Keep these ids at the absolute tail.
+    register_leaf_storage_box::<pyre_object::celldict::ModuleDictStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStorage>,
+        pyre_object::celldict::set_module_dict_storage_gc_type_id,
+    );
+    register_leaf_storage_box::<pyre_object::celldict::ModuleDictStrategy>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
+        pyre_object::celldict::set_module_dict_strategy_gc_type_id,
+    );
+    // bytes / bytearray `data` storage box (off-GC storage epic S4). A leaf
+    // `Vec<u8>` (no inner refs) shared by both types; `bytes_object_custom_trace`
+    // / `bytearray_object_custom_trace` grey it through the `data` field slot and
+    // the box tid's drop glue reclaims the buffer on sweep. Keep this id at the
+    // absolute registration tail.
+    register_leaf_storage_box::<pyre_object::bytesobject::BytesDataStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
+        pyre_object::bytesobject::set_bytes_data_gc_type_id,
+    );
+    // Mortal (subclass) `str` `value` WTF-8 buffer storage box (off-GC storage
+    // epic S5). A leaf `Wtf8Buf` (no inner refs); the W_UnicodeObject `value`
+    // gc-pointer edge greys it and the box tid's drop glue reclaims the buffer
+    // on sweep. Only subclass strings box their value; exact strings keep a
+    // `malloc_raw` immortal value. Keep this id at the absolute registration tail.
+    register_leaf_storage_box::<pyre_object::unicodeobject::UnicodeValueStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<
+            pyre_object::unicodeobject::UnicodeValueStorage,
+        >,
+        pyre_object::unicodeobject::set_unicode_value_gc_type_id,
+    );
+    // Mortal `name` string storage box shared by heap `W_TypeObject` and user
+    // `Function` (off-GC storage epic S5). A leaf `String` (no inner refs); the
+    // type's `type_object_custom_trace` name-slot greying and the function's
+    // `FUNCTION_NAME_OFFSET` gc-pointer edge grey it, and the box tid's drop glue
+    // reclaims the buffer on sweep. Only mortal holders box their name; immortal
+    // builtin types/functions keep a `malloc_raw` name. Keep this id at the
+    // absolute registration tail.
+    register_leaf_storage_box::<pyre_object::typeobject::NameStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::typeobject::NameStorage>,
+        pyre_object::typeobject::set_name_storage_gc_type_id,
+    );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

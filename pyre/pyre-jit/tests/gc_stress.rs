@@ -624,3 +624,195 @@ assert result == 300, result
         "generator leaked-StopIteration gc stress program failed",
     );
 }
+
+/// A `bytes` / `bytearray` object's `data` buffer is a GC-managed leaf storage
+/// box (off-GC storage epic S4): `bytes_object_custom_trace` /
+/// `bytearray_object_custom_trace` grey it through the `data` field slot, and
+/// the box tid's drop glue reclaims it on sweep. Regression for two failure
+/// modes the migration off `malloc_typed`-immortal holders could introduce: a
+/// buffer swept while its still-live object is reachable only through a list
+/// (UAF on read-back), and a per-round dead throwaway whose buffer leaks or is
+/// double-freed. `bytearray` extension after the collections re-derives the box
+/// pointer, proving the box survived and stayed writable.
+///
+/// `blobs` (bytes reachable only through a list), `ba` (a live bytearray grown
+/// after the collections), and `pieces` (bytearray fragments held only through a
+/// list) must all survive the 100 collections; each round allocates fresh dead
+/// bytes/bytearray garbage. The returned checksum is reachable only if every
+/// live buffer survived intact.
+#[test]
+fn bytes_bytearray_buffers_survive_full_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def run():
+    blobs = []
+    i = 0
+    while i < 12:
+        blobs.append(b"abcde")
+        i = i + 1
+
+    ba = bytearray(b"seed")
+    pieces = []
+    i = 0
+    while i < 8:
+        pieces.append(bytearray(b"xy"))
+        i = i + 1
+
+    n = 0
+    while n < 100:
+        junk = b"garbage" * 4
+        tmp = bytearray(b"throwaway") * 3
+        gc.collect()
+        n = n + 1
+
+    ba.extend(b"-grown")
+
+    total = 0
+    i = 0
+    while i < 12:
+        total = total + len(blobs[i]) + blobs[i][0]
+        i = i + 1
+    i = 0
+    while i < 8:
+        total = total + len(pieces[i]) + pieces[i][0]
+        i = i + 1
+    total = total + len(ba) + ba[0]
+    return total
+
+result = run()
+assert result == 2325, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<bytes_bytearray_gc_stress>",
+        "bytes/bytearray buffer survival checks",
+        "bytes/bytearray gc stress program failed",
+    );
+}
+
+/// A `str` SUBCLASS instance's WTF-8 `value` buffer is a GC-managed leaf storage
+/// box (off-GC storage epic S5): the mortal subclass holder is GC-swept and its
+/// `value` gc-pointer edge greys the box, whose tid drop glue reclaims the
+/// buffer on sweep. Regression for the migration off the per-type
+/// `unicode_object_destructor`: a subclass string reachable only through a list
+/// must keep its value buffer across collections (UAF on read-back if the box is
+/// swept early), and per-round dead subclass strings must be reclaimed without a
+/// double-free (the box drop glue is the sole reclaimer). Exact strings keep an
+/// immortal `malloc_raw` value and are unaffected — the test mixes both.
+///
+/// `subs` holds `S` (a str subclass) instances reachable only through a list;
+/// each carries its own boxed value. The returned checksum reads them back after
+/// 100 collections, so it is reachable only if every subclass value survived.
+#[test]
+fn str_subclass_value_survives_full_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+class S(str):
+    pass
+
+def run():
+    subs = []
+    i = 0
+    while i < 12:
+        subs.append(S("payload"))
+        i = i + 1
+
+    n = 0
+    while n < 100:
+        junk = S("throwaway garbage")
+        plain = "exact" * 3
+        gc.collect()
+        n = n + 1
+
+    total = 0
+    i = 0
+    while i < 12:
+        s = subs[i]
+        total = total + len(s) + ord(s[0])
+        i = i + 1
+    return total
+
+result = run()
+assert result == 1428, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<str_subclass_value_gc_stress>",
+        "str subclass value survival checks",
+        "str subclass value gc stress program failed",
+    );
+}
+
+/// A mortal (user) `Function`'s `name` string and a heap `W_TypeObject`'s `name`
+/// string are GC-managed leaf storage boxes shared under one `NameStorage` tid
+/// (off-GC storage epic S5): the function's `FUNCTION_NAME_OFFSET` gc-pointer
+/// edge and the type's `type_object_custom_trace` name-slot greying keep the box
+/// live, and the box tid's drop glue is the sole reclaimer. Regression for the
+/// migration off `function_object_destructor` / the type destructor's name-free:
+/// a function/type reachable only through a list must keep its name across
+/// collections (UAF on `__name__` read-back if swept early), the `__name__`
+/// setter must rebox on a mortal holder, and per-round dead functions/types must
+/// be reclaimed without a double-free.
+///
+/// `fns` and `types` are reachable only through lists; each function's name is
+/// reassigned via the setter. The checksum reads every `__name__` back after
+/// 100 collections, so it is reachable only if every name box survived.
+#[test]
+fn function_type_name_survives_full_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def make_funcs():
+    fns = []
+    i = 0
+    while i < 10:
+        def f():
+            return 1
+        f.__name__ = "renamed"
+        fns.append(f)
+        i = i + 1
+    return fns
+
+def make_types():
+    types = []
+    i = 0
+    while i < 10:
+        class C:
+            pass
+        types.append(C)
+        i = i + 1
+    return types
+
+def run():
+    fns = make_funcs()
+    types = make_types()
+
+    n = 0
+    while n < 100:
+        def junk():
+            return 0
+        class Junk:
+            pass
+        gc.collect()
+        n = n + 1
+
+    total = 0
+    i = 0
+    while i < 10:
+        total = total + len(fns[i].__name__)
+        total = total + len(types[i].__name__)
+        i = i + 1
+    return total
+
+result = run()
+assert result == 80, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<function_type_name_gc_stress>",
+        "function/type name survival checks",
+        "function/type name gc stress program failed",
+    );
+}

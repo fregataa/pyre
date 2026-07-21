@@ -6120,7 +6120,11 @@ impl<'a> Lowering<'a> {
                 //   • `typedef::set_method_difference`: `&args[1..]` →
                 //     `core::slice::index::<Impl>::index` (unregistered), and the
                 //     `set_copy_real` → `w_set_copy_storage_from` storage-copy
-                //     chain.
+                //     chain (its `__deref_write` wall is gone as of the off-GC
+                //     storage box S1 — `w_set_copy_storage_from` reassigns the
+                //     `items` GC field; the chain now walls only on the
+                //     `w_set_new` `setattr("items")`/`d.len` `int ∪ r_uint`
+                //     annotator UnionError).
                 // Until BOTH graphs fully lift (slice-iterator + slice-index +
                 // the collect_parameters UnionError — all annotator-completeness
                 // axis walls, not vec! walls), the unconditional recognizer is
@@ -13908,6 +13912,11 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 /// Grammar (verified against the real LLBC for several handler graphs):
 /// - literal segment: a length byte `L` with `L < 0x80`, then `L` bytes
 ///   of UTF-8 text appended to the current piece;
+/// - long literal segment: the byte `0x80` followed by a little-endian
+///   `u16` length `L`, then `L` bytes of UTF-8 text appended to the
+///   current piece — the encoding a literal of 128+ bytes takes (a single
+///   length byte tops out at `0x7F`), e.g. the 130-byte deprecation tail
+///   in `space_int` / `space_index`;
 /// - sequential placeholder: the single byte `0xC0` — closes the current
 ///   piece, begins the next, and renders the next argument in order (the
 ///   Display-vs-Debug choice lives in the parallel args array, not in this
@@ -13957,6 +13966,18 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
             pieces.push(std::mem::take(&mut current));
             indices.push(lo | (hi << 8));
             i += 3;
+        } else if b == 0x80 {
+            // long literal segment: `0x80` + little-endian u16 length,
+            // then that many UTF-8 bytes (a 128+ byte literal that the
+            // single length byte below cannot express).
+            let lo = *bytes.get(i + 1)? as usize;
+            let hi = *bytes.get(i + 2)? as usize;
+            let len = lo | (hi << 8);
+            let start = i + 3;
+            let end = start.checked_add(len)?;
+            let seg = bytes.get(start..end)?;
+            current.push_str(std::str::from_utf8(seg).ok()?);
+            i = end;
         } else if b < 0x80 {
             // literal segment of length `b`
             let start = i + 1;
@@ -16858,6 +16879,77 @@ mod tests {
         );
     }
 
+    /// Anchor the `next()` fold to the real lowered IR of
+    /// `call_function_impl_result` — the generic-dispatch slice for-loop
+    /// `for &arg in args { pin_root(arg) }` that 16 census heads funnel
+    /// through.  The unregistered `next()` returns an opaque `Ref` the MIR
+    /// recasts to `Option<*mut PyObject>` via a trailing
+    /// `__pyre_cast_instance` narrow, so the raw call is not the block's
+    /// last op; `peel_recast_chain` must strip the recast and fold anyway.
+    /// After the fold no residual `slice::iter::Iter::next` call survives
+    /// and the native `[__iter_next]` op is present.  Ignored by default
+    /// (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn iter_next_fold_real_call_function_impl_result() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "call_function_impl_result")
+            .expect("lower call_function_impl_result");
+
+        let count_call_leaf = |leaf: &[&str]| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(segments, leaf)
+                    )
+                })
+                .count()
+        };
+        // The residual `slice::iter::Iter::next` dispatch wall is gone.
+        assert_eq!(
+            count_call_leaf(&["slice", "iter", "Iter", "next"]),
+            0,
+            "residual slice-iter next removed by the fold"
+        );
+        // The native `[__iter_next]` marker op is present.
+        let iter_next_ops = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.first().is_some_and(|s| s == "__iter_next")
+                )
+            })
+            .count();
+        assert!(
+            iter_next_ops >= 1,
+            "at least one native [__iter_next] op emitted"
+        );
+        // The `rooted_args` reload is spelled as a `for i in 0..n` +
+        // `Vec::push` loop (not `.map().collect()`), so no residual
+        // `iter::adapters::map::Map::collect` dispatch wall survives — the
+        // deeper co-wall this graph exposed once the slice-iter wall fell.
+        assert_eq!(
+            count_call_leaf(&["iter", "adapters", "map", "Map", "collect"]),
+            0,
+            "no residual Map::collect reload wall"
+        );
+    }
+
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
     /// its int census callers — `setitem_bytearray` / `byte_w`
     /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
@@ -17455,5 +17547,124 @@ mod tests {
         // No use at all (just the def): rejected (no element load/store).
         let dead = body_of(vec![]);
         assert!(!super::add_dest_used_only_as_single_deref(&dead, 1));
+    }
+
+    #[test]
+    fn decode_packed_format_pieces_handles_long_literal_marker() {
+        use super::decode_packed_format_pieces;
+
+        // A literal of 128+ bytes cannot use the single length byte
+        // (`L < 0x80`); it packs as `0x80` + little-endian u16 length +
+        // the bytes.  A 130-byte piece (`0x0082`) after one placeholder,
+        // the exact shape charon lowers for `space_int`'s deprecation
+        // warning `format!("…(type {tp}).  The ability to…Python.")`.
+        let tail = ").  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python.";
+        assert_eq!(tail.len(), 130);
+        let mut bytes = vec![2u8, b'a', b'b', 0xC0]; // "ab" then a placeholder
+        bytes.push(0x80); // long-literal marker
+        bytes.push((tail.len() & 0xFF) as u8); // u16 LE lo
+        bytes.push((tail.len() >> 8) as u8); // u16 LE hi
+        bytes.extend_from_slice(tail.as_bytes());
+        bytes.push(0x00); // terminator
+        let (pieces, indices) = decode_packed_format_pieces(&bytes).unwrap();
+        assert_eq!(pieces, vec!["ab".to_string(), tail.to_string()]);
+        assert_eq!(indices, vec![0]);
+
+        // A long-literal marker whose declared length overruns the buffer
+        // bails (no OOB, fail-safe residual).
+        assert_eq!(
+            decode_packed_format_pieces(&[0x80, 0xFF, 0xFF, b'x', 0]),
+            None
+        );
+        // A long-literal marker truncated before its 2 length bytes bails.
+        assert_eq!(decode_packed_format_pieces(&[0x80, 0x05]), None);
+    }
+
+    /// Anchor the fmt-collapse to the real lowered IR of `space_int` /
+    /// `space_index` — both raise a deprecation `format!` whose 130-byte
+    /// trailing literal packs as the `0x80`+u16 long-literal token.  Before
+    /// the decoder handled that token the chain stayed residual as
+    /// `alloc::fmt::format` (unregisterable `fmt::rt::Argument::new_display`),
+    /// dropping ~50 census heads that reach `space_int` via `int_w` etc.
+    /// After: zero residual `alloc::fmt::format` and the native `str` +
+    /// `add` (`ll_strconcat`) expansion instead.  Ignored by default (loads
+    /// the ~440MB real LLBC); run with `cargo test -p majit-translate --lib
+    /// fmt_collapse_long_literal_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn fmt_collapse_long_literal_real_space_int() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for fname in ["space_int", "space_index"] {
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+            let fmt_calls = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(segments, &["fmt", "format"])
+                    )
+                })
+                .count();
+            assert_eq!(
+                fmt_calls, 0,
+                "{fname}: residual alloc::fmt::format after long-literal collapse"
+            );
+            let str_ops = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "str"))
+                .count();
+            assert!(
+                str_ops >= 1,
+                "{fname}: at least one native `str` op from the collapse"
+            );
+        }
+    }
+
+    /// Anchor the `?`-operator fold to the real lowered IR of
+    /// `baseobjspace::lookup` (`let w_type = type(obj)?; lookup_in_type(..)`).
+    /// The break arm (`None => return None`) narrows the `from_residual`
+    /// result through a `__pyre_cast_instance` recast; before the break-arm
+    /// purity gate peeled that recast, `option_try` declined and the residual
+    /// `Try::branch` Method-call stayed, walling ~50 heads reaching `lookup`.
+    /// After: zero residual `branch` Method-call.  Ignored by default (loads
+    /// the ~440MB real LLBC); run with `cargo test -p majit-translate --lib
+    /// option_try_recast_break_arm_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn option_try_recast_break_arm_real_lookup() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "lookup").expect("lower lookup");
+        let branch_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
+                        if name == "branch" && args.len() == 1
+                )
+            })
+            .count();
+        assert_eq!(
+            branch_calls, 0,
+            "lookup: residual Try::branch Method-call after the recast-break-arm fold"
+        );
     }
 }
