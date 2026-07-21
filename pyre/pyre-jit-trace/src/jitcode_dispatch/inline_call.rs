@@ -2053,17 +2053,48 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);
             }
         }
-        // Strict fresh-frame fold: a branchless leaf inlined without a virtual
-        // frame (not `try_multiframe`) whose body carries the Portal
-        // frame-vable locals prologue resolves its own `getarrayitem_vable_r` /
-        // `setarrayitem_vable_r` register-to-register through the per-slot
-        // shadow.  Seed each param into slot `i` (`local_to_vable_slot` is
-        // identity) and activate the fold so the callee's first LOAD_FAST of a
-        // param folds to the arg OpRef instead of reading its unseeded frame
-        // box.  Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF /
-        // frame reg unresolved) or `try_multiframe` (real virtual frame seeded).
-        if !try_multiframe && callee_portal_frame_reg != u16::MAX {
-            sub_wc.callee_shadow.as_mut().unwrap().fold_frame_reg = callee_portal_frame_reg;
+        // Seed the callee's per-slot concrete-locals shadow from the param
+        // boxes.  Two distinct consumers, gated differently:
+        //
+        // 1. Register-to-register fold (`!try_multiframe` only): a branchless
+        //    leaf inlined without a materialized virtual frame folds its own
+        //    `getarrayitem_vable_r` / `setarrayitem_vable_r` through the per-slot
+        //    OpRef shadow (`fold_frame_reg` + `set_opref`), so the callee's first
+        //    LOAD_FAST of a param folds to the arg OpRef instead of reading its
+        //    unseeded frame box.  A `try_multiframe` callee HAS a real virtual
+        //    frame, so this fold must stay off (its reads go through the frame).
+        //
+        // 2. Concrete-locals fallback (BOTH paths): the `getarrayitem_vable`
+        //    read fallback and the `setarrayitem_vable` re-seed
+        //    (`getarrayitem_vable_via_metainterp` / `setarrayitem_vable`) supply
+        //    the local's recording-time concrete when the heapcache holds no
+        //    entry.  A `try_multiframe` callee's param reads forward through the
+        //    heapcache only until an in-callee may-force op runs
+        //    `reset_keep_likely_virtuals` (heapcache.py:183) and clears the array
+        //    cache; the post-call LOAD_FAST re-read then misses and the branch
+        //    value goes non-concrete (`GotoIfNotValueNotConcrete`).  Seeding the
+        //    shadow for `try_multiframe` too gives that re-read a fallback — the
+        //    analog of the callee MIFrame register box RPython reads
+        //    `box.getint()` off (registers survive a residual call; the heapcache
+        //    does not).  STORE_FAST keeps both maps current (the
+        //    `setarrayitem_vable` handler re-seeds `set_opref` + `set_concrete`
+        //    on every store).
+        //
+        //    `set_opref` is seeded on BOTH paths (not just the fold): the read
+        //    fallback re-resolves the slot's concrete through `concrete_of_opref`
+        //    on this OpRef — a GC-forwarded, rooted channel — in preference to
+        //    the raw `Value` copy in `concrete`, which the trace-ref walker does
+        //    not visit and so dangles if a minor collection moves a nursery Ref
+        //    across the may-force residual.  The fold consumer stays gated by
+        //    `fold_frame_reg` (kept `!try_multiframe`), so seeding `opref` here is
+        //    inert for folding on the multiframe path.
+        //
+        // Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF / frame reg
+        // unresolved).
+        if callee_portal_frame_reg != u16::MAX {
+            if !try_multiframe {
+                sub_wc.callee_shadow.as_mut().unwrap().fold_frame_reg = callee_portal_frame_reg;
+            }
             for i in 0..nparams {
                 let slot = i as i64;
                 let value = callee_args[i];
