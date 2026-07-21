@@ -568,11 +568,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op_pc });
     }
-    // Authoritative-executor gate (#51b/#54): fire ONLY when the walk
-    // is the sole concrete-execution leg (production full-body walk and
-    // production per-opcode arm walk).  Shadow / diagnostic-probe runs
-    // leave the flag `false` so the call is recorded symbolically
-    // without re-running its side effects.
+    // Authoritative-executor gate: fire ONLY when the walk is the sole
+    // concrete-execution leg (the production full-body walk and its
+    // inline sub-walks; the per-opcode arm walk is retired).  Shadow /
+    // diagnostic-probe runs leave the flag `false` so the call is
+    // recorded symbolically without re-running its side effects.
     if !ctx.is_authoritative_executor {
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
@@ -1390,16 +1390,13 @@ pub(crate) fn do_not_in_trace_call_result(
 /// halves of the vable token protocol
 /// (`vinfo.tracing_before_residual_call(virtualizable)` /
 /// `vinfo.tracing_after_residual_call(virtualizable)`) live with
-/// whichever leg actually executes the callee:
-///
-/// * trait-driven leg — `state.rs
-///   MIFrame::vable_and_vrefs_before_residual_call` /
-///   `vable_after_residual_call` (`trace_opcode.rs:2602/2646`);
-/// * authoritative full-body walk —
-///   [`try_execute_residual_call_via_executor`], which brackets the
-///   concrete `execute_residual_call` with both halves and surfaces
-///   [`DispatchError::VableEscapedDuringResidualCall`] on a detected
-///   force (pyjitpl.py:3365 ABORT_ESCAPE parity).
+/// the walk that executes the callee:
+/// [`try_execute_residual_call_via_executor`] brackets the concrete
+/// `execute_residual_call` with both halves of
+/// `vable_and_vrefs_before_residual_call` /
+/// `vable_after_residual_call` and surfaces
+/// [`DispatchError::VableEscapedDuringResidualCall`] on a detected
+/// force (pyjitpl.py:3365 ABORT_ESCAPE parity).
 ///
 /// This helper records ONLY the IR portion here and never
 /// touches the token; the heap-half token protocol is bracketed by
@@ -1408,11 +1405,13 @@ pub(crate) fn do_not_in_trace_call_result(
 /// intact.
 ///
 /// `vrefs_before_residual_call` / `vrefs_after_residual_call`
-/// (`pyjitpl.py:3317-3326, 3337-3347`) are omitted — they have zero
-/// IR ops on the no-force path, and the walker tracks no
-/// `virtualref_boxes` (production producers of `jit.virtual_ref` are
-/// absent; the trait leg carries the vref halves at
-/// `trace_opcode.rs:2730/2752`).
+/// (`pyjitpl.py:3341-3372`) are unported.  `PyreSym` does carry
+/// `virtualref_boxes` (`state.rs`), so what is missing is the bracket
+/// itself: the pre-call `vrefinfo.tracing_before_residual_call` loop
+/// and the post-call `stop_tracking_virtualref`.  Unreachable today —
+/// the codewriter emits no `jit.virtual_ref` producers
+/// (`jit/call.rs`), leaving `virtualref_boxes` empty so both upstream
+/// loops iterate zero times.
 pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     // pyjitpl.py:3326-3327: vinfo = self.jitdriver_sd.virtualizable_info;
     //                       if vinfo is not None:
@@ -1650,7 +1649,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
 
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
     {
@@ -1786,7 +1784,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `i = i + 1; while i < n` read the pre-increment value and ran one
     // extra iteration).
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && dst_bank == 'v'
         && r_args.len() == 3
         && matches!(
@@ -1837,11 +1834,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Full-body walks only: `BOOL_BOX_TRUTH` is reset at FBW walk entry;
     // an arm walk consulting it could read a stale OpRef key from an
     // earlier FBW walk's recorder.
-    if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
-        && dst_bank == 'i'
-        && r_args.len() == 1
-    {
+    if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
         if let Some(truth) = bool_box_truth_lookup(r_args[0]) {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -1865,7 +1858,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Full-body walks only: the eager store rides `FBW_STORE_JOURNAL`,
     // whose commit/rollback epilogues run on FBW walk ends.
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && dst_bank == 'v'
         && ei.pyre_helper == majit_ir::PyreHelperKind::StoreSubscr
     {
@@ -1893,10 +1885,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // Range GET_ITER: virtualize exact machine-word `range` into the same
     // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
-    if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
-        && ei.pyre_helper == majit_ir::PyreHelperKind::GetIter
-    {
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::GetIter {
         if let Some(iter_op) = try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -1909,10 +1898,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // The specialization supplies the same Ref result that the residual would,
     // including NULL for exhaustion, so the codewriter's trailing
     // GuardNonnull remains the only loop-exit guard.
-    if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
-        && ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext
-    {
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext {
         if let Some(item_op) =
             try_walker_specialize_for_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
         {
@@ -1927,7 +1913,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // UNPACK_SEQUENCE reads DCE to a pure-int loop.  Falls through to the
     // opaque residual for any other shape (SAFE — never declined).
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::NewtupleFromArray
         && try_walker_specialize_newtuple(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
@@ -1945,7 +1930,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // cannot reproduce faithfully (empty list, non-const array length, an
     // element without a concrete Ref shadow) — SAFE, never declined.
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::NewlistFromArray
         && newlist_virt_enabled()
@@ -1990,7 +1974,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // un-lowered in-body helper aborts the trace (graceful interpreter
     // fallback).  Gated to top full-body frames, not inside a sub-walk.
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
@@ -2008,7 +1991,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Gated to top full-body frames, not inside a sub-walk (same
     // caller-side-effect doubling concern as the CallFn form).
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'v'
         && ei.pyre_helper == majit_ir::PyreHelperKind::ListAppendValue
@@ -2037,7 +2019,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // sub-walk restriction; any non-matching shape falls through to the
     // generic residual (SAFE).
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)?.is_some()
@@ -2059,7 +2040,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // the exception virtualizes and DCEs.  Any non-matching shape falls
     // through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && fbw_raise_enabled()
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
@@ -2068,7 +2048,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && fbw_raise_enabled()
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
@@ -2092,7 +2071,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && fbw_raise_enabled()
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
@@ -2112,7 +2090,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // virtual and DCEs — eliding the per-iteration `set_current_exception`
     // CALL that otherwise forces the exception to materialize.
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && fbw_raise_enabled()
         && matches!(
             ei.pyre_helper,
@@ -2415,7 +2392,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // descriptors, custom hooks, absent/boxed/float slots, and type-changing
     // values retain the original CallMayForceN unchanged.
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && original_call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreAttr
         && fbw_storeattr_fold_enabled()
     {
@@ -2564,10 +2540,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // combined with the user-call inlining path.  The handler-bearing
     // reachability is additionally gated `PYRE_FBW_BUILTIN_FOLD` (default ON)
     // so the legacy handler-free behavior is recoverable.
-    if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
-        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
-    {
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal {
         if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1))
         {
@@ -2597,7 +2570,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
         && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").as_deref() != Ok("0")
         && (!jitcode_has_exception_handler(code) || fbw_builtin_fold_enabled())
@@ -2641,10 +2613,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // CanRaise residual a `catch_exception` could otherwise resume into);
     // `try_walker_load_name_cell_fold` gates module scope at runtime and
     // routes non-module frames back to this residual.
-    if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
-        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
-    {
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (
                 Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
@@ -2668,7 +2637,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
         && !jitcode_has_exception_handler(code)
         && std::env::var("PYRE_FBW_LOADNAME_FOLD").as_deref() != Ok("0")
@@ -2699,7 +2667,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // even in handler-bearing bodies; every unfoldable shape falls through to
     // the residual (which keeps its exception guard).
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadAttr
         && fbw_loadattr_fold_enabled()
     {
@@ -2730,7 +2697,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadAttr
         && fbw_loadmethod_fold_enabled()
         && next_op_is_load_method_self_for_attr(code, op, ctx, dst)
@@ -2762,7 +2728,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
         && fbw_loadmethod_fold_enabled()
     {
@@ -2890,11 +2855,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             },
                         }
                     }
-                } else if op_tag == 10
-                    && fbw_raise_enabled()
-                    && ctx.is_authoritative_executor
-                    && ctx.is_full_body_walk
-                {
+                } else if op_tag == 10 && fbw_raise_enabled() && ctx.is_authoritative_executor {
                     // B3 (`PYRE_FBW_RAISE`): `op_tag == 10` is CHECK_EXC_MATCH
                     // (`bh_compare_fn(exc, match_type, 10)`,
                     // `call_jit.rs:4299`).  Fold the match concretely to a

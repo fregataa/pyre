@@ -63,11 +63,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // `op_pc`.  Set `fbw_mode.snapshot_sym` for the walk's lifetime;
     // `walker_capture_snapshot_for_last_guard` and
     // `fbw_foriter_body_from_op_pc` read it.  This is the PRODUCTION
-    // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
-    // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
-    // so `fbw_mode.snapshot_sym` is non-null on every default-JIT
-    // run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
-    // (the transitional trait leg), which leaves the pointer null.
+    // default tracer: `trace.rs` enters `full_body_walk_trace` for every
+    // traced key (unless a prior walk structurally declined it), so
+    // `fbw_mode.snapshot_sym` is non-null on every default-JIT run.
     // Recover the portal EC red off `sym.frame` before the first opcode is
     // dispatched (thus before any guard is recorded), caching it into
     // `sym.execution_context`.  A bridge-from-guard sym whose ec color collides
@@ -223,11 +221,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             descr_refs,
             raw_descrs,
             is_authoritative_executor,
-            // `dispatch_via_miframe` is the full-body walk entry
-            // (production tracer, diagnostic probe — the non-production
-            // roots are excluded from concrete execution by
-            // `is_authoritative_executor: false` instead).
-            is_full_body_walk: true,
             trace_ctx,
             done_with_this_frame_descr_ref,
             done_with_this_frame_descr_int,
@@ -742,7 +735,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // never run pre-deopt (the deopt cut the trace there), so this is its
             // first and only concrete execution.
             is_authoritative_executor: true,
-            is_full_body_walk: true,
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
@@ -1077,7 +1069,6 @@ pub(crate) fn drive_outer_frame_continuation<Sym: WalkSym>(
             descr_refs: &perfn_descr_refs,
             raw_descrs: RawDescrPool::PerFn(perfn_descrs),
             is_authoritative_executor: true,
-            is_full_body_walk: true,
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),

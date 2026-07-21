@@ -85,9 +85,17 @@ way PyPy's metainterp does it rather than by keeping a second leg.
 **Tracking.** gh#344 (observer/replay two-executor → single authoritative
 walker) is the epic; its original scope was the generic majit engine only,
 and the pyre-side half — deleting the `OpcodeHandler` trace-time twin and
-the `is_full_body_walk` bifurcation — is now recorded there as a scope
+the full-body-walk mode bifurcation — is now recorded there as a scope
 supplement (2026-07-05 comment). gh#342 and gh#115 track the walker
 coverage gaps that force the trait leg to stay alive.
+
+**Status — pyre-side done.** The `is_full_body_walk` field and its fork, the
+`OpcodeHandler`-on-`MIFrame` trace-time methods, and the `PYRE_FULL_BODY_WALK`
+gate are deleted; the walker is the sole trace-time executor and observes a
+vable-force via the residual-call token protocol
+(`try_execute_residual_call_via_executor`), the metainterp mechanism — no
+second leg. The generic majit-engine half of gh#344 is separate; the F1
+resume side (pc_map / resume translation) is WS1 increments 1–2.
 
 ### F3 — GC root registration is a post-hoc walker registry
 
@@ -212,9 +220,11 @@ Increments (each lands green on N4 gates, each with its kill switch):
 4. **Single executor (W4)**: make walker-as-tracer the only trace-time
    leg; solve the vable-force observation blocker via the metainterp
    mechanism; delete the `OpcodeHandler` trace-time twin and the
-   `is_full_body_walk` bifurcation (A7). gh#344 owns both halves (the
+   full-body-walk mode bifurcation (A7). gh#344 owns both halves (the
    pyre-side twin deletion was added to its scope 2026-07-05);
-   gh#342/gh#115 track the walker coverage gaps.
+   gh#342/gh#115 track the walker coverage gaps. *Pyre-side done
+   (2026-07-20): twin methods, mode field/fork, and the PYRE_FULL_BODY_WALK
+   gate deleted; walker is the sole trace-time leg.*
 
 Regression corpus (all must be tests before the increments that fix them):
 the pr354 FOR_ITER-in-called-function crash repro, the loop-carried `or`
@@ -222,7 +232,7 @@ deopt underflow repro, rc_d32.py double-append, aheui logo --jit, the wasm
 timeout re-entry cases.
 
 Exit criteria: `pc_map`, the resume translation layer, `OpcodeHandler` twin, and
-`is_full_body_walk` no longer exist in the tree; full benchmark suite (all
+the full-body-walk mode flag no longer exist in the tree; full benchmark suite (all
 8) no regressions; crash corpus green; slot-vs-color epic closeable.
 
 ### WS2 — majit-translate systematization (F4)
