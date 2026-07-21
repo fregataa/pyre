@@ -3831,6 +3831,21 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// with the exact, depth-independent edge resolution. Empty outside the
     /// gated kept-stack path.
     pub branch_guard_kept_recovered: &'a [(u16, OpRef)],
+
+    /// Extra virtual roots to seed into the guard snapshot beyond the outer
+    /// Python frame's jitcode-liveness boxes — walker-minted virtual op-results
+    /// that carry no liveness color yet must survive a deopt as fail-arg roots.
+    /// The motivating case is the `w_list_append` commit sub-walk over a
+    /// non-empty nested list element (`[[i] for i in range(n)]`): the appended
+    /// inner-list wrapper is passed to the sub-walk as a register arg but is not
+    /// named by any live outer color, so without an explicit root the resume
+    /// recursion never descends into it and its backing block resolves to a null
+    /// `OpRef`. Each entry is the `(OpRef, Type)` of a root the snapshot builder
+    /// must append to the top frame's boxes so the ported
+    /// `_visitor_walk_recursive` registers the nested virtual (wrapper + backing
+    /// block) in resume data. Empty on every path today: only populated behind
+    /// the DEFAULT-OFF `PYRE_NESTED_LIST_FOLD_VIRT` gate, so this is dormant.
+    pub sub_walk_extra_virtual_roots: &'a [(OpRef, majit_ir::Type)],
 }
 
 /// `rlib/jit.py:601` `max_unroll_recursion` default (= warmstate
@@ -6088,6 +6103,51 @@ fn empty_append_virt_enabled() -> bool {
         std::env::var("PYRE_EMPTY_APPEND_VIRT").map_or(true, |v| v != "0")
     });
     *ENABLED
+}
+
+/// `PYRE_NESTED_LIST_FOLD_VIRT` gate (read once) — admits a non-empty nested
+/// `BUILD_LIST` element (`[[i] for i in range(n)]`) into the orthodox
+/// `w_list_append` fold. The appended value is a virtualized inner list whose
+/// separately allocated backing block (`NewArray` / `NewArrayClear`) carries no
+/// jitcode-liveness slot; once the trace-time single-executor forks were retired
+/// the append body no longer runs under a speculative-replay sub-walk, so the
+/// backing block is bound at every guard-exit deopt and the shape compiles
+/// bit-exact on dynasm / cranelift / wasm (comprehension-hot acceptance repro
+/// `bench/synth/nested_list_comprehension_hot.py`). Default-on; set
+/// `PYRE_NESTED_LIST_FOLD_VIRT=0` to fall back to the `for_iter_bodies_all_jit_safe`
+/// decline (native only — the wasm guest cannot read the env var).
+pub fn nested_list_fold_virt_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PYRE_NESTED_LIST_FOLD_VIRT").map_or(true, |v| v != "0")
+    });
+    *ENABLED
+}
+
+/// `PYRE_WASM_UNBOXED_APPEND_FOLD` gate (read once) — admits the unboxed
+/// (Integer/Float storage) `w_list_append` fold on the wasm backend. The fold
+/// records the spare-capacity fast path guarded by `GuardTrue(length <
+/// arraylen(items))`; when the comprehension result escapes the enclosing frame
+/// and a later append crosses the backing block's realloc boundary, the wasm
+/// backend mis-resumes that capacity-guard deopt — the reallocating append's
+/// iteration is lost (list one element short) or, when the partially built list
+/// is a kept operand-stack temp, the whole list resolves to NULL ("call
+/// failed"). dynasm / cranelift resume the identical guard IR correctly, so this
+/// is a wasm-backend deopt/resume defect. Until it is root-fixed, decline the
+/// unboxed arm on wasm so the append runs as the plain residual `jit_list_append`
+/// (interpreter fallback, correct if unaccelerated). DEFAULT-ON for wasm32 (the
+/// backend that mis-resumes); a strict no-op on native (the fold always folds
+/// there). Set `PYRE_WASM_UNBOXED_APPEND_FOLD=1` to force the fold back on for
+/// bisecting the root fix. The Object-storage arm is unaffected — it resumes
+/// correctly and stays folded.
+fn wasm_unboxed_append_fold_declined() -> bool {
+    static DECLINED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        if cfg!(target_arch = "wasm32") {
+            std::env::var("PYRE_WASM_UNBOXED_APPEND_FOLD").map_or(true, |v| v != "1")
+        } else {
+            false
+        }
+    });
+    *DECLINED
 }
 
 /// #62 dead-`box_bool` proof for [`try_walker_specialize_compare_op_int`] /
