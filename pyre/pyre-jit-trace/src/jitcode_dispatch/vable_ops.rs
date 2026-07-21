@@ -173,7 +173,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 /// full `_nonstandard_virtualizable` -> SETFIELD_GC fallback +
 /// `virtualizable_boxes[index] = valuebox` write + `synchronize_virtualizable`
 /// mirror.  The concrete `Value` is reconstructed via
-/// `TraceCtx::concrete_of_opref` (matches the trait-leg's
+/// `TraceCtx::concrete_of_opref` (matching the
 /// `pyjitpl/dispatch.rs:1608-1609` shape `let (value, concrete) =
 /// self.read_<bank>_reg(src); ctx.vable_setfield(...)`).
 ///
@@ -250,8 +250,9 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
     let array_pool_idx = read_pool_idx(array_offset);
     // RPython `MIFrame.vable_array_index_pair_at` reads `self.descrs[idx]`
     // — pyre's single per-walk pool, selected by `ctx.raw_descrs`
-    // (global `ALL_DESCRS` for arm walks, per-`CodeObject` `exec.descrs`
-    // for full-body walks).
+    // (global `ALL_DESCRS` only for the build-time canonical jitcode a
+    // specialization sub-walk inlines, per-`CodeObject` `exec.descrs`
+    // otherwise).
     let array_field_index = match (
         ctx.raw_descrs.bh_descr_at(field_idx),
         ctx.raw_descrs.bh_descr_at(array_pool_idx),
