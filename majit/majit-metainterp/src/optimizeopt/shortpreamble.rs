@@ -1325,7 +1325,7 @@ fn imported_const_opref(
     }
     // history.py:227/268/314 Const{Int,Float,Ptr}.value inline — fresh
     // imported short-preamble constant lands inline in `op.args` rather
-    // than indexing the legacy pool. Slice 7b op-graph walker covers
+    // than indexing the legacy pool. The op-graph walker covers
     // ConstPtr slots across minor collection.
     let opref = match value {
         majit_ir::Value::Int(v) => OpRef::const_int(*v),
@@ -1619,7 +1619,7 @@ impl ProducedShortOp {
         // phase boundary, so an eager `imported_short_aliases.push` here
         // would be a TODO dual write.
         //
-        // Path B parity (B.6.7): Heap/Array/LoopInvariant produce_* return
+        // Heap/Array/LoopInvariant produce_* return
         // `source` so successor short-op dependency args resolve through
         // `produced_results` to Phase 1 source-namespace (matching body
         // refs after `force_op_from_preamble_op` returns `preamble_source`).

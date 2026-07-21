@@ -142,9 +142,8 @@ fn concrete_shadow_value(value: Value) -> Option<Value> {
 /// RPython's `Box` carries type implicitly via Python class identity
 /// (`ConstInt`/`ConstFloat`/`InputArgRef` etc.).  Pyre's flat-OpRef
 /// encoding stores type as a separate `Type` tag, so `GreenBox` bundles
-/// the position + type tag into one struct — Phase A.4 step in
-/// `~/.claude/plans/ec-wiring-gentle-wave.md` folding away the
-/// previous parallel `Vec<OpRef>` + `Vec<Type>` adaptation.
+/// the position + type tag into one struct, folding away the previous
+/// parallel `Vec<OpRef>` + `Vec<Type>` adaptation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GreenBox {
     pub opref: OpRef,
@@ -1471,8 +1470,8 @@ impl TraceCtx {
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
     /// history.py:314 `ConstPtr.value` is inline on the Box; pyre
-    /// mirrors with `OpRef::ConstPtr(GcRef)`. The Slice 7b
-    /// op-graph walker forwards these slots across minor collection.
+    /// mirrors with `OpRef::ConstPtr(GcRef)`. The op-graph walker
+    /// forwards these slots across minor collection.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
         OpRef::const_ptr(majit_ir::GcRef(value as usize))
     }

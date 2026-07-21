@@ -1887,7 +1887,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|trace| (trace_id, trace))
     }
 
-    /// gh#73 S3.3: the OpCode of the guard op that produced this exit, resolved
+    /// The OpCode of the guard op that produced this exit, resolved
     /// from the `source_op_index` the fail descriptor / exit layout carries.
     /// Pure read of the retained compiled trace ops; None if the loop/trace is
     /// gone or the index is out of range.
@@ -6915,7 +6915,7 @@ impl<M: Clone> MetaInterp<M> {
         combined_ops.extend(body_ops);
         // history.py:227/268/314 parity: `op.args[j]` carries inline
         // `ConstX.value` directly; the retrace boundary no longer needs
-        // a separate `constants` side-table merge (Slice 7a).
+        // a separate `constants` side-table merge.
 
         // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
         // compile_trace already owns the bridge inputarg contract
@@ -10003,7 +10003,7 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
-        // #217 Slice 4 — bridge inputarg `InputArg*.value` stamp.
+        // Bridge inputarg `InputArg*.value` stamp.
         //
         // bridgeopt.py:124 `deserialize_optimizer_knowledge` receives
         // `frontend_boxes` (the source guard's live boxes) alongside
@@ -13488,11 +13488,11 @@ impl<M: Clone> MetaInterp<M> {
         );
         // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs).
         //
-        // S2.4 follow-up: pull `arg_types` from `target_sd.red_args_types`
+        // Pull `arg_types` from `target_sd.red_args_types`
         // (warmspot.py:664) — the static spec is the source of truth.
         // The previous shape recomputed types from runtime arg kinds
         // every call; the consistency assert at
-        // compile.rs::compile_tmp_callback (S2.4) already locks the
+        // compile.rs::compile_tmp_callback already locks the
         // contract that the runtime kinds match jd.red_args_types in
         // declaration order, so the two derivations are observationally
         // identical. Routing through the static spec removes the
@@ -14302,8 +14302,8 @@ impl<M: Clone> MetaInterp<M> {
         pc: usize,
         assembler_call: bool,
     ) -> Result<Option<(OpRef, i64)>, DoResidualCallAbort> {
-        // S2.1 invariant (wiggly-barto plan, mirrors `compile_tmp_callback`'s
-        // pre-check at compile.rs:2123): the recursive-call funcbox dereferences
+        // Invariant (mirrors `compile_tmp_callback`'s pre-check in
+        // compile.rs): the recursive-call funcbox dereferences
         // `portal_runner_adr` directly (line below), so a 0 address would jump
         // to NULL on the bh_call_r side. `warmspot.py:1010-1012` populates this
         // before any do_recursive_call can fire; `debug_assert!` catches a
@@ -15765,7 +15765,7 @@ impl MetaInterpStaticData {
     /// except pyre populates the table incrementally as drivers register
     /// instead of taking it wholesale from the codewriter's CallControl.
     ///
-    /// # S2.1 invariant (wiggly-barto plan)
+    /// # Invariant
     ///
     /// The caller must populate `jd.portal_runner_adr` to the host's
     /// `ll_portal_runner` address (`warmspot.py:1010-1012`) **before**
@@ -17447,7 +17447,7 @@ mod metainterp_static_data_tests {
         0xc0ffee
     }
 
-    /// S2.1 invariant (wiggly-barto plan): `do_recursive_call` requires
+    /// Invariant: `do_recursive_call` requires
     /// `portal_runner_adr != 0`. The default `with_virtualizable` /
     /// `JitDriverStaticData::new` constructor leaves the address at 0
     /// until the host runtime populates it (`warmspot.py:1010-1012`).
@@ -17475,7 +17475,7 @@ mod metainterp_static_data_tests {
             majit_ir::EffectInfo::default(),
         );
         // Deliberately do NOT set jd.portal_runner_adr — the default 0
-        // sentinel must trigger the S2.1 invariant assertion.
+        // sentinel must trigger the invariant assertion.
         let jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         let _ = meta.do_recursive_call(&jd, &[], descr_ref, &descr_view, 0, 0, false);
     }
@@ -19035,7 +19035,7 @@ mod tests {
     fn walk_partial_trace_refs_forwards_inline_const_ptr_in_op_args() {
         // history.py:314 `ConstPtr.value` parity: an inline-Const Ref
         // stored in `op.args[j]` is the canonical forwardable Ref site
-        // after Slice 2 producer cutover. A minor collection between
+        // after the producer cutover. A minor collection between
         // a failed bridge compile and `compile_retrace` must forward
         // it through the op-graph walker.
         let mut meta = MetaInterp::<()>::new(0);
@@ -19067,7 +19067,7 @@ mod tests {
     fn walk_partial_trace_refs_forwards_inline_const_ptr_in_fail_args() {
         // history.py:314 + resoperation.py guard fail_args parity:
         // guard ops carry `fail_args` (the resume-side live values).
-        // After Slice 2 cutover, an inline ConstPtr in fail_args must
+        // After the cutover, an inline ConstPtr in fail_args must
         // also forward across minor collection.
         let mut meta = MetaInterp::<()>::new(0);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 11);
@@ -21196,7 +21196,7 @@ mod tests {
 
     #[test]
     fn on_back_edge_typed_installs_cell_with_typed_comparekey() {
-        // #203 gap-7 step-a cutover: a hot back-edge carrying a real
+        // A hot back-edge carrying a real
         // (code, pc) must install a warm-state cell with a typed
         // `comparekey`, so the marker-path lookup (`lookup_chain_with_key`)
         // resolves to the same cell as the legacy u64 hash flow. The cell
@@ -21229,7 +21229,7 @@ mod tests {
 
     #[test]
     fn bound_reached_force_starts_cell_with_typed_comparekey() {
-        // #203 gap-7 step-a: the can_enter_jit force-start path
+        // The can_enter_jit force-start path
         // (`bound_reached` → `force_start_tracing_for_key`) must also
         // install a cell with a typed comparekey, bypassing the counter.
         let mut meta = MetaInterp::<()>::new(1);

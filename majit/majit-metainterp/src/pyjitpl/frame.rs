@@ -407,7 +407,7 @@ impl MIFrame {
     /// must satisfy [`OpRef::is_constant`] — the constant-namespace
     /// flag set by `OpRef::const_int` / `const_ptr` / `const_float`.
     ///
-    /// Production callers land with S2.3 follow-up (the metainterp-side
+    /// Production callers land with a follow-up (the metainterp-side
     /// `opimpl_jit_merge_point` port). For now the helper is dead code
     /// outside tests; it locks the contract upstream relies on so a
     /// future caller cannot silently accept a non-Const green.
@@ -1550,7 +1550,7 @@ mod tests {
         use crate::JitCallArg;
         let mut builder = JitCodeBuilder::new();
         // Emit a canonical Pure residual_call that records 'i' at
-        // end-of-instr per `assembler.py:217-219` (Parity #14 Slice C.5).
+        // end-of-instr per `assembler.py`.
         let fn_idx = builder.add_fn_ptr(0x1usize as *const ());
         builder.call_pure_int_canonical_via_target(fn_idx, &[JitCallArg::int(0)], 0);
         let jitcode = Arc::new(builder.finish());
