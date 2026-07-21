@@ -414,6 +414,38 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
     true
 }
 
+/// Whether an exception string-override body issues a nested Python call.  The
+/// bounded string-override route inlines the override as a leaf; a nested call
+/// (`CallFn` residual, or a `cond_call`/`call_assembler`/`inline_call`) forces a
+/// multi-frame guard-resume snapshot the sub-walk cannot build, aborting
+/// mid-recording (`LoopBearingCalleeInlineUnsupported`) and discarding the whole
+/// loop.  Such a body must stay on the residual dispatch path.
+pub(crate) fn exception_string_override_has_nested_call(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return true;
+        };
+        if d.opname.starts_with("cond_call")
+            || d.opname.starts_with("call_assembler")
+            || d.opname.starts_with("inline_call")
+        {
+            return true;
+        }
+        if d.opname.starts_with("residual_call")
+            && residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
+                == Some(majit_ir::PyreHelperKind::CallFn)
+        {
+            return true;
+        }
+        pc = d.next_pc;
+    }
+    false
+}
+
 /// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
 /// (#68).  The fast-path inline predicate guarantees the callee does not own a
 /// virtualizable (any vable op declines the inline), so the owns_vable /
@@ -1267,7 +1299,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     nparams: usize,
     has_closure: bool,
     exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
-    arg_class_guard: Option<(OpRef, i64)>,
+    arg_class_guard: Option<ArgClassGuard>,
     allow_method_load_attr: bool,
     require_str_result: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -1518,8 +1550,39 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             version_tag,
         )?;
     }
-    if let Some((arg, w_class)) = arg_class_guard {
-        walker_guard_class(ctx, op.pc, arg, w_class)?;
+    if let Some((arg, concrete_arg, w_type)) = arg_class_guard {
+        // `GuardClass` compares the object's physical `ob_type`, not its Python
+        // `W_TypeObject`.  Pin the physical type: a boxed builtin whose
+        // `ob_type` the optimizer already knows would make a `GuardClass`
+        // against the heap type object provably fail, discarding the loop
+        // (`InvalidLoop`).  `walker_guard_class` also emits the tagged-int
+        // low-bit test, needed when `arg` may arrive as a tagged int.
+        let physical_type = unsafe { (*concrete_arg).ob_type } as i64;
+        walker_guard_class(ctx, op.pc, arg, physical_type)?;
+        // A builtin subclass / user instance shares its `ob_type` with the base
+        // layout, so `ob_type` alone does not pin the class the reflected-op
+        // decline (`w_type_issubtype`) was computed against.  Guard the live
+        // `w_class` too so an arg of a distinct class deopts.  Singletons with a
+        // null `w_class` (`Ellipsis`/`NotImplemented`) are pinned exactly by
+        // `ob_type`, and guarding their null slot against `w_type` would itself
+        // be provably false — so guard `w_class` only when it is populated.
+        if !unsafe { (*concrete_arg).w_class }.is_null() {
+            let live_w_class = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                arg,
+                crate::descr::w_class_descr(),
+            );
+            let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[live_w_class, w_class_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(live_w_class, w_class_const);
+        }
     }
 
     let callable_expected = ctx
@@ -2376,6 +2439,18 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     if !exception_string_override_straight_line(body.code) {
         return Ok(None);
     }
+    // A nested Python call in the override body (e.g. `return repr(self.args)`)
+    // cannot be inlined on this bounded route: recording the callee's own
+    // residual and its guard-resume snapshot aborts mid-trace, discarding the
+    // whole loop instead of declining.  Keep such a body on the residual
+    // dispatch path where the interpreter owns the nested frame.
+    let Some((override_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
+        return Ok(None);
+    };
+    if exception_string_override_has_nested_call(body.code, override_descr_refs) {
+        return Ok(None);
+    }
 
     // A straight-line, effect-free override can be sampled before any IR is
     // emitted. If its observed result is not a string, decline to the original
@@ -2485,6 +2560,18 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // A tagged immediate is an exact builtin `int` with C-level operator slots:
+    // it has no heap `ob_type`/`w_class` to pin, and its dunder is not inlinable
+    // Python code.  Decline before the concrete derefs below, which would fault
+    // on the immediate (`typedef::r#type` stays the tagged-safe typing path).
+    // Inert behind `CAN_BE_TAGGED` (default false).
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(concrete_lhs)
+            || pyre_object::tagged_int::is_tagged_int(concrete_rhs))
+    {
+        return Ok(None);
+    }
+
     let w_class = unsafe { (*concrete_lhs).w_class };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return Ok(None);
@@ -2544,7 +2631,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
-        Some((rhs, w_typ_r as i64)),
+        Some((rhs, concrete_rhs, w_typ_r)),
         false,
         false,
     )?
@@ -2621,6 +2708,18 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // A tagged immediate is an exact builtin `int` with C-level operator slots:
+    // it has no heap `ob_type`/`w_class` to pin, and its dunder is not inlinable
+    // Python code.  Decline before the concrete derefs below, which would fault
+    // on the immediate (`typedef::r#type` stays the tagged-safe typing path).
+    // Inert behind `CAN_BE_TAGGED` (default false).
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(concrete_lhs)
+            || pyre_object::tagged_int::is_tagged_int(concrete_rhs))
+    {
+        return Ok(None);
+    }
+
     let w_class = unsafe { (*concrete_lhs).w_class };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return Ok(None);
@@ -2680,7 +2779,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
-        Some((rhs, w_typ_r as i64)),
+        Some((rhs, concrete_rhs, w_typ_r)),
         false,
         false,
     )?
