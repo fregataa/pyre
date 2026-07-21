@@ -3223,6 +3223,22 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     value: pyre_object::PyObjectRef,
     len_before: usize,
 ) -> Result<(), DispatchError> {
+    // `w_list_append` unboxes its `value` inside an inline sub-walk.  A
+    // virtual range item must be materialized at that call boundary: otherwise
+    // the sub-walk's snapshot exports its raw payload as a loop-carried scalar,
+    // which makes a module-cell reload retain the trace-entry value.  The
+    // identity ptr→int→ptr pair is the normal forcing shape: it preserves the
+    // live SSA Ref while making the virtual allocation observable to the
+    // optimizer, so the descended `plain_int_w` reads the current iteration's
+    // payload (as the real `w_list_append` call does).
+    let value_as_int = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[value_op]);
+    ctx.trace_ctx
+        .set_opref_concrete(value_as_int, Value::Int(value as usize as i64));
+    let value_op = ctx
+        .trace_ctx
+        .record_op(OpCode::CastIntToPtr, &[value_as_int]);
+    ctx.trace_ctx
+        .set_opref_concrete(value_op, Value::Ref(majit_ir::GcRef(value as usize)));
     // Stamp the receiver concrete (the sub-walk reads it as ref-arg 0; its
     // strategy switch needs the concrete receiver).
     ctx.trace_ctx.set_opref_concrete(
@@ -4455,18 +4471,210 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Walker-native `GetIter` for an exact machine-word `range`.
+///
+/// Emits the virtual `W_IntRangeIterator` allocation shape directly — the
+/// iterator PyPy's inlined `descr_iter` would trace — so a locally consumed
+/// iterator stays a removable virtual `New`.
+pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    _dst: usize,
+    dst_bank: char,
+) -> Result<Option<OpRef>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || dst_bank != 'r'
+        || r_args.len() != 1
+        || ctx.fbw_mode.inline_subwalk
+    {
+        return Ok(None);
+    }
+
+    let range_op = r_args[0];
+    let Some(range_obj) = walker_concrete_ref_object(ctx, range_op) else {
+        return Ok(None);
+    };
+
+    let (concrete_start, concrete_step, concrete_length, concrete_mul, concrete_one_past) = unsafe {
+        if !pyre_object::functional::is_w_range(range_obj)
+            || !pyre_object::functional::is_exact_w_range(range_obj)
+        {
+            return Ok(None);
+        }
+        let (start_obj, _stop_obj, step_obj) = pyre_object::functional::w_range_fields(range_obj);
+        let length_obj = pyre_object::functional::w_range_length(range_obj);
+        if !pyre_object::is_int(start_obj)
+            || pyre_object::is_bool(start_obj)
+            || !pyre_object::is_int(step_obj)
+            || pyre_object::is_bool(step_obj)
+            || !pyre_object::is_int(length_obj)
+            || pyre_object::is_bool(length_obj)
+        {
+            return Ok(None);
+        }
+        let Some((start, _stop, step)) = pyre_object::functional::w_range_fields_i64(range_obj)
+        else {
+            return Ok(None);
+        };
+        let Some(length) = pyre_object::functional::w_range_length_i64(range_obj) else {
+            return Ok(None);
+        };
+        let one_past_i128 = start as i128 + length as i128 * step as i128;
+        let Ok(one_past) = i64::try_from(one_past_i128) else {
+            return Ok(None);
+        };
+        let Some(mul) = length.checked_mul(step) else {
+            return Ok(None);
+        };
+        let Some(one_past_checked) = start.checked_add(mul) else {
+            return Ok(None);
+        };
+        debug_assert_eq!(one_past_checked, one_past);
+        (start, step, length, mul, one_past)
+    };
+
+    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
+    if !range_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(range_op) {
+        let range_type_const = ctx.trace_ctx.const_int(range_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[range_op, range_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(range_op, range_type_addr);
+
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let int_type_const = ctx.trace_ctx.const_int(int_type_addr);
+
+    let start_r = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        range_op,
+        crate::descr::range_start_descr(),
+    );
+    if !ctx.trace_ctx.heap_cache().is_class_known(start_r) {
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[start_r, int_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(start_r, int_type_addr);
+    }
+    let start_i = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        start_r,
+        crate::descr::int_intval_descr(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(start_i, majit_ir::Value::Int(concrete_start));
+
+    let step_r = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        range_op,
+        crate::descr::range_step_descr(),
+    );
+    if !ctx.trace_ctx.heap_cache().is_class_known(step_r) {
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[step_r, int_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(step_r, int_type_addr);
+    }
+    let step_i =
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, step_r, crate::descr::int_intval_descr());
+    ctx.trace_ctx
+        .set_opref_concrete(step_i, majit_ir::Value::Int(concrete_step));
+
+    let length_r = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        range_op,
+        crate::descr::range_length_descr(),
+    );
+    if !ctx.trace_ctx.heap_cache().is_class_known(length_r) {
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[length_r, int_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(length_r, int_type_addr);
+    }
+    let length_i = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        length_r,
+        crate::descr::int_intval_descr(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(length_i, majit_ir::Value::Int(concrete_length));
+
+    let mul = ctx
+        .trace_ctx
+        .record_op(OpCode::IntMulOvf, &[length_i, step_i]);
+    ctx.trace_ctx
+        .set_opref_concrete(mul, majit_ir::Value::Int(concrete_mul));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
+
+    let one_past = ctx.trace_ctx.record_op(OpCode::IntAddOvf, &[start_i, mul]);
+    ctx.trace_ctx
+        .set_opref_concrete(one_past, majit_ir::Value::Int(concrete_one_past));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
+
+    let new = ctx.trace_ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_range_iter_size_descr(),
+    );
+    ctx.trace_ctx.heap_cache_mut().new_object(new);
+
+    let current_descr = crate::descr::range_iter_current_descr();
+    let current_index = current_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new, start_i], current_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new, current_index, start_i);
+
+    let remaining_descr = crate::descr::range_iter_remaining_descr();
+    let remaining_index = remaining_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new, length_i], remaining_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new, remaining_index, length_i);
+
+    let step_descr = crate::descr::range_iter_step_descr();
+    let step_index = step_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new, step_i], step_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new, step_index, step_i);
+
+    let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new, range_iter_type_addr);
+
+    let real_iter = unsafe { pyre_object::functional::w_range_iter(range_obj) };
+    ctx.trace_ctx.set_opref_concrete(
+        new,
+        majit_ir::Value::Ref(majit_ir::GcRef(real_iter as usize)),
+    );
+    ctx.vstack_last_ref = new;
+
+    Ok(Some(new))
+}
+
 /// Walker-native `ForIterNext` for `W_IntRangeIterator`.
 ///
 /// The generic residual advances the shared iterator before an abort can
 /// occur, and forward-delivery preserves that consumed item.  This inline
 /// path keeps that deliberately irreversible advance: it never journals or
 /// rolls the cursor back.  It instead emits the `W_IntRangeIterator.next`
-/// field-update shape with a branchless continuation mask, leaving the
-/// codewriter's existing trailing `GuardNonnull` to select loop exit.
+/// field-update shape with a continuation guard.  Its false side resumes at
+/// the same FOR_ITER coordinate as the codewriter's ordinary exhaustion edge.
 ///
-/// The Phase 1 result remains a normal `W_IntObject` allocation.  Its mask is
-/// only for the exhaustion result; item virtualization is intentionally not
-/// attempted here.
+/// The continuation item is a normal virtualizable `W_IntObject`; allocation
+/// removal elides it until an escaping consumer or a deopt needs a real box.
 pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4549,9 +4757,33 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         .heap_cache_mut()
         .class_now_known(iter_op, range_iter_type_addr);
 
-    // Emit the cursor update without a separate exhaustion guard.  `continues`
-    // is 0/1, so the exhausted path writes the existing cursor values and the
-    // masked item becomes NULL for the pre-existing GuardNonnull.
+    if !concrete_continues {
+        // Exhausted arrival: the walker concretely reached remaining==0 (a nested
+        // inner loop run to completion inside the outer body).  Record the
+        // routing guard for the false continue predicate, then present the
+        // exhaustion edge exactly as the residual does: a NULL Ref that the
+        // codewriter's trailing GuardNonnull consumes as the loop exit.  The
+        // iterator is already exhausted, so no cursor advance and no in-flight
+        // capture.
+        let zero = ctx.trace_ctx.const_int(0);
+        let remaining = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            iter_op,
+            crate::descr::range_iter_remaining_descr(),
+        );
+        let continues = ctx.trace_ctx.record_op(OpCode::IntGt, &[remaining, zero]);
+        ctx.trace_ctx.set_opref_concrete(continues, Value::Int(0));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[continues])?;
+        let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
+        ctx.trace_ctx
+            .set_opref_concrete(null_item, Value::Ref(majit_ir::GcRef(0)));
+        return Ok(Some(null_item));
+    }
+
+    // Guard the continue arm before constructing the item.  The false arm
+    // resumes at this FOR_ITER, where the interpreter takes the existing
+    // exhaustion edge (iterator retained, no item pushed).  This avoids the
+    // pointer-mask representation which forced the item to be materialized.
     let current = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         iter_op,
@@ -4571,6 +4803,10 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     let continues = ctx.trace_ctx.record_op(OpCode::IntGt, &[remaining, zero]);
     ctx.trace_ctx
         .set_opref_concrete(continues, Value::Int(concrete_continues as i64));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[continues])?;
+
+    // The continue guard establishes `continues == 1` on the trace path. Keep
+    // Slice-1's wrapping IntAdd and live-iterator SetfieldGc updates intact.
     let delta = ctx.trace_ctx.record_op(OpCode::IntMul, &[step, continues]);
     ctx.trace_ctx.set_opref_concrete(
         delta,
@@ -4605,52 +4841,36 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx.trace_ctx
         .heapcache_setfield_cached(iter_op, remaining_descr.index(), next_remaining);
 
-    // Phase 1 keeps the item boxed.  Mask its pointer through an Int word so
-    // exhaustion produces a NULL Ref without an additional guard or side exit.
-    let boxed = crate::state::wrapint(ctx.trace_ctx, current);
-    let boxed_as_int = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[boxed]);
-    let mask = ctx.trace_ctx.record_op(OpCode::IntSub, &[zero, continues]);
-    let mask_concrete = 0i64.wrapping_sub(concrete_continues as i64);
-    ctx.trace_ctx
-        .set_opref_concrete(mask, Value::Int(mask_concrete));
-    let masked_as_int = ctx
-        .trace_ctx
-        .record_op(OpCode::IntAnd, &[boxed_as_int, mask]);
-    let masked_item = ctx
-        .trace_ctx
-        .record_op(OpCode::CastIntToPtr, &[masked_as_int]);
+    // `wrapint` is the transparent `NewWithVtable(W_IntObject)` +
+    // `SetfieldGc(intval=current)` shape allocation removal virtualizes.  Do
+    // not feed it through pointer arithmetic: locally consumed items stay
+    // virtual, while normal forcing materializes escaping items.
+    let item = crate::state::wrapint(ctx.trace_ctx, current);
 
     // Tracing executes the real range cursor advance.  The direct helper is
     // the same `W_IntRangeIterator.next` implementation used by the residual;
     // do not journal it, because abort recovery forwards this exact item.
     let concrete_item = unsafe { pyre_object::functional::w_range_iter_next(iter_obj) };
     debug_assert_eq!(concrete_item.is_some(), concrete_continues);
-    let concrete_item_ptr = concrete_item.unwrap_or(pyre_object::PY_NULL);
-    let concrete_box_ptr = if concrete_continues {
-        concrete_item_ptr as usize
-    } else {
-        0
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(boxed, Value::Ref(majit_ir::GcRef(concrete_box_ptr)));
-    ctx.trace_ctx
-        .set_opref_concrete(boxed_as_int, Value::Int(concrete_box_ptr as i64));
-    let masked_concrete = (concrete_box_ptr as i64) & mask_concrete;
-    ctx.trace_ctx
-        .set_opref_concrete(masked_as_int, Value::Int(masked_concrete));
+    let concrete_item_ptr = concrete_item.expect("GuardTrue(continues) implies a range item");
     ctx.trace_ctx.set_opref_concrete(
-        masked_item,
-        Value::Ref(majit_ir::GcRef(masked_concrete as usize)),
+        item,
+        Value::Ref(majit_ir::GcRef(concrete_item_ptr as usize)),
     );
 
-    if concrete_continues {
-        fbw_foriter_inflight_capture(concrete_item_ptr, body);
-        // Range iteration stays at the C level, so the operand-stack mirror
-        // remains valid and must receive the item produced by FOR_ITER.
-        ctx.vstack_last_ref = masked_item;
-    }
+    // Keep the virtual payload's concrete shadow paired with the concrete New.
+    // A later body guard can then encode the virtual `i` in its snapshot and
+    // blackhole will rematerialize the right item on deopt.
+    ctx.trace_ctx
+        .set_opref_concrete(current, Value::Int(concrete_current));
 
-    Ok(Some(masked_item))
+    fbw_foriter_inflight_capture(concrete_item_ptr, body);
+    // Range iteration stays at the C level, so the operand-stack mirror
+    // remains valid and must receive the item produced by FOR_ITER.  Its
+    // virtual state is captured by subsequent body-guard snapshots.
+    ctx.vstack_last_ref = item;
+
+    Ok(Some(item))
 }
 
 /// Specialize `STORE_SUBSCR target[const_slice] = source` for a same-length,
