@@ -475,3 +475,47 @@ mutating_target = {mutating_key}
 MutatingSetKey.target = mutating_target
 MutatingSetKey.enabled = True
 mutating_target -= {0}
+
+
+# test_set.py TestJointOps.test_free_after_iterating: exhausting a set
+# iterator releases its source immediately. Layout-specific allocation must
+# also register `__del__` on set/frozenset subclasses, just like PyPy's common
+# objspace.allocate_instance path.
+import gc
+
+
+for _set_base in (set, frozenset):
+    _finalized = []
+
+    class _FinalizedSet(_set_base):
+        def __del__(self):
+            _finalized.append(True)
+
+    _set_iter = iter(_FinalizedSet())
+    try:
+        next(_set_iter)
+    except StopIteration:
+        pass
+    gc.collect()
+    gc.collect()
+    gc.collect()
+    assert _finalized == [True]
+
+
+# test_set.py TestJointOps.test_container_iterator: the iterator's source and
+# an element may form a cycle.  A full explicit collection must finish any
+# in-progress major cycle and then collect this cycle in a fresh major pass.
+import weakref
+
+
+for _set_base in (set, frozenset):
+    class _SetCycleElement:
+        pass
+
+    _set_cycle_element = _SetCycleElement()
+    _set_cycle_ref = weakref.ref(_set_cycle_element)
+    _set_cycle_container = _set_base([_set_cycle_element, 1])
+    _set_cycle_element.iterator = iter(_set_cycle_container)
+    del _set_cycle_element, _set_cycle_container
+    gc.collect()
+    assert _set_cycle_ref() is None

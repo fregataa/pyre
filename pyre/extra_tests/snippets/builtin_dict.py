@@ -462,10 +462,11 @@ iterator_value_dict[0] = 1
 assert next(iterator_value_iter) == 0
 
 
-# A dict operation that hashes an unhashable key raises a TypeError carrying
-# `unhashable type: 'list'`. PyPy raises it bare; CPython 3.14
-# (`dict_unhashable_type`) prefixes the key type, so match on the substring.
-unhashable_key_message = "unhashable type: 'list'"
+# Python 3.14's `dict_unhashable_type` adds the dict-key context to an exact
+# hashing TypeError.
+unhashable_key_message = (
+    "cannot use 'list' as a dict key (unhashable type: 'list')"
+)
 unhashable_dict = {"present": 1}
 for operation in (
     lambda: [] in unhashable_dict,
@@ -477,7 +478,7 @@ for operation in (
 ):
     with assert_raises(TypeError) as cm:
         operation()
-    assert unhashable_key_message in str(cm.exception)
+    assert str(cm.exception) == unhashable_key_message
 
 
 class DictHashTypeErrorSubclass(TypeError):
@@ -500,6 +501,34 @@ assert str(cm.exception) == "object is not iterable"
 assert cm.exception.__notes__ == [
     "Cannot convert dictionary update sequence element #0 to a sequence"
 ]
+
+
+# Python 3.14 makes the concrete dict view types non-instantiable and final.
+for dict_view_type in (
+    type({}.keys()),
+    type({}.values()),
+    type({}.items()),
+):
+    assert "__new__" not in dict_view_type.__dict__
+    assert_raises(TypeError, dict_view_type)
+    assert_raises(TypeError, dict_view_type, {})
+    assert_raises(TypeError, type, "DictViewSubclass", (dict_view_type,), {})
+
+
+recursive_view_dict = {}
+recursive_view_dict[42] = recursive_view_dict.values()
+assert isinstance(repr(recursive_view_dict), str)
+recursive_view_dict[42] = recursive_view_dict.items()
+assert isinstance(repr(recursive_view_dict), str)
+
+
+# OrderedDict uses the Python 3.14 collections ABC view classes now that the
+# concrete dict view types are final.
+ordered_view_dict = collections.OrderedDict((("a", 1), ("b", 2)))
+assert list(ordered_view_dict.keys()) == ["a", "b"]
+assert list(reversed(ordered_view_dict.keys())) == ["b", "a"]
+assert list(reversed(ordered_view_dict.items())) == [("b", 2), ("a", 1)]
+assert list(reversed(ordered_view_dict.values())) == [2, 1]
 
 
 def failing_dict_pair():

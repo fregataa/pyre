@@ -499,20 +499,26 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// the guard skips it.
 unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let bytes = unsafe { &mut *(obj_addr as *mut pyre_object::bytesobject::W_BytesObject) };
+    f(&mut bytes.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !bytes.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(bytes.data as *mut u8) {
         let data_slot = std::ptr::addr_of_mut!(bytes.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
+    f(&mut bytes.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut bytes.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
 /// `W_BytesObject` (off-GC storage epic S4).
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
+    f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !ba.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(ba.data as *mut u8) {
         let data_slot = std::ptr::addr_of_mut!(ba.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
+    f(&mut ba.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
@@ -812,7 +818,15 @@ fn trace_bufferview(
 }
 
 unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
+    let mv = obj_addr as *mut pyre_object::memoryview::W_MemoryView;
+    f(unsafe { &mut (*mv).ob.w_class } as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // memoryobject.py's make_weakref_descr(W_MemoryView) stores the lifeline
+    // inline on the view.  A custom trace replaces fixed-offset tracing, so
+    // forward that field explicitly before walking the off-heap BufferView.
+    f(
+        unsafe { &mut (*mv).w_weakreflifeline } as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
     if view_ptr.is_null() {
         return;
@@ -2708,15 +2722,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         );
         pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_iterator_tid);
     }
-    // `collections.deque` W_Deque — AUTO-ID typed payload allocated via
-    // `allocate_stable` (GC-managed old-gen).  Managed only means the marker
-    // *scans* it; tracing its `data` backing list still needs a registered tid
-    // + offsets.  Unregistered, its cell stays UNASSIGNED and
-    // `malloc_typed_stable` stamps tid 0 (= `object`: empty offsets, no custom
-    // trace), so the marker forwards none of its children and `data` is swept
-    // while the deque is live — use-after-free on the next `len`/index/iterate.
-    // Register at the absolute tail like the auto-id iterators above so no
-    // earlier fixed slot shifts.
+    // `interp_deque.py Block` and `W_Deque` — AUTO-ID typed payloads allocated
+    // via `allocate_stable` (GC-managed old-gen).  The block marker follows
+    // both links and its 62-slot list; the deque marker follows its two
+    // endpoint blocks.  Register at the absolute tail like the auto-id
+    // iterators above so no earlier fixed slot shifts.
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
@@ -2816,6 +2826,19 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::_tokenize::W_TokenizerIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
+    // Python-visible vtable.  Registering it through `register_pyre_class`
+    // would add a spurious subclass-range alias and shift W_Deque's canonical
+    // object type id.  PyPy likewise treats Block as the deque's internal
+    // storage node, not as an exposed Python class.
+    let deque_block_descr =
+        <pyre_interpreter::module::_collections::deque_block::W_DequeBlock
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let deque_block_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        deque_block_descr.object_size,
+        deque_block_descr.ptr_offsets.to_vec(),
+    ));
+    deque_block_descr.gc_type_id.set(deque_block_tid);
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children

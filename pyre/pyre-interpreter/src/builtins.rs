@@ -240,6 +240,39 @@ unsafe fn w_memoryview_new_plain(
     }
 }
 
+/// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
+/// byte window whose owner remains the mmap object.
+#[cfg(unix)]
+unsafe fn w_memoryview_new_mmap(
+    w_obj: PyObjectRef,
+    address: usize,
+    length: usize,
+    readonly: bool,
+) -> PyObjectRef {
+    use pyre_object::buffer::Buffer;
+    use pyre_object::bufferview::BufferView;
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let view = BufferView::Simple {
+            backing: Buffer::External {
+                w_obj: r_obj,
+                address,
+                size: length,
+                readonly,
+            },
+            w_obj: r_obj,
+            length: length as i64,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
 /// The LIVE logical bytes of a view, honouring `offset`/strides/shape so a
 /// strided slice (`m[::2]`, `m[::-1]`) or an N-D view gathers the right
 /// elements in C order (`buffer.py as_str`).  Reads the backing object's own
@@ -317,6 +350,11 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
+        }
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(w_obj) {
+            let (address, length, readonly) = view?;
+            return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
         }
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         if let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
@@ -442,6 +480,10 @@ unsafe fn memoryview_unpack_element(
     match memoryview_format_code(fmt) {
         b'c' => pyre_object::bytesobject::w_bytes_from_bytes(buf),
         b'?' => w_bool_from(buf.iter().any(|&x| x != 0)),
+        b'e' => {
+            let bits = u16::from_ne_bytes(buf.try_into().unwrap());
+            w_float_new(crate::module::r#struct::unpack_half(bits))
+        }
         tc => {
             let w = pyre_object::interp_array::unpack_value(tc, buf);
             if w == pyre_object::PY_NULL {
@@ -477,7 +519,11 @@ fn memoryview_pack_value(
         if unsafe { pyre_object::is_int_or_long(w_val) } {
             Ok(w_val)
         } else {
-            unsafe { crate::baseobjspace::space_index(w_val) }.map_err(|_| bad_type())
+            match unsafe { crate::baseobjspace::space_index(w_val) } {
+                Ok(index) => Ok(index),
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => Err(bad_type()),
+                Err(err) => Err(err),
+            }
         }
     };
     let int_val = || -> Result<i64, crate::PyError> {
@@ -523,18 +569,33 @@ fn memoryview_pack_value(
             v.to_ne_bytes().to_vec()
         }
         b'f' => {
-            if !unsafe { pyre_object::is_int_or_long(w_val) || pyre_object::is_float(w_val) } {
-                return Err(bad_type());
-            }
-            let v = crate::baseobjspace::float_w(w_val).map_err(|_| bad_type())? as f32;
+            // `PackFormatIterator.accept_float_arg`: use `space.float_w`,
+            // including a user `__float__`; only TypeError becomes the
+            // memoryview format error and other user exceptions propagate.
+            let v = match crate::baseobjspace::float_w(w_val) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
+                Err(err) => return Err(err),
+            } as f32;
             v.to_ne_bytes().to_vec()
         }
         b'd' => {
-            if !unsafe { pyre_object::is_int_or_long(w_val) || pyre_object::is_float(w_val) } {
-                return Err(bad_type());
-            }
-            let v = crate::baseobjspace::float_w(w_val).map_err(|_| bad_type())?;
+            let v = match crate::baseobjspace::float_w(w_val) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
+                Err(err) => return Err(err),
+            };
             v.to_ne_bytes().to_vec()
+        }
+        b'e' => {
+            let v = match crate::baseobjspace::float_w(w_val) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
+                Err(err) => return Err(err),
+            };
+            crate::module::r#struct::pack_half(v)?
+                .to_ne_bytes()
+                .to_vec()
         }
         b'?' => {
             vec![crate::baseobjspace::is_true(w_val)? as u8]
@@ -587,7 +648,46 @@ unsafe fn memoryview_slice_view(
         } else {
             0
         };
-        let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+
+        // CPython 3.14 `memory_subscript`: `mbuf_add_view(self->mbuf, view)`
+        // registers the result *before* `init_slice` evaluates the slice
+        // bounds.  A bound's `__index__` may release `mv`; the registered
+        // result must keep the export alive and continue from its private
+        // view snapshot (gh-92888).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(mv);
+        pyre_object::gc_roots::pin_root(index);
+        let sliced = w_memoryview_alloc_header(false, true);
+        let r_mv = pyre_object::gc_roots::shadow_stack_get(sp);
+        let snapshot = w_memoryview_view(r_mv).clone();
+        // The root `Buffer` tag was fixed by `buffer_w`; follow it directly
+        // instead of repeating an objspace isinstance lookup in this hot/JIT
+        // path.  `Buffer::sub` never nests, so one parent peel is sufficient.
+        let backing = snapshot.backing();
+        match backing {
+            pyre_object::buffer::Buffer::Byte { w_obj } => {
+                pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
+            }
+            pyre_object::buffer::Buffer::Array { w_obj } => {
+                pyre_object::interp_array::w_array_exports_incref(*w_obj)
+            }
+            pyre_object::buffer::Buffer::Sub { parent, .. } => match parent.as_ref() {
+                pyre_object::buffer::Buffer::Byte { w_obj } => {
+                    pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
+                }
+                pyre_object::buffer::Buffer::Array { w_obj } => {
+                    pyre_object::interp_array::w_array_exports_incref(*w_obj)
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        w_memoryview_set_view(sliced, bufferview_alloc(snapshot));
+        pyre_object::gc_roots::pin_root(sliced);
+
+        let r_index = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let (start, stop, step) = crate::baseobjspace::normalize_slice(r_index, count)?;
         let slicelength = if (step < 0 && stop >= start) || (step > 0 && start >= stop) {
             0
         } else if step < 0 {
@@ -595,9 +695,13 @@ unsafe fn memoryview_slice_view(
         } else {
             (stop - start - 1) / step + 1
         };
-        Ok(w_memoryview_new_derived(mv, |v| unsafe {
-            v.new_slice(start, step, slicelength)
-        }))
+        let r_sliced = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        let old_view =
+            (*(r_sliced as *mut W_MemoryView)).view as *mut pyre_object::bufferview::BufferView;
+        let view = (&*old_view).new_slice(start, step, slicelength);
+        w_memoryview_set_view(r_sliced, bufferview_alloc(view));
+        drop(Box::from_raw(old_view));
+        Ok(r_sliced)
     }
 }
 
@@ -618,7 +722,7 @@ fn memoryview_native_fmtchar(fmt: &str) -> Option<i64> {
     };
     Some(match f {
         b'c' | b'b' | b'B' | b'?' => 1,
-        b'h' | b'H' => 2,
+        b'h' | b'H' | b'e' => 2,
         b'i' | b'I' | b'f' => 4,
         b'l' | b'L' | b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
         _ => return None,
@@ -688,7 +792,12 @@ unsafe fn memoryview_start_from_tuple(
             if !memoryview_is_index(w) {
                 return Err(crate::PyError::type_error("memoryview: invalid slice key"));
             }
-            start += memoryview_get_offset(mv, dim, getindex_w(w)?)?;
+            let index = getindex_w(w)?;
+            // memoryobject.py `_start_from_tuple`: `__index__` is arbitrary
+            // Python code and may release this memoryview before the offset
+            // reads its view geometry.
+            memoryview_check_released(mv)?;
+            start += memoryview_get_offset(mv, dim, index)?;
         }
         Ok(start)
     }
@@ -742,6 +851,9 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             let length = w_memoryview_length(mv);
             let count = if itemsize > 0 { length / itemsize } else { 0 };
             let mut i = getindex_w(index)?;
+            // memoryobject.py `descr_getitem`: `_decode_index` may invoke a
+            // user `__index__` which releases the view.
+            memoryview_check_released(mv)?;
             if i < 0 {
                 i += count;
             }
@@ -834,6 +946,9 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 ));
             }
             let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+            // `decode_index4` evaluates arbitrary slice-bound `__index__`
+            // methods before the assignment touches the backing.
+            memoryview_check_released(mv)?;
             let mut indices = Vec::new();
             let mut i = start;
             while (step > 0 && i < stop) || (step < 0 && i > stop) {
@@ -1298,6 +1413,22 @@ fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         if !pyre_object::memoryview::w_memoryview_released(mv) {
+            let exports = pyre_object::memoryview::w_memoryview_exports(mv);
+            if exports > 0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    format!(
+                        "memoryview has {exports} exported buffer{}",
+                        if exports == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            if exports < 0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::SystemError,
+                    "memoryview: negative export count",
+                ));
+            }
             // `_release_underlying`: read the backing before `set_released`
             // drops the view box.  A slice / copy (`owns_export == false`)
             // shares the export and must not release it.
@@ -1525,7 +1656,14 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut fwd = Vec::with_capacity(args.len());
     fwd.push(w_bytes);
     fwd.extend_from_slice(&args[1..]);
-    crate::typedef::bytes_method_hex(&fwd)
+    // CPython 3.14 `memoryview_hex_impl`: a contiguous view increments its
+    // export count while separator coercion may run arbitrary Python code.
+    // All pyre memoryview formats accepted here are gathered from the same
+    // live view, so retain the identical release guard across the formatter.
+    unsafe { pyre_object::memoryview::w_memoryview_exports_incref(mv) };
+    let result = crate::typedef::bytes_method_hex(&fwd);
+    unsafe { pyre_object::memoryview::w_memoryview_exports_decref(mv) };
+    result
 }
 
 /// `descr_hash` (memoryobject.py:476) — a writable view is unhashable; a
@@ -1543,6 +1681,15 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
                     "cannot hash writable memoryview object",
                 ));
             }
+            // CPython 3.14 `memory_hash`: hash the exporter while holding a
+            // temporary export.  The digest is deliberately discarded; the
+            // call validates hashability and, crucially, prevents a
+            // re-entrant `mv.release()` from freeing the bytes being hashed.
+            let backing = pyre_object::memoryview::w_memoryview_obj(mv);
+            pyre_object::memoryview::w_memoryview_exports_incref(mv);
+            let backing_hash = crate::baseobjspace::hash_w_strict(backing);
+            pyre_object::memoryview::w_memoryview_exports_decref(mv);
+            backing_hash?;
             // `compute_hash(self.view.as_str())` — the same content digest the
             // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
             hash = hash_str_bytes(&memoryview_gather_bytes(mv));
@@ -1718,7 +1865,23 @@ fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     let mv = args[0];
     unsafe { memoryview_check_released(mv)? };
-    let n = unsafe { pyre_object::memoryview::w_memoryview_length(mv) };
+    let ndim = unsafe { pyre_object::memoryview::w_memoryview_ndim(mv) };
+    if ndim == 0 {
+        return Err(crate::PyError::type_error("invalid lookup on 0-dim memory"));
+    }
+    if ndim != 1 {
+        return Err(crate::PyError::not_implemented(
+            "multi-dimensional lookup is not implemented",
+        ));
+    }
+    // CPython 3.14 `memoryview_index_impl`: lookup bounds are measured in
+    // elements (`view->shape[0]`), not bytes (`view->len`).
+    let n = unsafe {
+        pyre_object::memoryview::w_memoryview_native_shape(mv)
+            .first()
+            .copied()
+            .unwrap_or(0)
+    };
     let mut start = if args.len() >= 3 {
         crate::baseobjspace::getindex_w(args[2])?
     } else {
@@ -3660,20 +3823,24 @@ fn type_descr_new_with_metaclass(
         unsafe {
             (*w_type).w_class = w_metaclass;
         }
-        let mro = unsafe { crate::baseobjspace::compute_default_mro(w_type) };
-        unsafe { pyre_object::w_type_set_mro(w_type, mro) };
-        // typeobject.py:373-377 ready() — link self into each base's
-        // `weak_subclasses` so `mutated()` and `__subclasses__()`
-        // observe this class.
-        unsafe { pyre_object::typeobject::w_type_ready(w_type) };
 
         // type_new_classcell — bind the captured `__classcell__` to the
         // new type so `__class__` / zero-arg `super()` in the methods
         // resolve; the key was already dropped from the namespace above.
+        // PyPy `_store_type_in_classcell` runs before W_TypeObject.__init__,
+        // whose `ensure_common_attributes` invokes a custom metaclass mro().
         if let Some(classcell_root) = classcell_root {
             let classcell = pyre_object::gc_roots::shadow_stack_get(classcell_root);
             unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }
+
+        // typeobject.py:1595-1613 compute_mro — a custom metaclass `mro`
+        // runs after the class cell is bound and before ready().
+        unsafe { crate::baseobjspace::compute_and_set_mro(w_type)? };
+        // typeobject.py:373-377 ready() — link self into each base's
+        // `weak_subclasses` so `mutated()` and `__subclasses__()`
+        // observe this class.
+        unsafe { pyre_object::typeobject::w_type_ready(w_type) };
 
         // _set_names (typeobject.py:1006) — call `__set_name__(owner, name)`
         // on each descriptor in the type's FINAL `__dict__` (`w_type.dict_w`),
@@ -6433,7 +6600,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                          The ability to return an instance of a strict subclass of \
                          float is deprecated, and may be removed in a future version \
                          of Python."
-                    ));
+                    ))?;
                     return Ok(floatobject::w_float_new(w_float_get_value(result)));
                 }
             }
@@ -6842,12 +7009,10 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         super_check(cls, obj)?;
         return Ok(pyre_object::descriptor::w_super_new(cls, obj));
     }
-    // Zero-arg super(): find __class__ cell and first arg from calling frame
-    //
-    // IMPORTANT: CURRENT_FRAME points to the frame that is currently
-    // executing the `super()` CALL.  For zero-arg super the __class__
-    // cell lives in the *caller* of super(), which IS the current frame
-    // (super is a builtin, not a user function that gets its own frame).
+    // descriptor.py `_super_from_frame`: zero-arg super() finds the first
+    // argument and the `__class__` free variable in the live caller frame.
+    // CURRENT_FRAME is that caller because a builtin call creates no Python
+    // frame of its own.
     crate::eval::CURRENT_FRAME.with(|current| {
         let frame_ptr = current.get();
         if frame_ptr.is_null() {
@@ -6855,75 +7020,54 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         }
         let frame = unsafe { &*frame_ptr };
         let code = frame.code();
-
-        // Find __class__ in freevars (it's a cell variable from the enclosing class scope)
-        let num_locals = code.varnames.len();
-        let ncellvars = code.cellvars.len();
-        let locals = frame.locals_w().as_slice();
-
-        let mut w_class = pyre_object::PY_NULL;
-
-        // Check freevars for __class__
-        for (slot, name) in code.freevars.iter().enumerate() {
-            if name == "__class__" {
-                let idx = num_locals + ncellvars + slot;
-                if idx < locals.len() {
-                    let cell = locals[idx];
-                    if !cell.is_null() {
-                        if unsafe { pyre_object::is_cell(cell) } {
-                            w_class = unsafe { pyre_object::w_cell_get(cell) };
-                        } else {
-                            w_class = cell;
-                        }
-                    }
-                }
-                break;
-            }
+        if code.arg_count == 0 {
+            return Err(crate::PyError::runtime_error("super(): no arguments"));
         }
 
-        // Also check cellvars for __class__
-        if w_class.is_null() {
-            for (slot, name) in code.cellvars.iter().enumerate() {
-                if name == "__class__" {
-                    let idx = if code.varnames.iter().any(|v| v == name) {
-                        code.varnames.iter().position(|v| v == name).unwrap()
-                    } else {
-                        num_locals + slot
-                    };
-                    if idx < locals.len() {
-                        let cell = locals[idx];
-                        if !cell.is_null() {
-                            if unsafe { pyre_object::is_cell(cell) } {
-                                w_class = unsafe { pyre_object::w_cell_get(cell) };
-                            } else {
-                                w_class = cell;
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if w_class.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "super(): __class__ cell not found",
-            ));
-        }
-
-        // First argument is self/cls/mcs (locals[0])
-        let w_self = if locals.is_empty() {
-            pyre_object::PY_NULL
+        // CPython 3.11+ localsplus lets an argument cellvar share slot zero;
+        // this is PyPy's `_get_self_location` / `_getcell(self_cell)` branch
+        // expressed in the unified slot layout.
+        let self_slot = frame.locals_w()[0];
+        let first_arg_is_cellvar = code
+            .varnames
+            .first()
+            .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first));
+        let w_self = if first_arg_is_cellvar
+            && !self_slot.is_null()
+            && unsafe { pyre_object::is_cell(self_slot) }
+        {
+            unsafe { pyre_object::w_cell_get(self_slot) }
         } else {
-            locals[0]
+            self_slot
         };
-
         if w_self.is_null() {
+            return Err(crate::PyError::runtime_error("super(): arg[0] deleted"));
+        }
+
+        let class_freevar = code
+            .freevars
+            .iter()
+            .position(|name| name == "__class__")
+            .ok_or_else(|| crate::PyError::runtime_error("super(): __class__ cell not found"))?;
+        let class_slot = code.varnames.len() + crate::pyframe::npure_cellvars(code) + class_freevar;
+        let class_cell = frame
+            .locals_w()
+            .as_slice()
+            .get(class_slot)
+            .copied()
+            .unwrap_or(PY_NULL);
+        let w_class = if !class_cell.is_null() && unsafe { pyre_object::is_cell(class_cell) } {
+            unsafe { pyre_object::w_cell_get(class_cell) }
+        } else {
+            class_cell
+        };
+        if w_class.is_null() {
             return Err(crate::PyError::runtime_error(
-                "super(): no first argument found",
+                "super(): empty __class__ cell",
             ));
         }
 
+        super_check(w_class, w_self)?;
         Ok(pyre_object::descriptor::w_super_new(w_class, w_self))
     })
 }
@@ -9234,6 +9378,17 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "writelines",
+            make_builtin_function_with_arity(
+                "writelines",
+                crate::module::_io::iobase_writelines,
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "close",
             make_builtin_function_with_arity("close", file_method_close, 1),
         )
@@ -9870,6 +10025,30 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(w_list_new(lines))
 }
 
+/// `_io/interp_fileio.py:write_w` — `space.getarg_w('s*', w_data).as_str()`.
+/// The `s*` converter accepts readable buffer exporters, not only bytes.
+unsafe fn file_write_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    unsafe {
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            return Ok(pyre_object::bytesobject::bytes_like_data(obj).to_vec());
+        }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            memoryview_check_released(obj)?;
+            if !memoryview_contiguity(obj).0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            return Ok(memoryview_gather_bytes(obj));
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            return Ok(pyre_object::interp_array::w_array_bytes(obj).to_vec());
+        }
+        Err(crate::PyError::type_error("write() expects str or bytes"))
+    }
+}
+
 fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error("write() requires (self, data)"));
@@ -9884,10 +10063,8 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 // `w_str_get_value`.
                 let (encoding, errors) = stream_encoding_errors(args[0]);
                 crate::type_methods::encode_object(args[1], &encoding, &errors)?
-            } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
-                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
             } else {
-                return Err(crate::PyError::type_error("write() expects str or bytes"));
+                file_write_buffer_bytes(args[1])?
             }
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
@@ -9926,12 +10103,10 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             let (encoding, errors) = stream_encoding_errors(args[0]);
             let bytes = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
             (bytes, pyre_object::w_str_len(args[1]))
-        } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
-            let data = pyre_object::bytesobject::bytes_like_data(args[1]).to_vec();
+        } else {
+            let data = file_write_buffer_bytes(args[1])?;
             let len = data.len();
             (data, len)
-        } else {
-            return Err(crate::PyError::type_error("write() expects str or bytes"));
         };
         prev.extend_from_slice(&bytes);
         let _ = crate::baseobjspace::setattr_str(
@@ -10487,17 +10662,14 @@ fn textio_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// Shared `_io.TextIOWrapper` type for text-mode file objects.
 pub fn text_io_wrapper_type() -> PyObjectRef {
-    thread_local! {
-        static TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp =
-                crate::typedef::make_builtin_type("_io.TextIOWrapper", init_text_io_wrapper_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // PyPy owns one W_TypeObject process-wide.  A TLS cache would create
+    // incompatible TextIOWrapper identities in different host threads.
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_text_io_wrapper_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn init_text_io_wrapper_type(ns: PyObjectRef) {
@@ -10548,6 +10720,17 @@ fn init_text_io_wrapper_type(ns: PyObjectRef) {
             ns,
             "write",
             make_builtin_function_with_arity("write", textio_method_write, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "writelines",
+            make_builtin_function_with_arity(
+                "writelines",
+                crate::module::_io::iobase_writelines,
+                2,
+            ),
         )
     };
     unsafe {
@@ -11049,7 +11232,7 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
                     crate::warn::warn_deprecation(&format!(
                         "__complex__ returned non-complex (type {}). The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
                         crate::type_methods::arg_type_name(res)
-                    ));
+                    ))?;
                 }
                 return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
             }
@@ -11143,7 +11326,6 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
-    let mut real_is_complex = false;
     let (mut real, mut imag) = match w_real {
         Some(a) => {
             let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
@@ -11168,33 +11350,33 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                 crate::warn::warn_deprecation(&format!(
                     "complex() argument 'real' must be a real number, not {}",
                     crate::type_methods::arg_type_name(a)
-                ));
+                ))?;
             }
-            real_is_complex = has_complex_protocol;
             value
         }
         None => (0.0, 0.0),
     };
     if let Some(b) = w_imag {
-        let (br, bi, imag_is_complex) = if unsafe { is_complex(b) } {
+        let (br, bi) = if unsafe { is_complex(b) } {
             crate::warn::warn_deprecation(&format!(
                 "complex() argument 'imag' must be a real number, not {}",
                 crate::type_methods::arg_type_name(b)
-            ));
-            unsafe { (w_complex_get_real(b), w_complex_get_imag(b), true) }
+            ))?;
+            unsafe { (w_complex_get_real(b), w_complex_get_imag(b)) }
         } else {
             if !unsafe { complex_constructor_has_real_protocol(b) } {
                 return Err(complex_constructor_argument_error("imag", b));
             }
             let converted = builtin_float(&[b])?;
-            (unsafe { w_float_get_value(converted) }, 0.0, false)
+            (unsafe { w_float_get_value(converted) }, 0.0)
         };
-        // CPython 3.14 complex_new_impl: only genuinely complex arguments
-        // contribute the cross lanes; real inputs leave those lanes absent.
-        if imag_is_complex {
+        // complex(x, y) == x + y*j even if y is already complex; preserve the
+        // signs of zero lanes by subtracting/adding only when the source lane
+        // is nonzero, otherwise taking the operand's real part directly.
+        if bi != 0.0 {
             real -= bi;
         }
-        if real_is_complex {
+        if imag != 0.0 {
             imag += br;
         } else {
             imag = br;
@@ -11457,7 +11639,7 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_complex_uses_python314_signed_zero_with_complex_real() {
+    fn test_builtin_complex_preserves_imag_arg_negative_zero_with_complex_real() {
         crate::typedef::init_typeobjects();
         let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
@@ -11466,7 +11648,7 @@ mod tests {
         );
         assert_eq!(
             unsafe { w_complex_get_imag(result).to_bits() },
-            0.0f64.to_bits()
+            (-0.0f64).to_bits()
         );
     }
 

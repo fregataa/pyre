@@ -245,6 +245,52 @@ pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(w_int_new(monotonic_nanos() as i64))
 }
 
+/// `interp_time.py:915-932 _get_time_info` — fill the app-level namespace
+/// used by `time.get_clock_info`.  The observable fields follow Python 3.14;
+/// all clocks exposed by pyre have nanosecond representation internally.
+pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // The registered arity is only a dispatch hint, so the positional count
+    // is enforced here rather than by the caller.
+    if args.len() != 2 {
+        let message = match args.len() {
+            0 => "_get_time_info() missing 2 required positional arguments: 'name' and 'info'"
+                .to_string(),
+            1 => "_get_time_info() missing 1 required positional argument: 'info'".to_string(),
+            n => format!("_get_time_info() takes 2 positional arguments but {n} were given"),
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    let name_obj = args[0];
+    let info = args[1];
+    if unsafe { !pyre_object::is_str(name_obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "time._get_time_info() argument 1 must be str, not {}",
+            crate::type_methods::arg_type_name(name_obj)
+        )));
+    }
+    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+    let (implementation, monotonic, adjustable) = match name {
+        "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
+        "monotonic" | "perf_counter" => {
+            #[cfg(target_os = "macos")]
+            {
+                ("mach_absolute_time()", true, false)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                ("clock_gettime(CLOCK_MONOTONIC)", true, false)
+            }
+        }
+        "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
+        _ => return Err(crate::PyError::value_error("unknown clock")),
+    };
+    crate::baseobjspace::setattr_str(info, "implementation", w_str_new(implementation))?;
+    crate::baseobjspace::setattr_str(info, "monotonic", w_bool_from(monotonic))?;
+    crate::baseobjspace::setattr_str(info, "adjustable", w_bool_from(adjustable))?;
+    crate::baseobjspace::setattr_str(info, "resolution", floatobject::w_float_new(1.0e-9))?;
+    Ok(w_none())
+}
+
 /// Process CPU time (kernel + user) as nanoseconds.
 ///
 /// Prefers `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`; falls back to

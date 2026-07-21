@@ -2829,6 +2829,14 @@ impl OpcodeStepExecutor for PyFrame {
     /// PyPy: pyopcode.py STORE_DEREF → cell.set(value)
     fn store_deref(&mut self, idx: usize) -> Result<(), PyError> {
         let value = self.pop();
+        // CPython 3.14 compile.c keeps an explicit class-body `__class__`
+        // assignment in the namespace (`STORE_NAME`) while the implicit cell
+        // remains available for methods and is filled by `type.__new__`.
+        // The pinned RustPython compiler emits STORE_DEREF for that assignment;
+        // normalize its semantics at the opcode boundary.
+        if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
+            return self.store_name_value("__class__", 0, value);
+        }
         let slot = self.locals_w()[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_set(slot, value) };
@@ -2870,6 +2878,9 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
+        if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
+            return self.delete_name("__class__");
+        }
         // `pyopcode.py:580 DELETE_DEREF`: fetch the cell, raise if empty, then
         // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
         // marker), not the slot pointer that holds the cell.  The cell lives at
@@ -3384,18 +3395,62 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_from_dict_or_deref(&mut self, idx: usize, name: &str) -> Result<(), PyError> {
         let mapping = self.pop();
         let key = pyre_object::w_str_new(name);
-        if let Ok(val) = crate::baseobjspace::getitem(mapping, key) {
-            self.push(val);
-            return Ok(());
+        match crate::baseobjspace::getitem(mapping, key) {
+            Ok(value) => {
+                self.push(value);
+                return Ok(());
+            }
+            Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}
+            Err(err) => return Err(err),
         }
-        let slot = self.locals_w()[idx];
+        // CPython 3.14 addresses the outer `__class__` freevar in the
+        // class-cell collision. The pinned compiler encodes the implicit
+        // method cell instead; if no outer cell exists, it emits this opcode
+        // where CPython uses LOAD_NAME, so preserve globals/builtins fallback.
+        let deref_idx = if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
+            match crate::pyframe::class_scope_outer_class_freevar(self.code()) {
+                Some(free_idx) => free_idx,
+                None => {
+                    // This deref name has no `co_names` index, so do the
+                    // uncached LOAD_NAME fallback directly rather than
+                    // corrupting an unrelated per-code LOAD_GLOBAL cache slot.
+                    let w_globals = self.get_w_globals();
+                    if !w_globals.is_null() {
+                        if let Some(value) = unsafe {
+                            pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name)
+                        } {
+                            self.push(value);
+                            return Ok(());
+                        }
+                    }
+                    if !self.w_builtin.is_null()
+                        && unsafe { pyre_object::is_module(self.w_builtin) }
+                    {
+                        let w_dict = unsafe { pyre_object::w_module_get_w_dict(self.w_builtin) };
+                        if !w_dict.is_null() {
+                            if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+                                self.push(value);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    return Err(PyError::name_error_with_name(
+                        format!("name '{name}' is not defined"),
+                        name,
+                    ));
+                }
+            }
+        } else {
+            idx
+        };
+        let slot = self.locals_w()[deref_idx];
         let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_get(slot) }
         } else {
             slot
         };
         if value == PY_NULL {
-            return Err(crate::pyframe::deref_unbound_error(self.code(), idx));
+            return Err(crate::pyframe::deref_unbound_error(self.code(), deref_idx));
         }
         self.push(value);
         Ok(())
@@ -3911,12 +3966,26 @@ impl OpcodeStepExecutor for PyFrame {
     // ── load_super_attr ──
     // CPython 3.12 LOAD_SUPER_ATTR: stack = [global_super, class, self]
     // → super(class, self).attr
-    fn load_super_attr_with(&mut self, name: &str, is_method: bool) -> Result<(), PyError> {
+    fn load_super_attr_with(
+        &mut self,
+        name: &str,
+        is_method: bool,
+        is_two_arg: bool,
+    ) -> Result<(), PyError> {
         let self_obj = self.pop();
         let cls = self.pop();
-        let _global_super = self.pop();
+        let global_super = self.pop();
 
-        let proxy = pyre_object::descriptor::w_super_new(cls, self_obj);
+        // CPython 3.14 `LOAD_SUPER_ATTR`: the callable loaded from globals is
+        // authoritative (it may shadow builtins.super).  Bit 1 distinguishes
+        // `super(type, obj)` from zero-argument `super()`; `cls` / `self_obj`
+        // are stack operands for the fast builtin case but are not arguments
+        // to a shadowing zero-arg callable.
+        let proxy = if is_two_arg {
+            crate::call::call_function_impl_result(global_super, &[cls, self_obj])?
+        } else {
+            crate::call::call_function_impl_result(global_super, &[])?
+        };
         let result = crate::baseobjspace::getattr_str(proxy, name)?;
 
         // CPython _PySuper_Lookup: determines whether the resolved attr
