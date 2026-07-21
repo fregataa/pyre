@@ -2988,9 +2988,8 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     // a reliable concrete pointer.  Allocate a real
     // `W_BaseException` so the deref against
     // `ob_header.ob_type` is sound; expect GuardClass + Finish
-    // recorded and the heapcache class-known flag pinned.  Mirrors
-    // trait-side `seed_raised_exception` at `trace_opcode.rs:
-    // 6629-6643`.
+    // recorded and the heapcache class-known flag pinned.  Mirrors the
+    // retired trait-side raise path.
     let exc_ptr = pyre_object::interp_exceptions::w_exception_new(
         pyre_object::interp_exceptions::ExcKind::ValueError,
         "shadow-walker probe",
@@ -9312,7 +9311,6 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
         ctx: &mut tc,
         sym: &mut sym,
         fallthrough_pc: 0,
-        parent_frames: Vec::new(),
         pending_result_stack_idx: None,
         pending_result_type: None,
         pending_inline_frame: None,
@@ -9398,7 +9396,6 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
         ctx: &mut tc,
         sym: &mut sym,
         fallthrough_pc: 0,
-        parent_frames: Vec::new(),
         pending_result_stack_idx: None,
         pending_result_type: None,
         pending_inline_frame: None,
@@ -9491,7 +9488,6 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
         ctx: &mut tc,
         sym: &mut sym,
         fallthrough_pc: 0,
-        parent_frames: Vec::new(),
         pending_result_stack_idx: None,
         pending_result_type: None,
         pending_inline_frame: None,

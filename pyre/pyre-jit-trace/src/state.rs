@@ -2134,7 +2134,7 @@ pub struct PyreSym {
     /// The entry is dropped as soon as freshness can no longer be proven:
     /// `RAISE_VARARGS` consumes it (a re-raise of the same object must
     /// take the residual path — its `w_context` is set by then), and
-    /// `box_value_for_python_helper` removes any value escaping into a
+    /// the retired Python-helper boxing path removed any value escaping into a
     /// python-helper residual call (which may mutate the exception).
     pub(crate) trace_built_exc: indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
@@ -2490,12 +2490,6 @@ pub struct MIFrame {
     /// bank may include post-regalloc color slots above the semantic
     /// locals+stack prefix.
     pub(crate) pre_opcode_semantic_depth: Option<usize>,
-    /// PyPy capture_resumedata: parent frame chain for multi-frame guards.
-    /// Each entry points at one parent frame plus the resumepc that
-    /// should be used when that parent is snapshotted. This stays much
-    /// closer to RPython's `self.framestack` than the old flattened
-    /// `(fail_args, fail_arg_types, resumepc, jitcode_index)` tuples.
-    pub parent_frames: Vec<ResumeFrameState>,
     /// `pyjitpl.py:181-193` `_result_argcode` analogue for non-top-frame
     /// snapshotting. When present, `get_list_of_active_boxes(in_a_call=True)`
     /// overwrites this caller stack slot with a zero/null placeholder before
@@ -2556,10 +2550,10 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             | Instruction::UnaryInvert
             | Instruction::RaiseVarargs { .. }
             // Both pop the operand stack (BUILD_TUPLE pop_n, UNPACK_SEQUENCE
-            // pop_value) before emitting a guard: trace_build_tuple_value emits
-            // the specialised-tuple w_class guards on the popped items, and
-            // unpack_sequence_value emits the sequence class / length guards on
-            // the popped sequence. Without the opcode-start snapshot the guard's
+            // pop_value) before emitting a guard: the specialised tuple path
+            // emits w_class guards on the popped items, and the unpack path
+            // emits sequence class / length guards on the popped sequence.
+            // Without the opcode-start snapshot the guard's
             // resume state reflects the post-pop stack, so resuming at the
             // opcode start restores the consumed operands as null / mismatched.
             | Instruction::BuildTuple { .. }
@@ -2754,36 +2748,6 @@ pub(crate) fn note_root_trace_too_long(green_key: u64) {
 
 pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
-}
-
-pub(crate) fn box_value_for_python_helper(
-    state: &mut MIFrame,
-    ctx: &mut TraceCtx,
-    value: OpRef,
-) -> OpRef {
-    match state.value_type(value) {
-        Type::Int => wrapint(ctx, value),
-        Type::Float => wrapfloat(ctx, value),
-        Type::Ref | Type::Void => {
-            // A trace-built exception escaping into a python-helper
-            // residual is no longer provably fresh (the callee may set
-            // `__context__` or other state); drop it so a later
-            // RAISE_VARARGS takes the residual path, whose runtime
-            // `attach_raise_cause` chaining is conditional.
-            state.sym_mut().trace_built_exc.swap_remove(&value);
-            value
-        }
-    }
-}
-
-pub(crate) fn box_args_for_python_helper(
-    state: &mut MIFrame,
-    ctx: &mut TraceCtx,
-    args: &[OpRef],
-) -> Vec<OpRef> {
-    args.iter()
-        .map(|&arg| box_value_for_python_helper(state, ctx, arg))
-        .collect()
 }
 
 // RPython parity note: pyjitpl.py (tracer) records GETFIELD_GC ops WITHOUT
@@ -3205,8 +3169,8 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
 /// `trace_guarded_int_payload`), step 1's `GUARD_CLASS` carries no
 /// `is_tagged_int` pre-check before its `ob_type` deref, and needs none: a
 /// tagged immediate can never select this arm. Both call sites gate it on
-/// `is_long(concrete)` — `trace_plain_int_payload` (`trace_opcode.rs` `if
-/// is_long(concrete_item)`) and `unbox_int_or_long_for_int_strategy` (fed by
+/// `is_long(concrete)` — the former plain-int payload path (`trace_opcode.rs`
+/// `if is_long(concrete_item)`) and `unbox_int_or_long_for_int_strategy` (fed by
 /// `unbox_long = is_long(concrete_value)` in `detect_list_setitem_strategy`).
 /// `is_long` routes through `py_type_check`, which short-circuits a tagged
 /// immediate to `ptr::eq(tp, &INT_TYPE)` — false for `LONG_TYPE` — before any
@@ -4664,7 +4628,7 @@ impl PyreSym {
     ///      `interp_jit.py:25-31`); the frame still owns the shadow
     ///      semantically though.
     ///
-    /// Callee inline frames (`inline_function_call` allocates a fresh
+    /// Callee inline frames (the retired inline-call path allocated a fresh
     /// `PyreSym::new_uninit`) keep both fields at their defaults and
     /// must NOT mirror into the caller's shadow — their
     /// `nlocals + stack_idx` space is the callee's own, not the
@@ -4929,8 +4893,8 @@ impl PyreSym {
         // seeding, `vable_setarrayitem_indexed` / `vable_getarrayitem_*`
         // fall through to raw SetarrayitemGc / GetarrayitemGc ops, and
         // `close_loop_args_at`'s `set_virtualizable_box_at` mirror
-        // becomes a no-op — the very reason `MIFrame::store_local_value`
-        // cannot route through the standard vable path today.
+        // becomes a no-op — the very reason the retired MIFrame local-store
+        // hook could not route through the standard vable path.
         if let Some(base) = self.vable_array_base {
             // virtualizable.py:86-99 read_boxes iterates `len(lst)` — the
             // heap-side `locals_cells_stack_w` length, which is
@@ -10204,7 +10168,6 @@ mod tests {
     //! upstream parity point, that reference is called out inline.
 
     use super::*;
-    use crate::helpers::TraceHelperAccess;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
     use pyre_interpreter::bytecode::{CodeObject, ConstantData, Instruction};
@@ -10835,16 +10798,16 @@ mod tests {
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
 
-        // BUILD_TUPLE pops its operands before trace_build_tuple_value emits
-        // the specialised-tuple w_class guards.
+        // BUILD_TUPLE pops its operands before the specialised tuple path
+        // emits the w_class guards.
         let build_tuple_code = compile_function_body("def f(a, b):\n    return (a, b)\n");
         assert!(contains_instruction(&build_tuple_code, |instruction| {
             matches!(instruction, Instruction::BuildTuple { .. })
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
 
-        // UNPACK_SEQUENCE pops the sequence before unpack_sequence_value emits
-        // the sequence class / length guards.
+        // UNPACK_SEQUENCE pops the sequence before the unpack path emits the
+        // sequence class / length guards.
         let unpack_code = compile_function_body("def f(s):\n    a, b = s\n    return a + b\n");
         assert!(contains_instruction(&unpack_code, |instruction| {
             matches!(instruction, Instruction::UnpackSequence { .. })
@@ -11098,7 +11061,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -11139,7 +11101,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -11195,7 +11156,6 @@ mod tests {
                 ctx: &mut ctx,
                 sym: &mut sym,
                 fallthrough_pc: 0,
-                parent_frames: Vec::new(),
                 pending_result_stack_idx: None,
                 pending_result_type: None,
                 pending_inline_frame: None,
@@ -11484,361 +11444,6 @@ mod tests {
                 &info,
             ),
             Some(vec![full_len])
-        );
-    }
-
-    #[test]
-    fn test_store_local_value_preserves_ref_slot_without_reboxing() {
-        // RPython Box.type parity: `_opimpl_setarrayitem_vable`
-        // (pyjitpl.py:1242-1247) writes the value's Ref box directly —
-        // it never reboxes at the consumer. `locals_cells_stack_w` is a
-        // W_Root array (virtualizable.py:86-98), so the producer side
-        // (`push_typed_value` on the operand stack) is responsible for
-        // wrapping Int/Float with `wrapint` / `wrapfloat` before the
-        // value flows into the stack or local slot. Pin the contract
-        // here: storing a pre-wrapped Ref leaves `registers_r[idx]`
-        // pointing at the same OpRef with no additional op emitted.
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = PyFrame::new(code);
-        frame.locals_w_mut()[0] = w_int_new(41);
-        frame.fix_array_ptrs();
-        let mut ctx = crate::trace_ctx_for_test(1);
-        // Pre-wrapped Ref — this is the shape producers hand us.
-        let ref_value = ctx.const_ref(pyre_object::PY_NULL as i64);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![OpRef::NONE];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.nlocals = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        state
-            .with_ctx(|this, ctx| this.store_local_value(ctx, 0, ref_value, ConcreteValue::Null))
-            .expect("store of pre-wrapped Ref should succeed");
-        assert_eq!(
-            state.sym().registers_r[0],
-            ref_value,
-            "Ref value must be stored as-is, not reboxed",
-        );
-        assert_eq!(state.sym().symbolic_local_types[0], Type::Ref);
-    }
-
-    #[test]
-    fn test_trace_known_builtin_call_boxes_typed_raw_args_for_python_helper_boundary() {
-        let code = compile_exec("x = abs(1)").expect("test code should compile");
-        let code_ref =
-            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
-                as *const ();
-        install_test_jitcode(&code, code_ref);
-        let mut ctx = crate::trace_ctx_for_test(2);
-        let callable = OpRef::input_arg_ref(0);
-        let arg = OpRef::input_arg_int(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.jitcode = jitcode_for(code_ref);
-        sym.registers_r = vec![callable, arg];
-        sym.symbolic_local_types = vec![Type::Ref, Type::Int];
-        sym.nlocals = 2;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let _ = state
-            .trace_known_builtin_call(callable, &[arg])
-            .expect("known builtin helper boundary should box raw int args");
-
-        let recorder = ctx.into_recorder();
-        // GuardNoException (pyjitpl.py:2082) follows the residual Call*, so
-        // look up the Call* op explicitly rather than via `ops().last()`.
-        let call = recorder
-            .ops()
-            .iter()
-            .rev()
-            .find(|op| {
-                matches!(
-                    op.opcode,
-                    OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
-                )
-            })
-            .expect("call op should be present");
-        assert_ne!(call.getarglist().last().map(|a| a.to_opref()), Some(arg));
-    }
-
-    #[test]
-    fn test_compare_value_direct_emits_raw_truth_for_immediate_branch_consumer() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
-        let code_ref =
-            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
-                as *const ();
-        install_test_jitcode(&code, code_ref);
-        let compare_pc = (0..code.instructions.len())
-            .find(|&pc| {
-                matches!(
-                    decode_instruction_at(&code, pc),
-                    Some((Instruction::CompareOp { .. }, _))
-                )
-            })
-            .expect("test bytecode should contain COMPARE_OP");
-        let branch_pc = ((compare_pc + 1)..code.instructions.len())
-            .find(|&pc| {
-                decode_instruction_at(&code, pc)
-                    .map(|(instruction, _)| instruction_consumes_comparison_truth(instruction))
-                    .unwrap_or(false)
-            })
-            .expect("test bytecode should contain POP_JUMP_IF after COMPARE_OP");
-
-        let mut frame = PyFrame::new(code);
-        frame.fix_array_ptrs();
-        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = crate::trace_ctx_for_test(2);
-        // Typed `InputArgInt` inputarg slots — `compare_value_direct`
-        // routes through `is_int_typed` lookups (history.py:220
-        // box.type) and Untyped slots silently fall through to the
-        // boxed-bool path under variant-aware Eq.
-        let lhs = OpRef::input_arg_int(0);
-        let rhs = OpRef::input_arg_int(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.valuestackdepth = 0;
-        sym.jitcode = jitcode_for(code_ref);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: branch_pc,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let concrete_lhs = w_int_new(10);
-        let concrete_rhs = w_int_new(20);
-        let result = state
-            .compare_value_direct(
-                lhs,
-                rhs,
-                ComparisonOperator::Less,
-                concrete_lhs,
-                concrete_rhs,
-            )
-            .expect("int comparison should trace");
-
-        let recorder = ctx.into_recorder();
-        let mut saw_cmp = false;
-        let mut saw_bool_call = false;
-        let mut saw_bool_unbox = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
-                continue;
-            };
-            if op.opcode == OpCode::IntLt {
-                saw_cmp = true;
-            }
-            if op.opcode == OpCode::CallR {
-                saw_bool_call = true;
-            }
-            if op.opcode == OpCode::GetfieldGcI {
-                saw_bool_unbox = true;
-            }
-        }
-        assert!(
-            saw_cmp,
-            "branch compare should still emit raw int comparison"
-        );
-        assert_eq!(
-            result,
-            // IntLt at op pos 2 — `IntOp` mixin (resoperation.py:564),
-            // `box.type='i'` (history.py:220).
-            OpRef::int_op(2),
-            "with two input args, the immediate branch consumer should receive the raw comparison truth"
-        );
-        assert!(
-            !saw_bool_call,
-            "immediate branch consumer should not allocate a bool object"
-        );
-        assert!(
-            !saw_bool_unbox,
-            "immediate branch consumer should not unbox a transient bool object"
-        );
-    }
-
-    #[test]
-    fn test_compare_value_direct_boxes_bool_when_not_immediately_consumed_by_branch() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("x = 1").expect("test code should compile");
-        let code_ref =
-            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
-                as *const ();
-        install_test_jitcode(&code, code_ref);
-        let mut frame = PyFrame::new(code);
-        frame.fix_array_ptrs();
-        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = crate::trace_ctx_for_test(2);
-        // Typed `InputArgInt` inputarg slots — `compare_value_direct`
-        // routes through `is_int_typed` lookups (history.py:220
-        // box.type) and Untyped slots silently fall through to the
-        // boxed-bool path under variant-aware Eq.
-        let lhs = OpRef::input_arg_int(0);
-        let rhs = OpRef::input_arg_int(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.valuestackdepth = 0;
-        sym.jitcode = jitcode_for(code_ref);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        let concrete_lhs = w_int_new(10);
-        let concrete_rhs = w_int_new(20);
-        let _ = state
-            .compare_value_direct(
-                lhs,
-                rhs,
-                ComparisonOperator::Less,
-                concrete_lhs,
-                concrete_rhs,
-            )
-            .expect("non-branch compare should trace");
-
-        let recorder = ctx.into_recorder();
-        let mut saw_bool_call = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
-                continue;
-            };
-            if op.opcode == OpCode::CallR {
-                saw_bool_call = true;
-            }
-        }
-        assert!(
-            saw_bool_call,
-            "non-branch compare should continue to materialize a Python bool result"
-        );
-    }
-
-    #[test]
-    fn test_next_instruction_consumes_comparison_truth_skips_extended_arg_trivia() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        ensure_test_callbacks();
-        let mut source = String::from("def f(x, y):\n    if x < y:\n");
-        for i in 0..400 {
-            source.push_str(&format!("        z{i} = {i}\n"));
-        }
-        source.push_str("    return 0\n");
-        source.push_str("f(1, 2)\n");
-
-        let module = compile_exec(&source).expect("test code should compile");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                    Some((**code).clone())
-                }
-                _ => None,
-            })
-            .expect("test source should contain function code");
-
-        let compare_pc = (0..code.instructions.len())
-            .find(|&pc| {
-                matches!(
-                    decode_instruction_at(&code, pc),
-                    Some((Instruction::CompareOp { .. }, _))
-                )
-            })
-            .expect("test bytecode should contain COMPARE_OP");
-
-        let first_after_compare = decode_instruction_at(&code, compare_pc + 1)
-            .map(|(instruction, _)| instruction)
-            .expect("bytecode should continue after COMPARE_OP");
-        assert!(
-            instruction_is_trivia_between_compare_and_branch(first_after_compare),
-            "test source should force trivia between COMPARE_OP and POP_JUMP_IF"
-        );
-
-        let code_ref =
-            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
-                as *const ();
-        install_test_jitcode(&code, code_ref);
-        let mut frame = PyFrame::new(code.clone());
-        frame.fix_array_ptrs();
-
-        let mut ctx = crate::trace_ctx_for_test(2);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.valuestackdepth = 0;
-        sym.jitcode = jitcode_for(code_ref);
-
-        let state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: compare_pc + 1,
-            parent_frames: Vec::new(),
-            pending_result_stack_idx: None,
-            pending_result_type: None,
-            pending_inline_frame: None,
-            residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-            pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
-        };
-
-        assert!(
-            state.next_instruction_consumes_comparison_truth(),
-            "branch fusion should survive EXTENDED_ARG/other trivia before the branch"
         );
     }
 
@@ -12243,7 +11848,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -12357,7 +11961,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -12476,8 +12079,8 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// into a [`PendingInlineFrame`] (concrete `PyFrame` + symbolic `PyreSym`)
 /// for `trace_bytecode` to push onto the bridge framestack.
 ///
-/// Mirrors `build_pending_inline_frame`'s IR-FREE FAST branch
-/// (`trace_opcode.rs:6035-6084`): set `jitcode` FIRST (the
+/// Mirrors the retired inline-frame builder's IR-FREE FAST branch: set
+/// `jitcode` FIRST (the
 /// `setup_kind_register_banks` debug_assert requires a non-null jitcode),
 /// then fill the per-bank register files + the lazy-boxing concrete shadow.
 /// It emits NO trace IR — the forward FAST branch's guard_value /
