@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pyre-ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  group: pyre-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
