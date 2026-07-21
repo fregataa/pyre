@@ -240,14 +240,15 @@ fn emit_sized_int_store(sink: &mut InstructionSink<'_>, offset: u64, size: usize
     }
 }
 
-/// `(field_size, is_signed)` from an op's FieldDescr; defaults to word-sized
-/// signed when the descr is absent.
+/// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
+/// a FieldDescr; a missing one is an invariant violation, so panic rather than
+/// emit a silently-wrong width.
 fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
     let descr = op.getdescr();
     if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
         return (fd.field_size(), fd.is_field_signed());
     }
-    (std::mem::size_of::<usize>(), true)
+    missing_layout_descr("field descr (size/sign)", op)
 }
 
 /// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
@@ -264,26 +265,27 @@ fn setfield_store_size_from_descr(op: &Op) -> usize {
         }
         return fd.field_size();
     }
-    std::mem::size_of::<usize>()
+    missing_layout_descr("field descr (store size)", op)
 }
 
 fn field_is_float_from_descr(op: &Op) -> bool {
-    op.getdescr()
-        .as_ref()
-        .and_then(|d| d.as_field_descr())
-        .is_some_and(|fd| fd.is_float_field())
+    let descr = op.getdescr();
+    match descr.as_ref().and_then(|d| d.as_field_descr()) {
+        Some(fd) => fd.is_float_field(),
+        None => missing_layout_descr("field descr (is_float)", op),
+    }
 }
 
-/// `(item_size, is_signed)` from an op's ArrayDescr; defaults to 8-byte
-/// signed when the descr is absent.
+/// `(item_size, is_signed)` from an op's ArrayDescr. An array op always carries
+/// an ArrayDescr; a missing one is an invariant violation, so panic.
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
     op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
-        .unwrap_or((8, true))
+        .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
 }
 
 fn array_item_is_float_from_descr(op: &Op) -> bool {
     op.with_array_descr(|ad| ad.item_type() == Type::Float)
-        .unwrap_or(false)
+        .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
 }
 
 /// Dense census of every non-constant Ref-typed value (input arg / op result),
@@ -1639,25 +1641,31 @@ fn build_function(
     // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
     // branches are retained solely for the direct-family-disabled baseline.
     debug_assert!(!ca.emit_ca || residual_type_base.is_some());
-    // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
-    // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
-    // the `UintMulHigh` 32-bit-split expansion (`emit_umulhi`). One i32 local
-    // past those (`num_vars+UMULHI_SCRATCH+1`) holds the bridge table slot for
-    // the epilogue `call_indirect` dispatch (unused when `!bridge_dispatch`).
-    let bridge_slot_local = num_vars + UMULHI_SCRATCH + 1;
+    // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` i64 locals
+    // past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) for the `UintMulHigh`
+    // 32-bit-split expansion, plus one i64 local for the pending overflow flag.
+    // One i32 local past those holds the bridge table slot for the epilogue
+    // `call_indirect` dispatch (unused when `!bridge_dispatch`).
+    let ovf_flag_local = num_vars + UMULHI_SCRATCH + 1;
+    let bridge_slot_local = num_vars + UMULHI_SCRATCH + 2;
     // The self-recursive CALL_ASSEMBLER arm needs two more i32 scratch locals:
     // `ca_cfp_local` (the current callee frame pointer) and `ca_fi_local` (the
     // returned frame[0] fail index). Reserve them only under `emit_ca` so a
     // flag-off module keeps exactly one i32 local (byte-identical).
-    let ca_cfp_local = num_vars + UMULHI_SCRATCH + 2;
-    let ca_fi_local = num_vars + UMULHI_SCRATCH + 3;
+    let ca_cfp_local = num_vars + UMULHI_SCRATCH + 3;
+    let ca_fi_local = num_vars + UMULHI_SCRATCH + 4;
     // Extra i32 scratches when the inline nursery-bump fast path is armed:
     // one holds the loaded `nursery_free` across the bump/commit sequence;
     // runtime varsize array allocation also needs one for the computed
     // total/new-free word.
     let base_i32_locals: u32 = if ca.emit_ca { 3 } else { 1 };
-    let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 1 + base_i32_locals;
+    let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 2 + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
+    debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
+    debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
+    debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
+    debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
+    debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
     debug_assert_eq!(value_types.len(), num_vars as usize);
     let mut locals = Vec::new();
     let mut start = 0;
@@ -1671,9 +1679,9 @@ fn build_function(
         start = end;
     }
     if let Some((count, ValType::I64)) = locals.last_mut() {
-        *count += UMULHI_SCRATCH;
+        *count += UMULHI_SCRATCH + 1;
     } else {
-        locals.push((UMULHI_SCRATCH, ValType::I64));
+        locals.push((UMULHI_SCRATCH + 1, ValType::I64));
     }
     locals.push((
         base_i32_locals
@@ -1693,6 +1701,17 @@ fn build_function(
         sink.local_get(0);
         sink.i64_const(0);
         sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
+    }
+
+    // Bind the folded constants the optimizer left under a plain op position
+    // (see `unbound_pool_const_seeds`). Emitted before every block so the
+    // binding dominates the whole body, including a resume-at-LABEL entry.
+    for (raw, bits) in unbound_pool_const_seeds(inputargs, ops, constants, num_vars)? {
+        sink.i64_const(bits);
+        if value_types[raw as usize] == ValType::F64 {
+            sink.f64_reinterpret_i64();
+        }
+        sink.local_set(1 + raw);
     }
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
@@ -1807,6 +1826,7 @@ fn build_function(
     let mut guard_idx = fail_index_base;
     let mut in_loop_body = false;
     let mut labels_passed = 0usize;
+    let mut ovf_flag_live = false;
 
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label && key_dispatch {
@@ -2093,23 +2113,39 @@ fn build_function(
             }
             OpCode::GuardNoOverflow => {
                 // RPython: 0 args — overflow flag implicit from preceding ovf op.
-                // Wasm MVP doesn't detect overflow, so always passes.
+                // If the optimizer proved the operation cannot overflow, the
+                // overflow op is absent and this guard is redundant.
+                if !ovf_flag_live {
+                    guard_idx += 1;
+                    continue;
+                }
+                ovf_flag_live = false;
+                sink.local_get(ovf_flag_local);
+                sink.i64_const(0);
+                sink.i64_ne();
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardOverflow => {
-                // Always fails (no overflow detected in wasm MVP).
-                emit_guard_exit(&mut sink, constants, value_types, guard_idx, op);
-                match block_exit_depth {
-                    Some(d) => {
-                        sink.br(d);
-                    }
-                    // Straight-line: return directly so the following ops and
-                    // the terminal Finish do not overwrite this exit.
-                    None => {
-                        sink.local_get(0);
-                        sink.return_();
-                    }
-                }
+                assert!(ovf_flag_live, "GuardOverflow without preceding overflow op");
+                ovf_flag_live = false;
+                sink.local_get(ovf_flag_local);
+                sink.i64_eqz();
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardNotInvalidated => {
@@ -2220,13 +2256,37 @@ fn build_function(
 
             // Overflow variants: compute result + overflow flag
             OpCode::IntAddOvf => {
-                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Add)
+                ovf_flag_live = emit_ovf_binop(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op,
+                    BinOp::I64Add,
+                    num_vars,
+                    ovf_flag_local,
+                );
             }
             OpCode::IntSubOvf => {
-                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Sub)
+                ovf_flag_live = emit_ovf_binop(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op,
+                    BinOp::I64Sub,
+                    num_vars,
+                    ovf_flag_local,
+                );
             }
             OpCode::IntMulOvf => {
-                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Mul)
+                ovf_flag_live = emit_ovf_binop(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op,
+                    BinOp::I64Mul,
+                    num_vars,
+                    ovf_flag_local,
+                );
             }
 
             // ── Integer comparisons (signed) ──
@@ -2302,15 +2362,19 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    // num_bytes is arg(1), typically a constant
+                    // num_bytes (arg(1)) is always a compile-time constant;
+                    // resolve it like every other emit-time const so a genuine
+                    // pool miss panics via missing_emit_const instead of silently
+                    // defaulting to 8 (which zeroes the shift and skips the
+                    // narrowing, passing an un-truncated integer through).
                     let arg1 = op.arg(1).to_opref();
-                    let num_bytes = if arg1.is_constant() {
-                        arg1.inline_const_bits()
-                            .or_else(|| constants.get(&arg1.raw()).copied())
-                            .unwrap_or(8)
-                    } else {
-                        8 // default to no-op
-                    };
+                    let num_bytes = const_operand_value(constants, arg1).unwrap_or_else(|| {
+                        panic!(
+                            "wasm int_signext: num_bytes operand (raw={}) is not a \
+                             resolvable compile-time constant",
+                            arg1.raw()
+                        )
+                    });
                     let shift = 64 - num_bytes * 8;
                     if shift > 0 && shift < 64 {
                         sink.i64_const(shift);
@@ -2590,61 +2654,23 @@ fn build_function(
             }
 
             // ── Interior field access ──
-            OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    // getinteriorfield(array, index, offset)
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
-                    sink.i32_wrap_i64();
-                    let field_offset = field_offset_from_descr(op);
-                    // Simplified: use field_offset directly (RPython computes base+index*itemsize+offset)
-                    let (size, signed) = field_size_sign_from_descr(op);
-                    emit_sized_int_load(&mut sink, field_offset, size, signed);
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::GetinteriorfieldGcF => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
-                    sink.i32_wrap_i64();
-                    let field_offset = field_offset_from_descr(op);
-                    sink.f64_load(MemArg {
-                        offset: field_offset,
-                        align: 3,
-                        memory_index: 0,
-                    });
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::SetinteriorfieldGc => {
-                if let Some(base) = write_barrier_base(op, ref_values) {
-                    emit_write_barrier(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        jit_call_idx,
-                        residual_type_base,
-                        wb_fn_ptr,
-                        base,
-                        frame,
-                    );
-                }
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i32_wrap_i64();
-                let field_offset = field_offset_from_descr(op);
-                if field_is_float_from_descr(op) {
-                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    sink.f64_store(MemArg {
-                        offset: field_offset,
-                        align: 3,
-                        memory_index: 0,
-                    });
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref()); // value
-                    let (size, _signed) = field_size_sign_from_descr(op);
-                    emit_sized_int_store(&mut sink, field_offset, size);
-                }
+            // getinteriorfield/setinteriorfield address an interior field of an
+            // array element at `base + base_size + index*item_size + offset`. The
+            // prior lowering resolved only arg(0) (the array ptr) and applied
+            // field_offset_from_descr (which returns 0 for an InteriorFieldDescr),
+            // dropping arg(1) (the index) entirely, so it read/wrote element 0's
+            // field regardless of index — a silent wrong-memory access (wasm
+            // offset 0 is valid linear memory, so it does not trap). Decline and
+            // let the metainterp fall back to the interpreter, which addresses the
+            // interior field correctly.
+            OpCode::GetinteriorfieldGcI
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetinteriorfieldGcF
+            | OpCode::SetinteriorfieldGc => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: interior-field op {:?} (index-aware addressing unimplemented)",
+                    op.opcode
+                )));
             }
 
             // ── String/Unicode ops (direct memory access) ──
@@ -2679,37 +2705,27 @@ fn build_function(
             }
 
             // ── GC memory ops ──
-            OpCode::GcLoadI => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    let offset = field_offset_from_descr(op);
-                    sink.i64_load(mem64(offset));
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::GcLoadR => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    let offset = field_offset_from_descr(op);
-                    sink.i32_load(MemArg {
-                        offset,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::GcStore => {
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i32_wrap_i64();
-                let offset = field_offset_from_descr(op);
-                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                sink.i64_store(mem64(offset));
+            // GC_LOAD/GC_STORE and their indexed forms are produced only by the
+            // GC rewrite (majit-gc/src/rewrite.rs): the true semantics are
+            // offset=arg1, size=arg2 (load) / value=arg2, size=arg3 (store), with
+            // no FieldDescr attached. The wasm backend does not run the GC rewrite,
+            // so these never reach here. The prior lowering read a nonexistent
+            // field_offset_from_descr (→ 0) and, for GcStore, stored arg(1) (the
+            // offset operand) as the value — a silent miscompile. Panic loudly like
+            // LoadFromGcTable rather than emit a wrong memory access.
+            OpCode::GcLoadI
+            | OpCode::GcLoadR
+            | OpCode::GcLoadF
+            | OpCode::GcLoadIndexedI
+            | OpCode::GcLoadIndexedR
+            | OpCode::GcLoadIndexedF
+            | OpCode::GcStore
+            | OpCode::GcStoreIndexed => {
+                panic!(
+                    "wasm backend: {:?} is unsupported (GC_LOAD/GC_STORE); \
+                     the GC rewrite must not run for wasm",
+                    op.opcode
+                );
             }
 
             // ── Raw memory access ──
@@ -3635,9 +3651,10 @@ fn build_function(
                 // llmodel.py:778-782: size, type_id, vtable from the size descr.
                 let descr = op.getdescr();
                 let sd = descr.as_ref().and_then(|d| d.as_size_descr());
-                let (size, type_id, vtable) = sd.map_or((16i64, 0i64, 0usize), |sd| {
-                    (sd.size() as i64, sd.type_id() as i64, sd.vtable())
-                });
+                let (size, type_id, vtable) = sd.map_or_else(
+                    || missing_layout_descr("size descr", op),
+                    |sd| (sd.size() as i64, sd.type_id() as i64, sd.vtable()),
+                );
 
                 // Inline nursery bump (rewrite.py malloc fast path, x86
                 // `malloc_cond`): total = align8(max(header+size, MIN)); if
@@ -3814,14 +3831,13 @@ fn build_function(
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos.get().raw();
                 let descr = op.getdescr();
-                let ad = descr.as_ref().and_then(|d| d.as_array_descr());
-                let (base_size, item_size) = ad.map_or((16i64, 8i64), |ad| {
-                    (ad.base_size() as i64, ad.item_size() as i64)
-                });
-                let len_offset = ad
-                    .and_then(|ad| ad.len_descr())
-                    .map_or(0i64, |ld| ld.offset() as i64);
-                let type_id = ad.map_or(0i64, |ad| ad.type_id() as i64);
+                let ad = descr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .unwrap_or_else(|| missing_layout_descr("array descr", op));
+                let (base_size, item_size) = (ad.base_size() as i64, ad.item_size() as i64);
+                let len_offset = ad.len_descr().map_or(0i64, |ld| ld.offset() as i64);
+                let type_id = ad.type_id() as i64;
 
                 // Inline nursery bump for arrays of a plain type under the
                 // large-object threshold (same fast path as the `New` arm).
@@ -4431,6 +4447,53 @@ fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
     Vec::new()
 }
 
+/// A legacy pool-indexed const that is absent from the constants pool at emit
+/// time is an optimizer-seeding invariant violation — panic loudly, matching
+/// `collect_constants_from_ops`' `missing_legacy_const`, instead of emitting a
+/// silent `0`. On native a null Ref traps on the first dereference; wasm's
+/// offset 0 is valid linear memory, so a silent `0` is read as garbage and
+/// miscompiles quietly rather than crashing.
+#[cold]
+#[inline(never)]
+fn missing_emit_const(opref: OpRef) -> ! {
+    panic!(
+        "wasm emit_resolve: legacy pool-indexed const OpRef (raw={}) is absent \
+         from the constants pool — the optimizer producer must seed it (or mint \
+         an inline Const) instead of emitting a silent 0.",
+        opref.raw()
+    );
+}
+
+/// A memory-access or allocation op reached codegen without the layout descr it
+/// must carry (Field/Array/Size). Emitting a default offset/size/type_id would
+/// silently miscompile — on wasm, offset 0 is valid linear memory, so a bogus
+/// address reads/writes garbage instead of trapping. Fail loud instead. Dead on
+/// valid traces: every such op carries its descr (RPython invariant), and the
+/// native x86 backend defaults identically without ever hitting the default.
+#[cold]
+#[inline(never)]
+fn missing_layout_descr(what: &str, op: &Op) -> ! {
+    panic!(
+        "wasm codegen: {what} is absent for {:?} — a memory-access/allocation op \
+         must carry its layout descr; a default offset/size/type_id would \
+         silently miscompile.",
+        op.opcode
+    );
+}
+
+/// Resolve a constant operand's i64 bits: the inline `Const` value if the
+/// variant carries one (`history.py:227/268/314`), else the legacy pool entry.
+/// A pool miss panics via [`missing_emit_const`] rather than falling back to a
+/// silent `0`.
+fn resolve_const_bits(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> i64 {
+    opref.inline_const_bits().unwrap_or_else(|| {
+        constants
+            .get(&opref.raw())
+            .copied()
+            .unwrap_or_else(|| missing_emit_const(opref))
+    })
+}
+
 fn emit_resolve(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -4438,10 +4501,7 @@ fn emit_resolve(
     opref: OpRef,
 ) {
     if opref.is_constant() {
-        // history.py:227/268/314 — inline-Const variants carry value inline.
-        let val = opref
-            .inline_const_bits()
-            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
+        let val = resolve_const_bits(constants, opref);
         sink.i64_const(val);
     } else {
         sink.local_get(1 + opref.raw());
@@ -4460,9 +4520,7 @@ fn emit_resolve_f64(
     opref: OpRef,
 ) {
     if opref.is_constant() {
-        let val = opref
-            .inline_const_bits()
-            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
+        let val = resolve_const_bits(constants, opref);
         sink.i64_const(val);
         sink.f64_reinterpret_i64();
     } else {
@@ -4471,14 +4529,79 @@ fn emit_resolve_f64(
     }
 }
 
+/// Values the optimizer left as plain (non-`Const`) OpRefs whose only
+/// definition is a constant-pool entry, paired with that entry's raw bits.
+///
+/// Constant folding and the short preamble both hand the backend a folded
+/// value under its original op position, with no producing op left in the
+/// trace. `RegisterManager::loc` (dynasm `regalloc.rs`) covers that case with
+/// a constants-map fallback taken once no register and no frame binding is
+/// found. wasm materializes every value in a local instead of a location, so
+/// the equivalent binding is a prologue store: without it the never-written
+/// local reads as the zero wasm initializes it to, silently substituting 0
+/// for the folded constant at every use.
+///
+/// Only positions actually read as a plain OpRef are returned, so a trace
+/// whose pool holds no such value emits no extra prologue instruction.
+fn unbound_pool_const_seeds(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    num_vars: u32,
+) -> Result<Vec<(u32, i64)>, BackendError> {
+    use std::collections::HashSet;
+    let mut defined: HashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+    for op in ops {
+        let r = op.pos.get();
+        if r != OpRef::NONE && !r.is_constant() {
+            defined.insert(r.raw());
+        }
+    }
+    let mut seeds: Vec<(u32, i64)> = Vec::new();
+    let mut unresolved: Vec<u32> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut consider = |a: OpRef, seeds: &mut Vec<(u32, i64)>, seen: &mut HashSet<u32>| {
+        if a == OpRef::NONE || a.is_constant() {
+            return;
+        }
+        let raw = a.raw();
+        if raw >= num_vars || defined.contains(&raw) || !seen.insert(raw) {
+            return;
+        }
+        match constants.get(&raw) {
+            Some(&bits) => seeds.push((raw, bits)),
+            // No producer and no pool entry: the local would read as the zero
+            // wasm initializes it to, which is a wrong value, not a missing
+            // one. Decline the trace (the interpreter runs it correctly,
+            // unaccelerated) exactly as the unhandled-opcode arm does.
+            None => unresolved.push(raw),
+        }
+    };
+    for op in ops {
+        for a in op.getarglist().iter() {
+            consider(a.to_opref(), &mut seeds, &mut seen);
+        }
+        if let Some(fa) = op.getfailargs() {
+            for a in fa.iter() {
+                consider(a.to_opref(), &mut seeds, &mut seen);
+            }
+        }
+    }
+    if !unresolved.is_empty() {
+        return Err(BackendError::Unsupported(format!(
+            "wasm codegen: value{unresolved:?} read with no producing op and no \
+             constant-pool entry"
+        )));
+    }
+    Ok(seeds)
+}
+
 /// Compile-time value of a constant operand (what `emit_resolve` would push
 /// as `i64.const`), or `None` for a runtime value.
 fn const_operand_value(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> Option<i64> {
-    opref.is_constant().then(|| {
-        opref
-            .inline_const_bits()
-            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0))
-    })
+    opref
+        .is_constant()
+        .then(|| resolve_const_bits(constants, opref))
 }
 
 /// Extract field offset from op's descr (FieldDescr).
@@ -4489,7 +4612,7 @@ fn field_offset_from_descr(op: &Op) -> u64 {
             return fd.offset() as u64;
         }
     }
-    0
+    missing_layout_descr("field descr (offset)", op)
 }
 
 /// `(length-field offset, length-field size)` from an op's ArrayDescr length
@@ -4506,7 +4629,7 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
             .map(|ld| (ld.offset() as u64, ld.field_size()))
     })
     .flatten()
-    .unwrap_or((8, std::mem::size_of::<usize>()))
+    .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
 }
 
 /// Compute array element address: base + base_size + index * item_size.
@@ -4519,7 +4642,7 @@ fn emit_array_addr(
 ) {
     let (base_size, item_size) = op
         .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
-        .unwrap_or((16, 8));
+        .unwrap_or_else(|| missing_layout_descr("array descr (base/item size)", op));
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref()); // array ptr
     sink.i32_wrap_i64();
     // base + base_size + index * item_size
@@ -4634,6 +4757,7 @@ fn emit_guard_exit(
 
 // ── Binary ops ──
 
+#[derive(Clone, Copy)]
 enum BinOp {
     I64Add,
     I64Sub,
@@ -4720,6 +4844,17 @@ fn emit_umulhi(
     if OpRef::raw_is_constant(vi) {
         return;
     }
+    emit_umulhi_to_local(sink, constants, value_types, op, num_vars, 1 + vi);
+}
+
+fn emit_umulhi_to_local(
+    sink: &mut InstructionSink<'_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
+    op: &Op,
+    num_vars: u32,
+    output_local: u32,
+) {
     const MASK32: i64 = 0xFFFF_FFFF;
     let al = num_vars + 1;
     let ah = num_vars + 2;
@@ -4779,22 +4914,86 @@ fn emit_umulhi(
     sink.i64_shr_u();
     sink.i64_add();
 
-    sink.local_set(1 + vi);
+    sink.local_set(output_local);
 }
 
-/// Overflow binary op: stores result in pos, overflow flag convention.
-/// The overflow flag is not stored separately — GuardNoOverflow/GuardOverflow
-/// is handled by checking after the fact (simplified for wasm MVP).
+/// Overflow binary op: stores the wrapping result in pos and the signed
+/// overflow flag in the dedicated scratch local.
 fn emit_ovf_binop(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &[ValType],
     op: &Op,
     binop: BinOp,
-) {
-    // For wasm MVP, just compute the result without overflow detection.
-    // GuardNoOverflow/GuardOverflow are treated as always-pass.
-    emit_binop(sink, constants, value_types, op, binop);
+    num_vars: u32,
+    ovf_flag_local: u32,
+) -> bool {
+    let vi = op.pos.get().raw();
+    if OpRef::raw_is_constant(vi) {
+        return false;
+    }
+    let result_local = 1 + vi;
+
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+    apply_binop(sink, binop);
+    sink.local_set(result_local);
+
+    match binop {
+        BinOp::I64Add => {
+            // ((a ^ result) & (b ^ result)) >>s 63
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.local_get(result_local);
+            sink.i64_xor();
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.local_get(result_local);
+            sink.i64_xor();
+            sink.i64_and();
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            sink.local_set(ovf_flag_local);
+        }
+        BinOp::I64Sub => {
+            // ((a ^ b) & (a ^ result)) >>s 63
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.i64_xor();
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.local_get(result_local);
+            sink.i64_xor();
+            sink.i64_and();
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            sink.local_set(ovf_flag_local);
+        }
+        BinOp::I64Mul => {
+            // Convert the unsigned high word to the signed high word:
+            // smulhi = umulhi - ((a >>s 63) & b) - ((b >>s 63) & a).
+            let high_local = num_vars + 1;
+            emit_umulhi_to_local(sink, constants, value_types, op, num_vars, high_local);
+            sink.local_get(high_local);
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.i64_and();
+            sink.i64_sub();
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.i64_and();
+            sink.i64_sub();
+            sink.local_get(result_local);
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            sink.i64_ne();
+            sink.i64_extend_i32_u();
+            sink.local_set(ovf_flag_local);
+        }
+        _ => unreachable!("overflow emitter requires add, sub, or mul"),
+    }
+    true
 }
 
 // ── Comparison ops ──
