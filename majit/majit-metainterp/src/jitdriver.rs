@@ -1434,13 +1434,28 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds)`
-    /// snapshot captured at the last CloseLoop (set in `merge_point` before
-    /// `compile_loop` drains the ctx). The `__merge` wrapper reads this after
-    /// the walk to drive the merge-point state transfer. `None` outside
-    /// single-pass.
+    /// snapshot captured at a terminal trace transition. CloseLoop and Finish
+    /// publish it before draining the ctx; a fresh TraceAction::Abort publishes
+    /// the current portal pc so the `__merge` wrapper resumes after its
+    /// committed prefix. `None` outside single-pass.
     #[inline]
     pub fn take_single_pass_outcome(&mut self) -> Option<(usize, Vec<crate::Value>)> {
         self.meta.single_pass_outcome.take()
+    }
+
+    /// Whether the just-published single-pass outcome came from a terminal
+    /// dispatch return (`TraceAction::Finish`) rather than a `CloseLoop`
+    /// back-edge. A CloseLoop resumes the native loop at the merge-point green
+    /// pc and keeps interpreting; a Finish means the interpreted function has
+    /// returned, so the native dispatch loop must EXIT and run its own
+    /// post-loop return once. The walk-final pc captured for a Finish is the
+    /// interpreter pc past the terminal opcode, which only lands past the
+    /// program end (making `while pc < size` exit) when the terminal is the
+    /// last opcode — a mid-program terminal would otherwise re-enter the loop.
+    /// The macro reads this to `break` instead of resuming at that pc.
+    /// Consumes (`take`s) the flag.
+    pub fn take_single_pass_finish(&mut self) -> bool {
+        std::mem::replace(&mut self.meta.single_pass_finish, false)
     }
 
     /// Push the walk's scalar state fields into native `state`. The walk
@@ -2450,6 +2465,33 @@ impl<S: JitState> JitDriver<S> {
                 finish_arg_types,
                 exit_with_exception,
             } => {
+                // A terminal dispatch return is also a valid single-pass
+                // handoff: the interpreted function has returned, so native
+                // execution must EXIT the dispatch loop and run its own
+                // post-loop work exactly once. The scalar/virt-array write-back
+                // still applies (post-loop reads the walk-final state), but the
+                // `single_pass_finish` flag tells the macro to `break` rather
+                // than resume at the captured pc. The captured pc (i0, past the
+                // terminal opcode) only lands past the program end — where
+                // `while pc < size` would exit on resume — when the terminal is
+                // the last opcode; a mid-program terminal would re-enter the
+                // loop body, so the exit is signalled explicitly.
+                let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                if let Some(p) = pc {
+                    self.meta.single_pass_outcome = Some((p, Vec::new()));
+                    self.meta.single_pass_finish = true;
+                }
+                if let Some(sym) = self.sym.as_ref() {
+                    let scalars = S::collect_scalar_state_field_values(sym);
+                    self.meta.single_pass_scalar_values = Some(scalars);
+                }
+                let virt_elems = self
+                    .meta
+                    .trace_ctx()
+                    .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                if let Some(elems) = virt_elems {
+                    self.meta.single_pass_virt_array_values = Some(elems);
+                }
                 // pyjitpl.py:3198-3220 + 3238-3245 parity — upstream's
                 // `compile_done_with_this_frame` and
                 // `compile_exit_frame_with_exception` both call
@@ -2521,7 +2563,7 @@ impl<S: JitState> JitDriver<S> {
             // (PyreMetaInterp::step_inline_frame pops the inline frame and
             // records the CALL_ASSEMBLER); it never reaches the jitdriver.
             // Defensive: treat an escaped instance as a plain Abort.
-            TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort => {
+            action @ (TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort) => {
                 if self.meta.bridge_info().is_some() {
                     crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                 }
@@ -2575,6 +2617,36 @@ impl<S: JitState> JitDriver<S> {
                         .unwrap_or(AbortReason::Generic)
                         .as_int(),
                 };
+                // pyjitpl.py:2949-2956
+                // run_blackhole_interp_to_cancel_tracing: a fresh trace has
+                // executed its portal body forward with real residual heap
+                // effects.  Before dropping that live frame, publish its
+                // current source pc and scalar state for the single-pass
+                // jit_merge_point hook.  The hook restores those scalars,
+                // runs `recover_after_compiled_run`, and continues the native
+                // interpreter from this pc rather than replaying the committed
+                // trace prefix.
+                //
+                // Bridge/compiled guard-failure recovery owns a separate
+                // blackhole resume path below `back_edge_internal`; do not
+                // feed that path through this fresh-trace handoff.
+                if matches!(action, TraceAction::Abort) && self.meta.bridge_info().is_none() {
+                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                    if let Some(pc) = pc {
+                        self.meta.single_pass_outcome = Some((pc, Vec::new()));
+                        if let Some(sym) = self.sym.as_ref() {
+                            let scalars = S::collect_scalar_state_field_values(sym);
+                            self.meta.single_pass_scalar_values = Some(scalars);
+                        }
+                        let virt_elems = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                        if let Some(elems) = virt_elems {
+                            self.meta.single_pass_virt_array_values = Some(elems);
+                        }
+                    }
+                }
                 self.meta.abort_trace_live(false);
                 self.meta.aborted_tracing(reason_int);
                 self.sym = None;
@@ -3057,9 +3129,27 @@ impl<S: JitState> JitDriver<S> {
             // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
             // guard failure resumes via blackhole — isolates bridge-record
             // resume defects from the blackhole path.
+            //
+            // Guard resume virtuals ARE bridgeable: the bridge trace emits a
+            // materialization prologue (`setup_bridge_sym` -> NEW_WITH_VTABLE /
+            // SETFIELD_GC, resume.py:1042-1057 ResumeDataBoxReader._prepare), so
+            // `rd_virtuals` alone must NOT decline — declining it strands the hot
+            // loop on blackhole deopt (recursive fib etc. lose all JIT speedup).
+            // `rd_pendingfields` still declines: the bridge path only seeds the
+            // exception channel, not the general SETFIELD_GC pending-field
+            // prologue (resume.py:993-1007 _prepare_pendingfields), which is the
+            // remaining orthodox gap tracked separately.
+            let bridge_needs_materialization = exit_layout
+                .storage
+                .as_deref()
+                .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
+            if bridge_needs_materialization {
+                self.meta.record_declined_bridge_guard(&descr_arc);
+            }
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled();
+                && !no_bridge_enabled()
+                && !bridge_needs_materialization;
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -4804,6 +4894,20 @@ impl<S: JitState> JitDriver<S> {
             majit_metainterp::mc_diag_bump(15); // sbt early: no compiled_meta
             return false;
         };
+
+        if self
+            .meta
+            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+            .and_then(|layout| layout.storage)
+            .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
+        {
+            // resume.py:993-1007 _prepare_pendingfields: the general SETFIELD_GC
+            // pending-field prologue is not yet emitted on the bridge path, so a
+            // guard carrying pending fields still declines. `rd_virtuals` alone
+            // is bridgeable via the `setup_bridge_sym` materialization prologue
+            // and must NOT gate here (see the handle_fail decline site).
+            return false;
+        }
 
         if !state.can_trace() {
             majit_metainterp::mc_diag_bump(16); // sbt early: !can_trace

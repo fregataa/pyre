@@ -192,92 +192,92 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
 /// of struct `type_id`, sharing the exact keyed `Arc<SimpleFieldDescr>` that a
 /// `getfield_gc_i` on the same `(type_id, write_field)` resolves to.  A
 /// residual helper that mutates a struct field through opaque host code — e.g.
-/// aheui's `jit_storage_*` advancing the selected `Stack.size` — declares this
-/// so `OptHeap::force_from_effectinfo` invalidates the cached `getfield_gc_i`
-/// on that field after the call.  Without it the residual call carries an empty
-/// write-set, the optimizer CSE-folds the field load to a single loop-invariant
-/// read, and a loop whose exit condition derives from that field never
-/// re-observes the mutation.  This is the residual analogue of the in-trace
-/// `setfield_gc` write barrier a traced mutator would emit.
+/// aheui's `jit_storage_*` changing selected `Stack` fields — declares them so
+/// `OptHeap::force_from_effectinfo` invalidates cached getfields after the
+/// call.  Without it the residual call carries an empty write-set and the
+/// optimizer can CSE-fold a mutable field load across the call.  This is the
+/// residual analogue of the in-trace `setfield_gc` write barrier a traced
+/// mutator would emit.
 ///
 /// `fields` is the same `(offset, is_ref, name)` layout the matching getfield
 /// passes to `register_struct_layout`; the parented size+field group is rebuilt
 /// here identically (`make_simple_descr_group_keyed`, idempotent / first-write-
-/// wins) so the field descr published into `gc_cache()._cache_field[Struct
-/// (type_id)][name]` is the one `field_descr_ref_from_bh` reads back for the
+/// wins) so every field descr published into `gc_cache()._cache_field[Struct
+/// (type_id)][name]` is the one `field_descr_ref_from_bh` reads back for its
 /// getfield — pointer identity, which `compute_bitstrings` keys on.  Must run
 /// before `finish_setup_descrs` (jitcode assembly does), matching the
 /// non-trivial-raw-set construction-timing `call_descr` asserts.
-pub fn struct_field_write_effect_info(
-    struct_size: usize,
-    type_id: u64,
-    is_gc_managed: bool,
-    fields: &[(usize, bool, &str)],
-    write_field: &str,
+pub fn struct_fields_write_effect_info(
+    layouts: &[(usize, u64, bool, &[(usize, bool, &str)])],
     can_raise: bool,
 ) -> majit_ir::EffectInfo {
     // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
     // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
-    let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
-    ordered.sort_by_key(|&(offset, _, _)| offset);
-    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
-        .iter()
-        .enumerate()
-        .map(|(idx, &(offset, is_ref, name))| {
-            let (field_type, flag) = if is_ref {
-                (
-                    majit_ir::value::Type::Ref,
-                    majit_ir::descr::ArrayFlag::Pointer,
-                )
-            } else {
-                (
-                    majit_ir::value::Type::Int,
-                    majit_ir::descr::ArrayFlag::Signed,
-                )
-            };
-            majit_ir::descr::SimpleFieldDescrSpec {
-                index: u32::MAX,
-                name: name.to_string(),
-                offset,
-                field_size: 8,
-                field_type,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                flag,
-                virtualizable: false,
-                index_in_parent: idx,
-            }
-        })
-        .collect();
-    majit_ir::descr::make_simple_descr_group_keyed(
-        u32::MAX,
-        struct_size,
-        type_id as u32,
-        type_id,
-        0,
-        is_gc_managed,
-        &specs,
-    );
-    let struct_key = majit_ir::descr::LLType::Struct(type_id);
-    let fd = majit_ir::descr::gc_cache()
-        .lock()
-        .unwrap()
-        ._cache_field
-        .get(&struct_key)
-        .and_then(|m| m.get(write_field))
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "struct_field_write_effect_info: field `{write_field}` not registered for type {type_id}"
-            )
-        });
+    let mut fds = Vec::new();
+    for &(struct_size, type_id, is_gc_managed, fields) in layouts {
+        let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _)| offset);
+        let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
+            .iter()
+            .enumerate()
+            .map(|(idx, &(offset, is_ref, name))| {
+                let (field_type, flag) = if is_ref {
+                    (
+                        majit_ir::value::Type::Ref,
+                        majit_ir::descr::ArrayFlag::Pointer,
+                    )
+                } else {
+                    (
+                        majit_ir::value::Type::Int,
+                        majit_ir::descr::ArrayFlag::Signed,
+                    )
+                };
+                majit_ir::descr::SimpleFieldDescrSpec {
+                    index: u32::MAX,
+                    name: name.to_string(),
+                    offset,
+                    field_size: 8,
+                    field_type,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    flag,
+                    virtualizable: false,
+                    index_in_parent: idx,
+                }
+            })
+            .collect();
+        majit_ir::descr::make_simple_descr_group_keyed(
+            u32::MAX,
+            struct_size,
+            type_id as u32,
+            type_id,
+            0,
+            is_gc_managed,
+            &specs,
+        );
+        let struct_key = majit_ir::descr::LLType::Struct(type_id);
+        fds.extend(fields.iter().map(|(_, _, write_field)| {
+            majit_ir::descr::gc_cache()
+                .lock()
+                .unwrap()
+                ._cache_field
+                .get(&struct_key)
+                .and_then(|m| m.get(*write_field))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "struct_fields_write_effect_info: field `{write_field}` not registered for type {type_id}"
+                    )
+                }) as majit_ir::DescrRef
+        }));
+    }
     let extra_effect = if can_raise {
         majit_ir::ExtraEffect::CanRaise
     } else {
         majit_ir::ExtraEffect::CannotRaise
     };
     let mut ei = majit_ir::EffectInfo::const_new(extra_effect, majit_ir::OopSpecIndex::None);
-    ei._write_descrs_fields = Some(vec![fd as majit_ir::DescrRef]);
+    ei._write_descrs_fields = Some(fds);
     ei
 }
 
@@ -1545,6 +1545,30 @@ where
         self.outer_program_pc = Some(pc);
     }
 
+    /// A root dispatch return finishes the source loop. Its ABI keeps the
+    /// interpreter program counter in i0, which has already been advanced by
+    /// the matched opcode arm. Preserve it before popping the frame so the
+    /// single-pass merge hook resumes native execution at the source loop exit.
+    /// The scalar state handoff rides `single_pass_scalar_values` (published by
+    /// the jitdriver Finish arm), so only the resume pc is captured here.
+    fn capture_single_pass_finish(&mut self, ctx: &mut TraceCtx) {
+        if self.outer_program_pc.is_none() || self.frames.len() != 1 {
+            return;
+        }
+        if let Some(pc) = self
+            .frames
+            .current_mut()
+            .int_values
+            .first()
+            .copied()
+            .flatten()
+        {
+            if let Ok(pc) = usize::try_from(pc) {
+                ctx.walk_final_pc = Some(pc);
+            }
+        }
+    }
+
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
         // model.py:199-201: ConstPtr wrap then cpu.cls_of_box(box).
         let const_box = majit_ir::operand::Operand::const_from_value(majit_ir::Value::Ref(
@@ -2027,7 +2051,7 @@ where
                     );
                 }
                 match action {
-                    TraceAction::CloseLoop => sym.commit_portal_op(),
+                    TraceAction::CloseLoop | TraceAction::Finish { .. } => sym.commit_portal_op(),
                     _ => sym.abort_portal_op(),
                 }
                 return action;
@@ -4794,6 +4818,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_int_reg(src);
                 let target = self.frames.current_mut().return_i;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4825,6 +4852,9 @@ where
                 let value = self.frames.current_mut().next_u8() as i8 as i64;
                 let opref = OpRef::ConstInt(value);
                 let target = self.frames.current_mut().return_i;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4852,6 +4882,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 let target = self.frames.current_mut().return_r;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4879,6 +4912,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_float_reg(src);
                 let target = self.frames.current_mut().return_f;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4903,6 +4939,7 @@ where
             }
             jitcode::insns::BC_VOID_RETURN => {
                 self.clear_exception();
+                self.capture_single_pass_finish(ctx);
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -7183,7 +7220,32 @@ where
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_pc);
-    machine.run_to_end(ctx, sym, runtime)
+    let action = machine.run_to_end(ctx, sym, runtime);
+    drop(machine);
+
+    // A fresh trace executes the portal JitCode forward against the real
+    // interpreter-owned heap.  If that walk aborts, its root frame still has
+    // the source interpreter pc in i0: dispatch advances i0 before executing
+    // the opcode arm.  Preserve that position before the temporary frame is
+    // dropped so the jit_merge_point single-pass handoff can resume after the
+    // committed prefix instead of replaying it from the trace header.
+    //
+    // This is the portal equivalent of blackhole.py:1799
+    // convert_and_run_from_pyjitpl(): resume from the current frame position,
+    // not from the trace-start snapshot.  CloseLoop and Finish already capture
+    // their own positions; only Abort needs this recovery handoff.
+    if matches!(action, TraceAction::Abort) && !standalone.frames.is_empty() {
+        if let Some(pc) = standalone.frames.frames[0]
+            .int_values
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|pc| usize::try_from(pc).ok())
+        {
+            ctx.walk_final_pc = Some(pc);
+        }
+    }
+    action
 }
 
 /// Enter a trace at a JitDriver merge point rather than the jitcode's entry.

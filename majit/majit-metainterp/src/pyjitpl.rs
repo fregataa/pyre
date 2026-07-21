@@ -4,7 +4,7 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, struct_field_write_effect_info, trace_jitcode,
+    StandaloneFrameStack, struct_fields_write_effect_info, trace_jitcode,
     trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
@@ -1073,6 +1073,14 @@ pub struct MetaInterp<M: Clone> {
     /// after the trace closes. `take`n by the `__merge` wrapper. `None` when
     /// the walk did not populate the reds.
     pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
+    /// Single-pass tracing: set alongside `single_pass_outcome` when the outcome
+    /// came from a terminal dispatch return (`TraceAction::Finish`) rather than a
+    /// `CloseLoop` back-edge. A CloseLoop resumes the native loop at the captured
+    /// pc and keeps interpreting; a Finish means the interpreted function has
+    /// returned, so the native dispatch loop must exit (the macro reads this to
+    /// `break` instead of resuming at the pc). `take`n by the `__merge` wrapper's
+    /// caller.
+    pub(crate) single_pass_finish: bool,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -2321,6 +2329,7 @@ impl<M: Clone> MetaInterp<M> {
             loop_header_pcs: indexmap::IndexMap::new(),
             tracing: None,
             single_pass_outcome: None,
+            single_pass_finish: false,
             single_pass_scalar_values: None,
             single_pass_virt_array_values: None,
             single_pass_compact_label_values: None,
