@@ -11625,6 +11625,7 @@ mod tests {
 
     #[test]
     fn test_builtin_divmod_delegates_through_proxy() {
+        let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
         let result = builtin_divmod(&[proxy, w_int_new(3)]).unwrap();
@@ -11654,6 +11655,7 @@ mod tests {
 
     #[test]
     fn test_builtin_divmod_allows_lhs_dunder_before_dead_proxy_rhs() {
+        let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("DivmodLhs", |ns| {
             unsafe {
@@ -11681,6 +11683,7 @@ mod tests {
 
     #[test]
     fn test_builtin_pow_three_arg_delegates_through_proxy() {
+        let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
         let result = builtin_pow(&[proxy, w_int_new(3), w_int_new(13)]).unwrap();
@@ -11689,6 +11692,7 @@ mod tests {
 
     #[test]
     fn test_builtin_pow_two_arg_delegates_through_proxy() {
+        let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
         let result = builtin_pow(&[proxy, w_int_new(3)]).unwrap();
@@ -11697,6 +11701,7 @@ mod tests {
 
     #[test]
     fn test_builtin_pow_three_arg_allows_lhs_dunder_before_dead_proxy_exp() {
+        let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
             unsafe {
