@@ -3430,7 +3430,51 @@ fn build_jit_driver_pair() -> JitDriverPair {
     majit_backend_wasm::set_ca_deopt_helper_slot(
         crate::call_jit::wasm_ca_resume_deopt as *const () as usize as u32,
     );
+    pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     (d, info)
+}
+
+unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
+    if frame.is_null() {
+        return;
+    }
+    let (driver, info) = driver_pair();
+    unsafe {
+        let tracing_frame = driver.meta_interp_mut().trace_ctx().and_then(|ctx| {
+            pyre_jit_trace::jitcode_dispatch::flush_active_frame_escape(ctx, frame);
+            ctx.virtualizable_heap_ptr()
+        });
+        let tracing_frame = tracing_frame.map(|ptr| ptr as *mut u8).filter(|ptr| {
+            matches!(
+                info.read_token(*ptr),
+                majit_metainterp::virtualizable::VableToken::TracingRescall
+            )
+        });
+        let live_frame_armed = match info.read_token(frame.cast()) {
+            majit_metainterp::virtualizable::VableToken::Active(token) => {
+                driver.meta_interp_mut().is_force_token_armed(token)
+            }
+            _ => false,
+        };
+        let mut force = |ptr: *mut u8| {
+            info.force_virtualizable_if_necessary(ptr, |token| {
+                driver.meta_interp_mut().force_virtualizable_token(token);
+            });
+        };
+        // Force the traced frame even when it IS the escaping one: clearing
+        // TOKEN_TRACING_RESCALL is what `tracing_after_residual_call` reads as
+        // "the callee forced the virtualizable", which raises
+        // `VableEscapedDuringResidualCall` and lets the walk resume forward
+        // from the pc `flush_active_frame_escape` just committed.  Skipping it
+        // would leave the walk tracing against a shadow whose frame has already
+        // been handed to Python code.
+        if let Some(ptr) = tracing_frame {
+            force(ptr);
+        }
+        if live_frame_armed {
+            force(frame.cast());
+        }
+    }
 }
 
 // dont_look_inside: JIT-driver global accessor (JIT_DRIVER TLS).

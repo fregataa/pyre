@@ -1943,7 +1943,7 @@ impl TraceCtx {
     /// stops at `self.num_arrays + self.static_fields.len()` and leaves the
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
     /// or `virtualizable_values` is unavailable.
-    pub(crate) fn synchronize_virtualizable(&self) {
+    pub fn synchronize_virtualizable(&self) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
@@ -2311,6 +2311,19 @@ impl TraceCtx {
     /// Whether standard virtualizable boxes are active.
     pub fn has_virtualizable_boxes(&self) -> bool {
         self.virtualizable_boxes.is_some()
+    }
+
+    /// Whether BOTH halves of the standard virtualizable shadow are active.
+    ///
+    /// `init_virtualizable_boxes` seeds the OpRef half alone when the caller
+    /// has no live concrete values (the bridge-entry rebuild in
+    /// `seed_virtualizable_boxes`, test fixtures), leaving
+    /// `virtualizable_values` disabled so readers fall back to the zero
+    /// placeholder. `set_virtualizable_entry_at` writes both halves and
+    /// panics without the concrete one, so its callers must gate on this
+    /// rather than on `has_virtualizable_boxes`.
+    pub fn has_virtualizable_shadow(&self) -> bool {
+        self.virtualizable_boxes.is_some() && self.virtualizable_values.is_some()
     }
 
     /// Drop the tracing-time virtualizable_boxes mirror.
