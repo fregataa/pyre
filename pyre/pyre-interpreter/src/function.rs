@@ -561,6 +561,19 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &BUILTIN_FUNCTION_TYPE) }
 }
 
+/// Whether this Function carrier wraps an interp-level BuiltinCode rather
+/// than Python bytecode.  PyPy uses FunctionWithFixedCode for these objects,
+/// but CPython-only function metadata such as PEP 649 `__annotate__` must not
+/// leak onto their public surface.
+#[inline]
+pub unsafe fn function_has_builtin_code(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let code = unsafe { (*(obj as *const Function)).code } as PyObjectRef;
+    !code.is_null() && unsafe { crate::gateway::is_builtin_code(code) }
+}
+
 /// Stamp a module-level builtin function's `__module__` with its
 /// containing module at install time — `MixedModule` registration sets
 /// `func.w_module = w(modulename)` for each interp-level definition.
@@ -976,6 +989,18 @@ pub unsafe fn function_set_annotate(
         ));
     }
     unsafe {
+        function_set_annotate_unchecked(obj, value);
+    }
+    Ok(())
+}
+
+/// MAKE_FUNCTION helper for the compiler-provided PEP 649 callable.  The
+/// callable is already validated by bytecode construction, but the GC write
+/// barrier is still required: Function objects are old-generation carriers
+/// and the annotate function may be in the nursery.
+#[inline]
+pub unsafe fn function_set_annotate_unchecked(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
         function_write_barrier(obj);
         let func = obj as *mut Function;
         (*func).w_annotate = value;
@@ -983,7 +1008,6 @@ pub unsafe fn function_set_annotate(
             (*func).w_ann = PY_NULL;
         }
     }
-    Ok(())
 }
 
 /// CPython 3.14 `function.__type_params__` getter.
@@ -1150,32 +1174,41 @@ pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
 /// stamp the resulting dict, mirroring CPython 3.14
 /// `func_get_annotations`.
 ///
+/// Errors raised by the annotation thunk propagate without caching.  This is
+/// required by annotationlib's FORWARDREF path, which retries a VALUE
+/// `NameError` in a Stringifier globals environment.
+///
 /// # Safety
 /// `obj` must point to a valid `Function`.
 #[inline]
-pub unsafe fn function_get_annotations(obj: PyObjectRef) -> PyObjectRef {
+pub unsafe fn function_get_annotations(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if obj.is_null() {
-            return pyre_object::w_dict_new();
+            return Ok(pyre_object::w_dict_new());
         }
         let func = obj as *mut Function;
         let cached = (*func).w_ann;
         if !cached.is_null() {
-            return cached;
+            return Ok(cached);
         }
         let annotate_fn = (*func).w_annotate;
         if !annotate_fn.is_null() && !pyre_object::is_none(annotate_fn) {
-            let dict = crate::call_function(annotate_fn, &[pyre_object::w_int_new(1)]);
-            if !dict.is_null() {
-                function_write_barrier(obj);
-                (*func).w_ann = dict;
-                return dict;
+            let dict =
+                crate::call::call_function_impl_result(annotate_fn, &[pyre_object::w_int_new(1)])?;
+            if !pyre_object::is_dict(dict) {
+                return Err(crate::PyError::type_error(format!(
+                    "__annotate__ returned non-dict of type '{}'",
+                    crate::baseobjspace::object_functionstr_type_name(dict),
+                )));
             }
+            function_write_barrier(obj);
+            (*func).w_ann = dict;
+            return Ok(dict);
         }
         let fresh = pyre_object::w_dict_new();
         function_write_barrier(obj);
         (*func).w_ann = fresh;
-        fresh
+        Ok(fresh)
     }
 }
 
@@ -1843,8 +1876,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // `PyDict_Check` accepts dict subclasses (annotationlib hands a
     // `_StringifierDict`); resolve the backing storage rather than
     // demanding an exact `dict`.
-    let w_globals_backing = crate::type_methods::resolve_dict_backing(w_globals);
-    if w_globals_backing.is_null() {
+    if crate::type_methods::resolve_dict_backing(w_globals).is_null() {
         return Err(crate::PyError::type_error(
             "function() argument 'globals' must be dict, not ...",
         ));
@@ -1864,15 +1896,12 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     } else {
         w_closure
     };
-    // Normalise a dict-subclass globals to its backing `W_DictObject`
-    // (the call-path frame builder reads the storage proxy off the
-    // `__globals__` object directly; a subclass instance carries no proxy
-    // and would fault — same normalisation the exec/eval `createframe_obj`
-    // path applies).  `__missing__`-based forward references are not
-    // surfaced through the backing, but defined-name annotations resolve.
     // `function.py:57 self.w_func_globals = w_globals` stores the dict
-    // object as the function's sole globals carrier.
-    let func = function_new_with_closure(w_code as *const (), name, w_globals_backing, closure);
+    // object itself as the function's sole globals carrier.  Preserving a
+    // dict subclass here is observable: annotationlib's `_StringifierDict`
+    // supplies unresolved names through `__missing__` when it clones a PEP
+    // 649 annotate function with `types.FunctionType`.
+    let func = function_new_with_closure(w_code as *const (), name, w_globals, closure);
     let qualname = pyre_object::w_str_new(unsafe { (*code_ptr).qualname.as_ref() });
     unsafe { function_set_qualname(func, qualname) };
     if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {

@@ -611,6 +611,12 @@ pub unsafe fn walk_pyframe_roots_area(
             // copy alone is not authoritative for later EC reads).
             let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
             visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
+            // Exceptions may use the off-GC malloc_typed fallback.  In that
+            // case forwarding the carrier above is a no-op, so trace its raw
+            // GC-managed children just as `walk_in_flight_exception` does.
+            // This is the post-PUSH_EXC_INFO owner of the same exception and
+            // must preserve its traceback/frame graph identically.
+            unsafe { walk_raw_exception_roots((*ec).sys_exc_value, visitor) };
             // pending_with_disabled_del is a GC-visible list upstream
             // (executioncontext.py:652); pyre's Vec lives in the boxed
             // UserDelAction, so its element slots are visited here.
@@ -1868,8 +1874,19 @@ impl NamespaceOpcodeHandler for PyFrame {
     ) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
         if !w_globals.is_null() {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
+            // A real W_DictObject / W_ModuleDictObject can use the borrowed
+            // string strategy path.  Dict subclasses are ordinary instance
+            // objects in pyre, however, and must retain their mapping object
+            // identity just as PyPy's `space.setitem_str(w_globals, ...)`
+            // does.  Casting such an instance to W_DictObject corrupts the
+            // layout and also skips an overridden `__setitem__`.
+            if unsafe { pyre_object::is_dict(w_globals) } {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
+                }
+            } else {
+                let key = unsafe { pyre_object::w_str_new(name) };
+                crate::baseobjspace::setitem(w_globals, key, value)?;
             }
         }
         Ok(())
@@ -1883,19 +1900,21 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// so `exec("x = len", {"__builtins__": {}})` raises `NameError`
     /// because the empty dict is the picked builtin.
     fn load_global_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
-        // `pyframe.py:128-132 get_w_globals_storage` returns the W_DictObject
-        // directly; pyre's `w_globals` slot (eagerly resolved at
-        // frame construction per `pyframe.py:98 __init__`) carries
-        // that identity.  Route the primary lookup through the strategy
-        // dispatch (`dictmultiobject.py:111-112 setitem_str` /
-        // `:113-115 getitem_str`) so dict-subclass overrides resolve
-        // properly and the W_ModuleDictObject path consults its cell
-        // map directly instead of walking the back-mirror storage.
+        // `pyopcode.py:958-960 _load_global_fallback` uses
+        // `space.finditem_str(self.get_w_globals(), varname)`.  Keep the
+        // borrowed-string strategy fast path for real W_DictObject /
+        // W_ModuleDictObject layouts, but dispatch a dict subclass through
+        // the exact mapping object.  In pyre a dict subclass is represented
+        // by an instance plus `__dict_data__`; treating the instance as a
+        // W_DictObject both loses `__missing__` and reads an invalid layout.
         let w_globals = self.get_w_globals();
         if !w_globals.is_null() {
-            if let Some(value) =
+            let value = if unsafe { pyre_object::is_dict(w_globals) } {
                 unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) }
-            {
+            } else {
+                crate::baseobjspace::finditem_str(w_globals, name)?
+            };
+            if let Some(value) = value {
                 return Ok(value);
             }
         }
@@ -3244,10 +3263,7 @@ impl OpcodeStepExecutor for PyFrame {
                 // evaluates with `format=1` when the runtime dict is
                 // requested; stored on the function's typed
                 // `w_annotate` slot (CPython 3.14 `func_annotate`).
-                unsafe { (*(func as *mut crate::function::Function)).w_annotate = attr };
-                // Direct field store bypasses `function_write_barrier`;
-                // record it for the prebuilt-root minor-collection skip.
-                pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+                unsafe { crate::function::function_set_annotate_unchecked(func, attr) };
             }
             // `MakeFunctionFlag::TypeParams` (oparg.rs:356) carries the
             // tuple of TypeVar / ParamSpec / TypeVarTuple bound by a
@@ -3273,6 +3289,11 @@ impl OpcodeStepExecutor for PyFrame {
         // `get_current_exception_fn` / `set_current_exception_fn`.
         let prev = get_current_exception();
         set_current_exception(exc);
+        // `PUSH_EXC_INFO` transfers ownership from the propagating `PyError`
+        // to the execution context.  Its `sys_exc_value` slot and raw
+        // exception children are walked above, so the temporary propagation
+        // root must no longer retain a completed handler's traceback.
+        set_in_flight_exception(pyre_object::PY_NULL);
         // Push "previous exception" for later restore
         self.push(prev);
         // Push the exception value back
@@ -3365,27 +3386,21 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── LoadFromDictOrGlobals ──
     // CPython 3.13: LOAD_FROM_DICT_OR_GLOBALS — try TOS dict first, then globals
-    fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), PyError> {
-        let dict = self.pop();
-        // Try dict first (if it's a dict or has attrs)
-        if let Ok(val) = crate::baseobjspace::getattr_str(dict, name) {
-            self.push(val);
-            return Ok(());
-        }
-        // Fall back to globals
-        let w_globals = self.get_w_globals();
-        if !w_globals.is_null() {
-            if let Some(val) =
-                unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) }
-            {
-                self.push(val);
+    fn load_from_dict_or_globals(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
+        let mapping = self.pop();
+        let key = pyre_object::w_str_new(name);
+        match crate::baseobjspace::getitem(mapping, key) {
+            Ok(value) => {
+                self.push(value);
                 return Ok(());
             }
+            Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}
+            Err(err) => return Err(err),
         }
-        Err(PyError::name_error_with_name(
-            format!("name '{name}' is not defined"),
-            name,
-        ))
+
+        let value = self.load_global_value(name, nameindex)?;
+        self.push(value);
+        Ok(())
     }
 
     // ── LoadFromDictOrDeref ──

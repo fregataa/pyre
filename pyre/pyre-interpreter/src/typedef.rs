@@ -1935,7 +1935,11 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     "__annotate__ returned non-dict of type '{received}'"
                 )));
             }
-            result
+            // Module annotation functions consult the mutable
+            // `__conditional_annotations__` set.  A partially executed
+            // module may therefore produce a larger dict on a later read;
+            // do not freeze the intermediate result in `__annotations__`.
+            return Ok(result);
         }
         _ => pyre_object::w_dict_new(),
     };
@@ -3432,7 +3436,10 @@ fn init_zip_type(ns: PyObjectRef) {
 ///         raise TypeError("%N.__new__(%N) is not safe, use %N.__new__()", ...)
 ///     return w_subtype
 /// ```
-fn check_user_subclass(w_self: PyObjectRef, w_subtype: PyObjectRef) -> Result<(), crate::PyError> {
+pub(crate) fn check_user_subclass(
+    w_self: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> Result<(), crate::PyError> {
     if w_subtype.is_null() || !unsafe { pyre_object::is_type(w_subtype) } {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         return Err(crate::PyError::type_error(format!(
@@ -8740,15 +8747,7 @@ unsafe fn getset_descriptor_owner(descr: PyObjectRef) -> PyObjectRef {
 /// Heap classes carry their compiler-stamped qualified name in their own
 /// namespace; static types fall back to the bare final component of tp_name.
 unsafe fn descriptor_owner_qualname(owner: PyObjectRef) -> String {
-    match crate::type_dict_lookup(owner, "__qualname__") {
-        Some(value) if unsafe { pyre_object::is_str(value) } => {
-            unsafe { pyre_object::w_str_get_value(value) }.to_string()
-        }
-        _ => {
-            let full = unsafe { pyre_object::w_type_get_name(owner) };
-            full.rsplit('.').next().unwrap_or(full).to_string()
-        }
-    }
+    unsafe { pyre_object::w_type_get_qualname(owner) }.to_string()
 }
 
 /// CPython 3.14 getset descriptor repr, shared with `display::py_repr` because
@@ -8953,28 +8952,25 @@ fn init_type_type(ns: PyObjectRef) {
             // GetSetProperty fget callbacks receive (descriptor_self, w_obj),
             // so the cls is at args[1].
             let cls = args[1];
-            // PEP 649 path: bytecode emits `__annotate_func__` (== `__annotate__`).
-            // Call it with format=1 (VALUE) to materialise the dict.
-            if let Some(annotate_fn) =
-                unsafe { crate::baseobjspace::lookup_in_type(cls, "__annotate_func__") }
-                    .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "__annotate__") })
-            {
-                if !annotate_fn.is_null() && !unsafe { pyre_object::is_none(annotate_fn) } {
-                    return Ok(crate::call::call_function_impl_raw(
-                        annotate_fn,
-                        &[pyre_object::w_int_new(1)],
-                    ));
-                }
-            }
-            Ok(pyre_object::w_dict_new())
+            crate::baseobjspace::type_get_annotations(cls)
         },
+        2,
+    );
+    let annotations_setter = make_builtin_function_with_arity(
+        "__annotations__",
+        |args| crate::baseobjspace::type_set_annotations(args[1], args[2]),
+        3,
+    );
+    let annotations_deleter = make_builtin_function_with_arity(
+        "__annotations__",
+        |args| crate::baseobjspace::type_del_annotations(args[1]),
         2,
     );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__annotations__",
-            make_getset_descriptor(annotations_getter),
+            make_getset_property(annotations_getter, annotations_setter, annotations_deleter),
         )
     };
 
@@ -9428,7 +9424,7 @@ fn init_function_type_common(ns: PyObjectRef) {
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
             "__annotations__",
         )?;
-        Ok(unsafe { crate::function::function_get_annotations(func) })
+        unsafe { crate::function::function_get_annotations(func) }
     });
     let ann_setter = make_builtin_function("__annotations__", |args| {
         let func = function_receiver(
@@ -10010,6 +10006,11 @@ fn init_function_type(ns: PyObjectRef) {
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
             "__annotate__",
         )?;
+        if unsafe { crate::function::function_has_builtin_code(function) } {
+            return Err(crate::PyError::attribute_error(
+                "builtin function has no attribute '__annotate__'",
+            ));
+        }
         Ok(unsafe { crate::function::function_get_annotate(function) })
     });
     let annotate_setter = make_builtin_function("__annotate__", |args| {
@@ -11273,20 +11274,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
             let owner_qualname = if owner.is_null() {
                 "?".to_string()
             } else {
-                // `type.__getattribute__` also sees the metatype's
-                // `__qualname__` getset.  Read the class namespace itself,
-                // matching `type.getqualname`: heap classes carry the
-                // compiler-stamped string there; static types fall back to
-                // their bare `tp_name` component.
-                match crate::type_dict_lookup(owner, "__qualname__") {
-                    Some(value) if unsafe { pyre_object::is_str(value) } => {
-                        unsafe { pyre_object::w_str_get_value(value) }.to_string()
-                    }
-                    _ => {
-                        let full = unsafe { pyre_object::w_type_get_name(owner) };
-                        full.rsplit('.').next().unwrap_or(full).to_string()
-                    }
-                }
+                unsafe { pyre_object::w_type_get_qualname(owner) }.to_string()
             };
             Ok(pyre_object::w_str_new(&format!("{owner_qualname}.{name}")))
         },
