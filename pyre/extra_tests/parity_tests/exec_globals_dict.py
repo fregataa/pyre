@@ -53,4 +53,30 @@ assert g["y"] == 3
 assert "__builtins__" in g
 
 
+# DELETE_GLOBAL must use the live globals dict-subclass backing, while dict's
+# intrinsic deletion semantics bypass the Python-level override.
+class DeletingGlobals(dict):
+    def __delitem__(self, key):
+        self.deleted = key
+        return super().__delitem__(key)
+
+
+g = DeletingGlobals(x=1)
+exec("global x\ndel x", g)
+assert not hasattr(g, "deleted")
+assert "x" not in g
+
+
+class GetattributeGlobals(dict):
+    def __getattribute__(self, name):
+        if name == "__dict_data__":
+            raise AssertionError("DELETE_GLOBAL exposed its intrinsic backing")
+        return super().__getattribute__(name)
+
+
+g = GetattributeGlobals(x=1)
+exec("global x\ndel x", g)
+assert "x" not in g
+
+
 print("OK")
