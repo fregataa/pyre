@@ -312,6 +312,37 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
              exact portal resolution; run scripts/extract-llbc.py first."
         );
     }
+    // Cross-target layout sidecars LAST.  Charon resolves struct layouts per
+    // target, and the artefacts above carry the extraction host's; building
+    // for a target with a different pointer width would otherwise read every
+    // field past the first pointer at the wrong offset.  A sidecar is the same
+    // crate re-extracted for that target, reduced to `type_decls`.  It must
+    // contribute *only* its `exact_layouts` (the target field offsets): its
+    // `type_decls` were extracted without the function bodies, so any field
+    // type first hash-consed in a dropped body resolves to nothing, and the
+    // host artefacts — where those types are target-independent and fully
+    // resolvable — are the authority for everything but offsets.  So the
+    // sidecar goes last, and `build_semantic_program_from_llbcs` seeds every
+    // per-type-string table from the host (first-writer) while overwriting
+    // `exact_layouts` from the sidecar (last-writer).
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let host = std::env::var("HOST").unwrap_or_default();
+    if layout::is_cross_target(&target, &host) {
+        for name in MANDATORY {
+            let stem = name.trim_end_matches(".ullbc");
+            let sidecar = llbc_dir.join(layout::layout_sidecar_filename(stem, &target));
+            if sidecar.exists() {
+                paths.push(sidecar.to_string_lossy().into_owned());
+            } else {
+                eprintln!(
+                    "[majit-translate] {stem}.{target}.layouts.ullbc absent — \
+                     cross-target build will read {stem}'s host-extracted field \
+                     offsets, which may be wrong for {target}; run \
+                     scripts/extract-llbc.py to produce it."
+                );
+            }
+        }
+    }
     Some(paths)
 }
 

@@ -1011,12 +1011,12 @@ impl StructLayout {
                     known_struct_sizes
                         .get(type_str.as_str())
                         .copied()
-                        .unwrap_or(std::mem::size_of::<usize>())
+                        .unwrap_or(crate::layout::target_word_size())
                 } else {
                     get_type_flag(type_str).2
                 };
                 if sz > 0 {
-                    let align = sz.min(std::mem::size_of::<usize>());
+                    let align = sz.min(crate::layout::target_word_size());
                     offset = (offset + align - 1) & !(align - 1);
                     offset += sz;
                 }
@@ -1028,7 +1028,7 @@ impl StructLayout {
                 continue;
             }
             // RPython: alignment is typically min(field_size, WORD).
-            let align = field_size.min(std::mem::size_of::<usize>());
+            let align = field_size.min(crate::layout::target_word_size());
             offset = (offset + align - 1) & !(align - 1);
             let rank = immutable_field_ranks.get(name).copied();
             layout_fields.push(StructFieldLayout {
@@ -1056,8 +1056,8 @@ impl StructLayout {
                     known_struct_sizes
                         .get(ty.as_str())
                         .copied()
-                        .unwrap_or(std::mem::size_of::<usize>())
-                        .min(std::mem::size_of::<usize>())
+                        .unwrap_or(crate::layout::target_word_size())
+                        .min(crate::layout::target_word_size())
                 } else {
                     get_type_flag(ty).2
                 }
@@ -1287,7 +1287,7 @@ impl CallControl {
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
             //
-            array_header_size: std::mem::size_of::<usize>(),
+            array_header_size: crate::layout::target_word_size(),
             struct_layouts: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
@@ -1416,6 +1416,39 @@ impl CallControl {
     pub fn struct_layout_for(&self, name: &str) -> Option<&StructLayout> {
         let sid = majit_ir::descr::struct_id_for_name(name)?;
         self.struct_layouts.get(&sid)
+    }
+
+    /// Byte offset of the first item of a length-prefixed array whose length
+    /// word ends at `header_end` and whose elements are `elem` (`item_size`
+    /// bytes wide).
+    ///
+    /// The blocks these descrs address are `#[repr(C)] { length: usize, items:
+    /// [T; 0] }`, so the items begin at the length word rounded UP to `T`'s
+    /// alignment — not at the word itself. The two coincide whenever the word
+    /// is at least as wide as every element, which is why a 64-bit target sees
+    /// `header_end` unchanged; on a 32-bit target an 8-byte element (`i64` /
+    /// `f64` unboxed list storage) is aligned past the 4-byte length word, and
+    /// addressing it at the word would stride the array 4 bytes early.
+    fn array_items_base(&self, header_end: usize, elem: Option<&str>, item_size: usize) -> usize {
+        let align = self.element_align(elem, item_size);
+        header_end.next_multiple_of(align)
+    }
+
+    /// Alignment of an array element. A scalar or pointer aligns to its own
+    /// width, capped at the 8 bytes of the widest one (`i64` / `f64` / a
+    /// pointer); a struct aligns to its widest field, which its total size
+    /// does not report. An unregistered struct falls back to the length word,
+    /// the alignment every length-prefixed block already satisfies.
+    fn element_align(&self, elem: Option<&str>, item_size: usize) -> usize {
+        let word = crate::layout::target_word_size();
+        let scalar_align = |size: usize| size.clamp(1, 8).next_power_of_two();
+        match elem.filter(|name| self.is_known_struct(name)) {
+            Some(name) => self
+                .struct_layout_for(name)
+                .and_then(|layout| layout.fields.iter().map(|f| scalar_align(f.size)).max())
+                .unwrap_or(word),
+            None => scalar_align(item_size),
+        }
     }
 
     /// RPython: resolve a struct field's type string.
@@ -1548,10 +1581,11 @@ impl CallControl {
         //   `nolength=False` → length at lendescr.offset → items past header
         // pyre's CallControl uses a single-word array header
         // (`array_header_size = WORD`), so the length-prefixed shape places
-        // items immediately after the length word at `len_offset + WORD`.
+        // items at the first element-aligned offset past the length word
+        // ([`Self::array_items_base`]).
         let base_size = match len_offset {
             None => 0,
-            Some(off) => off + self.array_header_size,
+            Some(off) => self.array_items_base(off + self.array_header_size, elem_ref, item_size),
         };
         // `descr.py:348-378 get_array_descr(gccache, ARRAY_OR_STRUCT)`:
         // PyPy keys `cache[ARRAY_OR_STRUCT]` on the ARRAY lltype's
@@ -1645,7 +1679,7 @@ impl CallControl {
                     use majit_ir::descr::SimpleFieldDescr;
                     // `descr.py:264 get_field_arraylen_descr` shape:
                     // `FieldDescr("len", ofs, WORD, FLAG_SIGNED)`.
-                    let word_size = std::mem::size_of::<usize>();
+                    let word_size = crate::layout::target_word_size();
                     std::sync::Arc::new(SimpleFieldDescr::new_with_name(
                         u32::MAX,
                         off,
@@ -2120,6 +2154,14 @@ impl CallControl {
         // `as Arc<dyn ArrayDescr>` matches the trait-object field type
         // on `SimpleInteriorFieldDescr.array_descr`.
         let item_size = compute_struct_size(self, &elem_name);
+        // Interior-field struct arrays address `GcTypedArray`, a flat
+        // `{ len: usize, items: [u8; 0] }` block whose items always begin at
+        // `GC_TYPED_ARRAY_ITEMS_OFFSET = WORD` regardless of the element's
+        // alignment (both the live block and the guard-resume materialiser
+        // `allocate_array_struct` use that offset). The base must match the
+        // block, so it is the bare word — NOT the element-aligned offset the
+        // list int/float storage (`TypedItemsBlock`, genuinely element-aligned)
+        // needs in `arraydescrof_concrete`.
         let base_size = self.array_header_size;
         let array_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(array_str));
         let cached: majit_ir::descr::DescrRef = {
@@ -6640,7 +6682,7 @@ fn all_interiorfielddescrs(
         if field_name == "typeptr" {
             continue;
         }
-        let align = field_size.min(std::mem::size_of::<usize>());
+        let align = field_size.min(crate::layout::target_word_size());
         if align > 0 {
             offset = (offset + align - 1) & !(align - 1);
         }
@@ -6755,7 +6797,7 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
             // RPython: symbolic.get_field_token() uses actual nested struct size.
             cc.struct_layout_for(field_type_str)
                 .map(|l| l.size)
-                .unwrap_or(std::mem::size_of::<usize>())
+                .unwrap_or(crate::layout::target_word_size())
         } else {
             let (_, field_type, s) = get_type_flag(field_type_str);
             if field_type == majit_ir::value::Type::Void || s == 0 {
@@ -6763,7 +6805,7 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
             }
             s
         };
-        let align = field_size.min(std::mem::size_of::<usize>());
+        let align = field_size.min(crate::layout::target_word_size());
         offset = (offset + align - 1) & !(align - 1);
         offset += field_size;
     }
@@ -6773,8 +6815,8 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
             if cc.is_known_struct(ty) {
                 cc.struct_layout_for(ty)
                     .map(|l| l.size)
-                    .unwrap_or(std::mem::size_of::<usize>())
-                    .min(std::mem::size_of::<usize>())
+                    .unwrap_or(crate::layout::target_word_size())
+                    .min(crate::layout::target_word_size())
             } else {
                 get_type_flag(ty).2
             }
@@ -6810,7 +6852,7 @@ fn field_metadata(
         let nested_size = known_struct_sizes
             .get(type_str)
             .copied()
-            .unwrap_or(std::mem::size_of::<usize>());
+            .unwrap_or(crate::layout::target_word_size());
         (
             majit_ir::descr::ArrayFlag::Struct,
             majit_ir::value::Type::Ref,
@@ -6835,7 +6877,11 @@ pub(crate) fn get_type_flag(
             || s.starts_with("Option<")
             || s == "String" =>
         {
-            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8)
+            (
+                ArrayFlag::Pointer,
+                majit_ir::value::Type::Ref,
+                crate::layout::target_word_size(),
+            )
         }
         // RPython: TYPE is lltype.Float → FLAG_FLOAT
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
@@ -6846,12 +6892,22 @@ pub(crate) fn get_type_flag(
         // `get_array_descr`.
         "f32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         // RPython: rffi.cast(TYPE, -1) == -1 → FLAG_SIGNED
-        "i64" | "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
+        "i64" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
+        "isize" => (
+            ArrayFlag::Signed,
+            majit_ir::value::Type::Int,
+            crate::layout::target_word_size(),
+        ),
         "i32" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 4),
         "i16" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 2),
         "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
         // RPython: Bool → FLAG_UNSIGNED; unsigned number → FLAG_UNSIGNED
-        "u64" | "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
+        "u64" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
+        "usize" => (
+            ArrayFlag::Unsigned,
+            majit_ir::value::Type::Int,
+            crate::layout::target_word_size(),
+        ),
         "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
@@ -6859,7 +6915,11 @@ pub(crate) fn get_type_flag(
         // RPython: Void fields are skipped
         "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
         // Unknown type — treat as GC pointer (conservative)
-        _ => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8),
+        _ => (
+            ArrayFlag::Pointer,
+            majit_ir::value::Type::Ref,
+            crate::layout::target_word_size(),
+        ),
     }
 }
 
@@ -7363,6 +7423,25 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+
+    /// A length-prefixed block puts its items at the length word rounded up to
+    /// the element's alignment. Only a target whose word is narrower than an
+    /// element can tell the two apart: with a 4-byte word, an `i64` item sits
+    /// at 8, and addressing it at 4 strides the whole array one half-word
+    /// early — every read then returns two packed 32-bit halves. A pointer
+    /// item, being word-wide, stays at the word.
+    #[test]
+    fn array_items_base_rounds_up_to_the_element_alignment() {
+        let cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+        assert_eq!(cc.array_items_base(word, Some("i64"), 8), 8);
+        assert_eq!(cc.array_items_base(word, Some("f64"), 8), 8);
+        assert_eq!(cc.array_items_base(word, Some("&PyObject"), word), word);
+        assert_eq!(cc.array_items_base(word, Some("u8"), 1), word);
+        // An unregistered struct element falls back to the word, which every
+        // length-prefixed block already satisfies.
+        assert_eq!(cc.array_items_base(word, Some("NoSuchStruct"), 24), word);
+    }
 
     /// `getkind(SingleFloat) == 'int'` (history.py:53): `f32` banks to the
     /// int kind across the field/return classifiers (FLAG_UNSIGNED,

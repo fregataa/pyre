@@ -16,6 +16,47 @@ use std::collections::{HashMap, HashSet};
 use crate::call::StructLayout;
 use crate::model::ImmutableRank;
 
+/// Byte width of a pointer on the target these layouts describe — RPython's
+/// `WORD`.
+///
+/// The layouts computed here are baked into build-time artefacts (the descr
+/// pool `pyre-jit-trace/build.rs` serialises) that the *target* binary reads
+/// back, so they must describe the target's structs, not the build host's.
+/// Cargo exports the target's pointer width to build scripts as
+/// `CARGO_CFG_TARGET_POINTER_WIDTH`; the layout model also runs in-process
+/// (where the host *is* the target), and there the host width applies.
+///
+/// Read once: neither the environment nor the target changes within a run.
+pub fn target_word_size() -> usize {
+    static WORD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORD.get_or_init(|| {
+        std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH")
+            .ok()
+            .and_then(|bits| bits.parse::<usize>().ok())
+            .map(|bits| bits / 8)
+            .unwrap_or(std::mem::size_of::<usize>())
+    })
+}
+
+/// Whether `target` is a real cross target — non-empty and distinct from the
+/// build `host` — so its layout sidecars apply. Native builds share the host's
+/// struct layouts and need no sidecar.
+pub fn is_cross_target(target: &str, host: &str) -> bool {
+    !target.is_empty() && target != host
+}
+
+/// Filename of the cross-target layout sidecar for `crate_stem` (an `.ullbc`
+/// stem such as `pyre-object`) and `target`, e.g.
+/// `pyre-object.wasm32-unknown-unknown.layouts.ullbc`.
+///
+/// The single home for this naming convention: `pyre-jit-trace/build.rs`
+/// (preflight, rerun tracking, the codegen cache key) and
+/// [`crate::auto_discover_workspace_llbc_paths`] both derive sidecar names
+/// through here, so the convention cannot drift between them.
+pub fn layout_sidecar_filename(crate_stem: &str, target: &str) -> String {
+    format!("{crate_stem}.{target}.layouts.ullbc")
+}
+
 /// RPython: `symbolic.get_field_token` + `symbolic.get_size` provider.
 ///
 /// Supplies struct layouts for the codewriter pipeline. Each struct is
