@@ -255,7 +255,10 @@ unsafe fn walk_raw_function_roots(
 /// never recurses into it; visit the slot as a root the same way
 /// `walk_raw_function_roots` forwards `w_func_globals_obj`.  No-op for non-code
 /// values and inert when the cached dict is non-moving.
-unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+pub unsafe fn walk_raw_code_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
     unsafe {
         if value.is_null() || !crate::pycode::is_code(value) {
             return;
@@ -279,7 +282,7 @@ unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut m
 /// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
 /// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`
 /// -held children. No-op for non-exception values.
-unsafe fn walk_raw_exception_roots(
+pub unsafe fn walk_raw_exception_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
@@ -617,6 +620,20 @@ pub unsafe fn walk_pyframe_roots_area(
             // This is the post-PUSH_EXC_INFO owner of the same exception and
             // must preserve its traceback/frame graph identically.
             unsafe { walk_raw_exception_roots((*ec).sys_exc_value, visitor) };
+            // `executioncontext.py:55` current_gen_or_coroutine is the head
+            // of the running-generator chain.  The generator custom trace
+            // follows each node's `previous_gen_or_coroutine` edge.
+            let current_gen_slot =
+                unsafe { &mut (*ec).current_gen_or_coroutine as *mut PyObjectRef };
+            visitor(unsafe { &mut *(current_gen_slot as *mut majit_ir::GcRef) });
+            for hook in unsafe {
+                [
+                    &mut (*ec).w_asyncgen_firstiter_fn as *mut PyObjectRef,
+                    &mut (*ec).w_asyncgen_finalizer_fn as *mut PyObjectRef,
+                ]
+            } {
+                visitor(unsafe { &mut *(hook as *mut majit_ir::GcRef) });
+            }
             // pending_with_disabled_del is a GC-visible list upstream
             // (executioncontext.py:652); pyre's Vec lives in the boxed
             // UserDelAction, so its element slots are visited here.
@@ -1072,6 +1089,20 @@ pub fn get_current_exception() -> PyObjectRef {
     unsafe { (*ec).sys_exc_value }
 }
 
+/// `executioncontext.py:219-233 sys_exc_info` — return the topmost handled
+/// exception, including one parked on the running generator/coroutine chain.
+/// The bytecode PUSH_EXC_INFO machinery deliberately continues to use
+/// [`get_current_exception`] for the direct EC slot; app-level `sys.exception`
+/// and bare raise use this logical view instead.
+#[majit_macros::dont_look_inside]
+pub fn get_sys_exception() -> PyObjectRef {
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return PY_NULL;
+    }
+    unsafe { (*ec).sys_exc_info(false) }
+}
+
 /// Flat TLS write of the per-thread `CURRENT_EXCEPTION` slot — same
 /// residual-leaf contract as [`get_current_exception`].
 #[majit_macros::dont_look_inside]
@@ -1142,6 +1173,10 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // `__context__` and `__cause__`/`__suppress_context__` writes land
     // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
+    // A running generator swaps its suspended exception into this flat EC
+    // slot before entering the frame.  Keep the hot raise path on the same
+    // residual leaf as PyPy's live frame state; walking the outer generator
+    // chain here would expose the virtualizable frame during tracing.
     crate::error::chain_context(exc, get_current_exception());
     if let Some(cause_obj) = cause {
         if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
@@ -1468,7 +1503,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
 /// `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback (call.rs:328 etc.)
 /// continues to reference it directly.
 pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
-    eval_frame_plain_with_operr(frame, None)
+    eval_frame_plain_with_resume(frame, None, None, None)
 }
 
 /// pyframe.py:270-299 execute_frame body — enter/call_trace/eval_loop/
@@ -1476,14 +1511,69 @@ pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
 /// throw() path routes it through handle_operation_error and sets
 /// last_instr = next_instr - 1 before resuming (pyframe.py:273-277).
 pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
+    eval_frame_plain_with_resume(frame, None, operr, None)
+}
+
+enum FrameResume {
+    Yielded(PyObjectRef),
+    Dispatch(Option<PyError>),
+}
+
+/// pyframe.py:285-315 `resume_execute_frame`.  A suspended `yield from` is
+/// resumed only after `execute_frame` has entered the outer frame.  Clearing
+/// `w_yielding_from` before the delegate call gives the running generator the
+/// same transient `gi_yieldfrom is None` state as PyPy.
+fn prepare_frame_resume(
+    frame: &mut PyFrame,
+    w_inputvalue: Option<PyObjectRef>,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> Result<FrameResume, PyError> {
+    let mut pending_operr = operr;
+    if !frame.w_yielding_from.is_null() {
+        let w_yf = frame.w_yielding_from;
+        frame.w_yielding_from = pyre_object::PY_NULL;
+        let w_arg = w_inputvalue.unwrap_or_else(pyre_object::w_none);
+        match crate::baseobjspace::resume_yield_from(
+            frame,
+            w_yf,
+            w_arg,
+            pending_operr.take(),
+            throw_args,
+        ) {
+            Ok(Some(value)) => return Ok(FrameResume::Yielded(value)),
+            // The delegate's StopIteration value is already on the outer
+            // frame stack and its SEND completion target is installed.
+            Ok(None) => return Ok(FrameResume::Dispatch(None)),
+            Err(err) => pending_operr = Some(err),
+        }
+    }
+    if pending_operr.is_none() {
+        if let Some(w_arg_or_err) = w_inputvalue {
+            let _ = frame.resume_execute_frame(w_arg_or_err)?;
+        }
+    }
+    Ok(FrameResume::Dispatch(pending_operr))
+}
+
+pub(crate) fn eval_frame_plain_with_resume(
+    frame: &mut PyFrame,
+    w_inputvalue: Option<PyObjectRef>,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> PyResult {
     frame.fix_array_ptrs();
     if frame.execution_context.is_null() {
-        if let Some(mut err) = operr {
-            let mut next_instr = frame.next_instr();
-            if !handle_exception(frame, &mut err, &mut next_instr) {
-                return Err(err);
+        match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {
+            FrameResume::Yielded(value) => return Ok(value),
+            FrameResume::Dispatch(Some(mut err)) => {
+                let mut next_instr = frame.next_instr();
+                if !handle_exception(frame, &mut err, &mut next_instr) {
+                    return Err(err);
+                }
+                frame.last_instr = next_instr as isize - 1;
             }
-            frame.last_instr = next_instr as isize - 1;
+            FrameResume::Dispatch(None) => {}
         }
         return eval_loop(frame);
     }
@@ -1512,12 +1602,19 @@ pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyE
     let outer_result = (|| -> PyResult {
         execution_context.call_trace(frame as *mut PyFrame)?;
         let inner_result = (|| -> PyResult {
-            if let Some(mut err) = operr {
-                let mut next_instr = frame.next_instr();
-                if !handle_exception(frame, &mut err, &mut next_instr) {
-                    return Err(err);
+            match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {
+                FrameResume::Yielded(value) => {
+                    w_exitvalue = value;
+                    return Ok(value);
                 }
-                frame.last_instr = next_instr as isize - 1;
+                FrameResume::Dispatch(Some(mut err)) => {
+                    let mut next_instr = frame.next_instr();
+                    if !handle_exception(frame, &mut err, &mut next_instr) {
+                        return Err(err);
+                    }
+                    frame.last_instr = next_instr as isize - 1;
+                }
+                FrameResume::Dispatch(None) => {}
             }
             let result = eval_loop(frame)?;
             w_exitvalue = result;
@@ -2949,7 +3046,7 @@ impl OpcodeStepExecutor for PyFrame {
             0 => {
                 // Bare `raise` — re-raise current exception
                 // PyPy: executioncontext.py sys_exc_info
-                let exc = get_current_exception();
+                let exc = get_sys_exception();
                 if exc.is_null() || unsafe { pyre_object::is_none(exc) } {
                     Err(PyError::runtime_error("No active exception to reraise"))
                 } else if unsafe { pyre_object::is_exception(exc) } {
@@ -3789,6 +3886,10 @@ impl OpcodeStepExecutor for PyFrame {
         crate::opcode_ops::list_to_tuple_value(val)
     }
 
+    fn async_gen_wrap(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        Ok(pyre_object::generator::w_async_gen_value_wrapper_new(val))
+    }
+
     // ── print_expr ──
     // PRINT_EXPR → sys.displayhook(value). Routing through the live hook lets
     // a rebound displayhook (doctest, IDLE) and a redirected sys.stdout take
@@ -3966,6 +4067,64 @@ impl OpcodeStepExecutor for PyFrame {
         // `running` flag.
         self.push(w_iter);
         Ok(())
+    }
+
+    fn get_aiter(&mut self) -> Result<(), PyError> {
+        let obj = self.pop();
+        let method =
+            unsafe { crate::baseobjspace::lookup_special(obj, "__aiter__")? }.ok_or_else(|| {
+                crate::PyError::type_error(format!(
+                    "'async for' requires an object with __aiter__ method, got {}",
+                    crate::type_methods::arg_type_name(obj)
+                ))
+            })?;
+        let iter = crate::call::call_function_impl_result(method, &[])?;
+        if unsafe { crate::baseobjspace::lookup_special(iter, "__anext__")? }.is_none() {
+            return Err(crate::PyError::type_error(format!(
+                "'async for' received an object from __aiter__ that does not implement __anext__: {}",
+                crate::type_methods::arg_type_name(iter)
+            )));
+        }
+        self.push(iter);
+        Ok(())
+    }
+
+    fn get_anext(&mut self) -> Result<(), PyError> {
+        let iter = self.peek();
+        let method = unsafe { crate::baseobjspace::lookup_special(iter, "__anext__")? }
+            .ok_or_else(|| {
+                crate::PyError::type_error(format!(
+                    "'async for' requires an iterator with __anext__ method, got {}",
+                    crate::type_methods::arg_type_name(iter)
+                ))
+            })?;
+        let next = crate::call::call_function_impl_result(method, &[])?;
+        let awaitable = crate::baseobjspace::get_awaitable_iter(next, 0).map_err(|err| {
+            if err.kind == crate::PyErrorKind::TypeError {
+                crate::PyError::type_error(format!(
+                    "'async for' received an invalid object from __anext__: {}",
+                    crate::type_methods::arg_type_name(next)
+                ))
+            } else {
+                err
+            }
+        })?;
+        self.push(awaitable);
+        Ok(())
+    }
+
+    fn end_async_for(&mut self) -> Result<(), PyError> {
+        let exc = self.pop();
+        let err = unsafe { crate::PyError::from_exc_object(exc) };
+        if err.kind == crate::PyErrorKind::StopAsyncIteration {
+            // The 3.14 exception table preserves the surrounding handler's
+            // previous-exception entry below the asynchronous iterator; the
+            // StopAsyncIteration edge itself pushes only `exc`.
+            self.pop(); // asynchronous iterator
+            Ok(())
+        } else {
+            Err(err)
+        }
     }
 
     // ── load_method ──
@@ -5519,6 +5678,126 @@ while i < 3000:
         unsafe {
             let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
+        }
+    }
+
+    #[test]
+    fn test_async_generator_asend_yield_and_exhaustion() {
+        let source = r#"
+async def agen():
+    yield 42
+
+g = agen()
+frame_visible = g.ag_frame is not None
+code_visible = g.ag_code is not None
+initially_suspended = g.ag_suspended
+a = g.__anext__()
+try:
+    a.send(None)
+except StopIteration as e:
+    yielded = e.value
+try:
+    g.__anext__().send(None)
+except StopAsyncIteration:
+    exhausted = True
+"#;
+        let (result, frame) = run_exec_frame(source);
+        result.expect("async generator program failed");
+        unsafe {
+            let yielded = w_dict_getitem_str(frame.w_globals, "yielded").unwrap();
+            assert_eq!(w_int_get_value(yielded), 42);
+            let exhausted = w_dict_getitem_str(frame.w_globals, "exhausted").unwrap();
+            assert!(is_true(exhausted).unwrap());
+            for name in ["frame_visible", "code_visible"] {
+                assert!(is_true(w_dict_getitem_str(frame.w_globals, name).unwrap()).unwrap());
+            }
+            assert!(
+                !is_true(w_dict_getitem_str(frame.w_globals, "initially_suspended").unwrap())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_async_generator_asend_value_and_aclose() {
+        let source = r#"
+closed = False
+async def agen():
+    global closed
+    try:
+        value = yield 1
+        yield value
+    finally:
+        closed = True
+
+g = agen()
+try:
+    g.__anext__().send(None)
+except StopIteration as e:
+    first = e.value
+try:
+    g.asend(42).send(None)
+except StopIteration as e:
+    second = e.value
+try:
+    g.aclose().send(None)
+except StopIteration:
+    close_done = True
+"#;
+        let (result, frame) = run_exec_frame(source);
+        result.expect("async generator asend/aclose program failed");
+        unsafe {
+            for (name, expected) in [("first", 1), ("second", 42)] {
+                assert_eq!(
+                    w_int_get_value(w_dict_getitem_str(frame.w_globals, name).unwrap()),
+                    expected
+                );
+            }
+            for name in ["closed", "close_done"] {
+                assert!(is_true(w_dict_getitem_str(frame.w_globals, name).unwrap()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn test_async_for_consumes_async_generator() {
+        let source = r#"
+async def agen():
+    yield 2
+    yield 3
+
+preserved_exception = False
+async def consume():
+    global preserved_exception
+    result = []
+    try:
+        raise ValueError('outer')
+    except ValueError:
+        async for value in agen():
+            result.append(value)
+        try:
+            raise
+        except ValueError:
+            preserved_exception = True
+    return result
+
+coro = consume()
+try:
+    coro.send(None)
+except StopIteration as e:
+    result = e.value
+"#;
+        let (result, frame) = run_exec_frame(source);
+        result.expect("async-for program failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert_eq!(w_list_len(result), 2);
+            assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
+            assert_eq!(w_int_get_value(w_list_getitem(result, 1).unwrap()), 3);
+            assert!(
+                is_true(w_dict_getitem_str(frame.w_globals, "preserved_exception").unwrap())
+                    .unwrap()
+            );
         }
     }
 

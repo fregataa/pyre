@@ -4,8 +4,9 @@
 //! `FormatIterator.interpret`) plus the standard and native format tables
 //! (`standardfmttable.py`, `nativefmttable.py`): byte-order/size/alignment
 //! decoding from the leading char, repetition counts, `needcount` codes
-//! (`x`/`s`/`p`), per-code range checks, and the `s`/`c`/`x`/`p`/`?`/`e`
-//! string, char, pad, pascal, bool and half-float codes.  `struct.error`
+//! (`x`/`s`/`p`), per-code range checks, and the `s`/`c`/`x`/`p`/`?`/`e`/
+//! `F`/`D` string, char, pad, pascal, bool, half-float and complex codes.
+//! `struct.error`
 //! is `space.new_exception_class("struct.error", space.w_Exception)`
 //! (`interp_struct.py:20 Cache`).
 
@@ -73,6 +74,8 @@ enum Code {
     HalfFloat,
     Float,
     Double,
+    FloatComplex,
+    DoubleComplex,
     Int { signed: bool },
 }
 
@@ -156,6 +159,11 @@ fn lookup_fmt(c: char, native: bool) -> Option<Fmt> {
             'e' => (Code::HalfFloat, 2),
             'f' => (Code::Float, 4),
             'd' => (Code::Double, 8),
+            // CPython 3.14 native_table: complex storage is two adjacent
+            // component values, aligned like one component rather than like
+            // the full 8/16-byte field.
+            'F' => (Code::FloatComplex, 8),
+            'D' => (Code::DoubleComplex, 16),
             _ => return None,
         }
     } else {
@@ -172,13 +180,23 @@ fn lookup_fmt(c: char, native: bool) -> Option<Fmt> {
             'e' => (Code::HalfFloat, 2),
             'f' => (Code::Float, 4),
             'd' => (Code::Double, 8),
+            'F' => (Code::FloatComplex, 8),
+            'D' => (Code::DoubleComplex, 16),
             // `n`/`N`/`P` do not exist in standard sizes.
             _ => return None,
         }
     };
     // Scalar types are naturally aligned on the targets pyre builds for;
     // in standard mode all alignments collapse to 1.
-    let alignment = if native { size.max(1) } else { 1 };
+    let alignment = if native {
+        match code {
+            Code::FloatComplex => std::mem::align_of::<f32>(),
+            Code::DoubleComplex => std::mem::align_of::<f64>(),
+            _ => size.max(1),
+        }
+    } else {
+        1
+    };
     Some(Fmt {
         code,
         size,
@@ -479,6 +497,44 @@ unsafe fn pack_float_code(
     Ok(())
 }
 
+/// CPython 3.14 `np_*_complex` / `bp_*_complex` / `lp_*_complex` — coerce
+/// one Python value with `PyComplex_AsCComplex`, then encode the real and
+/// imaginary components independently in that order.
+unsafe fn pack_complex_code(
+    out: &mut Vec<u8>,
+    arg: PyObjectRef,
+    code: Code,
+    bigendian: bool,
+) -> Result<(), crate::PyError> {
+    let (real, imag) = crate::builtins::complex_coerce(arg)
+        .map_err(|_| struct_error("required argument is not a complex"))?;
+    match code {
+        Code::FloatComplex => {
+            for component in [real, imag] {
+                let value = component as f32;
+                // CPython 3.14 `init_endian_tables` replaces the host-endian
+                // standard F row with `np_float_complex`, whose C float cast
+                // permits infinity.  The opposite-endian `PyFloat_Pack4`
+                // rows retain their overflow check.
+                if bigendian != native_is_bigendian()
+                    && component.is_finite()
+                    && value.is_infinite()
+                {
+                    return Err(struct_overflow("float too large to pack with f format"));
+                }
+                push_endian(out, &value.to_bits().to_le_bytes(), bigendian);
+            }
+        }
+        Code::DoubleComplex => {
+            for component in [real, imag] {
+                push_endian(out, &component.to_bits().to_le_bytes(), bigendian);
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 fn push_endian(out: &mut Vec<u8>, le: &[u8], bigendian: bool) {
     if bigendian {
         out.extend(le.iter().rev());
@@ -550,21 +606,26 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
                 let arg = values[ai];
                 ai += 1;
                 let data = unsafe { accept_bytes(arg, "argument for 'p' must be a bytes object")? };
+                // CPython 3.14 accepts `0p`: it still consumes one argument,
+                // but the zero-width field has no prefix or payload bytes.
+                // Older PyPy raises `bad '0p'`; pyre follows the 3.14 target.
+                if rep == 0 {
+                    continue;
+                }
                 // `pack_pascal` — length prefix byte (clamped to count-1 and
-                // 255) then the string, padded to `count` bytes total.  A
-                // `0p` field has no room for even the length byte.
+                // 255) then the string, padded to `count` bytes total.
                 let mut prefix = data.len();
                 if prefix >= rep {
-                    if rep == 0 {
-                        return Err(struct_error("bad '0p' in struct format"));
-                    }
                     prefix = rep - 1;
                 }
                 if prefix > 255 {
                     prefix = 255;
                 }
                 out.push(prefix as u8);
-                pack_string_bytes(&mut out, &data[..prefix], rep - 1);
+                // PyPy `_pack_string(fmtiter, string, count-1)`: only the
+                // one-byte length prefix is capped at 255.  The field still
+                // stores as much payload as its full `count - 1` width.
+                pack_string_bytes(&mut out, data, rep - 1);
             }
             Code::Bool => {
                 for _ in 0..rep {
@@ -600,6 +661,13 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
                     unsafe { pack_float_code(&mut out, arg, fmt.code, parsed.bigendian)? };
                 }
             }
+            Code::FloatComplex | Code::DoubleComplex => {
+                for _ in 0..rep {
+                    let arg = values[ai];
+                    ai += 1;
+                    unsafe { pack_complex_code(&mut out, arg, fmt.code, parsed.bigendian)? };
+                }
+            }
         }
     }
     Ok(out)
@@ -611,6 +679,18 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
     unsafe {
         if bytearrayobject::is_bytearray(obj) {
             return Ok(bytearrayobject::w_bytearray_data_mut(obj));
+        }
+        if interp_array::is_array(obj) {
+            return Ok(interp_array::w_array_vec_mut(obj).as_mut_slice());
+        }
+        // `W_MMap.writebuf_w` — the live mapping, unless it was opened
+        // read-only.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
+            let (address, length, readonly) = view?;
+            if !readonly {
+                return Ok(std::slice::from_raw_parts_mut(address as *mut u8, length));
+            }
         }
         if memoryview::is_w_memoryview(obj) {
             crate::builtins::memoryview_check_released(obj)?;
@@ -636,6 +716,26 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
     }
 }
 
+/// One export held on a `pack_into` target for as long as the writable slice
+/// is live.  `s_pack_into` keeps the buffer exported across `s_pack_internal`,
+/// so a value coercion that re-enters Python and calls `release()` — or
+/// resizes the exporter — raises instead of leaving the saved slice stale.
+struct PackIntoExport(PyObjectRef);
+
+impl PackIntoExport {
+    /// Returns `None` for an immutable target that carries no export count;
+    /// `writebuf` rejects every unsupported exporter before use.
+    unsafe fn acquire(obj: PyObjectRef) -> Option<Self> {
+        unsafe { crate::builtins::buffer_export_incref(obj).then_some(Self(obj)) }
+    }
+}
+
+impl Drop for PackIntoExport {
+    fn drop(&mut self) {
+        unsafe { crate::builtins::buffer_export_decref(self.0) }
+    }
+}
+
 /// `do_pack_into` — pack `values` into `buffer` starting at `offset`,
 /// resolving a negative offset against the buffer end.
 fn do_pack_into(
@@ -646,6 +746,7 @@ fn do_pack_into(
 ) -> Result<PyObjectRef, crate::PyError> {
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()?;
+    let _export = unsafe { PackIntoExport::acquire(buffer) };
     let buf = unsafe { writebuf(buffer)? };
     let buflen = buf.len() as i64;
     let mut offset = offset;
@@ -663,12 +764,14 @@ fn do_pack_into(
         offset += buflen;
     }
     if buflen - offset < size {
+        // `r_uint(s_size + offset)` in PyPy: the diagnostic deliberately
+        // represents `sys.maxsize + size` above the signed machine range.
+        // Add in the unsigned domain so CPython 3.14's boundary message does
+        // not turn into a Rust debug-overflow panic.
+        let required = (offset as u64) + (size as u64);
         return Err(struct_error(format!(
             "pack_into requires a buffer of at least {} bytes for packing {} bytes at offset {} (actual buffer size is {})",
-            size + offset,
-            size,
-            offset,
-            buflen
+            required, size, offset, buflen
         )));
     }
     let packed = pack_values(&parsed, values)?;
@@ -725,6 +828,35 @@ fn unpack_float(raw: &[u8], code: Code, bigendian: bool) -> PyObjectRef {
     }
 }
 
+/// CPython 3.14 `nu_*_complex` / `bu_*_complex` / `lu_*_complex` — decode
+/// two adjacent components and preserve their exact zero/NaN/Inf bit signs.
+fn unpack_complex(raw: &[u8], code: Code, bigendian: bool) -> PyObjectRef {
+    let (real, imag) = match code {
+        Code::FloatComplex => {
+            let mut real = [0u8; 4];
+            let mut imag = [0u8; 4];
+            copy_endian(&raw[..4], &mut real, bigendian);
+            copy_endian(&raw[4..8], &mut imag, bigendian);
+            (
+                f32::from_bits(u32::from_le_bytes(real)) as f64,
+                f32::from_bits(u32::from_le_bytes(imag)) as f64,
+            )
+        }
+        Code::DoubleComplex => {
+            let mut real = [0u8; 8];
+            let mut imag = [0u8; 8];
+            copy_endian(&raw[..8], &mut real, bigendian);
+            copy_endian(&raw[8..16], &mut imag, bigendian);
+            (
+                f64::from_bits(u64::from_le_bytes(real)),
+                f64::from_bits(u64::from_le_bytes(imag)),
+            )
+        }
+        _ => unreachable!(),
+    };
+    w_complex_new(real, imag)
+}
+
 fn copy_endian(raw: &[u8], out: &mut [u8], bigendian: bool) {
     let n = out.len();
     for i in 0..n {
@@ -769,9 +901,11 @@ fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyErr
             }
             Code::Pascal => {
                 // `unpack_pascal` — first byte is the length, clamped to the
-                // field width; the value is the following bytes.
+                // field width; the value is the following bytes.  CPython
+                // 3.14's zero-width form contributes one empty bytes value.
                 if rep == 0 {
-                    return Err(struct_error("bad '0p' in struct format"));
+                    out.push(w_bytes_from_bytes(&[]));
+                    continue;
                 }
                 let data = &buf[pos..pos + rep];
                 let end = (1 + data[0] as usize).min(rep);
@@ -805,6 +939,16 @@ fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyErr
                     pos += fmt.size;
                 }
             }
+            Code::FloatComplex | Code::DoubleComplex => {
+                for _ in 0..rep {
+                    out.push(unpack_complex(
+                        &buf[pos..pos + fmt.size],
+                        fmt.code,
+                        parsed.bigendian,
+                    ));
+                    pos += fmt.size;
+                }
+            }
         }
     }
     Ok(w_tuple_new(out))
@@ -831,12 +975,12 @@ fn do_unpack_from(format: &str, buf: &[u8], offset: i64) -> Result<PyObjectRef, 
         offset += buflen;
     }
     if buflen - offset < size as i64 {
+        // Same `r_uint(s_size + offset)` boundary calculation as
+        // `do_pack_into`; `sys.maxsize + size` is a valid diagnostic value.
+        let required = (offset as u64) + (size as u64);
         return Err(struct_error(format!(
             "unpack_from requires a buffer of at least {} bytes for unpacking {} bytes at offset {} (actual buffer size is {})",
-            size as i64 + offset,
-            size,
-            offset,
-            buflen
+            required, size, offset, buflen
         )));
     }
     let start = offset as usize;
@@ -959,6 +1103,21 @@ pub struct W_Struct {
     size: i64,
 }
 
+impl W_Struct {
+    /// CPython 3.14 `ENSURE_STRUCT_IS_READY` — every operation other than the
+    /// `size` getter rejects an object allocated with `Struct.__new__` but not
+    /// initialized yet.
+    fn ensure_ready(&self) -> Result<(), crate::PyError> {
+        if self.size < 0 {
+            Err(crate::PyError::runtime_error(
+                "Struct object is not initialized",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[crate::pyre_methods(doc = "Struct(fmt) --> compiled struct object")]
 impl W_Struct {
     /// `interp_struct.py:256 descr__new__` — the format string is consumed by
@@ -987,8 +1146,9 @@ impl W_Struct {
     }
 
     #[getter]
-    fn format(&self) -> PyObjectRef {
-        self.format
+    fn format(&self) -> Result<PyObjectRef, crate::PyError> {
+        self.ensure_ready()?;
+        Ok(self.format)
     }
 
     #[getter]
@@ -1001,6 +1161,7 @@ impl W_Struct {
     /// The whole-args-slice ABI hands `args[0]` = self; the packed values
     /// are `args[1..]`.
     fn pack(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
         let fmt = unsafe { w_str_get_value(format) };
         do_pack(fmt, &args[1..])
@@ -1009,6 +1170,7 @@ impl W_Struct {
     /// `interp_struct.py:234 descr_unpack` —
     /// `do_unpack(space, jit.promote_string(self.format), w_str)`.
     fn unpack(&self, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
         let fmt = unsafe { w_str_get_value(format) };
         let buf = unsafe { readbuf(w_str)? };
@@ -1020,6 +1182,7 @@ impl W_Struct {
     /// Whole-args ABI: `args[0]` = self, `args[1]` = buffer, `args[2]` =
     /// offset, `args[3..]` = the packed values.
     fn pack_into(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
         let fmt = unsafe { w_str_get_value(format) };
         let (pos, _) = crate::builtins::split_builtin_kwargs(&args[1..]);
@@ -1036,6 +1199,7 @@ impl W_Struct {
     /// `do_unpack_from(space, jit.promote_string(self.format), buffer, offset)`.
     /// `buffer` / `offset` are accepted positionally or by keyword.
     fn unpack_from(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
         let fmt = unsafe { w_str_get_value(format) };
         let (buffer, offset) = resolve_buffer_offset(&args[1..])?;
@@ -1046,6 +1210,7 @@ impl W_Struct {
     /// `interp_struct.py:241 descr_iter_unpack` — a `W_UnpackIter` over
     /// `buffer`.  Whole-args ABI: `args[0]` = self, `args[1]` = buffer.
     fn iter_unpack(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        self.ensure_ready()?;
         let buffer = args
             .get(1)
             .copied()
@@ -1054,9 +1219,17 @@ impl W_Struct {
     }
 
     /// `_struct.Struct.__repr__` — `Struct('<format>')`.
-    fn __repr__(&self) -> PyObjectRef {
+    fn __repr__(&self) -> Result<String, crate::PyError> {
+        self.ensure_ready()?;
         let fmt = unsafe { w_str_get_value(self.format) };
-        w_str_new(&format!("Struct('{fmt}')"))
+        Ok(format!("Struct('{fmt}')"))
+    }
+
+    /// CPython exposes a dedicated `Struct.__sizeof__` and applies the same
+    /// readiness guard before consulting the compiled format allocation.
+    fn __sizeof__(&self) -> Result<i64, crate::PyError> {
+        self.ensure_ready()?;
+        Ok(std::mem::size_of::<W_Struct>() as i64)
     }
 }
 
@@ -1097,6 +1270,10 @@ pub mod unpack_iter {
         buffer: PyObjectRef,
         size: i64,
         index: i64,
+        /// `self.view is not None` (`interp_struct.py:212-224`).  A true
+        /// value owns exactly one exporter count and is cleared on normal
+        /// exhaustion or from the native finalizer.
+        export_active: bool,
     }
 
     #[crate::pyre_methods]
@@ -1108,8 +1285,14 @@ pub mod unpack_iter {
         /// `descr_next` — unpack the next record, raising `StopIteration`
         /// at the end of the buffer.
         fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+            if self.buffer.is_null() {
+                return Err(crate::PyError::new(crate::PyErrorKind::StopIteration, ""));
+            }
             let buf = unsafe { readbuf(self.buffer)? };
             if self.index >= buf.len() as i64 {
+                // CPython/PyPy release the inline Py_buffer eagerly at the
+                // first exhausted `next()`, rather than waiting for GC.
+                self.release_export();
                 return Err(crate::PyError::new(crate::PyErrorKind::StopIteration, ""));
             }
             let start = self.index as usize;
@@ -1122,11 +1305,30 @@ pub mod unpack_iter {
 
         /// `descr_length_hint` — records remaining.
         fn __length_hint__(&self) -> PyObjectRef {
+            if self.buffer.is_null() {
+                return w_int_new(0);
+            }
             let remaining = match unsafe { readbuf(self.buffer) } {
                 Ok(buf) => (buf.len() as i64 - self.index) / self.size,
                 Err(_) => 0,
             };
             w_int_new(remaining)
+        }
+    }
+
+    impl W_UnpackIter {
+        /// `_finalize_` / the exhausted branch share `_release_buf`'s
+        /// idempotent take-then-release shape.
+        pub(crate) fn release_export(&mut self) {
+            if self.buffer.is_null() {
+                return;
+            }
+            if self.export_active {
+                self.export_active = false;
+                unsafe { crate::builtins::buffer_export_decref(self.buffer) };
+            }
+            self.buffer = PY_NULL;
+            self.format = PY_NULL;
         }
     }
 
@@ -1141,7 +1343,14 @@ pub mod unpack_iter {
         // Force the type's method table to be built before allocating (the
         // `unpack_iterator` type is not exposed as a module attribute, so
         // nothing else triggers `type_object()`).
-        let _ = type_object();
+        let iter_type = type_object();
+        // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
+        // TypeDef shape: the implementation type is returned by `type(it)`
+        // but cannot be instantiated or used as a base class.
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(iter_type, false);
+            pyre_object::w_type_set_disallow_instantiation(iter_type);
+        }
         let buf = unsafe { readbuf(buffer)? };
         if size <= 0 {
             return Err(struct_error(format!(
@@ -1153,7 +1362,8 @@ pub mod unpack_iter {
                 "iterative unpacking requires a buffer of a multiple of {size} bytes"
             )));
         }
-        Ok(W_UnpackIter::allocate_stable(W_UnpackIter {
+        let export_active = unsafe { crate::builtins::buffer_export_incref(buffer) };
+        let w_iter = W_UnpackIter::allocate_stable(W_UnpackIter {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -1162,7 +1372,12 @@ pub mod unpack_iter {
             buffer,
             size,
             index: 0,
-        }))
+            export_active,
+        });
+        if export_active {
+            crate::executioncontext::register_native_buffer_finalizer(w_iter);
+        }
+        Ok(w_iter)
     }
 }
 
@@ -1180,6 +1395,12 @@ unsafe fn readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
         if bytesobject::is_bytes_like(obj) {
             return Ok(bytesobject::bytes_like_data(obj));
+        }
+        // `W_MMap.readbuf_w` — the live mapping.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
+            let (address, length, _readonly) = view?;
+            return Ok(std::slice::from_raw_parts(address as *const u8, length));
         }
         if interp_array::is_array(obj) {
             return Ok(interp_array::w_array_bytes(obj));
@@ -1213,8 +1434,9 @@ crate::py_module! {
             let fmt = format_to_string(fmt_obj)?;
             parse_format(&fmt)?.calcsize()
         }
-        fn unpack(fmt_obj: PyObjectRef, buf: &[u8]) -> Result<PyObjectRef, crate::PyError> {
+        fn unpack(fmt_obj: PyObjectRef, buffer: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             let fmt = format_to_string(fmt_obj)?;
+            let buf = unsafe { readbuf(buffer)? };
             do_unpack(&fmt, buf)
         }
     },

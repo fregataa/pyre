@@ -136,6 +136,14 @@ pub fn register_generator_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
 }
 
+/// Register an interp-level object whose PyPy counterpart implements
+/// `_finalize_` solely to release an acquired buffer.  The ownership bit
+/// lives on the object itself; this queue supplies the unreachable-object
+/// callback corresponding to `register_finalizer(space)`.
+pub fn register_native_buffer_finalizer(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
+}
+
 /// Register an object that owns a `WeakrefLifeline`. PyPy's GC invalidates the
 /// rweakrefs and registers callback-bearing lifelines themselves; until pyre's
 /// mapdict weakref SPECIAL slot is inline, the address-keyed slot keeps that
@@ -146,7 +154,9 @@ pub fn register_weakref_finalizer(obj: PyObjectRef) {
     let already_registered = crate::typedef::r#type(obj)
         .map(|w_type| unsafe { pyre_object::w_type_get_hasuserdel(w_type) })
         .unwrap_or(false);
-    if !already_registered {
+    let native_buffer_finalizer = crate::module::__pypy__::W_PickleBuffer::from_obj(obj).is_some()
+        || crate::module::r#struct::unpack_iter::W_UnpackIter::from_obj(obj).is_some();
+    if !already_registered && !native_buffer_finalizer {
         pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
     }
 }
@@ -203,6 +213,14 @@ pub struct ExecutionContext {
     /// per-thread EC pointer and the optimizer can dead-store-eliminate a
     /// balanced save/restore.  GC-rooted via `walk_pyframe_roots`.
     pub sys_exc_value: PyObjectRef,
+    /// `executioncontext.py:55` — linked-list head for running generators and
+    /// coroutines.  Each node owns the suspended exception state of its
+    /// caller through `GeneratorOrCoroutine.previous_gen_or_coroutine`.
+    pub current_gen_or_coroutine: PyObjectRef,
+    /// `executioncontext.py:53-54` — PEP 525 hooks, owned by the execution
+    /// context (thread-specific), never by a process-global side table.
+    pub w_asyncgen_firstiter_fn: PyObjectRef,
+    pub w_asyncgen_finalizer_fn: PyObjectRef,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -252,6 +270,9 @@ impl ExecutionContext {
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
             sys_exc_value: pyre_object::PY_NULL,
+            current_gen_or_coroutine: pyre_object::PY_NULL,
+            w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
+            w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
         }
     }
 
@@ -697,23 +718,64 @@ impl ExecutionContext {
     pub fn sys_exc_info(&self, _for_hidden: bool) -> PyObjectRef {
         let _ = self.gettopframe();
         let _ = _for_hidden;
+        if !self.sys_exc_value.is_null() {
+            return self.sys_exc_value;
+        }
+        let mut generator = self.current_gen_or_coroutine;
+        while !generator.is_null() {
+            let saved =
+                unsafe { pyre_object::generator::w_generator_get_saved_exc_value(generator) };
+            if !saved.is_null() {
+                return saved;
+            }
+            generator = unsafe { pyre_object::generator::w_generator_get_previous(generator) };
+        }
         pyre_object::PY_NULL
     }
 
-    pub fn set_sys_exc_info(&mut self, _operror: PyObjectRef) {
-        let _ = _operror;
-        let frame = self.gettopframe_nohidden();
-        if !frame.is_null() {
-            // Real PyPy stores OperationError in frame.last_exception.
-            let _ = frame;
-        }
+    pub fn current_exception(&self) -> PyObjectRef {
+        self.sys_exc_value
+    }
+
+    pub fn set_sys_exc_info(&mut self, operror: PyObjectRef) {
+        self.sys_exc_value = operror;
     }
 
     pub fn clear_sys_exc_info(&mut self) {
-        let mut frame = self.gettopframe_nohidden();
-        while !frame.is_null() {
-            frame = Self::getnextframe_nohidden(frame);
+        self.sys_exc_value = pyre_object::PY_NULL;
+    }
+
+    /// `executioncontext.py:254-259` — exchange the caller's active handler
+    /// exception with the exception suspended on `gen`, then link `gen` as
+    /// the current generator/coroutine.
+    pub fn push_gen_or_coroutine(&mut self, generator: PyObjectRef) {
+        let current_exc = self.sys_exc_value;
+        let saved_exc =
+            unsafe { pyre_object::generator::w_generator_get_saved_exc_value(generator) };
+        self.sys_exc_value = saved_exc;
+        unsafe {
+            pyre_object::generator::w_generator_set_saved_exc_value(generator, current_exc);
+            pyre_object::generator::w_generator_set_previous(
+                generator,
+                self.current_gen_or_coroutine,
+            );
         }
+        self.current_gen_or_coroutine = generator;
+    }
+
+    /// `executioncontext.py:261-267` — unlink `gen`, park the exception state
+    /// produced by its frame on the generator, and restore its caller's state.
+    pub fn pop_gen_or_coroutine(&mut self, generator: PyObjectRef) {
+        debug_assert_eq!(self.current_gen_or_coroutine, generator);
+        let caller_exc =
+            unsafe { pyre_object::generator::w_generator_get_saved_exc_value(generator) };
+        self.current_gen_or_coroutine =
+            unsafe { pyre_object::generator::w_generator_get_previous(generator) };
+        unsafe {
+            pyre_object::generator::w_generator_set_previous(generator, pyre_object::PY_NULL);
+            pyre_object::generator::w_generator_set_saved_exc_value(generator, self.sys_exc_value);
+        }
+        self.sys_exc_value = caller_exc;
     }
 
     pub fn settrace(&mut self, w_func: PyObjectRef) {
@@ -1953,6 +2015,14 @@ impl UserDelAction {
 
     pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
         crate::module::_weakref::interp__weakref::finalize_weakrefs(w_obj);
+        if let Some(pb) = crate::module::__pypy__::W_PickleBuffer::from_obj(w_obj) {
+            pb.release_export();
+            return;
+        }
+        if let Some(iter) = crate::module::r#struct::unpack_iter::W_UnpackIter::from_obj(w_obj) {
+            iter.release_export();
+            return;
+        }
         if unsafe { pyre_object::generator::is_generator_or_coroutine(w_obj) } {
             if self.gc_disabled(w_obj) {
                 return;

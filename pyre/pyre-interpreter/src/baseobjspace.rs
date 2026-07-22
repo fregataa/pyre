@@ -64,6 +64,17 @@ pub fn take_pending_hash_error() -> PyError {
     })
 }
 
+/// Convert the two failure modes of a checked set-table operation back into
+/// the Python exception carried by PyPy's `r_dict` operation.
+pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyError {
+    match err {
+        pyre_object::setobject::SetUpdateError::Key(_) => take_pending_hash_error(),
+        pyre_object::setobject::SetUpdateError::ChangedSize => {
+            PyError::runtime_error("Set changed size during iteration")
+        }
+    }
+}
+
 /// Root the exception parked in `PENDING_HASH_ERROR` while a raising
 /// `__hash__`/`__eq__` propagates across a dict probe. Its `PyError` holds GC
 /// refs the precise collector does not reach through the raw `Cell`; forward
@@ -136,11 +147,23 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
     ))
 }
 
-/// The set-element counterpart of [`wrap_dict_key_hash_error`]: a bad element
-/// raises the bare `unhashable type: '<type>'` TypeError from hashing, so the
-/// error passes through unchanged.
-pub fn wrap_set_element_hash_error(_item: PyObjectRef, err: PyError) -> PyError {
-    err
+/// Python 3.14's set-element counterpart of [`wrap_dict_key_hash_error`].
+pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
+    if err.kind != PyErrorKind::TypeError {
+        return err;
+    }
+    if !err.exc_object.is_null() {
+        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let raised_type = crate::typedef::r#type(err.exc_object).unwrap_or(PY_NULL);
+        if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
+            return err;
+        }
+    }
+    PyError::type_error(format!(
+        "cannot use '{}' as a set element ({})",
+        object_functionstr_type_name(item),
+        err.message,
+    ))
 }
 
 /// Compatibility alias for PyPy's base-object type.
@@ -3722,8 +3745,11 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
     mro.iter().any(|&klass| is_w(klass, check_class))
 }
 
-/// Get the length of a container: `len(obj)`.
-pub fn len(obj: PyObjectRef) -> PyResult {
+/// `pypy/objspace/descroperation.py:294-298 _len` — invoke the concrete
+/// `__len__` descriptor and return its still-wrapped result.  The public
+/// [`len`] and [`len_w`] operations below perform the mandatory index,
+/// nonnegative, and machine-word checks around this primitive.
+fn _len(obj: PyObjectRef) -> PyResult {
     // descroperation.py:294-298 `_len` — a builtin subclass overriding
     // `__len__` dispatches the override (bound via `get_and_call_function`);
     // exact builtins and non-overriding subclasses fall through to the
@@ -3735,6 +3761,16 @@ pub fn len(obj: PyObjectRef) -> PyResult {
         }
     }
     len_slot(obj)
+}
+
+/// `pypy/objspace/descroperation.py:304-308 len` — preserve the wrapped
+/// integer returned by `space.index`, but validate negativity and overflow
+/// before exposing it to app-level `len()`.
+pub fn len(obj: PyObjectRef) -> PyResult {
+    let w_res = _len(obj)?;
+    let w_index = space_index(w_res)?;
+    _check_len_result(w_index)?;
+    Ok(w_index)
 }
 
 /// The builtin `__len__` slot body: length dispatch by concrete layout.
@@ -4615,31 +4651,27 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    // Module objects: look up in module namespace.
-    // PyPy `space.getattr(w_module, w_name) → Module.getdictvalue(space,
-    // name)` (`pypy/interpreter/module.py:Module.getdictvalue`
-    // inherited from `baseobjspace.py:45-48 W_Root.getdictvalue`):
-    //
-    //     w_dict = self.getdict(space)        # module.py:77 → self.w_dict
-    //     if w_dict is not None:
-    //         return space.finditem_str(w_dict, attr)
-    //     return None
-    //
-    // Routing through `space.finditem_str` (rather than reading the
-    // backing storage directly) gives dict subclass `__getitem__`
-    // overrides their PyPy chance to fire on the user-supplied
-    // `__builtins__` aliasing case (`moduledef.py:102-103
-    // Module(space, None, w_builtin)`), and routes through the
-    // storage-authoritative read path so transient W_DictObject
-    // snapshots can't shadow the live storage state.  The Result-
-    // bearing variant propagates non-KeyError errors from subclass
-    // overrides (`baseobjspace.py:870 finditem` re-raise).
+    // Module objects use `object_getattribute` first (`module.py:130-134`),
+    // so their class descriptors and namespace follow the normal descriptor
+    // precedence.  This matters for a ModuleType subclass that shadows the
+    // base `__dict__` member: `class M(ModuleType): __dict__ = 8` must expose
+    // 8, and `module.__dir__` then rejects it as a non-dict.  Only after the
+    // complete normal lookup misses does module.py consult PEP 562
+    // `__getattr__` (the tail below).
     unsafe {
         if is_module(obj) {
-            if name == "__dict__" {
-                // module.py:20 — `Module.getdict(space)` returns
-                // `self.w_dict`.  Always non-null after construction.
-                return Ok(pyre_object::w_module_get_w_dict(obj));
+            let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+            let w_descr = if w_type.is_null() {
+                None
+            } else {
+                lookup_in_type_where(w_type, name)
+            };
+            if let Some(descr) = w_descr {
+                if is_data_descr(descr) {
+                    if let Some(value) = get(descr, obj, w_type)? {
+                        return Ok(value);
+                    }
+                }
             }
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
@@ -4648,6 +4680,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         return Ok(value);
                     }
                 }
+            }
+            if let Some(descr) = w_descr {
+                return Ok(get(descr, obj, w_type)?.unwrap_or(descr));
             }
         }
     }
@@ -8669,6 +8704,26 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     w_type_get_name(obj)
                 )));
             }
+            // typeobject.py's metadata setters update the heap type itself;
+            // they are not ordinary inherited class attributes.
+            if name == "__qualname__" {
+                if !crate::baseobjspace::isinstance_str_w(value) {
+                    return Err(PyError::type_error(format!(
+                        "can only assign string to {}.__qualname__, not '{}'",
+                        w_type_get_name(obj),
+                        pyre_object::type_name_of(value)
+                    )));
+                }
+                pyre_object::w_type_set_qualname(obj, pyre_object::w_str_get_value(value));
+                mutated(obj, Some(name));
+                return Ok(w_none());
+            }
+            if name == "__module__" {
+                crate::type_dict_store(obj, name, value);
+                crate::type_dict_delete(obj, "__firstlineno__");
+                mutated(obj, Some(name));
+                return Ok(w_none());
+            }
             if crate::type_dict_has_storage(obj) {
                 // CPython 3.14 type_set_annotations stores assignments in
                 // the per-type cache and disables the lazy annotate
@@ -9416,6 +9471,15 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     w_type_get_name(obj)
                 )));
             }
+            // CPython 3.14 exposes these as non-deletable type metadata.
+            // Their values may be assigned, but deletion must not fall
+            // through to raw namespace removal.
+            if name == "__name__" || name == "__qualname__" || name == "__type_params__" {
+                return Err(PyError::type_error(format!(
+                    "cannot delete '{name}' attribute of type '{}'",
+                    w_type_get_name(obj)
+                )));
+            }
             if crate::type_dict_has_storage(obj) {
                 if name == "__annotations__" {
                     return type_del_annotations(obj);
@@ -9922,36 +9986,22 @@ fn generator_unpack_into(
             // resume value (e.g. `x = yield`) would observe stale
             // stack on the second iteration.
             w_generator_set_started(gen_obj);
-            w_generator_set_running(gen_obj, true);
-            let result = frame.execute_frame(Some(pyre_object::w_none()), None);
-            w_generator_set_running(gen_obj, false);
+            let result = generator_invoke_execute_frame(
+                gen_obj,
+                frame,
+                Some(pyre_object::w_none()),
+                None,
+                None,
+            );
             match result {
-                // generator.py:132-138 `_invoke_execute_frame`'s
-                // `finally: self.frame_is_finished()` runs before the
-                // OperationError reaches the unpack_into try/except,
-                // so by the time PyPy's `if e.match(StopIteration):
-                // break` fires the generator is already marked
-                // finished.  Pyre's inline `frame.execute_frame` path
-                // skips that finally block, so mirror it explicitly.
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
-                    // generator.py:131-138 — `_invoke_execute_frame` applies
-                    // `_leak_stopiteration` (PEP 479) BEFORE unpack_into's
-                    // `if e.match(StopIteration): break`, so a StopIteration
-                    // leaked from the body becomes RuntimeError and propagates;
-                    // it is not the normal-exhaustion path (which is the
-                    // `Ok`/`frame_finished_execution` arm below).
-                    w_generator_set_exhausted(gen_obj);
-                    return Err(leak_stopiteration(e));
-                }
-                Err(e) => {
-                    w_generator_set_exhausted(gen_obj);
-                    return Err(e);
-                }
+                // `_invoke_execute_frame` has already applied PEP 479 and
+                // finalized the frame for any escaping error.
+                Err(e) => return Err(e),
                 Ok(w_result) => {
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
                     if frame.frame_finished_execution() {
-                        w_generator_set_exhausted(gen_obj);
+                        generator_frame_is_finished(gen_obj, frame);
                         break;
                     }
                     // generator.py:342 `results.append(w_result)`.
@@ -10155,7 +10205,7 @@ fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
 /// before `_check_len_result` so `__index__` is consulted but `__int__`
 /// is NOT — matching PyPy's stricter contract.
 pub fn len_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    let w_res = len(w_obj)?;
+    let w_res = _len(w_obj)?;
     let w_index = space_index(w_res)?;
     _check_len_result(w_index)
 }
@@ -12664,6 +12714,74 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 // - throw(t,v) → send_ex(None, OperationError(t,v))
 // - close()    → throw(GeneratorExit) then check result
 
+/// generator.py:313-315 `frame_is_finished` plus Python 3.14's eager frame
+/// clearing on `close()`.  Dropping the generator's frame edge releases all
+/// suspended locals; an escaped `gi_frame` remains a valid, cleared frame.
+unsafe fn generator_frame_is_finished(gen_obj: PyObjectRef, frame: &mut crate::pyframe::PyFrame) {
+    use pyre_object::generator::*;
+    unsafe { w_generator_set_exhausted(gen_obj) };
+    frame.set_frame_finished_execution(true);
+    frame.w_yielding_from = PY_NULL;
+    // The exhausted flag makes `descr_clear` take its permitted finalized
+    // branch.  It has no semantic failure path after that state transition.
+    let _ = frame.descr_clear();
+    frame.f_backref = std::ptr::null_mut();
+    frame.f_generator_nowref = PY_NULL;
+    unsafe { w_generator_set_frame(gen_obj, std::ptr::null_mut()) };
+}
+
+/// generator.py:121-145 `_invoke_execute_frame`: install the generator's
+/// exception state, execute its already-entered frame resume, finish the frame
+/// on errors, and perform the common frame/running/EC cleanup in `finally`.
+unsafe fn generator_invoke_execute_frame(
+    gen_obj: PyObjectRef,
+    frame: &mut crate::pyframe::PyFrame,
+    w_inputvalue: Option<PyObjectRef>,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> PyResult {
+    use pyre_object::generator::*;
+    if w_generator_is_running(gen_obj) {
+        return Err(PyError::value_error("generator already executing"));
+    }
+    w_generator_set_running(gen_obj, true);
+    let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
+    if !ec.is_null() {
+        (*ec).push_gen_or_coroutine(gen_obj);
+    }
+    let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
+    let result = match result {
+        Err(e) => {
+            generator_frame_is_finished(gen_obj, frame);
+            if e.kind == crate::PyErrorKind::StopIteration {
+                let message = if is_async_generator(gen_obj) {
+                    "async generator raised StopIteration"
+                } else {
+                    "generator raised StopIteration"
+                };
+                Err(leak_generator_iteration(e, message))
+            } else if is_async_generator(gen_obj)
+                && e.kind == crate::PyErrorKind::StopAsyncIteration
+            {
+                Err(leak_generator_iteration(
+                    e,
+                    "async generator raised StopAsyncIteration",
+                ))
+            } else {
+                Err(e)
+            }
+        }
+        result => result,
+    };
+    // generator.py:142-145 `finally`.
+    frame.f_backref = std::ptr::null_mut();
+    w_generator_set_running(gen_obj, false);
+    if !ec.is_null() {
+        (*ec).pop_gen_or_coroutine(gen_obj);
+    }
+    result
+}
+
 /// PyPy: GeneratorIterator._send_ex(w_arg, operr)
 ///
 /// Resume a generator frame: push w_arg (for send/next) or inject operr
@@ -12676,15 +12794,15 @@ fn generator_send_ex(
 ) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
-        if w_generator_is_running(gen_obj) {
-            return Err(PyError::value_error("generator already executing"));
-        }
-
         if w_generator_is_exhausted(gen_obj) {
             if let Some(err) = operr {
                 return Err(err);
             }
-            return Err(PyError::stop_iteration());
+            return Err(if is_async_generator(gen_obj) {
+                PyError::stop_async_iteration()
+            } else {
+                PyError::stop_iteration()
+            });
         }
 
         let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
@@ -12693,78 +12811,56 @@ fn generator_send_ex(
             if let Some(err) = operr {
                 return Err(err);
             }
-            return Err(PyError::stop_iteration());
+            return Err(if is_async_generator(gen_obj) {
+                PyError::stop_async_iteration()
+            } else {
+                PyError::stop_iteration()
+            });
         }
         let frame = &mut *frame_ptr;
         let already_started = w_generator_is_started(gen_obj);
 
         if !already_started {
             if operr.is_none() && !w_arg.is_null() && !is_none(w_arg) {
-                return Err(PyError::type_error(
-                    "can't send non-None value to a just-started generator",
-                ));
+                return Err(PyError::type_error(format!(
+                    "can't send non-None value to a just-started {}",
+                    if is_async_generator(gen_obj) {
+                        "async generator"
+                    } else if is_coroutine(gen_obj) {
+                        "coroutine"
+                    } else {
+                        "generator"
+                    }
+                )));
             }
         }
         w_generator_set_started(gen_obj);
-        w_generator_set_running(gen_obj, true);
-
-        // A suspended `yield from` owns the next resume operation.  Keep the
-        // outer frame parked until its delegate either yields again or is
-        // exhausted, so a value or exception never takes the bytecode path
-        // intended for an awaitable resume.
-        let mut pending_operr = operr;
-        let mut delegated_completion = false;
-        if already_started && !frame.w_yielding_from.is_null() {
-            match resume_yield_from(frame, w_arg, pending_operr.take(), throw_args) {
-                Ok(Some(value)) => {
-                    w_generator_set_running(gen_obj, false);
-                    return Ok(value);
-                }
-                Ok(None) => delegated_completion = true,
-                Err(err) => pending_operr = Some(err),
-            }
-        }
-
-        // generator.py:104 — w_result = frame.execute_frame(w_arg, operr)
-        let w_inputvalue = if already_started && pending_operr.is_none() && !delegated_completion {
+        // generator.py:104 `_invoke_execute_frame` delegates the complete
+        // resume to `frame.execute_frame(w_arg_or_err)`.  In particular,
+        // `PyFrame.resume_execute_frame` handles `w_yielding_from` only after
+        // the outer frame has entered the execution context.
+        let w_inputvalue = if already_started && operr.is_none() {
             Some(w_arg)
         } else {
             None
         };
-        let result = frame.execute_frame(w_inputvalue, pending_operr);
-
-        w_generator_set_running(gen_obj, false);
-
-        match result {
+        match generator_invoke_execute_frame(gen_obj, frame, w_inputvalue, operr, throw_args) {
             Ok(value) => {
                 // generator.py:109-114 — if the frame marked itself finished,
                 // it was RETURNed from; otherwise it YIELDed.
                 if frame.frame_finished_execution() {
-                    w_generator_set_exhausted(gen_obj);
+                    generator_frame_is_finished(gen_obj, frame);
+                    if is_async_generator(gen_obj) {
+                        return Err(PyError::stop_async_iteration());
+                    }
                     // generator.py:117-119 / pyopcode.py RETURN_VALUE in
-                    // generator frames — `raise StopIteration(returnvalue)`
-                    // so callers can pull the return value off `.value`.
-                    // Wrap any non-None return into the exception's args
-                    // tuple; bare `return` (or fallthrough → None) keeps
-                    // an empty args tuple.
+                    // generator frames — `raise StopIteration(returnvalue)`.
                     Err(stop_iteration_with_value(value))
                 } else {
                     Ok(value)
                 }
             }
-            Err(e) => {
-                w_generator_set_exhausted(gen_obj);
-                // generator.py `_leak_stopiteration` (PEP 479) — a
-                // StopIteration that escaped the body becomes RuntimeError;
-                // any other error propagates unchanged.  The normal-return
-                // StopIteration is built in the `Ok`/`frame_finished_execution`
-                // arm above and never reaches here.
-                if e.kind == crate::PyErrorKind::StopIteration {
-                    Err(leak_stopiteration(e))
-                } else {
-                    Err(e)
-                }
-            }
+            Err(e) => Err(e),
         }
     }
 }
@@ -12774,13 +12870,13 @@ fn generator_send_ex(
 /// `Some` is a value yielded by the delegate and is therefore also the
 /// outer generator's result.  `None` means the delegate completed and the
 /// outer frame has been positioned at the completion path.
-fn resume_yield_from(
+pub(crate) fn resume_yield_from(
     frame: &mut crate::pyframe::PyFrame,
+    w_yf: PyObjectRef,
     w_arg: PyObjectRef,
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    let w_yf = frame.w_yielding_from;
     debug_assert!(!w_yf.is_null());
 
     let result = match operr {
@@ -12804,7 +12900,20 @@ fn resume_yield_from(
     };
 
     match result {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => {
+            // pyopcode.py:1225-1227 `next_yield_from`: publish the delegate
+            // only after its call has yielded.  While the delegate is
+            // executing, `gi_yieldfrom` must therefore remain None.
+            frame.w_yielding_from = w_yf;
+            if pyre_object::gc_hook::try_gc_owns_object(
+                frame as *mut crate::pyframe::PyFrame as *mut u8,
+            ) {
+                pyre_object::gc_hook::try_gc_write_barrier(
+                    frame as *mut crate::pyframe::PyFrame as *mut u8,
+                );
+            }
+            Ok(Some(value))
+        }
         Err(err) if err.kind == PyErrorKind::StopIteration => {
             frame.w_yielding_from = pyre_object::PY_NULL;
             finish_yield_from(frame, err)?;
@@ -12929,7 +13038,7 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
 /// cause suppresses the context in display, mirroring
 /// `chain_exceptions_from_cause`).  This is distinct from a normal generator
 /// return, which surfaces through the `Ok`/`frame_finished_execution` path.
-unsafe fn leak_stopiteration(mut e: PyError) -> PyError {
+unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
     use pyre_object::interp_exceptions::*;
     let w_stopiter = e.to_exc_object();
     // Root the leaked StopIteration across the RuntimeError allocation below:
@@ -12940,7 +13049,7 @@ unsafe fn leak_stopiteration(mut e: PyError) -> PyError {
     if !w_stopiter.is_null() {
         pyre_object::gc_roots::pin_root(w_stopiter);
     }
-    let rt = w_exception_new(ExcKind::RuntimeError, "generator raised StopIteration");
+    let rt = w_exception_new(ExcKind::RuntimeError, message);
     if pyre_object::is_exception(rt) && !w_stopiter.is_null() {
         w_exception_set_context(rt, w_stopiter);
         w_exception_set_cause(rt, w_stopiter);
@@ -13116,23 +13225,82 @@ pub(crate) fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
 pub(crate) fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = if args.is_empty() {
-        pyre_object::PY_NULL
-    } else {
-        args[0]
-    };
-    let w_type = if args.len() > 1 {
-        args[1]
-    } else {
-        pyre_object::PY_NULL
-    };
+    generator_throw_impl(args, true)
+}
+
+fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> PyResult {
+    let given = args.len().saturating_sub(1);
+    if given == 0 {
+        return Err(PyError::type_error(
+            "throw expected at least 1 argument, got 0",
+        ));
+    }
+    if given > 3 {
+        return Err(PyError::type_error(format!(
+            "throw expected at most 3 arguments, got {given}"
+        )));
+    }
+    let gen_obj = args[0];
+    let w_type = args[1];
     let w_val = args.get(2).copied().unwrap_or_else(w_none);
     let w_tb = args.get(3).copied().unwrap_or_else(w_none);
-    let argc = (args.len() - 1).clamp(1, 3);
+    let argc = given;
 
-    // A non-exception argument or a normalization failure is raised to the
-    // caller; the generator is not resumed.
-    let err = normalize_throw_args(w_type, w_val)?;
+    // Python 3.14 deprecates only the legacy three-argument spelling; the
+    // one- and two-argument forms retain their existing semantics.
+    if warn_legacy_signature && argc == 3 {
+        crate::warn::warn_category(
+            "the (type, exc, tb) signature of throw() is deprecated, use the single-arg signature instead.",
+            "DeprecationWarning",
+            2,
+        )?;
+    }
+
+    // generator.py:185-216 `throw` — validate the traceback before the
+    // exception class/instance, then normalize an OperationError.  Usage
+    // errors are raised to the caller; failures produced while constructing
+    // an exception class are thrown into the generator itself.
+    let traceback = if unsafe { is_none(w_tb) } {
+        None
+    } else if unsafe { crate::pytraceback::is_pytraceback(w_tb) } {
+        Some(w_tb)
+    } else {
+        return Err(PyError::type_error(
+            "throw() third argument must be a traceback object",
+        ));
+    };
+    let is_class = unsafe { exception_is_valid_obj_as_class_w(w_type) };
+    let is_instance = if is_class {
+        false
+    } else {
+        let w_class = exception_getclass(w_type);
+        !w_class.is_null() && unsafe { exception_is_valid_class_w(w_class) }
+    };
+    if !is_class && !is_instance {
+        return Err(PyError::type_error(format!(
+            "exceptions must be classes or instances deriving from BaseException, not {}",
+            crate::type_methods::arg_type_name(w_type),
+        )));
+    }
+    if is_instance && unsafe { !is_none(w_val) } {
+        return Err(PyError::type_error(
+            "instance exception may not have a separate value",
+        ));
+    }
+
+    let mut operr = crate::error::OperationError::new(w_type, w_val);
+    operr._application_traceback = traceback;
+    let err = match operr.normalize_exception(w_none()) {
+        Ok(w_value) => unsafe { PyError::from_exc_object(w_value) },
+        Err(err) => {
+            return generator_send_ex(
+                gen_obj,
+                w_none(),
+                Some(err),
+                Some(([w_type, w_val, w_tb], argc)),
+            );
+        }
+    };
     generator_send_ex(
         gen_obj,
         w_none(),
@@ -13154,7 +13322,12 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_none());
         }
         if !w_generator_is_started(gen_obj) {
-            w_generator_set_exhausted(gen_obj);
+            let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+            if frame_ptr.is_null() {
+                w_generator_set_exhausted(gen_obj);
+            } else {
+                generator_frame_is_finished(gen_obj, &mut *frame_ptr);
+            }
             return Ok(w_none());
         }
     }
@@ -13164,9 +13337,15 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // Generator yielded after GeneratorExit — RuntimeError
             Err(PyError::runtime_error("generator ignored GeneratorExit"))
         }
-        Err(e) if e.kind == PyErrorKind::StopIteration || e.kind == PyErrorKind::GeneratorExit => {
-            Ok(w_none())
+        Err(mut e) if e.kind == PyErrorKind::StopIteration => {
+            // Python 3.13+ / 3.14: close() returns the value produced when
+            // GeneratorExit is caught and the generator executes `return x`.
+            let w_exc = e.to_exc_object();
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_exc);
+            getattr_str(w_exc, "value").or_else(|_| Ok(w_none()))
         }
+        Err(e) if e.kind == PyErrorKind::GeneratorExit => Ok(w_none()),
         Err(e) => Err(e),
     }
 }
@@ -13206,6 +13385,415 @@ pub(crate) fn coroutine_wrapper_close_method(args: &[PyObjectRef]) -> PyResult {
     generator_close_method(&[coroutine])
 }
 
+/// PyPy `AsyncGenerator.init_hooks`.
+fn async_generator_init_hooks(async_gen: PyObjectRef) -> PyResult {
+    unsafe {
+        use pyre_object::generator::*;
+        if w_async_generator_hooks_inited(async_gen) {
+            return Ok(w_none());
+        }
+        w_async_generator_set_hooks_inited(async_gen);
+        let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+        if ec.is_null() {
+            w_async_generator_set_finalizer(async_gen, PY_NULL);
+            return Ok(w_none());
+        }
+        w_async_generator_set_finalizer(async_gen, (*ec).w_asyncgen_finalizer_fn);
+        let firstiter = (*ec).w_asyncgen_firstiter_fn;
+        if !firstiter.is_null() {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(async_gen);
+            pyre_object::gc_roots::pin_root(firstiter);
+            crate::call::call_function_impl_result(firstiter, &[async_gen])?;
+        }
+    }
+    Ok(w_none())
+}
+
+pub(crate) fn async_generator_anext_method(args: &[PyObjectRef]) -> PyResult {
+    let async_gen = args.first().copied().unwrap_or(PY_NULL);
+    async_generator_init_hooks(async_gen)?;
+    Ok(pyre_object::generator::w_async_gen_asend_new(
+        async_gen,
+        w_none(),
+    ))
+}
+
+pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
+    let async_gen = args.first().copied().unwrap_or(PY_NULL);
+    let value = args.get(1).copied().unwrap_or_else(w_none);
+    async_generator_init_hooks(async_gen)?;
+    Ok(pyre_object::generator::w_async_gen_asend_new(
+        async_gen, value,
+    ))
+}
+
+pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
+    let given = args.len().saturating_sub(1);
+    if given == 0 {
+        return Err(PyError::type_error(
+            "athrow expected at least 1 argument, got 0",
+        ));
+    }
+    if given > 3 {
+        return Err(PyError::type_error(format!(
+            "athrow expected at most 3 arguments, got {given}"
+        )));
+    }
+    // CPython 3.14: match generator.throw() and deprecate the legacy
+    // (type, value, traceback) spelling while retaining PyPy's state machine.
+    if given == 3 {
+        crate::warn::warn_category(
+            "the (type, exc, tb) signature of athrow() is deprecated, use the single-arg signature instead.",
+            "DeprecationWarning",
+            2,
+        )?;
+    }
+    let async_gen = args[0];
+    async_generator_init_hooks(async_gen)?;
+    Ok(pyre_object::generator::w_async_gen_athrow_new(
+        async_gen,
+        args[1],
+        args.get(2).copied().unwrap_or_else(w_none),
+        args.get(3).copied().unwrap_or_else(w_none),
+    ))
+}
+
+pub(crate) fn async_generator_aclose_method(args: &[PyObjectRef]) -> PyResult {
+    let async_gen = args.first().copied().unwrap_or(PY_NULL);
+    async_generator_init_hooks(async_gen)?;
+    Ok(pyre_object::generator::w_async_gen_athrow_new(
+        async_gen,
+        PY_NULL,
+        w_none(),
+        w_none(),
+    ))
+}
+
+fn async_gen_unwrap_value(async_gen: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if let Some(wrapper) = pyre_object::generator::AsyncGenValueWrapper::from_obj(value) {
+        let yielded = wrapper.w_value;
+        unsafe {
+            pyre_object::generator::w_async_generator_set_running(async_gen, false);
+        }
+        Err(stop_iteration_with_value(yielded))
+    } else {
+        Ok(value)
+    }
+}
+
+fn async_gen_asend_do_send(awaitable: PyObjectRef, mut arg: PyObjectRef) -> PyResult {
+    use pyre_object::generator::*;
+    let (async_gen, initial_value, state) = {
+        let payload = AsyncGenASend::from_obj(awaitable)
+            .ok_or_else(|| PyError::type_error("invalid async_generator_asend receiver"))?;
+        (payload.async_gen, payload.w_value_to_send, payload.state)
+    };
+    if state == ASYNC_GEN_STATE_CLOSED {
+        return Err(PyError::runtime_error(
+            "cannot reuse already awaited __anext__()/asend()",
+        ));
+    }
+    if state == ASYNC_GEN_STATE_INIT {
+        if unsafe { is_none(arg) } {
+            arg = initial_value;
+        }
+        AsyncGenASend::from_obj(awaitable)
+            .expect("validated async_generator_asend")
+            .state = ASYNC_GEN_STATE_ITER;
+        if unsafe { w_async_generator_is_running(async_gen) } {
+            AsyncGenASend::from_obj(awaitable)
+                .expect("validated async_generator_asend")
+                .state = ASYNC_GEN_STATE_CLOSED;
+            return Err(PyError::runtime_error(
+                "anext(): asynchronous generator is already running",
+            ));
+        }
+        unsafe { w_async_generator_set_running(async_gen, true) };
+    }
+    let result = generator_send_ex(async_gen, arg, None, None)
+        .and_then(|value| async_gen_unwrap_value(async_gen, value));
+    if result.is_err() {
+        unsafe { w_async_generator_set_running(async_gen, false) };
+        AsyncGenASend::from_obj(awaitable)
+            .expect("validated async_generator_asend")
+            .state = ASYNC_GEN_STATE_CLOSED;
+    }
+    result
+}
+
+pub(crate) fn async_gen_asend_next_method(args: &[PyObjectRef]) -> PyResult {
+    async_gen_asend_do_send(args.first().copied().unwrap_or(PY_NULL), w_none())
+}
+
+pub(crate) fn async_gen_asend_send_method(args: &[PyObjectRef]) -> PyResult {
+    async_gen_asend_do_send(
+        args.first().copied().unwrap_or(PY_NULL),
+        args.get(1).copied().unwrap_or_else(w_none),
+    )
+}
+
+pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
+    let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    let (async_gen, state) = {
+        let payload = pyre_object::generator::AsyncGenASend::from_obj(awaitable)
+            .ok_or_else(|| PyError::type_error("invalid async_generator_asend receiver"))?;
+        (payload.async_gen, payload.state)
+    };
+    pyre_object::generator::AsyncGenASend::from_obj(awaitable)
+        .expect("validated async_generator_asend")
+        .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+    if state != pyre_object::generator::ASYNC_GEN_STATE_ITER {
+        return Ok(w_none());
+    }
+    let result = generator_send_ex(
+        async_gen,
+        w_none(),
+        Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
+        None,
+    );
+    unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
+    match result {
+        Ok(_) => Err(PyError::runtime_error("coroutine ignored GeneratorExit")),
+        Err(err)
+            if matches!(
+                err.kind,
+                PyErrorKind::GeneratorExit
+                    | PyErrorKind::StopIteration
+                    | PyErrorKind::StopAsyncIteration
+            ) =>
+        {
+            Ok(w_none())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn async_gen_asend_throw_method(args: &[PyObjectRef]) -> PyResult {
+    let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    let (async_gen, state) = {
+        let payload = pyre_object::generator::AsyncGenASend::from_obj(awaitable)
+            .ok_or_else(|| PyError::type_error("invalid async_generator_asend receiver"))?;
+        (payload.async_gen, payload.state)
+    };
+    if state == pyre_object::generator::ASYNC_GEN_STATE_CLOSED {
+        return Err(PyError::runtime_error(
+            "cannot reuse already awaited __anext__()/asend()",
+        ));
+    }
+    if state == pyre_object::generator::ASYNC_GEN_STATE_INIT {
+        pyre_object::generator::AsyncGenASend::from_obj(awaitable)
+            .expect("validated async_generator_asend")
+            .state = pyre_object::generator::ASYNC_GEN_STATE_ITER;
+        if unsafe { pyre_object::generator::w_async_generator_is_running(async_gen) } {
+            pyre_object::generator::AsyncGenASend::from_obj(awaitable)
+                .expect("validated async_generator_asend")
+                .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+            return Err(PyError::runtime_error(
+                "anext(): asynchronous generator is already running",
+            ));
+        }
+        unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, true) };
+    }
+    let mut forwarded = Vec::with_capacity(args.len());
+    forwarded.push(async_gen);
+    forwarded.extend_from_slice(args.get(1..).unwrap_or(&[]));
+    let result = generator_throw_method(&forwarded)
+        .and_then(|value| async_gen_unwrap_value(async_gen, value));
+    if result.is_err() {
+        unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
+        pyre_object::generator::AsyncGenASend::from_obj(awaitable)
+            .expect("validated async_generator_asend")
+            .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+    }
+    result
+}
+
+fn async_gen_athrow_handle_error(closing: bool, err: PyError) -> PyResult {
+    if closing
+        && matches!(
+            err.kind,
+            PyErrorKind::StopAsyncIteration
+                | PyErrorKind::StopIteration
+                | PyErrorKind::GeneratorExit
+        )
+    {
+        Err(PyError::stop_iteration())
+    } else {
+        Err(err)
+    }
+}
+
+fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResult {
+    use pyre_object::generator::*;
+    let (async_gen, exc_type, exc_value, exc_tb, state) = {
+        let payload = AsyncGenAThrow::from_obj(awaitable)
+            .ok_or_else(|| PyError::type_error("invalid async_generator_athrow receiver"))?;
+        (
+            payload.async_gen,
+            payload.w_exc_type,
+            payload.w_exc_value,
+            payload.w_exc_tb,
+            payload.state,
+        )
+    };
+    if state == ASYNC_GEN_STATE_CLOSED {
+        return Err(PyError::runtime_error(
+            "cannot reuse already awaited aclose()/athrow()",
+        ));
+    }
+    let throwing = state == ASYNC_GEN_STATE_INIT;
+    if throwing {
+        if unsafe { !is_none(arg) } {
+            return Err(PyError::runtime_error(
+                "can't send non-None value to a just-started coroutine",
+            ));
+        }
+        AsyncGenAThrow::from_obj(awaitable)
+            .expect("validated async_generator_athrow")
+            .state = ASYNC_GEN_STATE_ITER;
+        if unsafe { w_async_generator_is_running(async_gen) } {
+            AsyncGenAThrow::from_obj(awaitable)
+                .expect("validated async_generator_athrow")
+                .state = ASYNC_GEN_STATE_CLOSED;
+            return Err(PyError::runtime_error(
+                "athrow(): asynchronous generator is already running",
+            ));
+        }
+        unsafe { w_async_generator_set_running(async_gen, true) };
+    }
+    let closing = exc_type.is_null();
+    let result = if throwing {
+        if closing {
+            generator_send_ex(
+                async_gen,
+                w_none(),
+                Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
+                None,
+            )
+        } else {
+            // `AsyncGenerator.athrow` already warned from the caller-visible
+            // argument count.  Its awaitable stores normalized optional
+            // slots, so this internal three-slot resume must not warn again.
+            generator_throw_impl(&[async_gen, exc_type, exc_value, exc_tb], false)
+        }
+    } else {
+        generator_send_ex(async_gen, arg, None, None)
+    };
+    let result = match result {
+        Ok(value) => {
+            if closing && AsyncGenValueWrapper::from_obj(value).is_some() {
+                Err(PyError::runtime_error(
+                    "async generator ignored GeneratorExit",
+                ))
+            } else {
+                async_gen_unwrap_value(async_gen, value)
+            }
+        }
+        Err(err) => async_gen_athrow_handle_error(closing, err),
+    };
+    if result.is_err() {
+        unsafe { w_async_generator_set_running(async_gen, false) };
+        AsyncGenAThrow::from_obj(awaitable)
+            .expect("validated async_generator_athrow")
+            .state = ASYNC_GEN_STATE_CLOSED;
+    }
+    result
+}
+
+pub(crate) fn async_gen_athrow_next_method(args: &[PyObjectRef]) -> PyResult {
+    async_gen_athrow_do_send(args.first().copied().unwrap_or(PY_NULL), w_none())
+}
+
+pub(crate) fn async_gen_athrow_send_method(args: &[PyObjectRef]) -> PyResult {
+    async_gen_athrow_do_send(
+        args.first().copied().unwrap_or(PY_NULL),
+        args.get(1).copied().unwrap_or_else(w_none),
+    )
+}
+
+pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
+    let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    let (async_gen, state) = {
+        let payload = pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
+            .ok_or_else(|| PyError::type_error("invalid async_generator_athrow receiver"))?;
+        (payload.async_gen, payload.state)
+    };
+    pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
+        .expect("validated async_generator_athrow")
+        .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+    if state != pyre_object::generator::ASYNC_GEN_STATE_ITER {
+        return Ok(w_none());
+    }
+    let result = generator_send_ex(
+        async_gen,
+        w_none(),
+        Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
+        None,
+    );
+    unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
+    match result {
+        Ok(_) => Err(PyError::runtime_error("coroutine ignored GeneratorExit")),
+        Err(err)
+            if matches!(
+                err.kind,
+                PyErrorKind::GeneratorExit
+                    | PyErrorKind::StopIteration
+                    | PyErrorKind::StopAsyncIteration
+            ) =>
+        {
+            Ok(w_none())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
+    let awaitable = args.first().copied().unwrap_or(PY_NULL);
+    let (async_gen, closing, state) = {
+        let payload = pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
+            .ok_or_else(|| PyError::type_error("invalid async_generator_athrow receiver"))?;
+        (
+            payload.async_gen,
+            payload.w_exc_type.is_null(),
+            payload.state,
+        )
+    };
+    if state == pyre_object::generator::ASYNC_GEN_STATE_CLOSED {
+        return Err(PyError::runtime_error(
+            "cannot reuse already awaited aclose()/athrow()",
+        ));
+    }
+    if state == pyre_object::generator::ASYNC_GEN_STATE_INIT {
+        pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
+            .expect("validated async_generator_athrow")
+            .state = pyre_object::generator::ASYNC_GEN_STATE_ITER;
+        if unsafe { pyre_object::generator::w_async_generator_is_running(async_gen) } {
+            pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
+                .expect("validated async_generator_athrow")
+                .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+            return Err(PyError::runtime_error(
+                "athrow(): asynchronous generator is already running",
+            ));
+        }
+        unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, true) };
+    }
+    let mut forwarded = Vec::with_capacity(args.len());
+    forwarded.push(async_gen);
+    forwarded.extend_from_slice(args.get(1..).unwrap_or(&[]));
+    let result = match generator_throw_method(&forwarded) {
+        Ok(value) => async_gen_unwrap_value(async_gen, value),
+        Err(err) => async_gen_athrow_handle_error(closing, err),
+    };
+    if result.is_err() {
+        unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
+        pyre_object::generator::AsyncGenAThrow::from_obj(awaitable)
+            .expect("validated async_generator_athrow")
+            .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
+    }
+    result
+}
+
 /// generator.py:302 `_finalize_` — called by the GC finalizer when a suspended generator
 /// is collected. If the suspended frame is still live and its current instruction is
 /// covered by an exception-table handler (a `finally`/`except`/`with` cleanup), raise
@@ -13225,45 +13813,22 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         let code = frame.code();
         let pc_bytes = (last_instr as u32) * 2; // last_instr is a word index; table is byte offsets
         if crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes).is_some() {
+            if is_async_generator(gen_obj) {
+                let finalizer = w_async_generator_get_finalizer(gen_obj);
+                if !finalizer.is_null() {
+                    return match crate::call::call_function_impl_result(finalizer, &[gen_obj]) {
+                        Ok(_) => Ok(w_none()),
+                        Err(mut err) => {
+                            err.write_unraisable(w_none(), "async generator finalizer", gen_obj);
+                            Ok(w_none())
+                        }
+                    };
+                }
+            }
             return generator_close_method(&[gen_obj]);
         }
     }
     Ok(w_none())
-}
-
-/// Normalize throw() arguments into a PyError.
-///
-/// PyPy: generator.py throw() → OperationError(w_type, w_val, tb) + normalize
-///
-/// Handles:
-///   throw(TypeError)         — type → creates instance
-///   throw(TypeError("msg"))  — instance → derives type
-///   throw(TypeError, "msg")  — type + value → creates instance
-fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> Result<PyError, PyError> {
-    unsafe {
-        // If w_type is an exception instance, use it directly
-        if !w_type.is_null() && pyre_object::interp_exceptions::is_exception(w_type) {
-            return Ok(PyError::from_exc_object(w_type));
-        }
-
-        // generator.py throw(): a valid exception class is called to make
-        // the exception instance, including user-defined subclasses.
-        if !w_type.is_null() && exception_is_valid_obj_as_class_w(w_type) {
-            let w_exc = if w_val.is_null() || pyre_object::is_none(w_val) {
-                crate::call::call_function_impl_result(w_type, &[])?
-            } else {
-                crate::call::call_function_impl_result(w_type, &[w_val])?
-            };
-            if pyre_object::interp_exceptions::is_exception(w_exc) {
-                return Ok(PyError::from_exc_object(w_exc));
-            }
-        }
-
-        // Fallback: TypeError
-        Err(PyError::type_error(
-            "exceptions must be classes or instances deriving from BaseException",
-        ))
-    }
 }
 
 #[cfg(test)]

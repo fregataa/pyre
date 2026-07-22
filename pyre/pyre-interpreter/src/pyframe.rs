@@ -27,6 +27,247 @@ const _: () = assert!(
 /// W_Root (mirrors `pytraceback::PYTRACEBACK_TYPE`).
 pub static FRAME_TYPE: PyType = new_pytype("frame");
 
+/// CPython 3.14 `FrameLocalsProxy` — the write-through mapping exposed by
+/// `frame.f_locals` for optimized frames.  PyPy's older `getdictscope` keeps
+/// the canonical locals mapping on `FrameDebugData.w_locals`; retain that
+/// owner and make the proxy synchronize through `fast2locals` / `locals2fast`
+/// rather than inventing a second per-frame store.
+pub mod frame_locals_proxy {
+    use super::*;
+
+    #[crate::pyre_class("FrameLocalsProxy")]
+    pub struct FrameLocalsProxy {
+        w_frame: PyObjectRef,
+    }
+
+    impl FrameLocalsProxy {
+        #[inline]
+        fn frame(&self) -> &mut PyFrame {
+            unsafe { &mut *(self.w_frame as *mut PyFrame) }
+        }
+
+        #[inline]
+        fn mapping(&self) -> Result<PyObjectRef, crate::PyError> {
+            self.frame().getdictscope()
+        }
+
+        fn call_mapping_method(
+            &self,
+            name: &str,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let result = crate::baseobjspace::call_method(self.mapping()?, name, args);
+            if result.is_null() {
+                Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| crate::PyError::runtime_error("method call failed")))
+            } else {
+                Ok(result)
+            }
+        }
+
+        fn key_is_fast_local(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
+            let frame = self.frame();
+            let code = frame.code();
+            for (index, name) in code.varnames.iter().enumerate() {
+                if hidden_local(code, index) {
+                    continue;
+                }
+                if crate::baseobjspace::eq_w(pyre_object::w_str_new(name.as_ref()), key)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    #[crate::pyre_methods(doc = "A write-through view of a frame's optimized locals.")]
+    impl FrameLocalsProxy {
+        #[staticmethod]
+        fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            // The gateway includes the type object in the raw argument slice
+            // passed to a static __new__ wrapper.
+            if args.len() != 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "FrameLocalsProxy expected 1 argument, got {}",
+                    args.len().saturating_sub(1)
+                )));
+            }
+            let w_frame = args[1];
+            if !unsafe { pyre_object::py_type_check(w_frame, &FRAME_TYPE) } {
+                return Err(crate::PyError::type_error(
+                    "FrameLocalsProxy() argument must be a frame",
+                ));
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_frame);
+            let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let proxy = FrameLocalsProxy::allocate_stable(FrameLocalsProxy {
+                ob: PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                w_frame: pyre_object::gc_roots::shadow_stack_get(slot),
+            });
+            Ok(proxy)
+        }
+
+        fn __getitem__(&self, key: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            crate::baseobjspace::getitem(self.mapping()?, key)
+        }
+
+        fn __setitem__(
+            &mut self,
+            key: PyObjectRef,
+            value: PyObjectRef,
+        ) -> Result<(), crate::PyError> {
+            let mapping = self.mapping()?;
+            crate::baseobjspace::setitem(mapping, key, value)?;
+            self.frame().locals2fast(false)
+        }
+
+        fn __delitem__(&mut self, key: PyObjectRef) -> Result<(), crate::PyError> {
+            let mapping = self.mapping()?;
+            // Perform the lookup first so absent/unhashable keys retain the
+            // underlying mapping's KeyError/TypeError.
+            crate::baseobjspace::getitem(mapping, key)?;
+            if self.key_is_fast_local(key)? {
+                return Err(crate::PyError::value_error(
+                    "cannot remove local variables from FrameLocalsProxy",
+                ));
+            }
+            crate::baseobjspace::delitem(mapping, key)
+        }
+
+        fn __len__(&self) -> Result<i64, crate::PyError> {
+            crate::baseobjspace::len_w(self.mapping()?)
+        }
+
+        fn __iter__(&self) -> Result<PyObjectRef, crate::PyError> {
+            crate::baseobjspace::iter(self.mapping()?)
+        }
+
+        fn __reversed__(&self) -> Result<PyObjectRef, crate::PyError> {
+            let mut keys: Vec<_> =
+                unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) }
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect();
+            keys.reverse();
+            Ok(pyre_object::w_list_new(keys))
+        }
+
+        fn __contains__(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
+            crate::baseobjspace::contains(self.mapping()?, key)
+        }
+
+        fn keys(&self) -> Result<PyObjectRef, crate::PyError> {
+            let keys = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) }
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            Ok(pyre_object::w_list_new(keys))
+        }
+
+        fn values(&self) -> Result<PyObjectRef, crate::PyError> {
+            let values = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) }
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect();
+            Ok(pyre_object::w_list_new(values))
+        }
+
+        fn items(&self) -> Result<PyObjectRef, crate::PyError> {
+            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) };
+            Ok(pyre_object::w_list_new(
+                items
+                    .into_iter()
+                    .map(|(key, value)| pyre_object::w_tuple_new(vec![key, value]))
+                    .collect(),
+            ))
+        }
+
+        fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
+            self.call_mapping_method("copy", &[])
+        }
+
+        fn get(
+            &self,
+            key: PyObjectRef,
+            #[default(pyre_object::w_none())] default: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            self.call_mapping_method("get", &[key, default])
+        }
+
+        fn update(&mut self, other: PyObjectRef) -> Result<(), crate::PyError> {
+            self.call_mapping_method("update", &[other])?;
+            self.frame().locals2fast(false)
+        }
+
+        fn setdefault(
+            &mut self,
+            key: PyObjectRef,
+            #[default(pyre_object::w_none())] default: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let result = self.call_mapping_method("setdefault", &[key, default])?;
+            self.frame().locals2fast(false)?;
+            Ok(result)
+        }
+
+        fn pop(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            // Raw slice methods receive the bound receiver in args[0].
+            if args.len() < 2 || args.len() > 3 {
+                return Err(crate::PyError::type_error("pop expected 1 or 2 arguments"));
+            }
+            let call_args = &args[1..];
+            let mapping = self.mapping()?;
+            if crate::baseobjspace::getitem(mapping, call_args[0]).is_ok()
+                && self.key_is_fast_local(call_args[0])?
+            {
+                return Err(crate::PyError::value_error(
+                    "cannot remove local variables from FrameLocalsProxy",
+                ));
+            }
+            self.call_mapping_method("pop", call_args)
+        }
+
+        fn __or__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            self.call_mapping_method("__or__", &[other])
+        }
+
+        fn __ror__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            self.call_mapping_method("__ror__", &[other])
+        }
+
+        fn __ior__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            self.update(other)?;
+            Ok(self as *mut FrameLocalsProxy as PyObjectRef)
+        }
+
+        fn __eq__(&self, other: PyObjectRef) -> Result<bool, crate::PyError> {
+            crate::baseobjspace::eq_w(self.mapping()?, other)
+        }
+
+        fn __repr__(&self) -> Result<String, crate::PyError> {
+            unsafe { crate::display::py_repr(self.mapping()?) }
+        }
+    }
+
+    pub fn new(w_frame: PyObjectRef) -> PyObjectRef {
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_frame);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_type = type_object();
+        unsafe { pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'M') };
+        FrameLocalsProxy::allocate_stable(FrameLocalsProxy {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_frame: pyre_object::gc_roots::shadow_stack_get(slot),
+        })
+    }
+}
+
 /// Build the `ob_header` for a freshly-created `PyFrame` — `ob_type`
 /// pinned to [`FRAME_TYPE`], `w_class` the cached `W_TypeObject`
 /// (null during bootstrap before `init_typeobjects`). Mirrors
@@ -431,7 +672,18 @@ impl FrameBox {
     /// the heap, header-bearing frame, so ownership transfers straight through
     /// `into_raw` without the snapshot copy `PyFrame::initialize_as_generator`
     /// needs for the borrowed-`&mut self` case.
-    pub fn into_generator(mut self) -> crate::PyResult {
+    pub fn into_generator(self) -> crate::PyResult {
+        self.into_generator_named(None, None)
+    }
+
+    /// `pyframe.py:259 initialize_as_generator(name, qualname)` — function
+    /// calls pass the function's current writable metadata so each newly
+    /// created generator freezes it independently of the code object.
+    pub fn into_generator_named(
+        mut self,
+        name: Option<&str>,
+        qualname: Option<&str>,
+    ) -> crate::PyResult {
         self.fix_array_ptrs();
         let register_final = !self.code().exceptiontable.is_empty();
         // A suspended generator frame is off the call chain — `f_back` is
@@ -450,6 +702,10 @@ impl FrameBox {
         // block is non-moving (old-gen when GC-managed, `std::alloc`
         // otherwise), so only the locals array needs protecting.
         let _root = FrameLocalsRoot::new(frame_ptr);
+        // generator.py:21 `self.pycode = frame.pycode`: preserve the exact
+        // code object independently of the frame, which is cleared when the
+        // generator finishes.
+        let pycode = unsafe { (*frame_ptr).pycode as pyre_object::PyObjectRef };
         // generator.py: GeneratorIterator / Coroutine — native `async def`
         // frames have their own object type.  In particular, a Coroutine is
         // awaitable but is not itself an iterator; `__await__` supplies the
@@ -458,12 +714,32 @@ impl FrameBox {
             (*frame_ptr)
                 .code()
                 .flags
+                .contains(crate::CodeFlags::ASYNC_GENERATOR)
+        } {
+            pyre_object::generator::w_async_generator_new(frame_ptr as *mut u8, pycode)
+        } else if unsafe {
+            (*frame_ptr)
+                .code()
+                .flags
                 .contains(crate::CodeFlags::COROUTINE)
         } {
-            pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8)
+            pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8, pycode)
         } else {
-            pyre_object::generator::w_generator_new(frame_ptr as *mut u8)
+            pyre_object::generator::w_generator_new(frame_ptr as *mut u8, pycode)
         };
+        // GeneratorOrCoroutine.__init__ stores `_name` / `_qualname` on the
+        // generator.  Root the new owner while allocating the two wrapped
+        // strings, then publish them through the normal GC write barrier.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(generator);
+        if let Some(name) = name {
+            let w_name = pyre_object::w_str_new(name);
+            unsafe { pyre_object::generator::w_generator_set_name(generator, w_name) };
+        }
+        if let Some(qualname) = qualname {
+            let w_qualname = pyre_object::w_str_new(qualname);
+            unsafe { pyre_object::generator::w_generator_set_qualname(generator, w_qualname) };
+        }
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }
@@ -2487,11 +2763,8 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:300 resume_execute_frame (send-path only).
-    ///
-    /// A suspended delegate is resumed by `generator_send_ex` before this
-    /// method runs.  Once that delegate completes, this path receives the
-    /// normal outer-frame input again.
+    /// pyframe.py:300 resume_execute_frame, after any suspended delegate has
+    /// either yielded or completed in `eval_frame_plain_with_resume`.
     #[inline]
     pub fn resume_execute_frame(
         &mut self,
@@ -2513,12 +2786,21 @@ impl PyFrame {
         w_inputvalue: Option<PyObjectRef>,
         operr: Option<crate::PyError>,
     ) -> crate::PyResult {
-        if operr.is_none() {
-            if let Some(w_arg_or_err) = w_inputvalue {
-                let _ = self.resume_execute_frame(w_arg_or_err)?;
-            }
-        }
-        crate::eval::eval_frame_plain_with_operr(self, operr)
+        crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
+    }
+
+    /// Generator/coroutine execution entry carrying the original throw
+    /// arguments for non-generator delegates.  This is the Rust representation
+    /// of PyPy's `SApplicationException` payload passed through
+    /// `PyFrame.execute_frame(w_arg_or_err)`.
+    #[inline]
+    pub fn execute_generator_frame(
+        &mut self,
+        w_inputvalue: Option<PyObjectRef>,
+        operr: Option<crate::PyError>,
+        throw_args: Option<([PyObjectRef; 3], usize)>,
+    ) -> crate::PyResult {
+        crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, throw_args)
     }
 
     /// pyframe.py:521-522 `hide(self): return self.pycode.hidden_applevel`.

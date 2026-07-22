@@ -366,7 +366,12 @@ pub fn init_typeobjects() {
         // str — PyPy: unicodeobject.py, bases=(object,)
         reg.insert(
             &STR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("str", init_str_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "str",
+                init_str_type,
+                object_type,
+                &STR_TYPE as *const PyType,
+            ) as usize,
         );
 
         // list — PyPy: listobject.py, bases=(object,)
@@ -783,6 +788,17 @@ pub fn init_typeobjects() {
             &pyre_object::generator::COROUTINE_TYPE as *const PyType as usize,
             coroutine_type as usize,
         );
+        let async_generator_type =
+            new_typeobject_with_base("async_generator", init_async_generator_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(async_generator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(async_generator_type, false);
+            pyre_object::w_type_set_weakrefable(async_generator_type, true);
+        }
+        reg.insert(
+            &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const PyType as usize,
+            async_generator_type as usize,
+        );
         let coroutine_wrapper_type = new_typeobject_with_base(
             "coroutine_wrapper",
             init_coroutine_wrapper_type,
@@ -796,6 +812,30 @@ pub fn init_typeobjects() {
             &pyre_object::generator::COROUTINE_WRAPPER_TYPE as *const PyType as usize,
             coroutine_wrapper_type as usize,
         );
+        for (pytype, name, init) in [
+            (
+                &pyre_object::generator::ASYNC_GEN_VALUE_WRAPPER_TYPE,
+                "async_generator_wrapped_value",
+                init_async_gen_value_wrapper_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::generator::ASYNC_GEN_ASEND_TYPE,
+                "async_generator_asend",
+                init_async_gen_asend_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::generator::ASYNC_GEN_ATHROW_TYPE,
+                "async_generator_athrow",
+                init_async_gen_athrow_type as fn(PyObjectRef),
+            ),
+        ] {
+            let ty = new_typeobject_with_base(name, init, object_type);
+            unsafe {
+                pyre_object::w_type_set_disallow_instantiation(ty);
+                pyre_object::w_type_set_acceptable_as_base_class(ty, false);
+            }
+            reg.insert(pytype as *const PyType as usize, ty as usize);
+        }
         let range_iterator_type =
             new_typeobject_with_base("range_iterator", init_range_iterator_type, object_type);
         unsafe {
@@ -1963,7 +2003,10 @@ fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// module.py:164-173 `Module.descr_module__dir__`.
 fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__")?;
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    // module.py:164 — deliberately perform ordinary attribute lookup rather
+    // than reading `self.w_dict`: a ModuleType subclass may shadow
+    // `__dict__`, in which case the resulting non-dict is a TypeError.
+    let w_dict = crate::baseobjspace::getattr_str(module, "__dict__")?;
     if w_dict.is_null()
         || (!unsafe { pyre_object::is_dict(w_dict) }
             && !unsafe { pyre_object::dictmultiobject::is_module_dict(w_dict) }
@@ -3706,6 +3749,14 @@ fn set_init_from_iterable(
     w_set: PyObjectRef,
     w_iterable: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    set_init_from_iterable_impl(w_set, w_iterable, true)
+}
+
+fn set_init_from_iterable_impl(
+    w_set: PyObjectRef,
+    w_iterable: PyObjectRef,
+    wrap_hash_error: bool,
+) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_set_or_frozenset(w_iterable) } {
         unsafe { pyre_object::w_set_copy_storage_from(w_set, w_iterable) };
         return Ok(());
@@ -3747,7 +3798,7 @@ fn set_init_from_iterable(
                     key,
                 )
             }
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            .map_err(crate::baseobjspace::map_set_update_error)?;
             copied_hashed_key = true;
             index += 1;
         }
@@ -3771,7 +3822,11 @@ fn set_init_from_iterable(
     let items =
         crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
     let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-    crate::builtins::builtin_set_add_items(w_set, &items)
+    if wrap_hash_error {
+        crate::builtins::builtin_set_add_items(w_set, &items)
+    } else {
+        crate::builtins::builtin_set_add_items_intersection(w_set, &items)
+    }
 }
 
 /// `set.__init__(self, [iterable])` — PyPy: setobject.py W_SetObject.descr_init.
@@ -6321,8 +6376,10 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_locals — read-only; runs `fast2locals` (pyframe.py:644
-    // fget_getdictscope), so it needs `&mut` and can raise.
+    // f_locals — read-only.  Python 3.14 exposes a fresh write-through
+    // FrameLocalsProxy for optimized frames; module/class frames retain their
+    // actual locals mapping.  The proxy itself routes through the frame-owned
+    // getdictscope/locals2fast machinery.
     let locals_getter = make_builtin_function_with_arity(
         "f_locals",
         |args| {
@@ -6330,7 +6387,11 @@ fn init_frame_type(ns: PyObjectRef) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let w = unsafe { &mut *f }.getdictscope()?;
+            let frame = unsafe { &mut *f };
+            if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
+                return Ok(crate::pyframe::frame_locals_proxy::new(args[1]));
+            }
+            let w = frame.getdictscope()?;
             Ok(if w.is_null() {
                 pyre_object::w_dict_new()
             } else {
@@ -6763,8 +6824,14 @@ fn dict_view_as_set_op(
     rhs: pyre_object::PyObjectRef,
     methname: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
-    let w_set = crate::call::call_function_impl_result(w_set_type, &[lhs])?;
+    let w_set = if methname == "intersection_update" {
+        let w_set = pyre_object::w_set_new();
+        set_init_from_iterable_impl(w_set, lhs, false)?;
+        w_set
+    } else {
+        let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+        crate::call::call_function_impl_result(w_set_type, &[lhs])?
+    };
     let method = crate::baseobjspace::getattr_str(w_set, methname)?;
     crate::call::call_function_impl_result(method, &[rhs])?;
     Ok(w_set)
@@ -9154,7 +9221,7 @@ fn init_type_type(ns: PyObjectRef) {
             // filters out null entries but preserves `w_none()`, matching
             // PyPy's "value present even if it's None" semantic.
             if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-                if let Some(v) = unsafe { crate::baseobjspace::lookup_in_type(cls, "__module__") } {
+                if let Some(v) = crate::type_dict_lookup(cls, "__module__") {
                     if !v.is_null() {
                         return Ok(v);
                     }
@@ -9183,6 +9250,10 @@ fn init_type_type(ns: PyObjectRef) {
             unsafe {
                 if pyre_object::is_type(cls) {
                     crate::type_dict_store(cls, "__module__", value);
+                    // CPython 3.14 type_set_module clears the compiler's
+                    // source-location metadata when the owning module changes.
+                    crate::type_dict_delete(cls, "__firstlineno__");
+                    crate::baseobjspace::mutated(cls, Some("__module__"));
                 }
             }
             Ok(pyre_object::w_none())
@@ -9285,6 +9356,48 @@ fn init_type_type(ns: PyObjectRef) {
             ns,
             "__name__",
             make_getset_property_named(name_getter, name_setter, pyre_object::PY_NULL, "__name__"),
+        )
+    };
+
+    let qualname_getter = make_builtin_function_with_arity(
+        "__qualname__",
+        |args| unsafe {
+            Ok(pyre_object::w_str_new(pyre_object::w_type_get_qualname(
+                args[1],
+            )))
+        },
+        2,
+    );
+    let qualname_setter = make_builtin_function_with_arity(
+        "__qualname__",
+        |args| {
+            let w_type = args[1];
+            let value = args[2];
+            if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
+                return Err(crate::PyError::type_error(format!(
+                    "can only assign string to {}.__qualname__, not '{}'",
+                    unsafe { pyre_object::w_type_get_name(w_type) },
+                    unsafe { pyre_object::type_name_of(value) }
+                )));
+            }
+            unsafe {
+                pyre_object::w_type_set_qualname(w_type, pyre_object::w_str_get_value(value));
+                crate::baseobjspace::mutated(w_type, Some("__qualname__"));
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__qualname__",
+            make_getset_property_named(
+                qualname_getter,
+                qualname_setter,
+                pyre_object::PY_NULL,
+                "__qualname__",
+            ),
         )
     };
 
@@ -16394,6 +16507,15 @@ pub(crate) fn buffer_as_bytes_like(
     if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes(obj) {
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
+    // `W_MMap.readbuf_w` — the mapping is a bytes-like source in its own
+    // right, so `bytes(m)` / `bytearray(m)` copy it here instead of falling
+    // through to the iterable path.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
+        let (address, length, _readonly) = view?;
+        let data = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
+        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
+    }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
         return Ok(Some(obj));
     }
@@ -16677,37 +16799,48 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             args.len().saturating_sub(1)
         )));
     }
-    let sep = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let iterable = args[1];
-    let items: Vec<PyObjectRef> = unsafe {
-        if pyre_object::is_list(iterable) {
-            let n = pyre_object::w_list_len(iterable);
-            (0..n)
-                .filter_map(|i| pyre_object::w_list_getitem(iterable, i as i64))
-                .collect()
-        } else if pyre_object::is_tuple(iterable) {
-            let n = pyre_object::w_tuple_len(iterable);
-            (0..n)
-                .filter_map(|i| pyre_object::w_tuple_getitem(iterable, i as i64))
-                .collect()
-        } else {
-            crate::builtins::collect_iterable(iterable)?
-        }
-    };
-    let mut out: Vec<u8> = Vec::new();
-    for (i, &item) in items.iter().enumerate() {
-        if i > 0 {
-            out.extend_from_slice(sep);
-        }
-        let Some(src) = buffer_as_bytes_like(item)? else {
-            return Err(crate::PyError::type_error(format!(
-                "sequence item {i}: expected a bytes-like object, {} found",
-                type_name_of(item)
-            )));
+    // Python 3.14's bytearray join holds a buffer export on the separator
+    // while materialising the iterable and copying its items (GH-112625).
+    // A re-entrant iterator therefore cannot resize/clear the separator out
+    // from under the borrowed bytes.  Immutable bytes acquires no export.
+    let acquired_export = unsafe { crate::builtins::buffer_export_incref(args[0]) };
+    let result = (|| {
+        let sep = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+        let iterable = args[1];
+        let items: Vec<PyObjectRef> = unsafe {
+            if pyre_object::is_list(iterable) {
+                let n = pyre_object::w_list_len(iterable);
+                (0..n)
+                    .filter_map(|i| pyre_object::w_list_getitem(iterable, i as i64))
+                    .collect()
+            } else if pyre_object::is_tuple(iterable) {
+                let n = pyre_object::w_tuple_len(iterable);
+                (0..n)
+                    .filter_map(|i| pyre_object::w_tuple_getitem(iterable, i as i64))
+                    .collect()
+            } else {
+                crate::builtins::collect_iterable(iterable)?
+            }
         };
-        out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(src) });
+        let mut out: Vec<u8> = Vec::new();
+        for (i, &item) in items.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(sep);
+            }
+            let Some(src) = buffer_as_bytes_like(item)? else {
+                return Err(crate::PyError::type_error(format!(
+                    "sequence item {i}: expected a bytes-like object, {} found",
+                    type_name_of(item)
+                )));
+            };
+            out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(src) });
+        }
+        Ok(new_bytes_like(args[0], &out))
+    })();
+    if acquired_export {
+        unsafe { crate::builtins::buffer_export_decref(args[0]) };
     }
-    Ok(new_bytes_like(args[0], &out))
+    result
 }
 
 /// `stringmethods.py:descr_partition` / `descr_rpartition` — split once
@@ -18460,6 +18593,11 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                     e
                 }
             })?;
+            // bytesobject.py:855-860 `_from_byte_sequence`: after obtaining
+            // the iterator, query the original source's length hint to size
+            // the builder.  RuntimeError and other real hint failures must
+            // propagate before any bytearray mutation.
+            let _ = crate::baseobjspace::length_hint(other, 0)?;
             let is_str = pyre_object::is_str(other);
             let mut appended = Vec::new();
             loop {
@@ -20056,7 +20194,7 @@ pub(crate) fn set_method_union(
     for other in &args[1..] {
         if unsafe { pyre_object::is_set_or_frozenset(*other) } {
             unsafe { pyre_object::w_set_update_from_set(result, *other) }
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                .map_err(crate::baseobjspace::map_set_update_error)?;
         } else {
             let other_items = crate::builtins::collect_iterable(*other)?;
             crate::builtins::builtin_set_add_items(result, &other_items)?;
@@ -20096,6 +20234,14 @@ fn set_newobj(
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let w_set = pyre_object::w_set_new();
     set_init_from_iterable(w_set, w_iterable)?;
+    Ok(w_set)
+}
+
+fn set_newobj_intersection(
+    w_iterable: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let w_set = pyre_object::w_set_new();
+    set_init_from_iterable_impl(w_set, w_iterable, false)?;
     Ok(w_set)
 }
 
@@ -20151,7 +20297,7 @@ fn set_intersect_update(
                     break;
                 };
                 pyre_object::w_set_insert_key_checked(result, key)
-                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                    .map_err(crate::baseobjspace::map_set_update_error)?;
             }
             i += 1;
         }
@@ -20197,12 +20343,12 @@ pub(crate) fn set_method_intersection(
 
     // `setobject.py` — the seed and every operand become sets, and a
     // set operand is intersected as it stands rather than rebuilt.
-    let mut result = set_newobj(others_w[0])?;
+    let mut result = set_newobj_intersection(others_w[0])?;
     for &w_other in &others_w[1..] {
         let w_other_as_set = if unsafe { pyre_object::is_set_or_frozenset(w_other) } {
             w_other
         } else {
-            set_newobj(w_other)?
+            set_newobj_intersection(w_other)?
         };
         result = set_intersect_update(result, w_other_as_set)?;
     }
@@ -20463,7 +20609,7 @@ fn set_method_update(
     for other in &args[1..] {
         if unsafe { pyre_object::is_set_or_frozenset(*other) } {
             unsafe { pyre_object::w_set_update_from_set(args[0], *other) }
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                .map_err(crate::baseobjspace::map_set_update_error)?;
         } else {
             let other_items = crate::builtins::collect_iterable(*other)?;
             crate::builtins::builtin_set_add_items(args[0], &other_items)?;
@@ -20485,7 +20631,7 @@ fn set_method_difference_update(
     for other in &args[1..] {
         let w_other_as_set = set_operand_as_set(*other)?;
         unsafe { pyre_object::w_set_difference_update_from_set(args[0], w_other_as_set) }
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            .map_err(crate::baseobjspace::map_set_update_error)?;
     }
     Ok(pyre_object::w_none())
 }
@@ -20552,7 +20698,7 @@ fn set_symmetric_difference_storage(
                         break;
                     };
                     pyre_object::w_set_insert_key_checked(w_new, key)
-                        .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                        .map_err(crate::baseobjspace::map_set_update_error)?;
                 }
                 i += 1;
             }
@@ -20677,7 +20823,7 @@ fn init_set_type(ns: PyObjectRef) {
                         let set = pyre_object::gc_roots::shadow_stack_get(sp);
                         let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                         pyre_object::w_set_add_hashed_checked(set, item, hash)
-                            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                            .map_err(crate::baseobjspace::map_set_update_error)?;
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -20989,6 +21135,15 @@ fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     )))
 }
 
+fn async_generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let name = generator_name_value(args[0], true)?;
+    Ok(w_str_new(&format!(
+        "<async_generator object {} at {:p}>",
+        unsafe { pyre_object::w_str_get_value(name) },
+        args[0]
+    )))
+}
+
 fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     let override_value = unsafe {
         if qualname {
@@ -21000,31 +21155,37 @@ fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     if !override_value.is_null() {
         return Ok(override_value);
     }
-    let frame = generator_frame(obj);
-    if frame.is_null() {
-        return Ok(w_str_new("<generator>"));
+    // generator.py:32-43 `get_name` / `get_qualname`: both fallback paths
+    // read the immutable generator-owned `pycode`, never the frame (which is
+    // cleared on exhaustion).  `_qualname is None` delegates to `get_name`.
+    let pycode = unsafe { pyre_object::generator::w_generator_get_pycode(obj) };
+    if pycode.is_null() || unsafe { pyre_object::is_none(pycode) } {
+        return Ok(w_str_new("<finished>"));
     }
-    let code = unsafe { (*frame).code() };
-    Ok(w_str_new(if qualname {
-        &code.qualname
-    } else {
-        &code.obj_name
-    }))
+    let code_ptr = unsafe { crate::pycode::w_code_get_ptr(pycode) } as *const crate::CodeObject;
+    if code_ptr.is_null() {
+        return Ok(w_str_new("<finished>"));
+    }
+    Ok(w_str_new(unsafe { &(*code_ptr).obj_name }))
 }
 
-fn generator_getter_for(args: &[PyObjectRef], field: usize, coroutine: bool) -> crate::PyResult {
+fn generator_getter_for(args: &[PyObjectRef], field: usize, kind: u8) -> crate::PyResult {
     let obj = args.get(1).copied().unwrap_or(PY_NULL);
     let matches = unsafe {
-        if coroutine {
-            pyre_object::generator::is_coroutine(obj)
-        } else {
-            pyre_object::generator::is_generator(obj)
+        match kind {
+            0 => pyre_object::generator::is_generator(obj),
+            1 => pyre_object::generator::is_coroutine(obj),
+            _ => pyre_object::generator::is_async_generator(obj),
         }
     };
     if !matches {
         return Err(crate::PyError::type_error(format!(
             "descriptor is for '{}'",
-            if coroutine { "coroutine" } else { "generator" }
+            match kind {
+                0 => "generator",
+                1 => "coroutine",
+                _ => "async_generator",
+            }
         )));
     }
     let frame = generator_frame(obj);
@@ -21042,13 +21203,9 @@ fn generator_getter_for(args: &[PyObjectRef], field: usize, coroutine: bool) -> 
                 frame as PyObjectRef
             }
         }
-        3 => {
-            if frame.is_null() {
-                w_none()
-            } else {
-                unsafe { (*frame).pycode as PyObjectRef }
-            }
-        }
+        // generator.py:387 / :464 `interp_attrproperty_w('pycode')` reads the
+        // generator-owned immutable field, not the possibly-cleared frame.
+        3 => unsafe { pyre_object::generator::w_generator_get_pycode(obj) },
         4 => {
             if frame.is_null() {
                 w_none()
@@ -21067,11 +21224,15 @@ fn generator_getter_for(args: &[PyObjectRef], field: usize, coroutine: bool) -> 
 }
 
 fn generator_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
-    generator_getter_for(args, field, false)
+    generator_getter_for(args, field, 0)
 }
 
 fn coroutine_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
-    generator_getter_for(args, field, true)
+    generator_getter_for(args, field, 1)
+}
+
+fn async_generator_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
+    generator_getter_for(args, field, 2)
 }
 
 fn generator_get_running(args: &[PyObjectRef]) -> crate::PyResult {
@@ -21123,25 +21284,54 @@ fn coroutine_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 fn coroutine_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 6)
 }
+fn async_generator_get_running(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args.get(1).copied().unwrap_or(PY_NULL);
+    if !unsafe { pyre_object::generator::is_async_generator(obj) } {
+        return Err(crate::PyError::type_error(
+            "descriptor is for 'async_generator'",
+        ));
+    }
+    Ok(w_bool_from(unsafe {
+        pyre_object::generator::w_async_generator_is_running(obj)
+    }))
+}
+fn async_generator_get_suspended(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 1)
+}
+fn async_generator_get_frame(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 2)
+}
+fn async_generator_get_code(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 3)
+}
+fn async_generator_get_await(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 4)
+}
+fn async_generator_get_name(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 5)
+}
+fn async_generator_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 6)
+}
 
-fn generator_set_name_common(
-    args: &[PyObjectRef],
-    qualname: bool,
-    coroutine: bool,
-) -> crate::PyResult {
+fn generator_set_name_common(args: &[PyObjectRef], qualname: bool, kind: u8) -> crate::PyResult {
     let obj = args[1];
     let value = args[2];
     let matches = unsafe {
-        if coroutine {
-            pyre_object::generator::is_coroutine(obj)
-        } else {
-            pyre_object::generator::is_generator(obj)
+        match kind {
+            0 => pyre_object::generator::is_generator(obj),
+            1 => pyre_object::generator::is_coroutine(obj),
+            _ => pyre_object::generator::is_async_generator(obj),
         }
     };
     if !matches {
         return Err(crate::PyError::type_error(format!(
             "descriptor is for '{}'",
-            if coroutine { "coroutine" } else { "generator" }
+            match kind {
+                0 => "generator",
+                1 => "coroutine",
+                _ => "async_generator",
+            }
         )));
     }
     if !unsafe { pyre_object::is_str(value) } {
@@ -21161,16 +21351,36 @@ fn generator_set_name_common(
 }
 
 fn generator_set_name(args: &[PyObjectRef]) -> crate::PyResult {
-    generator_set_name_common(args, false, false)
+    generator_set_name_common(args, false, 0)
 }
 fn generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
-    generator_set_name_common(args, true, false)
+    generator_set_name_common(args, true, 0)
+}
+fn generator_delete_name(_args: &[PyObjectRef]) -> crate::PyResult {
+    // CPython 3.14 routes deletion through the same string-only member
+    // setter, so `del gen.__name__` is a TypeError (the bundled 3.14
+    // GeneratorTest requires the exception class), not PyPy's older
+    // null-fdel AttributeError.
+    Err(crate::PyError::type_error(
+        "__name__ must be set to a string object",
+    ))
+}
+fn generator_delete_qualname(_args: &[PyObjectRef]) -> crate::PyResult {
+    Err(crate::PyError::type_error(
+        "__qualname__ must be set to a string object",
+    ))
 }
 fn coroutine_set_name(args: &[PyObjectRef]) -> crate::PyResult {
-    generator_set_name_common(args, false, true)
+    generator_set_name_common(args, false, 1)
 }
 fn coroutine_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
-    generator_set_name_common(args, true, true)
+    generator_set_name_common(args, true, 1)
+}
+fn async_generator_set_name(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_set_name_common(args, false, 2)
+}
+fn async_generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_set_name_common(args, true, 2)
 }
 
 fn generator_descr_sizeof(_args: &[PyObjectRef]) -> crate::PyResult {
@@ -21234,25 +21444,28 @@ fn init_generator_type(ns: PyObjectRef) {
             )
         };
     }
-    for (name, getter, setter) in [
+    for (name, getter, setter, deleter) in [
         (
             "__name__",
             generator_get_name as DunderFn,
             generator_set_name as DunderFn,
+            generator_delete_name as DunderFn,
         ),
         (
             "__qualname__",
             generator_get_qualname as DunderFn,
             generator_set_qualname as DunderFn,
+            generator_delete_qualname as DunderFn,
         ),
     ] {
         let get = make_builtin_function_with_arity(name, getter, 2);
         let set = make_builtin_function_with_arity(name, setter, 3);
+        let delete = make_builtin_function_with_arity(name, deleter, 2);
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
+                make_getset_property_full(get, set, delete, PY_NULL, PY_NULL, Some(name)),
             )
         };
     }
@@ -21303,28 +21516,181 @@ fn init_coroutine_type(ns: PyObjectRef) {
             )
         };
     }
-    for (name, getter, setter) in [
+    for (name, getter, setter, deleter) in [
         (
             "__name__",
             coroutine_get_name as DunderFn,
             coroutine_set_name as DunderFn,
+            generator_delete_name as DunderFn,
         ),
         (
             "__qualname__",
             coroutine_get_qualname as DunderFn,
             coroutine_set_qualname as DunderFn,
+            generator_delete_qualname as DunderFn,
         ),
     ] {
         let get = make_builtin_function_with_arity(name, getter, 2);
         let set = make_builtin_function_with_arity(name, setter, 3);
+        let delete = make_builtin_function_with_arity(name, deleter, 2);
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
+                make_getset_property_full(get, set, delete, PY_NULL, PY_NULL, Some(name)),
             )
         };
     }
+}
+
+/// PyPy `generator.py AsyncGenerator.typedef`.
+fn init_async_generator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
+    for (name, function, arity) in [
+        ("__repr__", async_generator_descr_repr as DunderFn, 1),
+        (
+            "asend",
+            crate::baseobjspace::async_generator_asend_method,
+            2,
+        ),
+        (
+            "aclose",
+            crate::baseobjspace::async_generator_aclose_method,
+            1,
+        ),
+        ("__aiter__", crate::baseobjspace::iter_self_method, 1),
+        (
+            "__anext__",
+            crate::baseobjspace::async_generator_anext_method,
+            1,
+        ),
+        ("__sizeof__", generator_descr_sizeof, 1),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, arity),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "athrow",
+            make_builtin_function("athrow", crate::baseobjspace::async_generator_athrow_method),
+        );
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        );
+    }
+    for (name, getter) in [
+        ("ag_running", async_generator_get_running as DunderFn),
+        ("ag_suspended", async_generator_get_suspended as DunderFn),
+        ("ag_frame", async_generator_get_frame as DunderFn),
+        ("ag_code", async_generator_get_code as DunderFn),
+        ("ag_await", async_generator_get_await as DunderFn),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(
+                    make_builtin_function_with_arity(name, getter, 2),
+                    name,
+                ),
+            )
+        };
+    }
+    for (name, getter, setter, deleter) in [
+        (
+            "__name__",
+            async_generator_get_name as DunderFn,
+            async_generator_set_name as DunderFn,
+            generator_delete_name as DunderFn,
+        ),
+        (
+            "__qualname__",
+            async_generator_get_qualname as DunderFn,
+            async_generator_set_qualname as DunderFn,
+            generator_delete_qualname as DunderFn,
+        ),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_property_full(
+                    make_builtin_function_with_arity(name, getter, 2),
+                    make_builtin_function_with_arity(name, setter, 3),
+                    make_builtin_function_with_arity(name, deleter, 2),
+                    PY_NULL,
+                    PY_NULL,
+                    Some(name),
+                ),
+            )
+        };
+    }
+}
+
+fn init_async_gen_value_wrapper_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
+}
+
+fn init_async_gen_awaitable_type(ns: PyObjectRef, athrow: bool) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
+    let (next, send, throw, close) = if athrow {
+        (
+            crate::baseobjspace::async_gen_athrow_next_method as DunderFn,
+            crate::baseobjspace::async_gen_athrow_send_method as DunderFn,
+            crate::baseobjspace::async_gen_athrow_throw_method as DunderFn,
+            crate::baseobjspace::async_gen_athrow_close_method as DunderFn,
+        )
+    } else {
+        (
+            crate::baseobjspace::async_gen_asend_next_method as DunderFn,
+            crate::baseobjspace::async_gen_asend_send_method as DunderFn,
+            crate::baseobjspace::async_gen_asend_throw_method as DunderFn,
+            crate::baseobjspace::async_gen_asend_close_method as DunderFn,
+        )
+    };
+    for (name, function, arity) in [
+        (
+            "__await__",
+            crate::baseobjspace::iter_self_method as DunderFn,
+            1,
+        ),
+        (
+            "__iter__",
+            crate::baseobjspace::iter_self_method as DunderFn,
+            1,
+        ),
+        ("__next__", next, 1),
+        ("send", send, 2),
+        ("close", close, 1),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, arity),
+            )
+        };
+    }
+    unsafe { pyre_object::w_dict_setitem_str(ns, "throw", make_builtin_function("throw", throw)) };
+}
+
+fn init_async_gen_asend_type(ns: PyObjectRef) {
+    init_async_gen_awaitable_type(ns, false)
+}
+
+fn init_async_gen_athrow_type(ns: PyObjectRef) {
+    init_async_gen_awaitable_type(ns, true)
 }
 
 /// PyPy `generator.py CoroutineWrapper.typedef`.

@@ -409,9 +409,30 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
+    f(&mut gen_obj.ob.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.pycode as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.cr_origin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.w_finalizer as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.saved_exc_value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(
+        &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
+    // W_BaseException is currently malloc_typed-immortal, so forwarding its
+    // carrier above does not make the collector visit traceback/context/args.
+    // Preserve the children of the exception parked by
+    // `ExecutionContext.pop_gen_or_coroutine`, just as the EC root walker does
+    // for its active `sys_exc_value` slot.
+    let mut exception_adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_code_roots(gen_obj.pycode, &mut exception_adapter);
+        pyre_interpreter::eval::walk_raw_exception_roots(
+            gen_obj.saved_exc_value,
+            &mut exception_adapter,
+        )
+    };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
         if pyre_object::gc_hook::try_gc_owns_object(gen_obj.frame_ptr) {
@@ -458,6 +479,7 @@ unsafe fn pytraceback_object_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let tb = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pytraceback::PyTraceback) };
+    f(&mut tb.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_next as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_code as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !tb.frame.is_null() && pyre_object::gc_hook::try_gc_owns_object(tb.frame as *mut u8) {
@@ -467,6 +489,8 @@ unsafe fn pytraceback_object_custom_trace(
 
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let w_dict = obj_addr as pyre_object::PyObjectRef;
+    let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
+    f(&mut dict.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
     // Keep the stable leaf storage box alive by forwarding its owning
     // `dstorage` field slot (off-GC storage). The box has no walker
@@ -478,7 +502,6 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // (`w_dict_new_unmanaged_side_table_value`) is not collector-owned —
     // both are skipped (Map by kind, the side table by `try_gc_owns_object`).
     if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map {
-        let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
         if !dict.dstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(dict.dstorage) {
             let dstorage_slot = std::ptr::addr_of_mut!(dict.dstorage);
             f(dstorage_slot as *mut majit_ir::GcRef);
@@ -614,13 +637,14 @@ unsafe fn module_dict_object_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let obj = obj_addr as pyre_object::PyObjectRef;
+    let md = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_ModuleDictObject) };
+    f(&mut md.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // Grey each GC-managed storage box through its field slot so a major GC
     // keeps it live; the box interiors are GC leaves, so the walk below is
     // the only thing that forwards their element slots.  Non-moving, so the
     // minor-GC forward is a no-op.  Guard on GC ownership: a `tid == 0`
     // `malloc_raw` fallback box (unit tests / pre-init) has no GC hook.
     if pyre_object::dictmultiobject::is_module_dict(obj) {
-        let md = &mut *(obj as *mut pyre_object::dictmultiobject::W_ModuleDictObject);
         for field in [
             std::ptr::addr_of_mut!(md.dstorage) as *mut *mut u8,
             std::ptr::addr_of_mut!(md.object_storage) as *mut *mut u8,
@@ -647,6 +671,13 @@ unsafe fn module_dict_object_custom_trace(
 
 unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let set = unsafe { &mut *(obj_addr as *mut pyre_object::setobject::W_SetObject) };
+    // A builtin-layout instance can carry a mortal heap subclass in the
+    // inline `w_class` header word.  This is the instance -> class edge that
+    // PyPy obtains from the W_Root object's runtime class.  Keep it on the
+    // set itself: in `check_free_after_iterating`, exhausting the iterator
+    // releases the last other reference to a frozenset subclass immediately
+    // before its instance finalizer resolves `__del__` through that class.
+    f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // Keep the stable leaf storage box alive by forwarding its owning field
     // slot. The box has no walker of its own; this trace also walks its inner
     // ObjectKey slots below, matching the mapdict leaf-storage pattern.
@@ -679,7 +710,8 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 /// (`capacity == len`, every slot written by `alloc_tuple_items_block`).
 unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
-    let tuple = unsafe { &*tuple_ptr };
+    let tuple = unsafe { &mut *tuple_ptr };
+    f(&mut tuple.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
@@ -714,7 +746,8 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
 /// behind.
 unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
-    let list = unsafe { &*list_ptr };
+    let list = unsafe { &mut *list_ptr };
+    f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if list.strategy == pyre_object::listobject::ListStrategy::Object && !list.items.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
             // Phase L2: a GC-managed (moving) block is forwarded by handing the
@@ -899,6 +932,7 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let frame = unsafe { &mut *(obj_addr as *mut PyFrame) };
 
+    f(&mut frame.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
 
@@ -1707,7 +1741,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `pytype_to_tid`, so this pre-registration wins over its
     // generic `object_subclass(sizeof(PyObject), parent_tid)`
     // default which would underallocate `W_BaseException`.
-    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::UnboundLocalError as u8) {
+    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::StopAsyncIteration as u8) {
         // Round-trip the byte through the enum so we don't depend
         // on unsafe transmute; every value in [0, UnboundLocalError]
         // is a valid `ExcKind` variant by construction.
@@ -1745,6 +1779,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             30 => pyre_object::interp_exceptions::ExcKind::SyntaxError,
             31 => pyre_object::interp_exceptions::ExcKind::BufferError,
             32 => pyre_object::interp_exceptions::ExcKind::UnboundLocalError,
+            33 => pyre_object::interp_exceptions::ExcKind::StopAsyncIteration,
             _ => unreachable!(),
         };
         let pytype_ptr =
@@ -2845,6 +2880,44 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // run its Drop glue and free that heap instead of leaking it.
     gc.types
         .set_destructor(tokenizer_iter_tid, tokenizer_iter_destructor);
+    // Python 3.14 FrameLocalsProxy — its sole managed edge owns the live
+    // PyFrame whose fast locals it exposes.  Keep the proxy in the ordinary
+    // AUTO-ID class chain so the generated offset walker forwards that frame
+    // for as long as user code retains the proxy.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // AsyncGenerator shares GeneratorOrCoroutine's suspended-frame payload
+    // and custom trace, but keeps a distinct vtable identity.  Its helper
+    // awaitables are appended at the absolute AUTO-ID tail so existing type
+    // ids remain stable.
+    let async_generator_vtable_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::generator::GeneratorIterator>(),
+        object_tid,
+        generator_object_custom_trace,
+    ));
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const _ as usize,
+        async_generator_vtable_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const _ as usize,
+        async_generator_vtable_tid,
+    );
+    for descriptor in [
+        <pyre_object::generator::AsyncGenValueWrapper
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::generator::AsyncGenASend
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::generator::AsyncGenAThrow
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    ] {
+        register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+    }
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical
