@@ -307,6 +307,15 @@ unsafe fn scan_set_key_reentrant(
 ) -> Result<(Option<usize>, crate::dictmultiobject::ObjectKey), crate::dictmultiobject::DictKeyError>
 {
     'restart: loop {
+        // Snapshot the table so a comparison that reallocates the backing
+        // store restarts the scan: `ll_dict_lookup` retries on
+        // `entries != d.entries` even when the candidate entry is untouched
+        // (`rordereddict.py:1058`).  A grow copies every entry to a fresh
+        // allocation, so a stale index would otherwise compare the wrong key.
+        let table_capacity = {
+            let s = &*(obj as *const W_SetObject);
+            (*s.items).capacity()
+        };
         let mut i = 0;
         loop {
             let Some((stored_hash, stored_obj)) = ({
@@ -331,18 +340,25 @@ unsafe fn scan_set_key_reentrant(
                 if crate::dictmultiobject::take_dict_key_error() {
                     return Err(crate::dictmultiobject::DictKeyError);
                 }
+                // Validate the paranoia condition before acting on the result:
+                // `ll_dict_lookup` restarts even when the comparison answered
+                // `true`, because a callback that reallocated the table or moved
+                // the candidate leaves the matched index stale
+                // (`rordereddict.py:1058`).
+                let disturbed = {
+                    let s = &*(obj as *const W_SetObject);
+                    // `entries != d.entries`: a realloc moved the whole table.
+                    (*s.items).capacity() != table_capacity
+                        // `entries.valid(index) && entries[index].key == checkingkey`.
+                        || !(*s.items).get_index(i).is_some_and(|(stored, _)| {
+                            stored.hash == stored_hash && stored.obj == stored_obj
+                        })
+                };
+                if disturbed {
+                    continue 'restart;
+                }
                 if equal {
                     return Ok((Some(i), key));
-                }
-
-                let entry_unchanged = {
-                    let s = &*(obj as *const W_SetObject);
-                    (*s.items).get_index(i).is_some_and(|(stored, _)| {
-                        stored.hash == stored_hash && stored.obj == stored_obj
-                    })
-                };
-                if !entry_unchanged {
-                    continue 'restart;
                 }
             }
             i += 1;

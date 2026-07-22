@@ -79,7 +79,12 @@ impl PartialEq for ObjectKey {
         if self.hash != other.hash {
             return false;
         }
-        unsafe { dict_keys_equal(self.obj, other.obj) }
+        // `IndexMap` compares `probe == stored`, so `self` is the incoming key
+        // and `other` the one already in the bucket.  `ll_dict_lookup` runs
+        // `keyeq(checkingkey, key)` with the *stored* key on the left
+        // (`rordereddict.py:1055`), which is what decides whose `__eq__` the
+        // comparison protocol tries first; hand them over in that order.
+        unsafe { dict_keys_equal(other.obj, self.obj) }
     }
 }
 
@@ -161,7 +166,7 @@ impl indexmap::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // `dict_keys_equal` does.  The materialized str is the rare-path
                 // cost (a str-subclass dict key); the common exact-str arm
                 // above allocates nothing.
-                dict_keys_equal(crate::w_str_new(self.key), k.obj)
+                dict_keys_equal(k.obj, crate::w_str_new(self.key))
             } else {
                 // ObjectDictStrategy uses the ordinary object equality hook
                 // for every hash collision.  A non-str key is allowed to
@@ -169,8 +174,9 @@ impl indexmap::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // observable side effects), so the borrowed-str fast path
                 // must not reject it by layout.  Materialise the query only
                 // on this rare collision path, matching
-                // `object_key_for(w_str_new(key))`.
-                dict_keys_equal(crate::w_str_new(self.key), k.obj)
+                // `object_key_for(w_str_new(key))`.  Pass the stored key first,
+                // the order `keyeq(checkingkey, key)` uses (`rordereddict.py:1055`).
+                dict_keys_equal(k.obj, crate::w_str_new(self.key))
             }
         }
     }
@@ -1660,6 +1666,12 @@ unsafe fn key_equality_is_builtin(key: PyObjectRef) -> bool {
 
 /// Compare two dict keys for equality.
 ///
+/// `a` is the key already stored in the bucket and `b` the incoming one, the
+/// order `ll_dict_lookup` passes to `keyeq` (`rordereddict.py:1055`,
+/// `keyeq(checkingkey, key)`).  The comparison protocol tries the left
+/// operand's `__eq__` first, so the order is observable whenever a key's
+/// `__eq__` is asymmetric or has side effects.
+///
 /// `pypy/objspace/std/dictmultiobject.py:1209 ObjectDictStrategy` —
 /// the storage is `r_dict(space.eq_w, space.hash_w)` so every key
 /// lookup routes through `space.eq_w` (`baseobjspace.py:823-825`),
@@ -1867,6 +1879,99 @@ pub unsafe fn w_dict_lookup_checked(
     Ok(result)
 }
 
+/// Run an object-dict operation with the callback-free guard raised, so
+/// `dict_keys_equal` answers from its builtin type ladder and no user
+/// `__eq__` observes or mutates the dict mid-probe.
+///
+/// Returns `None` when a comparison escaped the ladder: `op` withholds its
+/// mutation in that case, so the dict is untouched and the caller re-runs the
+/// operation by scanning entries without holding a table borrow across a
+/// callback.
+#[inline]
+unsafe fn callback_free_dict_op<T>(op: impl FnOnce() -> T) -> Option<Result<T, DictKeyError>> {
+    crate::dict_eq_hook::begin_callback_free_probe();
+    let result = op();
+    if crate::dict_eq_hook::end_callback_free_probe() {
+        return None;
+    }
+    if take_dict_key_error() {
+        return Some(Err(DictKeyError));
+    }
+    Some(Ok(result))
+}
+
+/// Find `key` in the object storage by scanning same-hash entries one at a
+/// time.  The table borrow ends before equality can call user code; if that
+/// callback changes the candidate entry, restart from the beginning like
+/// `ll_dict_lookup`'s paranoia restart (`rordereddict.py:1057`).
+unsafe fn scan_dict_key_reentrant(
+    obj: PyObjectRef,
+    mut key: ObjectKey,
+) -> Result<(Option<usize>, ObjectKey), DictKeyError> {
+    'restart: loop {
+        // Snapshot the table so a comparison that reallocates the backing
+        // store restarts the scan: `ll_dict_lookup` retries on
+        // `entries != d.entries` even when the candidate entry is untouched
+        // (`rordereddict.py:1058`).  A grow copies every entry to a fresh
+        // allocation, so a stale index would otherwise compare the wrong key.
+        let table_capacity = {
+            let dict = &*(obj as *const W_DictObject);
+            (*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)).capacity()
+        };
+        let mut i = 0;
+        loop {
+            let Some((stored_hash, stored_obj)) = ({
+                let dict = &*(obj as *const W_DictObject);
+                let entries =
+                    &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+                entries
+                    .get_index(i)
+                    .map(|(stored, _)| (stored.hash, stored.obj))
+            }) else {
+                return Ok((None, key));
+            };
+
+            if stored_hash == key.hash {
+                let _roots = crate::gc_roots::push_roots();
+                let stored_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(stored_obj);
+                let key_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(key.obj);
+
+                let equal = dict_keys_equal(stored_obj, key.obj);
+                let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
+                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+                if take_dict_key_error() {
+                    return Err(DictKeyError);
+                }
+                // Validate the paranoia condition before acting on the result:
+                // `ll_dict_lookup` restarts even when the comparison answered
+                // `true`, because a callback that reallocated the table or moved
+                // the candidate leaves the matched index stale
+                // (`rordereddict.py:1058`).
+                let disturbed = {
+                    let dict = &*(obj as *const W_DictObject);
+                    let entries =
+                        &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+                    // `entries != d.entries`: a realloc moved the whole table.
+                    entries.capacity() != table_capacity
+                        // `entries.valid(index) && entries[index].key == checkingkey`.
+                        || !entries.get_index(i).is_some_and(|(stored, _)| {
+                            stored.hash == stored_hash && stored.obj == stored_obj
+                        })
+                };
+                if disturbed {
+                    continue 'restart;
+                }
+                if equal {
+                    return Ok((Some(i), key));
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Internal helper: `ObjectDictStrategy::getitem` body for pyre's
 /// W_DictObject. Called only from the strategy trait impl to avoid
 /// recursion through `w_dict_lookup`.
@@ -1877,23 +1982,27 @@ pub unsafe fn w_dict_lookup_object_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    let dict = &*(obj as *const W_DictObject);
-    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    entries.get(&object_key_for(key)).copied()
+    w_dict_lookup_object_strategy_checked(obj, key).unwrap_or(None)
 }
 
 pub unsafe fn w_dict_lookup_object_strategy_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
-    let dict = &*(obj as *const W_DictObject);
-    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    let key = object_key_for_checked(key)?;
-    let result = entries.get(&key).copied();
-    if take_dict_key_error() {
-        return Err(DictKeyError);
+    let object_key = object_key_for_checked(key)?;
+    if let Some(result) = callback_free_dict_op(|| {
+        let dict = &*(obj as *const W_DictObject);
+        let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        entries.get(&object_key).copied()
+    }) {
+        return result;
     }
-    Ok(result)
+    let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+    Ok(found.map(|i| {
+        let dict = &*(obj as *const W_DictObject);
+        let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        *entries.get_index(i).unwrap().1
+    }))
 }
 
 /// Internal helper: `ModuleDictStrategy::getitem` body for pyre's
@@ -2120,27 +2229,52 @@ pub unsafe fn w_dict_setdefault_checked(
         return Ok(value);
     }
     if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
-        // `ObjectDictStrategy.setdefault` inherits DictStrategy.setdefault
-        // (`dictmultiobject.py:487-493`).  RPython's r_dict entry probe hashes
-        // and compares once, then either returns the occupied value or fills
-        // the vacant entry.  Keep that single-probe shape with IndexMap's
-        // entry API so a callback exception aborts before insertion.
+        // `AbstractTypedStrategy.setdefault` (`dictmultiobject.py:1073`) runs
+        // `r_dict.setdefault`, a single bucket probe that returns the occupied
+        // value or fills the vacant slot.  Run that probe callback-free; a
+        // comparison the builtin ladder cannot settle withholds the insert and
+        // re-runs the probe over `scan_dict_key_reentrant`.
         let object_key = object_key_for_checked(key)?;
+        if let Some(result) = callback_free_dict_op(|| -> Option<PyObjectRef> {
+            let dict = &mut *(obj as *mut W_DictObject);
+            let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+            let index = entries.get_index_of(&object_key);
+            if crate::dict_eq_hook::callback_free_probe_broken() {
+                return None;
+            }
+            match index {
+                Some(i) => Some(*entries.get_index(i).unwrap().1),
+                None => {
+                    entries.insert(object_key, value);
+                    w_dict_bump_keys_version(obj);
+                    dict_write_barrier(obj);
+                    Some(value)
+                }
+            }
+        }) {
+            if let Ok(Some(existing)) = result {
+                return Ok(existing);
+            }
+            if let Err(err) = result {
+                return Err(err);
+            }
+            // `Ok(None)` only arises on a broken probe (which surfaces as the
+            // outer `None`); fall through to the scan defensively.
+        }
+        let (found, object_key) = scan_dict_key_reentrant(obj, object_key)?;
+        if let Some(i) = found {
+            let dict = &*(obj as *const W_DictObject);
+            let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+            return Ok(*entries.get_index(i).unwrap().1);
+        }
+        crate::dict_eq_hook::begin_callback_free_probe();
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-        let entry = entries.entry(object_key);
-        if take_dict_key_error() {
-            return Err(DictKeyError);
-        }
-        return match entry {
-            indexmap::map::Entry::Occupied(entry) => Ok(*entry.get()),
-            indexmap::map::Entry::Vacant(entry) => {
-                entry.insert(value);
-                w_dict_bump_keys_version(obj);
-                dict_write_barrier(obj);
-                Ok(value)
-            }
-        };
+        entries.insert(object_key, value);
+        let _ = crate::dict_eq_hook::end_callback_free_probe();
+        w_dict_bump_keys_version(obj);
+        dict_write_barrier(obj);
+        return Ok(value);
     }
     let result = strategy.setdefault(obj, key, value);
     if take_dict_key_error() {
@@ -2176,21 +2310,38 @@ pub unsafe fn w_dict_pop_checked(
     } else {
         let strategy = (*(obj as *const W_DictObject)).dstrategy;
         if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
-            // `DictStrategy.pop` (`dictmultiobject.py:624-634`) performs one
-            // r_dict lookup followed by removal.  IndexMap's checked removal
-            // is the equivalent single hash/equality probe; a comparison
-            // exception reads as no match and is observed before returning.
+            // `AbstractTypedStrategy.pop` (`dictmultiobject.py:1123`) performs
+            // one r_dict lookup followed by removal.  Run that probe
+            // callback-free; a comparison the builtin ladder cannot settle
+            // withholds the removal and re-runs it over
+            // `scan_dict_key_reentrant`.
             let object_key = object_key_for_checked(key)?;
-            let dict = &mut *(obj as *mut W_DictObject);
-            let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-            let result = entries.shift_remove(&object_key);
-            if take_dict_key_error() {
-                return Err(DictKeyError);
+            if let Some(result) = callback_free_dict_op(|| -> Option<PyObjectRef> {
+                let dict = &mut *(obj as *mut W_DictObject);
+                let entries =
+                    &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+                let index = entries.get_index_of(&object_key);
+                if crate::dict_eq_hook::callback_free_probe_broken() {
+                    return None;
+                }
+                index.map(|i| {
+                    let removed = entries.shift_remove_index(i).unwrap().1;
+                    w_dict_bump_keys_version(obj);
+                    removed
+                })
+            }) {
+                return result;
             }
-            if result.is_some() {
+            let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+            if let Some(i) = found {
+                let dict = &mut *(obj as *mut W_DictObject);
+                let entries =
+                    &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+                let removed = entries.shift_remove_index(i).unwrap().1;
                 w_dict_bump_keys_version(obj);
+                return Ok(Some(removed));
             }
-            return Ok(result);
+            return Ok(None);
         }
         match strategy.pop(obj, key, None) {
             Ok(val) => {
@@ -2218,12 +2369,7 @@ pub unsafe fn w_dict_pop_checked(
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_store_object_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
-    let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    if entries.insert(object_key_for(key), value).is_none() {
-        dict.keys_version = dict.keys_version.wrapping_add(1);
-    }
-    dict_write_barrier(obj);
+    let _ = w_dict_store_object_strategy_checked(obj, key, value);
 }
 
 pub unsafe fn w_dict_store_object_strategy_checked(
@@ -2244,21 +2390,51 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
         Some(hash) => object_key_hashed(key, hash),
         None => object_key_for_checked(key)?,
     };
-    let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    // Single setitem probe (matches `r_dict.setitem`'s one bucket scan).
-    // When `space.eq_w` raises mid-probe the comparison reads as "not
-    // equal", so `insert` finds no match and appends a fresh (spurious)
-    // entry at the end; drop it with `pop` so the store leaves the dict
-    // unchanged, matching r_dict raising at the comparison without
-    // completing the store.  A no-raise store touches the bucket once.
-    let previous = entries.insert(object_key, value);
-    if take_dict_key_error() {
-        entries.pop();
-        return Err(DictKeyError);
+    // Single setitem probe (matches `r_dict.setitem`'s one bucket scan), run
+    // callback-free so no user `__eq__` mutates the dict while the `IndexMap`
+    // borrow is live.  When every same-hash comparison stays inside the
+    // builtin ladder the probe updates or appends in place; a pair it cannot
+    // decide breaks the probe, withholds the store, and re-runs it over
+    // `scan_dict_key_reentrant`.
+    if let Some(result) = callback_free_dict_op(|| {
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        let index = entries.get_index_of(&object_key);
+        if crate::dict_eq_hook::callback_free_probe_broken() {
+            return;
+        }
+        match index {
+            Some(i) => {
+                *entries.get_index_mut(i).unwrap().1 = value;
+            }
+            None => {
+                entries.insert(object_key, value);
+                dict.keys_version = dict.keys_version.wrapping_add(1);
+            }
+        }
+        dict_write_barrier(obj);
+    }) {
+        return result;
     }
-    if previous.is_none() {
-        dict.keys_version = dict.keys_version.wrapping_add(1);
+
+    let (found, object_key) = scan_dict_key_reentrant(obj, object_key)?;
+    match found {
+        Some(i) => {
+            let dict = &mut *(obj as *mut W_DictObject);
+            let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+            *entries.get_index_mut(i).unwrap().1 = value;
+        }
+        None => {
+            // The scan proved inequality against every same-hash key.  Keep
+            // IndexMap's placement probe callback-free so any comparison
+            // outside the builtin ladder answers false, reproducing that scan.
+            crate::dict_eq_hook::begin_callback_free_probe();
+            let dict = &mut *(obj as *mut W_DictObject);
+            let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+            entries.insert(object_key, value);
+            let _ = crate::dict_eq_hook::end_callback_free_probe();
+            dict.keys_version = dict.keys_version.wrapping_add(1);
+        }
     }
     dict_write_barrier(obj);
     Ok(())
@@ -2638,13 +2814,7 @@ pub unsafe fn w_dict_delitem_checked(
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_delitem_object_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    let removed = entries.shift_remove(&object_key_for(key)).is_some();
-    if removed {
-        dict.keys_version = dict.keys_version.wrapping_add(1);
-    }
-    removed
+    w_dict_delitem_object_strategy_checked(obj, key).unwrap_or(false)
 }
 
 pub unsafe fn w_dict_delitem_object_strategy_checked(
@@ -2652,21 +2822,37 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     key: PyObjectRef,
 ) -> Result<bool, DictKeyError> {
     let object_key = object_key_for_checked(key)?;
-    let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    // `shift_remove` removes only on a positive match; an `__eq__` raise
-    // reads as "not equal" (and short-circuits the rest of the probe), so
-    // the key is never found and the dict is left unchanged.  Reporting the
-    // error before returning is the first-exception, no-mutation path that
-    // `r_dict.delitem` raises on.
-    let hit = entries.shift_remove(&object_key).is_some();
-    if take_dict_key_error() {
-        return Err(DictKeyError);
+    // Single delitem probe, run callback-free so no user `__eq__` mutates the
+    // dict while the `IndexMap` borrow is live.  A comparison the builtin
+    // ladder cannot settle withholds the removal and re-runs the probe over
+    // `scan_dict_key_reentrant`.
+    if let Some(result) = callback_free_dict_op(|| {
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        let index = entries.get_index_of(&object_key);
+        if crate::dict_eq_hook::callback_free_probe_broken() {
+            return false;
+        }
+        match index {
+            Some(i) => {
+                entries.shift_remove_index(i);
+                dict.keys_version = dict.keys_version.wrapping_add(1);
+                true
+            }
+            None => false,
+        }
+    }) {
+        return result;
     }
-    if hit {
+    let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+    if let Some(i) = found {
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        entries.shift_remove_index(i);
         dict.keys_version = dict.keys_version.wrapping_add(1);
+        return Ok(true);
     }
-    Ok(hit)
+    Ok(false)
 }
 
 /// Internal helper: `ModuleDictStrategy::delitem` body for pyre's
@@ -5279,17 +5465,25 @@ mod tests {
     /// A user `__eq__` that raises during a colliding store must leave the
     /// dict unchanged and surface the first error, matching r_dict raising
     /// mid-probe without completing setitem.  Verifies: the store reports an
-    /// error, the spuriously appended entry is dropped (k1 intact, k2 never
-    /// stored), and `__eq__` runs exactly once (the probe short-circuits
-    /// after the first raise).
+    /// error, the withheld store never inserts (k1 intact, k2 never stored),
+    /// and `__eq__` runs exactly once (the scan short-circuits after the
+    /// first raise).
+    ///
+    /// The keys are out-of-`int`-range longs so `key_equality_is_builtin` is
+    /// false and the comparison actually routes through the `eq_w` hook —
+    /// exact `str`/`int` keys settle on the builtin ladder and never reach a
+    /// user `__eq__`.
     #[test]
     fn test_dict_store_raising_eq_leaves_dict_unchanged() {
+        use crate::longobject::w_long_new;
+        use malachite_bigint::BigInt;
         install_test_hash_hook();
         unsafe {
             crate::dict_eq_hook::register_hash_w_hook(constant_collision_hash);
             let dict = w_dict_new();
-            let k1 = w_str_new("k1");
-            let k2 = w_str_new("k2");
+            let huge = BigInt::from(i64::MAX) * BigInt::from(2);
+            let k1 = w_long_new(huge.clone());
+            let k2 = w_long_new(huge + BigInt::from(1));
             // Seed one entry while the bucket is empty (no comparison runs).
             w_dict_store(dict, k1, w_int_new(1));
 
