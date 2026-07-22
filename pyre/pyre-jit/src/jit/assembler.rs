@@ -2162,11 +2162,11 @@ mod tests {
     fn try_assemble_declines_constant_pool_byte_overflow() {
         // The register file alone fits (`num_regs.ref_ < 256`), so the
         // up-front gate passes. Constants routed through the per-kind pool
-        // occupy the SAME one-byte namespace above `count_regs[ref]`
-        // (`assembler.py:131-137`), so enough of them push a
-        // `jit_merge_point` red-list operand past 255 —
-        // `assembler.py:265-269 check_result`. The runtime seam must decline
-        // rather than abort while emitting the operand.
+        // occupy the SAME one-byte namespace above `count_regs[ref]`, and the
+        // byte is synthesized as they are appended (`assembler.py:131-137`), so
+        // enough of them push a `jit_merge_point` red-list operand past 255 at
+        // the `assembler.py:133` `assert 0 <= val < 256`. The runtime seam must
+        // decline there rather than abort while emitting the operand.
         const NUM_REGS_R: u16 = 200;
         let reds_r: Vec<Operand> = (0..100).map(|i| Operand::ConstRef(i * 8)).collect();
         let empty = |kind| {

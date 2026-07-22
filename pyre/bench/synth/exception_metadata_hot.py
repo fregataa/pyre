@@ -6,7 +6,8 @@
 # each section adds ref registers and constants, and the constants routed
 # through the per-kind pool sit ABOVE `count_regs[ref]` in the same byte
 # (`assembler.py:131-137`). A module that overruns it must decline the graph
-# (`assembler.py:265-269 check_result`), not abort while emitting the operand.
+# rather than abort while emitting the operand at the `assembler.py:133`
+# `assert 0 <= val < 256`.
 
 import sys
 
