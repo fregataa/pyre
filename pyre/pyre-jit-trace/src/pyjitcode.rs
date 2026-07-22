@@ -122,6 +122,25 @@ pub struct PyJitCodeMetadata {
     /// skeleton / fixture.
     pub depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
+    /// Slice B (#73): floor-only STATIC-liveness depth twin of the
+    /// containing-opcode resolution. Keys mirror `py_floor_by_jit_pc` exactly
+    /// (same offsets, same order); each value is
+    /// `liveness_for(code).depth_at_py_pc().get(py).copied().unwrap_or(0)` for
+    /// that segment's py. NO block-head marker precedence and NO trivia skip —
+    /// a floor lookup reproduces `depth_at_py_pc[vstack_containing_py_pc(jit_pc)]`
+    /// for every jit_pc. Empty for skeleton / fixture metadata.
+    pub depth_containing_by_jit_pc: Vec<(u32, u16)>,
+    /// Slice D (#73): exact-match STATIC-liveness depth twin of the block-head
+    /// marker resolution (`metadata_block_head_py_pc`). Keys mirror
+    /// `block_head_py_by_jit_pc` exactly (same marker offsets, same order); each
+    /// value is
+    /// `liveness_for(code).depth_at_py_pc().get(block_head_py).copied().unwrap_or(0)`
+    /// for that marker's py. EXACT binary search only (no predecessor, no
+    /// floor) — a miss means `start_pc` is not a block-head marker and the
+    /// consumer falls back to the floor twin, mirroring
+    /// `vstack_initial_py_pc`'s `metadata_block_head_py_pc(...).unwrap_or(floor)`.
+    /// Empty for skeleton / fixture metadata.
+    pub depth_block_head_by_jit_pc: Vec<(usize, u16)>,
     /// Reproduces `pcdep_color_slots[skip_python_trivia_forward(
     /// python_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
     /// and predecessor-op-start tiers as the trivia-aware depth twin.
@@ -167,6 +186,16 @@ pub struct PyJitCodeMetadata {
     /// fallback. Empty for skeleton / fixture.
     pub result_color_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub result_color_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
+    /// Slice C (#73): STATIC-liveness operand-stack depth at the after-residual
+    /// fallthrough PC, keyed by JitCode byte offset with the same exact-marker /
+    /// predecessor-op-start split as `after_residual_marker_*`. Value =
+    /// `liveness_for(code).depth_at_py_pc().get(semantic_fallthrough_pc(py)).copied()`
+    /// for the RAW resolving py (no trivia skip — the runtime readers invert then
+    /// take the fallthrough directly, matching the `result_color_after_residual_*`
+    /// construction). `None` where the fallthrough overshoots the table end.
+    /// Empty for skeleton / fixture.
+    pub depth_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
+    pub depth_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
     /// Whether codewriter register allocation assigned non-identity frame
     /// colors. Skeleton and portal metadata leave this false.
     pub has_color_map: bool,
@@ -539,6 +568,40 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| table[i].1)
     }
 
+    /// Floor-only containing-opcode STATIC-liveness depth keyed by a JitCode
+    /// byte offset via the `depth_containing_by_jit_pc` twin. Same
+    /// `partition_point` floor pivot as `floor_segment_for_jitcode_pc` over the
+    /// same keys as `py_floor_by_jit_pc`, so it equals
+    /// `liveness_for(code).depth_at_py_pc().get(vstack_containing_py_pc(jit_pc) as usize).copied().unwrap_or(0)`
+    /// by construction — no block-head marker precedence, no trivia skip. `None`
+    /// when the twin is empty (skeleton / fixture) — see
+    /// [`Self::depth_containing_populated`].
+    pub fn depth_containing_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let table = &self.metadata.depth_containing_by_jit_pc;
+        let end = table.partition_point(|&(off, _)| (off as usize) <= jit_pc);
+        end.checked_sub(1).map(|idx| table[idx].1)
+    }
+
+    /// Whether the floor-only containing-depth twin carries entries. `false` for
+    /// skeleton / fixture installs; the #8/#17 consumers fall back to the raw
+    /// py_pc-keyed static-liveness read there.
+    pub fn depth_containing_populated(&self) -> bool {
+        !self.metadata.depth_containing_by_jit_pc.is_empty()
+    }
+
+    /// Exact-match block-head marker STATIC-liveness depth keyed by a JitCode
+    /// byte offset via the `depth_block_head_by_jit_pc` twin.
+    /// Equals `liveness_for(code).depth_at_py_pc().get(metadata_block_head_py_pc(jit_pc) as usize).copied().unwrap_or(0)`
+    /// when `jit_pc` is a block-head marker offset; `None` when it is not (the
+    /// consumer then falls back to the floor twin) or the table is empty.
+    pub fn depth_block_head_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let table = &self.metadata.depth_block_head_by_jit_pc;
+        table
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+            .ok()
+            .map(|i| table[i].1)
+    }
+
     /// The const operand-stack slots keyed by a JitCode byte offset via
     /// the `const_ref_slots_by_jit_pc` predecessor twin. Returns the slots for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
@@ -686,6 +749,38 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
+    /// Slice C (#73): STATIC-liveness depth at the after-residual fallthrough
+    /// PC, keyed by a JitCode byte offset with the SAME exact-marker /
+    /// predecessor-op-start tiers as `after_residual_marker_for_jitcode_pc`.
+    /// Equals the raw
+    /// `liveness_for(code).depth_at_py_pc().get(semantic_fallthrough_pc(python_pc_for_jitcode_pc(jit_pc))).copied()`
+    /// by construction for a call-op coordinate, including a fallthrough overshoot
+    /// as an in-table `None`. `None` also when the twin is empty (skeleton /
+    /// fixture) — distinguish via [`Self::depth_after_residual_populated`].
+    pub fn depth_after_residual_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let marker = &self.metadata.depth_after_residual_marker_by_jit_pc;
+        let pred = &self.metadata.depth_after_residual_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return marker[i].1;
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
+    /// Whether the after-residual depth twin carries entries. `false` for
+    /// skeleton / fixture installs; consumers fall back to the raw py-keyed
+    /// static-liveness read there.
+    pub fn depth_after_residual_populated(&self) -> bool {
+        !self
+            .metadata
+            .depth_after_residual_marker_by_jit_pc
+            .is_empty()
+            || !self.metadata.depth_after_residual_pred_by_jit_pc.is_empty()
+    }
+
     /// Post-`residual_call` catch resume marker keyed by a JitCode byte
     /// offset, resolved with the SAME exact-marker / predecessor-op-start
     /// tiers as `python_pc_for_jitcode_pc`.
@@ -806,6 +901,8 @@ impl PyJitCode {
                 depth_pred_by_jit_pc: Vec::new(),
                 depth_trivia_marker_by_jit_pc: Vec::new(),
                 depth_trivia_pred_by_jit_pc: Vec::new(),
+                depth_containing_by_jit_pc: Vec::new(),
+                depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),
@@ -818,6 +915,8 @@ impl PyJitCode {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 result_color_after_residual_marker_by_jit_pc: Vec::new(),
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
+                depth_after_residual_marker_by_jit_pc: Vec::new(),
+                depth_after_residual_pred_by_jit_pc: Vec::new(),
                 // Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
                 // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both

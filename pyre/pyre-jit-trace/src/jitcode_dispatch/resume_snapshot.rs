@@ -520,13 +520,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // dereferences a null operand.  Overlay the live operands, build
             // the snapshot, then restore the shadow so this transient write
             // never leaks into a later op or merge-point sync.
-            // Guard's Python pc (derived from the branch handler's scoped
-            // jitcode pc) — needed by the kept-stack source recovery in the
-            // overlay below and the resume coordinate further down.
-            let guard_py_pc = scope.branch_guard_jitcode_pc.map(|guard_jc_pc| unsafe {
-                let jc = &*sym.jitcode();
-                python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc)
-            });
+            // Whether this is a kept-stack branch guard. Its resume/liveness
+            // window is keyed by the guard's own jitcode pc
+            // (`scope.branch_guard_jitcode_pc`, resolved to `entry_jitcode_pc`
+            // below), so only its presence is needed here.
+            let has_branch_guard = scope.branch_guard_jitcode_pc.is_some();
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
                     let jc = &*sym.jitcode();
@@ -588,9 +586,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // (`resolved_recovered`) is empty for this shape, so the mirror is
             // the only kept-stack source and it has a hole.
             // Fill the hole from the guard-PC register file: the per-PC
-            // `pcdep_color_slots` map at `guard_py_pc` names the Ref-bank color
-            // that holds operand-stack slot `nlocals + s` at THIS guard PC (the
-            // same authoritative inversion `collect_outer_active_boxes` reads),
+            // `pcdep_color_slots` map at the guard's own jitcode pc names the
+            // Ref-bank color that holds operand-stack slot `nlocals + s` at THIS
+            // guard PC (the same authoritative twin `collect_outer_active_boxes` reads),
             // and `ctx.registers_r[color]` holds the live guard-state box.  This
             // is the guard-PC color read (as `resolved_recovered` does for
             // `registers_r[src]`), NOT the retired stale merge-color read.
@@ -600,14 +598,12 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // set.
             // Capture-only: writes the transient snapshot overlay, never the live
             // shadow (the trace_opcode.rs bridge-NULL constraint holds).
-            let mut stack_sync: Vec<(usize, OpRef)> = if guard_py_pc.is_some()
+            let mut stack_sync: Vec<(usize, OpRef)> = if has_branch_guard
                 && sym.owns_virtualizable_shadow()
                 && !sym.jitcode().is_null()
             {
-                let gpc = guard_py_pc.unwrap() as usize;
-                // `guard_py_pc` above is the plain JitCode-PC inversion (no
-                // Python-trivia skip), so the pcdep twin here must be the plain
-                // predecessor-keyed flavor too.
+                // The pcdep twin here must be the plain predecessor-keyed flavor
+                // (no Python-trivia skip), keyed by the guard's own jitcode pc.
                 let gjc = scope.branch_guard_jitcode_pc.unwrap();
                 let nlocals = sym.nlocals();
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
@@ -671,10 +667,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             } else {
                 stack_sync
             };
-            // `scope.branch_guard_jitcode_pc` / `guard_py_pc` derived above
-            // (before the stack overlay, which needs `guard_py_pc` for the #124
-            // kept-stack source recovery): map the guard's own jitcode pc to its
-            // Python opcode so the encoder reads the guard-pc liveness — the
+            // A branch guard (`scope.branch_guard_jitcode_pc`, consumed by the
+            // stack overlay above for the #124 kept-stack source recovery) keys
+            // the encoder liveness window on the guard's own jitcode pc — the
             // resume `py_pc` is a not-taken merge point whose live colors the
             // walk has not written.
             // #124 Approach B (M2): carry the guard's raw JitCode byte offset
@@ -690,7 +685,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // Carrying `op_pc` for those broke encoder ↔ decoder
             // symmetry: `collect_outer_active_boxes` resolves the reg banks at
             // the carried coordinate but `live_locals` / `stack_color_map` at
-            // `entry_py_pc`, and for a non-branch guard
+            // the entry coordinate, and for a non-branch guard
             // `op_pc != marker`
             // — the two windows diverge and the decoded box layout mismatches.
             let guard_jitcode_pc: i32 = if let Some(guard_jc_pc) = scope.branch_guard_jitcode_pc {
@@ -810,8 +805,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 //     the ordinary post-call marker.
                 //     `py_pc == liveness_py_pc` here: the residual-call path
                 //     never supplies `GuardCaptureScope::branch_guard_jitcode_pc`
-                //     (only kept-stack branch guards do), so `guard_py_pc` is
-                //     `None`.
+                //     (only kept-stack branch guards do), so this is not a
+                //     branch guard.
                 // Both offsets are the SAME physical post-call `-live-` insn by
                 // codewriter construction (the plain fallthrough re-key and the
                 // catch-predecessor anchor resolve to one marker), so the
@@ -852,17 +847,15 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 }
             };
-            // #124 Approach B: when the carrier holds the guard's own pc (a
-            // branch guard whose not-taken arm is reached by RE-EXECUTING
-            // `goto_if_not`), resume at the guard's Python pc too.  Keying the
-            // snapshot's resume pc on the guard coordinate makes the encoder
-            // liveness window (`collect_outer_active_boxes`), the blackhole
-            // `setposition`, and the cranelift bridge re-trace entry all agree
-            // — the kept operand stack is naturally live at the guard pc and is
-            // recovered from the walk-level box mirror in
-            // `collect_outer_active_boxes`.  A non-branch guard carries no guard
-            // pc, so it keeps the merge `py_pc` and its exact resume-translation.
-            let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
+            // The liveness-window py coordinate. A branch guard keys its
+            // liveness window on the guard's own jitcode pc (via
+            // `entry_jitcode_pc` below); every other `liveness_py_pc` consumer
+            // sits on a non-branch-guard path — the `after_residual_call`
+            // bridge-semantic-maps call below and the fallthrough
+            // `first_floor_boundary_for_py` entry lookup, both reached only
+            // when `has_branch_guard` is false — so this is always the merge
+            // `py_pc`.
+            let liveness_py_pc = py_pc;
             let payload = unsafe { &(&*sym.jitcode()).payload };
             let resolved = payload
                 .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live());
@@ -927,7 +920,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
                 }
             }
-            let (entry_jitcode_pc, entry_twin, entry_caller) = if guard_py_pc.is_some() {
+            let (entry_jitcode_pc, entry_twin, entry_caller) = if has_branch_guard {
                 let entry_jitcode_pc = unsafe {
                     let metadata = &(&*sym.jitcode()).payload.metadata;
                     (guard_jitcode_pc >= 0)
@@ -970,8 +963,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 ctx.registers_r,
                 ctx.registers_f,
                 jitcode_index,
-                liveness_py_pc,
-                guard_py_pc,
+                has_branch_guard,
                 guard_jitcode_pc,
                 entry_jitcode_pc,
                 entry_twin,
@@ -1222,13 +1214,31 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         // A missing marker has no fallthrough-native key. Preserve the
         // existing Python-keyed path rather than declining a formerly valid
         // caller frame.
-        None => unsafe {
-            crate::liveness::liveness_for(code_ptr)
-                .depth_at_py_pc()
-                .get(fallthrough_py_pc as usize)
-                .copied()
-                .unwrap_or(0) as usize
-        },
+        None => {
+            let payload = unsafe { &(*caller_sym.jitcode()).payload };
+            let raw = || unsafe {
+                crate::liveness::liveness_for(code_ptr)
+                    .depth_at_py_pc()
+                    .get(fallthrough_py_pc as usize)
+                    .copied()
+                    .unwrap_or(0) as usize
+            };
+            if payload.depth_after_residual_populated() {
+                let depth = payload
+                    .depth_after_residual_for_jitcode_pc(call_jit_pc)
+                    .unwrap_or(0) as usize;
+                if pcmap_afterresidual_audit_enabled() {
+                    assert_eq!(
+                        depth,
+                        raw(),
+                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller after-residual depth twin diverged at jit_pc {call_jit_pc} (py {fallthrough_py_pc})"
+                    );
+                }
+                depth
+            } else {
+                raw()
+            }
+        }
     };
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
@@ -1272,8 +1282,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         ctx.registers_r,
         ctx.registers_f,
         jitcode_index,
-        fallthrough_py_pc,
-        None,
+        false,
         caller_liveness_word,
         caller_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
@@ -1327,13 +1336,30 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let depth = match resume_marker_jit_pc {
         Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
         None => {
-            let fallthrough_py_pc = legacy_fallthrough_py_pc();
-            unsafe {
-                crate::liveness::liveness_for(pjc.code_ptr)
-                    .depth_at_py_pc()
-                    .get(fallthrough_py_pc as usize)
-                    .copied()
-                    .unwrap_or(0) as usize
+            let raw = || {
+                let fallthrough_py_pc = legacy_fallthrough_py_pc();
+                unsafe {
+                    crate::liveness::liveness_for(pjc.code_ptr)
+                        .depth_at_py_pc()
+                        .get(fallthrough_py_pc as usize)
+                        .copied()
+                        .unwrap_or(0) as usize
+                }
+            };
+            if pjc.depth_after_residual_populated() {
+                let depth = pjc
+                    .depth_after_residual_for_jitcode_pc(call_jit_pc)
+                    .unwrap_or(0) as usize;
+                if pcmap_afterresidual_audit_enabled() {
+                    assert_eq!(
+                        depth,
+                        raw(),
+                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: nested inline-caller after-residual depth twin diverged at jit_pc {call_jit_pc}"
+                    );
+                }
+                depth
+            } else {
+                raw()
             }
         }
     };
@@ -1676,8 +1702,49 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                 if jc.payload.code_ptr.is_null() {
                     caller_sym.valuestackdepth() as i64
                 } else {
-                    let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-                    match lv.depth_at_py_pc().get(resume_py_pc as usize).copied() {
+                    // Raw py_pc-keyed static-liveness read: the fallback where the
+                    // twin does not apply (cross-jitcode parent, or empty twin),
+                    // and the audit oracle.
+                    let raw = || {
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(resume_py_pc as usize)
+                            .copied()
+                    };
+                    // The raw read resolves `resume_py_pc` against
+                    // `outer.jitcode_index`'s tables but indexes THIS jitcode's
+                    // liveness; the twins key one jitcode, so cut only when both
+                    // are the same jitcode. `Some(inner)` = twin applies (inner is
+                    // its Option<u16> depth); `None` = not applicable -> raw.
+                    let twin: Option<Option<u16>> = if outer.jitcode_index != jc.index as u32 {
+                        None
+                    } else {
+                        match outer.resume_coord {
+                            ParentResumeCoord::Backxlat(jitcode_pc) => jc
+                                .payload
+                                .depth_trivia_populated()
+                                .then(|| jc.payload.depth_trivia_for_jitcode_pc(jitcode_pc)),
+                            ParentResumeCoord::CallFallthrough(call_jit_pc) => {
+                                jc.payload.depth_after_residual_populated().then(|| {
+                                    jc.payload.depth_after_residual_for_jitcode_pc(call_jit_pc)
+                                })
+                            }
+                        }
+                    };
+                    let depth = match twin {
+                        Some(d) => {
+                            if pcmap_afterresidual_audit_enabled() {
+                                assert_eq!(
+                                    d,
+                                    raw(),
+                                    "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: multiframe vsd depth twin diverged (py {resume_py_pc})"
+                                );
+                            }
+                            d
+                        }
+                        None => raw(),
+                    };
+                    match depth {
                         Some(d) => (caller_sym.nlocals() + d as usize) as i64,
                         None => caller_sym.valuestackdepth() as i64,
                     }
