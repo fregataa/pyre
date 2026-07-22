@@ -11563,15 +11563,11 @@ impl CodeWriter {
                             // undefined on at least one predecessor
                             // (`framestate.py:105-114 union`); the legacy
                             // `ConstantValue::None` sentinel represents the
-                            // statically-unbound form.  The walker has no SSA
-                            // value for either shape.  Emitting the
-                            // `load_fast_check` residual + `GuardNoException` +
-                            // push leaves a normal-return `Finish` continuation;
-                            // a later guard-failure bridge resolves into that
-                            // return and silently swallows the raise.  Bail to
-                            // the interpreter so it raises, mirroring the
-                            // constant-folded `if w_value is None` failure arm
-                            // (matches the DeleteFast known-unbound handling).
+                            // statically-unbound form. The walker has no SSA
+                            // value for either shape, so read the physical frame
+                            // slot and guard its nullness. The bound arm keeps
+                            // compiling; the null arm aborts at this opcode so
+                            // the interpreter re-runs LOAD_FAST_CHECK and raises.
                             let local_value = current_state.local_value_at(idx as usize);
                             if local_value.is_none()
                                 || matches!(
@@ -11580,6 +11576,65 @@ impl CodeWriter {
                                         if c.value == super::flow::ConstantValue::None
                                 )
                             {
+                                exception_edge_handled = true;
+                                emit_load_fast_ref!(current_depth, idx, py_pc);
+                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let truth = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "ptr_nonzero",
+                                    vec![value_value.clone().into()],
+                                    Kind::Int,
+                                    py_pc as i64,
+                                );
+                                current_block.block().borrow_mut().exitswitch =
+                                    Some(super::flow::ExitSwitch::Value(truth.into()));
+
+                                push_and_bump!(value_value, py_pc);
+                                let fallthrough_py_pc = py_pc + 1;
+                                mergeblock(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &current_block,
+                                    &{
+                                        let mut s = current_state.clone();
+                                        s.next_offset = fallthrough_py_pc;
+                                        s.blocklist =
+                                            frame_blocks_for_offset(code, fallthrough_py_pc);
+                                        s
+                                    },
+                                    fallthrough_py_pc,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                );
+                                set_last_bool_exitcase(&current_block.block(), true);
+
+                                current_state.stack.pop();
+                                current_depth = current_depth.saturating_sub(1);
+                                let mut unbound_state = current_state.clone();
+                                unbound_state.next_offset = py_pc;
+                                unbound_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                                let unbound_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(unbound_state.clone()),
+                                );
+                                unbound_block.block().borrow_mut().inputargs =
+                                    unbound_state.getvariables();
+                                all_walker_blocks.push(unbound_block.clone());
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(
+                                        &current_state,
+                                        &unbound_state,
+                                        unbound_block.block(),
+                                    ),
+                                );
+                                set_last_bool_exitcase(&current_block.block(), false);
+
+                                current_block = unbound_block;
+                                current_state = unbound_state;
                                 emit_abort_permanent!(py_pc);
                                 continue;
                             }
@@ -11885,10 +11940,6 @@ impl CodeWriter {
                         Instruction::DeleteFast { var_num } => {
                             if fbw_delete_fast_enabled() {
                                 let idx = var_num.get(op_arg).as_usize();
-                                if current_state.local_value_at(idx).is_none() {
-                                    emit_abort_permanent!(py_pc);
-                                    continue;
-                                }
                                 let local_slot = local_to_vable_slot(idx) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -16172,6 +16223,81 @@ def f(n):
             opnames.contains(&"abort_permanent"),
             "the undefined LOAD_FAST_CHECK must bail to the interpreter"
         );
+    }
+
+    #[test]
+    fn walker_conditional_delete_reads_unbound_union_from_frame() {
+        let source = "\
+def f():
+    i = 0
+    x = 0
+    while i < 100000:
+        if i < 50000:
+            x = i
+        else:
+            del x
+        i = i + 1
+    return i
+";
+        let code = first_nested_function_code(source);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("conditional DELETE_FAST must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(opnames.contains(&"ptr_iszero"));
+        assert!(opnames.contains(&"raise"));
+    }
+
+    #[test]
+    fn walker_load_fast_check_guards_unbound_union_from_frame() {
+        let source = "\
+def f(n):
+    acc = 0
+    i = 0
+    while i < n:
+        if i >= 0:
+            x = i
+        acc = acc + x
+        i = i + 1
+    return acc
+";
+        let code = first_nested_function_code(source);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("conditional LOAD_FAST_CHECK must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(opnames.contains(&"ptr_nonzero"));
+        assert!(opnames.contains(&"abort_permanent"));
     }
 
     #[test]
