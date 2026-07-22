@@ -17,7 +17,7 @@ use super::*;
 /// the recorder's result OpRef into `registers_i[dst]`. Operand
 /// layout is `ii>i` (1B src1 + 1B src2 + 1B dst).
 ///
-/// RPython parity: `pyjitpl.py:288-292` exec-generated
+/// RPython parity: `pyjitpl.py` exec-generated
 /// `opimpl_int_BINOP(b1, b2): return self.execute(rop.<OPNUM>, b1,
 /// b2)` + the trailing `>i` decorator that writes the result into
 /// `registers_i[dst]`. Walker collapses execute+writeback into
@@ -31,6 +31,19 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
     let b = read_int_reg(code, op, 1, ctx)?;
+    // This handler serves both generated loops: the plain binops (`int_add`,
+    // `uint_lt`, …) and the `int_eq`..`int_ge` compares.  Only the latter
+    // carry `if b1 is b2: return <const>`, so gate on membership rather than
+    // on "looks like a comparison" — `uint_lt` and friends compare too and
+    // must still record.
+    if a == b {
+        if let Some(folded) = fastpath_same_boxes(opcode) {
+            let result = ctx.trace_ctx.const_int(folded);
+            let dst = code[op.pc + 3] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
@@ -52,7 +65,114 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// RPython `pyjitpl.py:588-595 opimpl_int_between`:
+/// `pyjitpl.py FASTPATHS_SAME_BOXES`, applied by the exec-generated
+/// `opimpl_%s(b1, b2): if b1 is b2: return <const>` loop.
+///
+/// Membership is the whole point: the loop that carries this fast path spells
+/// exactly `int_eq`, `int_ne`, `int_lt`, `int_le`, `int_gt`, `int_ge`,
+/// `ptr_eq`, `ptr_ne`, `instance_ptr_eq`, `instance_ptr_ne`. The unsigned
+/// compares (`uint_lt`/`uint_le`/`uint_gt`/`uint_ge`) sit in the *other*
+/// generated loop and get no fast path, so this must not be widened to "any
+/// comparison opcode".
+///
+/// `None` means the opcode is not a same-boxes fast-path member.
+pub(crate) fn fastpath_same_boxes(opcode: OpCode) -> Option<i64> {
+    match opcode {
+        OpCode::IntEq | OpCode::IntLe | OpCode::IntGe => Some(1),
+        OpCode::IntNe | OpCode::IntLt | OpCode::IntGt => Some(0),
+        OpCode::PtrEq | OpCode::InstancePtrEq => Some(1),
+        OpCode::PtrNe | OpCode::InstancePtrNe => Some(0),
+        _ => None,
+    }
+}
+
+pub(crate) fn record_int_cmp<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+    b: OpRef,
+) -> OpRef {
+    if a == b {
+        let folded = fastpath_same_boxes(opcode).unwrap_or_else(|| {
+            unreachable!("record_int_cmp requires an integer comparison opcode")
+        });
+        return ctx.trace_ctx.const_int(folded);
+    }
+    if let (Some(Value::Int(la)), Some(Value::Int(rb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        return ctx
+            .trace_ctx
+            .const_int(majit_metainterp::eval_binop_i(opcode, la, rb));
+    }
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
+}
+
+/// Record a one-operand integer op and its concrete result. The unary
+/// counterpart of [`record_int_cmp`], for the fused `goto_if_not_int_is_*`
+/// handlers whose condbox comes from `self.execute(rop.INT_IS_*, box)`.
+pub(crate) fn record_int_unary<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+) -> OpRef {
+    let result = ctx.trace_ctx.record_op(opcode, &[a]);
+    if let Some(majit_ir::Value::Int(la)) = ctx.trace_ctx.box_value(a) {
+        let folded = majit_metainterp::eval_unary_i(opcode, la);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
+}
+
+/// Record an overflow-checking integer operation and its concrete result.
+///
+/// RPython parity: `pyjitpl.py opimpl_int_add_jump_if_ovf` records the
+/// matching `INT_*_OVF`, while `pyjitpl.py handle_possible_overflow_error`
+/// chooses the guard separately from the concrete overflow flag.
+pub(crate) fn record_int_ovf<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    opcode: OpCode,
+    b1: OpRef,
+    b2: OpRef,
+) -> Result<(OpRef, bool), DispatchError> {
+    let v1 = match ctx.trace_ctx.concrete_of_opref(b1) {
+        Some(Value::Int(value)) => value,
+        _ => {
+            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b1 });
+        }
+    };
+    let v2 = match ctx.trace_ctx.concrete_of_opref(b2) {
+        Some(Value::Int(value)) => value,
+        _ => {
+            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b2 });
+        }
+    };
+    let (wrapping_result, overflow) = match opcode {
+        OpCode::IntAddOvf => (v1.wrapping_add(v2), v1.checked_add(v2).is_none()),
+        OpCode::IntSubOvf => (v1.wrapping_sub(v2), v1.checked_sub(v2).is_none()),
+        OpCode::IntMulOvf => (v1.wrapping_mul(v2), v1.checked_mul(v2).is_none()),
+        _ => unreachable!("record_int_ovf requires an IntAddOvf/IntSubOvf/IntMulOvf opcode"),
+    };
+    if b1.is_constant() && b2.is_constant() {
+        return Ok((ctx.trace_ctx.const_int(wrapping_result), overflow));
+    }
+    let resbox = ctx.trace_ctx.record_op(opcode, &[b1, b2]);
+    ctx.trace_ctx
+        .set_opref_concrete(resbox, Value::Int(wrapping_result));
+    Ok((resbox, overflow))
+}
+
+/// RPython `pyjitpl.py opimpl_int_between`:
 ///
 /// ```python
 /// b5 = self.execute(rop.INT_SUB, b3, b1)
@@ -68,17 +188,17 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
 /// record time, matching upstream's choice to emit elementary
 /// `INT_SUB`/`INT_EQ`/`UINT_LT` into the trace rather than relying on
 /// the optimizer to lower `INT_BETWEEN`.  The blackhole semantics
-/// (`blackhole.py:560-561 bhimpl_int_between(a, b, c): return a <= b
+/// (`blackhole.py bhimpl_int_between(a, b, c): return a <= b
 /// < c`) are preserved through the same decomposition.
 ///
 /// Operand layout `iii>i`: 3B sources + 1B dst (=4 operand bytes after
 /// the opcode).  Concrete-value propagation in [`execute_pure_binop_i`]
 /// runs in two layers: all-inline-Const operand pairs fold to a
 /// `const_int(...)` OpRef without recording (matching upstream
-/// `_all_constants` short-circuit at `pyjitpl.py:2654-2660`); the
+/// `_all_constants` short-circuit at `pyjitpl.py`); the
 /// trailing concrete-tracked-pair path additionally stamps the recorded
 /// op via `set_opref_concrete`.  The `ConstInt(1)` fast path at
-/// `pyjitpl.py:590` keys on the inline-Const layer through
+/// `pyjitpl.py` keys on the inline-Const layer through
 /// `inline_const_to_value`, mirroring `isinstance(b5, ConstInt)` —
 /// box_value's concrete-stamp layer does not participate in that
 /// branch decision.
@@ -94,7 +214,7 @@ pub(crate) fn int_between_record<Sym: WalkSym>(
     // b5 = execute(INT_SUB, b3, b1)
     let b5 = execute_pure_binop_i(ctx, OpCode::IntSub, b3, b1);
 
-    // pyjitpl.py:590 `if isinstance(b5, ConstInt) and b5.getint() == 1`
+    // pyjitpl.py `if isinstance(b5, ConstInt) and b5.getint() == 1`
     // — the `ConstInt(1)` fast path emits INT_EQ; otherwise the
     // generic INT_SUB + UINT_LT pair.  `inline_const_to_value` returns
     // `Some(_)` exactly when `b5` is an inline-Const OpRef, mirroring
@@ -121,7 +241,7 @@ pub(crate) fn int_between_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `pyjitpl.py:2648-2662 execute_and_record` for pure integer binops.
+/// `pyjitpl.py execute_and_record` for pure integer binops.
 /// When both operands are inline-Const, fold to a `ConstInt` OpRef
 /// (no `record_op` call); otherwise record the op and stamp the
 /// observed concrete value if both sides have one.
@@ -156,7 +276,7 @@ pub(crate) fn execute_pure_binop_i<Sym: WalkSym>(
 }
 
 /// Generic int-bank unary handler. Operand layout `i>i` (1B src + 1B
-/// dst). RPython parity: `pyjitpl.py:356-368` exec-generated
+/// dst). RPython parity: `pyjitpl.py` exec-generated
 /// `opimpl_int_<unary>` (int_neg / int_invert / int_is_zero etc.) +
 /// the `>i` decorator's writeback. Walker reads `registers_i[src]`,
 /// records `OpCode::<Variant>` with `[a]`, writes the recorder result
@@ -188,7 +308,7 @@ pub(crate) fn unop_int_record<Sym: WalkSym>(
 
 /// Generic ref-bank → int-bank binop handler. Operand layout `rr>i`
 /// (1B r-src1 + 1B r-src2 + 1B i-dst). RPython parity:
-/// `pyjitpl.py:326-336` exec-generated `opimpl_ptr_eq` /
+/// `pyjitpl.py` exec-generated `opimpl_ptr_eq` /
 /// `opimpl_ptr_ne` (and instance variants) follow `self.execute(rop.<OPNUM>,
 /// b1, b2)` — both `b1`/`b2` are ref boxes, result is an int box. The
 /// `b1 is b2` fast path is omitted (same rationale as `binop_int_record`'s
@@ -201,6 +321,18 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_ref_reg(code, op, 0, ctx)?;
     let b = read_ref_reg(code, op, 1, ctx)?;
+    // `if b1 is b2: return <const>` — all four ref compares this handler
+    // serves are `FASTPATHS_SAME_BOXES` members, so an identical operand pair
+    // answers without recording.
+    if a == b {
+        let folded = fastpath_same_boxes(opcode).unwrap_or_else(|| {
+            unreachable!("binop_ref_to_int_record: unsupported opcode {opcode:?}")
+        });
+        let result = ctx.trace_ctx.const_int(folded);
+        let dst = code[op.pc + 3] as usize;
+        write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (matches dispatch.rs trace_binop_r_to_i).
@@ -221,11 +353,58 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+    b: OpRef,
+    a_concrete: ConcreteValue,
+    b_concrete: ConcreteValue,
+) -> OpRef {
+    if a == b {
+        let folded = fastpath_same_boxes(opcode)
+            .unwrap_or_else(|| unreachable!("record_ptr_cmp requires PtrEq or PtrNe"));
+        return ctx.trace_ctx.const_int(folded);
+    }
+    if let (Some(Value::Ref(la)), Some(Value::Ref(rb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        return ctx.trace_ctx.const_int(match opcode {
+            OpCode::PtrEq => (la == rb) as i64,
+            OpCode::PtrNe => (la != rb) as i64,
+            _ => unreachable!("record_ptr_cmp requires PtrEq or PtrNe"),
+        });
+    }
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    let folded = if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        Some(match opcode {
+            OpCode::PtrEq => (la == rb) as i64,
+            OpCode::PtrNe => (la != rb) as i64,
+            _ => panic!("record_ptr_cmp: unsupported opcode {opcode:?}"),
+        })
+    } else if let (ConcreteValue::Ref(la), ConcreteValue::Ref(rb)) = (a_concrete, b_concrete) {
+        Some(match opcode {
+            OpCode::PtrEq => (la == rb) as i64,
+            OpCode::PtrNe => (la != rb) as i64,
+            _ => panic!("record_ptr_cmp: unsupported opcode {opcode:?}"),
+        })
+    } else {
+        None
+    };
+    if let Some(folded) = folded {
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
+}
+
 /// `ptr_nonzero/r>i` (`nonzero = true`) and `ptr_iszero/r>i`
 /// (`nonzero = false`) handler (operand layout `r>i`: 1B r-src + 1B i-dst).
 ///
 /// RPython parity:
-/// `pyjitpl.py:378-380 opimpl_ptr_nonzero(box)`:
+/// `pyjitpl.py opimpl_ptr_nonzero(box)`:
 /// ```python
 /// @arguments("box")
 /// def opimpl_ptr_nonzero(self, box):
@@ -235,9 +414,9 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
 ///
 /// Walker reads one `r` reg, records `OpCode::PtrNe`/`PtrEq` with
 /// `[box, CONST_NULL]` (via `trace_ctx.const_null()` —
-/// `history.py:361 CONST_NULL = ConstPtr(ConstPtr.value)`), and writes
+/// `history.py CONST_NULL = ConstPtr(ConstPtr.value)`), and writes
 /// the recorder result into `registers_i[dst]`.  RPython does the
-/// same `b1 is b2` short-circuit at `pyjitpl.py:328-332` for
+/// same `b1 is b2` short-circuit at `pyjitpl.py` for
 /// `opimpl_ptr_eq` but the nullity test against `CONST_NULL` cannot
 /// short-circuit because `box` is never the literal `CONST_NULL`
 /// constant (codewriter would have folded that).
@@ -280,10 +459,11 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `ref_guard_value/r` handler (operand layout `r`: 1B r-src, no dst).
+/// `int_guard_value/i`, `ref_guard_value/r`, and `float_guard_value/f`
+/// handler (operand layout is one 1B bank-specific source, no dst).
 ///
-/// RPython parity: `pyjitpl.py:1494-1496 _opimpl_guard_value` →
-/// `pyjitpl.py:1916-1927 implement_guard_value`:
+/// RPython parity: `pyjitpl.py _opimpl_guard_value` →
+/// `pyjitpl.py implement_guard_value`:
 ///
 /// ```python
 /// def implement_guard_value(self, box, orgpc):
@@ -297,49 +477,89 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
 ///         return promoted_box
 /// ```
 ///
+/// All three banks share this body exactly as `pyjitpl.py`
+/// aliases `_opimpl_guard_value` to the Int, Ref, and Float opimpl names.
+///
 /// Walker behaviour:
-///   * Read 1B Ref operand and its concrete shadow.
+///   * Read the 1B bank-specific operand and its concrete value.
 ///   * If the symbolic OpRef is already a Const, skip (Const arm of
 ///     `implement_guard_value`).
-///   * If the concrete shadow is `ConcreteValue::Null`, skip — the
-///     walker doesn't have a runtime value to mint the expected
-///     constant from.  This is the strictest mode (sibling
+///   * If the concrete value is null or has the wrong bank variant,
+///     skip — the walker doesn't have a runtime value to mint the
+///     expected constant from.  This is the strictest mode (sibling
 ///     `dispatch_switch_id` line 1207 falls into the same skip-guard
 ///     branch when `valuebox.is_constant()`).
-///   * Otherwise mint `ConstPtr(concrete_ptr)` (executor.py:544-551
-///     `constant_from_op` for a Ref-typed Box), emit `GuardValue`
-///     with `[value, expected_ref]`, and call `replace_box(value,
-///     expected_ref)` (pyjitpl.py:1923).  Also rewrite every
-///     `registers_r` slot still pointing at `value` to `expected_ref`,
+///   * Otherwise mint the bank-specific constant (executor.py
+///     `constant_from_op`), emit `GuardValue` with `[value, expected]`,
+///     and call `replace_box(value, expected)` (pyjitpl.py).  Also
+///     rewrite every slot in the selected register bank still pointing
+///     at `value` to `expected`,
 ///     matching `dispatch_switch_id:1198-1202`.
 ///
-/// TODO: guards record with empty resume data
-/// (`record_guard(..., 0)`) — same caveat as `dispatch_switch_id`
-/// (no MIFrame liveness / framestack in the standalone walker).
-pub(crate) fn ref_guard_value_record<Sym: WalkSym>(
+/// The `0` in `record_guard(..., 0)` is only `record_guard`'s `num_live`
+/// argument; a full production resume snapshot is attached on the next line
+/// via `walker_capture_snapshot_for_last_guard`.
+#[derive(Clone, Copy)]
+pub(crate) enum GuardValueBank {
+    Int,
+    Ref,
+    Float,
+}
+
+pub(crate) fn guard_value_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
+    bank: GuardValueBank,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let value = read_ref_reg(code, op, 0, ctx)?;
+    let value = match bank {
+        GuardValueBank::Int => read_int_reg(code, op, 0, ctx)?,
+        GuardValueBank::Ref => read_ref_reg(code, op, 0, ctx)?,
+        GuardValueBank::Float => read_float_reg(code, op, 0, ctx)?,
+    };
     if value.is_constant() {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    let concrete = read_ref_reg_concrete(code, op, 0, ctx);
-    let ConcreteValue::Ref(ptr) = concrete else {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+    let concrete = match bank {
+        GuardValueBank::Int => read_int_reg_concrete(code, op, 0, ctx),
+        GuardValueBank::Ref => read_ref_reg_concrete(code, op, 0, ctx),
+        GuardValueBank::Float => read_float_reg_concrete(code, op, 0, ctx),
     };
-    if ptr.is_null() {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    let expected = ctx.trace_ctx.const_ref(ptr as usize as i64);
+    let expected = match (bank, concrete) {
+        (GuardValueBank::Int, ConcreteValue::Int(v)) => ctx.trace_ctx.const_int(v),
+        (GuardValueBank::Ref, ConcreteValue::Ref(ptr)) if !ptr.is_null() => {
+            ctx.trace_ctx.const_ref(ptr as usize as i64)
+        }
+        (GuardValueBank::Float, ConcreteValue::Float(f)) => {
+            ctx.trace_ctx.const_float(f.to_bits() as i64)
+        }
+        _ => return Ok((DispatchOutcome::Continue, op.next_pc)),
+    };
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[value, expected], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     ctx.trace_ctx.replace_box(value, expected);
-    for slot in ctx.registers_r.iter_mut() {
-        if *slot == value {
-            *slot = expected;
+    match bank {
+        GuardValueBank::Int => {
+            for slot in ctx.registers_i.iter_mut() {
+                if *slot == value {
+                    *slot = expected;
+                }
+            }
+        }
+        GuardValueBank::Ref => {
+            for slot in ctx.registers_r.iter_mut() {
+                if *slot == value {
+                    *slot = expected;
+                }
+            }
+        }
+        GuardValueBank::Float => {
+            for slot in ctx.registers_f.iter_mut() {
+                if *slot == value {
+                    *slot = expected;
+                }
+            }
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -347,7 +567,7 @@ pub(crate) fn ref_guard_value_record<Sym: WalkSym>(
 
 /// Generic float-pair-to-int handler for `float_<cmp>/ff>i` (operand
 /// layout `ff>i`: 1B f-src + 1B f-src + 1B i-dst).  RPython parity:
-/// `bhimpl_float_{lt,le,eq,ne,gt,ge}` (`blackhole.py:721-746`) — read
+/// `bhimpl_float_{lt,le,eq,ne,gt,ge}` (`blackhole.py`) — read
 /// two `f` regs, record `OpCode::Float<Cmp>`, write the recorder
 /// result into `registers_i[dst]`.
 pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
@@ -375,43 +595,96 @@ pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `cast_int_to_float/i>f` handler. Operand layout `i>f` (1B i-src +
-/// 1B f-dst). RPython parity: `pyjitpl.py:357 cast_int_to_float`
-/// belongs to the same exec-generated unary opimpl loop —
-/// `self.execute(rop.CAST_INT_TO_FLOAT, b)`. Result lands in the
-/// float bank (the `>f` decorator) instead of the int bank.
-pub(crate) fn cast_int_to_float_record<Sym: WalkSym>(
+pub(crate) fn record_float_cmp<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+    b: OpRef,
+) -> OpRef {
+    // Mirrors `self.execute(rop.<CMP>, b1, b2)` but does not pre-fold
+    // `_all_constants` / `b1 is b2` (`pyjitpl.py`);
+    // the recorded compare and downstream guard are optimizer-folded/strengthened.
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded =
+            majit_metainterp::eval_float_cmp(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
+}
+
+/// Bank-crossing unary cast family from the `pyjitpl.py`
+/// exec-generated unary loop (`cast_int_to_float` / `cast_int_to_ptr`
+/// / `cast_ptr_to_int`). PyPy generates these from one template
+/// because its boxes are untyped; pyre's typed register banks make
+/// each cast a distinct (src-bank, dst-bank, concrete-fold) triple, so
+/// the recorded `opcode` selects the shape. Operand layout `<s>><d>`
+/// (1B src + 1B dst); the recorded result lands in the destination
+/// bank per the trailing `>X` decorator.
+pub(crate) fn unop_cast_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let a = read_int_reg(code, op, 0, ctx)?;
-    let result = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[a]);
-    // Box.value parity — if `a`'s runtime concrete is known, stamp
-    // the cast result with the corresponding float bit-pattern so
-    // downstream `box_value(result)` callers see the live value.
-    if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
-        ctx.trace_ctx
-            .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
-    }
     let dst = code[op.pc + 2] as usize;
-    let len = ctx.registers_f.len();
-    let slot = ctx
-        .registers_f
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "f",
-        })?;
-    *slot = result;
+    match opcode {
+        // `cast_int_to_float/i>f`: Int-bank → Float-bank. Stamp the
+        // result with the operand's Box.value as an f64 so downstream
+        // `box_value(result)` callers see the live value.
+        OpCode::CastIntToFloat => {
+            let a = read_int_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(opcode, &[a]);
+            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
+            }
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = result;
+        }
+        // `cast_int_to_ptr/i>r`: Int-bank → Ref-bank. Bit-cast the
+        // operand's Box.value (`BoxInt(n)` → `BoxRef(n as ptr)`).
+        OpCode::CastIntToPtr => {
+            let a = read_int_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(opcode, &[a]);
+            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Ref(majit_ir::GcRef(n as usize)));
+            }
+            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+        }
+        // `cast_ptr_to_int/r>i`: Ref-bank → Int-bank. Bit-cast the
+        // operand's Box.value (`BoxRef(p)` → `BoxInt(p as i64)`).
+        OpCode::CastPtrToInt => {
+            let a = read_ref_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(opcode, &[a]);
+            if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Int(r.0 as i64));
+            }
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
+        _ => panic!("unop_cast_record: unsupported opcode {opcode:?}"),
+    }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
 /// Generic float-bank binop handler. Operand layout `ff>f` (1B src1
 /// + 1B src2 + 1B dst). RPython parity: same as `binop_int_record`
-/// but on the float bank — `pyjitpl.py:284-292`'s exec-generated
+/// but on the float bank — `pyjitpl.py`'s exec-generated
 /// `opimpl_float_<binop>` reads two `f` regs, calls
 /// `self.execute(rop.<OPNUM>, b1, b2)`, and the trailing `>f`
 /// decorator writes the result into `registers_f[dst]`.
@@ -487,7 +760,7 @@ pub(crate) fn unop_float_record<Sym: WalkSym>(
 /// `handle` consults `dispatch_regular_record` before its per-opname
 /// `match`; a `Some` short-circuits it. The Rust analogue of the
 /// `@arguments`-decorated exec-generated `opimpl_*` families in
-/// `pyjitpl.py:279-368`, which collapse the opcode × register-bank cross
+/// `pyjitpl.py`, which collapse the opcode × register-bank cross
 /// product into one metaprogrammed table rather than spelling out each arm.
 macro_rules! regular_record_table {
     ( $( $helper:ident { $( $key:literal => $variant:ident, )+ } )* ) => {
@@ -511,7 +784,7 @@ macro_rules! regular_record_table {
 }
 
 regular_record_table! {
-    // Binary arithmetic `int_*`, from the `pyjitpl.py:279-292`
+    // Binary arithmetic `int_*`, from the `pyjitpl.py`
     // exec-generated `(box, box)` opimpl loop: read two `i`-coded reg
     // operands, `self.execute(rop.<OPNUM>, b1, b2)`. Operand layout
     // `ii>i` (1B src1 + 1B src2 + 1B dst). No MIFrame state — pure
@@ -519,7 +792,7 @@ regular_record_table! {
     // the canonical shape (`bhimpl_int_lshift`); a mixed `int_lshift/ri>i`
     // stays unwired because a Ref register flowing into an Int op is a
     // kind-flow bug, not a shape to handle. The `int_eq..int_ge`
-    // comparisons carry a `b1 is b2` fast path in `pyjitpl.py:326-336`;
+    // comparisons carry a `b1 is b2` fast path in `pyjitpl.py`;
     // the walker omits it (two distinct OpRefs record correctly and the
     // optimizer collapses tautological compares) since the recorder
     // shares constants by value rather than allocating a `ConstInt`.
@@ -538,8 +811,18 @@ regular_record_table! {
         "int_le/ii>i" => IntLe,
         "int_gt/ii>i" => IntGt,
         "int_ge/ii>i" => IntGe,
+        // The same generated loop also spells the unsigned members. They
+        // share the `ii>i` shape and differ only in how the recorded
+        // opcode reinterprets the operands, so they need no separate
+        // helper — `eval_binop_i` already folds each with u64 semantics.
+        "uint_rshift/ii>i" => UintRshift,
+        "uint_mul_high/ii>i" => UintMulHigh,
+        "uint_lt/ii>i" => UintLt,
+        "uint_le/ii>i" => UintLe,
+        "uint_gt/ii>i" => UintGt,
+        "uint_ge/ii>i" => UintGe,
     }
-    // Float arithmetic — same `pyjitpl.py:284-292` loop on the `f` bank.
+    // Float arithmetic — same `pyjitpl.py` loop on the `f` bank.
     // Codewriter today emits only float_add/float_sub/float_truediv
     // (float_mul appears only when an explicit `*` operand reaches the
     // codewriter; the bench set has none yet).
@@ -550,7 +833,7 @@ regular_record_table! {
         "float_truediv/ff>f" => FloatTrueDiv,
     }
     // Float comparisons `bhimpl_float_{lt,le,eq,ne,gt,ge}`
-    // (`blackhole.py:721-746`) — part of the same `pyjitpl.py:284-292`
+    // (`blackhole.py`) — part of the same `pyjitpl.py`
     // generated loop, but the recorder result lands in the int bank
     // (`ff>i`).
     binop_float_to_int_record {
@@ -561,10 +844,10 @@ regular_record_table! {
         "float_gt/ff>i" => FloatGt,
         "float_ge/ff>i" => FloatGe,
     }
-    // Int-bank unary ops: `pyjitpl.py:356-368` (int_neg / int_invert) +
+    // Int-bank unary ops: `pyjitpl.py` (int_neg / int_invert) +
     // 371-375 (int_same_as, which records `rop.SAME_AS_I` via
     // `_record_helper` — same shape, treated as a regular
-    // record-and-writeback). `int_is_true` (`pyjitpl.py:319-330`) is
+    // record-and-writeback). `int_is_true` (`pyjitpl.py`) is
     // Int-typed on the bank though semantically bool (matches the `>i`
     // destination shape).
     unop_int_record {
@@ -575,10 +858,28 @@ regular_record_table! {
     }
     unop_float_record {
         "float_neg/f>f" => FloatNeg,
+        // `float_abs` sits beside `float_neg` in the generated unary loop
+        // and `eval_unary_f` already folds it.
+        "float_abs/f>f" => FloatAbs,
     }
-    // `ptr_eq` / `ptr_ne` (`pyjitpl.py:326-336`): Ref operands, int result.
+    // Bank-crossing unary casts from the same `pyjitpl.py`
+    // generated unary loop; `unop_cast_record` selects the src/dst bank
+    // shape from the opcode (pyre's typed banks cannot share one template
+    // the way PyPy's untyped boxes do).
+    unop_cast_record {
+        "cast_int_to_float/i>f" => CastIntToFloat,
+        "cast_int_to_ptr/i>r" => CastIntToPtr,
+        "cast_ptr_to_int/r>i" => CastPtrToInt,
+    }
+    // `ptr_eq` / `ptr_ne` (`pyjitpl.py`): Ref operands, int result. The
+    // `instance_ptr_*` pair shares that generated compare loop —
+    // `jtransform.py` rewrites a pointer comparison whose operands are
+    // known instances into the `instance_ptr_*` spelling, which carries
+    // the same operand shape and the same fold.
     binop_ref_to_int_record {
         "ptr_eq/rr>i" => PtrEq,
         "ptr_ne/rr>i" => PtrNe,
+        "instance_ptr_eq/rr>i" => InstancePtrEq,
+        "instance_ptr_ne/rr>i" => InstancePtrNe,
     }
 }

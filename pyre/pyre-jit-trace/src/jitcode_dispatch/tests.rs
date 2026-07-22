@@ -57,7 +57,7 @@ fn fresh_trace_ctx() -> TraceCtx {
 }
 
 /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the
-/// production fallback at `pyjitpl.rs:4733` (`make_fail_descr_typed`)
+/// production fallback at `pyjitpl.rs` (`make_fail_descr_typed`)
 /// when the staticdata singleton was never attached.
 fn done_descr_ref_for_tests() -> DescrRef {
     make_fail_descr(1)
@@ -463,25 +463,28 @@ fn t3_audit_opname_gap_inventory() {
     // dispatch arms of `handle()` — they look like
     // `"<opname>/[argcodes]" => ...`.  Filter to entries that are
     // also in the runtime table to drop test-fixture literals.
+    // An arm may list several keys on one line (`"a/i" | "b/c" => ...`),
+    // so every literal on the line counts, not just the leading one —
+    // reading only the first silently under-reports the handled set.
     for line in source.lines() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('"') {
             continue;
         }
-        let Some(rest) = trimmed.strip_prefix('"') else {
-            continue;
-        };
-        let Some(end_quote_idx) = rest.find('"') else {
-            continue;
-        };
-        let key = &rest[..end_quote_idx];
-        // Must contain '/' (separates opname from argcodes); skip
-        // anything that doesn't look like an opname/argcodes literal.
-        if !key.contains('/') {
-            continue;
-        }
-        if runtime_names.contains(key) {
-            handled.insert(key.to_string());
+        for (idx, key) in trimmed.split('"').enumerate() {
+            // Odd indices are the quoted spans; even ones are the
+            // separators between them.
+            if idx % 2 == 0 {
+                continue;
+            }
+            // Must contain '/' (separates opname from argcodes); skip
+            // anything that doesn't look like an opname/argcodes literal.
+            if !key.contains('/') {
+                continue;
+            }
+            if runtime_names.contains(key) {
+                handled.insert(key.to_string());
+            }
         }
     }
 
@@ -572,7 +575,7 @@ fn regular_record_table_is_the_sole_dispatcher() {
 
     // (b) every key is a real codewriter-emitted opname, except the
     // documented dormant `int_same_as/i>i` forward-prep arm: RPython
-    // `jtransform.py:246 rewrite_op_same_as` strips `same_as` before
+    // `jtransform.py rewrite_op_same_as` strips `same_as` before
     // assembly, so it is intentionally absent from the runtime table while
     // its dispatch entry is kept for the walker's forward-prep path.
     let runtime = insns_opname_to_byte();
@@ -596,6 +599,692 @@ fn regular_record_table_is_the_sole_dispatcher() {
              it is dispatched by regular_record_table!",
         );
     }
+}
+
+fn drive_int_add_jump_if_ovf(
+    lhs_value: i64,
+    rhs_value: i64,
+) -> (Vec<OpCode>, usize, bool, u32, OpRef, OpRef, usize) {
+    let opname = "int_add_jump_if_ovf/Lii>i";
+    let ovf_byte = *insns_opname_to_byte()
+        .get(opname)
+        .expect("int_add_jump_if_ovf must be in the runtime instruction table");
+    let live_byte = *insns_opname_to_byte()
+        .get("live/")
+        .expect("live must be in the runtime instruction table");
+    // Lii>i: target 9, source registers 0/1, destination register 2.
+    // Separate live tails at 6 and 9 make fallthrough and jump observable.
+    let code = [ovf_byte, 9, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
+    let _ = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let lhs = OpRef::input_arg_int(0);
+    let rhs = OpRef::input_arg_int(1);
+    tc.set_opref_concrete(lhs, Value::Int(lhs_value));
+    tc.set_opref_concrete(rhs, Value::Int(rhs_value));
+    let mut regs_i = vec![lhs, rhs, OpRef::NONE];
+    let mut concrete_i = vec![
+        ConcreteValue::Int(lhs_value),
+        ConcreteValue::Int(rhs_value),
+        ConcreteValue::Null,
+    ];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut [],
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_add_jump_if_ovf must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    let dst = wc.registers_i[2];
+    drop(wc);
+    let ops = tc.ops();
+    let opcodes = ops.iter().map(|op| op.opcode).collect();
+    let guard_num_args = ops[1].num_args();
+    let guard_has_snapshot = ops[1].rd_resume_position.get() >= 0;
+    let guard_resume_pc = tc
+        .get_snapshot(ops[1].rd_resume_position.get())
+        .expect("overflow guard snapshot must exist")
+        .frames
+        .last()
+        .expect("overflow guard snapshot must contain its frame")
+        .pc;
+    let resbox = ops[0].pos.get();
+    (
+        opcodes,
+        guard_num_args,
+        guard_has_snapshot,
+        guard_resume_pc,
+        resbox,
+        dst,
+        next_pc,
+    )
+}
+
+#[test]
+fn int_add_jump_if_ovf_no_overflow_records_guard_no_overflow_and_writes_dst() {
+    let (opcodes, guard_num_args, guard_has_snapshot, guard_resume_pc, resbox, dst, next_pc) =
+        drive_int_add_jump_if_ovf(40, 2);
+    assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardNoOverflow],);
+    assert_eq!(guard_num_args, 0, "GuardNoOverflow is operand-less");
+    assert!(guard_has_snapshot);
+    assert_eq!(
+        guard_resume_pc, 0,
+        "the guard resumes at the overflow opcode"
+    );
+    assert_eq!(next_pc, 6, "no overflow continues at op.next_pc");
+    assert_eq!(dst, resbox, "the no-overflow continue writes resbox to dst");
+}
+
+#[test]
+fn int_add_jump_if_ovf_overflow_records_guard_overflow_and_jumps() {
+    let (opcodes, guard_num_args, guard_has_snapshot, guard_resume_pc, _, dst, next_pc) =
+        drive_int_add_jump_if_ovf(i64::MAX, 1);
+    assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardOverflow],);
+    assert_eq!(guard_num_args, 0, "GuardOverflow is operand-less");
+    assert!(guard_has_snapshot);
+    assert_eq!(
+        guard_resume_pc, 0,
+        "the guard resumes at the overflow opcode"
+    );
+    assert_eq!(dst, OpRef::NONE, "the overflow jump does not write dst");
+    assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+}
+
+#[test]
+fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
+    let byte = *insns_opname_to_byte()
+        .get("int_add_jump_if_ovf/Lii>i")
+        .expect("int_add_jump_if_ovf must be in the runtime instruction table");
+    let code = [byte, 6, 0, 0, 1, 2];
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_int(40);
+    let rhs = tc.const_int(2);
+    let mut regs_i = [lhs, rhs, OpRef::NONE];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("constant overflow arithmetic must fold");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    assert_eq!(
+        tc.num_ops(),
+        0,
+        "folding emits neither an ovf op nor a guard"
+    );
+    assert_eq!(regs_i[2].inline_const_to_value(), Some(Value::Int(42)));
+}
+
+#[test]
+fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("int_add_jump_if_ovf/Lii>i")
+        .expect("int_add_jump_if_ovf must be in the runtime instruction table");
+    let code = [byte, 6, 0, 0, 1, 2];
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let lhs = OpRef::input_arg_int(0);
+    let rhs = OpRef::input_arg_int(1);
+    let mut regs_i = [lhs, rhs, OpRef::NONE];
+    let err = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect_err("an unstamped overflow operand must decline");
+    assert_eq!(
+        err,
+        DispatchError::IntOvfOperandNotConcrete { pc: 0, value: lhs }
+    );
+    assert_eq!(tc.num_ops(), 0, "a declined overflow jump records nothing");
+}
+
+/// Drive one of the `d>r` struct-allocation handlers (`new`,
+/// `new_with_vtable`): both record the descr alone and write the
+/// allocation into the ref bank.
+fn drive_alloc_with_descr(opname: &str, expected_opcode: OpCode) {
+    let nwv_byte = *insns_opname_to_byte()
+        .get(opname)
+        .unwrap_or_else(|| panic!("`{opname}` must be in the runtime instruction table"));
+    let live_byte = *insns_opname_to_byte()
+        .get("live/")
+        .expect("live must be in the runtime instruction table");
+    // `d>r`: 2B descr index (0) + 1B dst register (0); live tail at 4.
+    let code = [nwv_byte, 0, 0, 0, live_byte, 0, 0];
+    let _ = test_outer_resume_jitcode_index();
+    let descr_pool = vec![crate::descr::w_int_size_descr()];
+    let mut tc = TraceCtx::for_test_types(&[]);
+    let mut regs_r = vec![OpRef::NONE];
+    let mut concrete_r = vec![ConcreteValue::Null];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut concrete_r,
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    let dst = wc.registers_r[0];
+    drop(wc);
+
+    let ops = tc.ops();
+    assert_eq!(
+        ops.iter().map(|op| op.opcode).collect::<Vec<_>>(),
+        vec![expected_opcode],
+    );
+    assert_eq!(
+        ops[0].num_args(),
+        0,
+        "the allocation records the descr alone, with no box operands"
+    );
+    assert_eq!(
+        dst,
+        ops[0].pos.get(),
+        "the `>r` decorator writes the allocation into the ref bank"
+    );
+    assert_eq!(next_pc, 4, "`d>r` consumes a 2B descr plus a 1B dst");
+}
+
+#[test]
+fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
+    drive_alloc_with_descr("new_with_vtable/d>r", OpCode::NewWithVtable);
+}
+
+#[test]
+fn new_records_the_alloc_and_writes_the_ref_dst() {
+    drive_alloc_with_descr("new/d>r", OpCode::New);
+}
+
+/// Step one record-only opcode (the heapcache hints, the raw-memory pair)
+/// over caller-supplied banks.
+fn run_hint_step(
+    code: &[u8],
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    concrete_r: &mut [ConcreteValue],
+    regs_i: &mut [OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    run_hint_step_with_descrs(code, tc, regs_r, concrete_r, regs_i, &[])
+}
+
+fn run_hint_step_with_descrs(
+    code: &[u8],
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    concrete_r: &mut [ConcreteValue],
+    regs_i: &mut [OpRef],
+    descr_pool: &[DescrRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Guard-emitting arms need a resolvable outer resume coordinate for the
+    // snapshot; record-only arms ignore these two fields.
+    let outer_jitcode_index = test_outer_resume_jitcode_index();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: regs_r,
+        registers_i: regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: concrete_r,
+        concrete_registers_i: &mut [],
+        descr_refs: descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(code, 0, &mut wc)
+}
+
+#[test]
+fn assert_not_none_records_when_the_operand_has_a_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("assert_not_none/r")
+        .expect("`assert_not_none/r` must be in insns table");
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`assert_not_none/r` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2, "`r` consumes a single register byte");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::AssertNotNone);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![operand],
+    );
+}
+
+#[test]
+fn assert_not_none_declines_when_the_operand_has_no_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("assert_not_none/r")
+        .expect("`assert_not_none/r` must be in insns table");
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [operand];
+    // No shadow for the slot: the walker never observed this pointer, so
+    // it cannot stand behind the non-null check the recorder performs.
+    let mut concrete_r = [ConcreteValue::Null];
+    let err = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect_err("a shadow-less operand must decline instead of asserting");
+    assert_eq!(
+        err,
+        DispatchError::UnsupportedOpname {
+            pc: 0,
+            key: "assert_not_none/r",
+        },
+    );
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a declined step must not leave a recorded op behind"
+    );
+}
+
+#[test]
+fn assert_not_none_uses_known_nonnull_heapcache_without_a_ref_shadow() {
+    let byte = *insns_opname_to_byte()
+        .get("assert_not_none/r")
+        .expect("`assert_not_none/r` must be in insns table");
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.heap_cache_mut().new_object(operand);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("a heapcache-known allocation needs no ref shadow");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the known-nonnull fast path records no AssertNotNone"
+    );
+}
+
+#[test]
+fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_int_eq/iiL")
+        .expect("`goto_if_not_int_eq/iiL` must be in insns table");
+    let code = [byte, 0x00, 0x00, 0x09, 0x00];
+    let mut same_tc = TraceCtx::for_test_types(&[Type::Int]);
+    let same = OpRef::input_arg_int(0);
+    let mut same_regs = [same];
+    let (_, same_next) = run_hint_step(&code, &mut same_tc, &mut [], &mut [], &mut same_regs)
+        .expect("a same-box equality has a static direction");
+    assert_eq!(same_next, code.len());
+    assert_eq!(
+        same_tc.num_ops(),
+        0,
+        "same-box equality records no compare or guard"
+    );
+
+    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let mut const_tc = fresh_trace_ctx();
+    let lhs = const_tc.const_int(4);
+    let rhs = const_tc.const_int(5);
+    let mut const_regs = [lhs, rhs];
+    let (_, const_next) = run_hint_step(&code, &mut const_tc, &mut [], &mut [], &mut const_regs)
+        .expect("constant equality has a static direction");
+    assert_eq!(const_next, 9);
+    assert_eq!(
+        const_tc.num_ops(),
+        0,
+        "constant equality records no compare or guard"
+    );
+
+    let ptr_byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_ne/rrL")
+        .expect("`goto_if_not_ptr_ne/rrL` must be in insns table");
+    let ptr_code = [ptr_byte, 0x00, 0x00, 0x09, 0x00];
+    let mut ptr_tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let same_ptr = OpRef::input_arg_ref(0);
+    let mut ptr_regs = [same_ptr];
+    let (_, ptr_next) = run_hint_step(&ptr_code, &mut ptr_tc, &mut ptr_regs, &mut [], &mut [])
+        .expect("a same-box pointer inequality has a static direction");
+    assert_eq!(ptr_next, 9);
+    assert_eq!(
+        ptr_tc.num_ops(),
+        0,
+        "same-box pointer inequality records no compare or guard"
+    );
+}
+
+#[test]
+fn fused_ptr_compare_uses_ref_shadows_for_the_runtime_direction() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_eq/rrL")
+        .expect("`goto_if_not_ptr_eq/rrL` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let lhs = OpRef::input_arg_ref(0);
+    let rhs = OpRef::input_arg_ref(1);
+    let mut regs_r = [lhs, rhs];
+    let ptr = 0xdead_beef_usize as *mut pyre_object::pyobject::PyObject;
+    let mut concrete_r = [ConcreteValue::Ref(ptr), ConcreteValue::Ref(ptr)];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("ref shadows determine the pointer comparison direction");
+    assert_eq!(next_pc, code.len());
+    assert_eq!(
+        tc.ops().iter().map(|op| op.opcode).collect::<Vec<_>>(),
+        vec![OpCode::PtrEq, OpCode::GuardTrue]
+    );
+}
+
+#[test]
+fn hint_force_virtualizable_is_a_noop_without_virtualizable_info() {
+    let byte = *insns_opname_to_byte()
+        .get("hint_force_virtualizable/r")
+        .expect("`hint_force_virtualizable/r` must be in insns table");
+    // `r`: 1B ref reg.
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let vable = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [vable];
+    let mut concrete_r = [ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`hint_force_virtualizable/r` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2, "`r` consumes a single register byte");
+    // `gen_store_back_in_vable` returns before emitting anything when the
+    // jitdriver carries no virtualizable info -- the upstream `vinfo is None`
+    // gate -- so the hint writes back nothing here.
+    assert_eq!(tc.num_ops(), ops_before);
+}
+
+#[test]
+fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    // `rL`: 1B ref reg + 2B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`goto_if_not_ptr_nonzero/rL` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 4,
+        "a non-null pointer falls through past the 3 operand bytes"
+    );
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(
+        last.opcode,
+        majit_ir::OpCode::GuardNonnull,
+        "`_establish_nullity` guards the observed non-nullness"
+    );
+    assert!(
+        tc.heap_cache()
+            .is_nullity_known(operand, |_| None)
+            .is_some(),
+        "the nullity must be stamped into the heapcache"
+    );
+}
+
+#[test]
+fn goto_if_not_ptr_iszero_takes_the_branch_when_nonnull() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_iszero/rL")
+        .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`goto_if_not_ptr_iszero/rL` must dispatch");
+    assert_eq!(
+        next_pc, 9,
+        "iszero jumps exactly where nonzero falls through"
+    );
+}
+
+#[test]
+fn goto_if_not_ptr_nonzero_guards_isnull_and_takes_the_branch() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(std::ptr::null_mut())];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`goto_if_not_ptr_nonzero/rL` must dispatch");
+    assert_eq!(next_pc, 9, "a null pointer takes the branch");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::GuardIsnull);
+}
+
+#[test]
+fn goto_if_not_ptr_nonzero_declines_without_a_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Null];
+    let err = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect_err("an unobserved pointer must decline, not pick a direction");
+    assert_eq!(
+        err,
+        DispatchError::UnsupportedOpname {
+            pc: 0,
+            key: "goto_if_not_ptr_nonzero/rL",
+        },
+    );
+    assert_eq!(tc.num_ops(), ops_before, "a declined step records nothing");
+}
+
+#[test]
+fn raw_load_i_records_the_load_against_the_descr() {
+    let byte = *insns_opname_to_byte()
+        .get("raw_load_i/iid>i")
+        .expect("`raw_load_i/iid>i` must be in insns table");
+    // `iid>i`: 1B base + 1B offset + 2B descr + 1B dst.
+    let code = [byte, 0x00, 0x01, 0x00, 0x00, 0x02];
+    let descr_pool = vec![crate::descr::w_int_size_descr()];
+    let mut tc = fresh_trace_ctx();
+    let base = tc.const_int(0x1000);
+    let offset = tc.const_int(8);
+    let mut regs_i = [base, offset, OpRef::NONE];
+    let (outcome, next_pc) =
+        run_hint_step_with_descrs(&code, &mut tc, &mut [], &mut [], &mut regs_i, &descr_pool)
+            .expect("`raw_load_i/iid>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "`iid>i` consumes 3 register bytes plus a 2B descr"
+    );
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RawLoadI);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![base, offset],
+        "raw loads record the address pair only; the descr rides alongside",
+    );
+    assert_eq!(
+        regs_i[2],
+        last.pos.get(),
+        "the `>i` decorator writes the dst"
+    );
+}
+
+#[test]
+fn raw_store_i_records_the_store_and_writes_no_register() {
+    let byte = *insns_opname_to_byte()
+        .get("raw_store_i/iiid")
+        .expect("`raw_store_i/iiid` must be in insns table");
+    // `iiid`: 1B base + 1B offset + 1B value + 2B descr.
+    let code = [byte, 0x00, 0x01, 0x02, 0x00, 0x00];
+    let descr_pool = vec![crate::descr::w_int_size_descr()];
+    let mut tc = fresh_trace_ctx();
+    let base = tc.const_int(0x1000);
+    let offset = tc.const_int(8);
+    let value = tc.const_int(42);
+    let mut regs_i = [base, offset, value];
+    let (outcome, next_pc) =
+        run_hint_step_with_descrs(&code, &mut tc, &mut [], &mut [], &mut regs_i, &descr_pool)
+            .expect("`raw_store_i/iiid` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "`iiid` consumes 3 register bytes plus a 2B descr"
+    );
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RawStore);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![base, offset, value],
+    );
+    assert_eq!(
+        regs_i,
+        [base, offset, value],
+        "a raw store leaves every register untouched"
+    );
+}
+
+#[test]
+fn record_exact_class_records_the_hint_with_both_operands() {
+    let byte = *insns_opname_to_byte()
+        .get("record_exact_class/ri")
+        .expect("`record_exact_class/ri` must be in insns table");
+    // `ri`: 1B ref reg + 1B int reg holding the class vtable address.
+    let code = [byte, 0x00, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let cls = tc.const_int(0x4000);
+    let mut regs_r = [operand];
+    let mut regs_i = [cls];
+    let mut concrete_r = [ConcreteValue::Null];
+    let (outcome, next_pc) =
+        run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+            .expect("`record_exact_class/ri` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3, "`ri` consumes two register bytes");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RecordExactClass);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![operand, cls],
+    );
 }
 
 #[test]
@@ -792,7 +1481,7 @@ fn switch_id_requires_concrete_int_value() {
 fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     // `goto_if_not/iL` with a concrete non-zero Int: emit GuardTrue,
     // do NOT take the jump (pc advances past the 3-byte operand
-    // block).  RPython `pyjitpl.py:511-520 opimpl_goto_if_not`
+    // block).  RPython `pyjitpl.py opimpl_goto_if_not`
     // `if switchcase: opnum = rop.GUARD_TRUE; ... if not switchcase: self.pc = target`.
     let goto_if_byte = *insns_opname_to_byte()
         .get("goto_if_not/iL")
@@ -1275,7 +1964,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     // `SubReturn { result: Some(callee.registers_i[0]) }`; the
     // caller's helper writes that OpRef into the caller's
     // `registers_i[dst]` (NOT registers_r — the kind discriminator
-    // for this variant). RPython parity: pyjitpl.py:1266-1324
+    // for this variant). RPython parity: pyjitpl.py
     // exec-generated `_opimpl_inline_call_r_i` template paired with
     // `_opimpl_any_return` for `int_return`.
     //
@@ -1439,7 +2128,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
     // Acceptance: caller's `inline_call_ir_r/dIR>r` carries
     // both an I-list and an R-list. The callee's int + ref register
     // banks must both be populated (RPython
-    // `pyjitpl.py:230-260 setup_call(argboxes_i, argboxes_r,
+    // `pyjitpl.py setup_call(argboxes_i, argboxes_r,
     // argboxes_f)`). Smoke test: callee body is `ref_return r0` —
     // the ref arg routes through registers_r[0] back to the caller's
     // dst slot. The int arg flowing into registers_i[0] is dead but
@@ -1771,7 +2460,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
     // `SubRaise { exc }` to the caller's inline_call handler. With
     // no caller-side `catch_exception/L` and is_top_level=true on
     // the outermost walker, RPython
-    // `pyjitpl.py:2533-2538 finishframe_exception` records
+    // `pyjitpl.py finishframe_exception` records
     // `compile_exit_frame_with_exception(last_exc_box)` — i.e.
     // FINISH(exc, exit_frame_with_exception_descr_ref) and exits
     // the trace. Walker mirrors this in `walk()`: top-level
@@ -2207,7 +2896,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
     // `int_return/i` mirrors `ref_return/r` on the int bank.
     // Top-level re-boxes the int for the Type::Ref portal exit
     // (`wrapint` = NEW_WITH_VTABLE + SETFIELD_GC) and stashes the
-    // boxed value as the finish payload (RPython `pyjitpl.py:3206-3208
+    // boxed value as the finish payload (RPython `pyjitpl.py
     // compile_done_with_this_frame`).
     let ret_byte = *insns_opname_to_byte()
         .get("int_return/i")
@@ -2292,7 +2981,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
 fn step_through_int_return_subwalk_surfaces_subreturn_some() {
     // nested `int_return/i` propagates SubReturn{Some(value)}
     // — same shape as `ref_return/r` sub-walk. RPython
-    // `pyjitpl.py:1688-1698 finishframe → popframe` returns control to
+    // `pyjitpl.py finishframe → popframe` returns control to
     // caller's metainterp loop with the box in hand.
     let ret_byte = *insns_opname_to_byte()
         .get("int_return/i")
@@ -2362,7 +3051,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
 #[test]
 fn step_through_void_return_stashes_void_finish_payload() {
     // Top-level `void_return/` is the VOID portal exit (RPython
-    // `pyjitpl.py:3202-3205 compile_done_with_this_frame`, the
+    // `pyjitpl.py compile_done_with_this_frame`, the
     // `result_type == VOID` branch — `exits = []`,
     // `token = sd.done_with_this_frame_descr_void`).  Under the
     // `PYRE_FBW_CALL_ASSEMBLER` gate (default on) it mirrors the three
@@ -2436,7 +3125,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
 #[test]
 fn step_through_void_return_subwalk_surfaces_subreturn_none() {
     // nested `void_return/` propagates SubReturn{None} —
-    // RPython `pyjitpl.py:467-469 opimpl_void_return → finishframe(None)`.
+    // RPython `pyjitpl.py opimpl_void_return → finishframe(None)`.
     // The caller's `inline_call_*_v` variant (when one exists) does
     // not write a dst register; today the walker has no `_v`
     // inline_call handler so `SubReturn{None}` reaching an `_r_r`
@@ -2564,7 +3253,7 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
 fn step_through_goto_jumps_to_label_target() {
     // `goto/L` reads its 2-byte LE label and the walker
     // returns Continue at the label target, not the linear next pc.
-    // RPython `blackhole.py:950-952 bhimpl_goto(target): return target`.
+    // RPython `blackhole.py bhimpl_goto(target): return target`.
     let goto_byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
@@ -2684,7 +3373,7 @@ fn step_through_goto_handles_high_byte_of_label() {
 #[test]
 fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
     // `finishframe_lookahead_at` must mirror RPython
-    // `pyjitpl.py:2506-2531 finishframe_exception` line-by-line —
+    // `pyjitpl.py finishframe_exception` line-by-line —
     // sequential `catch_exception/L` then `rvmprof_code/ii` then
     // fall-through.
     //
@@ -2736,7 +3425,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
 
 #[test]
 fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
-    // RPython `pyjitpl.py:497-504 opimpl_catch_exception`:
+    // RPython `pyjitpl.py opimpl_catch_exception`:
     //   assert not self.metainterp.last_exc_value
     // Reaching catch_exception/L on the normal walk path with
     // last_exc_value=Some(_) violates the codewriter invariant —
@@ -2798,7 +3487,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
 #[test]
 fn step_through_catch_exception_advances_past_label_operand() {
     // `catch_exception/L` records nothing on the normal
-    // walk (RPython `pyjitpl.py:497-504 opimpl_catch_exception` is
+    // walk (RPython `pyjitpl.py opimpl_catch_exception` is
     // an `assert not last_exc_value` only) and the walker advances
     // linearly past the 2-byte target.
     let catch_byte = *insns_opname_to_byte()
@@ -2863,7 +3552,7 @@ fn step_through_catch_exception_advances_past_label_operand() {
 
 #[test]
 fn step_through_raise_records_outermost_finish_and_terminates() {
-    // RPython `pyjitpl.py:1688-1698 opimpl_raise` →
+    // RPython `pyjitpl.py opimpl_raise` →
     // `finishframe_exception` (outermost-frame branch) →
     // `compile_exit_frame_with_exception` records
     // `FINISH(exc, descr=exit_frame_with_exception_descr_ref)`.
@@ -2970,7 +3659,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     let mut tc = fresh_trace_ctx();
     // Use a non-constant OpRef so the heapcache class-known flag
     // actually pins. pyre's `is_class_known(constant)` returns
-    // false (`heapcache.rs:1014`) while `class_now_known(constant)`
+    // false (`heapcache.rs`) while `class_now_known(constant)`
     // is a no-op, so constants never round-trip through the
     // class-pinned cache.
     let exc_box = OpRef::input_arg_ref(0);
@@ -3035,7 +3724,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
 
     // Only the GuardClass op lands inline: `raise/r` records it during
     // dispatch (the GUARD_CLASS precedes the FINISH per
-    // `pyjitpl.py:1690-1696`), then the top-level SubRaise stashes the
+    // `pyjitpl.py`), then the top-level SubRaise stashes the
     // exception as an `is_exception` finish payload — the FINISH is
     // recorded by the FBW Terminate arm's compile consumer, not inline.
     assert_eq!(
@@ -3075,10 +3764,10 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
     // `reraise/` mirrors `raise/r` for the top-level
     // frame — it records `FINISH(last_exc_value,
     // exit_frame_with_exception_descr_ref)`. RPython parity:
-    // `pyjitpl.py:1700-1704 opimpl_reraise → popframe →
+    // `pyjitpl.py opimpl_reraise → popframe →
     // finishframe_exception` when the framestack is empty falls
     // through to `compile_exit_frame_with_exception(last_exc_box)`
-    // (pyjitpl.py:2533-2538).
+    // (pyjitpl.py).
     let reraise_byte = *insns_opname_to_byte()
         .get("reraise/")
         .expect("`reraise/` must be in insns table");
@@ -3159,7 +3848,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
 
 #[test]
 fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
-    // RPython `pyjitpl.py:1702 opimpl_reraise`:
+    // RPython `pyjitpl.py opimpl_reraise`:
     //   assert self.metainterp.last_exc_value
     // — reaching `reraise` without an active exception is a
     // codewriter invariant violation. Walker surfaces it as a
@@ -3217,7 +3906,7 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
 #[test]
 fn raise_at_top_level_populates_last_exc_value_before_finish() {
     // `raise/r` at top-level records FINISH and *also*
-    // sets `ctx.last_exc_value` (RPython `pyjitpl.py:1695`). The
+    // sets `ctx.last_exc_value` (RPython `pyjitpl.py`). The
     // post-condition matters because a future opcode in a
     // wrap-around (e.g. an unconditional `reraise/` after the
     // raise) would read it. Independently asserting the field
@@ -3283,7 +3972,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     // the caller; caller's inline_call SubRaise arm probes
     // `op.next_pc` for `live/` + `catch_exception/L`, finds it,
     // sets `last_exc_value = exc`, and resumes at the catch target.
-    // RPython parity: `pyjitpl.py:2506-2522 finishframe_exception`
+    // RPython parity: `pyjitpl.py finishframe_exception`
     // line-by-line — `op_live` skip then `op_catch_exception`
     // target jump.
     let raise_byte = *insns_opname_to_byte()
@@ -3427,7 +4116,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
     // loop with no `catch_exception/L` match, the loop returns
     // `SubRaise` unchanged so the parent's inline_call SubRaise arm
     // can scan its own op.next_pc for a catch handler.
-    // RPython parity: `pyjitpl.py:2533 finishframe_exception` loops
+    // RPython parity: `pyjitpl.py finishframe_exception` loops
     // through the framestack — only when `framestack` is exhausted
     // does it call `compile_exit_frame_with_exception`. Sub-walks
     // are not the framestack root.
@@ -3541,7 +4230,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
     // `int_copy/i>i` reads the src `i` operand for OOR
     // validation, advances past 2 operand bytes, records nothing.
     // Dst writeback (`registers_i[dst] = registers_i[src]`) is
-    // deferred — RPython `pyjitpl.py:471-477 _opimpl_any_copy(box)
+    // deferred — RPython `pyjitpl.py _opimpl_any_copy(box)
     // -> box` is a register rename only, no IR op.
     let int_copy_byte = *insns_opname_to_byte()
         .get("int_copy/i>i")
@@ -4184,7 +4873,7 @@ fn int_and_records_intand() {
 // `int_or/ii>i` is not currently in `pipeline.insns` — pyre's
 // interpreter source does not emit Rust `|` on integers in any
 // path the JIT traces.  RPython's `Assembler.insns` only carries
-// emitted opnames (`assembler.py:220
+// emitted opnames (`assembler.py
 // setdefault(key, len(self.insns))`); pyre's runtime now mirrors
 // that (build.rs walks only `pipeline.insns`).  The dispatcher
 // handler exists; this test will unignore once an interpreter
@@ -4202,6 +4891,40 @@ fn int_xor_records_intxor() {
 #[test]
 fn int_rshift_records_intrshift() {
     drive_int_binop("int_rshift/ii>i", majit_ir::OpCode::IntRshift);
+}
+
+// The unsigned members of the same generated binop loop. They reach the
+// walker through `record_binop_i`, which the legacy dispatcher also feeds
+// from `BC_UINT_*`; the shape is identical to the signed arms, so the
+// driver covers them unchanged.
+#[test]
+fn uint_rshift_records_uintrshift() {
+    drive_int_binop("uint_rshift/ii>i", majit_ir::OpCode::UintRshift);
+}
+
+#[test]
+fn uint_mul_high_records_uintmulhigh() {
+    drive_int_binop("uint_mul_high/ii>i", majit_ir::OpCode::UintMulHigh);
+}
+
+#[test]
+fn uint_lt_records_uintlt() {
+    drive_int_binop("uint_lt/ii>i", majit_ir::OpCode::UintLt);
+}
+
+#[test]
+fn uint_le_records_uintle() {
+    drive_int_binop("uint_le/ii>i", majit_ir::OpCode::UintLe);
+}
+
+#[test]
+fn uint_gt_records_uintgt() {
+    drive_int_binop("uint_gt/ii>i", majit_ir::OpCode::UintGt);
+}
+
+#[test]
+fn uint_ge_records_uintge() {
+    drive_int_binop("uint_ge/ii>i", majit_ir::OpCode::UintGe);
 }
 
 #[test]
@@ -4336,7 +5059,7 @@ fn drive_int_between(
     (new_ops, dst_post, arg_b1)
 }
 
-/// `pyjitpl.py:2648-2662 execute_and_record` — when every argbox
+/// `pyjitpl.py execute_and_record` — when every argbox
 /// is `ConstInt`, a pure op like `INT_SUB` / `INT_EQ` is folded
 /// via `wrap_constant` and never reaches `_record_helper`.
 /// `opimpl_int_between(ConstInt, ConstInt, ConstInt)` chains three
@@ -4361,7 +5084,7 @@ fn int_between_const_inputs_with_unit_width_takes_inteq_fast_path() {
     );
 }
 
-/// All-Const generic path: `pyjitpl.py:2648-2662` folds the three
+/// All-Const generic path: `pyjitpl.py` folds the three
 /// pure binops without recording.  Destination must carry the
 /// folded UINT_LT result.
 #[test]
@@ -4505,12 +5228,13 @@ fn float_truediv_records_floattruediv() {
     drive_float_binop("float_truediv/ff>f", majit_ir::OpCode::FloatTrueDiv);
 }
 
-#[test]
-fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
+/// Drive a single `float_<unop>/f>f` handler. Same shape pattern as
+/// `drive_float_binop` minus one read.
+fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     // `f>f` shape: 1B src + 1B dst = 2 operand bytes after opcode.
     let byte = *insns_opname_to_byte()
-        .get("float_neg/f>f")
-        .expect("`float_neg/f>f` must be in insns table");
+        .get(opname)
+        .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x02, 0x05];
     let mut tc = fresh_trace_ctx();
     let mut regs_f = distinct_const_refs(&mut tc, 8);
@@ -4557,24 +5281,35 @@ fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 3, "float_neg/f>f operand layout `f>f` = 2 bytes");
+    assert_eq!(next_pc, 3, "`{opname}` operand layout `f>f` = 2 bytes");
     let dst_post = wc.registers_f[5];
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
     let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, majit_ir::OpCode::FloatNeg);
+    assert_eq!(last.opcode, expected_opcode);
     assert_eq!(
         last.getarglist()
             .iter()
             .map(|a| a.to_opref())
             .collect::<Vec<_>>(),
         vec![arg],
-        "FloatNeg args must be [registers_f[src]]",
+        "`{opname}` args must be [registers_f[src]]",
     );
     assert_eq!(dst_post, last.pos.get());
+}
+
+#[test]
+fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
+    drive_float_unop("float_neg/f>f", majit_ir::OpCode::FloatNeg);
+}
+
+#[test]
+fn float_abs_records_floatabs() {
+    drive_float_unop("float_abs/f>f", majit_ir::OpCode::FloatAbs);
 }
 
 /// Drive a single `int_<unop>/i>i` handler. Same shape pattern as
@@ -4661,7 +5396,7 @@ fn int_invert_records_intinvert() {
 
 #[test]
 fn int_same_as_is_eliminated_from_generated_insns_table() {
-    // RPython `jtransform.py:246 rewrite_op_same_as` removes
+    // RPython `jtransform.py rewrite_op_same_as` removes
     // `same_as` before assembly. The walker keeps a handler arm for
     // forward-prep, but the production insns table should not contain
     // the opname unless a future codewriter path legitimately emits it.
@@ -4754,6 +5489,16 @@ fn ptr_eq_records_ptreq_with_two_ref_operands_into_int_dst() {
 #[test]
 fn ptr_ne_records_ptrne() {
     drive_ptr_compare("ptr_ne/rr>i", majit_ir::OpCode::PtrNe);
+}
+
+#[test]
+fn instance_ptr_eq_records_instanceptreq() {
+    drive_ptr_compare("instance_ptr_eq/rr>i", majit_ir::OpCode::InstancePtrEq);
+}
+
+#[test]
+fn instance_ptr_ne_records_instanceptrne() {
+    drive_ptr_compare("instance_ptr_ne/rr>i", majit_ir::OpCode::InstancePtrNe);
 }
 
 #[test]
@@ -4942,7 +5687,7 @@ fn unsupported_opname_surfaces_typed_error() {
     // Stable choice for exercising the catch-all `UnsupportedOpname`
     // error path.  `vtable_method_ptr/rd>i` is a pyre-only backend
     // adaptation (emitted by `OpKind::VtableMethodPtr` /
-    // `assembler.rs:2762`) without a PyPy analog: Python dispatch
+    // `assembler.rs`) without a PyPy analog: Python dispatch
     // resolves through `cpu.bh_call_*` at runtime rather than
     // reifying a method pointer into the bytecode stream.  Zero
     // JitCode hits in production traces (per
@@ -5000,7 +5745,7 @@ fn unsupported_opname_surfaces_typed_error() {
 }
 
 /// `ptr_nonzero/r>i` records `PtrNe(box, CONST_NULL)` into the
-/// int dst.  RPython parity: `pyjitpl.py:378-380 opimpl_ptr_nonzero`
+/// int dst.  RPython parity: `pyjitpl.py opimpl_ptr_nonzero`
 /// returns `self.execute(rop.PTR_NE, box, CONST_NULL)`.
 #[test]
 fn ptr_nonzero_records_ptrne_with_box_and_null() {
@@ -5060,7 +5805,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
     assert!(matches!(outcome, DispatchOutcome::Continue));
     assert_eq!(next_pc, 3);
     // `get_or_insert_typed` mints a fresh OpRef on every call (see
-    // `constant_pool.rs:87` — equality is `Const.same_constant`, not
+    // `constant_pool.rs` — equality is `Const.same_constant`, not
     // OpRef identity), so we cannot compare against a freshly-minted
     // null_const.  Verify args[1] is a Ref-typed constant whose
     // pooled value is 0 instead.
@@ -5094,7 +5839,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
 
 /// `abort/>r` is a pyre-only no-op result marker — the walker
 /// counterpart of blackhole's `handler_abort_result_marker_r`
-/// (`blackhole.rs:5149`).  No operand read, no register write, no
+/// (`blackhole.rs`).  No operand read, no register write, no
 /// IR op recorded; dispatch advances past the 1B dst slot only.
 #[test]
 fn abort_result_r_is_pure_pc_advance() {
@@ -5157,7 +5902,7 @@ fn abort_result_r_is_pure_pc_advance() {
 
 /// `ref_guard_value/r` records `GuardValue(value, ConstPtr(concrete))`
 /// when the symbolic OpRef is non-Const and a concrete pointer is
-/// available in the shadow.  Mirrors `pyjitpl.py:1916-1927
+/// available in the shadow.  Mirrors `pyjitpl.py
 /// implement_guard_value`.
 #[test]
 fn ref_guard_value_records_guardvalue_with_concrete_constant() {
@@ -5248,8 +5993,98 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     );
 }
 
+/// `int_guard_value/i` records `GuardValue(value, ConstInt(concrete))`
+/// through the same bank-parameterized body as the Ref and Float variants.
+#[test]
+fn int_guard_value_records_guardvalue_with_concrete_constant() {
+    let opname = "int_guard_value/i";
+    let byte = *insns_opname_to_byte()
+        .get(opname)
+        .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+    // Operand encoding `i`: 1B i-src only.
+    let code = [byte, 0];
+    let mut tc = fresh_trace_ctx();
+    let descr = done_descr_ref_for_tests();
+    // Symbolic side: a recorded op OpRef (not a Const).
+    let value_opref = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [OpRef::None];
+    let mut regs_i = [value_opref];
+    let mut concrete_i = [ConcreteValue::Int(42)];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: descr.clone(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+    wc.outer_resume_marker_jit_pc = Some(0);
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).expect("int_guard_value must record GuardValue");
+    assert!(matches!(outcome, DispatchOutcome::Continue));
+    assert_eq!(next_pc, 2);
+    assert_eq!(
+        wc.trace_ctx.num_ops(),
+        ops_before + 1,
+        "int_guard_value must record exactly one GuardValue op",
+    );
+    let (last_opcode, last_args0, last_args1, last_args_len) = {
+        let ops = wc.trace_ctx.ops();
+        let last = ops.last().expect("int_guard_value must record one op");
+        let args = last.getarglist();
+        (last.opcode, args[0].clone(), args[1].clone(), args.len())
+    };
+    assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
+    assert_eq!(last_args_len, 2);
+    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(wc.trace_ctx.const_value(last_args1.to_opref()), Some(42));
+    assert_eq!(
+        wc.trace_ctx.const_type(last_args1.to_opref()),
+        Some(Type::Int)
+    );
+    assert_eq!(
+        wc.registers_i[0],
+        last_args1.to_opref(),
+        "register slot still holding the original OpRef must be rewritten \
+         to the promoted constant (pyjitpl.py:1923 replace_box)",
+    );
+}
+
 /// Symbolic OpRef already a Const → `ref_guard_value/r` is a no-op
-/// (`pyjitpl.py:1920-1921 if isinstance(box, Const): return box`).
+/// (`pyjitpl.py if isinstance(box, Const): return box`).
 #[test]
 fn ref_guard_value_on_const_records_nothing() {
     let opname = "ref_guard_value/r";
@@ -5320,7 +6155,7 @@ fn ref_guard_value_on_const_records_nothing() {
 fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
     // `residual_call_r_r/iRd>r` records `OpCode::CallR`
     // with `[funcptr, ...args]` and `descr=descr_refs[d]`. RPython
-    // `pyjitpl.py:1334-1347 _opimpl_residual_call1` →
+    // `pyjitpl.py _opimpl_residual_call1` →
     // `do_residual_or_indirect_call → execute_and_record_varargs(
     // rop.CALL_R, [funcbox]+argboxes, descr=calldescr)`.
     let residual_byte = *insns_opname_to_byte()
@@ -5457,11 +6292,11 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
     );
     // `walker_capture_snapshot_for_last_guard` ports
     // `capture_resumedata(after_residual_call=True)`
-    // (`pyjitpl.py:2599-2603`).  Every guard emitted by a
+    // (`pyjitpl.py`).  Every guard emitted by a
     // residual_call dispatcher now carries a snapshot whose
     // `rd_resume_position` is the freshly-allocated snapshot id
     // (`>= 0`), so the optimizer's `store_final_boxes_in_guard`
-    // (`optimizeopt/mod.rs:5033`) finds attached resume data
+    // (`optimizeopt/mod.rs`) finds attached resume data
     // instead of panicking on the `-1` sentinel.
     assert!(
         guard_op.rd_resume_position.get() >= 0,
@@ -5524,7 +6359,7 @@ fn call_descr_with_oopspec(
 
 #[test]
 fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
-    // RPython parity: `do_residual_call` (pyjitpl.py:2111-2118) reads
+    // RPython parity: `do_residual_call` (pyjitpl.py) reads
     // `effectinfo.check_is_elidable()` + `effectinfo.check_can_raise()`,
     // then `execute_varargs(rop.CALL_R, ..., exc, pure)`. With
     // EF_ELIDABLE_CANNOT_RAISE: `pure=True` (CALL_PURE_R) + `exc=False`
@@ -5836,14 +6671,14 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     );
 }
 
-// pyjitpl.py:3329-3330 / 3349-3353 vable token protocol around a
+// pyjitpl.py / 3349-3353 vable token protocol around a
 // concrete-executed may-force call: with an active standard
 // virtualizable the executor sets TOKEN_TRACING_RESCALL before the
 // call and probes-and-clears after it.  A token still intact means
 // no force — execute + stamp as usual, token back to TOKEN_NONE.  A
 // cleared token means the callee forced the virtualizable —
 // `DispatchError::VableEscapedDuringResidualCall` (ABORT_ESCAPE,
-// pyjitpl.py:3365).
+// pyjitpl.py).
 fn bind_fake_vable(tc: &mut TraceCtx, buf: &mut [u8]) {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     assert!(
@@ -5944,7 +6779,7 @@ static FORCING_CALLEE_TOKEN_ADDR: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 extern "C" fn forces_vable_for_walker_test(a: i64, b: i64) -> i64 {
-    // A force path clears the vable token (virtualizable.rs:543
+    // A force path clears the vable token (virtualizable.rs
     // force_now on TOKEN_TRACING_RESCALL).
     let addr = FORCING_CALLEE_TOKEN_ADDR.load(std::sync::atomic::Ordering::SeqCst);
     unsafe { *(addr as *mut u64) = 0 };
@@ -6035,10 +6870,10 @@ fn may_force_vable_escape_surfaces_typed_abort() {
 
 #[test]
 fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py:2003-2005` routes
+    // RPython parity: `pyjitpl.py` routes
     // `OS_NOT_IN_TRACE` residual calls through `do_not_in_trace_call`
     // which executes the callee concretely and aborts to blackhole
-    // only if it raises (`pyjitpl.py:3683-3697`). The walker has no
+    // only if it raises (`pyjitpl.py`). The walker has no
     // concrete executor, so it must surface a typed error rather
     // than recording either the normal-return or
     // SwitchToBlackhole shape.
@@ -6104,7 +6939,7 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
 
 #[test]
 fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py:2011-2014` short-circuits
+    // RPython parity: `pyjitpl.py` short-circuits
     // `do_residual_call` via `_do_jit_force_virtual` when
     // `effectinfo.oopspecindex == OS_JIT_FORCE_VIRTUAL`.  The
     // walker can't reproduce that short-circuit (needs concrete
@@ -6379,7 +7214,7 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
     wc.outer_resume_marker_jit_pc = Some(0);
     let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
     // The dst slot must hold the OpRef of the recorded CallR. Each
-    // Op carries its OpRef in `op.pos` (recorder.rs:159), which lets
+    // Op carries its OpRef in `op.pos` (recorder.rs), which lets
     // the test compare without re-deriving the index (input args
     // also occupy OpRef indices, so `ops.iter().position()` would
     // be off by `num_inputargs`).
@@ -6403,11 +7238,11 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
 
 #[test]
 fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
-    // pyjitpl.py:1950 _opimpl_residual_call*: result lands in
+    // pyjitpl.py _opimpl_residual_call*: result lands in
     // `registers_*[reg_index]` BEFORE
     // `handle_possible_exception()` records GUARD_NO_EXCEPTION.
     // `walker_capture_snapshot_for_last_guard`
-    // (`pyjitpl.py:2599-2603 capture_resumedata(after_residual_call
+    // (`pyjitpl.py capture_resumedata(after_residual_call
     // =True)`) snapshots the active registers AFTER the writeback,
     // so the dst slot's recorded OpRef rides the snapshot's
     // fail_arg list.  The structural invariant tested here is:
@@ -6719,10 +7554,10 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
 #[test]
 fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
     // kind sibling of `_r_r`. Same `iRd>X` operand
-    // layout, dst kind flipped to int. RPython `pyjitpl.py:1346
+    // layout, dst kind flipped to int. RPython `pyjitpl.py
     // opimpl_residual_call_r_i = _opimpl_residual_call1` shares
     // the body; `do_residual_call`'s `descr.get_normalized_result_type()`
-    // dispatch (pyjitpl.py:2022-2044) selects `'i' → CALL_*_I`.
+    // dispatch (pyjitpl.py) selects `'i' → CALL_*_I`.
     // CallDescr required (RPython do_residual_call invariant);
     // walker records `OpCode::CallI` + `OpCode::GuardNoException`,
     // writes the call's OpRef into `registers_i[dst]`.
@@ -7072,7 +7907,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
 fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
     // The `_ir_*` shape gives
     // the walker source-list-order argboxes `[i_args..., r_args...]`,
-    // but RPython `_build_allboxes` (pyjitpl.py:1960-1993) re-orders
+    // but RPython `_build_allboxes` (pyjitpl.py) re-orders
     // those to match the callee's `descr.get_arg_types()` ABI. This
     // test pins the non-identity permutation.
     //
@@ -7181,7 +8016,7 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
 #[test]
 fn residual_call_descr_not_call_descr_surfaces_typed_error() {
     // Walker requires CallDescr per RPython invariant
-    // (pyjitpl.py:1995 do_residual_call). When the descr_pool entry
+    // (pyjitpl.py do_residual_call). When the descr_pool entry
     // at the operand-encoded index lacks a CallDescr downcast (here
     // a FailDescr), the walker surfaces ResidualCallDescrNotCallDescr.
     // In production the codewriter never emits non-CallDescr; this
@@ -8519,7 +9354,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     // writes the recorder OpRef into `registers_i[dst]` — the same
     // shape `getfield_gc_via_heapcache` produces on a cache miss.
     // The handler itself stays orthodox to RPython
-    // `pyjitpl.py:1167-1172 opimpl_getfield_vable_i`; the
+    // `pyjitpl.py opimpl_getfield_vable_i`; the
     // GETFIELD_GC fallback is `vable_getfield_int`'s decision, not
     // the walker's, so this test exercises the walker→trace_ctx
     // boundary without depending on a `virtualizable_info` fixture.
@@ -8707,7 +9542,7 @@ fn setfield_gc_i_redundant_write_skips_recording() {
     // When the heapcache already knows
     // valuebox is the current value of (obj, descr), the
     // SETFIELD_GC IR op must NOT be recorded. RPython parity:
-    // `pyjitpl.py:976 if upd.currfieldbox is valuebox: return`.
+    // `pyjitpl.py if upd.currfieldbox is valuebox: return`.
     let byte = *insns_opname_to_byte()
         .get("setfield_gc_i/rid")
         .expect("`setfield_gc_i/rid` must be in insns table");
@@ -9356,7 +10191,7 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     );
     // Post-condition: dispatch_via_miframe also sets
     // sym.class_of_last_exc_is_const to mirror RPython's
-    // `pyjitpl.py:1694 opimpl_raise: class_of_last_exc_is_const = True`.
+    // `pyjitpl.py opimpl_raise: class_of_last_exc_is_const = True`.
     assert!(
         sym.class_of_last_exc_is_const(),
         "sym.class_of_last_exc_is_const must be true after a raise/r",
@@ -9497,7 +10332,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
 /// visit of a (green key, red shape) registers the merge point and
 /// continues unrolling; the second visit with the same key + shape
 /// closes the loop with the reds as jump args.  Mirrors
-/// `pyjitpl.py:2994-3036` first-visit/found split.
+/// `pyjitpl.py` first-visit/found split.
 #[test]
 fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let jmp_byte = *insns_opname_to_byte()
@@ -9573,25 +10408,25 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     };
 
     // Arrival without a preceding `loop_header` stamp and with no
-    // recorded ops is a plain pass-through (pyjitpl.py:1547-1548):
+    // recorded ops is a plain pass-through (pyjitpl.py):
     // nothing registers, nothing closes.
     let (gated, gated_next) = step(&code, 0, &mut wc).expect("gated jit_merge_point must dispatch");
     assert_eq!(gated, DispatchOutcome::Continue);
     assert_eq!(gated_next, code.len());
 
     // First crossing via a backward jump: `loop_header` stamped the
-    // per-trace flag (pyjitpl.py:1527-1528) — registers
+    // per-trace flag (pyjitpl.py) — registers
     // (key, [red0, red1]) and continues.
     wc.trace_ctx.seen_loop_header_for_jdindex = 0;
     let (first, first_next) = step(&code, 0, &mut wc).expect("first jit_merge_point must dispatch");
     assert_eq!(first, DispatchOutcome::Continue);
     assert_eq!(first_next, code.len());
-    // The stamp is consumed (pyjitpl.py:1562).
+    // The stamp is consumed (pyjitpl.py).
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
 
     // Second stamped crossing (same key + red shape): closes the loop.
     // The reds here are constants, so `remove_consts_and_duplicates`
-    // (pyjitpl.py:2934-2965) replaces each with a freshly recorded
+    // (pyjitpl.py) replaces each with a freshly recorded
     // `same_as` op before the close — the jump args are runtime
     // OpRefs wrapping the original const reds, not the consts.
     wc.trace_ctx.seen_loop_header_for_jdindex = 0;
@@ -9614,7 +10449,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
 }
 
 /// `loop_header/i` stamps `seen_loop_header_for_jdindex` from its
-/// int-constant operand and records nothing (pyjitpl.py:1527-1528).
+/// int-constant operand and records nothing (pyjitpl.py).
 #[test]
 fn loop_header_stamps_seen_flag() {
     let lh_byte = *insns_opname_to_byte()
@@ -9670,6 +10505,77 @@ fn loop_header_stamps_seen_flag() {
     assert_eq!(next, code.len());
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
     assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
+}
+
+#[test]
+fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
+    let byte = *insns_opname_to_byte()
+        .get("jit_merge_point/iIRFIRF")
+        .expect("`jit_merge_point/iIRFIRF` must be in insns table");
+    let code = [
+        byte, 0x02, // jdindex is in i2, not the literal value 2
+        0x01, 0x00, // gi: [i0]
+        0x01, 0x00, // gr: [r0]
+        0x00, // gf
+        0x00, // ri
+        0x00, // rr
+        0x00, // rf
+    ];
+    let pycode_ptr = 0x1_0000usize;
+    let mut tc = TraceCtx::for_test_types_with_green_key(
+        &[Type::Ref],
+        crate::driver::make_green_key(pycode_ptr as *const (), 42),
+    );
+    let next_instr = tc.const_int(42);
+    let unused = tc.const_int(99);
+    let jdindex = tc.const_int(0);
+    let pycode = tc.const_ref(pycode_ptr as i64);
+    let mut regs_i = [next_instr, unused, jdindex];
+    let mut regs_r = [pycode];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    wc.trace_ctx.seen_loop_header_for_jdindex = 0;
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int-form merge point must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, code.len());
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
 }
 
 /// A green list with no concrete leading element cannot form the
@@ -9841,4 +10747,178 @@ fn callee_vable_ref_gates_on_frame_register_identity() {
     assert_eq!(super::callee_vable_ref_at(Some(&shadow), 1, 4), None);
     assert_eq!(super::callee_vable_ref_at(Some(&shadow), u16::MAX, 3), None);
     assert_eq!(super::callee_vable_ref_at(None, 1, 3), None);
+}
+
+/// `insert_renamings` routes a cyclic parallel move through the Int scratch
+/// (`int_push/i` then `int_pop/>i`).  The pop must land the source's concrete
+/// shadow in `concrete_registers_i[dst]`; leaving the destination slot's old
+/// shadow behind makes every later `read_int_reg_concrete` on that register
+/// report the value the move overwrote.
+#[test]
+fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
+    let push_byte = *insns_opname_to_byte()
+        .get("int_push/i")
+        .expect("int_push must be in the runtime instruction table");
+    let pop_byte = *insns_opname_to_byte()
+        .get("int_pop/>i")
+        .expect("int_pop must be in the runtime instruction table");
+    // Push r0, pop into r1: r1's pre-existing shadow must not survive.
+    let code = [push_byte, 0, pop_byte, 1];
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let src = OpRef::input_arg_int(0);
+    let dst_before = OpRef::input_arg_int(1);
+    tc.set_opref_concrete(src, Value::Int(7));
+    tc.set_opref_concrete(dst_before, Value::Int(99));
+    let mut regs_i = vec![src, dst_before];
+    let mut concrete_i = vec![ConcreteValue::Int(7), ConcreteValue::Int(99)];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut [],
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("`int_push/i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2);
+    let (outcome, next_pc) = step(&code, next_pc, &mut wc).expect("`int_pop/>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 4);
+    assert_eq!(wc.registers_i[1], src, "the pop moves the source OpRef");
+    assert_eq!(
+        wc.concrete_registers_i[1],
+        ConcreteValue::Int(7),
+        "the pop must overwrite the destination's stale concrete shadow",
+    );
+}
+
+/// `FASTPATHS_SAME_BOXES` membership, on the non-fused (macro-table) arms.
+/// The generated loop that carries `if b1 is b2: return <const>` spells only
+/// the six signed int compares plus the four ref compares; the unsigned
+/// compares live in the other loop and must still record their op.
+#[test]
+fn same_box_fastpath_covers_exactly_the_generated_fastpath_list() {
+    // (opname, expected folded value) for every FASTPATHS_SAME_BOXES member
+    // reachable through `binop_int_record` / `binop_ref_to_int_record`.
+    let int_cases: &[(&str, i64)] = &[
+        ("int_eq/ii>i", 1),
+        ("int_le/ii>i", 1),
+        ("int_ge/ii>i", 1),
+        ("int_ne/ii>i", 0),
+        ("int_lt/ii>i", 0),
+        ("int_gt/ii>i", 0),
+    ];
+    for (opname, expected) in int_cases {
+        let byte = *insns_opname_to_byte()
+            .get(*opname)
+            .unwrap_or_else(|| panic!("{opname} must be in the runtime instruction table"));
+        // Same register for both operands: `b1 is b2`.
+        let code = [byte, 0, 0, 1];
+        let mut tc = TraceCtx::for_test_types(&[Type::Int]);
+        let same = OpRef::input_arg_int(0);
+        let mut regs_i = vec![same, OpRef::NONE];
+        let (outcome, _) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+            .unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert!(
+            tc.ops().is_empty(),
+            "`{opname}` on identical boxes must answer without recording an op",
+        );
+        assert_eq!(
+            tc.constant_value(regs_i[1]),
+            Some(*expected),
+            "`{opname}` on identical boxes must fold to {expected}",
+        );
+    }
+    // The unsigned compares share the `ii>i` shape but are NOT fast-path
+    // members: they must still record.
+    for opname in [
+        "uint_lt/ii>i",
+        "uint_le/ii>i",
+        "uint_gt/ii>i",
+        "uint_ge/ii>i",
+    ] {
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("{opname} must be in the runtime instruction table"));
+        let code = [byte, 0, 0, 1];
+        let mut tc = TraceCtx::for_test_types(&[Type::Int]);
+        let same = OpRef::input_arg_int(0);
+        let mut regs_i = vec![same, OpRef::NONE];
+        let (outcome, _) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+            .unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            tc.ops().len(),
+            1,
+            "`{opname}` is not a same-boxes fast-path member and must record",
+        );
+    }
+}
+
+/// The four ref compares are all `FASTPATHS_SAME_BOXES` members, including
+/// `instance_ptr_eq` / `instance_ptr_ne`.
+#[test]
+fn ref_compare_same_box_fastpath_covers_the_instance_ptr_spellings() {
+    let cases: &[(&str, i64)] = &[
+        ("ptr_eq/rr>i", 1),
+        ("ptr_ne/rr>i", 0),
+        ("instance_ptr_eq/rr>i", 1),
+        ("instance_ptr_ne/rr>i", 0),
+    ];
+    for (opname, expected) in cases {
+        let byte = *insns_opname_to_byte()
+            .get(*opname)
+            .unwrap_or_else(|| panic!("{opname} must be in the runtime instruction table"));
+        let code = [byte, 0, 0, 0];
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let same = OpRef::input_arg_ref(0);
+        let mut regs_r = vec![same];
+        let mut concrete_r = vec![ConcreteValue::Null];
+        let mut regs_i = vec![OpRef::NONE];
+        let (outcome, _) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+            .unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert!(
+            tc.ops().is_empty(),
+            "`{opname}` on identical boxes must answer without recording an op",
+        );
+        assert_eq!(
+            tc.constant_value(regs_i[0]),
+            Some(*expected),
+            "`{opname}` on identical boxes must fold to {expected}",
+        );
+    }
 }
