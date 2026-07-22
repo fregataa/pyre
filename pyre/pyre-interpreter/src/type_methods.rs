@@ -450,6 +450,14 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let root_base = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(list);
             pyre_object::gc_roots::pin_root(other);
+            // listobject.py:1052 _extend_from_iterable — consult the length
+            // hint before iterating.  A `__length_hint__` returning a negative
+            // value raises ValueError, and one exceeding a C ssize_t raises
+            // OverflowError (via `int_w`), rather than being silently ignored.
+            crate::baseobjspace::length_hint(
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                0,
+            )?;
             let iterator =
                 crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
             pyre_object::gc_roots::pin_root(iterator);
@@ -1760,9 +1768,12 @@ struct ParsedSpec {
     fractional_grouping: Option<char>,
     precision: Option<usize>,
     ty: char,
+    /// The `z` option (PEP 682): coerce a negative-zero result to positive
+    /// zero. Held only in the pyre-side parse — the engine spec drops it.
+    no_neg_zero: bool,
     /// The equivalent pre-3.14 spec accepted by rustpython-common's format
-    /// engine (the fractional grouping marker, and its otherwise-empty dot,
-    /// are removed).
+    /// engine (the fractional grouping marker, its otherwise-empty dot, and
+    /// the `z` option are removed).
     engine_spec: String,
     width_start: usize,
     width_end: usize,
@@ -1785,6 +1796,15 @@ fn parse_spec(spec: &str) -> ParsedSpec {
     let mut sign: Option<char> = None;
     if i < n && matches!(chars[i], '+' | '-' | ' ') {
         sign = Some(chars[i]);
+        i += 1;
+    }
+    // PEP 682 `z`: sits after the sign and before `#`. The engine does not
+    // accept it, so record it and drop its index from `engine_spec` below.
+    let mut no_neg_zero = false;
+    let mut z_index: Option<usize> = None;
+    if i < n && chars[i] == 'z' {
+        no_neg_zero = true;
+        z_index = Some(i);
         i += 1;
     }
     let mut alt_form = false;
@@ -1848,13 +1868,20 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         .iter()
         .enumerate()
         .filter_map(|(index, ch)| {
-            if Some(index) == fractional_grouping_index || Some(index) == empty_precision_dot {
+            if Some(index) == fractional_grouping_index
+                || Some(index) == empty_precision_dot
+                || Some(index) == z_index
+            {
                 None
             } else {
                 Some(*ch)
             }
         })
         .collect();
+    // `z` precedes the width, so dropping it from `engine_spec` shifts the
+    // width slice left by one; `float_engine_spec_with_width` indexes the
+    // engine spec, so bias the recorded bounds to match.
+    let z_shift = z_index.is_some() as usize;
     ParsedSpec {
         fill,
         align,
@@ -1865,9 +1892,10 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         fractional_grouping,
         precision,
         ty,
+        no_neg_zero,
         engine_spec,
-        width_start,
-        width_end,
+        width_start: width_start - z_shift,
+        width_end: width_end - z_shift,
     }
 }
 
@@ -1878,6 +1906,9 @@ fn complex_component_spec(p: &ParsedSpec, sign: char) -> String {
     let mut spec = String::new();
     if sign != '-' {
         spec.push(sign);
+    }
+    if p.no_neg_zero {
+        spec.push('z');
     }
     if p.alt_form {
         spec.push('#');
@@ -2106,9 +2137,9 @@ fn format_spec_err(
         E::ExclusiveFormat(c1, c2) => {
             crate::PyError::value_error(format!("Cannot specify both '{c1}' and '{c2}'."))
         }
-        E::UnknownFormatCode(c, _) if integer && c == 'z' => crate::PyError::value_error(
-            "Negative zero coercion (z) not allowed in integer format specifier",
-        ),
+        E::UnknownFormatCode(c, _) if integer && c == 'z' => {
+            crate::PyError::value_error("Negative zero coercion (z) not allowed")
+        }
         E::UnknownFormatCode(c, _) => crate::PyError::value_error(format!(
             "Unknown format code '{}' for object of type '{type_name}'",
             unknown_code_display(c)
@@ -2311,6 +2342,15 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                 return Err(crate::PyError::value_error(
                     "'=' alignment flag is not allowed in complex format specifier",
                 ));
+            }
+            // Only the float presentation types e/E/f/F/g/G/n are valid for
+            // complex; reject any other code with a `complex`-typed message
+            // rather than letting the per-part float formatter report `float`.
+            if p.ty != '\0' && !matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n') {
+                return Err(crate::PyError::value_error(format!(
+                    "Unknown format code '{}' for object of type 'complex'",
+                    p.ty
+                )));
             }
             let align = p.align.unwrap_or('>');
             // With no component-affecting flags, the default presentation is
@@ -2622,6 +2662,28 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
     Ok(())
 }
 
+/// Probe whether `v` renders to a zero magnitude under `p` — every digit of
+/// the unpadded rendering is `0` — so PEP 682's `z` option coerces its sign.
+fn float_rounds_to_zero(v: f64, p: &ParsedSpec) -> bool {
+    let probe_spec = float_engine_spec_with_width(p, Some(0));
+    let Some(rendered) = rustpython_common::format::FormatSpec::parse(probe_spec.as_str())
+        .ok()
+        .and_then(|f| f.format_float(v).ok())
+    else {
+        return false;
+    };
+    let mut saw_digit = false;
+    for b in rendered.bytes() {
+        if b.is_ascii_digit() {
+            saw_digit = true;
+            if b != b'0' {
+                return false;
+            }
+        }
+    }
+    saw_digit
+}
+
 /// Format a finite `f64` through `spec`.  Every presentation type
 /// (`\0`/`e`/`E`/`f`/`F`/`g`/`G`/`n`/`%`) pads, groups, and rounds through the
 /// shared engine.  `validate_float_spec` still supplies the type and
@@ -2629,6 +2691,14 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
 fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     validate_float_spec(spec, &p)?;
+    // PEP 682 `z`: a value that rounds to a zero magnitude renders its sign
+    // away. Format the positive zero in its place so the padded result the
+    // engine produces below already carries the coerced sign.
+    let v = if p.no_neg_zero && v.is_sign_negative() && float_rounds_to_zero(v, &p) {
+        0.0
+    } else {
+        v
+    };
     if let Some(separator) = p.fractional_grouping {
         let unpadded_spec = float_engine_spec_with_width(&p, None);
         let unpadded = rustpython_common::format::FormatSpec::parse(unpadded_spec.as_str())

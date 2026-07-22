@@ -144,6 +144,70 @@ fn times_result_seq_type() -> PyObjectRef {
     })
 }
 
+/// Split `path` into the root and everything after it, the way
+/// `ntpath.splitroot` splits it three ways with the drive and the root joined
+/// back together.
+///
+/// `_bootstrap_external._path_join` maps this over its parts and classifies
+/// each result: a root that starts or ends with a separator is absolute, one
+/// ending in `:` is drive-relative, anything else is a plain relative part.
+///
+/// Both separators count, so the tests are taken on a copy with `/` rewritten
+/// to `\`; that rewrite is character-for-character, so an offset into it
+/// addresses the same character of the original. The offsets are per
+/// character rather than per byte, which is what makes `"ä:\x"` take the
+/// drive branch — at byte 1 it would be a continuation byte and take none.
+///
+/// Compiled everywhere so the tests run on every platform; only the Windows
+/// build has a caller.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn split_root(path: &str) -> (&str, &str) {
+    const SEP: char = '\\';
+    const UNC_PREFIX: &str = "\\\\?\\UNC\\";
+
+    let norm: Vec<char> = path
+        .chars()
+        .map(|c| if c == '/' { SEP } else { c })
+        .collect();
+    let byte_at = |index: usize| {
+        path.char_indices()
+            .nth(index)
+            .map_or(path.len(), |(offset, _)| offset)
+    };
+    let sep_from = |start: usize| {
+        norm.get(start..)
+            .and_then(|rest| rest.iter().position(|&c| c == SEP))
+            .map(|offset| offset + start)
+    };
+
+    if norm.first() != Some(&SEP) {
+        if norm.get(1) == Some(&':') {
+            // `X:\Windows` keeps the separator in the root; `X:Windows` names
+            // a location on the drive's own cursor and has no root at all.
+            let split = if norm.get(2) == Some(&SEP) { 3 } else { 2 };
+            return path.split_at(byte_at(split));
+        }
+        return ("", path);
+    }
+    if norm.get(1) != Some(&SEP) {
+        // A path rooted on the current drive, e.g. `\Windows`.
+        return path.split_at(byte_at(1));
+    }
+    // A UNC share (`\\server\share`, `\\?\UNC\server\share`) or a device
+    // (`\\.\device`): the root runs to the separator after the share name,
+    // and a path that never reaches a second separator is all root.
+    let unc = norm.len() >= 8
+        && norm[..8]
+            .iter()
+            .map(|c| c.to_ascii_uppercase())
+            .eq(UNC_PREFIX.chars());
+    let start = if unc { 8 } else { 2 };
+    match sep_from(start).and_then(|index| sep_from(index + 1)) {
+        Some(index) => path.split_at(byte_at(index + 1)),
+        None => (path, ""),
+    }
+}
+
 /// posix stub — PyPy: pypy/module/posix/ interp_posix.py
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
@@ -452,11 +516,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     use crate::gateway::fsencode_w as extract_path;
 
     // ── Helper: convert std::io::Error → PyError (OSError) ──
+    fn errno_err(errno: i32, path: &str) -> crate::PyError {
+        let w_filename = if path.is_empty() {
+            pyre_object::PY_NULL
+        } else {
+            pyre_object::w_str_new(path)
+        };
+        crate::PyError::os_error_syscall(errno, w_filename)
+    }
+
     fn io_err(e: std::io::Error, path: &str) -> crate::PyError {
-        crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("{}: '{}'", e, path),
-        )
+        errno_err(crate::builtins::io_error_posix_errno(&e, 0), path)
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──
@@ -755,69 +825,121 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ),
     );
 
-    // ── posix.rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None) ──
+    // ── posix.rename / posix.replace(src, dst, *, src_dir_fd=None,
+    //    dst_dir_fd=None) ──
     // A non-None `src_dir_fd` / `dst_dir_fd` resolves the path relative to the
     // open directory descriptor (`renameat`); the descriptors are only usable
     // where `renameat` exists (unix).
+    //
+    // The two entry points take the same arguments and differ only in what a
+    // pre-existing `dst` does: `replace` overwrites it on every platform,
+    // `rename` leaves that to the platform call. The host layer renames
+    // through `std::fs::rename`, which overwrites on both, so one body serves
+    // both and `name` only selects the text of the argument errors.
+    fn rename_impl(
+        args: &[PyObjectRef],
+        name: &'static str,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        if pos.len() < 2 {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() requires 2 arguments"
+            )));
+        }
+        if pos.len() > 2 {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes exactly 2 positional arguments ({} given)",
+                pos.len()
+            )));
+        }
+        crate::builtins::kwarg_reject_unknown(kwargs, &["src_dir_fd", "dst_dir_fd"], name)?;
+        let src = extract_path(pos[0])?;
+        let dst = extract_path(pos[1])?;
+        let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
+            match crate::builtins::kwarg_get(kwargs, name) {
+                Some(v) if !unsafe { pyre_object::is_none(v) } => {
+                    if !unsafe { pyre_object::is_int(v) } {
+                        let type_name = crate::typedef::r#type(v)
+                            .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t) })
+                            .unwrap_or("object");
+                        return Err(crate::PyError::type_error(format!(
+                            "argument should be integer or None, not {type_name}"
+                        )));
+                    }
+                    Ok(Some((unsafe { pyre_object::w_int_get_value(v) }) as i32))
+                }
+                _ => Ok(None),
+            }
+        };
+        let src_fd = dir_fd("src_dir_fd")?;
+        let dst_fd = dir_fd("dst_dir_fd")?;
+        #[cfg(unix)]
+        let (src_b, dst_b) = {
+            use rustpython_host_env::crt_fd::Borrowed;
+            (
+                src_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
+                dst_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
+            )
+        };
+        #[cfg(not(unix))]
+        let (src_b, dst_b) = {
+            if src_fd.is_some() || dst_fd.is_some() {
+                return Err(crate::PyError::not_implemented(
+                    "dir_fd unavailable on this platform",
+                ));
+            }
+            (None, None)
+        };
+        host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| {
+            let errno = crate::builtins::io_error_posix_errno(&e, 0);
+            // The source string must survive the destination's allocation.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let src_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&src));
+            let w_dst = pyre_object::w_str_new(&dst);
+            crate::PyError::os_error_syscall2(
+                errno,
+                pyre_object::gc_roots::shadow_stack_get(src_slot),
+                w_dst,
+            )
+        })?;
+        Ok(pyre_object::w_none())
+    }
     crate::module_ns_store(
         ns,
         "rename",
-        crate::make_builtin_function("rename", |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if pos.len() < 2 {
-                return Err(crate::PyError::type_error("rename() requires 2 arguments"));
-            }
-            if pos.len() > 2 {
-                return Err(crate::PyError::type_error(format!(
-                    "rename() takes exactly 2 positional arguments ({} given)",
-                    pos.len()
-                )));
-            }
-            crate::builtins::kwarg_reject_unknown(
-                kwargs,
-                &["src_dir_fd", "dst_dir_fd"],
-                "rename",
-            )?;
-            let src = extract_path(pos[0])?;
-            let dst = extract_path(pos[1])?;
-            let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
-                match crate::builtins::kwarg_get(kwargs, name) {
-                    Some(v) if !unsafe { pyre_object::is_none(v) } => {
-                        if !unsafe { pyre_object::is_int(v) } {
-                            let type_name = crate::typedef::r#type(v)
-                                .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t) })
-                                .unwrap_or("object");
-                            return Err(crate::PyError::type_error(format!(
-                                "argument should be integer or None, not {type_name}"
-                            )));
-                        }
-                        Ok(Some((unsafe { pyre_object::w_int_get_value(v) }) as i32))
-                    }
-                    _ => Ok(None),
-                }
-            };
-            let src_fd = dir_fd("src_dir_fd")?;
-            let dst_fd = dir_fd("dst_dir_fd")?;
-            #[cfg(unix)]
-            let (src_b, dst_b) = {
-                use rustpython_host_env::crt_fd::Borrowed;
-                (
-                    src_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
-                    dst_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
-                )
-            };
-            #[cfg(not(unix))]
-            let (src_b, dst_b) = {
-                if src_fd.is_some() || dst_fd.is_some() {
-                    return Err(crate::PyError::not_implemented(
-                        "dir_fd unavailable on this platform",
+        crate::make_builtin_function("rename", |args| rename_impl(args, "rename")),
+    );
+    crate::module_ns_store(
+        ns,
+        "replace",
+        crate::make_builtin_function("replace", |args| rename_impl(args, "replace")),
+    );
+
+    // ── posix._path_splitroot(path) → (root, tail) ──
+    // Registered only where `sys.platform` is `win32`, the same condition
+    // `_bootstrap_external` gates its use on.
+    #[cfg(windows)]
+    crate::module_ns_store(
+        ns,
+        "_path_splitroot",
+        crate::make_builtin_function_with_arity(
+            "_path_splitroot",
+            |args| {
+                let Some(&arg) = args.first() else {
+                    return Err(crate::PyError::type_error(
+                        "_path_splitroot() missing required argument 'path'",
                     ));
-                }
-                (None, None)
-            };
-            host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| io_err(e, &src))?;
-            Ok(pyre_object::w_none())
-        }),
+                };
+                let path = extract_path(arg)?;
+                let (root, tail) = split_root(&path);
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_str_new(root),
+                    pyre_object::w_str_new(tail),
+                ]))
+            },
+            1,
+        ),
     );
 
     // ── posix.listdir(path=".") → list of str ──
@@ -1268,13 +1390,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let st_flags = 0u32;
                     Ok(make_stat_result(&m, st_flags))
                 }
-                Err(e) => {
-                    let kind = e.raw_os_error().unwrap_or(2);
-                    Err(crate::PyError::os_error_with_errno(
-                        kind,
-                        format!("{}: '{}'", e, path_str),
-                    ))
-                }
+                Err(e) => Err(errno_err(
+                    crate::builtins::io_error_posix_errno(&e, 2),
+                    &path_str,
+                )),
             }
         }
     }
@@ -1564,7 +1683,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             Ok(make_stat_result(&m, st_flags))
                         }
                         Err(e) => Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(9),
+                            crate::builtins::io_error_posix_errno(&e, 9),
                             format!("{}", e),
                         )),
                     }
@@ -1893,7 +2012,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 |_| match host_posix::getlogin() {
                     Some(name) => Ok(pyre_object::w_str_new(name.to_string_lossy().as_ref())),
                     None => Err(crate::PyError::os_error_with_errno(
-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        crate::builtins::io_error_posix_errno(&std::io::Error::last_os_error(), 0),
                         "getlogin",
                     )),
                 },
@@ -1989,9 +2108,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let path = extract_path(args[0])?;
                     let c_path = std::ffi::CString::new(path.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    host_posix::chdir(&c_path).map_err(|e| {
-                        crate::PyError::os_error_with_errno(e as i32, format!("chdir: '{}'", path))
-                    })?;
+                    host_posix::chdir(&c_path).map_err(|e| errno_err(e as i32, &path))?;
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -3373,7 +3490,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // host filesystem mutation that bypasses the controller
             "chmod", "fchmod", "lchmod", "chown", "fchown", "lchown", "chroot",
             "chdir", "fchdir", "link", "symlink", "truncate", "ftruncate",
-            "rename", "rmdir", "mkfifo", "mknod",
+            "rename", "replace", "rmdir", "mkfifo", "mknod",
             // privilege / scheduling
             "setuid", "setgid", "setreuid", "setregid", "setresuid", "setresgid",
             "setgroups", "initgroups", "setsid", "setpgid", "setpgrp", "nice",
@@ -3404,4 +3521,59 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     crate::module_ns_store(ns, "error", crate::typedef::w_object());
+}
+
+#[cfg(test)]
+mod split_root_tests {
+    use super::split_root;
+
+    /// Expectations taken from `ntpath.splitroot`, whose three-way split
+    /// joins drive and root into the root this returns.
+    #[test]
+    fn matches_ntpath_splitroot() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("", "", ""),
+            ("Windows", "", "Windows"),
+            ("a/b", "", "a/b"),
+            ("\\", "\\", ""),
+            ("/", "/", ""),
+            ("\\Windows", "\\", "Windows"),
+            ("/Windows", "/", "Windows"),
+            ("C:", "C:", ""),
+            ("C:a", "C:", "a"),
+            ("C:\\", "C:\\", ""),
+            ("C:/Windows", "C:/", "Windows"),
+            (":a", "", ":a"),
+            ("\\\\server", "\\\\server", ""),
+            ("\\\\server\\share", "\\\\server\\share", ""),
+            ("\\\\server\\share\\", "\\\\server\\share\\", ""),
+            ("\\\\server\\share\\dir", "\\\\server\\share\\", "dir"),
+            ("//server/share/dir", "//server/share/", "dir"),
+            ("\\\\.\\device\\x", "\\\\.\\device\\", "x"),
+            ("\\\\?\\C:\\x", "\\\\?\\C:\\", "x"),
+            (
+                "\\\\?\\UNC\\server\\share\\dir",
+                "\\\\?\\UNC\\server\\share\\",
+                "dir",
+            ),
+            ("//?/unc/server/share/dir", "//?/unc/server/share/", "dir"),
+            // No separator after the share name, so the whole path is root.
+            ("\\\\\\a", "\\\\\\a", ""),
+            // Offsets address characters: the drive branch is taken here.
+            ("\u{e4}:\\x", "\u{e4}:\\", "x"),
+            (
+                "\\\\s\u{e4}rver\\share\\dir",
+                "\\\\s\u{e4}rver\\share\\",
+                "dir",
+            ),
+        ];
+        for &(path, root, tail) in cases {
+            assert_eq!(split_root(path), (root, tail), "split_root({path:?})");
+            assert_eq!(
+                format!("{root}{tail}"),
+                path,
+                "split_root({path:?}) lost characters"
+            );
+        }
+    }
 }

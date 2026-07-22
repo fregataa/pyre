@@ -2152,6 +2152,16 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "next", || {
         make_module_builtin_function("next", builtin_next)
     });
+    // aiter/anext resolve their app-level implementations lazily; the
+    // builtins dict is filled before an execution context exists.  Arity is
+    // enforced by the app-level `def aiter(obj)` / `def anext(iterator,
+    // default=...)` signatures, so no interp-level arity is imposed here.
+    crate::module_ns_get_or_insert_with(ns, "aiter", || {
+        make_module_builtin_function("aiter", crate::async_operation::builtin_aiter)
+    });
+    crate::module_ns_get_or_insert_with(ns, "anext", || {
+        make_module_builtin_function("anext", crate::async_operation::builtin_anext)
+    });
     crate::module_ns_get_or_insert_with(ns, "callable", || {
         make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });
@@ -2996,10 +3006,10 @@ fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // no single-dict value, so route it through the gateway for the faithful
     // `_match_signature` arity error.
     if let [obj] = args {
-        return crate::baseobjspace::len(*obj);
+        return Ok(w_int_new(crate::baseobjspace::len_w(*obj)?));
     }
     let obj = parse_single_required(args, "obj", "len")?;
-    crate::baseobjspace::len(obj)
+    Ok(w_int_new(crate::baseobjspace::len_w(obj)?))
 }
 
 /// `abs(x)` — return the absolute value of a number.
@@ -3660,6 +3670,24 @@ fn type_descr_new_with_metaclass(
         if unsafe { pyre_object::is_str(name_obj) } {
             check_surrogate(name_obj)?;
         }
+        // typeobject.py `type.__new__` — `isinstance_w(w_bases, w_tuple)` and
+        // `isinstance_w(w_dict, w_dict)`: bases must be a tuple and the
+        // namespace a dict (subclasses of each are accepted, e.g. a dict
+        // subclass namespace); neither is silently coerced.
+        let w_tuple_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
+        if !unsafe { crate::baseobjspace::isinstance_w(bases, w_tuple_type) } {
+            return Err(crate::PyError::type_error(format!(
+                "type() argument 2 must be tuple, not {}",
+                crate::baseobjspace::object_functionstr_type_name(bases)
+            )));
+        }
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
+            return Err(crate::PyError::type_error(format!(
+                "type() argument 3 must be dict, not {}",
+                crate::baseobjspace::object_functionstr_type_name(w_namespace_dict)
+            )));
+        }
         let name = unsafe { pyre_object::w_str_get_value(name_obj) };
 
         // CPython: calculate_metaclass — if bases have a custom metaclass,
@@ -3783,8 +3811,10 @@ fn type_descr_new_with_metaclass(
         } else {
             w_metaclass
         };
-        let w_winner = crate::call::calculate_metaclass(default_meta, w_effective_bases)
-            .unwrap_or(default_meta);
+        // A metaclass conflict among the bases (or an explicit metaclass that
+        // is not a subclass of every base's metaclass) is a hard error, not a
+        // silent fall-back to `default_meta`.
+        let w_winner = crate::call::calculate_metaclass(default_meta, w_effective_bases)?;
         if !std::ptr::eq(w_winner, default_meta) {
             // Winner is a different metaclass — delegate to its __new__
             if let Some(w_metaclass_new) =
@@ -4283,7 +4313,7 @@ mod wasm_errno {
 /// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
 /// exact `OSError` constructor selects for a recognised errno, by
 /// registered class name.  Returns `None` for an unmapped errno.
-fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
+pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
     // `ESHUTDOWN` is sourced through `errno_is_eshutdown` (MSVC CRT lacks it);
     // the rest come from `libc`, or the darwin/BSD `wasm_errno` table on wasm32.
     #[cfg(not(target_arch = "wasm32"))]
@@ -4329,6 +4359,40 @@ fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
         return None;
     };
     Some(name)
+}
+
+/// The POSIX errno for a `std::io::Error`, so the errno-specific OSError
+/// subclass (`os_error_errno_subclass`) and the `.errno` slot stay consistent
+/// across platforms.  On Windows `raw_os_error()` reports a Win32 error code
+/// (e.g. `ERROR_ALREADY_EXISTS` 183), not a C errno, so the raw value never
+/// matches the libc constants the subclass table keys on; translate the common
+/// kinds to their POSIX errno through `ErrorKind` (which the standard library
+/// normalises per platform), the way `winerror_to_errno` fills `OSError.errno`
+/// alongside `.winerror`.  Unrecognised kinds keep the raw code, and an error
+/// carrying no OS code at all falls back to `default` (the errno each call site
+/// used before the translation existed).
+pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
+    #[cfg(windows)]
+    {
+        use std::io::ErrorKind;
+        let mapped = match e.kind() {
+            ErrorKind::NotFound => Some(libc::ENOENT),
+            ErrorKind::AlreadyExists => Some(libc::EEXIST),
+            ErrorKind::PermissionDenied => Some(libc::EACCES),
+            ErrorKind::ConnectionRefused => Some(libc::ECONNREFUSED),
+            ErrorKind::ConnectionReset => Some(libc::ECONNRESET),
+            ErrorKind::ConnectionAborted => Some(libc::ECONNABORTED),
+            ErrorKind::BrokenPipe => Some(libc::EPIPE),
+            ErrorKind::TimedOut => Some(libc::ETIMEDOUT),
+            ErrorKind::Interrupted => Some(libc::EINTR),
+            ErrorKind::WouldBlock => Some(libc::EWOULDBLOCK),
+            _ => None,
+        };
+        if let Some(errno) = mapped {
+            return errno;
+        }
+    }
+    e.raw_os_error().unwrap_or(default)
 }
 
 /// `_parse_init_args` yields an errno only for a 2..=5 argument call whose
@@ -7249,14 +7313,35 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// bits), `dont_inherit` controls whether the caller's `__future__`
 /// flags are inherited, and `optimize` selects the -1/0/1/2 optimisation
 /// level (assert / `__debug__` / docstring stripping).
-/// Map a compiler failure string to a Python `SyntaxError`, matching
-/// CPython where `compile`/`exec`/`eval`/`ast.parse` raise `SyntaxError`
-/// (not `ValueError`) for malformed source.  The `compile error: ` prefix
-/// `compile_source` prepends is stripped so the message reads like
-/// CPython's (`'yield' outside function`).
-fn compile_err_to_syntax_error(e: String) -> crate::PyError {
-    let msg = e.strip_prefix("compile error: ").unwrap_or(&e).to_string();
-    crate::PyError::syntax_error(msg)
+/// Map a compiler failure to a Python `SyntaxError`, matching where
+/// `compile`/`exec`/`eval`/`ast.parse` raise `SyntaxError` (not
+/// `ValueError`) for malformed source.  The error's `python_location` /
+/// `python_end_location` / `source_path` populate `e.lineno` / `e.offset`
+/// / `e.end_lineno` / `e.end_offset` / `e.filename`, and `e.text` is the
+/// offending line sliced from `source`; a location-less codegen error
+/// (line 0) falls back to a bare, message-only SyntaxError.
+pub fn compile_err_to_syntax_error(
+    e: crate::compile::CompileError,
+    source: &str,
+) -> crate::PyError {
+    let msg = e.to_string();
+    let (lineno, offset) = e.python_location();
+    if lineno == 0 {
+        return crate::PyError::syntax_error(msg);
+    }
+    let (end_lineno, end_offset) = e.python_end_location().unwrap_or((lineno, offset));
+    let filename = e.source_path().to_string();
+    // The offending source line, keeping its trailing newline like `e.text`.
+    let text = source.split_inclusive('\n').nth(lineno - 1);
+    crate::PyError::syntax_error_located(
+        msg,
+        &filename,
+        lineno as i64,
+        offset as i64,
+        end_lineno as i64,
+        end_offset as i64,
+        text,
+    )
 }
 
 /// `pypy/interpreter/astcompiler/consts.py` compilation flag bits.
@@ -7447,13 +7532,9 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let code_ptr = Box::into_raw(Box::new(code)) as *const ();
         return Ok(crate::w_code_new(code_ptr));
     }
-    let code = crate::compile::compile_source_with_opts(
-        source_str.as_deref().expect("non-AST source"),
-        mode,
-        &filename,
-        opts,
-    )
-    .map_err(compile_err_to_syntax_error)?;
+    let source = source_str.as_deref().expect("non-AST source");
+    let code = crate::compile::compile_source_with_opts(source, mode, &filename, opts)
+        .map_err(|e| compile_err_to_syntax_error(e, source))?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     Ok(crate::w_code_new(code_ptr))
 }
@@ -7545,8 +7626,8 @@ fn exec_or_eval(
             } else {
                 crate::compile::Mode::Exec
             };
-            let code =
-                crate::compile::compile_source(&s, mode).map_err(compile_err_to_syntax_error)?;
+            let code = crate::compile::compile_source(&s, mode)
+                .map_err(|e| compile_err_to_syntax_error(e, &s))?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();
             (crate::w_code_new(code_ptr), false)
         } else if !source.is_null() && crate::is_code(source) {
@@ -8264,12 +8345,12 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // The concrete builtin advertises `__hash__ = None`, but a user
             // subclass may replace that slot.  PyPy's normal special-method
             // lookup reaches the subclass entry before the inherited typedef
-            // value (Bug #1257731 in CPython's set tests), so only reject the
-            // object after giving a non-None override the call.
+            // value (`descroperation.py:556-565`), so only reject the object
+            // after giving a non-None override the call.
             if let Some(w_type) = crate::typedef::r#type(obj) {
                 if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
                     if !pyre_object::is_none(method) {
-                        return hash_call_normalize(method, obj);
+                        return hash_call_normalize(method, obj, w_type);
                     }
                 }
             }
@@ -8285,6 +8366,35 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // `descr_hash` — released and writable views are unhashable; a
             // read-only view hashes its raw bytes, cached in `_hash`.
             return memoryview_hash_value(obj);
+        }
+        // A tuple/frozenset *subclass* can set `__hash__ = None` to become
+        // unhashable, or override `__hash__` with its own method; the
+        // structural fast paths below hash by contents and would ignore both.
+        // For a non-exact receiver consult the `__hash__` slot: `None` raises,
+        // a genuine override dispatches, and the inherited structural hash
+        // falls through to the fast path.
+        let is_tuple_recv = is_tuple(obj);
+        let is_frozenset_recv = pyre_object::is_frozenset(obj);
+        if (is_tuple_recv && !is_exact_type(obj, &TUPLE_TYPE))
+            || (is_frozenset_recv && !is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE))
+        {
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+                    if pyre_object::is_none(method) {
+                        return Err(unhashable_type_error(obj));
+                    }
+                    let base = if is_tuple_recv {
+                        crate::typedef::gettypefor(&TUPLE_TYPE)
+                    } else {
+                        crate::typedef::gettypefor(&pyre_object::setobject::FROZENSET_TYPE)
+                    };
+                    let base_hash =
+                        base.and_then(|b| crate::baseobjspace::lookup_in_type(b, "__hash__"));
+                    if Some(method) != base_hash {
+                        return hash_call_normalize(method, obj, w_type);
+                    }
+                }
+            }
         }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);
@@ -8328,7 +8438,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 if pyre_object::is_none(method) {
                     return Err(unhashable_type_error(obj));
                 }
-                return hash_call_normalize(method, obj);
+                return hash_call_normalize(method, obj, w_type);
             }
         }
         // A type may declare itself unhashable via `__hash__ = None`
@@ -8349,7 +8459,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 let default_hash =
                     crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__hash__");
                 if default_hash != Some(method) {
-                    return hash_call_normalize(method, obj);
+                    return hash_call_normalize(method, obj, w_type);
                 }
             }
         }
@@ -8386,8 +8496,12 @@ fn slice_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// Call a resolved `__hash__` method and normalize its result:
 /// `descroperation.py:576-579` — accept `bool` / `int` / `long`, reject other
 /// return types, and map a `-1` result to `-2`.
-fn hash_call_normalize(method: PyObjectRef, obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    let r = call_and_check(method, &[obj])?;
+fn hash_call_normalize(
+    method: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<i64, crate::PyError> {
+    let r = unsafe { crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]) }?;
     let h = unsafe {
         if is_bool(r) {
             pyre_object::w_bool_get_value(r) as i64
@@ -8946,21 +9060,6 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ))
 }
 
-/// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`
-/// parity:
-///
-/// ```python
-/// def descr_new(space, w_subtype, w_iterable, w_start=None):
-///     ...
-///     if w_start is None:
-///         start = 0
-///     else:
-///         start = space.index_w(w_start)
-///     ...
-/// ```
-///
-/// `space.index_w` accepts ANY object exposing `__index__`
-/// (subclasses of int, NumPy ints, etc.) — not just exact int.  The
 /// kwarg surface is also strict: anything other than `start=` is a
 /// TypeError per the gateway's parsed signature.
 // `pypy/module/__builtin__/functional.py:253-275 W_Enumerate.descr___new__`
@@ -9144,10 +9243,12 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             }
             pyre_object::gc_roots::pin_root(method);
             let method_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            return Ok(crate::call_function(
+            // Propagate a raised error from `__reversed__` instead of handing
+            // back a null result.
+            return call_and_check(
                 unsafe { pyre_object::gc_roots::shadow_stack_get(method_slot) },
                 &[unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) }],
-            ));
+            );
         }
     }
     // functional.py:351 — without `__reversed__`, require the sequence
@@ -9926,7 +10027,7 @@ fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> Result<PyObjectRef, 
 }
 
 fn fd_io_err(e: std::io::Error) -> crate::PyError {
-    crate::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(5), e.to_string())
+    crate::PyError::os_error_with_errno(io_error_posix_errno(&e, 5), e.to_string())
 }
 
 fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -10197,7 +10298,7 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             if unsafe { libc::close(fd) } < 0 {
                 let e = std::io::Error::last_os_error();
                 return Err(crate::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(0),
+                    io_error_posix_errno(&e, 0),
                     format!("close: {e}"),
                 ));
             }
@@ -10254,7 +10355,7 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
             };
             if let Err(e) = write_res {
                 return Err(crate::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(5),
+                    io_error_posix_errno(&e, 5),
                     format!("{e}: '{name_s}'"),
                 ));
             }
@@ -10489,9 +10590,12 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 Ok(bytes) => bytes,
                 Err(_e) if writing => Vec::new(),
                 Err(e) => {
-                    return Err(crate::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(2),
-                        format!("{e}: '{path}'"),
+                    // Report the original path object as `.filename`, keeping a
+                    // bytes path a bytes object (`interp_fileio.py` wraps the raw
+                    // `w_name`, not the decoded buffer).
+                    return Err(crate::PyError::os_error_syscall(
+                        io_error_posix_errno(&e, 2),
+                        path_obj,
                     ));
                 }
             }

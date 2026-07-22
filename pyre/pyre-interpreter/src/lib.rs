@@ -66,6 +66,7 @@ pub mod host_seam {
         let _ = std::io::stdout().flush();
     }
 }
+pub mod async_operation;
 pub mod jit_fnaddr;
 pub mod listobject;
 pub mod opcode_ops;

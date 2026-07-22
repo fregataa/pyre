@@ -51,13 +51,30 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
             "types.SimpleNamespace() takes no positional arguments",
         ));
     }
+    namespace_apply_kwargs(self_obj, kwargs)
+}
+
+/// Copy the keyword arguments into a namespace instance's dict, skipping the
+/// `__pyre_kw__` marker. Shared by `sys.namespace` and `types.SimpleNamespace`
+/// construction. `_structseq.py:172` `self.__dict__.update(kwargs)` writes the
+/// instance dict directly, so `setdictvalue` is used rather than `setattr` — a
+/// subclass `__setattr__` is not consulted during construction.
+fn namespace_apply_kwargs(self_obj: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::PyResult {
+    // `self.__dict__.update(kwargs)` evaluates `self.__dict__` first, so a
+    // receiver without an instance dict raises AttributeError even for an
+    // empty keyword set.
+    crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
     if let Some(dict) = kwargs {
         unsafe {
             for (key, value) in pyre_object::w_dict_items(dict) {
-                if pyre_object::is_str(key)
-                    && pyre_object::w_str_get_wtf8(key).as_str() == Ok("__pyre_kw__")
-                {
-                    continue;
+                if pyre_object::is_str(key) {
+                    if let Ok(name) = pyre_object::w_str_get_wtf8(key).as_str() {
+                        if name == "__pyre_kw__" {
+                            continue;
+                        }
+                        crate::baseobjspace::setdictvalue(self_obj, name, value);
+                        continue;
+                    }
                 }
                 crate::baseobjspace::setattr(self_obj, key, value)?;
             }
@@ -70,6 +87,184 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// all the CPython-style attribute bags surfaced by the sys module.
 fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
+}
+
+/// `_structseq.py:171 SimpleNamespace.__init__(self, **kwargs)` — keyword-only,
+/// so a positional argument raises the arg-count TypeError instead of being
+/// accepted as a mapping.
+fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let Some(&self_obj) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "__init__() missing 1 required positional argument: 'self'",
+        ));
+    };
+    if positional.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "SimpleNamespace.__init__() takes 1 positional argument but {} were given",
+            positional.len()
+        )));
+    }
+    namespace_apply_kwargs(self_obj, kwargs)
+}
+
+/// `types.SimpleNamespace` — the attribute-bag type exposed as
+/// `type(sys.implementation)` and re-published by `types.py:20`
+/// (`SimpleNamespace = type(sys.implementation)`).
+///
+/// `_structseq.py:166 SimpleNamespace`: keyword-only construction that copies
+/// into the instance dict, a `namespace(...)` repr over the sorted items with
+/// a recursion guard, structural `__eq__`/`__ne__` (NotImplemented against a
+/// non-namespace), and no `__hash__` (so instances are unhashable). The
+/// keyword copy into the instance dict is shared with `sys.namespace` via
+/// `namespace_apply_kwargs`; the positional rejection is `SimpleNamespace`-specific.
+fn simple_namespace_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    let raw = *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("types.SimpleNamespace", |ns| {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__init__",
+                    crate::make_builtin_function("__init__", simple_namespace_init),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__repr__",
+                    make_builtin_function_with_arity("__repr__", simple_namespace_repr, 1),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__eq__",
+                    make_builtin_function_with_arity("__eq__", simple_namespace_eq, 2),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__ne__",
+                    make_builtin_function_with_arity("__ne__", simple_namespace_ne, 2),
+                );
+                // SimpleNamespace defines no `__hash__`, so it inherits None
+                // and is unhashable.
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none());
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__dict__",
+                    crate::typedef::dict_descr(),
+                );
+            }
+        });
+        unsafe { w_type_set_hasdict(tp, true) };
+        tp as usize
+    });
+    raw as PyObjectRef
+}
+
+/// `_structseq.py:174 SimpleNamespace.__repr__` — `namespace(k=v, ...)` over
+/// the sorted `__dict__` items (`%s=%r`), returning `namespace(...)` when the
+/// instance is already being repr'd on this thread.
+fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let Some(&self_obj) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "__repr__() missing 1 required positional argument: 'self'",
+        ));
+    };
+    let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
+        return Ok(w_str_new("namespace(...)"));
+    };
+    let dict = crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
+    // A user `__lt__`, `__str__` or `__repr__` below can collect, and the
+    // moving GC relocates the items this snapshot holds. Pin every key and
+    // value on the shadow stack and address them by slot from here on: a raw
+    // `(key, value)` vector would go stale at the first such call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let items = unsafe { pyre_object::w_dict_items(dict) };
+    for (k, v) in &items {
+        pyre_object::gc_roots::pin_root(*k);
+        pyre_object::gc_roots::pin_root(*v);
+    }
+    let key = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i * 2);
+    let value = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i * 2 + 1);
+
+    // `sorted(self.__dict__.items())` — order by the key objects with Python
+    // `<`, not by their `str()`. Incomparable keys (e.g. `int` mixed with
+    // `str`) raise, halting the repr as the sort itself does. Rust's `sort_by`
+    // closure cannot return `Result`, so a raising comparison is captured in a
+    // `Cell` and surfaced once the sort completes.
+    let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
+    let lt = |x: usize, y: usize| -> bool {
+        if let Some(e) = sort_error.take() {
+            sort_error.set(Some(e));
+            return false;
+        }
+        match crate::baseobjspace::compare(key(x), key(y), crate::baseobjspace::CompareOp::Lt) {
+            Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
+                sort_error.set(Some(e));
+                false
+            }),
+            Err(e) => {
+                sort_error.set(Some(e));
+                false
+            }
+        }
+    };
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|&a, &b| {
+        if lt(a, b) {
+            std::cmp::Ordering::Less
+        } else if lt(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    if let Some(e) = sort_error.take() {
+        return Err(e);
+    }
+    let mut parts = Vec::with_capacity(order.len());
+    for i in order {
+        parts.push(format!(
+            "{}={}",
+            unsafe { crate::display::py_str(key(i))? },
+            unsafe { crate::display::py_repr(value(i))? }
+        ));
+    }
+    Ok(w_str_new(&format!("namespace({})", parts.join(", "))))
+}
+
+/// `_structseq.py:185 SimpleNamespace.__eq__` — structural over `__dict__`
+/// when `other` is a namespace, NotImplemented otherwise.
+fn simple_namespace_eq(args: &[PyObjectRef]) -> crate::PyResult {
+    simple_namespace_richcompare(args, "__eq__", false)
+}
+
+/// `_structseq.py:190 SimpleNamespace.__ne__`.
+fn simple_namespace_ne(args: &[PyObjectRef]) -> crate::PyResult {
+    simple_namespace_richcompare(args, "__ne__", true)
+}
+
+fn simple_namespace_richcompare(
+    args: &[PyObjectRef],
+    name: &str,
+    negate: bool,
+) -> crate::PyResult {
+    // `def __eq__(self, other)` — a missing argument is an arity error, not a
+    // NotImplemented result.
+    let (Some(&self_obj), Some(&other)) = (args.first(), args.get(1)) else {
+        return Err(crate::PyError::type_error(format!(
+            "SimpleNamespace.{name}() missing 1 required positional argument: '{}'",
+            if args.is_empty() { "self" } else { "other" }
+        )));
+    };
+    if !unsafe { crate::baseobjspace::isinstance_w(other, simple_namespace_type()) } {
+        return Ok(w_not_implemented());
+    }
+    // `self.__dict__ == other.__dict__` — read through the descriptor so a
+    // subclass `__dict__` override is honoured, as PyPy's attribute access is.
+    let self_dict = crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
+    let other_dict = crate::baseobjspace::getattr_str(other, "__dict__")?;
+    let equal = crate::baseobjspace::eq_w(self_dict, other_dict)?;
+    Ok(w_bool_from(equal ^ negate))
 }
 
 /// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
@@ -646,7 +841,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // sys.implementation — structseq-like namespace with name, version, ...
     {
-        let impl_obj = make_sys_namespace_instance();
+        let impl_obj = w_instance_new(simple_namespace_type());
         crate::baseobjspace::setdictvalue(impl_obj, "name", w_str_new("pyre"));
         crate::baseobjspace::setdictvalue(
             impl_obj,
@@ -889,77 +1084,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.warnoptions
     module_ns_store(ns, "warnoptions", w_list_new(vec![]));
     // sys.builtin_module_names — tuple of names of modules compiled into
-    // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names.
-    // Pyre: include all stub/native built-ins from importing.rs. The host-access
-    // modules importing.rs omits under `sandbox` are gated out here too, so the
-    // advertised set matches what is actually importable.
-    #[allow(unused_mut)]
-    let mut builtin_names = vec![
-        "__pypy__",
-        "_abc",
-        "_bisect",
-        "_blake2",
-        "_codecs",
-        "_collections",
-        "_collections_abc",
-        "_contextvars",
-        "_csv",
-        "_datetime",
-        "_decimal",
-        "_functools",
-        "_hashlib",
-        "_heapq",
-        "_imp",
-        "_io",
-        "_json",
-        "_locale",
-        "_md5",
-        "_opcode",
-        "_operator",
-        "_pickle",
-        "_random",
-        "_sha1",
-        "_sha2",
-        "_sha3",
-        "_signal",
-        "_socket",
-        "_sre",
-        "_stat",
-        "_string",
-        "_struct",
-        "_thread",
-        "_tokenize",
-        "_tracemalloc",
-        "_typing",
-        "_warnings",
-        "_weakref",
-        "atexit",
-        "binascii",
-        "builtins",
-        "errno",
-        "fcntl",
-        "grp",
-        "itertools",
-        "marshal",
-        "math",
-        "cmath",
-        "operator",
-        "posix",
-        "pwd",
-        "select",
-        "sys",
-        "time",
-    ];
-    // Host-access modules registered only in non-sandbox builds (importing.rs);
-    // under `sandbox` they are omitted, so drop them from the advertised set
-    // in place — the surrounding order is left untouched.
-    #[cfg(feature = "sandbox")]
-    builtin_names.retain(|n| {
-        !matches!(
-            *n,
-            "_signal" | "_socket" | "fcntl" | "grp" | "pwd" | "select"
-        )
-    });
+    // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names,
+    // which reads the same registry `import` resolves against, so the
+    // advertised set cannot drift from what is actually importable on a build.
+    let builtin_names = crate::importing::builtin_module_names();
     module_ns_store(
         ns,
         "builtin_module_names",

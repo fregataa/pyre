@@ -910,6 +910,22 @@ pub fn init_typeobjects() {
             &pyre_object::functional::ZIP_TYPE as *const PyType as usize,
             new_typeobject_with_base("zip", init_zip_type, object_type) as usize,
         );
+        // `iter(callable, sentinel)` produces a `_CallableIterator`; register
+        // its type so `type(it)` / `it.__class__` resolve like the other
+        // iterators. Not directly instantiable.
+        let callable_iterator_type = new_typeobject_with_base(
+            "callable_iterator",
+            init_callable_iterator_type,
+            object_type,
+        );
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(callable_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(callable_iterator_type, false);
+        }
+        reg.insert(
+            &pyre_object::operation::CALLABLE_ITERATOR_TYPE as *const PyType as usize,
+            callable_iterator_type as usize,
+        );
         for (pytype, name, init) in [
             (
                 &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE as *const PyType,
@@ -1140,6 +1156,7 @@ pub fn init_typeobjects() {
     static PATCH_TYPEOBJECTS: std::sync::Once = std::sync::Once::new();
     PATCH_TYPEOBJECTS.call_once(|| {
         patch_object_class_descriptor();
+        patch_complex_realimag_descriptors();
         patch_builtin_function_descriptors();
         patch_function_member_descriptors();
         patch_module_descriptors();
@@ -1187,6 +1204,62 @@ fn patch_object_class_descriptor() {
             Some("__class__"),
         ),
     );
+}
+
+/// Install `complex.real` / `complex.imag` after the complex type exists.
+///
+/// complexobject.py:556-561 `complexwprop` builds each as
+/// `GetSetProperty(fget, doc=doc, cls=W_ComplexObject)`; the `cls` gives the
+/// descriptor its `__objclass__` and rejects a non-complex receiver. The
+/// complex type object is not available while `init_complex_type` fills the
+/// namespace (it is created by the same call that runs the initializer), so
+/// the two descriptors are stored here, once the type is registered.
+fn patch_complex_realimag_descriptors() {
+    let complex_type = gettypefor(&pyre_object::COMPLEX_TYPE).unwrap_or(pyre_object::PY_NULL);
+    if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
+        return;
+    }
+    for (name, doc, getter) in [
+        (
+            "real",
+            "the real part of a complex number",
+            make_builtin_function_with_arity(
+                "real",
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_real(args[1])
+                    }))
+                },
+                2,
+            ),
+        ),
+        (
+            "imag",
+            "the imaginary part of a complex number",
+            make_builtin_function_with_arity(
+                "imag",
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_imag(args[1])
+                    }))
+                },
+                2,
+            ),
+        ),
+    ] {
+        crate::type_dict_store(
+            complex_type,
+            name,
+            make_getset_property_full(
+                getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                pyre_object::w_str_new(doc),
+                complex_type,
+                Some(name),
+            ),
+        );
+    }
 }
 
 /// `typedef.py:58 add_entries` parity — walk every registered
@@ -2526,27 +2599,28 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         "object of this type has no bool()",
                     ));
                 }
-                let result = crate::call_function(method, &[w_obj]);
-                if !result.is_null() {
-                    if !pyre_object::is_bool(result) {
-                        // A tagged immediate is always an exact `int`; name it
-                        // without derefing its (non-pointer) tagged bits as
-                        // `ob_type`. Mirrors the tag short-circuit in
-                        // `builtin_str`. Gated on `CAN_BE_TAGGED`.
-                        let tp_name: &str = if pyre_object::tagged_int::CAN_BE_TAGGED
-                            && pyre_object::tagged_int::is_tagged_int(result)
-                        {
-                            "int"
-                        } else {
-                            (*(*result).ob_type).name
-                        };
-                        return Err(crate::PyError::type_error(format!(
-                            "__bool__ should return bool, returned {}",
-                            tp_name,
-                        )));
-                    }
-                    return Ok(result);
+                // Propagate a raised `__bool__` instead of dropping its
+                // stashed error and falling through to `is_true`, which would
+                // dispatch a second time and leave the first copy pending.
+                let result = crate::builtins::call_and_check(method, &[w_obj])?;
+                if !pyre_object::is_bool(result) {
+                    // A tagged immediate is always an exact `int`; name it
+                    // without derefing its (non-pointer) tagged bits as
+                    // `ob_type`. Mirrors the tag short-circuit in
+                    // `builtin_str`. Gated on `CAN_BE_TAGGED`.
+                    let tp_name: &str = if pyre_object::tagged_int::CAN_BE_TAGGED
+                        && pyre_object::tagged_int::is_tagged_int(result)
+                    {
+                        "int"
+                    } else {
+                        (*(*result).ob_type).name
+                    };
+                    return Err(crate::PyError::type_error(format!(
+                        "__bool__ should return bool, returned {}",
+                        tp_name,
+                    )));
                 }
+                return Ok(result);
             }
             if let Some(len_m) = crate::baseobjspace::lookup_in_type(w_type, "__len__") {
                 if pyre_object::is_none(len_m) {
@@ -2554,9 +2628,10 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         "object of this type has no len()",
                     ));
                 }
-                // __len__ returning negative → ValueError
-                let len_result = crate::call_function(len_m, &[w_obj]);
-                if !len_result.is_null() && pyre_object::is_int(len_result) {
+                // __len__ returning negative → ValueError. Propagate a raised
+                // `__len__` rather than dropping its stashed error.
+                let len_result = crate::builtins::call_and_check(len_m, &[w_obj])?;
+                if pyre_object::is_int(len_result) {
                     let v = pyre_object::w_int_get_value(len_result);
                     if v < 0 {
                         return Err(crate::PyError::new(
@@ -9262,6 +9337,19 @@ fn init_type_type(ns: PyObjectRef) {
     };
 }
 
+/// `typeobject.py:1090 mro_subclasses` — recompute the MRO of `w_type` and,
+/// recursively, of every subclass, after a base change alters the
+/// linearization.  The subclasses stay reachable through the (rooted) type
+/// hierarchy across each `compute_mro` allocation, so the walk needs no
+/// extra rooting (mirrors `baseobjspace::mutated`).
+unsafe fn mro_subclasses(w_type: PyObjectRef) {
+    let mro = crate::baseobjspace::compute_mro(w_type);
+    pyre_object::w_type_set_mro(w_type, mro);
+    for w_sc in unsafe { pyre_object::typeobject::w_type_get_subclasses(w_type, false) } {
+        mro_subclasses(w_sc);
+    }
+}
+
 /// `type.__bases__` setter (typeobject.py:1064-1105 `descr_set__bases__`).
 /// Heap types only; the new bases must be a non-empty tuple of classes whose
 /// best base shares the current instance layout (so instances stay valid).
@@ -9285,7 +9373,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let n = pyre_object::w_tuple_len(w_value);
         if n == 0 {
             return Err(crate::PyError::type_error(format!(
-                "can only assign non-empty tuple to {type_name}.__bases__"
+                "can only assign non-empty tuple to {type_name}.__bases__, not ()"
             )));
         }
         // find_best_base: pick the base with the most-derived instance layout.
@@ -9321,15 +9409,37 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // as Generic is fine; switching to an incompatible solid base is not.
         let cur_layout = pyre_object::w_type_get_layout_ptr(w_type);
         if best_layout != cur_layout {
+            // The clash names the new best base and the type's *current* best
+            // base (`__base__`), not the type being reassigned.
             return Err(crate::PyError::type_error(format!(
-                "__bases__ assignment: '{}' object layout differs from '{type_name}'",
-                pyre_object::w_type_get_name(w_bestbase)
+                "__bases__ assignment: '{}' object layout differs from '{}'",
+                pyre_object::w_type_get_name(w_bestbase),
+                pyre_object::w_type_get_name(pyre_object::typeobject::w_type_get_best_base(w_type))
             )));
         }
+        // Invalidate the method cache of w_type and every subclass before the
+        // hierarchy changes (typeobject.py:1130 `w_type.mutated(None)`).
+        crate::baseobjspace::mutated(w_type, None);
+        // Unlink w_type from its old bases' subclass lists before switching to
+        // the new bases (typeobject.py:1136-1138 `remove_subclass`); the new
+        // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
+        // `add_subclass`).
+        let saved_bases = pyre_object::typeobject::w_type_get_bases(w_type);
+        if !saved_bases.is_null() {
+            let old_n = pyre_object::w_tuple_len(saved_bases);
+            for i in 0..old_n as i64 {
+                if let Some(w_oldbase) = pyre_object::w_tuple_getitem(saved_bases, i) {
+                    if pyre_object::is_type(w_oldbase) {
+                        pyre_object::typeobject::w_type_remove_subclass(w_oldbase, w_type);
+                    }
+                }
+            }
+        }
         pyre_object::typeobject::w_type_set_bases(w_type, w_value);
-        let mro = crate::baseobjspace::compute_mro(w_type);
-        pyre_object::w_type_set_mro(w_type, mro);
         pyre_object::typeobject::w_type_ready(w_type);
+        // Recompute the MRO of w_type and, recursively, of every subclass
+        // (typeobject.py:1144 `mro_subclasses`).
+        mro_subclasses(w_type);
         Ok(pyre_object::w_none())
     }
 }
@@ -13833,45 +13943,10 @@ fn init_complex_type(ns: PyObjectRef) {
             ),
         )
     };
-    // complex.real / complex.imag — read-only float components.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "real",
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity(
-                    "real",
-                    |args| {
-                        Ok(pyre_object::w_float_new(unsafe {
-                            pyre_object::w_complex_get_real(args[0])
-                        }))
-                    },
-                    1,
-                ),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "imag",
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity(
-                    "imag",
-                    |args| {
-                        Ok(pyre_object::w_float_new(unsafe {
-                            pyre_object::w_complex_get_imag(args[0])
-                        }))
-                    },
-                    1,
-                ),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        )
-    };
+    // complex.real / complex.imag — read-only float getset descriptors.
+    // Installed post-registration by `patch_complex_realimag_descriptors`
+    // because the required-class check needs the complex type object, which
+    // does not exist yet while this namespace is being filled.
     for (name, func) in [
         ("__add__", complex_dunder_add as DunderFn),
         ("__radd__", complex_dunder_radd),
@@ -16444,11 +16519,10 @@ fn split_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
             break;
         }
         if maxsplit >= 0 && parts.len() as i64 >= maxsplit {
-            let mut end = n;
-            while end > i && is_ws(data[end - 1]) {
-                end -= 1;
-            }
-            parts.push(data[i..end].to_vec());
+            // `rstring.py split` (sep=None): once maxsplit is reached the rest
+            // of the string is the final field verbatim — trailing whitespace
+            // is kept, not stripped.
+            parts.push(data[i..n].to_vec());
             break;
         }
         let start = i;
@@ -16472,11 +16546,10 @@ fn rsplit_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
             break;
         }
         if maxsplit >= 0 && parts.len() as i64 >= maxsplit {
-            let mut start = 0;
-            while start < i && is_ws(data[start]) {
-                start += 1;
-            }
-            parts.push(data[start..i].to_vec());
+            // `rstring.py rsplit` (sep=None): once maxsplit is reached the
+            // leading remainder is the final field verbatim — leading
+            // whitespace is kept, not stripped.
+            parts.push(data[0..i].to_vec());
             break;
         }
         let end = i;
@@ -19403,6 +19476,12 @@ fn setlike_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 fn setlike_descr_isdisjoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.isdisjoint"
+    } else {
+        "set.isdisjoint"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     if unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
         return Ok(pyre_object::w_bool_from(set_is_disjoint_from(
             args[0], args[1],
@@ -20155,12 +20234,12 @@ pub(crate) fn set_method_difference(
 pub(crate) fn set_method_symmetric_difference(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        if args.is_empty() {
-            return Ok(pyre_object::w_set_new());
-        }
-        return Ok(args[0]);
-    }
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.symmetric_difference"
+    } else {
+        "set.symmetric_difference"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     // `setobject.py symmetric_difference` wraps the computed storage
     // in a set of self's class.
     let w_other_as_set = set_operand_as_set(args[1])?;
@@ -20338,9 +20417,12 @@ pub(crate) fn set_is_subset_of(
 fn set_method_le(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        return Ok(pyre_object::w_bool_from(true));
-    }
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.issubset"
+    } else {
+        "set.issubset"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     let w_other_as_set = set_operand_as_set(args[1])?;
     Ok(pyre_object::w_bool_from(set_is_subset_of(
         args[0],
@@ -20351,9 +20433,12 @@ fn set_method_le(
 fn set_method_ge(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        return Ok(pyre_object::w_bool_from(true));
-    }
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.issuperset"
+    } else {
+        "set.issuperset"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     // `setobject.py descr_issuperset` — the operand becomes a set and
     // the subset test runs the other way round.
     let w_other_as_set = set_operand_as_set(args[1])?;
@@ -20432,9 +20517,7 @@ fn set_method_intersection_update(
 fn set_method_symmetric_difference_update(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.is_empty() || args.len() < 2 {
-        return Ok(pyre_object::w_none());
-    }
+    crate::type_methods::arity_exact(args, "set.symmetric_difference_update", 1)?;
     let w_other_as_set = set_operand_as_set(args[1])?;
     let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
     // `setobject.py` — the computed storage replaces self's.

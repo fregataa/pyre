@@ -1,5 +1,6 @@
 //! Wrapper around RustPython's compiler to parse and compile Python source.
 
+pub use rustpython_compiler::CompileError;
 pub use rustpython_compiler::CompileOpts;
 pub use rustpython_compiler::Mode;
 pub use rustpython_compiler::compile as rp_compile;
@@ -9,9 +10,14 @@ pub use rustpython_compiler_core::bytecode::{
 };
 
 /// Compile Python source code to a RustPython CodeObject.
-pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, String> {
-    rp_compile(source, mode, "<pyre>".into(), Default::default())
-        .map_err(|e| format!("compile error: {e}"))
+///
+/// The filename is the one `exec`/`eval` report for a str source, surfacing
+/// as `co_filename` and as the `SyntaxError.filename` of a failed compile.
+///
+/// The `CompileError` is returned unflattened so the SyntaxError builders
+/// can read its `python_location` / `python_end_location` / `source_path`.
+pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, CompileError> {
+    rp_compile(source, mode, "<string>".into(), Default::default())
 }
 
 /// Compile Python source code with a custom filename.
@@ -21,7 +27,7 @@ pub fn compile_source_with_filename(
     source: &str,
     mode: Mode,
     filename: &str,
-) -> Result<CodeObject, String> {
+) -> Result<CodeObject, CompileError> {
     compile_source_with_opts(source, mode, filename, Default::default())
 }
 
@@ -34,8 +40,8 @@ pub fn compile_source_with_opts(
     mode: Mode,
     filename: &str,
     opts: CompileOpts,
-) -> Result<CodeObject, String> {
-    rp_compile(source, mode, filename.into(), opts).map_err(|e| format!("compile error: {e}"))
+) -> Result<CodeObject, CompileError> {
+    rp_compile(source, mode, filename.into(), opts)
 }
 
 /// Scan the first two lines of `source` for a PEP 263 coding cookie
@@ -183,11 +189,11 @@ pub fn decode_source_bytes(
 }
 
 /// Compile a Python expression.
-pub fn compile_eval(source: &str) -> Result<CodeObject, String> {
+pub fn compile_eval(source: &str) -> Result<CodeObject, CompileError> {
     compile_source(source, Mode::Eval)
 }
 
 /// Compile a Python script (module).
-pub fn compile_exec(source: &str) -> Result<CodeObject, String> {
+pub fn compile_exec(source: &str) -> Result<CodeObject, CompileError> {
     compile_source(source, Mode::Exec)
 }

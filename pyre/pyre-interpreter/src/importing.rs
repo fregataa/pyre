@@ -439,6 +439,28 @@ pub fn register_builtin_module_with_startup(
     });
 }
 
+/// The registered builtin module names, for `sys.builtin_module_names`.
+///
+/// PyPy equivalent: `pypy/module/sys/state.py get_builtin_module_names`,
+/// which likewise reads `space.builtin_modules` rather than a second list.
+/// Reading the registry keeps the advertised set equal to the set `import`
+/// can satisfy under every `cfg` combination, which a parallel list cannot:
+/// the modules gated on `unix` / `wasm32` / `sandbox` differ per build.
+/// Dotted keys (`importlib.machinery`, `__pypy__.builders`) are registry
+/// entries for submodules, not top-level modules, so they are left out.
+pub fn builtin_module_names() -> Vec<&'static str> {
+    BUILTIN_MODULES.with(|m| {
+        let mut names: Vec<&'static str> = m
+            .borrow()
+            .keys()
+            .copied()
+            .filter(|name| !name.contains('.'))
+            .collect();
+        names.sort_unstable();
+        names
+    })
+}
+
 /// Install all standard builtin modules.
 ///
 /// Mirrors PyPy's `baseobjspace.make_builtins()` +
@@ -489,6 +511,10 @@ pub fn install_builtin_modules() {
     // (PyPy: pypy/module/* mixed modules).
     pyre_install_module!(_weakref);
     pyre_install_module!(_warnings);
+    // `sys.platform == "win32"` sends shutil (and so tempfile) through the
+    // `_winapi` import even though the Windows build installs `posix`.
+    #[cfg(windows)]
+    pyre_install_module!(_winapi);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));
@@ -547,9 +573,14 @@ pub fn install_builtin_modules() {
     {
         #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!("_signal"(signal));
-        #[cfg(not(target_arch = "wasm32"))]
+        // Only a POSIX host has the user/group databases these read; the
+        // platforms without them have no `pwd`/`grp` module at all, and the
+        // callers depend on that: `posixpath.expanduser`, `pathlib` and
+        // `tarfile` all reach for the module inside `try/except ImportError`
+        // and take a fallback when it is missing.
+        #[cfg(unix)]
         pyre_install_module!(pwd);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(unix)]
         pyre_install_module!(grp);
         #[cfg(unix)]
         pyre_install_module!(resource);
@@ -852,7 +883,7 @@ fn init_sysconfigdata_empty(ns: PyObjectRef) {
 /// `W_ModuleDictObject` for every module via
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
-fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
+pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let module_def = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
@@ -911,6 +942,38 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
         crate::module_ns_store(w_dict, "__builtins__", module);
     }
     Some(module)
+}
+
+/// The builtin-module half of `load_part`: build the module, bind it in
+/// `sys.modules`, then run its `startup` hook. `_imp.create_builtin` performs
+/// the same three steps a native `import` does, so the two entry points leave
+/// a builtin module in the same state.
+pub(crate) fn create_builtin_module(
+    name: &str,
+    execution_context: *const PyExecutionContext,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    // `import builtins` must resolve to `space.builtin`, the one Module every
+    // frame uses for its LOAD_GLOBAL fallback. A fresh `load_builtin_module`
+    // would rerun `install_default_builtins`, minting a second exception
+    // hierarchy and overwriting the name→class registry, so a caught
+    // `except KeyError` would then compare against the wrong `BaseException`.
+    // `load_part` routes the name this way; the `_imp.create_builtin` entry
+    // point must too.
+    if name == "builtins" && !execution_context.is_null() {
+        let module = unsafe { (*execution_context).get_builtin() };
+        set_sys_module(name, module);
+        return Ok(Some(module));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let Some(module) = load_builtin_module(name) else {
+        return Ok(None);
+    };
+    pyre_object::gc_roots::pin_root(module);
+    set_sys_module(name, pyre_object::gc_roots::shadow_stack_get(module_slot));
+    let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
+    startup_builtin_module(name, module, execution_context)?;
+    Ok(Some(pyre_object::gc_roots::shadow_stack_get(module_slot)))
 }
 
 fn startup_builtin_module(
@@ -1067,6 +1130,29 @@ fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
         }
     }
     SYS_MODULES.with(|m| m.borrow().get(name).copied())
+}
+
+/// Whether `sys.modules[name]` is bound to `None`, the sentinel that marks
+/// a name as blocked.
+///
+/// `_bootstrap._find_and_load` treats it as a cached "this import must not
+/// succeed" and raises instead of searching, which is how code disables an
+/// import for everything downstream of it.  `check_sys_modules` cannot
+/// report it — `None` is not a module it can hand back, so it falls through
+/// to the search — hence the separate lookup.
+fn sys_modules_blocks(name: &str) -> bool {
+    // Build the key before reading the dict, the order `check_sys_modules`
+    // uses: reading the thread-local last keeps the borrow off the stack
+    // across the allocation.
+    let key = pyre_object::w_str_new(name);
+    let dict = SYS_MODULES_DICT.with(|d| d.get());
+    if dict.is_null() {
+        return false;
+    }
+    match unsafe { pyre_object::w_dict_lookup(dict, key) } {
+        Some(m) => !m.is_null() && unsafe { pyre_object::is_none(m) },
+        None => false,
+    }
 }
 
 /// Look up a loaded module by name in `sys.modules` (Python-visible dict
@@ -1520,7 +1606,7 @@ fn parent_package_path(parent: PyObjectRef) -> Option<Vec<PathBuf>> {
 // PyPy equivalent: importing.py `parse_source_module(space, pathname, source)`
 
 fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, String> {
-    compile_source_with_filename(source, Mode::Exec, pathname)
+    compile_source_with_filename(source, Mode::Exec, pathname).map_err(|e| e.to_string())
 }
 
 // ── exec_code_module ─────────────────────────────────────────────────
@@ -1795,7 +1881,71 @@ fn load_source_module(
         }
     }
 
+    // `_bootstrap` has no `sys` or `_imp` of its own until it is handed them,
+    // so every entry point through it raises NameError until this runs. Read
+    // the module back out of sys.modules rather than reusing the local: the
+    // body just executed arbitrary code, and a collection in there relocates
+    // a young module while only the dict entry is updated.
+    if modulename == "importlib._bootstrap" {
+        if let Some(loaded) = check_sys_modules(modulename) {
+            install_importlib_bootstrap(loaded, execution_context)?;
+        }
+    }
+
     Ok(module)
+}
+
+/// Wire a freshly executed `importlib._bootstrap` into this interpreter.
+///
+/// PyPy does the same from `_frozen_importlib`'s `install()`: `_install`
+/// binds `sys` / `_imp` into the module globals and appends BuiltinImporter
+/// and FrozenImporter to `sys.meta_path`, then
+/// `_install_external_importers` imports `_bootstrap_external` — reached
+/// through the `_frozen_importlib_external` alias `absolute_import` already
+/// maps — and appends PathFinder.
+///
+/// PyPy runs it while building the space; doing it as the module finishes
+/// loading keeps both bootstrap files off the startup path, since nothing
+/// reads `sys.meta_path` before something has imported the machinery that
+/// fills it.
+#[cfg(feature = "host_env")]
+fn install_importlib_bootstrap(
+    module: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let module_slot = shadow_stack_len();
+    pin_root(module);
+
+    let w_sys = absolute_import("sys", pyre_object::PY_NULL, execution_context)?;
+    let sys_slot = shadow_stack_len();
+    pin_root(w_sys);
+
+    let w_imp = absolute_import("_imp", pyre_object::PY_NULL, execution_context)?;
+    let imp_slot = shadow_stack_len();
+    pin_root(w_imp);
+
+    let install = crate::baseobjspace::getattr_str(shadow_stack_get(module_slot), "_install")?;
+    let install_slot = shadow_stack_len();
+    pin_root(install);
+    let args = [shadow_stack_get(sys_slot), shadow_stack_get(imp_slot)];
+    crate::call::call_function_impl_result(shadow_stack_get(install_slot), &args)?;
+
+    let install_external = crate::baseobjspace::getattr_str(
+        shadow_stack_get(module_slot),
+        "_install_external_importers",
+    )?;
+    crate::call::call_function_impl_result(install_external, &[])?;
+
+    // `_install_external_importers` imports `_frozen_importlib_external`,
+    // which aliases that name onto the loaded submodule; the bootstrap module
+    // itself is only reached under its submodule name, so it never picks up
+    // the matching alias. Register it once both installs have succeeded, so a
+    // body that raised leaves no alias behind.
+    set_sys_module("_frozen_importlib", shadow_stack_get(module_slot));
+    Ok(())
 }
 
 // ── load_package ─────────────────────────────────────────────────────
@@ -1863,6 +2013,15 @@ fn load_part(
     parent_dirs: Option<&[PathBuf]>,
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
+    // A blocked name is answered before any search, so it also applies to a
+    // name that was never importable to begin with.
+    if sys_modules_blocks(modulename) {
+        return Err(crate::PyError::module_not_found_with_name(
+            format!("import of {modulename} halted; None in sys.modules"),
+            modulename,
+        ));
+    }
+
     // Check sys.modules cache first
     if let Some(cached) = check_sys_modules(modulename) {
         return Ok(Some(cached));
@@ -2258,9 +2417,40 @@ pub fn import_from(
         }
     }
 
-    Err(crate::PyError::new(
-        crate::PyErrorKind::ImportError,
-        format!("cannot import name '{name}'"),
+    // The name is neither a real attribute nor an importable submodule.
+    // `error.py:new_import_error` — raise `ImportError(msg, name=pkgname,
+    // path=pkgpath)`: `pkgname` is the package `__name__` (default "<unknown
+    // module name>"), `pkgpath` its `__file__` (`get_path`, default "unknown
+    // location").  pyopcode.py:1152 resolves the name via
+    // `space.getattr(w_module, '__name__')` and importing.py:460-470 `get_path`
+    // via `space.getattr(w_module, '__file__')`, so a descriptor- or
+    // `__getattr__`-supplied value and a non-module `from` target are honored;
+    // a missing / None path takes the default.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pkgname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let w_pkgname = match crate::baseobjspace::getattr_str(module, "__name__") {
+        Ok(v) if unsafe { pyre_object::is_str(v) } => v,
+        _ => pyre_object::w_str_new("<unknown module name>"),
+    };
+    // The `__file__` lookup below can run a descriptor or `__getattr__` and so
+    // collect; the name string is young and movable, so pin it and read it
+    // back from the slot afterwards.
+    pyre_object::gc_roots::pin_root(w_pkgname);
+    // pypy/module/imp/importing.py:460 get_path
+    let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
+        Ok(v) if unsafe { pyre_object::is_none(v) } => pyre_object::w_str_new("unknown location"),
+        Ok(v) => v,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            pyre_object::w_str_new("unknown location")
+        }
+        Err(e) => return Err(e),
+    };
+    let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
+    let pkgname = unsafe { pyre_object::w_str_get_value(w_pkgname) };
+    let pkgpath = crate::baseobjspace::utf8_w(w_pkgpath)?;
+    let msg = format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})");
+    Err(crate::PyError::import_error_name_path(
+        msg, w_pkgname, w_pkgpath,
     ))
 }
 

@@ -1,5 +1,7 @@
 use pyre_object::PyObjectRef;
 use pyre_object::interp_exceptions::{ExcKind, exc_kind_name, w_exception_new};
+use ruff_text_size::Ranged;
+use rustpython_compiler::{ast, parser};
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -530,6 +532,83 @@ impl PyError {
         Self::new(PyErrorKind::SyntaxError, msg)
     }
 
+    /// Build a compile-time SyntaxError carrying the parser location so
+    /// `e.msg` / `e.filename` / `e.lineno` / `e.offset` / `e.text` /
+    /// `e.end_lineno` / `e.end_offset` read back once the instance is
+    /// materialised.  `args` becomes `(msg, (filename, lineno, offset,
+    /// text, end_lineno, end_offset))`, the shape
+    /// `interp_exceptions.py:836 W_SyntaxError.descr_init` stores and
+    /// `syntax_error_attr` / `descr_str` read from.  `text` is the
+    /// offending source line (`None` → `text` reads back as `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn syntax_error_located(
+        msg: impl Into<String>,
+        filename: &str,
+        lineno: i64,
+        offset: i64,
+        end_lineno: i64,
+        end_offset: i64,
+        text: Option<&str>,
+    ) -> Self {
+        let message = msg.into();
+        // Root the fresh exception across the args/details allocations: `exc`
+        // lives only in this Rust local while `w_str_new` / `w_int_new` /
+        // `w_tuple_new` / `w_list_new` run, so a collection there could sweep
+        // the unrooted exception before `w_exception_set_args` writes it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc = w_exception_new(ExcKind::SyntaxError, &message);
+        pyre_object::gc_roots::pin_root(exc);
+        // Build the `(filename, lineno, offset, text, end_lineno, end_offset)`
+        // details tuple element by element. Each is pinned as it is created and
+        // reloaded before the tuple is assembled: an int / str allocation for a
+        // later element can trigger a minor collection that relocates an earlier
+        // young element (the filename or text string, or an uncached line/col
+        // int), leaving its raw local pointing at the old address.
+        let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
+        let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
+        let offset_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
+        let text_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(match text {
+            Some(t) => pyre_object::w_str_new(t),
+            None => pyre_object::w_none(),
+        });
+        let end_lineno_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_lineno));
+        let end_offset_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_offset));
+        let details = pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(filename_slot),
+            pyre_object::gc_roots::shadow_stack_get(lineno_slot),
+            pyre_object::gc_roots::shadow_stack_get(offset_slot),
+            pyre_object::gc_roots::shadow_stack_get(text_slot),
+            pyre_object::gc_roots::shadow_stack_get(end_lineno_slot),
+            pyre_object::gc_roots::shadow_stack_get(end_offset_slot),
+        ]);
+        // Root the details tuple across the message allocation below before it
+        // becomes `args[1]`.
+        let details_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(details);
+        let w_msg = pyre_object::w_str_new(&message);
+        let details = pyre_object::gc_roots::shadow_stack_get(details_slot);
+        let args_list = pyre_object::w_list_new(vec![w_msg, details]);
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+        PyError {
+            kind: PyErrorKind::SyntaxError,
+            // Leave the display message empty so `message_text` derives it from
+            // `exc_object` via the SyntaxError `descr_str`, which appends the
+            // `(filename, line N)` suffix.
+            message: String::new(),
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
     pub fn zero_division(msg: impl Into<String>) -> Self {
         Self::new(PyErrorKind::ZeroDivisionError, msg)
     }
@@ -589,6 +668,18 @@ impl PyError {
     /// key object.  The display message is the key's repr, matching
     /// what `KeyError.__str__` yields.
     pub fn key_error_with_key(key: PyObjectRef) -> Self {
+        // Root the caller's key and the fresh exception across the repr,
+        // exception, and args allocations below: they live only in Rust
+        // locals, which the precise collector does not scan, so a collection
+        // inside `py_repr` / `w_exception_new` / `w_list_new` could sweep the
+        // key or the exception before `w_exception_set_args` stamps them.
+        // The key is pinned before `py_repr` because that repr itself
+        // allocates.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !key.is_null() {
+            pyre_object::gc_roots::pin_root(key);
+        }
         let message = if key.is_null() {
             "<null>".to_string()
         } else {
@@ -596,7 +687,12 @@ impl PyError {
                 .unwrap_or_else(|_| "<unrepresentable>".to_string())
         };
         let exc = pyre_object::interp_exceptions::w_exception_new(ExcKind::KeyError, &message);
+        pyre_object::gc_roots::pin_root(exc);
         if !key.is_null() {
+            // Reload the key after the repr / exception allocations: the pin
+            // keeps it alive, but a minor collection may have relocated the
+            // young key, leaving this raw local pointing at the old address.
+            let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
             let args_list = pyre_object::w_list_new(vec![key]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         }
@@ -623,15 +719,127 @@ impl PyError {
         Self::new(PyErrorKind::OSError, msg)
     }
 
-    /// Raise an OSError (or FileNotFoundError when errno is ENOENT) with
-    /// a platform-style error message.
-    pub fn os_error_with_errno(errno: i32, msg: impl Into<String>) -> Self {
-        let kind = if errno == 2 {
-            PyErrorKind::FileNotFoundError
+    /// Rust's OS-error `Display` is `"{strerror} (os error {errno})"`;
+    /// recover the bare strerror the way `rposix.strerror` reports it.
+    fn clean_strerror(errno: i32) -> String {
+        // `from_raw_os_error` reads its argument as a Win32 code on Windows,
+        // where these errnos are the POSIX ones `io_error_posix_errno`
+        // translated to, so it would describe an unrelated system error (17 is
+        // EEXIST but also ERROR_NOT_SAME_DEVICE).  The C runtime keeps the
+        // errno-keyed table `strerror` reports from.
+        #[cfg(windows)]
+        {
+            let msg = unsafe { libc::strerror(errno) };
+            if !msg.is_null() {
+                return unsafe { std::ffi::CStr::from_ptr(msg) }
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+        let full = std::io::Error::from_raw_os_error(errno).to_string();
+        match full.rfind(" (os error ") {
+            Some(idx) => full[..idx].to_string(),
+            None => full,
+        }
+    }
+
+    /// `error.py:_wrap_oserror2` — build the OSError a failed syscall raises:
+    /// `args = (errno, strerror)`, the errno-specific subclass (`ERRNO_MAP`),
+    /// the clean strerror, and the `.errno` / `.strerror` / `.filename` slots.
+    /// `w_filename` is the affected path, or `PY_NULL` for none.
+    pub fn os_error_syscall(errno: i32, w_filename: PyObjectRef) -> Self {
+        Self::os_error_syscall2(errno, w_filename, pyre_object::PY_NULL)
+    }
+
+    /// `os_error_syscall` for the two-path syscalls (`rename`, `replace`,
+    /// `link`, `symlink`): `w_filename2` becomes the `.filename2` slot, which
+    /// `str(e)` renders as the `" -> 'dest'"` suffix.
+    pub fn os_error_syscall2(
+        errno: i32,
+        w_filename: PyObjectRef,
+        w_filename2: PyObjectRef,
+    ) -> Self {
+        let strerror = Self::clean_strerror(errno);
+        let subclass = crate::builtins::os_error_errno_subclass(errno as i64);
+        // The dedicated FileNotFoundError kind carries its own str/repr; the
+        // other errno subclasses share OSError's and differ only by class.
+        let (kind, exc_kind) = if matches!(subclass, Some("FileNotFoundError")) {
+            (PyErrorKind::FileNotFoundError, ExcKind::FileNotFoundError)
         } else {
-            PyErrorKind::OSError
+            (PyErrorKind::OSError, ExcKind::OSError)
         };
-        Self::new(kind, msg)
+        let message = format!("[Errno {errno}] {strerror}");
+        // Root the caller's filename and the fresh exception across the
+        // exception and args allocations below: they live only in Rust locals,
+        // which the precise collector does not scan, so a collection inside
+        // `w_exception_new` / `w_list_new` could sweep them before the setters
+        // stamp them onto `exc`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let pin = |obj: PyObjectRef| -> Option<usize> {
+            if obj.is_null() {
+                return None;
+            }
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            Some(slot)
+        };
+        let filename_slot = pin(w_filename);
+        let filename2_slot = pin(w_filename2);
+        let exc = w_exception_new(exc_kind, &message);
+        pyre_object::gc_roots::pin_root(exc);
+        // Retag to the errno subclass through `w_class`, like
+        // `os_error_family_new`: the subclasses share OSError's layout, so
+        // the ExcKind stays OSError and only the class differs.
+        if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
+            unsafe {
+                (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
+            }
+        }
+        let args_list = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(errno as i64),
+            pyre_object::w_str_new(&strerror),
+        ]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
+            pyre_object::interp_exceptions::w_exception_set_errno(
+                exc,
+                pyre_object::w_int_new(errno as i64),
+            );
+            pyre_object::interp_exceptions::w_exception_set_strerror(
+                exc,
+                pyre_object::w_str_new(&strerror),
+            );
+            // Reload the paths after the args allocations: the pins keep them
+            // alive, but a minor collection may have relocated the young
+            // strings, leaving the raw locals pointing at the old addresses.
+            if let Some(slot) = filename_slot {
+                let w_filename = pyre_object::gc_roots::shadow_stack_get(slot);
+                pyre_object::interp_exceptions::w_exception_set_filename(exc, w_filename);
+            }
+            if let Some(slot) = filename2_slot {
+                let w_filename2 = pyre_object::gc_roots::shadow_stack_get(slot);
+                pyre_object::interp_exceptions::w_exception_set_filename2(exc, w_filename2);
+            }
+        }
+        PyError {
+            kind,
+            // Leave the display message empty so `message_text` derives it from
+            // `exc_object` via `W_OSError.descr_str`, which appends the
+            // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
+            // it and the uncaught-traceback header would drop the filename.
+            message: String::new(),
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
+    /// Raise the structured OSError for `errno` (no filename). The caller's
+    /// platform message is superseded by the errno-derived strerror.
+    pub fn os_error_with_errno(errno: i32, _msg: impl Into<String>) -> Self {
+        Self::os_error_syscall(errno, pyre_object::PY_NULL)
     }
 
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
@@ -652,7 +860,13 @@ impl PyError {
             ExcKind::OSError
         };
         let message = format!("[Errno {errno}] {strerror}");
+        // Root the fresh exception across the args allocation below: `exc`
+        // lives only in this Rust local while `w_int_new` / `w_str_new` /
+        // `w_list_new` run, so a collection there could sweep the unrooted
+        // exception before `w_exception_set_args` writes through it.
+        let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new(exc_kind, &message);
+        pyre_object::gc_roots::pin_root(exc);
         let args_list = pyre_object::w_list_new(vec![
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
@@ -660,6 +874,69 @@ impl PyError {
         unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         PyError {
             kind,
+            message,
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
+    /// `error.py:new_import_error` — `ImportError(msg, name=name, path=path)`.
+    /// A failed `from X import Y` (pyopcode.py import_from) raises through
+    /// this so `.name` (the package) and `.path` (its file) are readable,
+    /// which `PyError::new(ImportError, msg)` cannot carry.
+    pub fn import_error_name_path(
+        msg: impl Into<String>,
+        w_name: PyObjectRef,
+        w_path: PyObjectRef,
+    ) -> Self {
+        let message = msg.into();
+        // Root the caller's name/path and the fresh exception across the
+        // exception and message allocations below: they live only in Rust
+        // locals, which the precise collector does not scan, so a collection
+        // inside `w_exception_new` / `w_str_new` could sweep them before the
+        // setters stamp them onto `exc`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !w_name.is_null() {
+            pyre_object::gc_roots::pin_root(w_name);
+        }
+        let path_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !w_path.is_null() {
+            pyre_object::gc_roots::pin_root(w_path);
+        }
+        let exc = w_exception_new(ExcKind::ImportError, &message);
+        pyre_object::gc_roots::pin_root(exc);
+        // `ImportError.__init__` mirrors args[0] into the dedicated `msg`
+        // slot; the prebuilt-instance path bypasses it, so stamp it here.
+        let w_msg = if message.is_empty() {
+            pyre_object::w_none()
+        } else {
+            pyre_object::w_str_new(&message)
+        };
+        // Reload name/path after the message allocation: the pins keep them
+        // alive, but a minor collection may have relocated the young objects,
+        // leaving these raw locals stale. A null (absent) ref was never pinned,
+        // so it has no slot and stays null.
+        let w_name = if w_name.is_null() {
+            w_name
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(name_slot)
+        };
+        let w_path = if w_path.is_null() {
+            w_path
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(path_slot)
+        };
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_import_msg(exc, w_msg);
+            pyre_object::interp_exceptions::w_exception_set_name(exc, w_name);
+            pyre_object::interp_exceptions::w_exception_set_import_path(exc, w_path);
+        }
+        PyError {
+            kind: PyErrorKind::ImportError,
             message,
             exc_object: exc,
             attach_tb: true,
@@ -715,9 +992,11 @@ impl PyError {
         // `w_exception_new` could sweep them before they are stamped onto `exc`
         // at the `set_name` / `set_attr_obj` calls.
         let _roots = pyre_object::gc_roots::push_roots();
+        let name_ctx_slot = pyre_object::gc_roots::shadow_stack_len();
         if !self.w_name_context.is_null() {
             pyre_object::gc_roots::pin_root(self.w_name_context);
         }
+        let obj_ctx_slot = pyre_object::gc_roots::shadow_stack_len();
         if !self.w_obj_context.is_null() {
             pyre_object::gc_roots::pin_root(self.w_obj_context);
         }
@@ -728,7 +1007,9 @@ impl PyError {
         // (non-moving oldgen) exception before it is written through.
         pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
+            let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let msg = pyre_object::w_str_new(&self.message);
+            pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::w_list_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
             // `ImportError` / `ModuleNotFoundError` expose the message through a
@@ -739,6 +1020,10 @@ impl PyError {
                 self.kind,
                 PyErrorKind::ImportError | PyErrorKind::ModuleNotFoundError
             ) {
+                // Reload `msg` after the args allocation: the pin keeps it
+                // alive, but `w_list_new` may have relocated the young string,
+                // leaving this raw local pointing at the old address.
+                let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
                 unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc, msg) };
             }
         }
@@ -746,15 +1031,16 @@ impl PyError {
         // materialised NameError / AttributeError instance, the lazy
         // equivalent of `_PyEval_FormatExcCheckArg` /
         // `set_attribute_error_context` (Python 3.10+).
+        // Reload the deferred context refs after the exception / args
+        // allocations: the pins keep them alive, but a minor collection may
+        // have relocated the young objects, leaving the stored fields stale.
         if !self.w_name_context.is_null() {
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_name(exc, self.w_name_context)
-            };
+            let w_name_context = pyre_object::gc_roots::shadow_stack_get(name_ctx_slot);
+            unsafe { pyre_object::interp_exceptions::w_exception_set_name(exc, w_name_context) };
         }
         if !self.w_obj_context.is_null() {
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, self.w_obj_context)
-            };
+            let w_obj_context = pyre_object::gc_roots::shadow_stack_get(obj_ctx_slot);
+            unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, w_obj_context) };
         }
         // Write-once memo (`get_w_value` self.w_value): cache the materialised
         // instance so a second call returns the same object (identity `e1 is e2`)
@@ -1140,6 +1426,67 @@ pub fn write_exception<W: Write>(
     }
 }
 
+/// Render an uncaught compile-time SyntaxError as the top-level banner
+/// (`print_error_text`): the `File "…", line N` header, the offending
+/// source line, a caret under the offending column span, and
+/// `<Class>: <msg>` (the raw `msg`, not `str(e)`'s `(file, line N)`
+/// suffix — the header already carries the location).  There is no
+/// traceback frame chain: a malformed source never began executing.
+/// Falls back to the plain header when the instance lacks structured
+/// location (a location-less codegen error).
+pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::Result<()> {
+    let exc = err.exc_object;
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return writeln!(writer, "{}", err.render_exception());
+    }
+    let attr = |name: &str| crate::baseobjspace::syntax_error_attr(exc, name);
+    let str_of = |w: PyObjectRef| -> Option<String> {
+        (!w.is_null() && unsafe { pyre_object::is_str(w) })
+            .then(|| unsafe { pyre_object::w_str_get_value(w) }.to_string())
+    };
+    let int_of = |w: PyObjectRef| -> Option<i64> {
+        (!w.is_null() && unsafe { pyre_object::is_int(w) })
+            .then(|| unsafe { pyre_object::intobject::w_int_get_value(w) })
+    };
+    let filename = str_of(attr("filename"));
+    let lineno = int_of(attr("lineno"));
+    if let (Some(fname), Some(lineno)) = (filename.as_ref(), lineno) {
+        writeln!(writer, "  File \"{fname}\", line {lineno}")?;
+    }
+    if let Some(text) = str_of(attr("text")) {
+        let raw = text.trim_end_matches(['\n', '\r']);
+        let shown = raw.trim_start();
+        let lead = raw.len() - shown.len();
+        writeln!(writer, "    {shown}")?;
+        if let Some(offset) = int_of(attr("offset")) {
+            let start_col = (offset.max(1) as usize) - 1;
+            let end_col = int_of(attr("end_offset"))
+                .filter(|&e| e >= offset)
+                .map_or(start_col, |e| (e as usize) - 1);
+            let caret_start = start_col.saturating_sub(lead);
+            let caret_len = end_col.saturating_sub(start_col).max(1);
+            let mut caret = String::from("    ");
+            caret.push_str(&" ".repeat(caret_start));
+            caret.push_str(&"^".repeat(caret_len));
+            writeln!(writer, "{caret}")?;
+        }
+    }
+    let name =
+        exc_object_class_name(exc).unwrap_or_else(|| exc_kind_name(err.to_exc_kind()).to_string());
+    match str_of(attr("msg")) {
+        Some(msg) if !msg.is_empty() => writeln!(writer, "{name}: {msg}"),
+        _ => writeln!(writer, "{name}"),
+    }
+}
+
+/// Emit `write_syntax_error` through the mediated stderr seam, mirroring
+/// `eprint_exception`.
+pub fn eprint_syntax_error(err: &PyError) {
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = write_syntax_error(&mut buf, err);
+    crate::host_seam::emit_stderr(&buf);
+}
+
 /// `Lib/traceback.py:171-200 TracebackException._format_*` parity —
 /// walk `__cause__` (or `__context__` when `__suppress_context__` is
 /// False) chains and emit each older exception with the appropriate
@@ -1290,18 +1637,34 @@ fn write_traceback_chain_from_exc<W: Write>(
         }
         let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(tb) };
         let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) };
-        let (filename, funcname) = if w_code.is_null() {
-            (String::from("<unknown>"), String::from("<unknown>"))
+        let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(tb) };
+        let (filename, funcname, location) = if w_code.is_null() {
+            (String::from("<unknown>"), String::from("<unknown>"), None)
         } else {
             // `w_code` is a GC-rooted `PyCode` pointer captured
             // at `record_application_traceback` time; the inner
             // `CodeObject` lives as long as `w_code` is reachable.
             let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
             if code_obj.is_null() {
-                (String::from("<unknown>"), String::from("<unknown>"))
+                (String::from("<unknown>"), String::from("<unknown>"), None)
             } else {
                 let code = unsafe { &*code_obj };
-                (code.source_path.to_string(), code.obj_name.to_string())
+                let location = usize::try_from(lasti)
+                    .ok()
+                    .and_then(|index| code.locations.get(index))
+                    .map(|(start, end)| {
+                        (
+                            start.line.get(),
+                            end.line.get(),
+                            start.character_offset.get().saturating_sub(1),
+                            end.character_offset.get().saturating_sub(1),
+                        )
+                    });
+                (
+                    code.source_path.to_string(),
+                    code.obj_name.to_string(),
+                    location,
+                )
             }
         };
         writeln!(
@@ -1310,12 +1673,147 @@ fn write_traceback_chain_from_exc<W: Write>(
             filename, lineno, funcname
         )?;
         if let Some(line) = read_source_line(&filename, lineno) {
-            let trimmed = line.trim_end_matches(['\n', '\r']);
-            writeln!(writer, "    {}", trimmed.trim_start())?;
+            let raw_line = line.trim_end_matches(['\n', '\r']);
+            let shown_line = raw_line.trim_start();
+            writeln!(writer, "    {shown_line}")?;
+
+            if let Some((start_line, end_line, start_col, end_col)) = location
+                && usize::try_from(lineno).ok() == Some(start_line)
+                && end_line == start_line
+                && end_col > start_col
+                && start_col <= raw_line.len()
+                && end_col <= raw_line.len()
+                && raw_line.is_char_boundary(start_col)
+                && raw_line.is_char_boundary(end_col)
+            {
+                let lead = raw_line.len() - shown_line.len();
+                let anchors = traceback_anchors(raw_line, start_col, end_col);
+                // `traceback.py:_should_show_carets` — a plain caret span covering
+                // the whole stripped line (nothing but whitespace before the start
+                // or after the end, and no binary-op/subscript sub-anchor) carries
+                // no information, so it is suppressed. A `<name> = <call>(…)` or
+                // `return <call>(…)` whose call value exactly covers the span is
+                // likewise suppressed even though it has a call sub-anchor.
+                let before_ws_only = raw_line
+                    .get(..start_col)
+                    .unwrap_or("")
+                    .trim_start()
+                    .is_empty();
+                let after_ws_only = raw_line.get(end_col..).unwrap_or("").trim_end().is_empty();
+                let full_line_call = spawns_full_line_call(
+                    shown_line,
+                    start_col.saturating_sub(lead),
+                    end_col.saturating_sub(lead),
+                );
+                if !full_line_call && (anchors.is_some() || !before_ws_only || !after_ws_only) {
+                    let mut caret_line = String::from("    ");
+                    caret_line.push_str(&" ".repeat(start_col.saturating_sub(lead)));
+                    for col in start_col..end_col {
+                        let marker = if let Some((lo, hi)) = anchors {
+                            if (lo..hi).contains(&col) { '^' } else { '~' }
+                        } else {
+                            '^'
+                        };
+                        caret_line.push(marker);
+                    }
+                    writeln!(writer, "{caret_line}")?;
+                }
+            }
         }
         tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(tb) };
     }
     Ok(())
+}
+
+/// `traceback.py:_should_show_carets` special case: a `<name> = <call>(…)` or
+/// `return <call>(…)` statement whose call value exactly spans the failing
+/// instruction (byte offsets `seg_start..seg_end` into `line`, the already-
+/// dedented source line). Such a caret would merely re-underline the whole
+/// right-hand side, so it is suppressed.
+fn spawns_full_line_call(line: &str, seg_start: usize, seg_end: usize) -> bool {
+    let Ok(parsed) = parser::parse_module(line) else {
+        return false;
+    };
+    let body = &parsed.syntax().body;
+    let [stmt] = body.as_slice() else {
+        return false;
+    };
+    let call = match stmt {
+        ast::Stmt::Assign(assign) => {
+            if assign.targets.len() != 1
+                || !matches!(assign.targets.first(), Some(ast::Expr::Name(_)))
+                || !matches!(assign.value.as_ref(), ast::Expr::Call(_))
+            {
+                return false;
+            }
+            assign.value.range()
+        }
+        ast::Stmt::Return(ret) => match ret.value.as_deref() {
+            Some(ast::Expr::Call(call)) if matches!(call.func.as_ref(), ast::Expr::Name(_)) => {
+                call.range()
+            }
+            _ => return false,
+        },
+        _ => return false,
+    };
+    call.start().to_usize() == seg_start && call.end().to_usize() == seg_end
+}
+
+/// Return the secondary-marker span used by `traceback.py` for an expression.
+fn traceback_anchors(raw_line: &str, start_col: usize, end_col: usize) -> Option<(usize, usize)> {
+    let segment = raw_line.get(start_col..end_col)?;
+    let wrapped = format!("(\n{segment}\n)");
+    let parsed = parser::parse_expression(&wrapped).ok()?;
+    let expr = parsed.syntax().body.as_ref();
+
+    let map_offset = |offset: usize| {
+        offset
+            .checked_sub(2)
+            .and_then(|offset| offset.checked_add(start_col))
+            .map(|offset| offset.clamp(start_col, end_col))
+    };
+    let map_range = |lo: usize, hi: usize| {
+        let lo = map_offset(lo)?;
+        let hi = map_offset(hi)?;
+        (lo < hi).then_some((lo, hi))
+    };
+
+    match expr {
+        ast::Expr::BinOp(bin_op) => {
+            let left_end = bin_op.left.range().end().to_usize();
+            let right_start = bin_op.right.range().start().to_usize();
+            if left_end > right_start || right_start > wrapped.len() {
+                return None;
+            }
+            let between = wrapped.as_bytes().get(left_end..right_start)?;
+            let op_relative = between
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace() && *byte != b')')?;
+            let op_start = left_end.checked_add(op_relative)?;
+            let mut op_end = op_start;
+            while op_end < right_start {
+                let byte = *wrapped.as_bytes().get(op_end)?;
+                if byte.is_ascii_whitespace()
+                    || byte == b')'
+                    || byte.is_ascii_alphanumeric()
+                    || byte == b'_'
+                {
+                    break;
+                }
+                op_end = op_end.checked_add(1)?;
+            }
+            map_range(op_start, op_end)
+        }
+        ast::Expr::Subscript(subscript) => map_range(
+            subscript.value.range().end().to_usize(),
+            expr.range().end().to_usize(),
+        ),
+        ast::Expr::Call(call) => map_range(
+            call.func.range().end().to_usize(),
+            expr.range().end().to_usize(),
+        ),
+        _ => None,
+    }
 }
 
 /// Open `filename` and return its `lineno`-th line (1-indexed).  Returns
