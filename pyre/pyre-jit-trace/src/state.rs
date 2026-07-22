@@ -1996,6 +1996,11 @@ pub struct PyreSym {
     /// `None` for a non-branch-guard resume, where the walk
     /// keeps the opcode-entry offset for `py_pc`.
     pub(crate) bridge_walk_entry_pc: Option<usize>,
+    /// JitCode body that owns `bridge_walk_entry_pc`. `resume.py:1049-1056`
+    /// constructs the resumed frame and applies its PC from the same resume
+    /// section; retain that body identity so the walker never interprets the
+    /// offset in another installed body for this code object.
+    pub(crate) bridge_walk_entry_jitcode_index: i32,
     /// The color-indexed Ref register bank as `consume_boxes`
     /// (resume.py:1055) fills `f.registers_r` — one box per abstract
     /// register color the guard's resume numbering named. This is the
@@ -2185,6 +2190,7 @@ pub trait WalkSym {
     fn live_vable_frame_addr(&self) -> usize;
     fn set_live_vable_frame_addr(&mut self, value: usize);
     fn bridge_walk_entry_pc(&self) -> Option<usize>;
+    fn bridge_walk_entry_jitcode_index(&self) -> i32;
     fn bridge_registers_r(&self) -> Option<&Vec<OpRef>>;
     fn bridge_registers_r_mut(&mut self) -> &mut Option<Vec<OpRef>>;
     fn bridge_stack_oprefs(&self) -> Option<&Vec<OpRef>>;
@@ -2304,6 +2310,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn bridge_walk_entry_pc(&self) -> Option<usize> {
         self.bridge_walk_entry_pc
+    }
+
+    #[inline]
+    fn bridge_walk_entry_jitcode_index(&self) -> i32 {
+        self.bridge_walk_entry_jitcode_index
     }
 
     #[inline]
@@ -4477,6 +4488,7 @@ impl PyreSym {
             bridge_local_oprefs: None,
             bridge_stack_oprefs: None,
             bridge_walk_entry_pc: None,
+            bridge_walk_entry_jitcode_index: -1,
             bridge_registers_r: None,
             bridge_local_types: None,
             vable_last_instr: OpRef::NONE,
@@ -6018,8 +6030,9 @@ fn reconstruct_inline_recipe(
     }
 
     // Virtualizable-callee shape (pyre's "every function is its own portal"
-    // model): the callee's only live ref registers are the portal reds
-    // [frame, ec], and its locals live in the `frame` red's own
+    // model): the callee's live ref registers are the portal reds [frame, ec]
+    // (and, at a mid-expression pause, operands kept live across a CALL), while
+    // its locals live in the `frame` red's own
     // `locals_cells_stack_w` virtual array — the same place the ROOT frame keeps
     // its locals — NOT in the register section. Recover them into REGISTER-
     // SECTION slots so the bridge rebuilds the callee as a plain MIFrame
@@ -6041,14 +6054,42 @@ fn reconstruct_inline_recipe(
     let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
     let has_frame = reg_indices.ref_.contains(&pframe_reg);
-    let full_portal =
-        reg_indices.ref_.len() == 2 && has_frame && reg_indices.ref_.contains(&pec_reg);
-    let in_call_portal =
-        in_a_call && pending_value_index.is_some() && reg_indices.ref_.len() == 1 && has_frame;
-    if pframe_reg != u32::from(u16::MAX)
-        && pec_reg != u32::from(u16::MAX)
-        && (full_portal || in_call_portal)
-    {
+    let maps = bridge_semantic_maps_from_pc(frame.jitcode_index, frame.pc);
+    // resume.py:1042-1057 `rebuild_from_resumedata` / `consume_boxes` rebuilds
+    // every paused frame and fills EVERY live register from the resume stream
+    // with no shape classifier. Pyre recovers a portal callee's locals from the
+    // `frame` red's own `locals_cells_stack_w` virtual array (below) rather than
+    // the register section, so accept any paused portal callee whose every live
+    // non-red color names a semantic slot at this pc (the `pcdep` inversion the
+    // encoder used): the reds are recovered through the `frame`, and each live
+    // operand kept across a CALL — e.g. `result1` in `f(a) + g(b)` at the second
+    // CALL — is decoded semantic-ordered from the flushed array. This single
+    // predicate subsumes the canonical `[frame, ec]` and the reduced `[frame]`
+    // in-a-call shapes; a slot the pause-time flush did not cover still declines
+    // at the mandatory-operand check below.
+    let portal_callee = has_frame
+        && reg_indices.ref_.iter().all(|&c| {
+            c == pframe_reg
+                || c == pec_reg
+                || semantic_ref_slot_for_reg_color(
+                    nlocals,
+                    stack_only,
+                    &maps.pcdep_entries,
+                    c as usize,
+                )
+                .is_some()
+        });
+    if pframe_reg != u32::from(u16::MAX) && pec_reg != u32::from(u16::MAX) && portal_callee {
+        // Distinguish the sibling-operand admission (a live color beyond the
+        // portal reds) from the canonical reds-only shape so the corpus shows
+        // what exercises the widened acceptance.
+        if reg_indices
+            .ref_
+            .iter()
+            .any(|&c| c != pframe_reg && c != pec_reg)
+        {
+            crate::jitcode_dispatch::census_record("P2Recipe::PortalSiblingAdmit");
+        }
         use majit_ir::resumedata::{RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
         let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
         let RebuiltValue::Virtual(frame_vidx) = values[frame_pos] else {
@@ -6121,6 +6162,7 @@ fn reconstruct_inline_recipe(
                 continue;
             }
             if registers_r[s] == OpRef::NONE {
+                crate::jitcode_dispatch::census_record("P2Recipe::MandatoryOperandMissing");
                 return None;
             }
         }
@@ -6155,8 +6197,8 @@ fn reconstruct_inline_recipe(
     // resume pc there is no per-pc map to faithfully rebuild the frame, so
     // decline to the single-frame bridge (whose vable payload IS semantic-
     // ordered) rather than rebuild the frame with mis-slotted boxes.
-    let maps = bridge_semantic_maps_from_pc(frame.jitcode_index, frame.pc);
     if maps.pcdep_entries.is_empty() {
+        crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
         return None;
     }
     for &color in &reg_indices.ref_ {
@@ -6171,7 +6213,10 @@ fn reconstruct_inline_recipe(
             Some(semantic_idx) if semantic_idx == color as usize => {}
             // A live color whose semantic slot differs (or is unmappable):
             // the color-indexed recipe would mis-slot it. Decline.
-            _ => return None,
+            _ => {
+                crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
+                return None;
+            }
         }
     }
 
@@ -9240,6 +9285,7 @@ impl JitState for PyreJitState {
         sym.bridge_walk_entry_pc =
             crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
                 .then_some(frame0.pc as usize);
+        sym.bridge_walk_entry_jitcode_index = frame0.jitcode_index;
         sym.bridge_local_types = Some(bridge_local_types);
         // consume_boxes (resume.py:1055) fills `f.registers_r` by abstract
         // register color; keep that color-indexed decode so a cross-frame

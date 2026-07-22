@@ -802,7 +802,7 @@ type PerfnWalkResult = Result<
 /// ([`drive_bridge_carrier_walk`]).  Resolves the five terminal descrs off
 /// `MetaInterpStaticData`, builds the per-CodeObject descr pool + sub-jitcode
 /// lookup off `pjc.jitcode.exec.descrs`, and runs `dispatch_via_miframe` from
-/// `entry` with the caller-seeded `argboxes_r`.  Returns
+/// `entry` with the caller-seeded register banks.  Returns
 /// `(code_len, walk_result)`; `None` when the terminal descrs are unwired.
 fn dispatch_perfn_frame<Sym: WalkSym>(
     ctx: &mut TraceCtx,
@@ -814,6 +814,7 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
     entry: usize,
     argboxes_r: &[majit_ir::OpRef],
     argboxes_i: &[majit_ir::OpRef],
+    argboxes_f: &[majit_ir::OpRef],
     authoritative: bool,
 ) -> Option<(usize, PerfnWalkResult)> {
     // Resolve the five terminal descrs off MetaInterpStaticData so the
@@ -918,7 +919,7 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
         pjc.jitcode.constants_f.as_slice(),
         argboxes_r,
         argboxes_i,
-        &[],
+        argboxes_f,
     );
     Some((code_len, walk_result))
 }
@@ -1990,6 +1991,117 @@ fn run_perfn_walk<Sym: WalkSym>(
         Vec::new()
     };
 
+    // resume.py:1036-1038 `_callback_f` parity: seed the Float bank the same
+    // way as argboxes_i. Empty for a non-marker resume; `truncate(num_regs_f)`
+    // strips the copy_constants tail exactly as the Int build does.
+    let argboxes_f: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc().is_some() {
+        let num_regs_f = pjc.jitcode.num_regs_f() as usize;
+        let mut v = sym.registers_f().to_vec();
+        v.truncate(num_regs_f);
+        v
+    } else {
+        Vec::new()
+    };
+
+    // resume.py:1049-1056 constructs a frame and consumes its register stream
+    // against that frame's JitCode body. Do not interpret a carried offset in
+    // another installed body for the same code object: its register colors are
+    // a foreign coordinate space. This is a runtime decline, not a green-key
+    // disable, because a later bridge may carry a matching body identity.
+    if is_bridge_trace
+        && sym.bridge_walk_entry_pc().is_some()
+        && pjc.jitcode.index() as i32 != sym.bridge_walk_entry_jitcode_index()
+    {
+        crate::jitcode_dispatch::census_record("Fbw::BridgeEntryForeignJitcode");
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-bridge-decline] foreign resume-marker jitcode: body_index={} \\
+                 bridge_jitcode_index={} entry={}",
+                pjc.jitcode.index(),
+                sym.bridge_walk_entry_jitcode_index(),
+                entry,
+            );
+        }
+        fbw_bridge_decline(ctx);
+        return None;
+    }
+
+    // The foreign-JitCode check above is a first-class runtime decline. Below,
+    // resume.py:1017-1057 `consume_boxes` / `enumerate_vars` fills every live
+    // Ref, Int, and Float register from the marker's stream. With the total
+    // bridge seed above, an uncovered color is a codewriter/seed defect.
+    // `_callback_r` writes `next_ref()` directly (resume.py:1032-1034), so a
+    // restored null Ref is covered; only `OpRef::NONE` is absent. `Some` is
+    // the resume-marker discriminator: setup_bridge_sym sets it only when the
+    // carried frame pc is a decodable `live/` offset.
+    if is_bridge_trace && sym.bridge_walk_entry_pc().is_some() {
+        let live = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+            pjc.jitcode.index() as i32,
+            entry as i32,
+        );
+        let uncovered = live
+            .ref_
+            .iter()
+            .copied()
+            .find(|&color| {
+                argboxes_r
+                    .get(color as usize)
+                    .is_none_or(|opref| opref.is_none())
+            })
+            .map(|color| ("Ref", color))
+            .or_else(|| {
+                live.int
+                    .iter()
+                    .copied()
+                    .find(|&color| {
+                        argboxes_i
+                            .get(color as usize)
+                            .is_none_or(|opref| opref.is_none())
+                    })
+                    .map(|color| ("Int", color))
+            })
+            .or_else(|| {
+                live.float
+                    .iter()
+                    .copied()
+                    .find(|&color| {
+                        argboxes_f
+                            .get(color as usize)
+                            .is_none_or(|opref| opref.is_none())
+                    })
+                    .map(|color| ("Float", color))
+            });
+        debug_assert!(
+            uncovered.is_none(),
+            "consume_boxes totality violated: jitcode_index={} entry={} uncovered={uncovered:?}",
+            pjc.jitcode.index(),
+            entry,
+        );
+        if let Some((bank, color)) = uncovered {
+            // read_int_reg/read_float_reg (jitcode_dispatch/mod.rs:1907-1936)
+            // only bounds-check. An uncovered color would record OpRef::NONE
+            // into an operation and can become a SIGSEGV or miscompile; retain
+            // this cold decline as the release airbag.
+            let census_key = match bank {
+                "Ref" => "Fbw::BridgeEntryLiveRegUnseeded::Ref",
+                "Int" => "Fbw::BridgeEntryLiveRegUnseeded::Int",
+                "Float" => "Fbw::BridgeEntryLiveRegUnseeded::Float",
+                _ => unreachable!("unknown bridge register bank"),
+            };
+            crate::jitcode_dispatch::census_record(census_key);
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-bridge-decline] uncovered resume-marker live register: \
+                     jitcode_index={} entry={} bank={bank} color={color}",
+                    pjc.jitcode.index(),
+                    entry,
+                );
+            }
+            fbw_bridge_decline(ctx);
+            return None;
+        }
+    }
+
     let Some((code_len, mut walk_result)) = dispatch_perfn_frame(
         ctx,
         sym,
@@ -2000,6 +2112,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         entry,
         &argboxes_r,
         &argboxes_i,
+        &argboxes_f,
         authoritative,
     ) else {
         return None;
@@ -3411,7 +3524,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
-            TraceAction::Abort
+            if ctx.is_bridge_trace && FBW_BRIDGE_DECLINED.with(|c| c.get()) {
+                TraceAction::Decline
+            } else {
+                TraceAction::Abort
+            }
         }
     }
 }
