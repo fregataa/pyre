@@ -57,6 +57,17 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let sym_ptr = sym as *mut Sym;
     let entry_py_pc = EntryPyPc::Py(orgpc as u32);
+    if is_top_level {
+        let mut walk_session = session.borrow_mut();
+        walk_session.recording_frame_ptr = sym.live_vable_frame_addr();
+        walk_session.recording_jitcode_index = if sym.jitcode().is_null() {
+            -1
+        } else {
+            unsafe { (*sym.jitcode()).index as i32 }
+        };
+        walk_session.recording_opcode_position = position;
+        walk_session.last_caught_exception_value = 0;
+    }
 
     // Phase 7: this IS the full-body walk over the outer `sym.jitcode`,
     // so guard snapshots can resolve a per-guard resume coordinate from
@@ -769,6 +780,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let consts = InlineCalleeConsts {
         w_globals: callee_w_globals,
         w_code: callee_code_key,
+        jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
 
     // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
@@ -1133,6 +1145,7 @@ pub(crate) fn drive_outer_frame_continuation<Sym: WalkSym>(
     let consts = InlineCalleeConsts {
         w_globals: root_w_globals,
         w_code: root_code_key,
+        jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
 
     let root_sym_ptr = root_sym as *const Sym;

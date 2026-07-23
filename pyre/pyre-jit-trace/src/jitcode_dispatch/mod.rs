@@ -453,6 +453,10 @@ pub struct InlineFrame {
     /// reaches [`FBW_MAX_INLINE_RECURSION`], the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
     pub w_code: usize,
+    /// Exception most recently caught by this frame. Matching
+    /// `MIFrame.last_caught_exception_value`, this suppresses a second
+    /// traceback node when the same exception later leaves via bare re-raise.
+    pub last_caught_exception_value: i64,
     /// Paused caller snapshot for the multi-frame path. `None` preserves the
     /// straight-line single-frame collapse while retaining the callee level.
     pub parent: Option<InlineParentFrame>,
@@ -489,6 +493,15 @@ pub struct WalkSession {
     pub tmpreg_i: OpRef,
     pub tmpreg_i_concrete: ConcreteValue,
     pub tmpreg_f: OpRef,
+    /// Concrete root frame and jitcode identity for application traceback
+    /// recording. Inlined callees carry their own identity separately in
+    /// `InlineCalleeConsts`.
+    pub recording_frame_ptr: usize,
+    pub recording_jitcode_index: i32,
+    /// Last opcode executed by the root recording frame.
+    pub recording_opcode_position: usize,
+    /// Exception already recorded when the root frame entered its handler.
+    pub last_caught_exception_value: i64,
 }
 
 impl Default for WalkSession {
@@ -501,8 +514,86 @@ impl Default for WalkSession {
             tmpreg_i: OpRef::NONE,
             tmpreg_i_concrete: ConcreteValue::Null,
             tmpreg_f: OpRef::NONE,
+            recording_frame_ptr: 0,
+            recording_jitcode_index: -1,
+            recording_opcode_position: 0,
+            last_caught_exception_value: 0,
         }
     }
+}
+
+fn record_top_level_application_traceback<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    exc_concrete: ConcreteValue,
+    opcode_position: usize,
+    caught: bool,
+) {
+    if !ctx.is_top_level {
+        return;
+    }
+    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return;
+    };
+    if exc_ptr.is_null() {
+        return;
+    }
+    let exc_value = exc_ptr as usize as i64;
+    let (frame_ptr, jitcode_index) = {
+        let mut session = ctx.session.borrow_mut();
+        if !caught && session.last_caught_exception_value == exc_value {
+            return;
+        }
+        if caught {
+            session.last_caught_exception_value = exc_value;
+        }
+        (session.recording_frame_ptr, session.recording_jitcode_index)
+    };
+    majit_metainterp::record_application_traceback_for_recording(
+        exc_value,
+        frame_ptr as i64,
+        jitcode_index,
+        opcode_position as i32,
+    );
+}
+
+fn record_inline_application_traceback<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    exc_concrete: ConcreteValue,
+    opcode_position: usize,
+    caught: bool,
+) {
+    if ctx.is_top_level {
+        return;
+    }
+    let Some(consts) = ctx.inline_callee_consts else {
+        return;
+    };
+    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return;
+    };
+    if exc_ptr.is_null() {
+        return;
+    }
+    let exc_value = exc_ptr as usize as i64;
+    {
+        let mut session = ctx.session.borrow_mut();
+        let Some(frame) = session.framestack.last_mut() else {
+            return;
+        };
+        if !caught && frame.last_caught_exception_value == exc_value {
+            return;
+        }
+        if caught {
+            frame.last_caught_exception_value = exc_value;
+        }
+    }
+    majit_metainterp::record_inline_application_traceback_for_recording(
+        exc_value,
+        consts.w_code as i64,
+        consts.w_globals as i64,
+        consts.jitcode_index,
+        opcode_position as i32,
+    );
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -514,6 +605,9 @@ pub struct InlineCalleeConsts {
     /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
     /// pointer.
     w_code: usize,
+    /// Jitcode identity used to translate a callee opcode to its Python
+    /// instruction coordinate when constructing `PyTraceback` metadata.
+    jitcode_index: i32,
 }
 
 /// Walk-scoped FBW modes inherited parent-to-child across sub-walk
@@ -1724,6 +1818,9 @@ pub fn step<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
+    if ctx.is_top_level {
+        ctx.session.borrow_mut().recording_opcode_position = op.pc;
+    }
     // #73: maintain the `-live-` BEFORE anchor.  Every
     // `-live-` byte the walk decodes becomes the resume point preceding the
     // NEXT guard (`pyjitpl.py`, normal guard resume reads at
@@ -1783,6 +1880,7 @@ pub fn walk<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let mut pc = start_pc;
     loop {
+        let opcode_position = pc;
         let (outcome, next_pc) = step(code, pc, ctx)?;
         pc = next_pc;
         match outcome {
@@ -1814,6 +1912,14 @@ pub fn walk<Sym: WalkSym>(
                 // `exit_frame_with_exception`, letting the exception escape a
                 // frame that actually catches it.
                 if let Some(target) = try_catch_exception_at(code, pc) {
+                    record_inline_application_traceback(ctx, exc_concrete, opcode_position, true);
+                    let opcode_position = ctx.session.borrow().recording_opcode_position;
+                    record_top_level_application_traceback(
+                        ctx,
+                        exc_concrete,
+                        opcode_position,
+                        true,
+                    );
                     ctx.last_exc_value = Some(exc);
                     ctx.last_exc_value_concrete = exc_concrete;
                     // pyjitpl.py:2530-2558 `finishframe_exception` only
@@ -1844,6 +1950,13 @@ pub fn walk<Sym: WalkSym>(
                     continue;
                 }
                 if ctx.is_top_level {
+                    let opcode_position = ctx.session.borrow().recording_opcode_position;
+                    record_top_level_application_traceback(
+                        ctx,
+                        exc_concrete,
+                        opcode_position,
+                        false,
+                    );
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms
@@ -1856,6 +1969,16 @@ pub fn walk<Sym: WalkSym>(
                     fbw_terminate_with_raise(exc, exc_concrete);
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
+                    let is_bare_reraise = decode_op_at(code, opcode_position)
+                        .is_some_and(|op| op.opname == "reraise/");
+                    if !is_bare_reraise {
+                        record_inline_application_traceback(
+                            ctx,
+                            exc_concrete,
+                            opcode_position,
+                            false,
+                        );
+                    }
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
                 }
             }
@@ -4037,10 +4160,11 @@ impl<'a> InlineFrameGuard<'a> {
         w_code: usize,
         parent: Option<InlineParentFrame>,
     ) -> Self {
-        session
-            .borrow_mut()
-            .framestack
-            .push(InlineFrame { w_code, parent });
+        session.borrow_mut().framestack.push(InlineFrame {
+            w_code,
+            last_caught_exception_value: 0,
+            parent,
+        });
         ACTIVE_WALK_SESSION.with(|c| c.set(session as *const _));
         InlineFrameGuard(session)
     }
@@ -8577,6 +8701,7 @@ fn handle<Sym: WalkSym>(
             // exit-frame finish (which escapes a try/except as a no-payload
             // Terminate abort).
             if ctx.is_top_level && !fbw_raise_enabled() {
+                record_top_level_application_traceback(ctx, concrete_exc, op.pc, false);
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
                 if let ConcreteValue::Ref(p) = concrete_exc {
@@ -8716,6 +8841,12 @@ fn handle<Sym: WalkSym>(
                 .ok_or(DispatchError::ReraiseWithoutLastExcValue { pc: op.pc })?;
             // Gated `PYRE_FBW_RAISE`: symmetric with `raise/r`.
             if ctx.is_top_level && !fbw_raise_enabled() {
+                record_top_level_application_traceback(
+                    ctx,
+                    ctx.last_exc_value_concrete,
+                    op.pc,
+                    false,
+                );
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
                 if let ConcreteValue::Ref(p) = ctx.last_exc_value_concrete {
