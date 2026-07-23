@@ -1373,7 +1373,7 @@ pub fn build_wasm_module(
             g.is_finish && !crate::failguard::meta_descr_is_exit_frame_with_exception(&g.meta_descr)
         })
         .map(|g| g.fail_index)
-        .unwrap_or(0);
+        .unwrap_or(crate::failguard::WASM_CA_FINISH_FI_UNKNOWN);
     // CA frames execute the source loop and this bridge on the same frozen
     // geometry.  `compile_bridge` rejects a bridge that needs more slots, so
     // no global floor or speculative slack is needed here.
@@ -2001,18 +2001,16 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardValue => {
-                let arg0 = op.arg(0).to_opref();
-                let is_float =
-                    !arg0.is_constant() && value_types[arg0.raw() as usize] == ValType::F64;
-                if is_float {
-                    emit_resolve_f64(&mut sink, constants, value_types, arg0);
-                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
-                    sink.f64_ne();
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, arg0);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                    sink.i64_ne();
-                }
+                // GUARD_VALUE checks bit-equality against the promoted constant:
+                // Value::eq (value.rs) compares floats by to_bits() (0.0 != -0.0,
+                // NaN == same-bit NaN, per history.py same_constant), which the
+                // dynasm/cranelift siblings implement as an integer bit-compare.
+                // emit_resolve pushes an F64 operand's i64 bits, so i64_ne is the
+                // correct compare for both int and float — an IEEE f64.ne would
+                // wrongly pass -0.0 == +0.0 (and fail NaN == same-bit NaN).
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                sink.i64_ne();
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
@@ -2674,34 +2672,20 @@ fn build_function(
             }
 
             // ── String/Unicode ops (direct memory access) ──
-            OpCode::Strlen | OpCode::Unicodelen => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    // Length at offset 8 (after ob_type pointer on wasm32)
-                    sink.i64_load(mem64(8));
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    // str[index]: base + header_size + index
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // index
-                    sink.i32_wrap_i64();
-                    sink.i32_add();
-                    // String data starts after header (assume 16 bytes: ob_type + length)
-                    sink.i32_load8_u(MemArg {
-                        offset: 16,
-                        align: 0,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
-                }
+            // strlen/strgetitem/unicodelen/unicodegetitem were lowered with a
+            // hardcoded layout (length as an 8-byte load of a 4-byte word field;
+            // item as a 1-byte, stride-1 read at a fixed offset) that is wrong for
+            // UNICODE (4-byte code units, stride 4) and folds garbage into a str
+            // length's high bits — a silent wrong value on wasm, where offset is
+            // valid linear memory and does not trap. pyre models strings/unicode
+            // as Array(Char) and routes these through the descr-driven
+            // GETARRAYITEM/ARRAYLEN paths, so no producer emits these ops; decline
+            // them (interpreter fallback) rather than ship a wrong hardcoded read.
+            OpCode::Strlen | OpCode::Unicodelen | OpCode::Strgetitem | OpCode::Unicodegetitem => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: string/unicode direct-memory op {:?} (no descr-driven layout)",
+                    op.opcode
+                )));
             }
 
             // ── GC memory ops ──
@@ -2950,7 +2934,12 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.i64_load(mem64(vtable_off as u64));
                     sink.i32_wrap_i64();
-                    sink.i64_load(mem64(offset2 as u64));
+                    emit_sized_int_load(
+                        &mut sink,
+                        offset2 as u64,
+                        std::mem::size_of::<usize>(),
+                        true,
+                    );
                 } else {
                     // assembler.py:1957-1969 gcremovetypeptr path.
                     //     MOV32 loc_tmp, mem(loc_object, 0)
@@ -2974,7 +2963,7 @@ fn build_function(
                     sink.i64_const((guard_gc_type_info.sizeof_ti + offset2) as i64);
                     sink.i64_add();
                     sink.i32_wrap_i64();
-                    sink.i64_load(mem64(0));
+                    emit_sized_int_load(&mut sink, 0, std::mem::size_of::<usize>(), true);
                 }
                 // Stack: [..., loc_tmp (i64)]
 
