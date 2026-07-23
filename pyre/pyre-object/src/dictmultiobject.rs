@@ -489,6 +489,16 @@ pub struct W_DictObject {
     /// `IndexMap::shift_remove` compacts its storage, so pyre records key-set
     /// changes explicitly; value-only overwrites leave this unchanged.
     pub keys_version: usize,
+    /// Generation bumped whenever `clear` empties an object dict in place.
+    /// `ll_dict_clear` reallocates `d.entries` to a fresh empty array
+    /// (`rordereddict.py:1360`), so a probe that cleared the dict through an
+    /// `__eq__` callback must restart on the `entries != d.entries` arm
+    /// (`:1058`).  `IndexMap::clear` retains its buffer, leaving the capacity
+    /// and every stale index unchanged, so the reentrant scan watches this
+    /// counter to reproduce that restart.  It bumps only on clear, never on a
+    /// non-emptying insert or delete, so a callback that merely reshapes the
+    /// dict does not trigger a spurious restart PyPy would not take.
+    pub clear_gen: usize,
 }
 
 /// Typed accessor — `dictmultiobject.py:1213-1215 ObjectDictStrategy.getitem`
@@ -880,6 +890,7 @@ pub fn w_dict_new() -> PyObjectRef {
             dstorage: entries as *mut u8,
             dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY,
             keys_version: 0,
+            clear_gen: 0,
         },
         false,
     )
@@ -901,6 +912,7 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
             dstorage: std::ptr::null_mut(),
             dstrategy: &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
             keys_version: 0,
+            clear_gen: 0,
         },
         false,
     )
@@ -925,6 +937,7 @@ pub fn w_dict_new_with(
             dstorage,
             dstrategy: strategy,
             keys_version: 0,
+            clear_gen: 0,
         },
         false,
     )
@@ -951,6 +964,7 @@ pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
         dstorage: entries as *mut u8,
         dstrategy: &crate::dictmultiobject::OBJECT_DICT_STRATEGY,
         keys_version: 0,
+        clear_gen: 0,
     }) as PyObjectRef
 }
 
@@ -1905,21 +1919,31 @@ unsafe fn callback_free_dict_op<T>(op: impl FnOnce() -> T) -> Option<Result<T, D
 /// callback changes the candidate entry, restart from the beginning like
 /// `ll_dict_lookup`'s paranoia restart (`rordereddict.py:1057`).
 unsafe fn scan_dict_key_reentrant(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     mut key: ObjectKey,
-) -> Result<(Option<usize>, ObjectKey), DictKeyError> {
+) -> Result<(Option<usize>, ObjectKey, PyObjectRef), DictKeyError> {
     'restart: loop {
-        // Snapshot the table so a comparison that reallocates the backing
-        // store restarts the scan: `ll_dict_lookup` retries on
-        // `entries != d.entries` even when the candidate entry is untouched
-        // (`rordereddict.py:1058`).  A grow copies every entry to a fresh
-        // allocation, so a stale index would otherwise compare the wrong key.
-        let table_capacity = {
+        // Pin the container for the whole attempt so a comparison that moves a
+        // nursery dict does not strand the raw `obj` the scan re-derefs after
+        // each callback (`w_dict_new` allocates through the movable
+        // `try_gc_alloc` hook).  Snapshot the table capacity: `ll_dict_lookup`
+        // retries on `entries != d.entries` even when the candidate entry is
+        // untouched (`rordereddict.py:1058`); a grow copies every entry to a
+        // fresh allocation, so a stale index would compare the wrong key.
+        let _attempt = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(obj);
+        obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let (table_capacity, clear_generation) = {
             let dict = &*(obj as *const W_DictObject);
-            (*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)).capacity()
+            (
+                (*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)).capacity(),
+                dict.clear_gen,
+            )
         };
         let mut i = 0;
         loop {
+            obj = crate::gc_roots::shadow_stack_get(obj_slot);
             let Some((stored_hash, stored_obj)) = ({
                 let dict = &*(obj as *const W_DictObject);
                 let entries =
@@ -1928,7 +1952,7 @@ unsafe fn scan_dict_key_reentrant(
                     .get_index(i)
                     .map(|(stored, _)| (stored.hash, stored.obj))
             }) else {
-                return Ok((None, key));
+                return Ok((None, key, obj));
             };
 
             if stored_hash == key.hash {
@@ -1939,6 +1963,7 @@ unsafe fn scan_dict_key_reentrant(
                 crate::gc_roots::pin_root(key.obj);
 
                 let equal = dict_keys_equal(stored_obj, key.obj);
+                obj = crate::gc_roots::shadow_stack_get(obj_slot);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
                 key.obj = crate::gc_roots::shadow_stack_get(key_slot);
                 if take_dict_key_error() {
@@ -1953,8 +1978,11 @@ unsafe fn scan_dict_key_reentrant(
                     let dict = &*(obj as *const W_DictObject);
                     let entries =
                         &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-                    // `entries != d.entries`: a realloc moved the whole table.
+                    // `entries != d.entries`: a realloc grew the table, or a
+                    // `clear` reset it in place (`clear_gen`) — either
+                    // reallocates `d.entries` in `ll_dict_lookup`'s eyes.
                     entries.capacity() != table_capacity
+                        || dict.clear_gen != clear_generation
                         // `entries.valid(index) && entries[index].key == checkingkey`.
                         || !entries.get_index(i).is_some_and(|(stored, _)| {
                             stored.hash == stored_hash && stored.obj == stored_obj
@@ -1964,7 +1992,7 @@ unsafe fn scan_dict_key_reentrant(
                     continue 'restart;
                 }
                 if equal {
-                    return Ok((Some(i), key));
+                    return Ok((Some(i), key, obj));
                 }
             }
             i += 1;
@@ -1997,7 +2025,7 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
     }) {
         return result;
     }
-    let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
     Ok(found.map(|i| {
         let dict = &*(obj as *const W_DictObject);
         let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -2276,7 +2304,14 @@ pub unsafe fn w_dict_setdefault_checked(
             // `Ok(None)` only arises on a broken probe (which surfaces as the
             // outer `None`); fall through to the scan defensively.
         }
-        let (found, object_key) = scan_dict_key_reentrant(obj, object_key)?;
+        // `value` is a native local held across the scan; a mid-scan GC in a
+        // probing `__eq__` could move it before the insert/return below, so pin
+        // and reload it alongside the container the scan returns.
+        let _value_root = crate::gc_roots::push_roots();
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(value);
+        let (found, object_key, obj) = scan_dict_key_reentrant(obj, object_key)?;
+        let value = crate::gc_roots::shadow_stack_get(value_slot);
         if let Some(i) = found {
             let dict = &*(obj as *const W_DictObject);
             let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -2347,7 +2382,7 @@ pub unsafe fn w_dict_pop_checked(
             }) {
                 return result;
             }
-            let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+            let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
             if let Some(i) = found {
                 let dict = &mut *(obj as *mut W_DictObject);
                 let entries =
@@ -2432,7 +2467,14 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
         return result;
     }
 
-    let (found, object_key) = scan_dict_key_reentrant(obj, object_key)?;
+    // `value` is a native local held across the scan; a mid-scan GC in a
+    // probing `__eq__` could move it before the overwrite/insert below, so pin
+    // and reload it alongside the container the scan returns.
+    let _value_root = crate::gc_roots::push_roots();
+    let value_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(value);
+    let (found, object_key, obj) = scan_dict_key_reentrant(obj, object_key)?;
+    let value = crate::gc_roots::shadow_stack_get(value_slot);
     match found {
         Some(i) => {
             let dict = &mut *(obj as *mut W_DictObject);
@@ -2935,7 +2977,7 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     }) {
         return result;
     }
-    let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
     if let Some(i) = found {
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -3046,6 +3088,11 @@ pub unsafe fn w_dict_clear_object_strategy(obj: PyObjectRef) {
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     if !entries.is_empty() {
         dict.keys_version = dict.keys_version.wrapping_add(1);
+        // Mirror `ll_dict_clear`'s `d.entries` realloc: an in-place
+        // `IndexMap::clear` keeps the buffer, so a reentrant scan that cleared
+        // the dict through `__eq__` would otherwise miss the restart when the
+        // dict is refilled to the same capacity.
+        dict.clear_gen = dict.clear_gen.wrapping_add(1);
     }
     entries.clear();
 }
