@@ -941,12 +941,13 @@ pub(crate) fn create_builtin_module(
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     // `import builtins` must resolve to `space.builtin`, the one Module every
-    // frame uses for its LOAD_GLOBAL fallback. A fresh `load_builtin_module`
-    // would rerun `install_default_builtins`, minting a second exception
-    // hierarchy and overwriting the name→class registry, so a caught
-    // `except KeyError` would then compare against the wrong `BaseException`.
-    // `load_part` routes the name this way; the `_imp.create_builtin` entry
-    // point must too.
+    // frame uses for its LOAD_GLOBAL fallback. Historically a fresh
+    // `load_builtin_module` reran `install_default_builtins`, minted a second
+    // exception hierarchy, and overwrote the name→class registry. The
+    // process-global get-or-mint registry now prevents that identity
+    // clobbering even on another fresh-dictionary path, while this guard still
+    // preserves the builtins Module identity. `load_part` routes the name this
+    // way; the `_imp.create_builtin` entry point must too.
     if name == "builtins" && !execution_context.is_null() {
         let module = unsafe { (*execution_context).get_builtin() };
         set_sys_module(name, module);
@@ -2141,7 +2142,20 @@ fn load_source_module(
     // a young module while only the dict entry is updated.
     if modulename == "importlib._bootstrap" {
         if let Some(loaded) = check_sys_modules(modulename) {
-            install_importlib_bootstrap(loaded, execution_context)?;
+            if let Err(e) = install_importlib_bootstrap(loaded, execution_context) {
+                // Unwind the partial install: `dunder_import` routes through
+                // `_bootstrap.__import__` whenever `importlib._bootstrap` is
+                // in `sys.modules`, and a half-installed bootstrap (module
+                // registered, PathFinder missing — e.g. `_bootstrap_external`
+                // needs the `nt` builtin on Windows) would then answer every
+                // import with no file finder installed. Dropping the entries
+                // keeps the native importer authoritative, the minimal-
+                // importer role the boot sequence already documents.
+                remove_sys_module(modulename);
+                remove_sys_module("_frozen_importlib");
+                remove_sys_module("_frozen_importlib_external");
+                return Err(e);
+            }
         }
     }
 
@@ -2192,12 +2206,69 @@ fn install_importlib_bootstrap(
     )?;
     crate::call::call_function_impl_result(install_external, &[])?;
 
+    if let Some(external) = check_sys_modules("_frozen_importlib_external") {
+        set_frozen_alias_metadata(
+            external,
+            "_frozen_importlib_external",
+            shadow_stack_get(module_slot),
+        )?;
+    }
+
     // `_install_external_importers` imports `_frozen_importlib_external`,
     // which aliases that name onto the loaded submodule; the bootstrap module
     // itself is only reached under its submodule name, so it never picks up
     // the matching alias. Register it once both installs have succeeded, so a
     // body that raised leaves no alias behind.
     set_sys_module("_frozen_importlib", shadow_stack_get(module_slot));
+    set_frozen_alias_metadata(
+        shadow_stack_get(module_slot),
+        "_frozen_importlib",
+        shadow_stack_get(module_slot),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "host_env")]
+fn set_frozen_alias_metadata(
+    module: PyObjectRef,
+    name: &str,
+    bootstrap: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let module_slot = shadow_stack_len();
+    pin_root(module);
+    let bootstrap_slot = shadow_stack_len();
+    pin_root(bootstrap);
+
+    let loader =
+        crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "FrozenImporter")?;
+    let loader_slot = shadow_stack_len();
+    pin_root(loader);
+    let find_spec = crate::baseobjspace::getattr_str(shadow_stack_get(loader_slot), "find_spec")?;
+    let find_spec_slot = shadow_stack_len();
+    pin_root(find_spec);
+    let w_name = pyre_object::w_str_new(name);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let spec = crate::call::call_function_impl_result(
+        shadow_stack_get(find_spec_slot),
+        &[shadow_stack_get(name_slot)],
+    )?;
+    let spec_slot = shadow_stack_len();
+    pin_root(spec);
+
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(module_slot),
+        "__loader__",
+        shadow_stack_get(loader_slot),
+    )?;
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(module_slot),
+        "__spec__",
+        shadow_stack_get(spec_slot),
+    )?;
     Ok(())
 }
 
@@ -2486,6 +2557,191 @@ pub fn import_name(
         frame,
         w_import,
         &[w_modulename, w_globals, w_locals, w_fromlist, w_flag],
+    )
+}
+
+// ── __import__ ───────────────────────────────────────────────────────
+// PyPy equivalent: _frozen_importlib/interp_import.py `interp___import__`
+
+/// `_gcd_import` fast path: the already-imported, fully-initialised module
+/// for `name`, or `None` when the slow path must run — a missing
+/// `sys.modules` entry, a missing `__spec__`, or a module whose
+/// `__spec__._initializing` is still true.  A `__spec__` without
+/// `_initializing` counts as initialised (a builtin module).
+fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    // A `None` sentinel blocks the name; `check_sys_modules` skips it and
+    // would fall back to the interpreter cache, resurrecting a builtin the
+    // sentinel is meant to block.  Give up so the slow path raises
+    // `import of {name} halted; None in sys.modules`.
+    if sys_modules_blocks(name) {
+        return Ok(None);
+    }
+    let Some(w_module) = check_sys_modules(name) else {
+        return Ok(None);
+    };
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    pin_root(w_module);
+    let Some(w_spec) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__spec__")?
+    else {
+        return Ok(None);
+    };
+    let spec_slot = shadow_stack_len();
+    pin_root(w_spec);
+    if let Some(w_initializing) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
+    {
+        if crate::baseobjspace::is_true(w_initializing)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(shadow_stack_get(mod_slot)))
+}
+
+/// `builtins.__import__` — `interp___import__`: a fast path answering
+/// absolute imports from initialised `sys.modules` entries, the app-level
+/// `_bootstrap.__import__` (the full `sys.meta_path` / `sys.path_hooks`
+/// protocol) otherwise.  While the importlib bootstrap is not installed —
+/// during startup, or when no stdlib is reachable — the native `importhook`
+/// stands in, the role of PyPy's minimal `importing.py` importer.
+pub fn dunder_import(
+    name: &str,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    // Captured before any Python can run below (`is_true` may call a
+    // `__bool__`); the raw argument pointers are stale after that.
+    let fromlist_missing = w_fromlist.is_null() || unsafe { is_none(w_fromlist) };
+
+    let _roots = push_roots();
+    let globals_slot = shadow_stack_len();
+    pin_root(if w_globals.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_globals
+    });
+    let locals_slot = shadow_stack_len();
+    pin_root(if w_locals.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_locals
+    });
+    let fromlist_slot = shadow_stack_len();
+    pin_root(if w_fromlist.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_fromlist
+    });
+
+    if level == 0 {
+        // Fast path only for absolute imports (interp_import.py).
+        // A package with a fromlist needs `_handle_fromlist`, which the
+        // slow path runs.
+        let have_fromlist =
+            !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
+        if let Some(w_mod) = gcd_import_fast(name)? {
+            let mod_slot = shadow_stack_len();
+            pin_root(w_mod);
+            if !have_fromlist {
+                match name.find('.') {
+                    None => return Ok(shadow_stack_get(mod_slot)),
+                    Some(dot) => {
+                        // `import a.b` returns `a`; give up when the
+                        // top-level ancestor is not initialised yet.
+                        if let Some(w_top) = gcd_import_fast(&name[..dot])? {
+                            return Ok(w_top);
+                        }
+                    }
+                }
+            } else if crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?
+                .is_none()
+            {
+                return Ok(shadow_stack_get(mod_slot));
+            }
+        }
+    }
+
+    // The frozen bootstrap aliases stay on the native importer:
+    // `_install_external_importers` imports `_frozen_importlib_external`
+    // while installing PathFinder, so no finder can serve it yet —
+    // `absolute_import` maps the alias onto the on-disk bootstrap sources.
+    if matches!(name, "_frozen_importlib" | "_frozen_importlib_external") {
+        return importhook(
+            name,
+            if w_globals.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                shadow_stack_get(globals_slot)
+            },
+            if w_fromlist.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                shadow_stack_get(fromlist_slot)
+            },
+            level,
+            execution_context,
+        );
+    }
+
+    // Slow path: the app-level `_bootstrap.__import__`.
+    if let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") {
+        let bootstrap_slot = shadow_stack_len();
+        pin_root(w_bootstrap);
+        if let Some(w_import) =
+            crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "__import__")?
+        {
+            let import_slot = shadow_stack_len();
+            pin_root(w_import);
+            let w_name = pyre_object::w_str_new(name);
+            let name_slot = shadow_stack_len();
+            pin_root(w_name);
+            let w_level = pyre_object::w_int_new(level);
+            let level_slot = shadow_stack_len();
+            pin_root(w_level);
+            // An omitted fromlist reaches `__import__` as its `()` default,
+            // not `None` (interp_import.py `WrappedDefault(())`).
+            let call_fromlist_slot = if fromlist_missing {
+                let w_empty = pyre_object::w_tuple_new(vec![]);
+                let slot = shadow_stack_len();
+                pin_root(w_empty);
+                slot
+            } else {
+                fromlist_slot
+            };
+            return crate::call::call_function_impl_result(
+                shadow_stack_get(import_slot),
+                &[
+                    shadow_stack_get(name_slot),
+                    shadow_stack_get(globals_slot),
+                    shadow_stack_get(locals_slot),
+                    shadow_stack_get(call_fromlist_slot),
+                    shadow_stack_get(level_slot),
+                ],
+            );
+        }
+    }
+    importhook(
+        name,
+        if w_globals.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            shadow_stack_get(globals_slot)
+        },
+        if w_fromlist.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            shadow_stack_get(fromlist_slot)
+        },
+        level,
+        execution_context,
     )
 }
 
