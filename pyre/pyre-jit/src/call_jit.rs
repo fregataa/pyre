@@ -2890,6 +2890,21 @@ pub fn trace_and_compile_from_bridge(
         if driver.is_tracing() {
             driver.meta_interp_mut().abort_trace(false);
         }
+        // This pre-walk decline returns before the `trace_bytecode` walk, so the
+        // walk-time `TraceAction::Abort` recorder below never runs for it. Record
+        // the guard here so `must_compile_with_values` does not re-enter this
+        // structurally-undecidable bridge every ~`trace_eagerness` failures. Only
+        // an exception guard is recorded: its `pending_exc` is guard-invariant, so
+        // the decline is deterministic while the exc-edge bridge is off. A
+        // `GUARD_NOT_FORCED` (even one carrying pending fields) has a
+        // runtime-conditional `pending_exc` and can still bridge on a later
+        // non-raising failure via the pending-field prologue, so blacklisting it
+        // after one raising failure would defeat that; leave it unrecorded.
+        if last_bridge_is_exception_guard {
+            driver
+                .meta_interp_mut()
+                .record_declined_bridge_guard(descr_arc);
+        }
         return BridgeResolution::ResumeBlackhole;
     }
 
