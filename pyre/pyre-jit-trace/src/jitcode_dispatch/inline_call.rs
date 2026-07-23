@@ -339,6 +339,29 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
     }
 }
 
+/// True iff `body_code` contains a `raise` op.  A callee that raises inline
+/// unwinds cleanly only at the top inline level (`inline_depth == 0`, directly
+/// under the real caller loop): a raise from a callee inlined BELOW another
+/// inlined frame must cross the suspended intermediate frame(s), which needs the
+/// cross-frame exception-unwind bridge (gh#343 / gh#467) the drain does not yet
+/// reconstruct — the trace instead drops the `NestedBreakBridgeResume` bridge
+/// and deopts the unwind to the blackhole.  Straight value-returning chains
+/// never raise, so they still inline to the full `fbw_max_multiframe_depth`; a
+/// raising callee is capped at the top level.
+pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname == "raise" {
+            return true;
+        }
+        pc = d.next_pc;
+    }
+    false
+}
+
 pub(crate) fn method_form_callee_body_supported(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
@@ -1413,6 +1436,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // virtual frame is seeded and snapshot-covered exactly as the loop's is.
     // There the decline is lifted: the call falls through to the self-recursive
     // unroll gate and multiframe seed as if walked from a primary trace.
+    // True once this attempt takes the `PYRE_FBW_BRIDGE_REC_INLINE` root-bridge
+    // admission for a self-recursive callee.  The admitted top-level inline's
+    // body sub-walk reaches its own recursive CALL as a nested residual, which
+    // `fbw_abort_nested_unjournaled_residual` declines on the self-recursive
+    // hazard arm — an abort storm that folds the whole guard bridge back to
+    // residual.  The native `CALL_ASSEMBLER` self-recursion fold already exempts
+    // that decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to
+    // this admitted inline, whose recursive residual runs concretely at the
+    // pre-execute site (executed, so no replay double-apply).  Native only: the
+    // wasm always-portal path type-confuses the self-recursive inline
+    // (`setintbound: got Ref`), so it keeps the correct residual-fallback
+    // decline.
+    let mut bridge_rec_root_selfrec = false;
     if ctx.trace_ctx.is_bridge_trace
         && args_all_builtin_integer
         && fbw_callee_body_has_binary_op_residual(body.code, callee_descr_refs)
@@ -1424,6 +1460,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         if !(fbw_bridge_rec_inline_enabled() && safe_root_bridge) {
             return Ok(None);
         }
+        bridge_rec_root_selfrec = cfg!(not(target_arch = "wasm32"))
+            && unsafe {
+                let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject;
+                !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
+            };
     }
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
@@ -1527,12 +1569,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // (`pyjitpl.py`) unroll within `max_unroll_recursion`,
             // then fall back to the assembler-call path.  Default-on
             // (`fbw_rec_multiframe_enabled`): a primary trace spends the
-            // multiframe budget unrolling recursion below the depth bound
+            // recursion-unroll budget unrolling below `max_unroll_recursion`
+            // (`fbw_max_rec_unroll_depth`, a bound distinct from the
+            // straight-line chain-inline depth `fbw_max_multiframe_depth`)
             // before folding the deepest call to the recursive portal
             // `CALL_ASSEMBLER`.
             let unroll = fbw_rec_multiframe_enabled()
                 && !ctx.fbw_mode.carrier_resume
-                && ctx.session.borrow().framestack.len() < fbw_max_multiframe_depth();
+                && ctx.session.borrow().framestack.len() < fbw_max_rec_unroll_depth();
             if !unroll {
                 return Ok(None);
             }
@@ -1560,8 +1604,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         u16::MAX
     };
     let inline_depth = ctx.session.borrow().framestack.len();
+    // A callee that raises inline is inlinable only at the top level: below an
+    // intermediate frame its unwind needs the cross-frame bridge (gh#343 /
+    // gh#467) the drain cannot yet build (`callee_body_contains_raise`).  A
+    // value-returning chain (no raise) inlines to the full depth.
+    let effective_multiframe_depth = if callee_body_contains_raise(body.code) {
+        1
+    } else {
+        fbw_max_multiframe_depth()
+    };
     let try_multiframe = multiframe_eligible
-        && inline_depth < fbw_max_multiframe_depth()
+        && inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
             callee_descr_refs,
@@ -2242,7 +2295,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // two-frame specialization of `run_blackhole_interp_to_cancel_tracing`:
         // `_copy_data_from_miframe` preserves the callee's own position and
         // live registers instead of collapsing it onto the caller frame.
-        let result = walk(body.code, 0, &mut sub_wc);
+        let result = {
+            // #704 root-bridge self-recursive inline: exempt this callee body
+            // sub-walk's nested recursive residual from the self-recursive
+            // nested-residual decline, mirroring the native `CALL_ASSEMBLER`
+            // fold's `SELFREC_CA_FOLD_ACTIVE` exemption.
+            let _bridge_rec_selfrec_guard = bridge_rec_root_selfrec.then(SelfRecCaFoldGuard::enter);
+            walk(body.code, 0, &mut sub_wc)
+        };
         let midbody_abort = match &result {
             Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
                 Some((*pc, MidBodyAbortKind::Marker))
