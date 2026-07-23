@@ -1038,10 +1038,10 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
     fn entry_py_pc(&self) -> u32 {
         match self.entry_py_pc {
             EntryPyPc::Py(py_pc) => py_pc,
-            EntryPyPc::Jit(jitcode_pc) => {
-                crate::state::backxlat_py_pc(self.outer_jitcode_index as i32, jitcode_pc as i32)
-                    as u32
-            }
+            EntryPyPc::Jit(jitcode_pc) => crate::state::forward_py_pc_or_backxlat(
+                self.outer_jitcode_index as i32,
+                jitcode_pc as i32,
+            ) as u32,
         }
     }
 }
@@ -4491,6 +4491,10 @@ pub(crate) struct MidBodyPayload {
     /// interpreter flush boundary.
     pub callee_jitcode_index: u32,
     pub abort_jitcode_pc: usize,
+    /// Forward-carried Python instruction PC for `abort_jitcode_pc`, stamped
+    /// once at capture so the flush reads a scalar instead of re-inverting the
+    /// coordinate through the jitcode->py tables.
+    pub callee_py_pc: usize,
     pub w_code: pyre_object::PyObjectRef,
     pub w_globals: pyre_object::PyObjectRef,
     pub x_arg: pyre_object::PyObjectRef,

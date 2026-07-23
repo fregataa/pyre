@@ -304,6 +304,15 @@ struct MidBodyFlushWords {
     callee_py_pc: usize,
 }
 
+/// `PYRE_M73_MIDBODY_CARRY_AUDIT` asserts the forward-carried
+/// `MidBodyPayload.callee_py_pc` equals the jitcode->py inversion at the
+/// midbody flush boundary before the carry is trusted. Off in production; the
+/// gated branch is the only added work.
+fn midbody_carry_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_MIDBODY_CARRY_AUDIT").is_some())
+}
+
 fn resolve_midbody_flush_words(
     payload: &crate::jitcode_dispatch::MidBodyPayload,
 ) -> Option<MidBodyFlushWords> {
@@ -318,16 +327,40 @@ fn resolve_midbody_flush_words(
         unsafe { &*outer.code_ptr },
         call_py_pc,
     );
+    // #73 walker-as-tracer P1: the callee resume py is read from the scalar
+    // forward-carried on the MidBodyPayload (`callee_py_pc`, stamped at capture
+    // from the same jitcode->py inversion this once performed). The `callee`
+    // pjc lookup above stays for its null-code decline (`?`) and feeds the
+    // gated audit, which asserts the carry still equals the live inversion.
+    // The midbody callee-rebuild resume path is corpus-cold, so byte-parity
+    // rests on encode/resume input identity (same immutable metadata + pc), not
+    // on an exercised audit; the gate remains a permanent tripwire.
+    if midbody_carry_audit_enabled() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let callee_py_pc_convert = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+            &callee.metadata,
+            payload.abort_jitcode_pc,
+        ) as usize;
+        if HITS.fetch_add(1, Ordering::Relaxed) == 0 {
+            eprintln!(
+                "[m73-midbody-carry-audit] first callee_py_pc comparison (carry={} convert={callee_py_pc_convert})",
+                payload.callee_py_pc
+            );
+        }
+        assert_eq!(
+            payload.callee_py_pc, callee_py_pc_convert,
+            "PYRE_M73_MIDBODY_CARRY_AUDIT: callee_py_pc carry diverged at jitcode {} pc {}",
+            payload.callee_jitcode_index, payload.abort_jitcode_pc
+        );
+    }
     Some(MidBodyFlushWords {
         call_py_pc,
         post_call_py_pc: crate::jitcode_dispatch::skip_python_trivia_forward(
             unsafe { &*outer.code_ptr },
             call_py_pc + 1,
         ),
-        callee_py_pc: crate::jitcode_dispatch::python_pc_for_jitcode_pc(
-            &callee.metadata,
-            payload.abort_jitcode_pc,
-        ) as usize,
+        callee_py_pc: payload.callee_py_pc,
     })
 }
 
@@ -593,7 +626,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
         start_pc
     };
     let lasti_pc = if let Some(ref c) = carrier {
-        crate::state::backxlat_py_pc(c.root_jitcode_index, c.root_pc as i32) as usize
+        crate::state::forward_py_pc_or_backxlat(c.root_jitcode_index, c.root_pc as i32) as usize
     } else {
         start_pc
     };
@@ -1047,7 +1080,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let pcs: Vec<usize> = carrier
             .recipes
             .iter()
-            .map(|r| crate::state::backxlat_py_pc(r.jitcode_index, r.jitcode_pc) as usize)
+            .map(|r| {
+                crate::state::forward_py_pc_or_backxlat(r.jitcode_index, r.jitcode_pc) as usize
+            })
             .collect();
         eprintln!(
             "[p2-shape] root_pc={root_pc} n_recipes={} recipe_pcs={pcs:?}",
@@ -1173,9 +1208,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         if want_compile && middles_ok {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
-                let root_py_pc =
-                    crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
-                        as usize;
+                let root_py_pc = crate::state::forward_py_pc_or_backxlat(
+                    carrier.root_jitcode_index,
+                    root_pc as i32,
+                ) as usize;
                 // The sub-walks above already applied each frame's eager stores
                 // and journaled them; hand those journals to the root walk so its
                 // epilogue settles them exactly once.
@@ -1198,7 +1234,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             if p2_diag {
                 eprintln!(
                     "[p2-drain] callee sub-walk OK recipe_py_pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
-                    crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
+                    crate::state::forward_py_pc_or_backxlat(
+                        recipe.jitcode_index,
+                        recipe.jitcode_pc
+                    )
                 );
             }
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkOk");
@@ -1207,7 +1246,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             if p2_diag {
                 eprintln!(
                     "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
-                    crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
+                    crate::state::forward_py_pc_or_backxlat(
+                        recipe.jitcode_index,
+                        recipe.jitcode_pc
+                    )
                 );
             }
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkStop");
