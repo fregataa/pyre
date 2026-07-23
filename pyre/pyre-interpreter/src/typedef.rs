@@ -1915,7 +1915,7 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// precedence shared by CPython 3.14.
 fn module_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
-    Ok(pyre_object::w_str_new(&module_repr_string(module)?))
+    Ok(pyre_object::w_str_new_managed(&module_repr_string(module)?))
 }
 
 fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
@@ -3164,7 +3164,9 @@ fn init_super_type(ns: PyObjectRef) {
 
 /// `functional.py W_Range.descr_repr`.
 fn range_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(&unsafe { crate::display::py_repr(args[0])? }))
+    Ok(w_str_new_managed(&unsafe {
+        crate::display::py_repr(args[0])?
+    }))
 }
 
 /// `functional.py W_Range.descr_getitem`.
@@ -3928,7 +3930,9 @@ fn init_list_type(ns: PyObjectRef) {
                 "__repr__",
                 |args| {
                     let list = crate::type_methods::require_list_receiver(args, "__repr__", false)?;
-                    Ok(w_str_new(&unsafe { crate::display::list_repr(list)? }))
+                    Ok(w_str_new_managed(&unsafe {
+                        crate::display::list_repr(list)?
+                    }))
                 },
                 1,
             ),
@@ -4381,9 +4385,11 @@ fn init_str_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__repr__",
                 |args| {
-                    Ok(pyre_object::w_str_new(&crate::display::format_wtf8_repr(
-                        unsafe { pyre_object::w_str_get_wtf8(args[0]) },
-                    )))
+                    Ok(pyre_object::w_str_new_managed(
+                        &crate::display::format_wtf8_repr(unsafe {
+                            pyre_object::w_str_get_wtf8(args[0])
+                        }),
+                    ))
                 },
                 1,
             ),
@@ -5399,7 +5405,11 @@ fn init_dict_type(ns: PyObjectRef) {
                          doesn't apply to a '{tp_name}' object"
                         )));
                     }
-                    unsafe { Ok(pyre_object::w_str_new(&crate::display::dict_repr(dict)?)) }
+                    unsafe {
+                        Ok(pyre_object::w_str_new_managed(&crate::display::dict_repr(
+                            dict,
+                        )?))
+                    }
                 },
                 1,
             ),
@@ -6708,7 +6718,7 @@ fn init_frame_type(ns: PyObjectRef) {
                     if f.is_null() {
                         return Ok(pyre_object::w_str_new("<frame (null)>"));
                     }
-                    Ok(pyre_object::w_str_new(&unsafe { &*f }.descr_repr()))
+                    Ok(pyre_object::w_str_new_managed(&unsafe { &*f }.descr_repr()))
                 },
                 1,
             ),
@@ -7158,7 +7168,11 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_str_new("mappingproxy({})"));
                 }
-                unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0])?)) }
+                unsafe {
+                    Ok(pyre_object::w_str_new_managed(&crate::display::py_repr(
+                        args[0],
+                    )?))
+                }
             }),
         )
     };
@@ -7171,7 +7185,11 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_str_new(""));
                 }
-                unsafe { Ok(pyre_object::w_str_new(&crate::display::py_str(args[0])?)) }
+                unsafe {
+                    Ok(pyre_object::w_str_new_managed(&crate::display::py_str(
+                        args[0],
+                    )?))
+                }
             }),
         )
     };
@@ -7474,7 +7492,9 @@ fn init_tuple_type(ns: PyObjectRef) {
                 |args| {
                     let tuple =
                         crate::type_methods::require_tuple_receiver(args, "__repr__", false)?;
-                    Ok(w_str_new(&unsafe { crate::display::tuple_repr(tuple)? }))
+                    Ok(w_str_new_managed(&unsafe {
+                        crate::display::tuple_repr(tuple)?
+                    }))
                 },
                 1,
             ),
@@ -7874,7 +7894,9 @@ fn slice_getter(
 /// sliceobject.py `descr_repr` — `"slice(%r, %r, %r)"`.
 fn slice_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = slice_receiver(args, "__repr__")?;
-    Ok(w_str_new(&unsafe { crate::display::py_repr(self_)? }))
+    Ok(w_str_new_managed(&unsafe {
+        crate::display::py_repr(self_)?
+    }))
 }
 
 /// sliceobject.py `descr_eq` / `descr_ne` — compare the three components.
@@ -12009,7 +12031,7 @@ fn staticmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     } else {
         unsafe { crate::display::py_repr(function)? }
     };
-    Ok(w_str_new(&format!("<staticmethod({repr})>")))
+    Ok(w_str_new_managed(&format!("<staticmethod({repr})>")))
 }
 
 /// PyPy `typedef.py:852-877 StaticMethod.typedef`, with the CPython 3.14
@@ -12274,7 +12296,7 @@ fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     } else {
         unsafe { crate::display::py_repr(function)? }
     };
-    Ok(w_str_new(&format!("<classmethod({repr})>")))
+    Ok(w_str_new_managed(&format!("<classmethod({repr})>")))
 }
 
 /// PyPy `typedef.py:878-908 ClassMethod.typedef`, with the Python 3.14
@@ -13874,7 +13896,7 @@ fn init_complex_type(ns: PyObjectRef) {
                 pyre_object::w_complex_get_imag(args[0]),
             )
         };
-        Ok(pyre_object::w_str_new(&complex_repr_string(re, im)))
+        Ok(pyre_object::w_str_new_managed(&complex_repr_string(re, im)))
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -14127,9 +14149,9 @@ fn init_float_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__repr__",
                 |args| {
-                    Ok(w_str_new(&crate::display::format_float_repr(unsafe {
-                        pyre_object::w_float_get_value(args[0])
-                    })))
+                    Ok(w_str_new_managed(&crate::display::format_float_repr(
+                        unsafe { pyre_object::w_float_get_value(args[0]) },
+                    )))
                 },
                 1,
             ),
@@ -14229,7 +14251,7 @@ fn init_float_type(ns: PyObjectRef) {
                         return Err(crate::PyError::type_error("hex() requires self"));
                     }
                     let v = unsafe { pyre_object::w_float_get_value(args[0]) };
-                    Ok(pyre_object::w_str_new(&float_hex_repr(v)))
+                    Ok(pyre_object::w_str_new_managed(&float_hex_repr(v)))
                 },
                 1,
             ),
@@ -15198,13 +15220,16 @@ fn init_object_type(ns: PyObjectRef) {
                         if pyre_object::is_instance(obj) {
                             // `w_obj.getrepr(space, '%s object' % fulltypename)`.
                             let name = crate::baseobjspace::getfulltypename(obj);
-                            return Ok(pyre_object::w_str_new(&format!(
+                            return Ok(pyre_object::w_str_new_managed(&format!(
                                 "<{name} object at {obj:?}>"
                             )));
                         }
                     }
                     // For non-instances, delegate to display
-                    Ok(pyre_object::w_str_new(&format!("<object at {:?}>", obj)))
+                    Ok(pyre_object::w_str_new_managed(&format!(
+                        "<object at {:?}>",
+                        obj
+                    )))
                 },
                 1,
             ),
@@ -15225,7 +15250,9 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::type_methods::arity_no_args(args, "object.__str__")?;
                     // Delegate to __repr__ to avoid infinite recursion
                     // PyPy: objectobject.py descr___str__ → space.repr(w_self)
-                    Ok(pyre_object::w_str_new(&unsafe { crate::py_repr(args[0])? }))
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
+                        crate::py_repr(args[0])?
+                    }))
                 },
                 1,
             ),
@@ -15257,7 +15284,9 @@ fn init_object_type(ns: PyObjectRef) {
                             crate::type_methods::arg_type_name(args[0])
                         )));
                     }
-                    Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }))
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
+                        crate::py_str(args[0])?
+                    }))
                 },
                 2,
             ),
@@ -18756,7 +18785,7 @@ fn bytearray_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let class_name = crate::typedef::r#type(args[0])
         .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
         .unwrap_or("bytearray");
-    Ok(w_str_new(&crate::display::bytearray_repr_string(
+    Ok(w_str_new_managed(&crate::display::bytearray_repr_string(
         data, class_name,
     )))
 }
@@ -19603,7 +19632,11 @@ fn setlike_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 fn setlike_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0])?)) }
+    unsafe {
+        Ok(pyre_object::w_str_new_managed(&crate::display::py_repr(
+            args[0],
+        )?))
+    }
 }
 
 fn setlike_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
