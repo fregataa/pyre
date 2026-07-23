@@ -3500,7 +3500,9 @@ fn arraydescrof(
             crate::model::ValueType::Ref(_) => (
                 majit_ir::descr::ArrayFlag::Pointer,
                 majit_ir::value::Type::Ref,
-                8,
+                // Pointer elements stride by the target word, not the
+                // build host's.
+                crate::layout::target_word_size(),
             ),
             _ => (
                 majit_ir::descr::ArrayFlag::Unsigned,
@@ -3512,9 +3514,15 @@ fn arraydescrof(
     // descr.py:354/359-362 + symbolic.get_array_token — basesize follows
     // the lltype's nolength flag: nolength → items at offset 0;
     // length-prefixed → items past the header at len_offset + WORD.
+    //
+    // This codewriter-less fallback is shape-only and serves GC arrays, whose
+    // items sit flat at the length word (`GcTypedArray`) — it does NOT
+    // element-align. The word must be the target's, not the host's, so a
+    // cross-target extraction (build host ≠ run target) bakes the right stride;
+    // the `CallControl` path above already routes through `array_items_base`.
     let base_size = match len_offset {
         None => 0,
-        Some(off) => off + std::mem::size_of::<usize>(),
+        Some(off) => off + crate::layout::target_word_size(),
     };
     crate::jitcode::BhDescr::Array {
         base_size,
@@ -3547,8 +3555,25 @@ fn vable_arraydescrof(
     is_item_signed: bool,
 ) -> crate::jitcode::BhDescr {
     let item_type = value_type_to_ir_type_for_descr(ty);
+    // The runtime block behind a vable array is `FixedObjectArray`: a length
+    // word with items flat at the target word (`FIXED_ARRAY_ITEMS_OFFSET`),
+    // holding word-wide `PyObjectRef` items. An element wider than the word
+    // would need an items-base decision this mint has never had to make
+    // (flat word vs element-aligned — the `TypedItemsBlock` /
+    // `GcTypedArray` split in `call.rs`); fail the build instead of
+    // silently picking a base.
+    assert!(
+        itemsize <= crate::layout::target_word_size(),
+        "vable array itemsize {itemsize} exceeds the target word \
+         {} — the flat-word items base below would under-align it; \
+         decide the items base against the runtime block before widening",
+        crate::layout::target_word_size(),
+    );
     crate::jitcode::BhDescr::Array {
-        base_size: std::mem::size_of::<usize>(),
+        // A virtualizable frame array is length-prefixed by a single word
+        // (`len_offset = Some(0)`), so its items start at the target word — the
+        // build host's word would mis-stride the block on a narrower target.
+        base_size: crate::layout::target_word_size(),
         itemsize,
         len_offset: Some(0),
         type_id: 0,
@@ -4268,6 +4293,37 @@ mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
+
+    #[test]
+    fn vable_arraydescrof_pins_the_flat_word_base_for_pointer_items() {
+        // `FixedObjectArray`: length word at 0, word-wide pointer items flat
+        // at the word. On the host both words are `size_of::<usize>()`.
+        let word = crate::layout::target_word_size();
+        let descr = vable_arraydescrof(&crate::model::ValueType::Ref(None), word, false);
+        let crate::jitcode::BhDescr::Array {
+            base_size,
+            itemsize,
+            len_offset,
+            is_array_of_pointers,
+            ..
+        } = descr
+        else {
+            panic!("vable_arraydescrof must mint a BhDescr::Array");
+        };
+        assert_eq!(base_size, word);
+        assert_eq!(itemsize, word);
+        assert_eq!(len_offset, Some(0));
+        assert!(is_array_of_pointers);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the target word")]
+    fn vable_arraydescrof_rejects_items_wider_than_the_word() {
+        // A wider-than-word element would be under-aligned by the flat-word
+        // base; the mint must fail the build rather than pick a base.
+        let word = crate::layout::target_word_size();
+        let _ = vable_arraydescrof(&crate::model::ValueType::Int, word * 2, true);
+    }
 
     #[test]
     fn assembler_error_message_matches_exception_payload() {

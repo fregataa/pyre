@@ -138,6 +138,46 @@ def charon_crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
     return [expand_features(arg, cargo_features) for arg in spec.charon_args]
 
 
+def crate_layout_flags(
+    spec: CrateSpec, cargo_features: str, flags: list[str]
+) -> list[str]:
+    """Cargo args for this crate's layout sidecar passes.
+
+    `layout_cargo_args` when the spec declares them (a cross target usually
+    needs a different feature set), otherwise the host extraction `flags`.
+    """
+    if spec.layout_cargo_args is None:
+        return flags
+    return [expand_features(arg, cargo_features) for arg in spec.layout_cargo_args]
+
+
+def features_in_cargo_flags(crate: str, flags: list[str]) -> list[str]:
+    """Feature names a cargo arg list enables, workspace-qualified.
+
+    A bare name is crate-relative (the extraction passes run cargo inside the
+    crate directory) and must be spelled `crate/feature` for the
+    workspace-level `cargo metadata`. `--no-default-features` is ignored:
+    dropping it can only widen the graph, and the fingerprint may
+    over-approximate but must never miss an input.
+    """
+    features: list[str] = []
+    index = 0
+    while index < len(flags):
+        arg = flags[index]
+        if arg in ("--features", "-F") and index + 1 < len(flags):
+            value = flags[index + 1]
+            index += 2
+        elif arg.startswith(("--features=", "-F=")):
+            value = arg.split("=", 1)[1]
+            index += 1
+        else:
+            index += 1
+            continue
+        for feature in value.replace(",", " ").split():
+            features.append(feature if "/" in feature else f"{crate}/{feature}")
+    return features
+
+
 def run_capture(args: list[str], *, cwd: Path) -> str:
     return subprocess.run(
         args,
@@ -159,7 +199,36 @@ def host_triple(root: Path) -> str:
     raise SystemExit("extract-llbc.py: could not determine rustc host triple")
 
 
-def metadata(eng: Engine, cargo_features: str) -> dict:
+_metadata_cache: dict[tuple, dict] = {}
+
+
+def metadata(
+    eng: Engine,
+    cargo_features: str,
+    platform: str,
+    extra_features: tuple[str, ...] = (),
+) -> dict:
+    """`cargo metadata` filtered to `platform`, memoised per full query.
+
+    The platform matters: `--filter-platform` drops dependencies gated on other
+    targets, so the host's graph does not see a `[target.'cfg(...)']` path dep
+    that only the cross-target layout sidecar pass compiles.
+    `extra_features` carries workspace-qualified features a layout sidecar
+    pass enables beyond the host pass (`layout_cargo_args`), so the graph
+    sees the dependencies they pull in. The memo key spans every input that
+    shapes the result — including the engine's workspace root and feature
+    crates, which differ between engines sharing this module.
+    """
+    key = (
+        str(eng.root),
+        eng.metadata_feature_crates,
+        cargo_features,
+        platform,
+        extra_features,
+    )
+    if key in _metadata_cache:
+        return _metadata_cache[key]
+
     metadata_features: list[str] = []
     for feature in cargo_features.split(","):
         feature = feature.strip()
@@ -167,17 +236,20 @@ def metadata(eng: Engine, cargo_features: str) -> dict:
             metadata_features.extend(
                 f"{crate}/{feature}" for crate in eng.metadata_feature_crates
             )
+    metadata_features.extend(extra_features)
 
     args = [
         "cargo",
         "metadata",
         "--format-version=1",
         "--filter-platform",
-        host_triple(eng.root),
+        platform,
     ]
     if metadata_features:
         args.extend(["--features", ",".join(metadata_features)])
-    return json.loads(run_capture(args, cwd=eng.root))
+    result = json.loads(run_capture(args, cwd=eng.root))
+    _metadata_cache[key] = result
+    return result
 
 
 def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
@@ -193,61 +265,86 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
             target_names.append(crate)
 
     if target_names:
-        meta = metadata(eng, cargo_features)
-        packages = meta["packages"]
-        by_name = {package["name"]: package for package in packages}
-        by_id = {package["id"]: package for package in packages}
-        resolve_nodes = {
-            node["id"]: node for node in meta.get("resolve", {}).get("nodes", [])
-        }
+        # The stamp covers the host artefact AND every layout sidecar, so the
+        # fingerprint must hash the union of the closures those passes compile:
+        # a path dep gated on a cross target alone would otherwise change
+        # without invalidating the sidecar it shaped.
+        platforms = {host_triple(root)}
+        for name in target_names:
+            platforms.update(crate_layout_targets(eng, eng.spec(name)))
 
-        missing = [name for name in target_names if name not in by_name]
-        if missing:
-            raise SystemExit(
-                "extract-llbc.py: unknown crate(s): " + ", ".join(sorted(missing))
-            )
+        # A layout sidecar pass may enable features the host pass does not
+        # (`layout_cargo_args`); fold them into every metadata query so the
+        # union closure sees the dependencies those features pull in.
+        layout_features: set[str] = set()
+        for name in target_names:
+            spec = eng.spec(name)
+            if spec.layout_cargo_args is not None:
+                layout_features.update(
+                    features_in_cargo_flags(
+                        name, crate_layout_flags(spec, cargo_features, [])
+                    )
+                )
+        extra_features = tuple(sorted(layout_features))
 
         # Never drop a requested target crate, only its excluded dependencies.
         exclude = excluded_packages(eng, crates) - set(target_names)
 
-        seen: set[str] = set()
-        stack = [by_name[name]["id"] for name in target_names]
-        closure = []
-        while stack:
-            package_id = stack.pop()
-            if package_id in seen:
-                continue
-            seen.add(package_id)
-            package = by_id[package_id]
-            closure.append(package)
+        for platform in sorted(platforms):
+            meta = metadata(eng, cargo_features, platform, extra_features)
+            packages = meta["packages"]
+            by_name = {package["name"]: package for package in packages}
+            by_id = {package["id"]: package for package in packages}
+            resolve_nodes = {
+                node["id"]: node for node in meta.get("resolve", {}).get("nodes", [])
+            }
 
-            for dep in resolve_nodes.get(package_id, {}).get("deps", []):
-                dep_kinds = dep.get("dep_kinds", [])
-                # An empty `dep_kinds` is a normal (non-dev) edge; only
-                # drop deps whose every listed kind is `dev`.
-                if dep_kinds and all(kind.get("kind") == "dev" for kind in dep_kinds):
-                    continue
-                dep_package = by_id.get(dep["pkg"])
-                if dep_package is not None and dep_package.get("source") is None:
-                    stack.append(dep_package["id"])
+            missing = [name for name in target_names if name not in by_name]
+            if missing:
+                raise SystemExit(
+                    "extract-llbc.py: unknown crate(s): " + ", ".join(sorted(missing))
+                )
 
-        for package in closure:
-            if package["name"] in exclude:
-                continue
-            package_dir = Path(package["manifest_path"]).resolve().parent
-            if package_dir.is_relative_to(root):
-                rel_dir = package_dir.relative_to(root).as_posix()
-                pathspecs.append(f"{rel_dir}/Cargo.toml")
-            for target in package["targets"]:
-                kinds = set(target["kind"])
-                if not ({"lib", "bin", "custom-build"} & kinds):
+            seen: set[str] = set()
+            stack = [by_name[name]["id"] for name in target_names]
+            closure = []
+            while stack:
+                package_id = stack.pop()
+                if package_id in seen:
                     continue
-                src_path = Path(target["src_path"]).resolve()
-                if src_path.is_relative_to(root):
-                    rel_src = src_path.relative_to(root).as_posix()
-                    pathspecs.append(rel_src)
-                    if "custom-build" not in kinds:
-                        pathspecs.append(str(Path(rel_src).parent) + "/")
+                seen.add(package_id)
+                package = by_id[package_id]
+                closure.append(package)
+
+                for dep in resolve_nodes.get(package_id, {}).get("deps", []):
+                    dep_kinds = dep.get("dep_kinds", [])
+                    # An empty `dep_kinds` is a normal (non-dev) edge; only
+                    # drop deps whose every listed kind is `dev`.
+                    if dep_kinds and all(
+                        kind.get("kind") == "dev" for kind in dep_kinds
+                    ):
+                        continue
+                    dep_package = by_id.get(dep["pkg"])
+                    if dep_package is not None and dep_package.get("source") is None:
+                        stack.append(dep_package["id"])
+
+            for package in closure:
+                if package["name"] in exclude:
+                    continue
+                package_dir = Path(package["manifest_path"]).resolve().parent
+                if package_dir.is_relative_to(root):
+                    rel_dir = package_dir.relative_to(root).as_posix()
+                    pathspecs.append(f"{rel_dir}/Cargo.toml")
+                for target in package["targets"]:
+                    kinds = set(target["kind"])
+                    if not ({"lib", "bin", "custom-build"} & kinds):
+                        continue
+                    src_path = Path(target["src_path"]).resolve()
+                    if src_path.is_relative_to(root):
+                        rel_src = src_path.relative_to(root).as_posix()
+                        pathspecs.append(rel_src)
+                        if "custom-build" not in kinds:
+                            pathspecs.append(str(Path(rel_src).parent) + "/")
 
     result = subprocess.run(
         ["git", "ls-files", "-z", "--", *pathspecs],
@@ -359,6 +456,7 @@ def stamp_for(
     flags: list[str],
     charon_flags: list[str],
     layout_targets: list[str],
+    layout_flags: list[str],
 ) -> str:
     return "\n".join(
         [
@@ -369,6 +467,10 @@ def stamp_for(
             f"flags={' '.join(flags)}",
             f"charon_flags={' '.join(charon_flags)}",
             f"layout_targets={' '.join(layout_targets)}",
+            # The sidecar passes' own inputs: their cargo args and RUSTFLAGS
+            # shape the extracted layouts, so changing either must re-extract.
+            f"layout_flags={' '.join(layout_flags)}",
+            f"layout_rustflags={eng.layout_target_rustflags}",
             f"source={source_fingerprint(eng, [crate], cargo_features)}",
         ]
     )
@@ -522,6 +624,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
 
         dest = dest_dir / spec.output_name
         stamp_path = dest.with_suffix(dest.suffix + ".fingerprint")
+        layout_flags = crate_layout_flags(spec, cargo_features, flags)
         stamp = stamp_for(
             eng,
             crate=crate,
@@ -531,6 +634,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             flags=flags,
             charon_flags=charon_flags,
             layout_targets=crate_layout_targets(eng, spec),
+            layout_flags=layout_flags,
         )
 
         sidecars = [
@@ -599,11 +703,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 prepared_std.add(target)
             sidecar = dest_dir / spec.layout_sidecar_name(target)
             print(f"=== extracting {crate} layouts for {target} -> {sidecar} ===")
-            layout_flags = (
-                flags
-                if spec.layout_cargo_args is None
-                else [expand_features(arg, cargo_features) for arg in spec.layout_cargo_args]
-            )
             layout_env = dict(env)
             if eng.layout_target_rustflags:
                 layout_env["RUSTFLAGS"] = (
