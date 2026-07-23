@@ -529,24 +529,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_opcode);
     pyre_install_module!("_imp"(imp));
 
-    // importlib package — four submodules backed by distinct init fns.
-    pyre_install_module!(
-        "importlib.machinery" =>
-        crate::module::importlib::interp_importlib::register_machinery
-    );
-    pyre_install_module!(
-        "importlib" =>
-        crate::module::importlib::interp_importlib::register_pkg
-    );
-    // importlib.util is NOT registered as a builtin: with importlib.__path__
-    // pointing at the on-disk package, the real util.py loads from there and
-    // re-exports the full _bootstrap / _bootstrap_external surface
-    // (cache_from_source, source_from_cache, source_hash, find_spec, …) that
-    // a stub could only approximate.
-    pyre_install_module!(
-        "importlib.abc" =>
-        crate::module::importlib::interp_importlib::register_abc
-    );
+    // importlib package and its submodules load their real source from disk:
+    // the package `__init__.py` binds `__import__`/`import_module`/… from the
+    // frozen `_bootstrap`, and `machinery`/`abc`/`util` re-export the real
+    // finders/loaders/spec classes out of `_frozen_importlib{,_external}`. The
+    // frozen bootstrap modules already carry the full surface, so a native stub
+    // would only inject placeholder `object` classes that shadow them.
 
     // __pypy__ package + builders submodule — the PyPy-only surface
     // pickle.py imports (identity_dict + builders.BytesBuilder).
@@ -976,15 +964,168 @@ pub(crate) fn create_builtin_module(
     Ok(Some(pyre_object::gc_roots::shadow_stack_get(module_slot)))
 }
 
+/// Set a builtin module's `__spec__`/`__loader__`/`__package__` from the
+/// app-level `BuiltinImporter`, matching `BuiltinImporter.exec_module` →
+/// `_init_module_attrs`. Reachable only once `importlib._bootstrap` is wired;
+/// the handful of builtins imported before that are fixed up in bulk by
+/// `_bootstrap._setup`'s sys.modules walk, so a no-op here is correct then.
+#[cfg(feature = "host_env")]
+fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let Some(bootstrap) = get_sys_module("importlib._bootstrap") else {
+        return Ok(());
+    };
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    pin_root(module);
+    let boot_slot = shadow_stack_len();
+    pin_root(bootstrap);
+
+    // Best-effort throughout: a builtin imported while `_bootstrap` is still
+    // executing sees a partially-initialised module whose `BuiltinImporter` /
+    // `_init_module_attrs` are not defined yet. Skip rather than break the
+    // import — `_bootstrap._setup` fixes up any builtin missed here.
+    let Ok(importer) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "BuiltinImporter")
+    else {
+        return Ok(());
+    };
+    let importer_slot = shadow_stack_len();
+    pin_root(importer);
+    let Ok(find_spec) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(importer_slot), "find_spec")
+    else {
+        return Ok(());
+    };
+    let find_spec_slot = shadow_stack_len();
+    pin_root(find_spec);
+    let w_name = pyre_object::w_str_new(name);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let Ok(spec) = crate::call::call_function_impl_result(
+        shadow_stack_get(find_spec_slot),
+        &[shadow_stack_get(name_slot)],
+    ) else {
+        return Ok(());
+    };
+    if unsafe { pyre_object::is_none(spec) } {
+        return Ok(());
+    }
+    let spec_slot = shadow_stack_len();
+    pin_root(spec);
+
+    // _init_module_attrs(spec, module)
+    let Ok(init) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "_init_module_attrs")
+    else {
+        return Ok(());
+    };
+    let init_slot = shadow_stack_len();
+    pin_root(init);
+    let _ = crate::call::call_function_impl_result(
+        shadow_stack_get(init_slot),
+        &[shadow_stack_get(spec_slot), shadow_stack_get(mod_slot)],
+    );
+    Ok(())
+}
+
+/// Off-`host_env` builds have no app-level importlib to source specs from.
+#[cfg(not(feature = "host_env"))]
+fn set_builtin_module_spec(_name: &str, _module: PyObjectRef) -> Result<(), crate::PyError> {
+    Ok(())
+}
+
+/// Set a source module's `__spec__`/`__loader__`/`__file__`/`__cached__` from
+/// the app-level `_bootstrap_external._fix_up_module` — the helper
+/// `PyImport_ExecCodeModuleObject` calls. Returns `false` when the importlib
+/// bootstrap is not wired yet, so the caller can seed `None` instead.
+///
+/// `ns` (the module dict) is written in place; the caller keeps it pinned.
+#[cfg(feature = "host_env")]
+fn fix_up_source_module_spec(
+    ns: PyObjectRef,
+    pathname: &str,
+    cpathname: Option<&str>,
+) -> Result<bool, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let Some(ext) = get_sys_module("importlib._bootstrap_external") else {
+        return Ok(false);
+    };
+    let Some(w_name) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__name__") }) else {
+        return Ok(false);
+    };
+
+    let _roots = push_roots();
+    let ns_slot = shadow_stack_len();
+    pin_root(ns);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let ext_slot = shadow_stack_len();
+    pin_root(ext);
+    let w_path = pyre_object::w_str_new(pathname);
+    let path_slot = shadow_stack_len();
+    pin_root(w_path);
+    let w_cpath = match cpathname {
+        Some(c) => pyre_object::w_str_new(c),
+        None => pyre_object::w_none(),
+    };
+    let cpath_slot = shadow_stack_len();
+    pin_root(w_cpath);
+
+    // Best-effort: `_bootstrap_external` itself is a source module, and its
+    // spec is fixed up (during partial-init) before its body defines
+    // `_fix_up_module` — the getattr then raises. Fall back to `None` seeding
+    // for that (and any other partially-initialised) case rather than break
+    // the import; the module's spec is corrected by later imports / `_setup`.
+    let Ok(fix) = crate::baseobjspace::getattr_str(shadow_stack_get(ext_slot), "_fix_up_module")
+    else {
+        return Ok(false);
+    };
+    let fix_slot = shadow_stack_len();
+    pin_root(fix);
+    // An error raised by `_fix_up_module` itself propagates — the appexec
+    // at importing.py:293-298 does not shield the call.
+    crate::call::call_function_impl_result(
+        shadow_stack_get(fix_slot),
+        &[
+            shadow_stack_get(ns_slot),
+            shadow_stack_get(name_slot),
+            shadow_stack_get(path_slot),
+            shadow_stack_get(cpath_slot),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// Off-`host_env` builds have no app-level importlib to source specs from.
+#[cfg(not(feature = "host_env"))]
+fn fix_up_source_module_spec(
+    _ns: PyObjectRef,
+    _pathname: &str,
+    _cpathname: Option<&str>,
+) -> Result<bool, crate::PyError> {
+    Ok(false)
+}
+
 fn startup_builtin_module(
     name: &str,
     module: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    pin_root(module);
+
     let startup = BUILTIN_MODULES.with(|m| m.borrow().get(name).and_then(|d| d.startup));
     if let Some(startup) = startup {
-        startup(module, execution_context)?;
+        startup(shadow_stack_get(mod_slot), execution_context)?;
     }
+    set_builtin_module_spec(name, shadow_stack_get(mod_slot))?;
     Ok(())
 }
 
@@ -1021,9 +1162,26 @@ pub fn init_sys_path(script_dir: &Path) {
                 }
             }
         }
-        // CPython stdlib path is detected lazily on first stdlib import
-        // to avoid spawning python3 subprocess on every startup.
-        // See find_module() → ensure_stdlib_path().
+        // PYTHONPATH entries follow the script/cwd seed and precede the
+        // stdlib (pathconfig.c), split on the platform path-list separator.
+        // Honoured regardless of the safe-path flag, which only suppresses the
+        // script/cwd seed, but skipped under `-E` / `-I` (ignore_environment),
+        // which ignore every `PYTHON*` variable. The sandbox interpreter takes
+        // its search path from the controller, so it does not read the host
+        // environment here.
+        #[cfg(not(feature = "sandbox"))]
+        if !ignore_environment_flag() {
+            if let Ok(pythonpath) = host_os::var("PYTHONPATH") {
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                // Empty components are preserved — an empty `sys.path` entry
+                // denotes the current directory (app_main.setup_and_fix_paths
+                // extends with the raw split).
+                path.extend(pythonpath.split(sep).map(PathBuf::from));
+            }
+        }
+        // The stdlib entry is appended when the `sys` module is created —
+        // `create_sys_path_list` forces `ensure_stdlib_path` before flushing
+        // this seed into `sys.path`.
     });
 }
 
@@ -1101,16 +1259,58 @@ pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
     }
 }
 
-/// Add a directory to sys.path.
+/// Add a directory to `sys.path`.
+///
+/// Before the `sys` module exists this stages the entry in the native
+/// `SYS_PATH` seed, which is flushed into `sys.path` when `sys` is created.
+/// Once `sys` exists the Python list is authoritative, so the entry is appended
+/// to it in place (deduplicated) and the spent seed is left untouched. A
+/// missing or non-list `sys.path` (e.g. after `del sys.path`) is respected.
 #[cfg(feature = "host_env")]
 pub fn add_sys_path(dir: &Path) {
-    SYS_PATH.with(|p| {
-        let mut path = p.borrow_mut();
-        let pb = dir.to_path_buf();
-        if !path.contains(&pb) {
-            path.push(pb);
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let entry = dir.to_string_lossy();
+    if get_sys_module("sys").is_none() {
+        SYS_PATH.with(|p| {
+            let mut path = p.borrow_mut();
+            let pb = dir.to_path_buf();
+            if !path.contains(&pb) {
+                path.push(pb);
+            }
+        });
+        return;
+    }
+    // Pin the new entry before any further allocation (`get_sys_module` and the
+    // dict lookup allocate) can relocate it. After the list is fetched below the
+    // path is allocation-free until the pinned entry reaches `w_list_append`.
+    let _roots = push_roots();
+    let slot = shadow_stack_len();
+    pin_root(pyre_object::w_str_new(entry.as_ref()));
+    let Some(sys_mod) = get_sys_module("sys") else {
+        return;
+    };
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
+    if w_dict.is_null() {
+        return;
+    }
+    let Some(w_path) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }) else {
+        return;
+    };
+    if !unsafe { pyre_object::is_list(w_path) } {
+        return;
+    }
+    let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
+    for i in 0..n {
+        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) } {
+            if unsafe { pyre_object::is_str(item) }
+                && unsafe { pyre_object::w_str_get_value(item) } == entry.as_ref()
+            {
+                return;
+            }
         }
-    });
+    }
+    unsafe { pyre_object::listobject::w_list_append(w_path, shadow_stack_get(slot)) };
 }
 
 // ── check_sys_modules ────────────────────────────────────────────────
@@ -1160,41 +1360,6 @@ fn sys_modules_blocks(name: &str) -> bool {
 pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
-
-/// Mirror the native search path (`SYS_PATH`) into Python `sys.path` so
-/// `PathFinder` — reached by `importlib.util.find_spec` for top-level module
-/// names — can resolve modules. `runpy._get_module_details` (the `-m` entry)
-/// drives that path, which is otherwise left empty.
-#[cfg(feature = "host_env")]
-pub fn sync_python_sys_path() {
-    // wasm seeds `sys.path` from its bootstrap and has no current_exe/python3
-    // lazy stdlib detection, so `ensure_stdlib_path` exists only off-wasm.
-    #[cfg(not(target_arch = "wasm32"))]
-    ensure_stdlib_path();
-    let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {
-        p.borrow()
-            .iter()
-            .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
-            .collect()
-    });
-    if let Some(sys_mod) = get_sys_module("sys") {
-        // `sys.path` lives in the sys module's own dict; store it with the
-        // infallible direct dict write the module `setattr` branch reaches
-        // (`baseobjspace::object_setattr` module arm), avoiding the
-        // discarded `Result` of the general `setattr_str`.
-        unsafe {
-            let w_dict = pyre_object::w_module_get_w_dict(sys_mod);
-            if !w_dict.is_null() {
-                pyre_object::w_dict_setitem_str(w_dict, "path", pyre_object::w_list_new(items));
-            }
-        }
-    }
-}
-
-/// Off-`host_env` builds keep no native `SYS_PATH`, so there is nothing to
-/// mirror into Python `sys.path`.
-#[cfg(not(feature = "host_env"))]
-pub fn sync_python_sys_path() {}
 
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
 /// installed. Used by callers that need to iterate every loaded module
@@ -1487,7 +1652,9 @@ fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindIn
         return Some(info);
     }
 
-    // Lazy stdlib detection — only on first miss (avoid python3 spawn at startup)
+    // Fallback stdlib detection. `create_sys_path_list` already forces this at
+    // sys-module creation, so the `DONE` guard normally makes this a no-op; it
+    // stays as a defensive retry for any miss reached before sys exists.
     ensure_stdlib_path();
     return find_in_sys_path(partname);
 }
@@ -1571,9 +1738,99 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
     None
 }
 
+/// Read the live Python `sys.path` list as filesystem directories, or an
+/// empty vec before `sys` / its `path` list exists (the pre-`sync` bootstrap
+/// window). Only `str` entries are collected — path hooks (zipimporter keys
+/// and the like) are not resolvable by the native file search.
+#[cfg(feature = "host_env")]
+fn python_sys_path_dirs() -> Option<Vec<PathBuf>> {
+    // `None` means the `sys` module does not exist yet (the pre-`sys` bootstrap
+    // window) — the caller falls back to the native seed. Once `sys` exists the
+    // Python list is authoritative even when empty: a missing / non-list / empty
+    // `sys.path` searches nothing, so `del sys.path` and `sys.path.clear()` break
+    // imports exactly as they do under CPython, rather than resurrecting the seed.
+    let sys_mod = get_sys_module("sys")?;
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
+    if w_dict.is_null() {
+        return None;
+    }
+    // Copy the entries up front so no Python borrow is held across the
+    // filesystem probes in `find_in_dirs` (which never invoke user code).
+    let mut dirs = Vec::new();
+    if let Some(w_path) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") } {
+        if unsafe { pyre_object::is_list(w_path) } {
+            let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
+            dirs.reserve(n);
+            for i in 0..n {
+                if let Some(item) =
+                    unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) }
+                {
+                    // Non-str entries are skipped: pyre's only path hook is the
+                    // native filesystem probe, and CPython also skips an entry no
+                    // hook accepts.
+                    if unsafe { pyre_object::is_str(item) } {
+                        dirs.push(PathBuf::from(unsafe { pyre_object::w_str_get_value(item) }));
+                    }
+                }
+            }
+        }
+    }
+    Some(dirs)
+}
+
+/// Search the import path for a top-level `partname`.
+///
+/// The live Python `sys.path` list is authoritative — user code (and PYTHONPATH)
+/// mutate it and imports must honor it, the same precedence `check_sys_modules`
+/// gives the Python `sys.modules` dict. The native `SYS_PATH` is only the write
+/// side of a pre-`sys` staging seed (flushed into `sys.path` at sys-module
+/// creation) and is consulted here solely in that pre-`sys` window.
 #[cfg(feature = "host_env")]
 fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
-    SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow()))
+    match python_sys_path_dirs() {
+        Some(dirs) => {
+            let found = find_in_dirs(partname, &dirs);
+            // Windows: pyre still registers the `posix` builtin (never `nt`),
+            // so `os.path` is posixpath and `site.removeduppaths()` rewrites
+            // every drive-letter `sys.path` entry into `<cwd>/D:\...` garbage
+            // at startup. Until the `nt` registration lands, a live-list miss
+            // falls back to the native seed so the stdlib stays importable.
+            #[cfg(windows)]
+            let found = found.or_else(|| SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())));
+            found
+        }
+        None => SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())),
+    }
+}
+
+/// Build the initial Python `sys.path` list from the native `SYS_PATH` seed.
+/// Called once at sys-module creation so the Python list is populated the
+/// instant `sys` exists; from then on the Python list is authoritative and the
+/// seed is spent.
+///
+/// Stdlib detection is forced here (off-wasm) so the vendored stdlib is on
+/// `sys.path` before any user code — including `python -S` / `-S -P` runs that
+/// never import `site` — reads it, matching the unconditional detection the
+/// removed `sync_python_sys_path` performed. `sys` is not yet in `sys.modules`
+/// during its own creation, so `ensure_stdlib_path`'s `add_sys_path` stages the
+/// stdlib in the seed, and the flush below picks it up.
+#[cfg(feature = "host_env")]
+pub(crate) fn create_sys_path_list() -> PyObjectRef {
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_stdlib_path();
+    let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {
+        p.borrow()
+            .iter()
+            .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+            .collect()
+    });
+    pyre_object::w_list_new(items)
+}
+
+/// Off-`host_env` builds have no native seed; `sys.path` starts empty.
+#[cfg(not(feature = "host_env"))]
+pub(crate) fn create_sys_path_list() -> PyObjectRef {
+    pyre_object::w_list_new(vec![])
 }
 
 /// Extract a package module's `__path__` as filesystem directories.
@@ -1673,26 +1930,22 @@ fn exec_code_module(
             pyre_object::w_dict_setitem_str(w_globals, "__cached__", w_cpathname);
         }
         // importing.py:286-298 — `_fix_up_module(d, name, pathname,
-        // cpathname)`.  PyPy's `_fix_up_module`
-        // (`lib-python/3/importlib/_bootstrap_external.py:1728`) sets
-        // `__spec__`/`__loader__`/`__file__`/`__cached__` from the
-        // app-level `SourceFileLoader` + `spec_from_file_location`
-        // helpers.  Pyre lacks the importlib bootstrap machinery
-        // (`SourceFileLoader`, `ModuleSpec`, `spec_from_file_location`
-        // are not yet ported), so as a TODO we seed
-        // `__loader__`/`__spec__` with `None` only when missing —
-        // matching PyPy's `if not loader / if not spec` guards
-        // (_bootstrap_external.py:1732, 1739).  When the importlib
-        // app-level layer lands, the `None` arms will collapse onto the
-        // mechanical PyPy port.
-        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
-            unsafe {
-                pyre_object::w_dict_setitem_str(w_globals, "__loader__", pyre_object::w_none());
+        // cpathname)` sets `__spec__`/`__loader__`/`__file__`/`__cached__`
+        // from the app-level `SourceFileLoader` + `spec_from_file_location`
+        // helpers.  Reachable only once the importlib bootstrap is wired;
+        // before that, seed `__loader__`/`__spec__` with `None` only when
+        // missing — the `if not loader / if not spec` guards at
+        // `_bootstrap_external.py:_fix_up_module`.
+        if !fix_up_source_module_spec(w_globals, p, cpathname)? {
+            if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
+                unsafe {
+                    pyre_object::w_dict_setitem_str(w_globals, "__loader__", pyre_object::w_none());
+                }
             }
-        }
-        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__spec__") }.is_none() {
-            unsafe {
-                pyre_object::w_dict_setitem_str(w_globals, "__spec__", pyre_object::w_none());
+            if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__spec__") }.is_none() {
+                unsafe {
+                    pyre_object::w_dict_setitem_str(w_globals, "__spec__", pyre_object::w_none());
+                }
             }
         }
     }
@@ -2051,6 +2304,9 @@ fn load_part(
         };
         set_sys_module(modulename, m);
         startup_builtin_module(modulename, m, execution_context)?;
+        // `startup_builtin_module` runs app-level spec construction that can
+        // collect and relocate `m`; re-read the live pointer from sys.modules.
+        let m = check_sys_modules(modulename).unwrap_or(m);
         return Ok(Some(m));
     }
 
@@ -2093,7 +2349,9 @@ fn load_part(
             // Store builtin modules in cache immediately
             set_sys_module(modulename, m);
             startup_builtin_module(partname, m, execution_context)?;
-            m
+            // `startup_builtin_module` may collect and relocate `m`; re-read
+            // the live pointer from sys.modules.
+            check_sys_modules(modulename).unwrap_or(m)
         }
     };
 
