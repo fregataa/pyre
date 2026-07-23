@@ -9510,10 +9510,15 @@ fn build_resumed_frames(
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
-        let decoded_py_pc = (frame.pc >= 0)
-            .then(|| pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize);
-        let py_pc = decoded_py_pc.unwrap_or(vable_ni);
+        // Forward-carried Python resume pc, recorded at guard capture from the
+        // codewriter `(jitcode_pc, py_pc)` marker pair (no jitcode→py inverse at
+        // decode).  py_pc=-1 is the no-snapshot sentinel (pc<0) → fall back to
+        // the vable next-instr.
+        let py_pc = if frame.py_pc >= 0 {
+            frame.py_pc as usize
+        } else {
+            vable_ni
+        };
         // resume.py:1339 jitcodes[jitcode_pos]:
         // Outermost frame: code from vable resume data.
         // Inner frames: code from jitcode_index registry (inlined calls).
@@ -9579,14 +9584,27 @@ fn build_resumed_frames(
             } else {
                 std::ptr::null()
             }
+        } else if !w_code.is_null() {
+            // get_w_globals: each inlined-callee section resolves LOAD_GLOBAL
+            // in its own module namespace, taken from its own code — not the
+            // chain virtualizable's (mirrors recover_inline_callee_globals).
+            // Fall back to the chain namespace only when the callee code
+            // carries no globals yet.
+            let callee_ns = unsafe {
+                pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef)
+                    as *const ()
+            };
+            if !callee_ns.is_null() {
+                callee_ns
+            } else {
+                vable_ns
+            }
         } else {
-            // Inner frames share the chain virtualizable's namespace.
             vable_ns
         };
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
             py_pc,
-            rd_numb_pc: decoded_py_pc,
             frame_ptr,
             vsd,
             namespace,

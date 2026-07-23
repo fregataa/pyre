@@ -11672,6 +11672,8 @@ mod tests {
         let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
             runtime_jitcode,
             crate::PyJitCodeMetadata {
+                forward_py_pc_marker_by_jit_pc: Vec::new(),
+                forward_py_pc_pred_by_jit_pc: Vec::new(),
                 after_residual_call_resume_marker_by_jit_pc: Vec::new(),
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 n_py_instrs: 0,
@@ -11698,6 +11700,8 @@ mod tests {
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
                 depth_after_residual_marker_by_jit_pc: Vec::new(),
                 depth_after_residual_pred_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec::new(),
                 has_color_map: false,
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
@@ -11775,6 +11779,7 @@ mod tests {
             frames: vec![RebuiltFrame {
                 jitcode_index,
                 pc: 0,
+                py_pc: 0,
                 values: vec![
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),

@@ -2934,9 +2934,25 @@ impl MIFrame {
             crate::state::request_trace_abort();
             top_pc as u32
         });
+        let top_py_pc = match resolved {
+            // A resolved JitCode pc with no forward Python-pc marker cannot be
+            // resumed; decline the trace exactly like the `top_pc_word` arm
+            // above rather than silently publishing a fallback Python pc.
+            Some(offset) => payload
+                .resume_position_for_jitcode_pc(offset)
+                .map(|(_, py_pc)| py_pc)
+                .unwrap_or_else(|| {
+                    crate::state::request_trace_abort();
+                    top_pc as u32
+                }),
+            // `resolved` was None: the `top_pc_word` arm already requested the
+            // abort, so mirror its fallback without asking twice.
+            None => top_pc as u32,
+        };
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc_word,
+            py_pc: top_py_pc,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
                 top_snapshot_types,

@@ -1014,6 +1014,7 @@ impl TreeLoop {
                         .map(|f| crate::recorder::SnapshotFrame {
                             jitcode_index: f.jitcode_index,
                             pc: f.pc,
+                            py_pc: f.py_pc,
                             boxes: f.boxes.iter().map(&remap_tagged).collect(),
                         })
                         .collect(),
@@ -2219,6 +2220,13 @@ impl TraceCtx {
     /// resolve to a known `Box.type`; constants must have a recorded
     /// value.  Misses are bookkeeping bugs and panic, not silent
     /// fallbacks.
+    /// `py_pc == pc` here: this convenience serves jitdrivers whose
+    /// interpreter pc already *is* the JitCode pc — the native meta-tracing
+    /// clients (and unit tests) that have no CPython-bytecode layer, so the
+    /// two coordinates coincide and no JitCode→Python translation applies.
+    /// The pyre CPython-bytecode path never uses this shortcut; it carries a
+    /// distinct forward Python pc through
+    /// `capture_snapshot_for_last_guard_with_vable_vref`.
     pub fn capture_snapshot_for_last_guard(
         &mut self,
         active_boxes: &[OpRef],
@@ -2228,6 +2236,7 @@ impl TraceCtx {
         self.capture_snapshot_for_last_guard_with_vable_vref(
             active_boxes,
             jitcode_index,
+            pc,
             pc,
             &[],
             &[],
@@ -2254,6 +2263,7 @@ impl TraceCtx {
         active_boxes: &[OpRef],
         jitcode_index: u32,
         pc: u32,
+        py_pc: u32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
@@ -2263,6 +2273,7 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
+                py_pc,
                 boxes,
             }],
             vable_boxes: vable_boxes.to_vec(),
@@ -2281,6 +2292,7 @@ impl TraceCtx {
         active_boxes: &[OpRef],
         jitcode_index: u32,
         pc: u32,
+        py_pc: u32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
@@ -2289,6 +2301,7 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
+                py_pc,
                 boxes,
             }],
             vable_boxes: vable_boxes.to_vec(),
@@ -2314,7 +2327,10 @@ impl TraceCtx {
     /// (RPython's `_number_boxes` does this implicitly via the memo
     /// table; pyre's `Snapshot.encode` does the same in
     /// `resume.rs:1898 _number_boxes`).
-    pub fn capture_snapshot_for_last_guard_multi_frame(&mut self, frames: &[(u32, u32, &[OpRef])]) {
+    pub fn capture_snapshot_for_last_guard_multi_frame(
+        &mut self,
+        frames: &[(u32, u32, u32, &[OpRef])],
+    ) {
         self.capture_snapshot_for_last_guard_multi_frame_with_vable_vref(frames, &[], &[]);
     }
 
@@ -2328,18 +2344,19 @@ impl TraceCtx {
     /// it sees in the trace-time MIFrame stack.
     pub fn capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
         &mut self,
-        frames: &[(u32, u32, &[OpRef])],
+        frames: &[(u32, u32, u32, &[OpRef])],
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
-            .map(|(jitcode_index, pc, boxes)| {
+            .map(|(jitcode_index, pc, py_pc, boxes)| {
                 // The pc word is a raw JitCode offset.
                 let encoded = self.encode_snapshot_boxes(boxes);
                 crate::recorder::SnapshotFrame {
                     jitcode_index: *jitcode_index,
                     pc: *pc,
+                    py_pc: *py_pc,
                     boxes: encoded,
                 }
             })
@@ -2362,18 +2379,19 @@ impl TraceCtx {
     /// paused caller chain is available for a full `Snapshot.frames`.
     pub fn capture_snapshot_for_last_guard_op_multi_frame_with_vable_vref(
         &mut self,
-        frames: &[(u32, u32, &[OpRef])],
+        frames: &[(u32, u32, u32, &[OpRef])],
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
-            .map(|(jitcode_index, pc, boxes)| {
+            .map(|(jitcode_index, pc, py_pc, boxes)| {
                 // The pc word is a raw JitCode offset.
                 let encoded = self.encode_snapshot_boxes(boxes);
                 crate::recorder::SnapshotFrame {
                     jitcode_index: *jitcode_index,
                     pc: *pc,
+                    py_pc: *py_pc,
                     boxes: encoded,
                 }
             })
@@ -2842,6 +2860,7 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: self.last_traced_pc as u32,
+                py_pc: self.last_traced_pc as u32,
                 boxes: Vec::new(),
             }],
             vable_boxes: Vec::new(),
