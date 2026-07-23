@@ -5240,6 +5240,14 @@ unsafe fn delattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                 return crate::call::call_function_impl_result(da, &[obj, w_name])
                     .map(|_| w_none());
             }
+        } else if let Some(w_type) = crate::typedef::r#type(obj) {
+            // descroperation.py:254 dispatches through space.lookup for every
+            // receiver kind. A class is an instance of its metaclass, so its
+            // __delattr__ override precedes direct type-dict removal too.
+            if let Some(da) = lookup_in_type(w_type, "__delattr__") {
+                return crate::call::call_function_impl_result(da, &[obj, w_name])
+                    .map(|_| w_none());
+            }
         }
     }
     unsafe { object_delattr_surrogate(obj, w_name, name) }
@@ -5557,7 +5565,6 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         if is_type(obj) {
             // baseobjspace.py:76 — the metaclass is type(C), read from w_class.
             let w_type_type = crate::typedef::w_type();
-            let w_object = crate::typedef::w_object();
             let w_metaclass = {
                 let w_class = (*obj).w_class;
                 if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
@@ -5568,20 +5575,17 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             };
             let w_metaclasses: [Option<PyObjectRef>; 2] =
                 [w_metaclass, crate::typedef::gettypefor((*obj).ob_type)];
-            // typeobject.py:811-819 — a metatype DATA descriptor is consulted
-            // before anything else, including the hardcoded type attributes
-            // below.  Only honor one defined on a user metaclass (its owner is
-            // neither `type` nor `object`): the builtin getsets those bases
-            // carry are served by the dedicated short-circuits below, so
-            // letting them through here would re-enter this lookup.
+            // typeobject.py:811-819 — `space.lookup(self, name)` searches the
+            // complete metaclass MRO, and any data descriptor found there is
+            // consulted before the class's own MRO.  This includes getsets
+            // defined by `type` itself: for example `type.__module__` must
+            // invoke type's descriptor with `type` as its receiver rather
+            // than return the raw descriptor from type's own dictionary.
             for w_metaclass in w_metaclasses.iter().flatten() {
                 let w_metaclass = *w_metaclass;
                 if is_type(w_metaclass) {
-                    if let Some((src, descr)) = lookup_where_pair(w_metaclass, name) {
-                        if !std::ptr::eq(src, w_type_type)
-                            && !std::ptr::eq(src, w_object)
-                            && is_data_descr(descr)
-                        {
+                    if let Some(descr) = lookup_in_type_where(w_metaclass, name) {
+                        if is_data_descr(descr) {
                             match get(descr, obj, w_metaclass) {
                                 Ok(Some(result)) => return Ok(result),
                                 Ok(None) => {}
@@ -5623,25 +5627,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             if name == "__name__" {
-                // typeobject.py:626 getname — a heap type keeps its stored
-                // name verbatim (it may legitimately contain a dot when built
-                // via `type('a.b', (), {})`); a static type's dotted tp_name
-                // (e.g. "types.UnionType") carries its module prefix only in
-                // repr, so strip to the final component.
-                let full = w_type_get_name(obj);
-                let bare = if pyre_object::w_type_is_heaptype(obj) {
-                    full
-                } else {
-                    full.rsplit('.').next().unwrap_or(full)
-                };
-                return Ok(w_str_new(bare));
+                return Ok(pyre_object::w_type_get_name_obj(obj));
             }
             if name == "__qualname__" {
-                // typeobject.py:637 getqualname returns the stored qualname;
-                // `type_new_take_qualname` popped an explicit class-body
-                // `__qualname__` into it at creation, and the heap/static name
-                // split is already baked into the field.
-                return Ok(w_str_new(pyre_object::w_type_get_qualname(obj)));
+                return Ok(pyre_object::w_type_get_qualname_obj(obj));
             }
             if name == "__mro__" {
                 let mro_ptr = w_type_get_mro(obj);
@@ -5776,8 +5765,21 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             {
                 return Ok(w_str_new(crate::typedef::METHOD_DOC));
             }
-            if name == "__doc__"
-                || name == "__code__"
+            // typeobject.py:1166-1179 descr__doc — a heap type reads only its
+            // own dict and returns None when absent; class docs are never
+            // inherited. EnumType may omit an explicit `__doc__ = None`, so an
+            // MRO lookup here would incorrectly surface Enum.__doc__.
+            if name == "__doc__" && pyre_object::w_type_is_heaptype(obj) {
+                if let Some(value) = crate::type_dict_lookup(obj, name) {
+                    return match get(value, PY_NULL, obj) {
+                        Ok(Some(result)) => Ok(result),
+                        Ok(None) => Ok(value),
+                        Err(e) => Err(e),
+                    };
+                }
+                return Ok(w_none());
+            }
+            if name == "__code__"
                 || name == "__func__"
                 || name == "__self__"
                 || name == "__globals__"
@@ -6592,7 +6594,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // second half of the "hasdict instance dict" protocol.
     let w_dict = getdict_backing(obj);
     if !w_dict.is_null() {
-        if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+        // `w_dict` may use MapDictStrategy, whose storage is the backing
+        // instance rather than a native r_dict. PyPy calls
+        // `w_obj.getdictvalue`, which routes through that strategy; use the
+        // generic dict lookup here for the same reason. Reading the raw native
+        // storage skips MapDictStrategy and makes an int/str/etc. subclass's
+        // freshly stored attribute appear shadowed by an inherited class value.
+        if let Some(value) = finditem_str(w_dict, name)? {
             return Ok(value);
         }
     }
@@ -8714,7 +8722,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                         pyre_object::type_name_of(value)
                     )));
                 }
-                pyre_object::w_type_set_qualname(obj, pyre_object::w_str_get_value(value));
+                crate::builtins::check_surrogate(value)?;
+                pyre_object::w_type_set_qualname(obj, value);
                 mutated(obj, Some(name));
                 return Ok(w_none());
             }
@@ -8746,7 +8755,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                             object_functionstr_type_name(value),
                         )));
                     }
-                    pyre_object::w_type_set_qualname(obj, pyre_object::w_str_get_value(value));
+                    crate::builtins::check_surrogate(value)?;
+                    pyre_object::w_type_set_qualname(obj, value);
                     return Ok(w_none());
                 }
                 // typeobject.py:1258-1261 descr_set___abstractmethods__ —
@@ -9381,6 +9391,14 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                             .map(|_| w_none());
                     }
                 }
+            }
+        } else if let Some(w_type) = crate::typedef::r#type(obj) {
+            // A class object's attribute operations dispatch through its
+            // metaclass in PyPy (`space.lookup(w_obj, '__delattr__')`).
+            if let Some(da) = lookup_in_type(w_type, "__delattr__") {
+                let w_name = w_str_new(name);
+                return crate::call::call_function_impl_result(da, &[obj, w_name])
+                    .map(|_| w_none());
             }
         }
     }
@@ -14708,6 +14726,21 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
         match pyre_object::dictmultiobject::w_dict_delitem_checked(obj, key) {
             Ok(true) => Ok(()),
             Ok(false) => Err(PyError::key_error_with_key(key)),
+            Err(_) => Err(take_pending_dict_key_error(key)),
+        }
+    }
+}
+
+/// PyPy `W_DictMultiObject.nondescr_delitem_if_value_is`: bypass subclass
+/// hooks and preserve the single-probe identity-checked deletion primitive.
+pub fn dict_delitem_if_value_is(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<bool, PyError> {
+    unsafe {
+        match pyre_object::dictmultiobject::w_dict_delitem_if_value_is_checked(obj, key, value) {
+            Ok(removed) => Ok(removed),
             Err(_) => Err(take_pending_dict_key_error(key)),
         }
     }

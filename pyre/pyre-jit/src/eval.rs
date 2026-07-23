@@ -340,6 +340,8 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
     // epic S5) for a mortal heap type; forward the field slot so a major GC greys
     // the box, and the box tid's drop glue reclaims the buffer on sweep. An
@@ -6626,6 +6628,23 @@ fn handle_fail(
     guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
+    // A failure reported through a retired/inlined source descr can belong to
+    // an invalidated JitCellToken even while the outer entry token is still
+    // installed.  PyPy cannot make that namespace mistake: the live
+    // MIFrame/looptoken path that contains GUARD_NOT_INVALIDATED is itself
+    // revoked from warm entry.  Revoke the actual entry token as well before
+    // resuming, so the next back-edge warms and compiles against the new
+    // quasi-immutable value instead of re-entering the stale containing
+    // machine trace on every iteration.
+    if descr_arc
+        .as_fail_descr()
+        .and_then(majit_backend::descr_owning_jct)
+        .is_some_and(|token| token.is_invalidated())
+    {
+        let (driver, _) = driver_pair();
+        driver.invalidate_loop(green_key);
+    }
+
     // The range FOR_ITER `GuardClass(RANGE_ITER)` proves its own site
     // polymorphic on the first failure.  The failing descr carries the
     // FOR_ITER green key it protects (`range_foriter_green_key`), stamped

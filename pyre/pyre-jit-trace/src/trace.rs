@@ -1609,6 +1609,24 @@ fn drive_outer_continuation_and_map<Sym: WalkSym>(
     }
 }
 
+fn seed_loop_entry_ref_slots(
+    pcdep: &[(u8, u16, u16)],
+    num_vable_scalars: usize,
+    mut box_at: impl FnMut(usize) -> Option<majit_ir::OpRef>,
+    mut seed: impl FnMut(u8, u16, majit_ir::OpRef),
+) {
+    for &(bank, color, slot) in pcdep {
+        if bank != 1 {
+            continue;
+        }
+        if let Some(opref) = box_at(num_vable_scalars + slot as usize)
+            && !opref.is_none()
+        {
+            seed(color as u8, slot, opref);
+        }
+    }
+}
+
 fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -1861,10 +1879,57 @@ fn run_perfn_walk<Sym: WalkSym>(
                 }
             }
         }
-        // Loop-trace entry seeds no operand-stack colors.  The codewriter's
-        // `Instruction::ForIter` handler emits `getarrayitem_vable_r` to reload
-        // the iterator from the virtualizable on every iteration, so the
-        // residual consumes that in-loop read rather than an entry register.
+        // A loop trace starts at the per-CodeObject sidecar coordinate near
+        // the loop header, not at the function entry that originally defined
+        // every live MIFrame register.  RPython reaches that header with the
+        // same MIFrame and therefore retains all live register contents.  The
+        // sidecar walk creates a fresh register bank, so reconstruct each
+        // per-PC Ref color from its authoritative slot in the red frame's
+        // virtualizable array before dispatching the header.  This is the
+        // non-bridge counterpart of `setup_bridge_sym`'s color/slot inversion;
+        // without it loop-carried collection operands remain `OpRef::NONE`.
+        if !is_bridge_trace {
+            let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            if let Some(pcdep) =
+                crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, entry as i32)
+            {
+                let mut live_slot_seeds = Vec::new();
+                seed_loop_entry_ref_slots(
+                    &pcdep,
+                    nvs,
+                    |index| ctx.virtualizable_box_at(index),
+                    |color, slot, opref| live_slot_seeds.push((color, slot, opref)),
+                );
+                for (color, slot, opref) in live_slot_seeds {
+                    seed(color, opref);
+                    // RPython's MIFrame register is a Box carrying both its
+                    // symbolic identity and recording-time value.  The
+                    // sidecar reconstruction above restores the first half;
+                    // stamp the live PyFrame slot onto the same OpRef so an
+                    // inlined callee receives its concrete argument identity.
+                    // Without this, a dynamic call such as pickle's
+                    // dispatch[key](self) loses `self` at the loop header;
+                    // a raising callee then mutates concrete state but cannot
+                    // recover the exception class, aborting and replaying the
+                    // already-applied mutation.
+                    if cf_addr != 0 {
+                        let frame =
+                            unsafe { &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame) };
+                        if let Some(&value) = frame.locals_w().as_slice().get(slot as usize)
+                            && !value.is_null()
+                        {
+                            ctx.set_opref_concrete(
+                                opref,
+                                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The pcdep inversion above is the complete loop-entry seed.  FOR_ITER
+        // also emits an in-loop `getarrayitem_vable_r`, so its iterator is
+        // refreshed from the same frame owner on every iteration.
         //
         // #124: a bridge enters mid-body, where the loop-header merge-point
         // colors seeded above (the loop's green pycode / red frame+ec) are
@@ -3676,6 +3741,34 @@ mod tests {
             None,
             "a sidecar after the marker must not bind an earlier sibling marker"
         );
+    }
+
+    #[test]
+    fn loop_sidecar_seeds_ref_colors_from_live_frame_slots() {
+        let slot0 = majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref);
+        let slot2 = majit_ir::OpRef::input_arg_typed(4, majit_ir::Type::Ref);
+        let none = majit_ir::OpRef::NONE;
+        let frame_boxes = [slot0, none, slot2];
+        let pcdep = [
+            (1, 7, 0),
+            (0, 8, 1), // Int bank is not a Ref seed.
+            (1, 9, 1), // An absent frame slot stays absent.
+            (1, 4, 2),
+        ];
+        let mut seeded = Vec::new();
+
+        super::seed_loop_entry_ref_slots(
+            &pcdep,
+            crate::virtualizable_gen::NUM_VABLE_SCALARS,
+            |index| {
+                index
+                    .checked_sub(crate::virtualizable_gen::NUM_VABLE_SCALARS)
+                    .and_then(|slot| frame_boxes.get(slot).copied())
+            },
+            |color, _slot, opref| seeded.push((color, opref)),
+        );
+
+        assert_eq!(seeded, vec![(7, slot0), (4, slot2)]);
     }
 
     #[test]

@@ -469,6 +469,8 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                     &mut (*(w_type as *mut pyre_object::typeobject::W_TypeObject)).bases;
                 forward(bases_slot);
                 let t = &mut *(w_type as *mut pyre_object::typeobject::W_TypeObject);
+                forward(&mut t.w_name);
+                forward(&mut t.w_qualname);
                 // Heap and builtin types both hold a managed W_DictObject.
                 // Forward the field itself; the dict's custom trace walks its
                 // keys and values.
@@ -4400,36 +4402,15 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: LOAD_LOCALS; CPython: LOAD_LOCALS
     // Pushes the current namespace dict onto the stack.
     fn load_locals(&mut self) -> Result<(), PyError> {
-        let dict = pyre_object::w_dict_new();
-        unsafe {
-            let w_locals = self.get_w_locals();
-            if !w_locals.is_null() && pyre_object::is_dict(w_locals) {
-                for (key, value) in pyre_object::dictmultiobject::w_dict_items(w_locals) {
-                    if !value.is_null() {
-                        pyre_object::w_dict_store(dict, key, value);
-                    }
-                }
-            } else {
-                let code = &*crate::pyframe_get_pycode(self);
-                for (idx, name) in code.varnames.iter().enumerate() {
-                    let value = self.locals_w()[idx];
-                    if !value.is_null() {
-                        pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
-                    }
-                }
-                let w_globals = self.get_w_globals();
-                if self.nlocals() == 0 && !w_globals.is_null() {
-                    for (key, value) in
-                        unsafe { pyre_object::dictmultiobject::w_dict_items(w_globals) }
-                    {
-                        if !value.is_null() {
-                            pyre_object::w_dict_store(dict, key, value);
-                        }
-                    }
-                }
-            }
-        }
-        self.push(dict);
+        // pyopcode.py:793-794:
+        //   self.pushvalue(self.getorcreatedebug().w_locals)
+        // In particular this must preserve a metaclass's custom `__prepare__`
+        // mapping.  Rebuilding a plain dict loses mapping-subclass semantics;
+        // treating a dict subclass as a non-dict can also accidentally copy
+        // globals into the class namespace and make LOAD_FROM_DICT_OR_DEREF
+        // select a global over its closure cell.
+        let w_locals = self.get_or_create_w_locals();
+        self.push(w_locals);
         Ok(())
     }
 

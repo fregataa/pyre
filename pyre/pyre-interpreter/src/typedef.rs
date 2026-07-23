@@ -636,10 +636,13 @@ pub fn init_typeobjects() {
             notimplemented_type as usize,
         );
 
-        // types.UnionType — PyPy: _pypy_generic_alias.py UnionType, bases=(object,)
+        // typing.Union — exported by `types` as `UnionType`; Python 3.14
+        // gives the shared runtime type the canonical name/module
+        // `typing.Union`. PyPy: _pypy_generic_alias.py UnionType,
+        // bases=(object,).
         // `__slots__` includes `__weakref__` (`_pypy_generic_alias.py:247`),
         // so a union is weak-referenceable.
-        let union_type = new_typeobject_with_base("types.UnionType", init_union_type, object_type);
+        let union_type = new_typeobject_with_base("typing.Union", init_union_type, object_type);
         unsafe { pyre_object::w_type_set_weakrefable(union_type, true) };
         reg.insert(
             &pyre_object::UNION_TYPE as *const PyType as usize,
@@ -8229,14 +8232,22 @@ fn union_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
             "Cannot take a Union of no types.",
         ));
     }
-    let mut curr = items[0];
-    for &next in &items[1..] {
-        curr = crate::_pypy_generic_alias::create_union(curr, next)?;
-    }
-    Ok(curr)
+    crate::_pypy_generic_alias::union_from_items(&items)
 }
 
 fn init_union_type(ns: PyObjectRef) {
+    // Python 3.14's shared `types.UnionType` / `typing.Union` runtime type
+    // exposes `__module__` on union *instances* as well as on the type.  Keep
+    // the value in the typedef namespace so generic object attribute lookup
+    // reaches it (the metatype's type-name-derived module alone is not an
+    // instance attribute).
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__module__",
+            pyre_object::w_str_new("typing"),
+        )
+    };
     // UnionType.__args__ — returns the tuple of union member types
     let args_getter = make_builtin_function_with_arity(
         "__args__",
@@ -9301,10 +9312,7 @@ fn init_type_type(ns: PyObjectRef) {
 
     let name_getter = make_builtin_function_with_arity(
         "__name__",
-        |args| unsafe {
-            let name = pyre_object::w_type_get_name(args[1]);
-            Ok(pyre_object::w_str_new(name))
-        },
+        |args| unsafe { Ok(pyre_object::w_type_get_name_obj(args[1])) },
         2,
     );
     // typeobject.py:1046 descr_set__name__
@@ -9345,8 +9353,7 @@ fn init_type_type(ns: PyObjectRef) {
             crate::builtins::check_surrogate(w_value)?;
             // typeobject.py:1058 `w_type.name = name` — surrogate-free, so
             // the str view is valid UTF-8.
-            let name = unsafe { pyre_object::w_str_get_value(w_value) };
-            unsafe { pyre_object::w_type_set_name(w_type, name) };
+            unsafe { pyre_object::w_type_set_name(w_type, w_value) };
             Ok(pyre_object::w_none())
         },
         3,
@@ -9381,7 +9388,7 @@ fn init_type_type(ns: PyObjectRef) {
                 )));
             }
             unsafe {
-                pyre_object::w_type_set_qualname(w_type, pyre_object::w_str_get_value(value));
+                pyre_object::w_type_set_qualname(w_type, value);
                 crate::baseobjspace::mutated(w_type, Some("__qualname__"));
             }
             Ok(pyre_object::w_none())
@@ -15360,23 +15367,26 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init_subclass__",
-            make_builtin_function("__init_subclass__", |args| {
-                let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                if let Some(kw) = kwargs {
-                    let has_real_kw = unsafe {
-                        pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
-                            pyre_object::is_str(k)
-                                && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
-                        })
-                    };
-                    if has_real_kw {
-                        return Err(crate::PyError::type_error(
-                            "__init_subclass__() takes no keyword arguments",
-                        ));
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__init_subclass__",
+                |args| {
+                    let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                    if let Some(kw) = kwargs {
+                        let has_real_kw = unsafe {
+                            pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
+                                pyre_object::is_str(k)
+                                    && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
+                            })
+                        };
+                        if has_real_kw {
+                            return Err(crate::PyError::type_error(
+                                "__init_subclass__() takes no keyword arguments",
+                            ));
+                        }
                     }
-                }
-                Ok(pyre_object::w_none())
-            }),
+                    Ok(pyre_object::w_none())
+                },
+            )),
         )
     };
     unsafe {
