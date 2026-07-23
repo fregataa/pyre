@@ -2923,7 +2923,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     }) {
         return result;
     }
-    let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
     let Some(index) = found else {
         return Ok(false);
     };
