@@ -1054,6 +1054,29 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
 }
 
 #[test]
+fn fused_int_is_zero_folds_a_const_operand_without_recording() {
+    // `opimpl_goto_if_not_int_is_zero`'s condbox comes from
+    // `self.execute(rop.INT_IS_ZERO, box)` — a `Const` operand folds the
+    // condition without recording, and `opimpl_goto_if_not` emits no guard
+    // for a `Const` condbox.
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_int_is_zero/iL")
+        .expect("`goto_if_not_int_is_zero/iL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_int(5);
+    let mut regs_i = [operand];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("a const int_is_zero condition has a static direction");
+    assert_eq!(next_pc, 9, "is_zero(5) = 0 takes the not-taken label");
+    assert_eq!(
+        tc.num_ops(),
+        0,
+        "const int_is_zero records no IntIsZero and no guard"
+    );
+}
+
+#[test]
 fn fused_ptr_compare_uses_ref_shadows_for_the_runtime_direction() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_eq/rrL")
@@ -5484,8 +5507,14 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         .get(opname)
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x02, 0x04, 0x06]; // r-src1=2, r-src2=4, i-dst=6
-    let mut tc = fresh_trace_ctx();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
     let mut regs_r = distinct_const_refs(&mut tc, 8);
+    // Non-const operands so the compare records: PyPy folds a ptr compare only
+    // when both operands are `Const`; the distinct-const fold is covered by
+    // `ptr_eq_folds_two_distinct_const_refs_without_recording`. InputArg refs
+    // (declared by `for_test_types`) are the recordable non-const operand.
+    regs_r[2] = OpRef::input_arg_ref(0);
+    regs_r[4] = OpRef::input_arg_ref(1);
     let mut regs_i = distinct_const_refs(&mut tc, 8);
     let arg0 = regs_r[2];
     let arg1 = regs_r[4];
@@ -5569,6 +5598,294 @@ fn instance_ptr_eq_records_instanceptreq() {
 #[test]
 fn instance_ptr_ne_records_instanceptrne() {
     drive_ptr_compare("instance_ptr_ne/rr>i", majit_ir::OpCode::InstancePtrNe);
+}
+
+#[test]
+fn ptr_eq_folds_two_distinct_const_refs_without_recording() {
+    // `execute_and_record` const-folds a pure op whose operands are all
+    // `Const`; two distinct const refs answer `is` (PtrEq -> false) at trace
+    // time without a recorded PTR_EQ.
+    let byte = *insns_opname_to_byte()
+        .get("ptr_eq/rr>i")
+        .expect("`ptr_eq/rr>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x00]; // `rr>i`: r-src1=0, r-src2=1, i-dst=0
+    let mut tc = fresh_trace_ctx();
+    let a = tc.const_ref(0xC0DE_0000);
+    let b = tc.const_ref(0xC0DE_0001);
+    let mut regs_r = [a, b];
+    let mut regs_i = [OpRef::None];
+    let mut concrete_r = [ConcreteValue::Null, ConcreteValue::Null];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+        .expect("ptr_eq on two const refs must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "distinct const-ref operands fold without recording a PtrEq",
+    );
+    assert_eq!(
+        tc.concrete_of_opref(regs_i[0]),
+        Some(majit_ir::Value::Int(0)),
+        "distinct const refs are not identical -> PtrEq folds to 0",
+    );
+}
+
+#[test]
+fn int_binop_folds_two_const_int_operands_without_recording() {
+    // `execute_and_record` const-folds a pure op whose operands are all
+    // `Const` (`_all_constants` short-circuit) — the int binop loop routes
+    // through `self.execute`, so an all-const `int_add` never records.
+    let byte = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x02]; // `ii>i`: src1=0, src2=1, dst=2
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_int(40);
+    let rhs = tc.const_int(2);
+    let mut regs_i = [lhs, rhs, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("int_add on two const ints must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "all-const operands fold without recording an IntAdd",
+    );
+    assert_eq!(
+        regs_i[2].inline_const_to_value(),
+        Some(majit_ir::Value::Int(42)),
+        "dst must hold the folded ConstInt",
+    );
+}
+
+#[test]
+fn int_unop_folds_a_const_int_operand_without_recording() {
+    // The unary loop (`int_neg` / `int_invert` / `int_is_true`) also routes
+    // through `self.execute`, so a `Const` operand folds without recording.
+    let byte = *insns_opname_to_byte()
+        .get("int_neg/i>i")
+        .expect("`int_neg/i>i` must be in insns table");
+    let code = [byte, 0x00, 0x01]; // `i>i`: src=0, dst=1
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_int(7);
+    let mut regs_i = [operand, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("int_neg on a const int must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a const operand folds without recording an IntNeg",
+    );
+    assert_eq!(
+        regs_i[1].inline_const_to_value(),
+        Some(majit_ir::Value::Int(-7)),
+        "dst must hold the folded ConstInt",
+    );
+}
+
+/// [`run_hint_step`] companion for float-bank steps: same lean harness
+/// with caller-supplied `registers_f` (and `registers_i` for the
+/// `ff>i` compares).
+fn run_float_step(
+    code: &[u8],
+    tc: &mut TraceCtx,
+    regs_f: &mut [OpRef],
+    regs_i: &mut [OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let outer_jitcode_index = test_outer_resume_jitcode_index();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut [],
+        registers_i: regs_i,
+        registers_f: regs_f,
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(code, 0, &mut wc)
+}
+
+#[test]
+fn float_binop_folds_two_const_float_operands_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("float_add/ff>f")
+        .expect("`float_add/ff>f` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x02]; // `ff>f`: src1=0, src2=1, dst=2
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_float((40.0f64).to_bits() as i64);
+    let rhs = tc.const_float((2.0f64).to_bits() as i64);
+    let mut regs_f = [lhs, rhs, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut [])
+        .expect("float_add on two const floats must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "all-const operands fold without recording a FloatAdd",
+    );
+    assert_eq!(
+        regs_f[2].inline_const_to_value(),
+        Some(majit_ir::Value::Float(42.0)),
+        "dst must hold the folded ConstFloat",
+    );
+}
+
+#[test]
+fn float_unop_folds_a_const_float_operand_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("float_neg/f>f")
+        .expect("`float_neg/f>f` must be in insns table");
+    let code = [byte, 0x00, 0x01]; // `f>f`: src=0, dst=1
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_float((1.5f64).to_bits() as i64);
+    let mut regs_f = [operand, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut [])
+        .expect("float_neg on a const float must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a const operand folds without recording a FloatNeg",
+    );
+    assert_eq!(
+        regs_f[1].inline_const_to_value(),
+        Some(majit_ir::Value::Float(-1.5)),
+        "dst must hold the folded ConstFloat",
+    );
+}
+
+#[test]
+fn float_compare_folds_two_const_float_operands_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("float_lt/ff>i")
+        .expect("`float_lt/ff>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x00]; // `ff>i`: f-src1=0, f-src2=1, i-dst=0
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_float((1.0f64).to_bits() as i64);
+    let rhs = tc.const_float((2.0f64).to_bits() as i64);
+    let mut regs_f = [lhs, rhs];
+    let mut regs_i = [OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("float_lt on two const floats must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "all-const operands fold without recording a FloatLt",
+    );
+    assert_eq!(
+        regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(1)),
+        "1.0 < 2.0 folds to ConstInt(1)",
+    );
+}
+
+#[test]
+fn fused_float_compare_folds_const_operands_without_guards() {
+    // The fused float compares route their condbox through
+    // `self.execute(rop.FLOAT_*, b1, b2)` — all-const operands fold and the
+    // `Const` condbox emits no guard.
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_float_lt/ffL")
+        .expect("`goto_if_not_float_lt/ffL` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_float((1.0f64).to_bits() as i64);
+    let rhs = tc.const_float((2.0f64).to_bits() as i64);
+    let mut regs_f = [lhs, rhs];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut [])
+        .expect("a const float compare has a static direction");
+    assert_eq!(next_pc, code.len(), "1.0 < 2.0 falls through");
+    assert_eq!(
+        tc.num_ops(),
+        0,
+        "const float compare records no FloatLt and no guard"
+    );
+}
+
+#[test]
+fn profiler_counts_ops_and_recorded_ops_like_execute_and_record() {
+    // `execute_and_record` counts `OPS` before the `_all_constants` fold
+    // and `_record_helper` adds `RECORDED_OPS` only when the op records;
+    // the `b1 is b2` fast path returns before `self.execute` and counts
+    // neither.
+    let byte = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x02];
+
+    // Record path: non-const operands -> OPS + RECORDED_OPS.
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let mut regs_i = [
+        OpRef::input_arg_int(0),
+        OpRef::input_arg_int(1),
+        OpRef::None,
+    ];
+    run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i).expect("int_add must record");
+    let snap = tc.profiler().snapshot();
+    assert_eq!(snap.ops, 1, "recorded int_add lands in the OPS bucket");
+    assert_eq!(snap.recorded_ops, 1, "recorded int_add adds RECORDED_OPS");
+
+    // Fold path: all-const operands -> OPS only.
+    let mut fold_tc = fresh_trace_ctx();
+    let lhs = fold_tc.const_int(1);
+    let rhs = fold_tc.const_int(2);
+    let mut fold_regs = [lhs, rhs, OpRef::None];
+    run_hint_step(&code, &mut fold_tc, &mut [], &mut [], &mut fold_regs)
+        .expect("int_add must fold");
+    let snap = fold_tc.profiler().snapshot();
+    assert_eq!(snap.ops, 1, "a folded op still lands in the OPS bucket");
+    assert_eq!(snap.recorded_ops, 0, "a folded op is not RECORDED_OPS");
+
+    // Same-box fast path: neither counter.
+    let eq_byte = *insns_opname_to_byte()
+        .get("int_eq/ii>i")
+        .expect("`int_eq/ii>i` must be in insns table");
+    let eq_code = [eq_byte, 0x00, 0x00, 0x01];
+    let mut same_tc = TraceCtx::for_test_types(&[Type::Int]);
+    let mut same_regs = [OpRef::input_arg_int(0), OpRef::None];
+    run_hint_step(&eq_code, &mut same_tc, &mut [], &mut [], &mut same_regs)
+        .expect("same-box int_eq must fold");
+    let snap = same_tc.profiler().snapshot();
+    assert_eq!(snap.ops, 0, "the same-box fast path skips self.execute");
+    assert_eq!(snap.recorded_ops, 0);
 }
 
 #[test]
@@ -5825,11 +6142,11 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     // Operand encoding `r>i`: 1B r-reg + 1B i-reg-dst = 2B
     let code = [byte, 0, 0];
-    let mut tc = fresh_trace_ctx();
+    // A `Const` box folds (`_all_constants` — CONST_NULL is a `Const`), so
+    // the record path needs a genuinely non-const InputArg operand.
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let descr = done_descr_ref_for_tests();
-    // Seed `registers_r[0]` with a placeholder OpRef so the
-    // handler has something to read.
-    let box_opref = tc.const_ref(0xdeadbeef);
+    let box_opref = OpRef::input_arg_ref(0);
     let mut regs_r = [box_opref];
     let mut regs_i = [OpRef::None];
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -5905,6 +6222,71 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         Some(Type::Ref)
     );
     assert_ne!(wc.registers_i[0], OpRef::None);
+}
+
+#[test]
+fn ptr_nullity_folds_a_const_box_without_recording() {
+    // `execute(PTR_NE, box, CONST_NULL)` has all-`Const` operands when
+    // `box` is a `Const` — `_all_constants` folds the nullity answer
+    // without recording.
+    let byte = *insns_opname_to_byte()
+        .get("ptr_nonzero/r>i")
+        .expect("`ptr_nonzero/r>i` must be in insns table");
+    let code = [byte, 0, 0];
+
+    let mut tc = fresh_trace_ctx();
+    let nonnull = tc.const_ref(0xdeadbeef);
+    let mut regs_r = [nonnull];
+    let mut regs_i = [OpRef::None];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut [], &mut regs_i)
+        .expect("ptr_nonzero on a const ref must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const box folds without recording");
+    assert_eq!(
+        regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(1)),
+        "a non-null const ref folds ptr_nonzero to 1",
+    );
+
+    let mut null_tc = fresh_trace_ctx();
+    let null = null_tc.const_null();
+    let mut null_regs_r = [null];
+    let mut null_regs_i = [OpRef::None];
+    let (_, _) = run_hint_step(
+        &code,
+        &mut null_tc,
+        &mut null_regs_r,
+        &mut [],
+        &mut null_regs_i,
+    )
+    .expect("ptr_nonzero on the null const must fold");
+    assert_eq!(null_tc.num_ops(), 0);
+    assert_eq!(
+        null_regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(0)),
+        "the null const folds ptr_nonzero to 0",
+    );
+}
+
+#[test]
+fn cast_int_to_float_folds_a_const_int_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("cast_int_to_float/i>f")
+        .expect("`cast_int_to_float/i>f` must be in insns table");
+    let code = [byte, 0x00, 0x00]; // `i>f`: i-src=0, f-dst=0
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_int(42);
+    let mut regs_i = [operand];
+    let mut regs_f = [OpRef::None];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("cast_int_to_float on a const int must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const operand folds without recording");
+    assert_eq!(
+        regs_f[0].inline_const_to_value(),
+        Some(majit_ir::Value::Float(42.0)),
+        "dst must hold the folded ConstFloat",
+    );
 }
 
 /// `abort/>r` is a pyre-only no-op result marker — the walker
@@ -9925,6 +10307,151 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         &descr,
     ));
     assert_eq!(dst_post, last.pos.get());
+}
+
+/// Backend stub for the pure-getarrayitem bypass test: the required
+/// methods are unreachable; `bh_getarrayitem_gc_*` trait defaults read
+/// the real backing memory.
+struct PureArrayTestCpu;
+impl majit_backend::Backend for PureArrayTestCpu {
+    fn compile_loop(
+        &mut self,
+        _inputargs: &[majit_ir::InputArg],
+        _ops: &[majit_ir::OpRc],
+        _token: &majit_backend::JitCellToken,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("PureArrayTestCpu::compile_loop")
+    }
+    fn compile_bridge(
+        &mut self,
+        _fail_descr: &dyn majit_ir::FailDescr,
+        _inputargs: &[majit_ir::InputArg],
+        _ops: &[majit_ir::OpRc],
+        _original_token: &majit_backend::JitCellToken,
+        _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
+        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("PureArrayTestCpu::compile_bridge")
+    }
+    fn execute_token(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _args: &[majit_ir::Value],
+    ) -> majit_backend::DeadFrame {
+        unimplemented!("PureArrayTestCpu::execute_token")
+    }
+    fn get_latest_descr<'a>(
+        &'a self,
+        _frame: &'a majit_backend::DeadFrame,
+    ) -> &'a dyn majit_ir::FailDescr {
+        unimplemented!("PureArrayTestCpu::get_latest_descr")
+    }
+    fn get_latest_descr_arc(
+        &self,
+        _frame: &majit_backend::DeadFrame,
+    ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+        unimplemented!("PureArrayTestCpu::get_latest_descr_arc")
+    }
+    fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+        unimplemented!("PureArrayTestCpu::get_int_value")
+    }
+    fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+        unimplemented!("PureArrayTestCpu::get_float_value")
+    }
+    fn get_ref_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> majit_ir::GcRef {
+        unimplemented!("PureArrayTestCpu::get_ref_value")
+    }
+    fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+        unimplemented!("PureArrayTestCpu::invalidate_loop")
+    }
+}
+
+/// `_opimpl_getarrayitem_gc_pure_any`: directly-constant array and index
+/// operands bypass the heapcache — the load executes now, the result is
+/// a `Const`, nothing is recorded, and no profiler bucket counts (the
+/// bypass calls `executor.execute`, not `execute_and_record`).
+#[test]
+fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
+    let byte = *insns_opname_to_byte()
+        .get("getarrayitem_gc_i_pure/rid>i")
+        .expect("`getarrayitem_gc_i_pure/rid>i` must be in insns table");
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let cpu = PureArrayTestCpu;
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    // Fake GcArray block: length prefix at offset 0, items from
+    // base_size 8 → item[1] == 9.
+    let storage: Box<[usize; 3]> = Box::new([2, 7, 9]);
+    let ptr = storage.as_ref().as_ptr() as i64;
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    regs_i[3] = tc.const_int(1);
+    let descr = crate::descr::make_array_descr(8, 8, Some(0), majit_ir::Type::Int, true);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let ops_before = tc.num_ops();
+    let prof_before = tc.profiler().snapshot();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: frame_done,
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_i_pure must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    let dst_post = wc.registers_i[5];
+    drop(wc);
+    assert!(dst_post.is_constant(), "the bypass substitutes a Const");
+    assert_eq!(
+        dst_post.inline_const_to_value(),
+        Some(majit_ir::Value::Int(9)),
+        "item[1] of the backing array"
+    );
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the bypass records no ArrayitemGc op"
+    );
+    let prof_after = tc.profiler().snapshot();
+    assert_eq!(prof_after.ops, prof_before.ops);
+    assert_eq!(prof_after.recorded_ops, prof_before.recorded_ops);
+    assert_eq!(prof_after.heapcached_ops, prof_before.heapcached_ops);
+    drop(storage);
 }
 
 #[test]
