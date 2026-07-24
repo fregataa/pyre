@@ -4908,17 +4908,35 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
+    // module.py:130-162 `Module.descr_getattribute` — a module receiver runs
+    // the generic lookup with the `__getattr__` fallback suppressed, then
+    // consults its own dict's PEP 562 `__getattr__`, and only then the receiver
+    // type's class-level `__getattr__` (descroperation.py:242-245).  Ordering
+    // the module-dict hook before the class hook — and giving the class hook the
+    // final say — matches `slot_tp_getattr_hook`: a class-level `__getattr__`'s
+    // own AttributeError must reach the caller rather than be overwritten by the
+    // generic module-miss message.
+    if call_getattr && unsafe { is_module(obj) } {
+        let err = match object_getattr_miss(obj, name, false) {
+            Ok(value) => return Ok(value),
+            Err(e) => e,
+        };
+        if err.kind != PyErrorKind::AttributeError {
+            return Err(err);
+        }
+        let err = match unsafe { module_getattr_hook_or_err(obj, name, err, true) } {
+            Ok(value) => return Ok(value),
+            Err(e) if e.kind == PyErrorKind::AttributeError => e,
+            Err(e) => return Err(e),
+        };
+        let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+        return unsafe { instance_getattr_hook_or_err(w_type, obj, name, err) };
+    }
+
     let err = match object_getattr_miss(obj, name, call_getattr) {
         Ok(value) => return Ok(value),
         Err(e) => e,
     };
-    // module.py:130-142 `Module.descr_getattribute` — PEP 562: after the
-    // normal lookup misses with AttributeError, a module-level `__getattr__`
-    // stored in the module's own dict gets the final say, called with just the
-    // attribute name.  Only `space.getattr` consults it.
-    if err.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
-        return unsafe { module_getattr_hook_or_err(obj, name, err, call_getattr) };
-    }
     Err(err)
 }
 
@@ -5429,14 +5447,76 @@ unsafe fn module_getattr_hook_or_err(
         }
     }
     // No module `__getattr__`: phrase the miss with the module's `__name__`
-    // when it is a string, falling back to the bare form otherwise.  The
-    // `__spec__`-based circular-import diagnostics are not ported.
-    let msg = match finditem_str(w_dict, "__name__")? {
-        Some(w) if !w.is_null() && pyre_object::is_str(w) => {
-            let nm = pyre_object::w_str_get_wtf8(w);
-            format!("module '{nm}' has no attribute '{name}'")
+    // when it is a string, falling back to the bare form otherwise
+    // (module.py:143-162).  Own the name up front so the `__spec__` lookups
+    // below, which allocate, cannot dangle the dict-borrowed slice.
+    let w_name = match finditem_str(w_dict, "__name__")? {
+        Some(w) if !w.is_null() && pyre_object::is_str(w) => w,
+        _ => {
+            return Err(PyError::new(
+                PyErrorKind::AttributeError,
+                format!("module has no attribute '{name}'"),
+            ));
         }
-        _ => format!("module has no attribute '{name}'"),
+    };
+    // Pin the name across the `__spec__` / shadowing lookups below, which
+    // allocate, then read the display form back from its slot.
+    let _scope = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_name);
+    let nm = pyre_object::w_str_get_wtf8(w_name).to_string();
+    // Classify the miss through `__spec__`: a same-named file shadowing a
+    // search-path module is flagged first (the stdlib hint takes priority over
+    // the circular-import cause), then a module still executing, then an unset
+    // submodule slot.
+    let w_spec = finditem_str(w_dict, "__spec__")?.filter(|w| !w.is_null());
+    let msg = if let Some(w_spec) = w_spec {
+        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_spec);
+        let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+        let (origin, is_shadowing, is_shadowing_stdlib) =
+            crate::importing::module_shadow_info(w_spec, w_name)?;
+        let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+        if is_shadowing_stdlib {
+            let origin = origin.as_deref().unwrap_or("");
+            format!(
+                "module '{nm}' has no attribute '{name}' (consider renaming \
+                 '{origin}' since it has the same name as the standard library \
+                 module named '{nm}' and prevents importing that standard \
+                 library module)"
+            )
+        } else if crate::importing::is_spec_initializing(w_spec)? {
+            if is_shadowing {
+                let origin = origin.as_deref().unwrap_or("");
+                format!(
+                    "module '{nm}' has no attribute '{name}' (consider renaming \
+                     '{origin}' if it has the same name as a library you \
+                     intended to import)"
+                )
+            } else if let Some(origin) = origin.as_deref() {
+                format!(
+                    "partially initialized module '{nm}' from '{origin}' has no \
+                     attribute '{name}' (most likely due to a circular import)"
+                )
+            } else {
+                format!(
+                    "partially initialized module '{nm}' has no attribute \
+                     '{name}' (most likely due to a circular import)"
+                )
+            }
+        } else {
+            let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+            if crate::importing::is_spec_uninitialized_submodule(w_spec, name)? {
+                format!(
+                    "cannot access submodule '{name}' of module '{nm}' \
+                     (most likely due to a circular import)"
+                )
+            } else {
+                format!("module '{nm}' has no attribute '{name}'")
+            }
+        }
+    } else {
+        format!("module '{nm}' has no attribute '{name}'")
     };
     Err(PyError::new(PyErrorKind::AttributeError, msg))
 }
