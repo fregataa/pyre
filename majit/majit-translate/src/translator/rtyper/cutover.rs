@@ -1616,6 +1616,20 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         };
         pending.push((key, graph, entry));
     }
+    // Lift `pending` in a deterministic order.  `function_graphs.iter()`
+    // (`GraphStore` over `path_to_key: HashMap<CallPath, _>`) yields entries
+    // in `std::HashMap` order, which varies run-to-run.  Pass 2's lift order
+    // is observable: the fail-closed transitive gate (`flowspace_adapter.rs`
+    // `translate_op`) rejects a caller whose callee has ALREADY recorded a
+    // `record_lift_error`, so whether a caller inherits a callee's recorded
+    // error — and which transitive error surfaces — depends on which of the
+    // two lifted first.  Sorting by the path key makes the lift order (and
+    // thus the recorded-error attribution) reproducible, mirroring the
+    // Phase-A subject sort (`run_two_phase_prepass_inner`).  The lift itself
+    // is per-entry isolated (`Rc::as_ptr` dedup below) and aliases of one
+    // entry share the same graph, so ordering changes neither which entries
+    // fail nor what each computes — only the attribution determinism.
+    pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
     // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
     // Pass 2 (callee lift).  `build_flow.rs:215` rejects unsafe bodies so
     // they never enter `function_graphs`; without a stub a safe-fn body
@@ -2139,10 +2153,15 @@ pub(crate) fn register_unsafe_fn_stubs(
 ///   `Void` result.
 /// - `core::cell::Cell::<T>::set(&self, val)` returns `()` — an
 ///   in-place store into the cell, `Void` result.
-/// - `core::f64::<Impl>::is_infinite` / `core::slice::<Impl>::is_empty`
-///   return `bool` — `Bool` result.
-/// - `std::f64::<Impl>::floor` / `std::f64::<Impl>::powf` return `f64` —
-///   `Float` result.
+/// - `core::f64::<Impl>::is_infinite` / `core::f64::<Impl>::is_nan` /
+///   `core::slice::<Impl>::is_empty` return `bool` — `Bool` result.
+/// - `std::f64::<Impl>::floor` / `std::f64::<Impl>::powf` /
+///   `core::f64::<Impl>::abs` return `f64` — `Float` result.
+/// - `core::f64::<Impl>::NAN` / `core::f64::<Impl>::INFINITY` are the
+///   associated `f64` constants, reached as zero-arg `FunctionPath`
+///   accessors — `Float` result, empty arg list. These plus the `f64`
+///   predicates above close the complex-division (`_Py_c_quot` /
+///   `_Py_c_prod`) foreign-leaf cluster.
 /// - `core::f64::<Impl>::to_bits` returns `u64` reinterpreted as `i64` —
 ///   `Signed` result.
 ///
@@ -2186,6 +2205,22 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["core", "f64", "<Impl>", "to_bits"],
         &["self"],
         LowLevelType::Signed,
+    ),
+    (
+        &["core", "f64", "<Impl>", "abs"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+    (
+        &["core", "f64", "<Impl>", "is_nan"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (&["core", "f64", "<Impl>", "NAN"], &[], LowLevelType::Float),
+    (
+        &["core", "f64", "<Impl>", "INFINITY"],
+        &[],
+        LowLevelType::Float,
     ),
 ];
 
