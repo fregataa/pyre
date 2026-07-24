@@ -7,6 +7,25 @@
 
 use pyre_object::*;
 
+mod buffered;
+pub use buffered::W_BufferedReader;
+mod buffered_writer;
+pub use buffered_writer::W_BufferedWriter;
+mod buffered_rwpair;
+pub use buffered_rwpair::W_BufferedRWPair;
+mod buffered_random;
+pub use buffered_random::W_BufferedRandom;
+mod textio;
+pub use textio::W_TextIOWrapper;
+
+pub fn text_io_wrapper_type() -> PyObjectRef {
+    textio::type_object()
+}
+
+// CPython 3.14 raised the public and constructor default from 8 KiB to
+// 128 KiB.  Keep one module-owned value shared by every buffered type.
+pub(crate) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;
+
 // The module-local exception class is process-global, like PyPy's module
 // definition object.  Keep the immortal type pointer shared across threads;
 // runtime semantic state must not be duplicated in TLS.
@@ -98,18 +117,19 @@ fn iobase_closed_get(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
+    // CPython 3.14 `IOBase._checkClosed` no longer exposes PyPy's optional
+    // `message` argument: Argument Clinic rejects every argument after self.
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "_IOBase._checkClosed() takes no arguments",
+        ));
+    }
     let self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("_checkClosed() requires self"))?;
-    let message = args
-        .get(1)
-        .copied()
-        .filter(|value| !unsafe { pyre_object::is_none(*value) })
-        .map(|value| unsafe { pyre_object::w_str_get_value(value).to_string() })
-        .unwrap_or_else(|| "I/O operation on closed file".to_string());
     if io_closed(self_obj) {
-        Err(crate::PyError::value_error(message))
+        Err(crate::PyError::value_error("I/O operation on closed file"))
     } else {
         Ok(w_none())
     }
@@ -355,7 +375,7 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `interp_iobase.py:W_IOBase.readlines_w` — consume the stream iterator,
 /// stopping after the accumulated line lengths exceed a positive hint.
-fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
+pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     let self_obj = args
         .first()
         .copied()
@@ -465,7 +485,7 @@ fn init_iobase_type(ns: PyObjectRef) {
     type_method(
         ns,
         "_checkClosed",
-        crate::make_builtin_function("_checkClosed", iobase_check_closed),
+        crate::make_builtin_function_with_arity("_checkClosed", iobase_check_closed, 1),
     );
     type_method(
         ns,
@@ -600,7 +620,7 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
         let data = call_method_result(
             pyre_object::gc_roots::shadow_stack_get(sp),
             "read",
-            &[w_int_new(8192)],
+            &[w_int_new(DEFAULT_BUFFER_SIZE)],
         )?;
         if unsafe { pyre_object::is_none(data) } {
             if output.is_empty() {
@@ -773,6 +793,118 @@ fn init_text_iobase_type(ns: PyObjectRef) {
     }
 }
 
+/// Process-global abstract IO type objects.  PyPy owns these as the module's
+/// `TypeDef` instances; they are shared by every import and are the actual
+/// bases used by the typed concrete stream payloads below.
+fn io_base_type() -> PyObjectRef {
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "_IOBase",
+            init_iobase_type,
+            crate::typedef::w_object(),
+        );
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+        }
+        tp as usize
+    }) as PyObjectRef
+}
+
+fn raw_iobase_type() -> PyObjectRef {
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "_RawIOBase",
+            init_rawiobase_type,
+            io_base_type(),
+        );
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+        }
+        tp as usize
+    }) as PyObjectRef
+}
+
+/// PyPy `space.gettypefor(W_FileIO)`: one process-global concrete raw type.
+///
+/// `open()` needs the same type object exported by `_io`, rather than a
+/// second wrapper-shaped allocation path.
+pub(crate) fn fileio_type() -> PyObjectRef {
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "FileIO",
+            |type_ns| {
+                crate::builtins::init_file_wrapper_type(type_ns);
+                crate::builtins::init_fileio_type(type_ns);
+                type_method(
+                    type_ns,
+                    "__init__",
+                    crate::make_builtin_function("__init__", crate::builtins::fileio_init),
+                );
+            },
+            raw_iobase_type(),
+        );
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+        }
+        tp as usize
+    }) as PyObjectRef
+}
+
+pub(crate) fn buffered_reader_type() -> PyObjectRef {
+    buffered::type_object()
+}
+
+pub(crate) fn buffered_writer_type() -> PyObjectRef {
+    buffered_writer::type_object()
+}
+
+pub(crate) fn buffered_random_type() -> PyObjectRef {
+    buffered_random::type_object()
+}
+
+pub(super) fn buffered_iobase_type() -> PyObjectRef {
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "_BufferedIOBase",
+            init_buffered_iobase_type,
+            io_base_type(),
+        );
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+        }
+        tp as usize
+    }) as PyObjectRef
+}
+
+fn text_iobase_type() -> PyObjectRef {
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "_TextIOBase",
+            init_text_iobase_type,
+            io_base_type(),
+        );
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+        }
+        tp as usize
+    }) as PyObjectRef
+}
+
 fn call_method_result(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> crate::PyResult {
     let result = crate::baseobjspace::call_method(obj, name, args);
     if result.is_null() {
@@ -783,80 +915,10 @@ fn call_method_result(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> cra
     }
 }
 
-fn buffered_reader_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_obj = args
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("BufferedReader.__init__() missing self"))?;
-    let raw = args
-        .get(1)
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("BufferedReader() missing raw argument"))?;
-    crate::baseobjspace::setattr_str(self_obj, "raw", raw)?;
-    crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(false))?;
-    Ok(w_none())
-}
-
-fn buffered_reader_call(args: &[PyObjectRef], method: &str) -> crate::PyResult {
-    let self_obj = args
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error(format!("{method}() requires self")))?;
-    let raw = crate::baseobjspace::getattr_str(self_obj, "raw")?;
-    call_method_result(raw, method, &args[1..])
-}
-
-fn buffered_reader_close(args: &[PyObjectRef]) -> crate::PyResult {
-    let result = buffered_reader_call(args, "close")?;
-    crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true))?;
-    Ok(result)
-}
-
-fn init_buffered_reader_type(ns: PyObjectRef) {
-    type_method(
-        ns,
-        "__init__",
-        crate::make_builtin_function("__init__", buffered_reader_init),
-    );
-    type_method(
-        ns,
-        "read",
-        crate::make_builtin_function("read", |args| buffered_reader_call(args, "read")),
-    );
-    type_method(
-        ns,
-        "seekable",
-        crate::make_builtin_function_with_arity(
-            "seekable",
-            |args| buffered_reader_call(args, "seekable"),
-            1,
-        ),
-    );
-    type_method(
-        ns,
-        "close",
-        crate::make_builtin_function_with_arity("close", buffered_reader_close, 1),
-    );
-    type_method(
-        ns,
-        "__enter__",
-        crate::make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
-    );
-    type_method(
-        ns,
-        "__exit__",
-        crate::make_builtin_function("__exit__", |args| {
-            // Dynamic dispatch, as on the IOBase `__exit__` above.
-            call_method_result(args[0], "close", &[])?;
-            Ok(w_none())
-        }),
-    );
-}
-
 crate::py_module! {
     "_io",
     interpleveldefs: {
-        "DEFAULT_BUFFER_SIZE" => w_int_new(8192),
+        "DEFAULT_BUFFER_SIZE" => w_int_new(DEFAULT_BUFFER_SIZE),
     },
     // BytesIO / StringIO are the pure-Python in-memory streams: pickle's
     // Pickler/Unpickler use BytesIO; logging / traceback / csv use StringIO.
@@ -901,32 +963,10 @@ crate::py_module! {
 
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).
         // PyPy hierarchy: RawIOBase/BufferedIOBase/TextIOBase all derive IOBase.
-        let obj_type = crate::typedef::w_object();
-        let io_base = crate::typedef::make_builtin_type_with_base(
-            "_IOBase",
-            init_iobase_type,
-            obj_type,
-        );
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(io_base, true) };
-        unsafe {
-            pyre_object::w_type_set_weakrefable(io_base, true);
-            pyre_object::typeobject::w_type_set_hasdict(io_base, true);
-        }
-        let raw_base = crate::typedef::make_builtin_type_with_base(
-            "_RawIOBase",
-            init_rawiobase_type,
-            io_base,
-        );
-        let buffered_base = crate::typedef::make_builtin_type_with_base(
-            "_BufferedIOBase",
-            init_buffered_iobase_type,
-            io_base,
-        );
-        let text_base = crate::typedef::make_builtin_type_with_base(
-            "_TextIOBase",
-            init_text_iobase_type,
-            io_base,
-        );
+        let io_base = io_base_type();
+        let raw_base = raw_iobase_type();
+        let buffered_base = buffered_iobase_type();
+        let text_base = text_iobase_type();
         for (name, typ) in [
             ("_IOBase", io_base),
             ("_RawIOBase", raw_base),
@@ -947,54 +987,16 @@ crate::py_module! {
         // test_io), so they must be real types, not function stubs.
         // `FileIO` derives from `_RawIOBase`; the buffered classes from
         // `_BufferedIOBase` (`Modules/_io/_iomodule.c` PyInit__io).
-        let file_io = crate::typedef::make_builtin_type_with_base(
-            "FileIO",
-            |type_ns| {
-                crate::builtins::init_file_wrapper_type(type_ns);
-                crate::builtins::init_fileio_type(type_ns);
-                type_method(
-                    type_ns,
-                    "__init__",
-                    crate::make_builtin_function("__init__", crate::builtins::fileio_init),
-                );
-            },
-            raw_base,
-        );
-        // W_IOBase carries a weakref lifeline; W_FileIO instances therefore
-        // accept weak references just like PyPy's concrete raw stream.
-        unsafe { pyre_object::w_type_set_weakrefable(file_io, true) };
-        let buffered_reader = crate::typedef::make_builtin_type_with_base(
-            "BufferedReader",
-            init_buffered_reader_type,
-            buffered_base,
-        );
+        let file_io = fileio_type();
+        let buffered_reader = buffered::type_object();
+        let buffered_writer = buffered_writer::type_object();
+        let buffered_rwpair = buffered_rwpair::type_object();
         for (name, t) in [
             ("FileIO", file_io),
             ("BufferedReader", buffered_reader),
-            (
-                "BufferedWriter",
-                crate::typedef::make_builtin_type_with_base(
-                    "BufferedWriter",
-                    |_| {},
-                    buffered_base,
-                ),
-            ),
-            (
-                "BufferedRWPair",
-                crate::typedef::make_builtin_type_with_base(
-                    "BufferedRWPair",
-                    |_| {},
-                    buffered_base,
-                ),
-            ),
-            (
-                "BufferedRandom",
-                crate::typedef::make_builtin_type_with_base(
-                    "BufferedRandom",
-                    |_| {},
-                    buffered_base,
-                ),
-            ),
+            ("BufferedWriter", buffered_writer),
+            ("BufferedRWPair", buffered_rwpair),
+            ("BufferedRandom", buffered_random::type_object()),
         ] {
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(t, true);
