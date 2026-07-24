@@ -856,6 +856,13 @@ impl BlackholeInterpreter {
         jitcode::read_u8(&self.jitcode.code, &mut self.position)
     }
 
+    /// Read one register operand ([`jitcode::JitcodeReg`]); register operands
+    /// are always one byte. Use this at register reads instead of `next_u8`
+    /// so the 1-byte register width stays enforced in one place.
+    fn next_reg(&mut self) -> jitcode::JitcodeReg {
+        self.next_u8()
+    }
+
     fn next_u16(&mut self) -> u16 {
         jitcode::read_u16(&self.jitcode.code, &mut self.position)
     }
@@ -913,54 +920,6 @@ impl BlackholeInterpreter {
         }
     }
 
-    fn bh_binop_i(&mut self, opcode: OpCode) {
-        let dst = self.next_u16() as usize;
-        let lhs_idx = self.next_u16() as usize;
-        let rhs_idx = self.next_u16() as usize;
-        let lhs = self.registers_i[lhs_idx];
-        let rhs = self.registers_i[rhs_idx];
-        self.registers_i[dst] = eval_binop_i(opcode, lhs, rhs);
-    }
-
-    /// Per-opname ref binop helper returning int. Mirrors
-    /// `bhimpl_{ptr_eq,ptr_ne,instance_ptr_eq,instance_ptr_ne}`.
-    fn bh_binop_r_to_i(&mut self, opcode: OpCode) {
-        let dst = self.next_u16() as usize;
-        let lhs_idx = self.next_u16() as usize;
-        let rhs_idx = self.next_u16() as usize;
-        let lhs = self.registers_r[lhs_idx];
-        let rhs = self.registers_r[rhs_idx];
-        self.registers_i[dst] = match opcode {
-            OpCode::PtrEq | OpCode::InstancePtrEq => (lhs == rhs) as i64,
-            OpCode::PtrNe | OpCode::InstancePtrNe => (lhs != rhs) as i64,
-            other => panic!("bh_binop_r_to_i: unsupported opcode {other:?}"),
-        };
-    }
-
-    /// Per-opname float binop helper. See `bh_binop_i` for the pattern.
-    /// RPython equivalents: `bhimpl_float_{add,sub,mul,truediv}`
-    /// (`blackhole.py:663-687`).
-    fn bh_binop_f(&mut self, opcode: OpCode) {
-        let dst = self.next_u16() as usize;
-        let lhs_idx = self.next_u16() as usize;
-        let rhs_idx = self.next_u16() as usize;
-        let lhs = self.registers_f[lhs_idx];
-        let rhs = self.registers_f[rhs_idx];
-        self.registers_f[dst] = eval_binop_f(opcode, lhs, rhs);
-    }
-
-    /// Unary ptr nullity helpers — `bhimpl_ptr_iszero` / `bhimpl_ptr_nonzero`.
-    fn bh_ptr_nullity(&mut self, nonzero: bool) {
-        let dst = self.next_u16() as usize;
-        let src_idx = self.next_u16() as usize;
-        let value = self.registers_r[src_idx];
-        self.registers_i[dst] = if nonzero {
-            (value != 0) as i64
-        } else {
-            (value == 0) as i64
-        };
-    }
-
     /// blackhole.py:1732-1748 _get_list_of_values parity.
     ///
     /// Decodes a bytecode-encoded register list: [length:u8][indices:u8...].
@@ -970,7 +929,7 @@ impl BlackholeInterpreter {
         let length = self.next_u8() as usize;
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
-            let index = self.next_u8() as usize;
+            let index = self.next_reg() as usize;
             if crate::bh_debug_enabled() {
                 eprintln!(
                     "[bh-getlist] i{index} -> {}",
@@ -987,7 +946,7 @@ impl BlackholeInterpreter {
         let length = self.next_u8() as usize;
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
-            let index = self.next_u8() as usize;
+            let index = self.next_reg() as usize;
             values.push(self.registers_r.get(index).copied().unwrap_or(0));
         }
         values
@@ -997,7 +956,7 @@ impl BlackholeInterpreter {
         let length = self.next_u8() as usize;
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
-            let index = self.next_u8() as usize;
+            let index = self.next_reg() as usize;
             values.push(self.registers_f.get(index).copied().unwrap_or(0));
         }
         values
@@ -1017,7 +976,7 @@ impl BlackholeInterpreter {
     /// `USE_C_FORM`).
     pub(crate) fn bhimpl_jit_merge_point(&mut self, opcode: u8) -> Result<(), DispatchError> {
         let nbody_debug = crate::nbody_debug_enabled();
-        let jdindex_byte = self.next_u8();
+        let jdindex_byte = self.next_reg();
         let jdindex = if opcode == jitcode::insns::BC_JIT_MERGE_POINT_C {
             (jdindex_byte as i8) as usize
         } else {
@@ -1419,16 +1378,16 @@ impl BlackholeInterpreter {
         Ok(())
     }
 
-    /// Read call arguments from bytecode (kind:u8, reg:u16 per arg).
+    /// Read call arguments from bytecode (kind:u8, reg:u8 per arg).
     fn read_call_args(&mut self, num_args: usize) -> Vec<i64> {
         let mut args = Vec::with_capacity(num_args);
-        let mut metas: Vec<(u8, u16)> = Vec::with_capacity(num_args);
+        let mut metas: Vec<(u8, u8)> = Vec::with_capacity(num_args);
         for _ in 0..num_args {
             let kind_byte = self.next_u8();
             let kind = JitArgKind::decode(kind_byte);
-            let reg = self.next_u16();
+            let reg = self.next_reg();
             metas.push((kind_byte, reg));
-            args.push(self.read_call_arg(kind, reg));
+            args.push(self.read_call_arg(kind, reg as u16));
         }
         if crate::majit_log_enabled() {
             // Heuristic: for Ref args, peek intval at +0x10 (W_IntObject layout).
@@ -5307,7 +5266,7 @@ fn bhimpl_uint_ge(a: i64, b: i64) -> i64 {
 
 /// `blackhole.py:471 bhimpl_uint_mul_high` — high 64 bits of unsigned
 /// 128-bit product.  Extracted from the inline body of
-/// `handler_uint_mul_high` so the pyre-u16 macro can target a named
+/// `handler_uint_mul_high` so the bhhandler macro can target a named
 /// bhimpl uniformly with the rest of the binop family.
 fn bhimpl_uint_mul_high(a: i64, b: i64) -> i64 {
     let a = a as u64 as u128;
@@ -6673,7 +6632,7 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 /// shapes.  This builder's `setup_insns` registers every opcode key
 /// the production producers (`pyjitpl/dispatch.rs`, `majit-macros`
 /// DSL lowerer, `pyre-jit/src/jit/assembler.rs`) can emit: byte-
-/// identical canonical keys, pyre-u16 register-width adapters,
+/// identical canonical keys, single-byte register operands,
 /// audited residual_call / vable / state-field families, the pyre
 /// nested inline-call handler, and the `_pyre/P` adapters for
 /// `BC_CALL_ASSEMBLER_*`, `BC_COND_CALL_*`, and
@@ -6889,7 +6848,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // P5 — int unary + float arithmetic + ref/ptr pyre-u16 family.
+    // P5 — int unary + float arithmetic + ref/ptr family.
     // 14 keys covering record_unary_i/f, record_binop_f, record_binop_r,
     // and ptr_iszero/nonzero (`assembler.rs:784,817,825,2956,2974,799`).
     for (key, byte) in [
@@ -6998,8 +6957,8 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // P7 — state_field family (byte-identical canonical: u16 descr +
-    // u8 register), push/pop/guard_value pyre-u16 (u16 register), and
+    // P7 — state_field family (u16 descr + u8 register),
+    // push/pop/guard_value (canonical 1-byte register), and
     // misc operand-less (reraise, unreachable) + jit_merge_point/iIRFIRF
     // (already wired canonically).
     for (key, byte) in [
@@ -7139,7 +7098,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // canonical RPython argcode contract (`blackhole.py:1224-1276`)
     // byte-for-byte, so the wired `handler_residual_call_*` decode
     // straight via `read_list_{i,r,f}` + `read_descr` without needing
-    // pyre-u16 variants.
+    // width adapters.
     insns.insert(
         "residual_call_r_v/iRd".to_string(),
         majit_translate::insns::BC_RESIDUAL_CALL_R_V,
@@ -9396,8 +9355,8 @@ fn handler_inline_call_r_v(
 /// `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
 /// (`assembler.rs:3370,3429,3451,3489`) emits a pyre-only flat payload
 /// for `BC_CALL_ASSEMBLER_{INT,REF,FLOAT,VOID}`:
-///   typed: `[target_idx: u16, dst: u16, num_args: u16, (kind: u8, reg: u16) × num_args]`
-///   void:  `[target_idx: u16, num_args: u16, (kind: u8, reg: u16) × num_args]`
+///   typed: `[target_idx: u16, dst: u8, num_args: u16, (kind: u8, reg: u8) × num_args]`
+///   void:  `[target_idx: u16, num_args: u16, (kind: u8, reg: u8) × num_args]`
 /// RPython has no `bhimpl_call_assembler_*`; pyre re-interprets the
 /// recorded operation by direct-calling `target.concrete_ptr` via the
 /// shared `call_int_function` / `call_void_function` C-ABI helpers.
@@ -9411,13 +9370,13 @@ fn handler_call_assembler_int_pyre(
 ) -> Result<usize, DispatchError> {
     let mut p = p;
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let dst = jitcode::read_u16(code, &mut p) as usize;
+    let dst = jitcode::read_reg(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
     let mut args = Vec::with_capacity(num_args);
     for _ in 0..num_args {
         let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_u16(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg));
+        let reg = jitcode::read_reg(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -9443,13 +9402,13 @@ fn handler_call_assembler_ref_pyre(
 ) -> Result<usize, DispatchError> {
     let mut p = p;
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let dst = jitcode::read_u16(code, &mut p) as usize;
+    let dst = jitcode::read_reg(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
     let mut args = Vec::with_capacity(num_args);
     for _ in 0..num_args {
         let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_u16(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg));
+        let reg = jitcode::read_reg(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -9489,13 +9448,13 @@ fn handler_call_assembler_float_pyre(
 ) -> Result<usize, DispatchError> {
     let mut p = p;
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let dst = jitcode::read_u16(code, &mut p) as usize;
+    let dst = jitcode::read_reg(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
     let mut args = Vec::with_capacity(num_args);
     for _ in 0..num_args {
         let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_u16(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg));
+        let reg = jitcode::read_reg(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -9525,8 +9484,8 @@ fn handler_call_assembler_void_pyre(
     let mut args = Vec::with_capacity(num_args);
     for _ in 0..num_args {
         let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_u16(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg));
+        let reg = jitcode::read_reg(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -9549,8 +9508,8 @@ fn handler_call_assembler_void_pyre(
 ///
 /// `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
 /// (`assembler.rs:2642,2660`) emit a pyre-only flat payload:
-///   `cond_call_*`:    `[first_reg: u16, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u16]`
-///   `cond_call_value`: `[value_reg: u16, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u16, dst: u16]`
+///   `cond_call_*`:    `[first_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8]`
+///   `cond_call_value`: `[value_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8, dst: u8]`
 ///   `record_known_result_*`: same shape as `cond_call_*` (no dst).
 ///
 /// Producers: `majit-macros/src/jit_interp/jitcode_lower.rs:2166-2458`,
@@ -9574,10 +9533,10 @@ fn read_cond_call_args(
     let regs_start = kinds_start + arg_count;
     for i in 0..arg_count {
         let kind = JitArgKind::decode(code[kinds_start + i]);
-        let reg = u16::from_le_bytes([code[regs_start + 2 * i], code[regs_start + 2 * i + 1]]);
-        args.push(bh.read_call_arg(kind, reg));
+        let reg = code[regs_start + i];
+        args.push(bh.read_call_arg(kind, reg as u16));
     }
-    (args, regs_start + 2 * arg_count)
+    (args, regs_start + arg_count)
 }
 
 fn handler_cond_call_void_pyre(
@@ -9586,7 +9545,7 @@ fn handler_cond_call_void_pyre(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let mut p = p;
-    let cond_reg = jitcode::read_u16(code, &mut p) as usize;
+    let cond_reg = jitcode::read_reg(code, &mut p) as usize;
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let arg_count = jitcode::read_u8(code, &mut p) as usize;
     let condition = bh.registers_i[cond_reg];
@@ -9615,19 +9574,19 @@ fn handler_cond_call_value_int_pyre(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let mut p = p;
-    let value_reg = jitcode::read_u16(code, &mut p) as usize;
+    let value_reg = jitcode::read_reg(code, &mut p) as usize;
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let arg_count = jitcode::read_u8(code, &mut p) as usize;
     let value = bh.registers_i[value_reg];
     let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
-    let dst = u16::from_le_bytes([code[p_end], code[p_end + 1]]) as usize;
+    let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         let r = call_int_function(target.concrete_ptr, &args);
         let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
         if exc_val != 0 {
-            bh.position = p_end + 2;
+            bh.position = p_end + 1;
             if bh.handle_exception_in_frame(exc_val) {
                 return Ok(bh.position);
             }
@@ -9640,7 +9599,7 @@ fn handler_cond_call_value_int_pyre(
         value
     };
     bh.registers_i[dst] = result;
-    Ok(p_end + 2)
+    Ok(p_end + 1)
 }
 
 fn handler_cond_call_value_ref_pyre(
@@ -9649,12 +9608,12 @@ fn handler_cond_call_value_ref_pyre(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let mut p = p;
-    let value_reg = jitcode::read_u16(code, &mut p) as usize;
+    let value_reg = jitcode::read_reg(code, &mut p) as usize;
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let arg_count = jitcode::read_u8(code, &mut p) as usize;
     let value = bh.registers_r[value_reg];
     let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
-    let dst = u16::from_le_bytes([code[p_end], code[p_end + 1]]) as usize;
+    let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -9664,7 +9623,7 @@ fn handler_cond_call_value_ref_pyre(
         let r = call_ref_function(target.concrete_ptr, &args);
         let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
         if exc_val != 0 {
-            bh.position = p_end + 2;
+            bh.position = p_end + 1;
             if bh.handle_exception_in_frame(exc_val) {
                 return Ok(bh.position);
             }
@@ -9677,7 +9636,7 @@ fn handler_cond_call_value_ref_pyre(
         value
     };
     bh.registers_r[dst] = result;
-    Ok(p_end + 2)
+    Ok(p_end + 1)
 }
 
 /// `bhimpl_record_known_result_*` body is `pass` — pure marker for
@@ -9689,14 +9648,14 @@ fn handler_record_known_result_int_pyre(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let mut p = p;
-    // first_reg : u16 + fn_ptr_idx : u16
-    p += 4;
+    // first_reg : u8 + fn_ptr_idx : u16
+    p += 3;
     let arg_count = jitcode::read_u8(code, &mut p) as usize;
     let _ = bh;
     // kinds: arg_count × u8
     p += arg_count;
-    // regs: arg_count × u16
-    p += arg_count * 2;
+    // regs: arg_count × u8
+    p += arg_count;
     Ok(p)
 }
 
@@ -9722,9 +9681,9 @@ fn handler_record_known_result_ref_pyre(
 /// the `(bh, code, position) -> Result<usize, _>` signature.  Operand
 /// payload (pyre-only):
 ///   `sub_idx: u16`, `num_args: u16`,
-///   `num_args × (kind: u8, caller_src: u16, callee_dst: u16)`,
-///   `return_i: u16`, `return_r: u16`, `return_f: u16`
-/// `u16::MAX` in any return slot encodes "no caller destination".
+///   `num_args × (kind: u8, caller_src: u8, callee_dst: u8)`,
+///   `return_i: u8`, `return_r: u8`, `return_f: u8`
+/// `NO_RETURN_REG` in any return slot encodes "no caller destination".
 ///
 /// Registered via the pyre-only opname `inline_call_pyre_nested/P`
 /// in `pyre_extension_insns()`.  Canonical `inline_call_{r,ir,irf}_*`
@@ -9744,8 +9703,8 @@ fn handler_inline_call_pyre_nested(
     let mut arg_triples = Vec::with_capacity(num_args);
     for _ in 0..num_args {
         let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let caller_src = jitcode::read_u16(code, &mut p) as usize;
-        let callee_dst = jitcode::read_u16(code, &mut p) as usize;
+        let caller_src = jitcode::read_reg(code, &mut p) as usize;
+        let callee_dst = jitcode::read_reg(code, &mut p) as usize;
         arg_triples.push((kind, caller_src, callee_dst));
     }
     let return_i = decode_return_slot_at(code, &mut p);
@@ -9858,11 +9817,11 @@ fn handler_inline_call_pyre_nested(
 
 /// Mirror of `BlackholeInterpreter::decode_return_slot` for handler
 /// callsites that thread a local cursor instead of mutating
-/// `self.position`.  `u16::MAX` encodes the "no caller destination"
+/// `self.position`.  `NO_RETURN_REG` encodes the "no caller destination"
 /// sentinel.
 fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
-    let dst = jitcode::read_u16(code, cursor) as usize;
-    if dst == u16::MAX as usize {
+    let dst = jitcode::read_reg(code, cursor) as usize;
+    if dst == jitcode::NO_RETURN_REG as usize {
         None
     } else {
         Some(dst)
