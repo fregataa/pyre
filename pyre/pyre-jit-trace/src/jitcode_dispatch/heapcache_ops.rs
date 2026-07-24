@@ -437,13 +437,13 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 ///
 /// Walker behaviour mirrors `_opimpl_getfield_gc_any_pureornot`
 /// uniformly: heapcache hit returns the cached box (no IR op);
-/// heapcache miss records `GetfieldGc<I|R>` (non-pure variant) +
-/// writes through. The optimizer's always-pure pass later folds the
-/// non-pure read into `GetfieldGcPure*` based on `descr.is_always_pure()`,
-/// which is `OpHelpers.getfield_pure_for_descr` (resoperation.py)
-/// parity. Walker emitting Pure variants directly would be
-/// a TODO since RPython's opimpl_* never emits the Pure
-/// opcodes; they're an optimizer-rewrite artifact.
+/// heapcache miss records the opcode the dispatch selected +
+/// writes through. RPython aliases the `_pure` jitcode spelling to
+/// the plain opimpl (`pyjitpl.py:884`), so both spellings record the
+/// plain opnum here; the optimizer re-derives purity from
+/// `descr.is_always_pure()` (`heap.py:641` const fold +
+/// invalidation-exempt field cache). There is no post-trace rewrite
+/// to the Pure opcodes.
 ///
 /// `dst_bank` selects the result bank: `'i'` writes `registers_i[dst]`,
 /// `'r'` writes `registers_r[dst]`.
@@ -464,9 +464,9 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     // substitutes the value as a Const literal, recording no op.
     let const_pure_result = if obj.is_constant() && descr.is_always_pure() {
         let load_type = match opcode {
-            OpCode::GetfieldGcI | OpCode::GetfieldGcPureI => Some(majit_ir::Type::Int),
-            OpCode::GetfieldGcR | OpCode::GetfieldGcPureR => Some(majit_ir::Type::Ref),
-            OpCode::GetfieldGcF | OpCode::GetfieldGcPureF => Some(majit_ir::Type::Float),
+            OpCode::GetfieldGcI => Some(majit_ir::Type::Int),
+            OpCode::GetfieldGcR => Some(majit_ir::Type::Ref),
+            OpCode::GetfieldGcF => Some(majit_ir::Type::Float),
             _ => None,
         };
         let struct_ptr = match ctx.trace_ctx.box_value(obj) {
@@ -507,12 +507,8 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let typeptr_const = if ctx.fbw_mode.inline_subwalk && !obj.is_constant() && is_typeptr_field {
         let known = ctx.trace_ctx.heap_cache().get_known_class(obj);
         match (known, opcode) {
-            (Some(cls), OpCode::GetfieldGcI | OpCode::GetfieldGcPureI) => {
-                Some(ctx.trace_ctx.const_int(cls))
-            }
-            (Some(cls), OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) => {
-                Some(ctx.trace_ctx.const_ref(cls))
-            }
+            (Some(cls), OpCode::GetfieldGcI) => Some(ctx.trace_ctx.const_int(cls)),
+            (Some(cls), OpCode::GetfieldGcR) => Some(ctx.trace_ctx.const_ref(cls)),
             _ => None,
         }
     } else {
@@ -548,12 +544,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         if ctx.fbw_mode.inline_subwalk
             && matches!(
                 opcode,
-                OpCode::GetfieldGcI
-                    | OpCode::GetfieldGcR
-                    | OpCode::GetfieldGcF
-                    | OpCode::GetfieldGcPureI
-                    | OpCode::GetfieldGcPureR
-                    | OpCode::GetfieldGcPureF
+                OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF
             )
             && descr
                 .as_field_descr()
@@ -568,15 +559,9 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         // struct pointer is known (Const, vable shadow, or stamped),
         // mirroring `pyjitpl.py resbox = execute_with_descr(...);
         // upd.getfield_now_known(resbox)`.
-        // The `_pure` jitcode spellings alias `opimpl_getfield_gc_*`
-        // upstream, so the profiler always sees the plain opnum even
-        // when the pure opcode is what gets recorded.
-        let profiled_opcode = match opcode {
-            OpCode::GetfieldGcPureI => OpCode::GetfieldGcI,
-            OpCode::GetfieldGcPureR => OpCode::GetfieldGcR,
-            OpCode::GetfieldGcPureF => OpCode::GetfieldGcF,
-            other => other,
-        };
+        // The immutable jitcode spellings alias `opimpl_getfield_gc_*`
+        // upstream, so the profiler sees the plain opnum.
+        let profiled_opcode = opcode;
         ctx.trace_ctx
             .profiler()
             .count_ops(profiled_opcode, majit_metainterp::counters::OPS);
@@ -587,9 +572,9 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
             .trace_ctx
             .record_op_with_descr(opcode, &[obj], descr.clone());
         let load_type = match opcode {
-            OpCode::GetfieldGcI | OpCode::GetfieldGcPureI => Some(majit_ir::Type::Int),
-            OpCode::GetfieldGcR | OpCode::GetfieldGcPureR => Some(majit_ir::Type::Ref),
-            OpCode::GetfieldGcF | OpCode::GetfieldGcPureF => Some(majit_ir::Type::Float),
+            OpCode::GetfieldGcI => Some(majit_ir::Type::Int),
+            OpCode::GetfieldGcR => Some(majit_ir::Type::Ref),
+            OpCode::GetfieldGcF => Some(majit_ir::Type::Float),
             _ => None,
         };
         let live_value = if let (Some(ty), Some(majit_ir::Value::Ref(struct_ref))) =

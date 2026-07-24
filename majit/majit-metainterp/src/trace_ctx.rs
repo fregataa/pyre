@@ -2334,7 +2334,7 @@ impl TraceCtx {
             return None;
         }
         let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
-        if !matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) {
+        if !matches!(op.opcode, OpCode::GetfieldGcR) {
             return None;
         }
         let descr = op.descr.borrow().clone()?;
@@ -2580,6 +2580,11 @@ impl TraceCtx {
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
                 let descr = info.static_field_descr(field_index);
+                // pyjitpl.py:3489-3521 `gen_store_back_in_vable`.
+                self.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
+                self.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
                 self.vable_setfield_descr(vable_opref, value, descr);
             }
         }
@@ -2593,14 +2598,29 @@ impl TraceCtx {
             for item_index in 0..len {
                 if let Some(&value) = boxes.get(flat_box_index) {
                     let index = self.const_int(item_index as i64);
+                    self.profiler()
+                        .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
+                    self.profiler()
+                        .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
                     self.vable_setarrayitem_descr(array_ref, index, value, array_descr.clone());
                 }
                 flat_box_index += 1;
             }
         }
 
+        // Final token-null store (`record2`, so it records no profiler
+        // counters). The token slot holds a raw force marker, and this
+        // store resets it to zero. Use an integer-zero null rather than a
+        // Ref `const_null`: introducing a Ref constant here routes the
+        // store through the ref-const path, which miscompiles on backends
+        // that bake ref consts as raw addresses (wasm) or emit a GC write
+        // barrier under a differing calling convention.
         let null = self.const_int(0);
-        self.vable_setfield_descr(vable_opref, null, info.token_field_descr());
+        self.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[vable_opref, null],
+            info.token_field_descr(),
+        );
     }
 
     /// `compile.py:425-461 patch_new_loop_to_load_virtualizable_fields`
@@ -2728,13 +2748,26 @@ impl TraceCtx {
             (token_descr, clear_ptr, clear_descr)
         };
         //     tokenbox = mi.execute_and_record(rop.GETFIELD_GC_R, token_descr, box)
+        // pyjitpl.py:1148-1158 `emit_force_virtualizable`.
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let tokenbox = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
         //     condbox = mi.execute_and_record(rop.PTR_NE, None, tokenbox, CONST_NULL)
         let null_ref = self.const_null();
+        self.profiler()
+            .count_ops(OpCode::PtrNe, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::PtrNe, crate::counters::RECORDED_OPS);
         let condbox = self.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
         let funcbox = self.const_int(clear_ptr as i64);
         //     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
         //                          calldescr, False, False)
+        self.profiler()
+            .count_ops(OpCode::CondCallN, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::CondCallN, crate::counters::RECORDED_OPS);
         Self::do_record_op_with_descr(
             &mut self.recorder,
             OpCode::CondCallN,
@@ -2873,6 +2906,11 @@ impl TraceCtx {
             // guard descr via `num_live` (live-var count), not pc, so the
             // parameter is documented here but not consumed at this layer.
             let _ = pc;
+            // pyjitpl.py:1135-1138 `_nonstandard_virtualizable` execute leg.
+            self.profiler()
+                .count_ops(OpCode::PtrEq, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::PtrEq, crate::counters::RECORDED_OPS);
             let eqbox = self.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
             let isstandard: i64 = if concrete_ptrs_eq(concrete.as_ref(), standard_concrete.as_ref())
             {
@@ -3058,6 +3096,12 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
+            // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
+            // the standard heap operation.
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
             let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox`
             // in RPython carries the loaded value via `BoxInt.value`;
@@ -3089,6 +3133,10 @@ impl TraceCtx {
             }
         }
         // Fallback for tests/missing layout
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
         let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
         (op, None)
     }
@@ -3152,6 +3200,11 @@ impl TraceCtx {
             concrete != 0,
             "do_assert_not_none: ref operand {opref:?} is null at trace time"
         );
+        // pyjitpl.py:390 `execute(ASSERT_NOT_NONE, ...)`.
+        self.profiler()
+            .count_ops(OpCode::AssertNotNone, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::AssertNotNone, crate::counters::RECORDED_OPS);
         self.record_op(OpCode::AssertNotNone, &[opref]);
         // pyjitpl.py:391 `self.metainterp.heapcache.nullity_now_known(box)`.
         self.heap_cache.nullity_now_known(opref, true);
@@ -3192,6 +3245,11 @@ impl TraceCtx {
             // class argument silently skips the record in RPython.
             return;
         }
+        // pyjitpl.py:399-402 `execute(RECORD_EXACT_CLASS, ...)`.
+        self.profiler()
+            .count_ops(OpCode::RecordExactClass, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::RecordExactClass, crate::counters::RECORDED_OPS);
         self.record_op(OpCode::RecordExactClass, &[opref, cls_const]);
         let cls_value = match self.constants_get_value(cls_const) {
             Some(Value::Int(vtable)) => vtable,
@@ -3254,6 +3312,12 @@ impl TraceCtx {
                     return;
                 }
             }
+            // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
+            // the standard heap operation.
+            self.profiler()
+                .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
             self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], record_descr);
             // pyjitpl.py:980 upd.setfield(valuebox).  Cache stores the
             // Box identity (`value` OpRef); the intrinsic concrete
@@ -3355,6 +3419,10 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
             let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — `resbox`
             // carries `.getref_base()` payload; pair it with the
@@ -3380,12 +3448,21 @@ impl TraceCtx {
                 return (op, concrete_shadow_value(value));
             }
         }
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
         (op, None)
     }
 
     /// Record a virtualizable ref field read with an explicit field descriptor.
     pub fn vable_getfield_ref_descr(&mut self, vable_opref: OpRef, descr: DescrRef) -> OpRef {
+        // pyjitpl.py:3489-3521 `gen_store_back_in_vable`.
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], descr)
     }
 
@@ -3449,6 +3526,10 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
             let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — pair the
             // float payload with the recorded opref so subsequent
@@ -3473,6 +3554,10 @@ impl TraceCtx {
                 return (op, concrete_shadow_value(value));
             }
         }
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
         let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
         (op, None)
     }
@@ -3493,6 +3578,11 @@ impl TraceCtx {
             }
         }
         let index = self.const_int(item_index as i64);
+        // pyjitpl.py:1218-1230 vable fallback uses standard array access.
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcI, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcI, crate::counters::RECORDED_OPS);
         let op = self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], adescr);
         (op, None)
     }
@@ -3558,6 +3648,10 @@ impl TraceCtx {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
             let record_descr = self.vable_array_record_descr(&fdescr);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             return (
@@ -3575,6 +3669,10 @@ impl TraceCtx {
             }
         }
         // Fallback: vable layout missing — go through getfield + arrayitem.
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
@@ -3601,6 +3699,10 @@ impl TraceCtx {
             }
         }
         let index = self.const_int(item_index as i64);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
         let op = self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], adescr);
         (op, None)
     }
@@ -3624,6 +3726,10 @@ impl TraceCtx {
                 adescr.index(),
             );
             let record_descr = self.vable_array_record_descr(&fdescr);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr);
@@ -3640,6 +3746,10 @@ impl TraceCtx {
                 return (op, concrete_shadow_value(value));
             }
         }
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
@@ -3666,6 +3776,10 @@ impl TraceCtx {
             }
         }
         let index = self.const_int(item_index as i64);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcF, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcF, crate::counters::RECORDED_OPS);
         let op = self.record_op_with_descr(OpCode::GetarrayitemGcF, &[array_opref, index], adescr);
         (op, None)
     }
@@ -3683,6 +3797,10 @@ impl TraceCtx {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             let record_descr = self.vable_array_record_descr(&fdescr);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             return (
@@ -3697,6 +3815,10 @@ impl TraceCtx {
                 return (op, concrete_shadow_value(value));
             }
         }
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
@@ -3745,8 +3867,16 @@ impl TraceCtx {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
             let record_descr = self.vable_array_record_descr(&fdescr);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
+            self.profiler()
+                .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
             self.vable_setarrayitem_descr(array_opref, index, value, adescr);
             return true;
         }
@@ -3793,6 +3923,11 @@ impl TraceCtx {
                 .count_ops(OpCode::ArraylenGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
             return cached_len;
         }
+        // pyjitpl.py:754-763 `opimpl_arraylen_gc` miss.
+        self.profiler()
+            .count_ops(OpCode::ArraylenGc, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::ArraylenGc, crate::counters::RECORDED_OPS);
         let len = self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], arraydescr);
         if let Some(v) = concrete {
             self.set_opref_concrete(len, v);
@@ -3865,6 +4000,11 @@ impl TraceCtx {
                 cached
             } else {
                 let record_descr = self.vable_array_record_descr(&fdescr);
+                // pyjitpl.py:1253-1263 nonstandard vable getfield miss.
+                self.profiler()
+                    .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+                self.profiler()
+                    .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
                 let op =
                     self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
                 let live = if vable_struct_ptr != 0 {
@@ -3897,7 +4037,15 @@ impl TraceCtx {
             }
         }
         // Fallback when the layout is unavailable.
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let array_opref = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
+        self.profiler()
+            .count_ops(OpCode::ArraylenGc, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::ArraylenGc, crate::counters::RECORDED_OPS);
         self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], adescr)
     }
 
@@ -3917,6 +4065,10 @@ impl TraceCtx {
         index: OpRef,
         descr: DescrRef,
     ) -> OpRef {
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcI, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcI, crate::counters::RECORDED_OPS);
         self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], descr)
     }
 
@@ -3927,6 +4079,10 @@ impl TraceCtx {
         index: OpRef,
         descr: DescrRef,
     ) -> OpRef {
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
         self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], descr)
     }
 
@@ -3937,6 +4093,10 @@ impl TraceCtx {
         index: OpRef,
         descr: DescrRef,
     ) -> OpRef {
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcF, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetarrayitemGcF, crate::counters::RECORDED_OPS);
         self.record_op_with_descr(OpCode::GetarrayitemGcF, &[array_opref, index], descr)
     }
 

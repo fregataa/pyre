@@ -268,7 +268,7 @@ fn trace_abort_error(reason: &'static str) -> PyError {
 pub(crate) struct LongBinopSpec {
     /// Pure `rbigint` op over the two bare `*const BigInt` *payloads*
     /// `[Ref, Ref] -> Ref`. The walker emits this after a
-    /// `GetfieldGcPure(value)` on each operand, so the elidable call is pure on
+    /// immutable `GetfieldGc(value)` on each operand, so the elidable call is pure on
     /// the immutable bigints (not the wrappers) and the optimizer never
     /// reorders it ahead of the boxing `setfield_gc` that initializes a fresh
     /// result wrapper.
@@ -2844,12 +2844,9 @@ impl MIFrame {
             &active_boxes,
             &snapshot_full_types,
         );
-        // pyjitpl.py:2581: self.staticdata.profiler.count_ops(opnum, Counters.GUARDS).
-        // Atomic fetch_add through the shared `Arc<MetaInterpStaticData>`
-        // — `&self` access is enough because `JitProfiler::count_ops`
-        // bumps an `AtomicUsize`.
-        ctx.profiler()
-            .count_ops(opcode, majit_metainterp::counters::GUARDS);
+        // pyjitpl.py:2581 `count_ops(opnum, Counters.GUARDS)` is bumped
+        // inside `TraceCtx::record_guard_typed` (the record chokepoint),
+        // so no explicit count here.
     }
 
     /// pyjitpl.py:2586-2602 capture_resumedata parity.
