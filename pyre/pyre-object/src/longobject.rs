@@ -154,20 +154,33 @@ pub unsafe fn bigint_external_size(addr: usize) -> usize {
 pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
     let tid = bigint_gc_type_id();
     if tid != 0 {
+        // A few limbs of external bytes are noise next to the 48-byte struct
+        // the nursery already tracks; skip both charge crossings for them so
+        // small-bignum churn stays on the plain bump-alloc path. The
+        // end-of-major recompute absorbs the drift for survivors.
         let external = bigint_external_bytes(&value);
-        crate::gc_hook::try_gc_charge_memory_pressure(external);
+        let charge = external > SMALL_EXTERNAL_EXEMPT_BYTES;
+        if charge {
+            crate::gc_hook::try_gc_charge_memory_pressure(external);
+        }
         if let Some(raw) = crate::gc_hook::try_gc_alloc_collecting(tid, BIGINT_PAYLOAD_SIZE)
             .filter(|p| !p.is_null())
         {
             unsafe {
                 std::ptr::write(raw as *mut BigInt, value);
             }
-            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
+            if charge {
+                crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
+            }
             return raw as *mut BigInt;
         }
     }
     alloc_bigint_nursery(value)
 }
+
+/// External-byte threshold below which [`alloc_bigint_nursery_collecting`]
+/// skips the memory-pressure / old-gen charge crossings (8 limbs).
+const SMALL_EXTERNAL_EXEMPT_BYTES: usize = 64;
 
 /// Allocate `value` as a GC-managed `BigInt` at a stable (old-gen, non-moving)
 /// address, for host/interpreter callers (`w_long_new`) that hold the pointer
@@ -519,14 +532,50 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(&*a + &*b) as i64 }
+    // Two-limb fast path: when both operands and the sum fit i128 the result
+    // is exact without the general limb machinery.
+    unsafe {
+        if let (Ok(x), Ok(y)) = (i128::try_from(&*a), i128::try_from(&*b)) {
+            if let Some(z) = x.checked_add(y) {
+                return alloc_bigint_nursery_collecting(BigInt::from(z)) as i64;
+            }
+        }
+        alloc_bigint_nursery_collecting(&*a + &*b) as i64
+    }
+}
+
+/// `rbigint.add_int_int_bigint_result` (`rpython/rlib/rbigint.py:717`,
+/// `@jit.elidable`) — exact bigint sum of two machine ints. Allocates the
+/// result via the COLLECTING nursery, matching [`jit_bigint_add`], and returns
+/// a freshly heap-allocated `*mut BigInt` payload (as i64).
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_add_int_int(a: i64, b: i64) -> i64 {
+    // Exact in i128 for any i64 pair; skips the general bigint add machinery.
+    unsafe { alloc_bigint_nursery_collecting(BigInt::from(a as i128 + b as i128)) as i64 }
 }
 
 /// `rbigint.sub` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(&*a - &*b) as i64 }
+    // Two-limb fast path mirroring `jit_bigint_add`.
+    unsafe {
+        if let (Ok(x), Ok(y)) = (i128::try_from(&*a), i128::try_from(&*b)) {
+            if let Some(z) = x.checked_sub(y) {
+                return alloc_bigint_nursery_collecting(BigInt::from(z)) as i64;
+            }
+        }
+        alloc_bigint_nursery_collecting(&*a - &*b) as i64
+    }
+}
+
+/// `rbigint.sub_int_int_bigint_result` (`rpython/rlib/rbigint.py:788`,
+/// `@jit.elidable`) — exact bigint difference of two machine ints. See
+/// [`jit_bigint_add_int_int`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_sub_int_int(a: i64, b: i64) -> i64 {
+    // Exact in i128 for any i64 pair; skips the general bigint sub machinery.
+    unsafe { alloc_bigint_nursery_collecting(BigInt::from(a as i128 - b as i128)) as i64 }
 }
 
 /// `rbigint.mul` on bare payloads (collecting). See [`jit_bigint_add`].
@@ -534,6 +583,15 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
 pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe { alloc_bigint_nursery_collecting(&*a * &*b) as i64 }
+}
+
+/// `rbigint.mul_int_int_bigint_result` (`rpython/rlib/rbigint.py:873`,
+/// `@jit.elidable`) — exact bigint product of two machine ints. See
+/// [`jit_bigint_add_int_int`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_mul_int_int(a: i64, b: i64) -> i64 {
+    // A 64x64 product is exact in i128; skips the general bigint mul machinery.
+    unsafe { alloc_bigint_nursery_collecting(BigInt::from(a as i128 * b as i128)) as i64 }
 }
 
 /// `rbigint.and_` on bare payloads (collecting). See [`jit_bigint_add`].
@@ -576,32 +634,6 @@ pub extern "C" fn jit_w_long_cmp(a: i64, b: i64) -> i64 {
             Ordering::Less => -1,
             Ordering::Equal => 0,
             Ordering::Greater => 1,
-        }
-    }
-}
-
-/// `bigint_result` — wrap the bigint produced by [`jit_w_long_add_raw`] in a
-/// Python int, demoting to `W_IntObject` when it fits in i64, otherwise
-/// reusing the `*mut BigInt` payload in a fresh `W_LongObject`. This is the
-/// `W_LongObject(...)` wrapper allocation that upstream keeps a residual `NEW`
-/// outside the elidable `rbigint.add` (the int fast path boxes the same way,
-/// via the `dont_look_inside` `jit_w_int_new`). Marked `dont_look_inside`, not
-/// elidable, so the wrapper object is never pure-CSE'd and each add yields a
-/// distinct boxed result, matching `W_LongObject(op(...))`.
-///
-/// The i64-range demotion to `W_IntObject` is pyre's two-class `int`
-/// representation (small-int fast object + bigint object); PyPy's default
-/// `newlong` (`longobject.py:495`, `withsmalllong=False`) keeps a
-/// `W_LongObject`. Both denote the same `int` value — this is a representation
-/// choice spanning every int path, not specific to this helper.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_bigint_result_box(num: i64) -> i64 {
-    let num = num as *mut BigInt;
-    unsafe {
-        if jit_bigint_to_i64_fits(&*num) != 0 {
-            crate::intobject::w_int_new(jit_bigint_to_i64_value(&*num)) as usize as i64
-        } else {
-            w_long_from_raw(num) as usize as i64
         }
     }
 }
@@ -715,30 +747,15 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_bigint_result_box_keeps_long_out_of_range() {
-        // Sum out of i64 range boxes as W_LongObject, reusing the payload.
-        let a = w_long_new(BigInt::from(i64::MAX));
-        let b = w_long_new(BigInt::from(i64::MAX));
-        let raw = jit_w_long_add_raw(a as i64, b as i64);
-        let r = jit_bigint_result_box(raw) as PyObjectRef;
-        unsafe {
-            assert!(is_long(r));
-            assert_eq!(*w_long_get_value(r), BigInt::from(i64::MAX) * 2);
-        }
-    }
-
-    #[test]
-    fn test_jit_bigint_result_box_demotes_to_int_when_fits() {
-        // `bigint_result` parity: a sum that fits in i64 demotes to W_IntObject
-        // (so a later GuardClass(LONG_TYPE) on the result correctly side-exits).
+    fn test_jit_w_long_add_raw_keeps_payload_when_fits() {
+        // The raw helper never demotes: a sum that fits i64 still yields a
+        // `*mut BigInt` payload (the boxing NEW wraps it as a W_LongObject,
+        // matching `newlong` which does not demote).
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_long_new(BigInt::from(-1) - BigInt::from(i64::MAX));
-        let raw = jit_w_long_add_raw(a as i64, b as i64);
-        let r = jit_bigint_result_box(raw) as PyObjectRef;
+        let raw = jit_w_long_add_raw(a as i64, b as i64) as *mut BigInt;
         unsafe {
-            assert!(is_int(r));
-            assert!(!is_long(r));
-            assert_eq!(crate::intobject::w_int_get_value(r), 0);
+            assert_eq!(*raw, BigInt::from(0));
         }
     }
 }

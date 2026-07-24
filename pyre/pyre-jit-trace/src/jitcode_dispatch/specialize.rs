@@ -417,24 +417,6 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // intobject.py `_make_generic_descr_binop`: the machine-int fast path
-    // exits through `_make_ovf2long` when `ovfcheck(op(x, y))` raises.
-    // This walker specialization represents only the no-overflow arm.  When
-    // the concrete walk is already on the overflow arm, defer before emitting
-    // any IR so the generic residual records the authentic W_Long result.
-    // Emitting INT_*_OVF + GUARD_NO_OVERFLOW here would contradict that
-    // result: the bridge would immediately try to prove the freshly boxed
-    // W_IntObject is a W_LongObject and abort on every retry.
-    let overflowed = match op_code {
-        OpCode::IntAddOvf => la.checked_add(rb).is_none(),
-        OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
-        OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
-        _ => false,
-    };
-    if overflowed {
-        return Ok(None);
-    }
-
     // intobject.py range validation (mirror the former int fast path's
     // needs_concrete_check): bail to the generic leg when the bare-IR-op
     // emission would be unsound (zero / INT_MIN-overflow divisor, oversized
@@ -478,6 +460,28 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         }
     }
 
+    // pyjitpl.py:1881 handle_possible_overflow_error follows the concrete
+    // Add/Sub/Mul outcome. The overflowing arm mirrors intobject.py:494
+    // _make_ovf2long: guard_overflow, call the elidable raw-int bigint helper
+    // (rbigint.py:717/788/873), guard the newlong demote attempt, and inline
+    // the W_LongObject box instead of falling through to the generic
+    // CallMayForceR BINARY_OP leg.
+    let overflows = has_overflow
+        && match op_code {
+            OpCode::IntAddOvf => la.checked_add(rb).is_none(),
+            OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
+            OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
+            _ => false,
+        };
+    if overflows {
+        let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+        if boxed_result_obj == pyre_object::PY_NULL
+            || !unsafe { pyre_object::is_long(boxed_result_obj) }
+        {
+            return Ok(None);
+        }
+    }
+
     // --- emit the specialized IR (walker-native) ---
     // bool and int share `intval`; guard each operand against its own vtable
     // (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
@@ -485,6 +489,78 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
     let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+    if overflows {
+        let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+        let concrete_value = match op_code {
+            OpCode::IntAddOvf => la.wrapping_add(rb),
+            OpCode::IntSubOvf => la.wrapping_sub(rb),
+            OpCode::IntMulOvf => la.wrapping_mul(rb),
+            _ => unreachable!("overflow arm requires Add/Sub/Mul"),
+        };
+        let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(raw_result, majit_ir::Value::Int(concrete_value));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardOverflow, &[])?;
+
+        let payload_concrete = unsafe {
+            *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+                as *const i64)
+        };
+        let payload_fn = match op_code {
+            OpCode::IntAddOvf => pyre_object::longobject::jit_bigint_add_int_int as *const (),
+            OpCode::IntSubOvf => pyre_object::longobject::jit_bigint_sub_int_int as *const (),
+            OpCode::IntMulOvf => pyre_object::longobject::jit_bigint_mul_int_int as *const (),
+            _ => unreachable!("overflow arm requires Add/Sub/Mul"),
+        };
+        let concrete_args = [
+            majit_ir::Value::Int(payload_fn as usize as i64),
+            majit_ir::Value::Int(la),
+            majit_ir::Value::Int(rb),
+        ];
+        let payload = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+            OpCode::CallR,
+            payload_fn,
+            &[lhs_raw, rhs_raw],
+            &[majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Ref,
+            majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            &concrete_args,
+            majit_ir::Value::Ref(majit_ir::GcRef(payload_concrete as usize)),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            payload,
+            majit_ir::Value::Ref(majit_ir::GcRef(payload_concrete as usize)),
+        );
+        if payload.inline_const_to_value().is_none() {
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+        }
+
+        let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+        let fits = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallI,
+            fits_fn,
+            &[payload],
+            &[majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            majit_metainterp::cannot_raise_effect_info(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(fits, majit_ir::Value::Int(0));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
+
+        let result = crate::helpers::emit_box_long_inline(
+            ctx.trace_ctx,
+            payload,
+            crate::descr::w_long_size_descr(),
+            crate::descr::long_value_descr(),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            result,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+        );
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        return Ok(Some(()));
+    }
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
             // rint.py _ovf_zer guards: int_eq(rhs,0)→guard_false +
@@ -606,12 +682,14 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::bytecode::BinaryOperator;
     if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(spec) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
-        .and_then(crate::trace_opcode::long_binop_raw_helper)
-    else {
+    let Some(op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    let Some(spec) = crate::trace_opcode::long_binop_raw_helper(op) else {
         return Ok(None);
     };
     let lhs = r_args[0];
@@ -630,16 +708,17 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
         return Ok(None);
     };
-    // Pyre representation demote: when the bigint result fits i64 it becomes a
-    // W_IntObject in pyre's two-class int model, which the inline-NEW long box
-    // cannot represent — so decline the spec here (before emitting any op) and
-    // let the generic record handle the demote. Reuse the authentic boxed
-    // result's payload instead of running `spec.raw_fn` a second time; the raw
-    // helpers allocate/publish exception state and must not be used as a
-    // trace-time probe.
+    // A NULL result means the op raised — defer to the generic record. `newlong`
+    // never demotes, so an arithmetic long op always yields a W_LongObject the
+    // inline-NEW box below can represent. The shift ops are the only ones that
+    // can still yield a W_IntObject (`space.newint(-1)`/`(0)` on a shift count
+    // that overflows a machine int); the `!is_long` decline routes that
+    // huge-count case to the generic leg. Reuse the authentic boxed result's
+    // payload instead of running `spec.raw_fn` a second time; the raw helpers
+    // allocate/publish exception state and must not be used as a trace-time
+    // probe.
     let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
-    if boxed_result_obj == pyre_object::PY_NULL || unsafe { pyre_object::is_int(boxed_result_obj) }
-    {
+    if boxed_result_obj == pyre_object::PY_NULL {
         return Ok(None);
     }
     if !unsafe { pyre_object::is_long(boxed_result_obj) } {
@@ -649,7 +728,6 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
         *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
             as *const i64)
     };
-    let fits_concrete = 0_i64;
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
@@ -711,22 +789,33 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     if raw.inline_const_to_value().is_none() {
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
     }
-    // `newlong` demote guard: `GuardFalse(fits_int(raw))`. Passes at record time
-    // (checked above), deopts to the interpreter if a future replay yields an
-    // i64-fitting result. Resumes at op_pc (the BINARY_OP), like the GuardClass
-    // guards.
-    let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
-    let fits = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallI,
-        fits_fn,
-        &[raw],
-        &[majit_ir::Type::Ref],
-        majit_ir::Type::Int,
-        majit_metainterp::cannot_raise_effect_info(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
+    // Shift-count demote guard: `_lshift`/`_rshift` demote to `space.newint`
+    // (-1/0) when the shift count overflows a machine int (`toint()`
+    // OverflowError), so guard that the count fits and let a huge-count replay
+    // deopt to the generic leg. The arithmetic ops (`newlong`, no demote) emit
+    // no such guard — a fitting result stays a W_LongObject in the trace.
+    if matches!(
+        op,
+        BinaryOperator::Lshift
+            | BinaryOperator::InplaceLshift
+            | BinaryOperator::Rshift
+            | BinaryOperator::InplaceRshift
+    ) {
+        let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+        let count_fits = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallI,
+            fits_fn,
+            &[rhs_pl],
+            &[majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            majit_metainterp::cannot_raise_effect_info(),
+        );
+        let count_fits_concrete =
+            unsafe { pyre_object::longobject::jit_bigint_fits_int(rhs_payload) };
+        ctx.trace_ctx
+            .set_opref_concrete(count_fits, majit_ir::Value::Int(count_fits_concrete));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[count_fits])?;
+    }
     // Inline `W_LongObject(raw)` NEW (`new_with_vtable` + `setfield_gc('value')`).
     // NewWithVtable lowers to the collecting `CallMallocNursery` — the GC
     // safepoint that lets bigint-heavy loops reclaim dead bigints.
@@ -1622,8 +1711,10 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
 /// byte-correct) for any shape it cannot reproduce faithfully: empty list
 /// (Empty strategy), a non-const / unrecoverable array length, an element
 /// without a concrete Ref shadow, or an Integer-strategy list that carries a
-/// fits-in-word `W_LongObject` / tagged immediate (which `walker_unbox_int`'s
-/// `&INT_TYPE` guard does not cover).
+/// tagged immediate (which has no `&INT_TYPE`/`&LONG_TYPE` header for the
+/// unbox guard). A fits-in-word `W_LongObject` is accepted: `is_plain_int1`
+/// covers it and `walker_unbox_long` supplies the `&LONG_TYPE` + `_fits_int`
+/// guarded extraction.
 pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -1688,18 +1779,21 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     // (a minor collection there could move the boxed elements, so the raw
     // pointers must not be dereferenced afterwards).
     enum Emit {
-        Int(Vec<i64>),
+        // Per element: `(unboxed i64, is_fits_long)`.  `is_fits_long` selects
+        // `walker_unbox_long` (`&LONG_TYPE` + `_fits_int` guard) over the
+        // plain `walker_unbox_int`.
+        Int(Vec<(i64, bool)>),
         Float(Vec<f64>),
         Object,
     }
     let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
     let emit = match strategy {
         ListStrategy::Integer => {
-            // `list_strategy_for` accepts fits-in-word `W_LongObject` and
-            // tagged immediates under Integer, but `walker_unbox_int` only
-            // covers the exact `W_IntObject` (`&INT_TYPE` + `intval`) shape —
-            // decline otherwise so the residual (correct for any element)
-            // rebuilds the same Integer list.
+            // `IntegerListStrategy.is_correct_type` is `is_plain_int1`, which
+            // accepts an exact `W_IntObject` or a fits-in-word `W_LongObject`;
+            // both store the unboxed i64 (`plain_int_w`). A tagged immediate
+            // has no header for the unbox guard, so decline it to the residual
+            // (correct for any element).
             let mut vals = Vec::with_capacity(len);
             for &p in &concretes {
                 if pyre_object::tagged_int::CAN_BE_TAGGED
@@ -1707,12 +1801,16 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
                 {
                     return Ok(None);
                 }
-                let exact_int =
-                    unsafe { pyre_object::is_plain_int1(p) && std::ptr::eq((*p).ob_type, int_ty) };
-                if !exact_int {
+                if !unsafe { pyre_object::is_plain_int1(p) } {
                     return Ok(None);
                 }
-                vals.push(unsafe { pyre_object::w_int_get_value(p) });
+                let is_fits_long = unsafe { pyre_object::pyobject::is_long(p) };
+                let val = if is_fits_long {
+                    pyre_object::longobject::jit_w_long_toint(p as usize as i64)
+                } else {
+                    unsafe { pyre_object::w_int_get_value(p) }
+                };
+                vals.push((val, is_fits_long));
             }
             Emit::Int(vals)
         }
@@ -1743,9 +1841,14 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     let list_op = match emit {
         Emit::Int(vals) => {
             let int_type_addr = int_ty as i64;
+            let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
             let mut raws: Vec<OpRef> = Vec::with_capacity(len);
-            for (&it, &v) in items.iter().zip(vals.iter()) {
-                let raw = walker_unbox_int(ctx, op_pc, it, int_type_addr)?;
+            for (&it, &(v, is_fits_long)) in items.iter().zip(vals.iter()) {
+                let raw = if is_fits_long {
+                    walker_unbox_long(ctx, op_pc, it, long_type_addr)?
+                } else {
+                    walker_unbox_int(ctx, op_pc, it, int_type_addr)?
+                };
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(v));
                 raws.push(raw);
@@ -1802,8 +1905,8 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 ///
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
-/// for any other shape (object tuple, arity ≠ 2, long element, cache miss)
-/// — so a non-foldable build is not declined.
+/// for any other shape (object tuple, arity ≠ 2, out-of-range long, tagged
+/// immediate, cache miss) — so a non-foldable build is not declined.
 pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -1847,61 +1950,72 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    // Only the arity-2 plain-int specialised tuple is folded today.  Gate
-    // on `is_plain_int1` (rejects int subclasses + non-fitting longs) AND
-    // an exact `&INT_TYPE` `ob_type` — that excludes the fits-in-word
-    // `W_LongObject` arm `is_plain_int1` also accepts, which would need the
-    // long unbox the retired trait-side payload helper did (out of scope
-    // here).  Any other shape falls through to the residual (correct).
+    // The arity-2 int specialised tuple `Cls_ii` (`makespecialisedtuple2`,
+    // specialisedtupleobject.py) is built when both elements pass
+    // `is_plain_int1` — an exact `W_IntObject` or a fits-in-word
+    // `W_LongObject`; the stored payload is `plain_int_w` of each.  A tagged
+    // immediate has no real header for the unbox guard and the emit is not
+    // tag-aware, so decline it to the residual (correct for any shape).
     if pyre_object::tagged_int::CAN_BE_TAGGED
         && (pyre_object::tagged_int::is_tagged_int(c0)
             || pyre_object::tagged_int::is_tagged_int(c1))
     {
-        // A tagged-immediate element has no real header to read for the exact
-        // `&INT_TYPE` ob_type check below, and the spec_ii emit (w_class guard +
-        // typed unbox) is not tag-aware. Fall through to the opaque residual,
-        // which is correct for any element shape.
         return Ok(None);
     }
     let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
-    let both_plain_int = unsafe {
-        pyre_object::is_plain_int1(c0)
-            && pyre_object::is_plain_int1(c1)
-            && std::ptr::eq((*c0).ob_type, int_ty)
-            && std::ptr::eq((*c1).ob_type, int_ty)
-    };
+    let both_plain_int =
+        unsafe { pyre_object::is_plain_int1(c0) && pyre_object::is_plain_int1(c1) };
     if !both_plain_int {
         return Ok(None);
     }
-    // Concrete element int payloads (already proven plain `W_IntObject`).
-    let (v0, v1) = unsafe {
-        (
-            pyre_object::w_int_get_value(c0),
-            pyre_object::w_int_get_value(c1),
-        )
+    let c0_long = unsafe { pyre_object::pyobject::is_long(c0) };
+    let c1_long = unsafe { pyre_object::pyobject::is_long(c1) };
+    // Concrete element int payloads (`plain_int_w`: `W_IntObject`'s `intval`
+    // or a fits-int `W_LongObject`'s `toint()`).
+    let v0 = if c0_long {
+        pyre_object::longobject::jit_w_long_toint(c0 as usize as i64)
+    } else {
+        unsafe { pyre_object::w_int_get_value(c0) }
+    };
+    let v1 = if c1_long {
+        pyre_object::longobject::jit_w_long_toint(c1 as usize as i64)
+    } else {
+        unsafe { pyre_object::w_int_get_value(c1) }
     };
 
     // --- emit the virtual spec_ii walker-native ---
     // Paired `w_class` guard per element so a runtime int subclass sharing
-    // `&INT_TYPE`'s payload side-exits, then the plain-int payload unbox.
+    // the public `int` `w_class` side-exits, then the plain-int payload unbox.
+    // A fits-int `W_LongObject` also carries the public `int` `w_class`
+    // (`is_plain_int1`), so the same guard covers it; the payload extraction
+    // switches to `walker_unbox_long` (`&LONG_TYPE` + `_fits_int`).
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_exact_w_class(ctx, op_pc, e0, int_typeobj)?;
     walker_guard_exact_w_class(ctx, op_pc, e1, int_typeobj)?;
     let int_type_addr = int_ty as i64;
-    let raw0 = walker_unbox_int_typed(
-        ctx,
-        op_pc,
-        e0,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )?;
-    let raw1 = walker_unbox_int_typed(
-        ctx,
-        op_pc,
-        e1,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )?;
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    let raw0 = if c0_long {
+        walker_unbox_long(ctx, op_pc, e0, long_type_addr)?
+    } else {
+        walker_unbox_int_typed(
+            ctx,
+            op_pc,
+            e0,
+            int_type_addr,
+            crate::descr::int_intval_descr(),
+        )?
+    };
+    let raw1 = if c1_long {
+        walker_unbox_long(ctx, op_pc, e1, long_type_addr)?
+    } else {
+        walker_unbox_int_typed(
+            ctx,
+            op_pc,
+            e1,
+            int_type_addr,
+            crate::descr::int_intval_descr(),
+        )?
+    };
 
     let tuple = ctx.trace_ctx.record_op_with_descr(
         OpCode::NewWithVtable,
@@ -3256,16 +3370,15 @@ unsafe fn orthodox_list_append_recognize(
     inner_self: pyre_object::PyObjectRef,
     value: pyre_object::PyObjectRef,
 ) -> Option<usize> {
-    // `is_plain_int1` accepts a fits-int `W_LongObject` (it implies
-    // `_fits_int()`), but a long is declined here: the commit path pins
-    // `guard_class(value, INT_TYPE)` and a long has `ob_type == LONG_TYPE`,
-    // so supporting it needs equivalent `unbox_long` machinery
-    // (guard_class LONG_TYPE + `_fits_int` residual guard + long
-    // extraction) threaded through the sub-walk (PR248 §2). Empirically a
-    // fits-int `W_LongObject` does not reach this append: pyre normalizes
-    // fits-int results to `W_IntObject` across arithmetic / `int(str)` /
-    // literals, so the long arm is an unreachable optimization and the
-    // decline is correctness-safe (the generic residual handles it).
+    // `is_plain_int1` accepts an exact `W_IntObject` or a fits-int
+    // `W_LongObject`; both route to Integer storage. The commit path pins
+    // `guard_class(value, LONG_TYPE)` for a long value (vs `INT_TYPE` for an
+    // int) so the descended `w_list_append` body observes the right `ob_type`.
+    // The body's `is_plain_int1(value)` / `plain_int_w(value)` then unbox the
+    // long through the compiled `_fits_int` / `toint` path; when that path
+    // reaches a helper the sub-walk cannot lower it declines
+    // (`OrthodoxSubWalkTraceUnsupported`) and rolls back to the generic
+    // residual (correctness-safe for any element).
     if !pyre_object::pyobject::is_list(inner_self) {
         return None;
     }
@@ -3279,15 +3392,14 @@ unsafe fn orthodox_list_append_recognize(
             return None;
         }
         let int_ok = pyre_object::is_plain_int1(value)
-            && !pyre_object::pyobject::is_long(value)
             && !(pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(value));
         let float_ok = !value.is_null() && pyre_object::is_plain_float_strict(value);
-        // switch_to_correct_strategy routes `is_plain_int1` -> Integer with no
-        // tagged exclusion. Exclude any plain-int / float from the object
-        // fallback so a tagged-int / fits-int `W_LongObject` DECLINES (generic
-        // residual) instead of mis-routing to Object and diverging the traced
-        // strategy from the concrete one the commit installs.
+        // switch_to_correct_strategy routes `is_plain_int1` (exact int or
+        // fits-in-word long) -> Integer with no tagged exclusion. Exclude any
+        // plain-int / float from the object fallback so a tagged-int DECLINES
+        // (generic residual) instead of mis-routing to Object and diverging the
+        // traced strategy from the concrete one the commit installs.
         let obj_ok = !value.is_null()
             && !pyre_object::is_plain_int1(value)
             && !pyre_object::is_plain_float_strict(value);
@@ -3300,13 +3412,12 @@ unsafe fn orthodox_list_append_recognize(
     if !pyre_object::w_list_can_append_without_realloc(inner_self) {
         return None;
     }
-    // Int-storage specialization: plain-int value stored unboxed (a
-    // fits-int `W_LongObject` is declined, see note above).
-    // A tagged-immediate value would need a tag-aware unboxed store and no
-    // `w_class` pin; decline to the generic residual append instead.
+    // Int-storage specialization: `is_plain_int1` value (exact `W_IntObject`
+    // or fits-int `W_LongObject`) stored unboxed. A tagged-immediate value
+    // would need a tag-aware unboxed store and no `w_class` pin; decline to
+    // the generic residual append instead.
     let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
         && pyre_object::is_plain_int1(value)
-        && !pyre_object::pyobject::is_long(value)
         && !(pyre_object::tagged_int::CAN_BE_TAGGED
             && pyre_object::tagged_int::is_tagged_int(value));
     // Object-storage extension: any non-null `Ref` value stored into the
@@ -3413,7 +3524,6 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     if promote_empty {
         let target = unsafe {
             let int_ok = pyre_object::is_plain_int1(value)
-                && !pyre_object::pyobject::is_long(value)
                 && !(pyre_object::tagged_int::CAN_BE_TAGGED
                     && pyre_object::tagged_int::is_tagged_int(value));
             if int_ok {
@@ -3450,25 +3560,31 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     }
 
     // Pin the appended value's class so the inlined `is_plain_int1` type
-    // predicate folds during the sub-walk: guard_class(value, INT_TYPE) +
-    // class_now_known, so its `is_int`/`is_bool` typeptr reads fold to the
-    // INT_TYPE const (the typeptr fold in `getfield_gc_via_heapcache`).  The
-    // recognition gate already proved `is_plain_int1(value)`; this guard
-    // enforces ob_type==INT_TYPE at runtime.  The value's integer payload
+    // predicate folds during the sub-walk: guard_class(value, <TYPE>) +
+    // class_now_known, so its `is_int`/`is_long`/`is_bool` typeptr reads fold
+    // to the pinned const (the typeptr fold in `getfield_gc_via_heapcache`).
+    // The recognition gate already proved `is_plain_int1(value)`; this guard
+    // enforces the observed ob_type at runtime.  The value's integer payload
     // stays symbolic — only its class is pinned.
     //
     // Object-storage append stores the value as a
     // plain GC ref with no unboxing, so it carries no type precondition —
-    // skip the INT_TYPE pin (the sub-walk's object-storage store path does
+    // skip the class pin (the sub-walk's object-storage store path does
     // not read the value's class).
     let is_obj_storage = unsafe { pyre_object::w_list_uses_object_storage(inner_self) };
     if !is_obj_storage {
         // Integer and Float storage both pin the value's class so the body's
-        // strict type test folds during the sub-walk; only the ob_type const
-        // differs (INT_TYPE vs FLOAT_TYPE).
+        // strict type test folds during the sub-walk; the ob_type const is
+        // FLOAT_TYPE for float storage, and INT_TYPE / LONG_TYPE for int
+        // storage depending on whether the value is an exact int or a fits-int
+        // `W_LongObject` (both pass `is_plain_int1` -> Integer storage, but
+        // carry distinct `ob_type`s the sub-walk's `is_plain_int1` folds on).
         let is_float_storage = unsafe { pyre_object::w_list_uses_float_storage(inner_self) };
+        let value_is_long = unsafe { pyre_object::pyobject::is_long(value) };
         let value_type_addr = if is_float_storage {
             &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64
+        } else if value_is_long {
+            &pyre_object::pyobject::LONG_TYPE as *const _ as i64
         } else {
             &pyre_object::pyobject::INT_TYPE as *const _ as i64
         };
@@ -5646,17 +5762,20 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     if majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
         return Ok(false);
     }
-    // The stored value must be a provably-plain-int box.  `is_plain_int1` on
-    // the trace-time concrete rejects `bool` / int-subclass / `long` (whose
-    // `write_cell` replaces the cell rather than mutating `intvalue`); the
-    // heapcache lookup recovers the box's raw `intvalue` (populated only by
-    // JIT int boxes, `emit_box_int_inline`), so the setfield needs no runtime
-    // class guard — exactly as pypy's optimized trace folds the
-    // `is_plain_int1` check away for an `int_add` result.
+    // The stored value must be a provably-plain-int box. `is_plain_int1` accepts
+    // a fits-int `W_LongObject`, whose `write_cell` REPLACES the cell rather than
+    // mutating `intvalue`, so exclude `long` explicitly; the remaining int box's
+    // raw `intvalue` (populated only by JIT int boxes, `emit_box_int_inline`) is
+    // recovered by the heapcache lookup, so the setfield needs no runtime class
+    // guard — exactly as pypy's optimized trace folds the `is_plain_int1` check
+    // away for an `int_add` result. (bool / int-subclass are already excluded by
+    // `is_plain_int1`.)
     let is_plain_int = matches!(
         ctx.trace_ctx.box_value(value_opref),
         Some(majit_ir::Value::Ref(majit_ir::GcRef(p)))
-            if p != 0 && unsafe { pyre_object::listobject::is_plain_int1(p as pyre_object::PyObjectRef) }
+            if p != 0
+                && unsafe { pyre_object::listobject::is_plain_int1(p as pyre_object::PyObjectRef) }
+                && !unsafe { pyre_object::is_long(p as pyre_object::PyObjectRef) }
     );
     if !is_plain_int {
         return Ok(false);
