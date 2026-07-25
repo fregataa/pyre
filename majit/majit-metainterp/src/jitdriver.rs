@@ -114,17 +114,17 @@ fn bh_jitdrivers_sd(
 /// null to leave it unset. A non-null vinfo lets the blackhole run a mid-body
 /// vable-array op (e.g. the `int_*_jump_if_ovf` overflow guard on a `[int; virt]`
 /// state field). Seed when either the portal-inline experiment is on, or the
-/// machine is a state-field one (`token_offset == 0`) whose `bh_clear_vable_token`
-/// is inert so a non-null vinfo cannot corrupt its non-GC `state` struct. A real
-/// heap virtualizable (`token_offset > 0`, e.g. PyFrame) is left with null vinfo
-/// to preserve its existing resume contract.
+/// machine is a state-field one (no `vable_token` field) whose
+/// `bh_clear_vable_token` is inert so a non-null vinfo cannot corrupt its non-GC
+/// `state` struct. A real heap virtualizable (e.g. PyFrame) is left with null
+/// vinfo to preserve its existing resume contract.
 fn seed_deopt_vinfo_ptr(
     vinfo: Option<&std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
 ) -> *const crate::virtualizable::VirtualizableInfo {
     match vinfo {
         Some(info)
             if crate::pyjitpl::dispatch::portal_inline_experiment_enabled()
-                || info.token_offset == 0 =>
+                || !info.has_vable_token() =>
         {
             std::sync::Arc::as_ptr(info)
         }
@@ -3641,7 +3641,7 @@ impl<S: JitState> JitDriver<S> {
                     // `setarrayitem_vable`) can resolve its vinfo during resume.
                     // Two sources:
                     //   * the portal-inline experiment (gated), OR
-                    //   * a state-field machine (`token_offset == 0`), whose
+                    //   * a state-field machine (no `vable_token` field), whose
                     //     `bh_clear_vable_token` is inert (the `state` struct has
                     //     no heap token), so a non-null vinfo cannot corrupt it.
                     //     The overflow-guard deopt (`int_*_jump_if_ovf` on the
@@ -4837,6 +4837,34 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.meta.has_compiled_loop(green_key)
+    }
+
+    /// Whether the warm-entry runner can actually execute the code at this
+    /// green key. Stronger than `has_compiled_loop`: it also requires a
+    /// frontend `compiled_loops` meta (`get_compiled_meta`).
+    ///
+    /// `has_compiled_loop` is true whenever the cell's procedure token has a
+    /// compiled backend body (`warmstate.py:482-511` gates entry on code
+    /// presence). That includes a `compile_tmp_callback` token
+    /// (`compile.py:1101-1150`): a CALL_ASSEMBLER fallback stub with a real
+    /// body but NO frontend meta, since MetaInterp never inserts it into
+    /// `compiled_loops`. RPython's `execute_assembler` can enter such a token
+    /// directly — the stub bounces control back to the interpreter
+    /// (ContinueRunningNormally). Pyre's warm-entry runner instead needs the
+    /// `compiled_loops` meta to interpret guard-failure exit layouts, so
+    /// entering a bare tmp callback here has no meta and aborts.
+    ///
+    /// Gating warm-entry dispatch on this predicate lets a tmp-only cell fall
+    /// through to the counter tick / trace-start, which is the pyre-orthodox
+    /// realization of the tmp-callback → resume-interp semantics: the back-edge
+    /// counter keeps ticking until the real loop compiles (a `compiled_loops`
+    /// entry appears) and `redirect_call_assembler` takes over. Entry bridges
+    /// (`ResumeFromInterpDescr`, `compile.py:1079-1083`) DO get a
+    /// `compiled_loops` entry despite carrying 0 target tokens, so they remain
+    /// dispatchable — this predicate only excludes bare tmp callbacks.
+    #[inline]
+    pub fn has_runnable_compiled_loop(&self, green_key: u64) -> bool {
+        self.has_compiled_loop(green_key) && self.meta.get_compiled_meta(green_key).is_some()
     }
 
     /// Actual key the last compile_loop stored under.
@@ -6042,22 +6070,22 @@ mod tests {
     use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
 
     // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
-    // a non-null `bh.virtualizable_info`. A state-field machine (`token_offset == 0`)
+    // a non-null `bh.virtualizable_info`. A state-field machine (no `vable_token`)
     // must be seeded so a mid-body vable-array op — the `int_*_jump_if_ovf` overflow
     // guard on a `[int; virt]` field — resolves its vinfo during resume instead of
-    // panicking. A real heap virtualizable (`token_offset > 0`, e.g. PyFrame) keeps
-    // the prior null-vinfo resume contract unless the portal-inline experiment is on.
+    // panicking. A real heap virtualizable (e.g. PyFrame) keeps the prior
+    // null-vinfo resume contract unless the portal-inline experiment is on.
     #[test]
     fn seed_deopt_vinfo_ptr_seeds_state_field_and_skips_heap_virtualizable() {
         use crate::virtualizable::VirtualizableInfo;
 
-        // token_offset == 0 → seed the reconstructed vinfo pointer (always, since
+        // no vable_token → seed the reconstructed vinfo pointer (always, since
         // its `bh_clear_vable_token` is inert and cannot corrupt the state struct).
-        let state_field = std::sync::Arc::new(VirtualizableInfo::new(0));
+        let state_field = std::sync::Arc::new(VirtualizableInfo::without_vable_token());
         assert_eq!(
             seed_deopt_vinfo_ptr(Some(&state_field)),
             std::sync::Arc::as_ptr(&state_field),
-            "a token_offset==0 state-field machine must seed a non-null vinfo",
+            "a state-field machine with no vable_token must seed a non-null vinfo",
         );
 
         // No vinfo available → null.

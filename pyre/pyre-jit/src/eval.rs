@@ -16,8 +16,11 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
     PyError, PyResult, StepResult, decode_instruction_forward, execute_opcode_step,
 };
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::rc::Rc;
+
+use vecset::VecSet;
 
 use majit_backend::Backend;
 use majit_gc::GcAllocator;
@@ -1092,7 +1095,8 @@ use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::{INT_INTVAL_OFFSET, W_IntObject};
 use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 
-const JIT_THRESHOLD: u32 = 200;
+// rlib/jit.py PARAMETERS default: loop hot-count threshold.
+const JIT_THRESHOLD: u32 = 1039;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
     std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
@@ -6184,6 +6188,25 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
     // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
 }
 
+/// Loop-header PC set for `code`, from the `CallControl` that owns the
+/// per-graph codewriter caches (call.py:29 `self.jitcodes = {}`).
+///
+/// The set is scanned once per graph and kept there, matching the point in
+/// upstream where loop headers are fixed: `jtransform.py:1714-1723`
+/// rewrites `can_enter_jit` into a `loop_header` operation while the
+/// codewriter builds that graph's `JitCode`, so the running interpreter
+/// only ever reads an already-derived answer. Recomputing the scan per
+/// back-edge would re-walk the whole bytecode and rebuild the successor
+/// map on every loop iteration of every interpreted frame.
+fn cached_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> std::sync::Arc<VecSet<usize>> {
+    // The `&mut CallControl` borrow ends with this statement — the set is
+    // handed back as a shared `Arc`, so no caller holds it across a
+    // re-entry into `callcontrol()`.
+    crate::jit::codewriter::CodeWriter::instance()
+        .callcontrol()
+        .get_loop_header_pcs(code)
+}
+
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
 /// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
@@ -6204,7 +6227,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // on the Rust stack that walk_pyframe_roots cannot reach).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    let semantic_loop_headers = crate::jit::codewriter::find_loop_header_pcs(code);
+    // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
+    // back-edge event).  Loopless frames — the overwhelming majority during
+    // cold startup, where every called helper / class body / module top level
+    // runs once and never takes a back-edge — never reach it, so computing it
+    // eagerly here scanned the whole bytecode and built a successor map for
+    // every frame entry to produce a set no one read.  Compute it lazily at
+    // the first back-edge instead (kept per graph on `CallControl`).
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
@@ -6371,7 +6400,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 driver.blackhole_if_trace_too_long();
             }
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
-                if !semantic_loop_headers.contains(&loop_header_pc) {
+                if !cached_loop_header_pcs(code).contains(&loop_header_pc) {
                     driver.blackhole_if_trace_too_long();
                     continue;
                 }
@@ -6603,8 +6632,13 @@ fn maybe_compile_and_run(
     }
     // warmstate.py:503-511: procedure_token exists → EnterJitAssembler.
     // RPython enters assembler unconditionally when a compiled loop is
-    // available for this green_key.
-    if driver.has_compiled_loop(green_key) {
+    // available for this green_key. Pyre gates on `has_runnable_compiled_loop`
+    // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token — which
+    // has a compiled body but no `compiled_loops` meta — falls through to the
+    // counter tick below instead of entering `execute_assembler` with no meta
+    // to interpret its exit (which aborts). The tmp cell then re-ticks until
+    // the real loop compiles.
+    if driver.has_runnable_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
     // Pyre-local deviation: this short-circuit treats `DONT_TRACE_HERE` as a
@@ -7501,7 +7535,7 @@ fn bound_reached(
     {
         return None;
     }
-    if !driver.has_compiled_loop(green_key) && !driver.is_tracing() {
+    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -7513,7 +7547,7 @@ fn bound_reached(
         );
     }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
-    let outcome = if driver.has_compiled_loop(green_key) {
+    let outcome = if driver.has_runnable_compiled_loop(green_key) {
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
@@ -7643,8 +7677,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let (driver, info) = driver_pair();
 
     // RPython warmstate.py maybe_compile_and_run fast path:
-    // if no compiled loop and not tracing, just tick the counter.
-    if !driver.has_compiled_loop(green_key) && !driver.is_tracing() {
+    // if no runnable compiled loop and not tracing, just tick the counter.
+    // A bare `compile_tmp_callback` token (has_compiled_loop true, no
+    // `compiled_loops` meta) is treated as not-yet-runnable so the counter
+    // keeps ticking toward compiling the real loop.
+    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
         let should_trace = driver
             .meta_interp_mut()
             .warm_state_mut()
@@ -7661,9 +7698,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     )) {
         return None;
     }
-    if driver.has_compiled_loop(green_key) {
+    if driver.has_runnable_compiled_loop(green_key) {
         // Same gate as maybe_compile_and_run: only enter compiled code
-        // when a compiled loop exists for this green_key.
+        // when a runnable compiled loop (frontend meta present, not a bare
+        // tmp callback) exists for this green_key.
         // warmstate.py:503-511: procedure_token → enter unconditionally.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
