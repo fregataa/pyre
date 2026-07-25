@@ -57,7 +57,7 @@ use std::rc::Rc;
 use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
-    Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
+    AlwaysInline, Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::FunctionGraph as LegacyGraph;
@@ -1747,8 +1747,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // against the real struct.  An unrecognized token (none currently
         // emitted) falls through to the normal lift.
         let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
-            || (crate::front::mir::elidable_residualize_enabled()
-                && graph.hints.iter().any(|h| h == "elidable"));
+            || graph.hints.iter().any(|h| h == "elidable");
         if residualize {
             let result_shell = match graph.return_type.as_deref() {
                 Some("ref") => Some(
@@ -1920,10 +1919,25 @@ pub(crate) fn lift_callee_to_pygraph(
     // FunctionDesc.__init__` test fixtures — empty Dict globals,
     // name from the legacy graph.  No HostCode body — the cache
     // pre-fill ensures `cachedgraph` never asks for one.
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         callee_graph.name.clone(),
         Constant::new(ConstValue::Dict(HashMap::new())),
     );
+    func._always_inline_ = if callee_graph
+        .hints
+        .iter()
+        .any(|hint| hint == "always_inline")
+    {
+        AlwaysInline::True
+    } else if callee_graph
+        .hints
+        .iter()
+        .any(|hint| hint == "always_inline_try")
+    {
+        AlwaysInline::Try
+    } else {
+        AlwaysInline::Absent
+    };
     let pygraph = Rc::new(PyGraph {
         graph,
         func,
@@ -4492,6 +4506,7 @@ mod tests {
             framestate: None,
         };
         callee_graph.blocks = vec![foo_start, foo_return];
+        callee_graph.hints.push("always_inline".to_string());
         let leaf_registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(
             std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
         );
@@ -4502,6 +4517,11 @@ mod tests {
             &leaf_registry,
         )
         .expect("leaf callee must lift to PyGraph");
+        assert_eq!(
+            pygraph.func._always_inline_,
+            AlwaysInline::True,
+            "legacy always_inline hint must land on graph.func"
+        );
         // Capture the callee's flowspace graph `Rc` before the pygraph
         // is moved into `register_callee`; this is the identity that
         // `cachedgraph` clones into `translator.graphs` and that

@@ -80,6 +80,15 @@ pub type GcAllocHookFn = fn(type_id: u32, payload_size: usize) -> *mut u8;
 majit_gc::global_hook!(static GC_ALLOC_HOOK: GcAllocHookFn);
 majit_gc::global_hook!(static GC_ALLOC_STABLE_HOOK: GcAllocHookFn);
 
+/// Placement-reporting companion of [`GcAllocHookFn`] for no-collect
+/// allocations that may spill from the nursery to old-gen.
+pub type GcAllocWithPlacementHookFn =
+    unsafe fn(type_id: u32, payload_size: usize, needs_write_barrier: *mut bool) -> *mut u8;
+
+majit_gc::global_hook!(
+    static GC_ALLOC_WITH_PLACEMENT_HOOK: GcAllocWithPlacementHookFn
+);
+
 /// Install the allocation callback. Overwrites any previously-installed hook.
 pub fn register_gc_alloc_hook(hook: GcAllocHookFn) {
     GC_ALLOC_HOOK.set(Some(hook));
@@ -97,6 +106,30 @@ pub fn clear_gc_alloc_hook() {
 #[inline]
 pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
     GC_ALLOC_HOOK.get().map(|f| f(type_id, payload_size))
+}
+
+pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
+    GC_ALLOC_WITH_PLACEMENT_HOOK.set(Some(hook));
+}
+
+pub fn clear_gc_alloc_with_placement_hook() {
+    GC_ALLOC_WITH_PLACEMENT_HOOK.set(None);
+}
+
+/// Attempt a no-collect allocation and report whether a fresh GC-reference
+/// field needs a creation barrier. Backends without placement reporting fall
+/// back to the ordinary allocation hook and conservatively keep the barrier.
+#[inline]
+pub fn try_gc_alloc_with_placement(
+    type_id: u32,
+    payload_size: usize,
+    needs_write_barrier: &mut bool,
+) -> Option<*mut u8> {
+    if let Some(f) = GC_ALLOC_WITH_PLACEMENT_HOOK.get() {
+        return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
+    }
+    *needs_write_barrier = true;
+    try_gc_alloc(type_id, payload_size)
 }
 
 /// Install the stable (old-gen) allocation callback for this thread.
@@ -165,65 +198,56 @@ pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<*mut
         .map(|f| f(type_id, payload_size))
 }
 
-/// Signature of the host-side memory-pressure callback: charge `bytes` of
-/// off-heap, GC-invisible payload (a bignum's external limb `Vec`).
-pub type GcChargeMemoryPressureFn = fn(bytes: usize);
+/// Root-aware collecting allocation callback. `root` is a caller-owned slot
+/// containing the one GC child manufactured before its parent allocation.
+pub type GcAllocCollectingRootedHookFn = unsafe fn(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut *mut u8,
+    needs_write_barrier: *mut bool,
+) -> *mut u8;
 
-majit_gc::global_hook!(static GC_CHARGE_MEMORY_PRESSURE_HOOK: GcChargeMemoryPressureFn);
+majit_gc::global_hook!(
+    static GC_ALLOC_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
+);
 
-/// Install the memory-pressure callback.
-pub fn register_gc_charge_memory_pressure_hook(hook: GcChargeMemoryPressureFn) {
-    GC_CHARGE_MEMORY_PRESSURE_HOOK.set(Some(hook));
+pub fn register_gc_alloc_collecting_rooted_hook(hook: GcAllocCollectingRootedHookFn) {
+    GC_ALLOC_COLLECTING_ROOTED_HOOK.set(Some(hook));
 }
 
-/// Remove the memory-pressure callback.
-pub fn clear_gc_charge_memory_pressure_hook() {
-    GC_CHARGE_MEMORY_PRESSURE_HOOK.set(None);
+pub fn clear_gc_alloc_collecting_rooted_hook() {
+    GC_ALLOC_COLLECTING_ROOTED_HOOK.set(None);
 }
 
-/// Charge `bytes` of off-heap memory pressure via the installed hook (no-op when
-/// none is installed, e.g. bare unit tests or backends without a generational GC).
-/// Only the bignum collecting-alloc site calls this, from a gcmap-rooted residual
-/// call where a forced minor is safe.
+/// Attempt a collecting allocation while preserving `root`.
+///
+/// Backends with the rooted fast path register the slot only if the nursery
+/// bump fails. The fallback retains the previous conservative behavior for
+/// backends that expose only the ordinary collecting hook.
+///
+/// # Safety
+/// `root` must remain a valid mutable GC-pointer slot until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
 #[inline]
-pub fn try_gc_charge_memory_pressure(bytes: usize) {
-    if let Some(f) = GC_CHARGE_MEMORY_PRESSURE_HOOK.get() {
-        f(bytes);
+pub unsafe fn try_gc_alloc_collecting_rooted(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut *mut u8,
+    needs_write_barrier: *mut bool,
+) -> Option<*mut u8> {
+    if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
+        return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
     }
-}
-
-/// Signature of the host-side old-gen external-byte callback: add `bytes` of
-/// `obj_addr`'s off-heap payload to the major-collection threshold's external
-/// total when the object is old-gen.
-pub type GcChargeOldgenExternalFn = fn(obj_addr: usize, bytes: usize);
-
-majit_gc::global_hook!(static GC_CHARGE_OLDGEN_EXTERNAL_HOOK: GcChargeOldgenExternalFn);
-
-/// Install the old-gen external-byte callback.
-pub fn register_gc_charge_oldgen_external_hook(hook: GcChargeOldgenExternalFn) {
-    GC_CHARGE_OLDGEN_EXTERNAL_HOOK.set(Some(hook));
-}
-
-/// Remove the old-gen external-byte callback.
-pub fn clear_gc_charge_oldgen_external_hook() {
-    GC_CHARGE_OLDGEN_EXTERNAL_HOOK.set(None);
-}
-
-/// Charge `bytes` of `obj_addr`'s off-heap payload against the major threshold
-/// via the installed hook when the object is old-gen (no-op when none is
-/// installed). Unlike [`try_gc_charge_memory_pressure`] this never forces a
-/// minor, so it is safe after allocating an unrooted payload: a directly-old-gen
-/// bignum's limb `Vec` would otherwise stay invisible to the threshold until
-/// the next major's `recompute_oldgen_external_bytes`.
-// `dont_look_inside`: host hook dispatch (a process-global atomic fn-pointer cell)
-// stays opaque to the JIT — the `try_gc_add_root` / `try_gc_remove_root` /
-// `try_gc_write_barrier` twins; calls residualize via the registered fnaddr
-// (`rlib/jit.py:139`). A `()` return has no discriminant to erase.
-#[majit_macros::dont_look_inside]
-pub fn try_gc_charge_oldgen_external(obj_addr: usize, bytes: usize) {
-    if let Some(f) = GC_CHARGE_OLDGEN_EXTERNAL_HOOK.get() {
-        f(obj_addr, bytes);
+    let collecting = GC_ALLOC_COLLECTING_HOOK.get()?;
+    // Backends without placement reporting retain the conservative creation
+    // barrier. MiniMark's rooted hook clears this for a nursery result.
+    unsafe { *needs_write_barrier = true };
+    let pinned = unsafe { try_gc_add_root(root) };
+    let result = collecting(type_id, payload_size);
+    if pinned {
+        try_gc_remove_root(root);
     }
+    Some(result)
 }
 
 /// Signature of the host-side full-collection callback. Used by
@@ -620,6 +644,25 @@ mod tests {
         std::ptr::null_mut()
     }
 
+    unsafe fn nursery_rooted_hook(
+        type_id: u32,
+        payload_size: usize,
+        _root: *mut *mut u8,
+        needs_write_barrier: *mut bool,
+    ) -> *mut u8 {
+        unsafe { *needs_write_barrier = false };
+        mock_hook(type_id, payload_size)
+    }
+
+    unsafe fn nursery_placement_hook(
+        type_id: u32,
+        payload_size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> *mut u8 {
+        unsafe { *needs_write_barrier = false };
+        mock_hook(type_id, payload_size)
+    }
+
     #[test]
     fn returns_none_when_unregistered() {
         let _hook_lock = hook_test_guard();
@@ -655,6 +698,20 @@ mod tests {
         let ptr = try_gc_alloc(1, 8);
         assert!(ptr.is_some());
         assert!(ptr.unwrap().is_null());
+        clear_gc_alloc_hook();
+    }
+
+    #[test]
+    fn managed_bigint_digits_do_not_fall_back_to_raw_after_hook_failure() {
+        let _hook_lock = hook_test_guard();
+        register_gc_alloc_hook(null_hook);
+        let block = unsafe {
+            crate::object_array::try_alloc_typed_items_block_nursery(
+                4,
+                crate::object_array::GC_INT_ARRAY_GC_TYPE_ID,
+            )
+        };
+        assert!(block.is_none());
         clear_gc_alloc_hook();
     }
 
@@ -716,6 +773,53 @@ mod tests {
 
         clear_gc_alloc_hook();
         clear_gc_alloc_stable_hook();
+    }
+
+    #[test]
+    fn no_collect_placement_hook_has_conservative_fallback() {
+        let _hook_lock = hook_test_guard();
+        clear_gc_alloc_hook();
+        clear_gc_alloc_with_placement_hook();
+        let mut needs_write_barrier = false;
+
+        register_gc_alloc_hook(mock_hook);
+        let result = try_gc_alloc_with_placement(7, 24, &mut needs_write_barrier);
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(needs_write_barrier);
+
+        register_gc_alloc_with_placement_hook(nursery_placement_hook);
+        let result = try_gc_alloc_with_placement(7, 24, &mut needs_write_barrier);
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(!needs_write_barrier);
+
+        clear_gc_alloc_hook();
+        clear_gc_alloc_with_placement_hook();
+    }
+
+    #[test]
+    fn rooted_collecting_hook_reports_placement_conservatively() {
+        let _hook_lock = hook_test_guard();
+        clear_gc_alloc_collecting_hook();
+        clear_gc_alloc_collecting_rooted_hook();
+        clear_gc_root_hooks();
+        let mut root = std::ptr::null_mut();
+        let mut needs_write_barrier = false;
+
+        register_gc_alloc_collecting_hook(mock_hook);
+        let result =
+            unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(needs_write_barrier);
+
+        register_gc_alloc_collecting_rooted_hook(nursery_rooted_hook);
+        needs_write_barrier = true;
+        let result =
+            unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(!needs_write_barrier);
+
+        clear_gc_alloc_collecting_hook();
+        clear_gc_alloc_collecting_rooted_hook();
     }
 
     #[test]

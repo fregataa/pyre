@@ -4535,15 +4535,11 @@ mod tests {
     /// executable-code buffers — is a process-global singleton driven on a
     /// single thread by design. The `cargo test` harness runs tests on a thread
     /// pool, so two loops crossing the compile threshold at once race on that
-    /// shared state and one of them reads a half-installed trace. Tests that
-    /// drive JIT compilation serialise on this lock so only one compiles at a
-    /// time. Poison is recovered: a panicking test must not wedge the others.
-    static JIT_COMPILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// shared state and one of them reads a half-installed trace. Use the same
+    /// exclusion domain as tests that mutate the process-global stack-probe
+    /// state: compiled Cranelift prologues read those values directly.
     fn jit_compile_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        JIT_COMPILE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::stack_check::test_support::stack_and_jit_test_guard()
     }
 
     fn run_eval(source: &str) -> PyResult {
@@ -5029,6 +5025,105 @@ while i < 3000:
     }
 
     #[test]
+    fn test_hot_mixed_long_int_specializations_survive_compiled_trace() {
+        let _jit_guard = jit_compile_test_guard();
+        let source = "\
+base = (1 << 190) + 81985529216486895
+i = 0
+while i < 3000:
+    add_l = base + i
+    add_r = i + base
+    sub_l = base - i
+    sub_r = i - base
+    mul_l = base * -17
+    mul_r = -17 * base
+    and_l = base & -17
+    and_r = -17 & base
+    or_l = base | -17
+    or_r = -17 | base
+    xor_l = base ^ -17
+    xor_r = -17 ^ base
+    bool_l = base + True
+    bool_r = True + base
+    lt_l = base < i
+    le_l = base <= i
+    gt_l = base > i
+    ge_l = base >= i
+    eq_l = base == i
+    ne_l = base != i
+    lt_r = i < base
+    le_r = i <= base
+    gt_r = i > base
+    ge_r = i >= base
+    eq_r = i == base
+    ne_r = i != base
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("mixed-long/int hot loop failed");
+
+        let base = pyre_object::rbigint::RBigInt::one()
+            .lshift(190)
+            .unwrap()
+            .int_add(81_985_529_216_486_895);
+        let expected = [
+            ("add_l", base.int_add(2999)),
+            ("add_r", base.int_add(2999)),
+            ("sub_l", base.int_sub(2999)),
+            (
+                "sub_r",
+                pyre_object::rbigint::RBigInt::fromint(2999).sub(&base),
+            ),
+            ("mul_l", base.int_mul(-17)),
+            ("mul_r", base.int_mul(-17)),
+            ("and_l", base.int_and_(-17)),
+            ("and_r", base.int_and_(-17)),
+            ("or_l", base.int_or_(-17)),
+            ("or_r", base.int_or_(-17)),
+            ("xor_l", base.int_xor(-17)),
+            ("xor_r", base.int_xor(-17)),
+            ("bool_l", base.int_add(1)),
+            ("bool_r", base.int_add(1)),
+        ];
+        unsafe {
+            let i = w_dict_getitem_str(frame.w_globals, "i").expect("missing i");
+            assert_eq!(w_int_get_value(i), 3000);
+            for (name, expected) in expected {
+                let value = w_dict_getitem_str(frame.w_globals, name)
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                let actual = if is_long(value) {
+                    w_long_get_value(value).clone()
+                } else {
+                    assert!(is_int(value), "{name} is not an int object");
+                    pyre_object::rbigint::RBigInt::fromint(w_int_get_value(value))
+                };
+                assert!(actual.eq(&expected), "{name} differs from rbigint.int_*");
+            }
+            for (name, expected) in [
+                ("lt_l", false),
+                ("le_l", false),
+                ("gt_l", true),
+                ("ge_l", true),
+                ("eq_l", false),
+                ("ne_l", true),
+                ("lt_r", true),
+                ("le_r", true),
+                ("gt_r", false),
+                ("ge_r", false),
+                ("eq_r", false),
+                ("ne_r", true),
+            ] {
+                let value = w_dict_getitem_str(frame.w_globals, name)
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                assert!(is_bool(value), "{name} is not bool");
+                assert_eq!(w_bool_get_value(value), expected, "{name} mismatch");
+            }
+        }
+    }
+
+    #[test]
     fn test_hot_unary_invert_loop_survives_compiled_trace() {
         let _jit_guard = jit_compile_test_guard();
         let source = "\
@@ -5500,7 +5595,9 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = frame.execute_frame(None, None);
+        frame
+            .execute_frame(None, None)
+            .expect("hot user-function loop failed");
         unsafe {
             let i = w_dict_getitem_str(frame.w_globals, "i").unwrap();
             let acc = w_dict_getitem_str(frame.w_globals, "acc").unwrap();

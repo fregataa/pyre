@@ -180,11 +180,15 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
+        dynasm_alloc_nursery_typed_with_placement,
+    ));
     majit_gc::set_active_alloc_nursery_collecting_typed(Some(
         dynasm_alloc_nursery_collecting_typed,
     ));
-    majit_gc::set_active_charge_memory_pressure(Some(dynasm_charge_memory_pressure));
-    majit_gc::set_active_charge_oldgen_external(Some(dynasm_charge_oldgen_external));
+    majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
+        dynasm_alloc_nursery_collecting_typed_rooted,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
     majit_gc::set_active_collect_full(Some(dynasm_collect_full));
     majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
@@ -362,18 +366,41 @@ fn dynasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // caller holds a raw `*mut u8` on the Rust stack that is NOT
     // registered as a GC root. Collection here would move the
     // freshly-allocated nursery object, leaving the caller with a
-    // dangling pointer. Routing through `alloc_nursery_no_collect_typed`
+    // dangling pointer. Routing through `try_alloc_nursery_no_collect_typed`
     // falls back to old-gen on nursery full — stable across minor
-    // collections that fire between here and the caller's store into
-    // a tracked slot.
+    // collections that fire between here and the caller's store into a
+    // tracked slot — and returns NULL when rawmalloc fails so the host helper
+    // can raise `MemoryError`.
     if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
         c.borrow_mut()
             .as_deref_mut()
-            .map(|g| g.alloc_nursery_no_collect_typed(type_id, size))
+            .map(|g| g.try_alloc_nursery_no_collect_typed(type_id, size))
     }) {
         return r;
     }
-    majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_no_collect_typed(type_id, size))
+    majit_gc::gc_sync::gc_op(|g| g.try_alloc_nursery_no_collect_typed(type_id, size))
+}
+
+/// Placement-reporting companion of [`dynasm_alloc_nursery_typed`].
+///
+/// # Safety
+/// `needs_write_barrier` must remain a valid mutable `bool` slot until this
+/// call returns.
+unsafe fn dynasm_alloc_nursery_typed_with_placement(
+    type_id: u32,
+    size: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+        c.borrow_mut().as_deref_mut().map(|g| unsafe {
+            g.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+        })
+    }) {
+        return r;
+    }
+    majit_gc::gc_sync::gc_op(|g| unsafe {
+        g.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+    })
 }
 
 /// Host-side *collecting* nursery allocation trampoline. Unlike
@@ -394,36 +421,30 @@ fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
     majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_typed(type_id, size))
 }
 
-/// Host-side old-gen external-byte trampoline — charges off-heap
-/// (GC-invisible) bytes such as a freshly-built bignum's limb `Vec` on the
-/// active GC when the initialized object landed in old-gen. Never forces a
-/// minor collection.
-fn dynasm_charge_oldgen_external(obj_addr: usize, bytes: usize) {
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow_mut()
-                .as_deref_mut()
-                .map(|g| g.charge_oldgen_external(obj_addr, bytes))
+/// Rooted collecting allocation used when a residual helper has manufactured
+/// one GC child on the native Rust stack before allocating its parent. The
+/// MiniMark override keeps the root out of the dynamic root set unless the
+/// nursery bump actually reaches `collect_and_reserve`.
+///
+/// # Safety
+/// `root` must remain a valid mutable GC slot until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
+unsafe fn dynasm_alloc_nursery_collecting_typed_rooted(
+    type_id: u32,
+    size: usize,
+    root: *mut GcRef,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+        c.borrow_mut().as_deref_mut().map(|g| unsafe {
+            g.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
         })
-        .is_some()
-    {
-        return;
+    }) {
+        return r;
     }
-    majit_gc::gc_sync::gc_op(|g| g.charge_oldgen_external(obj_addr, bytes));
-}
-
-fn dynasm_charge_memory_pressure(bytes: usize) {
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow_mut()
-                .as_deref_mut()
-                .map(|g| g.charge_memory_pressure(bytes))
-        })
-        .is_some()
-    {
-        return;
-    }
-    majit_gc::gc_sync::gc_op(|g| g.charge_memory_pressure(bytes));
+    majit_gc::gc_sync::gc_op(|g| unsafe {
+        g.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+    })
 }
 
 /// Host-side old-gen allocation trampoline. Used by
