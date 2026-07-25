@@ -195,7 +195,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         ConcreteValue::Ref(sym.last_exc_value())
     };
 
-    // Exception-edge bridge routing (`PYRE_EXC_EDGE_BRIDGE`): an exception-guard
+    // Exception-edge bridge routing: an exception-guard
     // bridge with a standing exception resumes at the no-exception fallthrough
     // `-live-`, NOT the `except` handler.  Mirror the blackhole
     // `handle_exception_in_frame` backward case: route the walk entry to the
@@ -214,7 +214,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         && !sym.last_exc_box().is_none()
         && !sym.last_exc_value().is_null();
     let exc_edge_catch_target = if exc_edge_precondition {
-        find_catch_before_resume_live(jitcode_code, position)
+        find_catch_for_exc_resume(jitcode_code, position)
             // Only route when the handler rejoins this frame's loop; a handler
             // that returns out of the frame (called function's `try/except:
             // return`, compiled as its own function trace) needs cross-frame
@@ -359,7 +359,26 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             let exc_class_const = wc.trace_ctx.const_int(exc_edge_class);
             wc.trace_ctx
                 .record_guard(OpCode::GuardException, &[exc_class_const], 0);
-            walker_capture_snapshot_for_last_guard(&mut wc, position)?;
+            // `handle_possible_exception` captures resume data at the MIFrame's
+            // CURRENT pc — already past the residual call (`pyjitpl.py:2610
+            // capture_resumedata`, default `resumepc`).  `position` here IS
+            // that post-call resume coordinate (decoded from the failing
+            // guard), so capture WITHOUT the after-residual advance and carry
+            // `position` verbatim (`GuardCaptureScope::carried_resume_jit_pc`):
+            // the twin lookups compensate CALL-START keys and would advance an
+            // already-advanced coordinate a second time — on this shape onto
+            // the physically-following `except` handler block, so the entry
+            // guard's own bridge would resume INSIDE the handler (every
+            // no-raise iteration then runs the handler body).
+            walker_capture_snapshot_for_last_guard_impl(
+                &mut wc,
+                position,
+                false,
+                GuardCaptureScope {
+                    carried_resume_jit_pc: Some(position),
+                    ..Default::default()
+                },
+            )?;
             // `execute_ll_raised` parity: the standing exception the handler
             // reads (`last_exc_value/>r`) is the SAVE_EXCEPTION box — the
             // runtime-restored value, NOT a baked constant — so a value-using
@@ -398,6 +417,31 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             vstack_enter_exception_handler(&mut wc, seed.catch_target, seed.exc);
             seed.catch_target
         } else {
+            // `_prepare_exception_resumption` null-exception arm
+            // (pyjitpl.py:3152-3154) + `prepare_resume_from_failure`
+            // (pyjitpl.py:3156-3171): every exception-guard bridge re-checks
+            // its entry flavor.  With no pending exception at walk time,
+            // `clear_exception()` + `handle_possible_exception()` record
+            // GUARD_NO_EXCEPTION at the bridge start, so the OTHER failure
+            // flavor — a pending exception whose class the source guard's
+            // expected class does not match — deopts to the blackhole at
+            // bridge entry instead of running the recorded no-exception
+            // continuation on a NULL raised-call result.
+            if wc.trace_ctx.is_bridge_trace && wc.trace_ctx.bridge_source_is_exception_guard() {
+                wc.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                // `position` is already the post-call resume coordinate —
+                // capture without the after-residual advance and carry it
+                // verbatim (see the routed arm above).
+                walker_capture_snapshot_for_last_guard_impl(
+                    &mut wc,
+                    position,
+                    false,
+                    GuardCaptureScope {
+                        carried_resume_jit_pc: Some(position),
+                        ..Default::default()
+                    },
+                )?;
+            }
             seed_vstack_mirror(&mut wc, sym, position);
             position
         };
