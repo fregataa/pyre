@@ -204,6 +204,182 @@ fn split_root(path: &str) -> (&str, &str) {
     }
 }
 
+/// Windows-only `nt` calls — PyPy: pypy/module/posix/interp_nt.py and the
+/// `if _WIN32` blocks of interp_posix.py. Registered under the `nt` module
+/// name on Windows (moduledef.py `applevel_name = os.name`); `ntpath` reaches
+/// for these through `from nt import _getfullpathname` and friends.
+#[cfg(all(windows, feature = "host_env"))]
+mod win_nt {
+    use pyre_object::PyObjectRef;
+    use rustpython_host_env::nt as host_nt;
+    use std::path::Path;
+
+    /// Wrap a host-layer `io::Error` as an OSError carrying the offending path.
+    fn io_err(error: &std::io::Error, path: &str) -> crate::PyError {
+        let errno = crate::builtins::io_error_posix_errno(error, 0);
+        let filename = if path.is_empty() {
+            pyre_object::PY_NULL
+        } else {
+            pyre_object::w_str_new(path)
+        };
+        crate::PyError::os_error_syscall(errno, filename)
+    }
+
+    /// Read argument 0 as a filesystem path; the flag reports whether the
+    /// input was bytes so the result can be encoded back to match.
+    fn arg_path(args: &[PyObjectRef], func: &str) -> Result<(String, bool), crate::PyError> {
+        let Some(&arg) = args.first() else {
+            return Err(crate::PyError::type_error(format!(
+                "{func}() missing required argument 'path'"
+            )));
+        };
+        let as_bytes = unsafe { pyre_object::bytesobject::is_bytes_like(arg) };
+        let path = crate::gateway::fsencode_w(arg)?;
+        Ok((path, as_bytes))
+    }
+
+    fn wrap_path(s: &std::ffi::OsStr, as_bytes: bool) -> PyObjectRef {
+        let text = s.to_string_lossy();
+        if as_bytes {
+            pyre_object::w_bytes_from_bytes(text.as_bytes())
+        } else {
+            pyre_object::w_str_new(&text)
+        }
+    }
+
+    /// ntpath.abspath helper — resolves `.`/`..` and the drive without
+    /// requiring the path to exist.
+    pub fn _getfullpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (path, as_bytes) = arg_path(args, "_getfullpathname")?;
+        match host_nt::getfullpathname(Path::new(&path)) {
+            Ok(result) => Ok(wrap_path(&result, as_bytes)),
+            Err(error) => Err(io_err(&error, &path)),
+        }
+    }
+
+    /// ntpath.realpath helper — the canonical `\\?\`-prefixed path, via a
+    /// backup-semantics handle so directories open too.
+    pub fn _getfinalpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (path, as_bytes) = arg_path(args, "_getfinalpathname")?;
+        if path.contains('\0') {
+            return Err(crate::PyError::value_error("embedded null character"));
+        }
+        match host_nt::getfinalpathname(Path::new(&path)) {
+            Ok(result) => Ok(wrap_path(&result, as_bytes)),
+            Err(error) => Err(io_err(&error, &path)),
+        }
+    }
+
+    /// os.stat helper for ntpath.samefile — (volume serial, file index high,
+    /// file index low) uniquely identifies a file across handles. host_env has
+    /// no wrapper for GetFileInformationByHandle, so call windows-sys directly.
+    pub fn _getfileinformation(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let Some(&arg) = args.first() else {
+            return Err(crate::PyError::type_error(
+                "_getfileinformation() missing required argument 'fd'",
+            ));
+        };
+        let fd = unsafe { pyre_object::w_int_get_value(arg) } as i32;
+        let handle = host_nt::handle_from_fd(fd);
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err(io_err(&std::io::Error::last_os_error(), ""));
+        }
+        Ok(pyre_object::w_tuple_new(vec![
+            pyre_object::w_int_new(info.dwVolumeSerialNumber as i64),
+            pyre_object::w_int_new(info.nFileIndexHigh as i64),
+            pyre_object::w_int_new(info.nFileIndexLow as i64),
+        ]))
+    }
+
+    /// shutil.disk_usage helper — (total, free) bytes. host_env::getdiskusage
+    /// retries against the parent directory when the path names a file
+    /// (ERROR_DIRECTORY).
+    pub fn _getdiskusage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (path, _) = arg_path(args, "_getdiskusage")?;
+        if path.contains('\0') {
+            return Err(crate::PyError::value_error("embedded null character"));
+        }
+        match host_nt::getdiskusage(Path::new(&path)) {
+            Ok((total, free)) => Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::w_int_new(total as i64),
+                pyre_object::w_int_new(free as i64),
+            ])),
+            Err(error) => Err(io_err(&error, &path)),
+        }
+    }
+
+    /// os.get_handle_inheritable — the argument is an OS handle value, not a
+    /// CRT fd (rwin32.cast(HANDLE, fd)).
+    pub fn get_handle_inheritable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let Some(&arg) = args.first() else {
+            return Err(crate::PyError::type_error(
+                "get_handle_inheritable() missing required argument 'handle'",
+            ));
+        };
+        let handle = unsafe { pyre_object::w_int_get_value(arg) } as libc::intptr_t;
+        match host_nt::get_handle_inheritable(handle) {
+            Ok(value) => Ok(pyre_object::w_bool_from(value)),
+            Err(error) => Err(io_err(&error, "")),
+        }
+    }
+
+    /// os.set_handle_inheritable.
+    pub fn set_handle_inheritable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        if args.len() < 2 {
+            return Err(crate::PyError::type_error(
+                "set_handle_inheritable() takes 2 arguments",
+            ));
+        }
+        let handle = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::intptr_t;
+        let inheritable = crate::baseobjspace::is_true(args[1])?;
+        match host_nt::set_handle_inheritable(handle, inheritable) {
+            Ok(()) => Ok(pyre_object::w_none()),
+            Err(error) => Err(io_err(&error, "")),
+        }
+    }
+
+    /// os._add_dll_directory. PyPy hands back a W_DLLCapsule; os.py only
+    /// round-trips the value into `_remove_dll_directory`, so the opaque
+    /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead. host_env has
+    /// no AddDllDirectory wrapper, so call windows-sys directly.
+    pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
+        let (path, _) = arg_path(args, "_add_dll_directory")?;
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
+        if cookie.is_null() {
+            return Err(io_err(&std::io::Error::last_os_error(), &path));
+        }
+        Ok(pyre_object::w_int_new(cookie as usize as i64))
+    }
+
+    /// os._remove_dll_directory — takes the cookie returned above.
+    pub fn _remove_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
+        let Some(&arg) = args.first() else {
+            return Err(crate::PyError::type_error(
+                "_remove_dll_directory() missing required argument 'cookie'",
+            ));
+        };
+        let cookie =
+            (unsafe { pyre_object::w_int_get_value(arg) } as usize) as *mut std::ffi::c_void;
+        let ok = unsafe { RemoveDllDirectory(cookie) };
+        Ok(pyre_object::w_bool_from(ok != 0))
+    }
+
+    /// os._supports_virtual_terminal — whether stderr's console mode carries
+    /// ENABLE_VIRTUAL_TERMINAL_PROCESSING.
+    pub fn _supports_virtual_terminal(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        Ok(pyre_object::w_bool_from(
+            host_nt::supports_virtual_terminal(),
+        ))
+    }
+}
+
 /// posix stub — PyPy: pypy/module/posix/ interp_posix.py
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
@@ -228,11 +404,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }
     }
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(feature = "host_env", not(feature = "sandbox"), not(windows)))]
     {
         // On POSIX, posix.environ stores bytes → bytes. os.py's
         // _create_environ_mapping wraps this dict in an _Environ object that
         // encodes/decodes via surrogateescape when accessed.
+        // (_convertenviron: `space.newbytes(key), space.newbytes(value)`.)
         for (key, value) in host_os::vars_os() {
             let k_bytes = key.as_encoded_bytes();
             let v_bytes = value.as_encoded_bytes();
@@ -241,6 +418,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     w_environ,
                     pyre_object::w_bytes_from_bytes(k_bytes),
                     pyre_object::w_bytes_from_bytes(v_bytes),
+                );
+            }
+        }
+    }
+    #[cfg(all(feature = "host_env", not(feature = "sandbox"), windows))]
+    {
+        // On Windows nt.environ stores str → str; os.py's nt branch of
+        // _create_environ_mapping demands str keys/values and upper-cases the
+        // keys itself. (_convertenviron: `space.newtext(key), newtext(value)`.)
+        for (key, value) in host_os::vars_os() {
+            unsafe {
+                pyre_object::w_dict_store(
+                    w_environ,
+                    pyre_object::w_str_new(&key.to_string_lossy()),
+                    pyre_object::w_str_new(&value.to_string_lossy()),
                 );
             }
         }
@@ -336,6 +528,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("SEEK_SET", libc::SEEK_SET as i64),
         ("SEEK_CUR", libc::SEEK_CUR as i64),
         ("SEEK_END", libc::SEEK_END as i64),
+    ] {
+        crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+    }
+    // Windows-only open() mode flags (fcntl.h). os.py exposes these off `nt`,
+    // and stdlib callers reach for them behind `hasattr(os, 'O_BINARY')`
+    // probes (tempfile) that only succeed once the names are bound.
+    #[cfg(windows)]
+    for (name, val) in [
+        ("O_BINARY", libc::O_BINARY as i64),
+        ("O_TEXT", libc::O_TEXT as i64),
+        ("O_NOINHERIT", libc::O_NOINHERIT as i64),
+        ("O_TEMPORARY", libc::O_TEMPORARY as i64),
+        ("O_SHORT_LIVED", libc::_O_SHORT_LIVED as i64),
+        ("O_RANDOM", libc::O_RANDOM as i64),
+        ("O_SEQUENTIAL", libc::O_SEQUENTIAL as i64),
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
     }
@@ -1069,6 +1276,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+
+    // ── Windows-only nt calls — moduledef.py `if os.name == 'nt'` block ──
+    // ntpath imports these from `nt` behind try/except ImportError, so a build
+    // that omits one silently falls back to its pure-Python path implementation.
+    #[cfg(all(windows, feature = "host_env"))]
+    {
+        for (name, func, arity) in [
+            (
+                "_getfullpathname",
+                win_nt::_getfullpathname as crate::gateway::BuiltinCodeFn,
+                1u16,
+            ),
+            ("_getfinalpathname", win_nt::_getfinalpathname, 1),
+            ("_getfileinformation", win_nt::_getfileinformation, 1),
+            ("_getdiskusage", win_nt::_getdiskusage, 1),
+            ("get_handle_inheritable", win_nt::get_handle_inheritable, 1),
+            ("set_handle_inheritable", win_nt::set_handle_inheritable, 2),
+            ("_add_dll_directory", win_nt::_add_dll_directory, 1),
+            ("_remove_dll_directory", win_nt::_remove_dll_directory, 1),
+        ] {
+            crate::module_ns_store(
+                ns,
+                name,
+                crate::make_builtin_function_with_arity(name, func, arity),
+            );
+        }
+        crate::module_ns_store(
+            ns,
+            "_supports_virtual_terminal",
+            crate::make_builtin_function(
+                "_supports_virtual_terminal",
+                win_nt::_supports_virtual_terminal,
+            ),
+        );
+    }
 
     // ── posix.listdir(path=".") → list of str ──
     crate::module_ns_store(

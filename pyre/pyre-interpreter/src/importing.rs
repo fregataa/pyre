@@ -516,14 +516,25 @@ pub fn install_builtin_modules() {
     // `_winapi` import even though the Windows build installs `posix`.
     #[cfg(windows)]
     pyre_install_module!(_winapi);
+    // `importlib._bootstrap_external` eagerly `import winreg`s on win32; the
+    // module must exist for the import machinery (and `import site`) to start.
+    #[cfg(windows)]
+    pyre_install_module!(winreg);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
-    #[cfg(not(target_arch = "wasm32"))]
+    // moduledef.py: `applevel_name = os.name` installs the one posix module
+    // under `os.name` — `"posix"` on a POSIX host, `"nt"` on Windows, where a
+    // module literally named `posix` does not exist. os.py picks `os.name` and
+    // the `path` module (posixpath vs ntpath) from which of the two names is in
+    // `sys.builtin_module_names`.
+    #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
     pyre_install_module!(posix);
+    #[cfg(windows)]
+    pyre_install_module!("nt"(posix));
     pyre_install_module!(errno);
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
