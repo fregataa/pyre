@@ -1244,6 +1244,167 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     stack.first().is_some_and(|c| !c.is_null()).then_some(stack)
 }
 
+/// Fold a keyword call's `kwnames`->parameter permutation at trace time so a
+/// `call_kw` reuses the positional inline path.  The constant `kwnames` tuple
+/// and the callee's static parameter names are both known at record time, so
+/// the reorder is a pure trace-time permutation of the argument boxes into
+/// parameter order — `_match_signature` (`@jit.unroll_safe`) unrolled and
+/// folded.  Once reordered the seeding is identical to a positional call.
+///
+/// `r_args` layout is `[callable, self_or_null, kwnames, arg0..argN-1]`; the
+/// trailing `nkw` args are the keyword values, `kwnames[j]` naming
+/// `arg[n_pos + j]` where `n_pos = nargs - nkw`.
+///
+/// Returns `None` (declining to the residual call, no behavior change) for any
+/// shape the plain positional seeding cannot serve: a non-constant / non-tuple
+/// `kwnames`, a callee with `*args` / `**kwargs` / keyword-only parameters, an
+/// argument count that does not exactly fill the positional parameters (a
+/// default would be needed), a keyword naming an unknown parameter, or a
+/// keyword colliding with a positionally-filled parameter ("multiple values").
+///
+/// # Safety
+/// `w_code` must be the live code object pointer for the resolved callable.
+unsafe fn fbw_reorder_call_kw_args(
+    r_args: &[OpRef],
+    arg_concretes: &[ConcreteValue],
+    w_code: *const (),
+    nparams: usize,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    if r_args.len() < 3 || arg_concretes.len() < 3 {
+        return None;
+    }
+    let ConcreteValue::Ref(kwnames) = arg_concretes[2] else {
+        return None;
+    };
+    if kwnames.is_null() || !unsafe { pyre_object::is_tuple(kwnames) } {
+        return None;
+    }
+    let args = &r_args[3..];
+    let arg_conc = &arg_concretes[3..];
+    let nargs = args.len();
+    if arg_conc.len() != nargs {
+        return None;
+    }
+    let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
+    // Every positional parameter must be filled exactly once from a passed arg:
+    // no defaults, no *args/**kwargs/keyword-only slots the seeding would leave
+    // unbound.
+    if nparams == 0 || nkw > nargs || nargs != nparams {
+        return None;
+    }
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let flags = unsafe { (*raw).flags };
+    if flags.contains(pyre_interpreter::CodeFlags::VARARGS)
+        || flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
+        || unsafe { (*raw).kwonlyarg_count } != 0
+    {
+        return None;
+    }
+    let varnames = unsafe { &(*raw).varnames };
+    if varnames.len() < nparams {
+        return None;
+    }
+    let n_pos = nargs - nkw;
+    let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
+    let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
+    for k in 0..n_pos {
+        slot_args[k] = Some(args[k]);
+        slot_conc[k] = Some(arg_conc[k]);
+    }
+    for j in 0..nkw {
+        let name_obj = unsafe { pyre_object::w_tuple_getitem(kwnames, j as i64) }?;
+        if !unsafe { pyre_object::is_str(name_obj) } {
+            return None;
+        }
+        let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) }
+            .as_str()
+            .ok()?;
+        let pi = varnames[..nparams]
+            .iter()
+            .position(|v| v.as_str() == name)?;
+        // A keyword may only bind a parameter past the positional fill, and each
+        // parameter at most once (else Python raises "multiple values for
+        // argument").
+        if pi < n_pos || slot_args[pi].is_some() {
+            return None;
+        }
+        slot_args[pi] = Some(args[n_pos + j]);
+        slot_conc[pi] = Some(arg_conc[n_pos + j]);
+    }
+    let mut out_args = Vec::with_capacity(nparams);
+    let mut out_conc = Vec::with_capacity(nparams);
+    for k in 0..nparams {
+        out_args.push(slot_args[k]?);
+        out_conc.push(slot_conc[k]?);
+    }
+    Some((out_args, out_conc))
+}
+
+/// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
+/// kwargs_or_null)` star tuple into the positional argument boxes the inline
+/// path seeds from, or `None` to leave the call a residual.
+///
+/// The elements are read out of the heap cache rather than off the tuple, so
+/// this folds exactly when the star tuple is virtual at the call — the
+/// `args = (...)` / `f(*args)` pair the walker just recorded, whose
+/// `wrappeditems` block and per-index stores are still cached
+/// (`try_walker_specialize_newtuple_object`).  A tuple that arrived from
+/// anywhere else has no cached block and declines, as does any `**kwargs`
+/// merge (the helper's `kwargs_or_null` is then a real mapping) and any arity
+/// that is not the callee's exact parameter count.
+fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+    arg_concretes: &[ConcreteValue],
+    nparams: usize,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    if r_args.len() < 4 || arg_concretes.len() < 4 || nparams == 0 {
+        return None;
+    }
+    // `kwargs_or_null` is the checked `PY_NULL` sentinel for a call with no
+    // `**` merge; anything else is a real mapping this fold does not bind.
+    match arg_concretes[3] {
+        ConcreteValue::Null => {}
+        ConcreteValue::Ref(kwargs) if kwargs.is_null() || kwargs == pyre_object::PY_NULL => {}
+        _ => return None,
+    }
+    let starargs = r_args[2];
+    let items_descr = crate::descr::tuple_wrappeditems_descr();
+    let block = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(starargs, items_descr.index())?;
+    // The cached length pins the arity: the callee takes exactly `nparams`
+    // positional parameters, and a mismatch is a runtime TypeError the inline
+    // path does not model.
+    let len_op = ctx.trace_ctx.heap_cache().arraylen(block)?;
+    match len_op.inline_const_to_value() {
+        Some(majit_ir::Value::Int(n)) if n as usize == nparams => {}
+        _ => return None,
+    }
+    let array_descr_index = crate::state::pyobject_gcarray_descr().index();
+    let mut args = Vec::with_capacity(nparams);
+    let mut concretes = Vec::with_capacity(nparams);
+    for index in 0..nparams {
+        let elem = ctx.trace_ctx.heapcache_getarrayitem(
+            block,
+            OpRef::ConstInt(index as i64),
+            array_descr_index,
+        )?;
+        // Take each concrete from the element box itself, not from the tuple,
+        // so the seeded shadow is the one the symbolic argument carries.
+        let concrete = walker_concrete_ref_object(ctx, elem)?;
+        args.push(elem);
+        concretes.push(ConcreteValue::Ref(concrete));
+    }
+    Some((args, concretes))
+}
+
 pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -1261,19 +1422,20 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     if !ctx.is_authoritative_executor {
         return Ok(None);
     }
-    // Only a genuine Python call helper (`call_fn` / `call_fn_N`, tagged
-    // `PyreHelperKind::CallFn` by the flatten lowering) is an inline
-    // target.  Every container/builtin helper routed here carries a
-    // different tag or `None` (`store_subscr_fn` -> StoreSubscr,
-    // `normalize_raise_varargs_fn` / `set_current_exception` -> None).
-    // Without this guard `d[f] = v` with a 1-arg function key `f` lowers
-    // to `residual_call_r_v(store_subscr_fn, [d, f, v])`, whose ref args
-    // pass the function sniff below and are mis-inlined as `f(v)`,
-    // skipping the store.  Upstream never inlines a Python call at a
-    // residual_call site (inlinable calls get their own inline_call
-    // jitcodes); this restores that invariant for the pyre FBW
-    // inline-at-residual lever.
-    if pyre_helper != majit_ir::PyreHelperKind::CallFn {
+    // Only a genuine Python call helper is an inline target: positional
+    // `call_fn` / `call_fn_N` (`PyreHelperKind::CallFn`) and keyword `call_kw_N`
+    // (`PyreHelperKind::CallKw`), both tagged by the flatten lowering.  Every
+    // container/builtin helper routed here carries a different tag or `None`
+    // (`store_subscr_fn` -> StoreSubscr, `normalize_raise_varargs_fn` /
+    // `set_current_exception` -> None).  Without this guard `d[f] = v` with a
+    // 1-arg function key `f` lowers to `residual_call_r_v(store_subscr_fn, [d,
+    // f, v])`, whose ref args pass the function sniff below and are mis-inlined
+    // as `f(v)`, skipping the store.  Upstream never inlines a Python call at a
+    // residual_call site (inlinable calls get their own inline_call jitcodes);
+    // this restores that invariant for the pyre FBW inline-at-residual lever.
+    let is_call_kw = pyre_helper == majit_ir::PyreHelperKind::CallKw;
+    let is_call_function_ex = pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
+    if pyre_helper != majit_ir::PyreHelperKind::CallFn && !is_call_kw && !is_call_function_ex {
         return Ok(None);
     }
     if r_args.is_empty() {
@@ -1298,21 +1460,56 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     if callable.is_null() {
         return Ok(None);
     }
-    let ConcreteValue::Ref(null_or_self) = arg_concretes[1] else {
-        return Ok(None);
+    // The receiver slot is a checked `PY_NULL` sentinel for a plain no-receiver
+    // call; its concrete shadow arrives as `Null` (`call_kw`) or `Ref(PY_NULL)`
+    // (`call_fn`).  Both mean "no receiver" (`method_form = false`).
+    let null_or_self = match arg_concretes[1] {
+        ConcreteValue::Ref(r) => r,
+        ConcreteValue::Null => pyre_object::PY_NULL,
+        _ => return Ok(None),
     };
-    let method_form = !null_or_self.is_null();
-    let mut callee_args = Vec::with_capacity(r_args.len().saturating_sub(1));
-    let mut callee_arg_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
-    if method_form {
-        callee_args.push(r_args[1]);
-        callee_arg_concretes.push(arg_concretes[1]);
-    }
-    callee_args.extend_from_slice(&r_args[2..]);
-    callee_arg_concretes.extend_from_slice(&arg_concretes[2..]);
+    let method_form = !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL;
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
     else {
         return Ok(None);
+    };
+    let (callee_args, callee_arg_concretes) = if is_call_kw {
+        // A keyword call folds its `kwnames`->parameter permutation at trace
+        // time (`fbw_reorder_call_kw_args`) so the reordered param-order args
+        // seed the callee exactly like a positional call.  A bound-method-form
+        // keyword call is not yet folded.
+        if method_form {
+            return Ok(None);
+        }
+        let Some(reordered) =
+            (unsafe { fbw_reorder_call_kw_args(r_args, &arg_concretes, w_code, nparams) })
+        else {
+            return Ok(None);
+        };
+        reordered
+    } else if is_call_function_ex {
+        // `f(*args)` unpacks the star tuple into positional arguments, which is
+        // a trace-time reorder whenever the tuple is the one this trace just
+        // built: its element boxes are still in the heap cache, so the callee
+        // seeds from them and the tuple keeps no consumer.
+        if method_form {
+            return Ok(None);
+        }
+        let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
+        else {
+            return Ok(None);
+        };
+        unpacked
+    } else {
+        let mut callee_args = Vec::with_capacity(r_args.len().saturating_sub(1));
+        let mut callee_arg_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
+        if method_form {
+            callee_args.push(r_args[1]);
+            callee_arg_concretes.push(arg_concretes[1]);
+        }
+        callee_args.extend_from_slice(&r_args[2..]);
+        callee_arg_concretes.extend_from_slice(&arg_concretes[2..]);
+        (callee_args, callee_arg_concretes)
     };
     try_walker_inline_resolved_user_call(
         ctx,
@@ -1470,18 +1667,35 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
     // a live-heap mutation would double it; the nested-residual decline catches
-    // that only after an abort storm.  A side-effect-free callee replays
-    // benignly, so admit it.
-    if fbw_foriter_inflight_active()
-        && !fbw_callee_body_side_effect_free(
+    // that only after an abort storm.  A callee whose body commits nothing
+    // replays benignly, so admit it.
+    //
+    // A body whose only unproven ops are Python-level CALL residuals is
+    // admitted too: this same gate re-runs for each callee the lever resolves
+    // below it, and one it cannot inline aborts before executing
+    // (`fbw_abort_nested_unjournaled_residual`) and denies this callee, so a
+    // deferred body commits nothing either.  Without that the whole nest
+    // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
+    // per iteration, though each body on its own is pure arithmetic.
+    let mut foriter_deferred_admit = false;
+    if fbw_foriter_inflight_active() {
+        let admit = match fbw_callee_body_replay_safety(
             body.code,
             args_all_numeric,
             body.num_regs_i,
             body.constants_i,
             callee_descr_refs,
-        )
-    {
-        return Ok(None);
+        ) {
+            CalleeReplaySafety::Clean => true,
+            CalleeReplaySafety::DeferredCall => {
+                foriter_deferred_admit = !fbw_foriter_deferred_call_denied(callee_code_key);
+                foriter_deferred_admit
+            }
+            CalleeReplaySafety::Dirty => false,
+        };
+        if !admit {
+            return Ok(None);
+        }
     }
     if method_form
         && !allow_method_load_attr
@@ -2222,6 +2436,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // Track this callee for the lifetime of the sub-walk so nested
         // self-calls see the correct recursion depth.
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
+        let _foriter_deferred =
+            ForiterDeferredInlineGuard::enter(callee_code_key, foriter_deferred_admit);
         if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
             if frame.body_matches(&body) {
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);
