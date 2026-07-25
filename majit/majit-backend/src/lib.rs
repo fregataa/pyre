@@ -1766,6 +1766,18 @@ pub trait Backend: Send {
     /// this header PC to synthesised exit recovery layouts.
     fn set_next_header_pc(&mut self, _header_pc: u64) {}
 
+    /// The compiling driver's override for the `jitcode.py:147 enumerate_vars`
+    /// frame box count, when a backend decodes the guards' `rd_numb` itself to
+    /// build exit layouts.
+    ///
+    /// Carried on `JitDriverStaticData::frame_value_count_fn`: a driver whose
+    /// frames are numbered outside the process-global liveness pool must not
+    /// decode against it, and the wrong pool decodes *successfully* with a
+    /// mistyped count rather than failing. `None` (the default) leaves the
+    /// backend on the global callback
+    /// (`majit_ir::resumedata::set_frame_value_count_fn`).
+    fn set_next_frame_value_count_fn(&mut self, _fvc: Option<fn(i32, i32) -> usize>) {}
+
     /// `compile.py:665-674` `make_and_attach_done_descrs([self, cpu])` —
     /// per-result-type `DoneWithThisFrame*` singleton shared with
     /// `MetaInterpStaticData`.  Attached once per CPU instance, matching
@@ -2692,20 +2704,17 @@ pub trait Backend: Send {
         if func == 0 {
             return 0;
         }
-        if let Some(hook) = crate::call_stub::residual_host_call() {
-            let args = crate::call_stub::collect_call_args_positional(
+        // SAFETY: `func` is a valid funcptr matching the ABI recovered from
+        // `calldescr.arg_classes`.
+        unsafe {
+            crate::call_stub::bh_call_i_by_classes(
+                func as usize,
                 &calldescr.arg_classes,
                 args_i,
                 args_r,
                 args_f,
-            );
-            return hook(func as usize, &args);
+            )
         }
-        let (int_args, float_args) =
-            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        // SAFETY: `func` is a valid funcptr matching the (ints, floats) arity
-        // recovered from `calldescr.arg_classes`.
-        unsafe { crate::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args) }
     }
     /// model.py:268 bh_call_r(func, args_i, args_r, args_f, calldescr).
     /// `llmodel.py:818 bh_call_r`: GCREF-returning parallel — a host pointer
@@ -2721,20 +2730,16 @@ pub trait Backend: Send {
         if func == 0 {
             return GcRef::NULL;
         }
-        if let Some(hook) = crate::call_stub::residual_host_call() {
-            let args = crate::call_stub::collect_call_args_positional(
+        // SAFETY: see `bh_call_i`.
+        let raw = unsafe {
+            crate::call_stub::bh_call_i_by_classes(
+                func as usize,
                 &calldescr.arg_classes,
                 args_i,
                 args_r,
                 args_f,
-            );
-            return GcRef(hook(func as usize, &args) as usize);
-        }
-        let (int_args, float_args) =
-            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        // SAFETY: see `bh_call_i`.
-        let raw =
-            unsafe { crate::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args) };
+            )
+        };
         GcRef(raw as usize)
     }
     /// model.py:270 bh_call_f(func, args_i, args_r, args_f, calldescr).
@@ -2751,20 +2756,16 @@ pub trait Backend: Send {
         if func == 0 {
             return 0.0;
         }
-        if let Some(hook) = crate::call_stub::residual_host_call() {
-            let args = crate::call_stub::collect_call_args_positional(
+        // SAFETY: see `bh_call_i`.
+        unsafe {
+            crate::call_stub::bh_call_f_by_classes(
+                func as usize,
                 &calldescr.arg_classes,
                 args_i,
                 args_r,
                 args_f,
-            );
-            // The trampoline returns an f64 callee result as its raw bits.
-            return f64::from_bits(hook(func as usize, &args) as u64);
+            )
         }
-        let (int_args, float_args) =
-            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        // SAFETY: see `bh_call_i`.
-        unsafe { crate::call_stub::bh_call_f_dispatch(func as usize, &int_args, &float_args) }
     }
     /// model.py:272 bh_call_v(func, args_i, args_r, args_f, calldescr).
     /// `llmodel.py:834 bh_call_v`: void-typed dispatch so a genuinely void
@@ -2780,20 +2781,16 @@ pub trait Backend: Send {
         if func == 0 {
             return;
         }
-        if let Some(hook) = crate::call_stub::residual_host_call() {
-            let args = crate::call_stub::collect_call_args_positional(
+        // SAFETY: see `bh_call_i`.
+        unsafe {
+            crate::call_stub::bh_call_v_by_classes(
+                func as usize,
                 &calldescr.arg_classes,
                 args_i,
                 args_r,
                 args_f,
-            );
-            let _ = hook(func as usize, &args);
-            return;
+            )
         }
-        let (int_args, float_args) =
-            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        // SAFETY: see `bh_call_i`.
-        unsafe { crate::call_stub::bh_call_v_dispatch(func as usize, &int_args, &float_args) }
     }
 
     // ── model.py: additional bh_* helpers ──

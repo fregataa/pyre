@@ -33,8 +33,9 @@
 //!   (`PyError::to_exc_object` — the trace-level exception value
 //!   domain is the `W_BaseException` ref, the same value
 //!   `BH_LAST_EXC_VALUE` carries) and closes the block towards
-//!   `exceptblock` with `(op.type(exc), exc)`, exactly the
-//!   `lower_exc_from_raise` tail shape (`flowcontext.py:600`).
+//!   `exceptblock` with `(exc, exc)`, exactly the
+//!   `lower_exc_from_raise` tail shape (`flowcontext.py:600`) — whose
+//!   `etype` slot is write-only, see that module's "etype link arg" note.
 //!
 //! - **Caller rule** ([`rewire_result_exc_call_sites`]): a `?` on a
 //!   call to a scoped callee lowers in MIR as a
@@ -533,20 +534,12 @@ pub(crate) fn lower_result_exc_returns(
                     true,
                 )
                 .expect("to_exc_object call must produce a value");
-            // `op.type(evalue)` — the `lower_exc_from_raise` tail
-            // (`flowcontext.py:600` `w_type = op.type(w_value)`).
-            let v_type = graph
-                .push_op_var(
-                    block_id,
-                    OpKind::Call {
-                        target: CallTarget::function_path(["type"]),
-                        args: vec![v_exc.clone()],
-                        result_ty: ValueType::Ref(None),
-                    },
-                    true,
-                )
-                .expect("op.type(evalue) must produce a value");
-            graph.set_raise_values(block_id, v_type, v_exc);
+            // `graph.set_raise_values(block, etype, evalue)`. The `etype`
+            // link arg is write-only: `make_return`'s 2-arg arm emits
+            // `raise <args[1]>` and never reads `args[0]`
+            // (`flatten.rs:781-793`, `flatten.py:139-143`). Pass the evalue
+            // for it — see `front::exc_from_raise`'s "etype link arg" note.
+            graph.set_raise_values(block_id, v_exc.clone(), v_exc);
         } else {
             // `return Ok(v)` → forward the payload itself.
             for link in &mut graph.blocks[bi].exits {
@@ -1620,16 +1613,41 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     let r_err = forward_alias(graph, &r_b, &err_link)
         .ok_or_else(|| format!("{name}: drain fuse: Err link drops the Result value"))?;
     let err_ops = &graph.blocks[err_target].operations;
-    let ctor_idx = err_ops
+    // `PyErrorKind::StopIteration` reaches the `eq` below in either of two
+    // lowered forms: as a niladic `SyntheticTransparentCtor` while the
+    // fieldless variant is still carried as an ADT constructor, or as a plain
+    // `ConstInt` once the fieldless enum lowers to its discriminant. Accept
+    // both. The constant form is value-checked, so a comparison against a
+    // different kind (`e.kind == PyErrorKind::ValueError`) can never be fused
+    // into a StopIteration test; the operand is additionally pinned by the
+    // `PyErrorKind::eq` argument check below.
+    //
+    // 9 == `PyErrorKind::StopIteration` (pyre-interpreter error.rs); like the
+    // `ExcKind::StopIteration` 10 used by the synthesised handler, the two are
+    // coupled — renumbering that variant makes this recognizer decline, which
+    // `unpackiterable_drain_match_fuses_to_kind_test` reports as a failure.
+    const PYERRORKIND_STOP_ITERATION: i64 = 9;
+    let (ctor_idx, sc) = err_ops
         .iter()
-        .position(|op| matches!(&op.kind,
-            OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name: n, owner_path }, .. }
-                if n == "StopIteration" && owner_path.last().is_some_and(|s| s == "PyErrorKind")))
-        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the StopIteration ctor"))?;
-    let sc = err_ops[ctor_idx]
-        .result
-        .clone()
-        .ok_or_else(|| format!("{name}: drain fuse: StopIteration ctor without result"))?;
+        .enumerate()
+        .find_map(|(i, op)| {
+            let is_stop_iteration = match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            name: n,
+                            owner_path,
+                        },
+                    ..
+                } => n == "StopIteration" && owner_path.last().is_some_and(|s| s == "PyErrorKind"),
+                OpKind::ConstInt(v) => *v == PYERRORKIND_STOP_ITERATION,
+                _ => false,
+            };
+            is_stop_iteration.then(|| op.result.clone().map(|s| (i, s)))?
+        })
+        .ok_or_else(|| {
+            format!("{name}: drain fuse: Err arm lacks the StopIteration ctor or discriminant")
+        })?;
     let (errpay_idx, err_payload) = err_ops
         .iter()
         .enumerate()
@@ -2073,21 +2091,13 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         "drain fuse: H references its unused etype inputarg"
     );
 
-    // R: `v_type = type(vb)`; `goto exceptblock [v_type, vb]`.  DO NOT reuse
-    // `va` (the int-kinded etype); `type(evalue)` recomputes the ref-kind
-    // class the raise tail needs.
-    let v_type = graph
-        .push_op_var(
-            r_id,
-            OpKind::Call {
-                target: CallTarget::function_path(["type"]),
-                args: vec![r_vb.clone()],
-                result_ty: ValueType::Ref(None),
-            },
-            true,
-        )
-        .expect("type(evalue) produces a value");
-    graph.set_raise_values(r_id, v_type, r_vb);
+    // R: `goto exceptblock [etype, vb]`, i.e. the drain's `return Err(e)`.
+    // The `etype` slot is write-only (`make_return` emits `raise <args[1]>`
+    // and never reads `args[0]`, `flatten.rs:781-793`), so pass `vb` rather
+    // than the int-kinded `va` — the raise operand must be the ref-kinded
+    // exception value, and a second ref-kinded producer would only add a dead
+    // residual to the arm a guard-failure resume walks.
+    graph.set_raise_values(r_id, r_vb.clone(), r_vb);
 
     // Break edge args in H scope (all forwarded Variables; the dead threads
     // were pruned, so no const rides the surviving edge).

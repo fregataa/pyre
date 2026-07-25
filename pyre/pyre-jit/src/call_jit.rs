@@ -1817,6 +1817,7 @@ fn jit_blackhole_resume_from_guard(
             Some(&storage.rd_virtuals),
             deadframe_types.as_deref(),
             guard_exc,
+            false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
         );
         return handle_blackhole_result(result, actual_green_key);
     }
@@ -1992,6 +1993,12 @@ pub fn blackhole_resume_via_rd_numb(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
     guard_exc: i64,
+    // compile.py:990 `vinfo = self.jitdriver_sd.virtualizable_info`: a novable
+    // jitdriver (jd1 `unpackiterable_driver`) has `vinfo=None`, so its resume
+    // data carries no vable section. Decoding with the (jd0) vinfo would try to
+    // consume a phantom vable and dereference garbage; a novable resume passes
+    // `None` for both the vinfo and the per-frame virtualizable handle.
+    novable: bool,
 ) -> BlackholeResult {
     let nbody_debug = pyre_nbody_debug_enabled();
     use majit_metainterp::resume;
@@ -2014,16 +2021,39 @@ pub fn blackhole_resume_via_rd_numb(
     };
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
-    // through the trace-side MetaInterpStaticData.jitcodes store.
+    // through the store the frame numbered against.
     let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
             return None;
+        }
+        let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
+        // A novable jitdriver (jd1 `unpackiterable_driver`) numbers its drain
+        // frames' `jitcode_index` in the build-time `jitcode_runtime` table
+        // (the extracted `_unpackiterable_unknown_length` body plus its inlined
+        // build-time callees), NOT the runtime `MetaInterpStaticData.jitcodes`
+        // store.  The runtime store is a different index space keyed by Python
+        // CodeObject, so its low indices hold unrelated jd0 PyCode jitcodes
+        // whose liveness at the same pc mistypes the drain's 2 refs as ints
+        // (`Const::getint on Ref`).  Resolve against the same table the frame
+        // numbered against — mirroring the driver's own bridge resume
+        // (`run_compiled_detailed_with_bridge_keyed`, jitdriver.rs), which
+        // resolves through the flat build-time `jitcode_registry`.
+        if novable {
+            let canonical =
+                pyre_jit_trace::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize)?;
+            if !canonical.can_decode_live_vars(pc as usize, op_live) {
+                return None;
+            }
+            let core = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+            return Some(resume::ResolvedJitCode::new(
+                std::sync::Arc::new(core),
+                pc as usize,
+            ));
         }
         let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
         // A published resume frame carries a decodable JitCode `-live-`
         // coordinate. An unrepresentable frame declines this blackhole path.
         let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
@@ -2031,13 +2061,6 @@ pub fn blackhole_resume_via_rd_numb(
         } else {
             return None;
         };
-        // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
-        // `state::code_for_jitcode_index` indices name the runtime
-        // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
-        // are not the same index space as `jitcode_runtime::ALL_JITCODES`
-        // (build-time opcode-dispatch artifacts).  Do not cross-lookup the
-        // canonical store by `jitcode_index` until pyre actually shares a
-        // single JitCode object graph end-to-end.
         Some(
             resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
                 .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
@@ -2079,11 +2102,27 @@ pub fn blackhole_resume_via_rd_numb(
     // unused in pyre (no greenfield_info installed on the driver).
     let (driver, driver_vinfo) = crate::eval::driver_pair();
     let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
+    // A novable driver's resume data has no vable section; pass no vinfo so the
+    // decoder skips `consume_vable_info` entirely.
+    let vinfo_arg: Option<&dyn resume::VirtualizableInfo> =
+        if novable { None } else { Some(vinfo_dyn) };
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     let allocator = crate::eval::PyreBlackholeAllocator;
     // pyjitpl.py:2264: metainterp_sd.liveness_info — single shared pool.
     // Snapshot once per call so the slice outlives ResumeDataDirectReader.
-    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+    let runtime_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+    // A novable drain frame's `-live-` markers carry 2-byte offsets baked at
+    // extraction into the build-time `ALL_LIVENESS` byte stream, NOT the
+    // runtime-accumulated `metainterp_sd.liveness_info` that jd0 tracing grows
+    // via `intern_liveness`.  Decoding a baked offset against the runtime buffer
+    // reads an unrelated jd0 frame's liveness triple (mistyping the drain's 2
+    // refs as ints → `Const::getint on Ref`).  Decode against the same build-time
+    // table the drain jitcode was resolved from.
+    let all_liveness: &[u8] = if novable {
+        pyre_jit_trace::jitcode_runtime::all_liveness()
+    } else {
+        &runtime_liveness
+    };
     // Scope the &mut to chain construction; the run() loop below uses
     // release_bh_rd to drop and re-acquire the borrow.
     let bh = BH_BUILDER_RD.with(|cell| unsafe {
@@ -2094,13 +2133,13 @@ pub fn blackhole_resume_via_rd_numb(
             &resolve_jitcode,
             rd_numb,
             rd_consts,
-            &all_liveness,
+            all_liveness,
             deadframe,
             deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
             rd_virtuals_slice,      // rd_virtuals
             rd_guard_pendingfields, // rd_guard_pendingfields
             Some(vrefinfo_dyn),     // resume.py:1314 metainterp_sd.virtualref_info
-            Some(vinfo_dyn),        // resume.py:1312 self.jitdriver_sd.virtualizable_info
+            vinfo_arg,              // resume.py:1312 self.jitdriver_sd.virtualizable_info
             None,                   // resume.py:1316 greenfield_info unused in pyre
             None,                   // heap PyFrame identity remains the live TAGBOX
             &allocator,
@@ -2116,13 +2155,17 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1404: virtualizable_ptr was read by consume_vable_info
     // from the vable section. Set on the blackhole for vable bytecodes.
-    if virtualizable_ptr != 0 {
-        bh.virtualizable_ptr = virtualizable_ptr;
-    } else if !deadframe.is_empty() {
-        // Fallback for guards without vable section.
-        bh.virtualizable_ptr = deadframe[0];
+    // A novable resume runs no vable opcodes, so leave both the pointer and
+    // the vinfo handle unset (null) instead of borrowing jd0's.
+    if !novable {
+        if virtualizable_ptr != 0 {
+            bh.virtualizable_ptr = virtualizable_ptr;
+        } else if !deadframe.is_empty() {
+            // Fallback for guards without vable section.
+            bh.virtualizable_ptr = deadframe[0];
+        }
+        bh.virtualizable_info = crate::eval::get_virtualizable_info();
     }
-    bh.virtualizable_info = crate::eval::get_virtualizable_info();
     // resume.py:1332-1343 builds the caller chain (`nextblackholeinterp`)
     // but does not set the virtualizable-info handle on each frame.  pyre
     // stores the vinfo per-`BlackholeInterpreter` (RPython reads it from
@@ -3709,6 +3752,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 &raw_values,
                 &exit_layout,
                 guard_exc,
+                false,
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
         }
