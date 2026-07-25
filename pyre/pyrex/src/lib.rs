@@ -544,9 +544,11 @@ fn real_main(binary_name: &str) {
 
     match mode {
         RunMode::Command(cmd) => {
-            // Initialize sys.path with CWD for -c mode.
+            // `_PyPathConfig_ComputeSysPath0` yields "" for a `-c` argv[0]. The
+            // cwd is still the anchor the shadowing check compares module
+            // origins against.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd);
+            importing::init_sys_path(&cwd, "");
             let mut argv = vec!["-c".to_string()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -559,7 +561,7 @@ fn real_main(binary_name: &str) {
             // `-m`: sys.path[0] is the cwd (runpy resets argv[0] to the
             // module's resolved origin via `_run_module_as_main`).
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd);
+            importing::init_sys_path(&cwd, &cwd.to_string_lossy());
             let mut argv = vec![module.clone()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -593,12 +595,20 @@ fn real_main(binary_name: &str) {
                 .unwrap_or(Path::new("."))
                 .to_path_buf();
             #[cfg(not(feature = "sandbox"))]
-            let script_dir = Path::new(&path)
-                .parent()
-                .unwrap_or(Path::new("."))
-                .canonicalize()
-                .unwrap_or_else(|_| Path::new(".").to_path_buf());
-            importing::init_sys_path(&script_dir);
+            let script_dir = {
+                // `parent()` of a bare `x.py` is the empty path;
+                // `_PyPathConfig_ComputeSysPath0` absolutizes the script's
+                // directory, so resolve the empty case against the cwd rather
+                // than leaving a relative `.` on `sys.path`.
+                let parent = Path::new(&path).parent().unwrap_or(Path::new("."));
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                parent.canonicalize().unwrap_or_else(|_| sys_path_cwd())
+            };
+            importing::init_sys_path(&script_dir, &script_dir.to_string_lossy());
             // sys.argv[0] is the script path; remaining values go to argv[1:].
             let mut argv = vec![path.clone()];
             argv.extend(args);
@@ -609,9 +619,11 @@ fn real_main(binary_name: &str) {
             }
         }
         RunMode::Repl => {
-            // Initialize sys.path with CWD for REPL mode.
+            // The REPL and piped stdin both take "" for `sys.path[0]`
+            // (`_PyPathConfig_ComputeSysPath0` on an argv[0] of "" / "-"); the
+            // cwd stays the shadowing-check anchor.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd);
+            importing::init_sys_path(&cwd, "");
             repl::run_repl(quiet, no_site);
         }
         RunMode::Interact {
@@ -746,22 +758,66 @@ fn setup_exec_context() -> Rc<PyExecutionContext> {
     execution_context
 }
 
-/// app_main.py:875-882 — unless `-S` (`no_site`) was given, `import site`
-/// once `__main__` is registered so the standard `site` initialization runs
-/// before user code (sys.path finalization, the `quit`/`exit`/`help`
-/// builtins). The import failing is non-fatal (the bare `except`): print
-/// "'import site' failed" to stderr and continue.
+/// app_main.py — unless `-S` (`no_site`) was given, `import site` once
+/// `__main__` is registered so the standard `site` initialization runs before
+/// user code (sys.path finalization, the `quit`/`exit`/`help` builtins). The
+/// import failing is non-fatal (the bare `except`): print "'import site'
+/// failed" to stderr and continue.
+///
+/// `pymain_run_python` then prepends the startup `sys.path[0]`, so that step
+/// happens here too — after `site`, whose `removeduppaths()` would otherwise
+/// rewrite the `-c` / REPL empty entry into the absolute cwd.
+/// `add_main_module` / `set_main_loader` — seed `__main__.__loader__`.
+///
+/// BuiltinImporter is the initial setting for every `__main__`; a script run by
+/// path replaces it with a `SourceFileLoader` bound to that file. `-m` is not
+/// covered here: `runpy._run_module_as_main` installs the module's own loader.
+/// Must run after the importlib bootstrap, which is what supplies both classes.
+pub(crate) fn seed_main_loader(
+    w_main_globals: pyre_object::PyObjectRef,
+    script_file: Option<&str>,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) {
+    use pyre_interpreter::baseobjspace::getattr_str;
+
+    let load = |module: &str, attr: &str| -> Option<pyre_object::PyObjectRef> {
+        importing::importhook(module, w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).ok()?;
+        let w_mod = importing::get_sys_module(module)?;
+        getattr_str(w_mod, attr).ok()
+    };
+
+    let loader = match script_file {
+        Some(path) => load("importlib._bootstrap_external", "SourceFileLoader").and_then(|ty| {
+            pyre_interpreter::call::call_function_impl_result(
+                ty,
+                &[
+                    pyre_object::w_str_new("__main__"),
+                    pyre_object::w_str_new(path),
+                ],
+            )
+            .ok()
+        }),
+        None => load("importlib._bootstrap", "BuiltinImporter"),
+    };
+    let Some(loader) = loader else {
+        return;
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(w_main_globals, "__loader__", loader);
+    }
+}
+
 pub(crate) fn import_site(
     no_site: bool,
     w_main_globals: pyre_object::PyObjectRef,
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
 ) {
-    if no_site {
-        return;
-    }
-    if importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err() {
+    if !no_site
+        && importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err()
+    {
         eprintln!("'import site' failed");
     }
+    importing::add_sys_path_0();
 }
 
 /// Run the `init_importlib` / `init_importlib_external` sequence
@@ -910,7 +966,7 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     // (pythonrun.c `_PyRun_SimpleFileObject`); the `-c "<string>"` command
     // path does not. `__file__` is absolutized (os.path.abspath, 3.9+) while
     // `sys.argv[0]` keeps the literal command-line path.
-    if filename != "<string>" {
+    let script_file = if filename != "<string>" {
         // Resolve a relative path against `sys_path_cwd()` — the seam-provided
         // virtual cwd under sandbox — before normalizing, so `std::path::absolute`
         // never consults (and leaks) the trusted process cwd. Off sandbox this is
@@ -935,7 +991,10 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             "__cached__",
             pyre_object::w_none(),
         );
-    }
+        Some(abs_file)
+    } else {
+        None
+    };
 
     // Import `sys` up front so its creation flushes the native search-path seed
     // into `sys.path` before `site` and user code read it.
@@ -949,6 +1008,8 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     if let Err(e) = init_importlib_bootstrap(canonical, ec_ptr) {
         eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
     }
+
+    seed_main_loader(canonical, script_file.as_deref(), ec_ptr);
 
     import_site(no_site, canonical, ec_ptr);
 
