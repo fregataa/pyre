@@ -7902,10 +7902,7 @@ pub unsafe fn bound_method_attr_fast_path(
     if w_obj.is_null() {
         return None;
     }
-    let w_type = crate::typedef::r#type(w_obj)?;
-    if w_type.is_null() {
-        return None;
-    }
+    let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
     // The tracer pins the class by guarding the receiver's `w_class` slot, so
     // only a receiver whose class IS that slot can be reproduced.  Exception
     // instances carrying the generic stub resolve their class through the
