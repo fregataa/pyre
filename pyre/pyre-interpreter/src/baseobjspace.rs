@@ -6726,10 +6726,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             // Shared `name` attribute for the kinds that expose it —
-            // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`,
-            // and `W_AttributeError` (Python 3.10+).  Read from the shared
-            // `w_exc_name` slot (default `None`); falls through to normal
-            // attribute lookup on every other exception kind.
+            // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`
+            // (and `W_UnboundLocalError`, which subclasses it and so inherits
+            // the descriptor), and `W_AttributeError` (Python 3.10+).  Read
+            // from the shared `w_exc_name` slot (default `None`); falls
+            // through to normal attribute lookup on every other exception
+            // kind.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
@@ -6737,6 +6739,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     pyre_object::interp_exceptions::ExcKind::ImportError
                         | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
                     let stored =
@@ -9469,8 +9472,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 }
             }
             // Shared writable `name` slot for ImportError / ModuleNotFoundError
-            // / NameError / AttributeError; the matching getattr arm reads it
-            // back.
+            // / NameError (and its UnboundLocalError subclass) / AttributeError;
+            // the matching getattr arm reads it back.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
@@ -9478,6 +9481,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     pyre_object::interp_exceptions::ExcKind::ImportError
                         | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
                     unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
@@ -9517,6 +9521,14 @@ pub enum ExceptionAttrSlot {
     Strerror,
     Filename,
     Filename2,
+    Traceback,
+    Name,
+    AttrObj,
+    UnicodeObject,
+    UnicodeStart,
+    UnicodeEnd,
+    UnicodeReason,
+    UnicodeEncoding,
 }
 
 /// Ingredients for the full-body walker's mirror of the typed exception-slot
@@ -9597,13 +9609,104 @@ pub unsafe fn exception_attr_slot_fold(
         {
             ExceptionAttrSlot::Filename2
         }
+        // `__traceback__` is a `W_BaseException` slot on every exception kind.
+        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`, which
+        // `w_exception_get_traceback` omits while the `ExecutionContext::leave`
+        // vref force it feeds is unported; the fold tracks that getter, so both
+        // sides gain the mark together.
+        "__traceback__" => ExceptionAttrSlot::Traceback,
+        // `name` shares the `w_exc_name` slot across the kinds whose getattr
+        // arm reads it; other kinds keep the regular attribute fall-through.
+        "name"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::ImportError
+                    | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+                    | pyre_object::interp_exceptions::ExcKind::NameError
+                    | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
+                    | pyre_object::interp_exceptions::ExcKind::AttributeError
+            ) =>
+        {
+            ExceptionAttrSlot::Name
+        }
+        "obj" if kind == pyre_object::interp_exceptions::ExcKind::AttributeError => {
+            ExceptionAttrSlot::AttrObj
+        }
+        "object"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) =>
+        {
+            ExceptionAttrSlot::UnicodeObject
+        }
+        "start"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) =>
+        {
+            ExceptionAttrSlot::UnicodeStart
+        }
+        "end"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) =>
+        {
+            ExceptionAttrSlot::UnicodeEnd
+        }
+        "reason"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) =>
+        {
+            ExceptionAttrSlot::UnicodeReason
+        }
+        // `encoding` is absent on `UnicodeTranslateError`, so its getattr arm
+        // excludes that kind.
+        "encoding"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) =>
+        {
+            ExceptionAttrSlot::UnicodeEncoding
+        }
         _ => return None,
     };
-    // Only loads of `__context__`/`__cause__` fold to a raw slot read.
-    // `descr_setcontext` (`interp_exceptions.py:183-190`) type-validates and
-    // `descr_setcause` (`:166-174`) also flips `suppress_context` to True, so a
-    // direct slot write would drop those effects.
-    if is_store && matches!(slot, ExceptionAttrSlot::Context | ExceptionAttrSlot::Cause) {
+    // This folds LOADS only.  `__context__`/`__cause__` stores are
+    // side-effecting: `descr_setcontext` (`interp_exceptions.py:183-190`)
+    // type-validates and `descr_setcause` (`:166-174`) also flips
+    // `suppress_context` to True, so a direct slot write would drop those
+    // effects; `descr_settraceback` likewise type-validates its store.  The
+    // `name`/`obj`/Unicode* setters are plain slot writes, but they are still
+    // left residual here — only the read side of every listed slot is folded.
+    if is_store
+        && matches!(
+            slot,
+            ExceptionAttrSlot::Context
+                | ExceptionAttrSlot::Cause
+                | ExceptionAttrSlot::Traceback
+                | ExceptionAttrSlot::Name
+                | ExceptionAttrSlot::AttrObj
+                | ExceptionAttrSlot::UnicodeObject
+                | ExceptionAttrSlot::UnicodeStart
+                | ExceptionAttrSlot::UnicodeEnd
+                | ExceptionAttrSlot::UnicodeReason
+                | ExceptionAttrSlot::UnicodeEncoding
+        )
+    {
         return None;
     }
     let w_type = crate::typedef::r#type(obj)?;
@@ -9635,6 +9738,28 @@ pub unsafe fn exception_attr_slot_fold(
             }
             ExceptionAttrSlot::Filename2 => {
                 pyre_object::interp_exceptions::w_exception_get_filename2(obj)
+            }
+            ExceptionAttrSlot::Traceback => {
+                pyre_object::interp_exceptions::w_exception_get_traceback(obj)
+            }
+            ExceptionAttrSlot::Name => pyre_object::interp_exceptions::w_exception_get_name(obj),
+            ExceptionAttrSlot::AttrObj => {
+                pyre_object::interp_exceptions::w_exception_get_attr_obj(obj)
+            }
+            ExceptionAttrSlot::UnicodeObject => {
+                pyre_object::interp_exceptions::w_exception_get_object(obj)
+            }
+            ExceptionAttrSlot::UnicodeStart => {
+                pyre_object::interp_exceptions::w_exception_get_start(obj)
+            }
+            ExceptionAttrSlot::UnicodeEnd => {
+                pyre_object::interp_exceptions::w_exception_get_end(obj)
+            }
+            ExceptionAttrSlot::UnicodeReason => {
+                pyre_object::interp_exceptions::w_exception_get_reason(obj)
+            }
+            ExceptionAttrSlot::UnicodeEncoding => {
+                pyre_object::interp_exceptions::w_exception_get_encoding(obj)
             }
         }
     };

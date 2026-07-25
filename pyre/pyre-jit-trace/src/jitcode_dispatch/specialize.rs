@@ -2083,10 +2083,18 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     )
                 }
                 pyre_interpreter::baseobjspace::ExceptionAttrSlot::Context
-                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Cause => {
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Cause
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Name
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::AttrObj
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeObject
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeStart
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEnd
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeReason
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEncoding => {
                     // `exception_attr_slot_fold` declines these for stores, so
                     // the store fold never reaches here.
-                    unreachable!("__context__/__cause__ slots fold on load only")
+                    unreachable!("load-only exception slots fold on load only")
                 }
                 pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => {
                     pyre_object::interp_exceptions::w_exception_set_code(
@@ -4620,11 +4628,15 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // final slice is selected below after the concrete constructor exposes the
     // value-dependent branch result.  The shared typed-list emitter reproduces
     // `w_list_new`'s Integer layout, allowing the common `SystemExit(i)` shape
-    // to virtualize alongside message-bearing Object lists.  Other strategies
-    // retain the safe residual fallback.
+    // to virtualize alongside message-bearing Object lists.  The Empty strategy
+    // (zero-argument `raise ValueError()` / `raise StopIteration()`, the most
+    // common raise shape) reproduces `w_list_new(vec![])`'s empty list, and the
+    // Float strategy reproduces its Float layout.
     enum ArgsEmit {
         Object,
         Int(Vec<i64>),
+        Float(Vec<f64>),
+        Empty,
     }
 
     let is_canonical = pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable);
@@ -4802,8 +4814,18 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             }
             ArgsEmit::Int(values)
         }
-        pyre_object::listobject::ListStrategy::Empty
-        | pyre_object::listobject::ListStrategy::Float => return Ok(None),
+        pyre_object::listobject::ListStrategy::Float => {
+            // `all_floats` is strict `type(w) is W_FloatObject`, which reads
+            // `w_class`, so every element is an exact `W_FloatObject` here.
+            // The emit side pins that `w_class` as well: `walker_unbox_float`
+            // guards only the payload `ob_type`, which a subclass shares.
+            let mut values = Vec::with_capacity(final_concrete_args.len());
+            for &arg in final_concrete_args {
+                values.push(unsafe { pyre_object::w_float_get_value(arg) });
+            }
+            ArgsEmit::Float(values)
+        }
+        pyre_object::listobject::ListStrategy::Empty => ArgsEmit::Empty,
     };
 
     // GuardClass pins each None-sensitive `_init_error` branch.  A tagged
@@ -4898,10 +4920,49 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // alongside the exception.
     let args_list = match args_emit {
         ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args),
-        ArgsEmit::Int(values) => {
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        ArgsEmit::Empty => crate::helpers::emit_empty_list_inline(ctx.trace_ctx),
+        ArgsEmit::Float(values) => {
+            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            let float_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
             let mut raws = Vec::with_capacity(final_args.len());
             for (&arg, value) in final_args.iter().zip(values) {
+                // A float subclass instance carries the same payload
+                // `ob_type` and only retags `w_class`, so `walker_unbox_float`
+                // alone would let a later subclass argument stay on this trace
+                // and be unboxed into Float-strategy storage — `e.args[0]`
+                // would come back a plain float.  `FloatListStrategy.
+                // is_correct_type` rejects it, so pin the exact `w_class` and
+                // let such an argument side-exit to the residual.  A constant
+                // operand is the same object on every iteration, so its
+                // trace-time `w_class` already holds.
+                if !arg.is_constant() {
+                    walker_guard_exact_w_class(ctx, op.pc, arg, float_typeobj)?;
+                }
+                let raw = walker_unbox_float(ctx, op.pc, arg, float_type_addr)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(value));
+                raws.push(raw);
+            }
+            crate::helpers::emit_typed_list_inline(
+                ctx.trace_ctx,
+                &raws,
+                crate::state::float_gcarray_descr(),
+                crate::descr::list_float_items_len_descr(),
+                crate::descr::list_float_items_block_descr(),
+                pyre_object::listobject::ListStrategy::Float,
+            )
+        }
+        ArgsEmit::Int(values) => {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let int_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+            let mut raws = Vec::with_capacity(final_args.len());
+            for (&arg, value) in final_args.iter().zip(values) {
+                // Same subclass hole as the Float arm: `is_plain_int1` rejects
+                // an int subclass on `w_class`, but `walker_unbox_int` guards
+                // the shared payload `ob_type`.
+                if !arg.is_constant() {
+                    walker_guard_exact_w_class(ctx, op.pc, arg, int_typeobj)?;
+                }
                 let raw = walker_unbox_int(ctx, op.pc, arg, int_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(value));
@@ -5119,6 +5180,188 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     // to the dst that feeds the following `raise/r`.
     fbw_built_exc_insert(exc_op);
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', exc_op)?;
+    Ok(Some(()))
+}
+
+/// B3: walker-native fold for a bare-class `raise Type`
+/// (no call parentheses).  Unlike `raise Type()`, a bare class has no
+/// preceding `CallFn` construct residual — `normalize_raise_varargs_jit`
+/// instantiates the class itself — so no virtualizable `NewWithVtable`
+/// exists and `try_walker_trace_raise_builtin` declines it to the residual
+/// (a per-iteration heap alloc + may-force).
+///
+/// `do_raise` instantiates a raised class with no arguments, so a bare
+/// `raise ValueError` is `raise ValueError()`.  When the operand is a
+/// canonical builtin exception class with a trivial-args constructor and no
+/// explicit `from` cause, build the zero-argument instance inline (the
+/// `try_walker_trace_exception_new` Empty-args shape) and chain
+/// `__context__` (the `try_walker_trace_raise_builtin` tail), so the whole
+/// exception virtualizes and DCEs when it never escapes.  A subclass or a
+/// non-trivial-args kind (OSError / Unicode) declines to the residual.
+///
+/// Returns `None` (fall through to the generic residual) for any
+/// non-matching shape.
+pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let class_op = r_args[1];
+    // The residual arg concretes are `[frame, exc, cause]`.  Recover the live
+    // exception operand (index 1) from the residual list rather than the opref
+    // shadow: a bare class comes straight from `LOAD_GLOBAL`, not the inline
+    // construct fold, so its shadow is not stamped.
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let Some(ConcreteValue::Ref(concrete_class)) = arg_concretes.get(1).copied() else {
+        return Ok(None);
+    };
+    // The operand must be a canonical builtin exception CLASS.  An already
+    // built instance (`raise ValueError()`) is not in the class registry and
+    // is handled by `try_walker_trace_raise_builtin`; a non-exception operand
+    // (`raise obj`) also declines here.
+    if concrete_class.is_null()
+        || !pyre_object::interp_exceptions::is_canonical_exc_class(concrete_class)
+    {
+        return Ok(None);
+    }
+
+    // Explicit `raise X from Y` keeps the residual: `attach_raise_cause` sets
+    // `__cause__` and `__suppress_context__`, which the inline `__context__`
+    // store alone does not reproduce.  The cause operand is a const `PY_NULL`
+    // (or a `Null` / `Ref(null)` shadow) when there is no cause; any concrete
+    // non-null Ref is an explicit cause.
+    let cause_op = r_args[2];
+    let cause_is_null = match arg_concretes.get(2) {
+        Some(ConcreteValue::Ref(p)) => p.is_null(),
+        Some(ConcreteValue::Null) | None => matches!(
+            ctx.trace_ctx.box_value(cause_op),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
+        ),
+        _ => false,
+    };
+    if !cause_is_null {
+        return Ok(None);
+    }
+
+    // Build the exception concretely on the plain eval loop (no tracer
+    // re-entry) to read its kind and confirm a flat builtin instance.  A
+    // canonical class has the builtin `descr_new` / `descr_init`, so a
+    // zero-argument construction runs no user code.  Trace-time only.
+    let exc = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_class, &[])
+    };
+    let Ok(exc) = exc else { return Ok(None) };
+    let kind = unsafe {
+        if !pyre_object::is_exception(exc) {
+            return Ok(None);
+        }
+        pyre_object::interp_exceptions::w_exception_get_kind(exc)
+    };
+    if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_class {
+        return Ok(None);
+    }
+    if !kind.has_trivial_args_constructor() {
+        return Ok(None);
+    }
+    let exc_type_ptr = unsafe {
+        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+            .ob_header
+            .ob_type
+    };
+    if !std::ptr::eq(
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+    ) {
+        return Ok(None);
+    }
+
+    // Resolve the EC while declining is still free.  `walker_ensure_execution_
+    // context` returns `None` on a null snapshot sym or a frameless walk, and
+    // its recovery records a `GETFIELD_GC_R` that must not land after a guard
+    // referencing it — `ensure_execution_context` recovers eagerly at walk
+    // entry for that reason.  A decline past the commit below would also leave
+    // the construction ops orphaned and the heap-cache shadows describing an
+    // object the caller's generic-residual fall-through never built.
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+
+    // --- commit: pin the class identity, emit the construction + raise ---
+    // Guard the class operand so the trace-time kind / vtable stay valid
+    // across iterations (`implement_guard_value`).
+    if !class_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_class as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[class_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(class_op, expected);
+    }
+
+    // Empty `args_w` list (zero-argument construction), stamped with the
+    // canonical list class exactly as `w_list_new` does.
+    let args_list = crate::helpers::emit_empty_list_inline(ctx.trace_ctx);
+    let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
+    let list_w_class_descr = crate::descr::list_w_class_descr();
+    let list_w_class_index = list_w_class_descr.index();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[args_list, list_w_class],
+        list_w_class_descr,
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(args_list, list_w_class_index, list_w_class);
+
+    let new_op =
+        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class_op, args_list);
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+
+    // `__context__` chaining on the still-virtual exception, mirroring the
+    // `try_walker_trace_raise_builtin` tail: `active = GETFIELD_GC_R(ec,
+    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  `ec` came
+    // from `walker_ensure_execution_context` above, so the read shares the one
+    // seeded EC OpRef the PUSH_EXC_INFO / POP_EXCEPT lowering consumes.
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, active],
+        crate::descr::w_exception_context_descr(kind),
+    );
+    // Apply the same context write to the concrete, freshly-built exception so
+    // Python code reached later in this authoritative walk observes the
+    // `__context__` the recorded SETFIELD performs on compiled iterations.
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
+
+    // Mark the inline-built instance FBW-built so the following `raise/r`
+    // records its frame node via the virtual `record_fresh_application_
+    // traceback` (an inline PyTraceback `NewWithVtable` + SETFIELDs on the
+    // exception) rather than `record_top_level_application_traceback`, whose
+    // runtime hook passes the exception to a `CallN` and forces it to
+    // materialize — defeating the save/restore DCE that virtualizes a
+    // locally-caught raise.  Mirrors `try_walker_trace_raise_builtin`.
+    fbw_built_exc_insert(new_op);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new_op)?;
     Ok(Some(()))
 }
 
