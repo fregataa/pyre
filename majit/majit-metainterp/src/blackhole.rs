@@ -2531,7 +2531,8 @@ mod tests {
             (0, vec![], 0),
         ] {
             let layout = StateFieldLayout::new(s, a.clone(), v, 0);
-            let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0);
+            let (live_i, live_r, live_f) =
+                crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0, 0, 0);
             assert_eq!(layout.total_slots(), live_i.len());
             assert!(live_r.is_empty() && live_f.is_empty());
         }
@@ -2550,7 +2551,8 @@ mod tests {
         assert_eq!(layout.total_slots(), 3);
         assert_eq!(layout.total_live_values(), 4);
         assert_eq!(layout.ref_scalar_slot(0), 1);
-        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(3, &[], 0, 1, 1, 0);
+        let (live_i, live_r, live_f) =
+            crate::live_slots_for_state_field_jit(3, &[], 0, 1, 1, 0, 0, 0);
         assert_eq!(layout.total_slots(), live_i.len());
         assert_eq!(layout.num_ref_scalars, live_r.len());
         assert_eq!(live_r, vec![1]);
@@ -3885,6 +3887,32 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn inline_builder_wires_float_cmp_and_raw_load_f() {
+            // A dispatch arm materializing a float comparison as an int
+            // (`(a >= b) as i64`) emits `float_ge/ff>i` and siblings, and
+            // `majit_raw_load_f` emits `raw_load_f/iid>f`.  Both must be in
+            // the inline builder's insns map so `wire_handler` installs a
+            // real handler; a forward blackhole resume through an unwired
+            // byte panics at `dispatch_step`.
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as *const () as usize;
+            for byte in [
+                majit_translate::insns::BC_FLOAT_LT,
+                majit_translate::insns::BC_FLOAT_LE,
+                majit_translate::insns::BC_FLOAT_EQ,
+                majit_translate::insns::BC_FLOAT_NE,
+                majit_translate::insns::BC_FLOAT_GT,
+                majit_translate::insns::BC_FLOAT_GE,
+                majit_translate::insns::BC_RAW_LOAD_F,
+            ] {
+                assert_ne!(
+                    builder.dispatch_table[byte as usize] as *const () as usize, placeholder,
+                    "opcode byte {byte} must be wired in the inline blackhole builder",
+                );
+            }
+        }
     }
 
     // ── `support.py:255-271 _ll_2_int_floordiv` / `_ll_2_int_mod`
@@ -4426,6 +4454,12 @@ pub struct StateFieldLayout {
     /// blackhole re-executes ops that read those argument registers, so
     /// the identity slots cannot alias them.
     pub ref_scalar_base: usize,
+    /// Float-typed scalar state fields. They live in the SEPARATE float
+    /// register bank at `registers_f[float_scalar_base ..
+    /// float_scalar_base + num_float_scalars]`, carrying raw f64 bits.
+    pub num_float_scalars: usize,
+    /// First float-bank register of the float-scalar identity slots.
+    pub float_scalar_base: usize,
     /// First int-bank register of the scalar/array identity slots —
     /// the int-bank mirror of `ref_scalar_base`. The dispatch JitCode's
     /// int argument (`pc` at i0) sits below it; an identity slot
@@ -4448,6 +4482,8 @@ impl StateFieldLayout {
             num_virt_arrays,
             num_ref_scalars: 0,
             ref_scalar_base: 0,
+            num_float_scalars: 0,
+            float_scalar_base: 0,
             int_scalar_base,
         }
     }
@@ -4468,8 +4504,23 @@ impl StateFieldLayout {
             num_virt_arrays,
             num_ref_scalars,
             ref_scalar_base,
+            num_float_scalars: 0,
+            float_scalar_base: 0,
             int_scalar_base,
         }
+    }
+
+    /// Add float-typed scalar fields in the float bank, starting at
+    /// `float_scalar_base`. Kept as a setter so existing int/ref constructor
+    /// call sites do not churn.
+    pub fn with_float_scalars(
+        mut self,
+        num_float_scalars: usize,
+        float_scalar_base: usize,
+    ) -> Self {
+        self.num_float_scalars = num_float_scalars;
+        self.float_scalar_base = float_scalar_base;
+        self
     }
 
     /// Total int register slots — equals the `live_slots_for_state_field_jit`
@@ -4484,7 +4535,7 @@ impl StateFieldLayout {
     /// run-compiled gate validates the flat live-value vector against this
     /// count (int slots flow to `registers_i`, ref scalars to `registers_r`).
     pub fn total_live_values(&self) -> usize {
-        self.total_slots() + self.num_ref_scalars
+        self.total_slots() + self.num_ref_scalars + self.num_float_scalars
     }
 
     /// Flat slot of scalar `field_idx` (scalars occupy
@@ -4510,6 +4561,19 @@ impl StateFieldLayout {
             self.num_ref_scalars
         );
         self.ref_scalar_base + field_idx
+    }
+
+    /// Float register slot of float-typed scalar `field_idx`. Float scalars
+    /// are densely packed in the float register bank starting at
+    /// `float_scalar_base`, in the same order the resume reader seeds the
+    /// float fail-args.
+    pub fn float_scalar_slot(&self, field_idx: usize) -> usize {
+        debug_assert!(
+            field_idx < self.num_float_scalars,
+            "float scalar field_idx {field_idx} out of range (num_float_scalars={})",
+            self.num_float_scalars
+        );
+        self.float_scalar_base + field_idx
     }
 
     /// First flat slot of fixed array `array_idx`.
@@ -4599,6 +4663,34 @@ fn handler_store_state_field_ref_dr(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
     bh.registers_r[slot] = bh.registers_r[src];
+    Ok(position + 3)
+}
+
+/// `load_state_field_float/df` — `registers_f[dest] = registers_f[float_slot(field_idx)]`.
+/// Encoding: 1× u16 `field_idx` + 1× u8 dest float register = 3 bytes.
+fn handler_load_state_field_float_df(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let dest = code[position + 2] as usize;
+    let slot = bh.state_field_layout.float_scalar_slot(field_idx);
+    bh.registers_f[dest] = bh.registers_f[slot];
+    Ok(position + 3)
+}
+
+/// `store_state_field_float/df` — `registers_f[float_slot(field_idx)] = registers_f[src]`.
+/// Encoding: 1× u16 `field_idx` + 1× u8 src float register = 3 bytes.
+fn handler_store_state_field_float_df(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let src = code[position + 2] as usize;
+    let slot = bh.state_field_layout.float_scalar_slot(field_idx);
+    bh.registers_f[slot] = bh.registers_f[src];
     Ok(position + 3)
 }
 
@@ -6863,6 +6955,17 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         ),
         ("float_neg/f>f", majit_translate::insns::BC_FLOAT_NEG),
         ("float_abs/f>f", majit_translate::insns::BC_FLOAT_ABS),
+        // Float value-comparisons materialized as an int result (e.g. a
+        // dispatch arm writing `(a >= b) as i64`).  Their `bhimpl_*`
+        // handlers are wired in `wire_bhimpl_handlers`; without the map
+        // entry `wire_handler` no-ops and a forward resume through the
+        // opcode hits the unwired-byte panic.
+        ("float_lt/ff>i", majit_translate::insns::BC_FLOAT_LT),
+        ("float_le/ff>i", majit_translate::insns::BC_FLOAT_LE),
+        ("float_eq/ff>i", majit_translate::insns::BC_FLOAT_EQ),
+        ("float_ne/ff>i", majit_translate::insns::BC_FLOAT_NE),
+        ("float_gt/ff>i", majit_translate::insns::BC_FLOAT_GT),
+        ("float_ge/ff>i", majit_translate::insns::BC_FLOAT_GE),
         ("ptr_eq/rr>i", majit_translate::insns::BC_PTR_EQ),
         ("ptr_ne/rr>i", majit_translate::insns::BC_PTR_NE),
         (
@@ -6978,6 +7081,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         (
             "store_state_field/di",
             majit_translate::insns::BC_STORE_STATE_FIELD,
+        ),
+        (
+            "load_state_field_float/df",
+            majit_translate::insns::BC_LOAD_STATE_FIELD_FLOAT,
+        ),
+        (
+            "store_state_field_float/df",
+            majit_translate::insns::BC_STORE_STATE_FIELD_FLOAT,
         ),
         (
             "load_state_array/dii",
@@ -7296,6 +7407,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "raw_load_i/iid>i".to_string(),
         majit_translate::insns::BC_RAW_LOAD_I,
     );
+    // `raw_load_f/iid>f` — the float read-side companion (`majit_raw_load_f`,
+    // used by the celfloat example).  `handler_raw_load_f` is wired below;
+    // register the opname so a forward resume through the opcode blackholes
+    // instead of hitting the unwired-byte panic.
+    insns.insert(
+        "raw_load_f/iid>f".to_string(),
+        majit_translate::insns::BC_RAW_LOAD_F,
+    );
     insns.insert(
         "setarrayitem_gc_i/riid".to_string(),
         majit_translate::insns::BC_SETARRAYITEM_GC_I,
@@ -7330,6 +7449,23 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     insns.insert(
         "new_array_clear/cd>r".to_string(),
         majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
+    );
+    // Overflow-checked arithmetic (`int_{add,sub,mul}_jump_if_ovf`): a guard
+    // failure on `GuardNoOverflow`/`GuardOverflow` resumes forward through the
+    // fused op, so the blackhole must dispatch it. The `bhimpl_*` handlers are
+    // wired in `wire_bhimpl_handlers` below; without the map entry `wire_handler`
+    // silently no-ops and the byte stays unwired.
+    insns.insert(
+        "int_add_jump_if_ovf/Lii>i".to_string(),
+        majit_translate::insns::BC_INT_ADD_JUMP_IF_OVF,
+    );
+    insns.insert(
+        "int_sub_jump_if_ovf/Lii>i".to_string(),
+        majit_translate::insns::BC_INT_SUB_JUMP_IF_OVF,
+    );
+    insns.insert(
+        "int_mul_jump_if_ovf/Lii>i".to_string(),
+        majit_translate::insns::BC_INT_MUL_JUMP_IF_OVF,
     );
     builder.setup_insns(&insns);
     // `setup_insns` already derives `op_live` and `op_catch_exception`
@@ -7400,6 +7536,14 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("store_state_field_ref/dr", handler_store_state_field_ref_dr);
     builder.wire_handler("load_state_field/di", handler_load_state_field_di);
     builder.wire_handler("store_state_field/di", handler_store_state_field_di);
+    builder.wire_handler(
+        "load_state_field_float/df",
+        handler_load_state_field_float_df,
+    );
+    builder.wire_handler(
+        "store_state_field_float/df",
+        handler_store_state_field_float_df,
+    );
     builder.wire_handler("load_state_array/dii", handler_load_state_array_dii);
     builder.wire_handler("store_state_array/dii", handler_store_state_array_dii);
 

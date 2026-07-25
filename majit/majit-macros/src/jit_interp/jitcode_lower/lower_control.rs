@@ -1,8 +1,47 @@
 use super::*;
 
+fn literal_nonnegative_i64(expr: &Expr) -> Option<i64> {
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(lit), ..
+    }) = expr
+    else {
+        return None;
+    };
+    let value = lit.base10_parse::<i64>().ok()?;
+    (value >= 0).then_some(value)
+}
+
 impl<'c> Lowerer<'c> {
+    /// True when any op recorded since index `since` is a float
+    /// comparison — an `OpKind::BinopF` whose result register is int
+    /// banked.  Float arithmetic writes a float result; only the value-
+    /// form `float_lt/le/eq/ne/gt/ge` (`ff>i`) writes an int.  A float
+    /// comparison feeding a conditional guard grows a bridge that hangs
+    /// the compiled trace (a4e191f71b5), so the branch lowerers roll back
+    /// and bail to interpreter fallback when the condition lowered through
+    /// one.
+    fn ops_since_contain_float_compare(&self, since: usize) -> bool {
+        self.op_metadata[since..].iter().any(|op| {
+            matches!(op.kind, OpKind::BinopF)
+                && op.writes.iter().any(|w| matches!(w.kind, BindingKind::Int))
+        })
+    }
+
     pub(super) fn lower_if_stmt(&mut self, expr_if: &ExprIf) -> Option<()> {
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_bindings = self.bindings.clone();
         let cond = self.lower_value_expr(&expr_if.cond)?;
+        if self.ops_since_contain_float_compare(snap_meta) {
+            // Guard over a float comparison hangs the compiled trace; roll
+            // back the condition ops and bail so the arm runs interpreted.
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.bindings = snap_bindings;
+            return None;
+        }
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let cond_reg = cond.reg;
@@ -195,6 +234,12 @@ impl<'c> Lowerer<'c> {
     /// loop_end:
     /// ```
     pub(super) fn lower_while_loop(&mut self, expr_while: &syn::ExprWhile) -> Option<()> {
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_label = self.next_label;
+        let snap_bindings = self.bindings.clone();
+
         let loop_start = self.alloc_label();
         let loop_end = self.alloc_label();
 
@@ -204,6 +249,17 @@ impl<'c> Lowerer<'c> {
 
         // Evaluate the condition
         let cond = self.lower_value_expr(&expr_while.cond)?;
+        if self.ops_since_contain_float_compare(snap_meta) {
+            // Guard over a float comparison hangs the compiled trace; roll
+            // back everything emitted for this loop and bail so the arm
+            // runs interpreted instead.
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.next_label = snap_label;
+            self.bindings = snap_bindings;
+            return None;
+        }
         let cond_reg = cond.reg;
         self.emit_op(
             OpMeta::live_marker(),
@@ -244,13 +300,120 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    /// Lower `for _ in _ { body }`.
+    /// Lower a small literal-range `for` loop by proc-macro-time unrolling.
     ///
-    /// For-loops involve Rust's iterator protocol which cannot be
-    /// statically decomposed at proc-macro time. Return `None` so the
-    /// arm falls back to opaque (not traced through by the JIT).
-    pub(super) fn lower_for_loop(&mut self, _expr_for: &syn::ExprForLoop) -> Option<()> {
-        None
+    /// Only `for ident in START..END { ... }`, `for ident in START..=END { ... }`,
+    /// and wildcard variants are accepted.  Other iterator protocol shapes
+    /// still return `None` so the containing arm falls back unchanged.
+    pub(super) fn lower_for_loop(&mut self, expr_for: &syn::ExprForLoop) -> Option<()> {
+        let loop_var = match &*expr_for.pat {
+            Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => Some(pat_ident.ident.clone()),
+            Pat::Wild(_) => None,
+            _ => return None,
+        };
+
+        let Expr::Range(range) = &*expr_for.expr else {
+            return None;
+        };
+        let start = literal_nonnegative_i64(range.start.as_deref()?)?;
+        let end = literal_nonnegative_i64(range.end.as_deref()?)?;
+        // Compute the iteration count with checked arithmetic BEFORE
+        // materializing the range.  `(start..end).collect()` on a huge
+        // literal range (`for _ in 0..i64::MAX`) would exhaust memory
+        // during macro expansion; bail as soon as the count is known to
+        // exceed the unroll cap (or overflows i64 for a closed range).
+        let count: Option<i64> = match range.limits {
+            // `end > start >= 0` and both `<= i64::MAX`, so the difference
+            // never overflows.
+            syn::RangeLimits::HalfOpen(_) => Some((start < end).then(|| end - start).unwrap_or(0)),
+            // Closed range spans `end - start + 1` values; the `+ 1` can
+            // overflow when `end == i64::MAX`, so guard it.
+            syn::RangeLimits::Closed(_) => {
+                if start > end {
+                    Some(0)
+                } else {
+                    (end - start).checked_add(1)
+                }
+            }
+        };
+        let Some(count) = count else {
+            return None;
+        };
+        if count > 64 || block_has_loop_control(&expr_for.body) {
+            return None;
+        }
+        if count == 0 {
+            return Some(());
+        }
+        let values: Vec<i64> = match range.limits {
+            syn::RangeLimits::HalfOpen(_) => (start..end).collect(),
+            syn::RangeLimits::Closed(_) => (start..=end).collect(),
+        };
+
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_bindings = self.bindings.clone();
+
+        for value in values {
+            if let Some(loop_var) = &loop_var {
+                let loop_let: Stmt = syn::parse_quote! {
+                    let #loop_var = #value;
+                };
+                if self.lower_stmt(&loop_let).is_none() {
+                    self.statements.truncate(snap_stmts);
+                    self.op_metadata.truncate(snap_meta);
+                    self.next_reg = snap_reg;
+                    self.bindings = snap_bindings;
+                    return None;
+                }
+            }
+            for stmt in &expr_for.body.stmts {
+                if self.lower_stmt(stmt).is_none() {
+                    self.statements.truncate(snap_stmts);
+                    self.op_metadata.truncate(snap_meta);
+                    self.next_reg = snap_reg;
+                    self.bindings = snap_bindings;
+                    return None;
+                }
+            }
+        }
+
+        // Names `let`-bound at the top level of the loop body are scoped to
+        // the body. Dropping the ones that did not exist before the loop is
+        // handled by the `retain` below, but a `let` that SHADOWS an outer
+        // binding must revert to the outer value rather than escaping with the
+        // last iteration's inner binding. Assignments to existing locals are
+        // not `let`s, so they are absent here and correctly persist.
+        let body_let_names: Vec<String> = expr_for
+            .body
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Local(local) => match &local.pat {
+                    Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        self.bindings
+            .retain(|name, _| snap_bindings.contains_key(name));
+        for name in &body_let_names {
+            if let Some(outer_binding) = snap_bindings.get(name) {
+                self.bindings.insert(name.clone(), outer_binding.clone());
+            }
+        }
+        if let Some(loop_var) = &loop_var {
+            let name = loop_var.to_string();
+            if let Some(old_binding) = snap_bindings.get(&name) {
+                self.bindings.insert(name, old_binding.clone());
+            } else {
+                self.bindings.remove(&name);
+            }
+        }
+        Some(())
     }
 
     /// Lower a loop body block, translating `break` → jump to `break_label`
@@ -336,7 +499,22 @@ impl<'c> Lowerer<'c> {
             return None; // no break/continue, fall back to normal lowering
         }
 
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_label = self.next_label;
+        let snap_bindings = self.bindings.clone();
         let cond = self.lower_value_expr(&expr_if.cond)?;
+        if self.ops_since_contain_float_compare(snap_meta) {
+            // Guard over a float comparison hangs the compiled trace; roll
+            // back and bail so the arm runs interpreted instead.
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.next_label = snap_label;
+            self.bindings = snap_bindings;
+            return None;
+        }
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let cond_reg = cond.reg;
@@ -526,5 +704,207 @@ impl<'c> Lowerer<'c> {
             depends_on_stack,
             struct_type: None,
         })
+    }
+
+    /// Overflow-checked arithmetic value match — the orthodox `ovfcheck`
+    /// idiom (`match a.checked_add(b) { Some(v) => v, None => <handler> }`).
+    /// Returns `None` when `expr_match` is not this idiom (the caller then
+    /// tries the generic value-match path); returns `Some(result)` once
+    /// committed, where `result` is `None` only on a hard lowering failure.
+    pub(super) fn lower_checked_ovf_match(
+        &mut self,
+        expr_match: &syn::ExprMatch,
+    ) -> Option<Option<Binding>> {
+        let (builder_method, recv, arg, none_body) = parse_checked_ovf_match(expr_match)?;
+        Some(self.emit_checked_ovf_match(builder_method, recv, arg, none_body))
+    }
+
+    fn emit_checked_ovf_match(
+        &mut self,
+        builder_method: &str,
+        recv: &Expr,
+        arg: &Expr,
+        none_body: &Expr,
+    ) -> Option<Binding> {
+        let lhs = self.lower_value_expr(recv)?;
+        let rhs = self.lower_value_expr(arg)?;
+        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+        // Lower the overflow (None) arm into a deferred sequence up front so its
+        // result register is known for the convergence move.
+        let (none_seq, none_binding) = self.lower_branch_value_expr(none_body)?;
+        if !matches!(none_binding.kind, BindingKind::Int) {
+            return None;
+        }
+
+        let dst = self.alloc_reg();
+        let ovf_label = self.alloc_label();
+        let end_label = self.alloc_label();
+        let builder_ident = format_ident!("{builder_method}");
+        let lhs_reg = lhs.reg;
+        let rhs_reg = rhs.reg;
+        let none_reg = none_binding.reg;
+
+        self.emit_aux(quote! { let #ovf_label = __builder.new_label(); });
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
+        // `-live-` precedes the fused guard so blackhole liveness decodes at the
+        // op's resume position (see `lower_if_stmt`).
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        self.emit_op(
+            OpMeta::int_binop_jump_if_ovf(
+                Register::int(lhs_reg),
+                Register::int(rhs_reg),
+                Register::int(dst),
+                ovf_label.clone(),
+            ),
+            quote! { __builder.#builder_ident(#dst, #lhs_reg, #rhs_reg, #ovf_label); },
+        );
+        // No-overflow path: `dst` holds the result; skip the overflow arm.
+        self.emit_jump(&end_label);
+        // Overflow path: run the None arm and converge its result into `dst`.
+        self.emit_label_def(&ovf_label);
+        self.append_lowered_sequence(none_seq);
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(none_reg)],
+                vec![Register::int(dst)],
+            ),
+            quote! { __builder.move_i(#dst, #none_reg); },
+        );
+        self.emit_label_def(&end_label);
+
+        Some(Binding {
+            reg: dst,
+            kind: BindingKind::Int,
+            depends_on_stack: lhs.depends_on_stack
+                || rhs.depends_on_stack
+                || none_binding.depends_on_stack,
+            struct_type: None,
+        })
+    }
+}
+
+/// Overflow (`None`) vs no-overflow (`Some`) variant of an option pattern.
+enum OptionPatVariant {
+    Some,
+    None,
+}
+
+fn option_variant_of_pat(pat: &Pat) -> Option<OptionPatVariant> {
+    let ident = match pat {
+        Pat::TupleStruct(ts) => ts.path.segments.last()?.ident.to_string(),
+        Pat::Path(p) => p.path.segments.last()?.ident.to_string(),
+        Pat::Ident(pi) if pi.subpat.is_none() => pi.ident.to_string(),
+        _ => return None,
+    };
+    match ident.as_str() {
+        "Some" => Some(OptionPatVariant::Some),
+        "None" => Some(OptionPatVariant::None),
+        _ => None,
+    }
+}
+
+/// Recognize the orthodox `ovfcheck` idiom
+/// `match recv.checked_{add,sub,mul}(arg) { Some(_) => _, None => <handler> }`.
+/// Returns the fused builder method name, the two operand expressions, and the
+/// overflow (`None`) arm body; `None` when `expr_match` is not this shape.
+fn parse_checked_ovf_match(
+    expr_match: &syn::ExprMatch,
+) -> Option<(&'static str, &Expr, &Expr, &Expr)> {
+    let call = match &*expr_match.expr {
+        Expr::MethodCall(call) => call,
+        _ => return None,
+    };
+    let builder_method = match call.method.to_string().as_str() {
+        "checked_add" => "int_add_jump_if_ovf",
+        "checked_sub" => "int_sub_jump_if_ovf",
+        "checked_mul" => "int_mul_jump_if_ovf",
+        _ => return None,
+    };
+    if call.args.len() != 1 {
+        return None;
+    }
+    let recv = &*call.receiver;
+    let arg = call.args.first()?;
+    // Exactly two guard-less arms: `Some(_) => _` and `None => <handler>`.
+    if expr_match.arms.len() != 2 {
+        return None;
+    }
+    let mut some_seen = false;
+    let mut none_body: Option<&Expr> = None;
+    for arm in &expr_match.arms {
+        if arm.guard.is_some() {
+            return None;
+        }
+        match option_variant_of_pat(&arm.pat)? {
+            OptionPatVariant::Some => some_seen = true,
+            OptionPatVariant::None => none_body = Some(&*arm.body),
+        }
+    }
+    if !some_seen {
+        return None;
+    }
+    Some((builder_method, recv, arg, none_body?))
+}
+
+#[cfg(test)]
+mod unroll_binding_tests {
+    use super::*;
+
+    fn int_binding(reg: u16) -> Binding {
+        Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+            struct_type: None,
+        }
+    }
+
+    #[test]
+    fn unrolled_body_let_shadow_reverts_to_outer_binding() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert("x".to_string(), int_binding(42));
+        let expr_for: syn::ExprForLoop = syn::parse_quote! {
+            for _ in 0..2 {
+                let x = 7;
+            }
+        };
+        assert!(
+            lowerer.lower_for_loop(&expr_for).is_some(),
+            "literal-range unroll must succeed"
+        );
+        // The body `let x` shadows the outer `x`; its binding is scoped to the
+        // loop body, so after the loop `x` must be the outer binding (reg 42),
+        // not the last iteration's inner `let`.
+        assert_eq!(
+            lowerer.bindings.get("x").map(|b| b.reg),
+            Some(42),
+            "a shadowed outer binding must be restored after unrolling"
+        );
+    }
+
+    #[test]
+    fn unrolled_body_let_without_outer_is_removed() {
+        let mut lowerer = Lowerer::new(None);
+        let expr_for: syn::ExprForLoop = syn::parse_quote! {
+            for _ in 0..2 {
+                let y = 7;
+            }
+        };
+        assert!(
+            lowerer.lower_for_loop(&expr_for).is_some(),
+            "literal-range unroll must succeed"
+        );
+        // `y` did not exist before the loop, so its body-local binding must not
+        // escape.
+        assert!(
+            lowerer.bindings.get("y").is_none(),
+            "a body-local let must not escape the loop"
+        );
     }
 }

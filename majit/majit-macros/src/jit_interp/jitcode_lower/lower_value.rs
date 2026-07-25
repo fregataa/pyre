@@ -133,6 +133,24 @@ impl<'c> Lowerer<'c> {
                     struct_type: None,
                 })
             }
+            Expr::Lit(ExprLit {
+                lit: Lit::Float(float_lit),
+                ..
+            }) => {
+                let value = float_lit.base10_parse::<f64>().ok()?;
+                let bits = value.to_bits() as i64;
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstF, vec![], vec![Register::float(reg)]),
+                    quote! { __builder.load_const_f_value(#reg, #bits); },
+                );
+                Some(Binding {
+                    reg,
+                    kind: BindingKind::Float,
+                    depends_on_stack: false,
+                    struct_type: None,
+                })
+            }
             // Bool comparisons (`stackok == false`) ride the int channel:
             // bool bindings are IntLt/IntLe/… results carrying 0/1.
             Expr::Lit(ExprLit {
@@ -188,6 +206,13 @@ impl<'c> Lowerer<'c> {
                     struct_type: None,
                 })
             }
+            Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_float_type(ty) => {
+                let binding = self.lower_value_expr(expr)?;
+                if !matches!(binding.kind, BindingKind::Int) {
+                    return None;
+                }
+                self.lower_int_to_float_cast(binding)
+            }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_int_cast(ty) => {
                 let binding = self.lower_value_expr(expr)?;
                 if !matches!(binding.kind, BindingKind::Int) {
@@ -197,7 +222,10 @@ impl<'c> Lowerer<'c> {
             }
             Expr::Paren(ExprParen { expr, .. }) => self.lower_value_expr(expr),
             Expr::If(expr_if) => self.lower_if_value(expr_if),
-            Expr::Match(expr_match) => self.lower_match_value(expr_match),
+            Expr::Match(expr_match) => match self.lower_checked_ovf_match(expr_match) {
+                Some(result) => result,
+                None => self.lower_match_value(expr_match),
+            },
             Expr::Unary(ExprUnary { op, expr, .. }) => self.lower_unary(op, expr),
             Expr::Binary(binary) => self.lower_binary(binary),
             Expr::Call(call) => {
@@ -225,9 +253,21 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_native_tag_small_call(call) {
                     return Some(binding);
                 }
-                // Raw native-memory load intrinsic `majit_raw_load_i64(base, ea)`
+                // Raw native-memory load intrinsic `majit_raw_load_iXX(base, ea)`
                 // → raw_load_i (jtransform.py:1165-1171 rewrite_op_raw_load).
                 if let Some(binding) = self.lower_raw_load_call(call) {
+                    return Some(binding);
+                }
+                // Float<->int bitcast intrinsics `majit_f64_to_bits(f)` /
+                // `majit_bits_to_f64(i)` → convert_{float_bytes_to_longlong,
+                // longlong_bytes_to_float} (rpython convert ops).
+                if let Some(binding) = self.lower_float_bitcast_call(call) {
+                    return Some(binding);
+                }
+                // Unsigned compare intrinsics `majit_uint_lt(a, b)` /
+                // `majit_uint_le(a, b)` → uint_lt / uint_le (the signed opcode
+                // the generic binop path emits is wrong for uint).
+                if let Some(binding) = self.lower_uint_compare_call(call) {
                     return Some(binding);
                 }
                 self.lower_call_value(call)
@@ -243,18 +283,164 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// Lower the float<->int bitcast intrinsics: `majit_f64_to_bits(f)` (float
+    /// argument → its i64 bit pattern, `convert_float_bytes_to_longlong`) and
+    /// `majit_bits_to_f64(i)` (int bits → float, `convert_longlong_bytes_to_float`).
+    /// Both reinterpret the 64-bit pattern (no value change); a branchless float
+    /// bit-select uses them to stay bit-exact where an arithmetic blend cannot.
+    fn lower_float_bitcast_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        let segments = canonical_expr_segments(&call.func)?;
+        match segments.last()?.as_str() {
+            "majit_f64_to_bits" => {
+                if call.args.len() != 1 {
+                    return None;
+                }
+                let src = self.lower_value_expr(&call.args[0])?;
+                if !matches!(src.kind, BindingKind::Float) {
+                    return None;
+                }
+                let src_reg = src.reg;
+                let dst = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        vec![Register::float(src_reg)],
+                        vec![Register::int(dst)],
+                    ),
+                    quote! { __builder.record_convert_float_bytes_to_longlong(#dst, #src_reg); },
+                );
+                Some(Binding {
+                    reg: dst,
+                    kind: BindingKind::Int,
+                    depends_on_stack: src.depends_on_stack,
+                    struct_type: None,
+                })
+            }
+            "majit_bits_to_f64" => {
+                if call.args.len() != 1 {
+                    return None;
+                }
+                let src = self.lower_value_expr(&call.args[0])?;
+                if !matches!(src.kind, BindingKind::Int) {
+                    return None;
+                }
+                let src_reg = src.reg;
+                let dst = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        vec![Register::int(src_reg)],
+                        vec![Register::float(dst)],
+                    ),
+                    quote! { __builder.record_convert_longlong_bytes_to_float(#dst, #src_reg); },
+                );
+                Some(Binding {
+                    reg: dst,
+                    kind: BindingKind::Float,
+                    depends_on_stack: src.depends_on_stack,
+                    struct_type: None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower the unsigned integer comparison intrinsics `majit_uint_lt(a, b)` /
+    /// `majit_uint_le(a, b)` to `uint_lt` / `uint_le` (`bhimpl_uint_lt` /
+    /// `bhimpl_uint_le`). Both operands are read from the int bank as unsigned
+    /// 64-bit values; the op writes a `0`/`1` int result. `opcode_for_binop`
+    /// maps `<`/`<=` to the signed `IntLt`/`IntLe`, so an explicit intrinsic is
+    /// the only way to select the unsigned opcode from the tracing frontend.
+    fn lower_uint_compare_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        let opcode_name = match canonical_expr_segments(&call.func)?.last()?.as_str() {
+            "majit_uint_lt" => "UintLt",
+            "majit_uint_le" => "UintLe",
+            _ => return None,
+        };
+        if call.args.len() != 2 {
+            return None;
+        }
+        let lhs = self.lower_value_expr(&call.args[0])?;
+        let rhs = self.lower_value_expr(&call.args[1])?;
+        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+        let (lhs_reg, rhs_reg) = (lhs.reg, rhs.reg);
+        let dst = self.alloc_reg();
+        let opcode = format_ident!("{opcode_name}");
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[lhs_reg, rhs_reg]),
+                vec![Register::int(dst)],
+            ),
+            binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
+        );
+        Some(Binding {
+            reg: dst,
+            kind: BindingKind::Int,
+            depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
     /// Lower a raw native-memory load intrinsic
-    /// `majit_raw_load_i64(base, ea)` to a `raw_load_i` op (the read-side
-    /// analogue of `lower_raw_store_stmt`).  RPython parity:
+    /// `majit_raw_load_{i,u}{8,16,32,64}(base, ea)` to a `raw_load_i` op (the
+    /// read-side analogue of `lower_raw_store_stmt`).  RPython parity:
     /// `jtransform.py:1165-1171 rewrite_op_raw_load` lowers a
     /// `rffi.raw_storage_getitem` to `raw_load_i(base, offset,
     /// arraydescrof(CArray(T)))`.  Both operands are int-kind (raw address,
     /// byte offset); the op writes an int result.
     fn lower_raw_load_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
         let segments = canonical_expr_segments(&call.func)?;
-        if segments.last().map(String::as_str) != Some("majit_raw_load_i64") {
-            return None;
+        if segments.last()?.as_str() == "majit_raw_load_f" {
+            if call.args.len() != 2 {
+                return None;
+            }
+            let base = self.lower_value_expr(&call.args[0])?;
+            let ea = self.lower_value_expr(&call.args[1])?;
+            if !matches!(base.kind, BindingKind::Int) || !matches!(ea.kind, BindingKind::Int) {
+                return None;
+            }
+            let (base_reg, ea_reg) = (base.reg, ea.reg);
+            let dst = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::RawLoad,
+                    vec![Register::int(base_reg), Register::int(ea_reg)],
+                    vec![Register::float(dst)],
+                ),
+                quote! {
+                    let __raw_descr = __builder.add_raw_float_array_descr();
+                    __builder.raw_load_f(
+                        #dst as u16,
+                        #base_reg as u16,
+                        #ea_reg as u16,
+                        __raw_descr,
+                    );
+                },
+            );
+            return Some(Binding {
+                reg: dst,
+                kind: BindingKind::Float,
+                depends_on_stack: base.depends_on_stack || ea.depends_on_stack,
+                struct_type: None,
+            });
         }
+        let (item_size, is_signed) = match segments.last()?.as_str() {
+            "majit_raw_load_i8" => (1usize, true),
+            "majit_raw_load_u8" => (1usize, false),
+            "majit_raw_load_i16" => (2usize, true),
+            "majit_raw_load_u16" => (2usize, false),
+            "majit_raw_load_i32" => (4usize, true),
+            "majit_raw_load_u32" => (4usize, false),
+            "majit_raw_load_i64" => (8usize, true),
+            // At 8 bytes signed/unsigned load into an i64 register is
+            // identical (no sign-extension gap), but the intrinsic is
+            // documented as supported, so accept it for parity.
+            "majit_raw_load_u64" => (8usize, false),
+            _ => return None,
+        };
         if call.args.len() != 2 {
             return None;
         }
@@ -269,7 +455,7 @@ impl<'c> Lowerer<'c> {
                 vec![Register::int(dst)],
             ),
             quote! {
-                let __raw_descr = __builder.add_raw_int_array_descr(8);
+                let __raw_descr = __builder.add_raw_int_array_descr_signed(#item_size, #is_signed);
                 __builder.raw_load_i(
                     #dst as u16,
                     #base_reg as u16,
@@ -1648,22 +1834,31 @@ impl<'c> Lowerer<'c> {
         match op {
             UnOp::Neg(_) => {
                 let inner = self.lower_value_expr(expr)?;
-                if !matches!(inner.kind, BindingKind::Int) {
-                    return None;
-                }
                 let reg = self.alloc_reg();
                 let src_reg = inner.reg;
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::UnaryI,
+                // Negate on the int bank (`IntNeg`) and the float bank
+                // (`FloatNeg`) share the one-src/one-dst unary shape; the bank
+                // is carried by the `Register` tag, not the `OpKind`. A `Ref`
+                // operand aborts to the interpreter.
+                let (reads, writes, emit, kind) = match inner.kind {
+                    BindingKind::Int => (
                         vec![Register::int(src_reg)],
                         vec![Register::int(reg)],
+                        quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntNeg, #src_reg); },
+                        BindingKind::Int,
                     ),
-                    quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntNeg, #src_reg); },
-                );
+                    BindingKind::Float => (
+                        vec![Register::float(src_reg)],
+                        vec![Register::float(reg)],
+                        quote! { __builder.record_unary_f(#reg, majit_ir::OpCode::FloatNeg, #src_reg); },
+                        BindingKind::Float,
+                    ),
+                    BindingKind::Ref => return None,
+                };
+                self.emit_op(OpMeta::linear(OpKind::UnaryI, reads, writes), emit);
                 Some(Binding {
                     reg,
-                    kind: BindingKind::Int,
+                    kind,
                     depends_on_stack: inner.depends_on_stack,
                     struct_type: None,
                 })
@@ -1778,6 +1973,46 @@ impl<'c> Lowerer<'c> {
     fn lower_binary(&mut self, expr: &ExprBinary) -> Option<Binding> {
         let lhs = self.lower_value_expr(&expr.left)?;
         let rhs = self.lower_value_expr(&expr.right)?;
+        if matches!(lhs.kind, BindingKind::Float) && matches!(rhs.kind, BindingKind::Float) {
+            let lhs_reg = lhs.reg;
+            let rhs_reg = rhs.reg;
+            // A float comparison materializes a `0`/`1` int result (like the
+            // int compare path), so its operands stay float but the write is
+            // int-banked. `record_compare_f` emits `float_lt/ff>i` etc.
+            if let Some(opcode) = opcode_for_compare_f(&expr.op) {
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::BinopF,
+                        Register::floats(&[lhs_reg, rhs_reg]),
+                        vec![Register::int(reg)],
+                    ),
+                    quote! { __builder.record_compare_f(#reg, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg); },
+                );
+                return Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+                    struct_type: None,
+                });
+            }
+            let opcode = opcode_for_binop_f(&expr.op)?;
+            let reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopF,
+                    Register::floats(&[lhs_reg, rhs_reg]),
+                    vec![Register::float(reg)],
+                ),
+                binop_f_emit_tokens(reg, &opcode, lhs_reg, rhs_reg),
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Float,
+                depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+                struct_type: None,
+            });
+        }
         if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
             return None;
         }
@@ -1797,6 +2032,30 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Lower an `<int> as f64` cast to RPython's `cast_int_to_float`
+    /// (`bhimpl_cast_int_to_float`). The operand is read from the int bank and
+    /// widened to the float bank; the result is a float binding. `UnaryI` is the
+    /// op-kind label (a single int read) — the float bank of the result is
+    /// carried by the write `Register`, which is what liveness/regalloc read.
+    fn lower_int_to_float_cast(&mut self, binding: Binding) -> Option<Binding> {
+        let src_reg = binding.reg;
+        let reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                Register::ints(&[src_reg]),
+                vec![Register::float(reg)],
+            ),
+            quote! { __builder.record_cast_int_to_float(#reg, #src_reg); },
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Float,
+            depends_on_stack: binding.depends_on_stack,
             struct_type: None,
         })
     }
@@ -2056,6 +2315,43 @@ mod tests {
             .collect::<String>();
         assert!(emitted.contains("raw_store_i"));
         assert!(emitted.contains("add_raw_int_array_descr"));
+    }
+
+    #[test]
+    fn raw_load_intrinsics_lower_with_width_and_sign() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("base".to_string(), binding(3, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("ea".to_string(), binding(4, BindingKind::Int));
+        let expr: Expr = syn::parse_str("majit_raw_load_i32(base, ea)").expect("parse raw load");
+
+        let result = lowerer
+            .lower_value_expr(&expr)
+            .expect("raw load should lower");
+
+        assert_eq!(result.kind, BindingKind::Int);
+        let kinds: Vec<_> = lowerer.op_metadata.iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, vec![OpKind::RawLoad]);
+        assert_eq!(
+            lowerer.op_metadata[0].reads,
+            vec![Register::int(3), Register::int(4)]
+        );
+        assert_eq!(
+            lowerer.op_metadata[0].writes,
+            vec![Register::int(result.reg)]
+        );
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("raw_load_i"));
+        assert!(emitted.contains("add_raw_int_array_descr_signed"));
+        assert!(emitted.contains("4usize"));
+        assert!(emitted.contains("true"));
     }
 
     #[test]

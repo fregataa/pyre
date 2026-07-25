@@ -172,8 +172,8 @@ pub const BC_LOAD_STATE_FIELD: u8 = 56;
 pub const BC_STORE_STATE_FIELD: u8 = 57;
 pub const BC_LOAD_STATE_ARRAY: u8 = 58;
 pub const BC_STORE_STATE_ARRAY: u8 = 59;
-// (bytes 60/61 were freed when the raw state-varray path was retired; virt
-// arrays now lower through the standard vable opcodes.)
+pub const BC_LOAD_STATE_FIELD_FLOAT: u8 = 60;
+pub const BC_STORE_STATE_FIELD_FLOAT: u8 = 61;
 pub const BC_GETFIELD_VABLE_I: u8 = 62;
 pub const BC_GETFIELD_VABLE_R: u8 = 63;
 pub const BC_GETFIELD_VABLE_F: u8 = 64;
@@ -384,6 +384,22 @@ pub const BC_FLOAT_GT: u8 = 182;
 pub const BC_CAST_INT_TO_FLOAT: u8 = 183;
 pub const BC_CAST_INT_TO_PTR: u8 = 184;
 pub const BC_CAST_PTR_TO_INT: u8 = 185;
+
+// Float<->longlong bit reinterpret — `bhimpl_convert_float_bytes_to_longlong`
+// / `bhimpl_convert_longlong_bytes_to_float` (`blackhole.py:828-834`): a bitcast
+// of the 64-bit pattern, NOT a value cast (unlike `cast_float_to_int`).
+pub const BC_CONVERT_FLOAT_BYTES_TO_LONGLONG: u8 = 229;
+pub const BC_CONVERT_LONGLONG_BYTES_TO_FLOAT: u8 = 230;
+
+// Overflow-checked arithmetic fused with its branch — `bhimpl_int_{add,sub,mul}
+// _jump_if_ovf` (`blackhole.py:478-497`).  Argcode `Lii>i`: a 2-byte overflow
+// label + two int reads + one int write (written only on the no-overflow path).
+// The metatracer records these as `IntAddOvf`/`IntSubOvf`/`IntMulOvf` + a
+// box-less `GuardNoOverflow`/`GuardOverflow` (`pyjitpl/dispatch.rs`); a guard
+// failure resumes at the fused op and the blackhole performs the branch itself.
+pub const BC_INT_ADD_JUMP_IF_OVF: u8 = 231;
+pub const BC_INT_SUB_JUMP_IF_OVF: u8 = 232;
+pub const BC_INT_MUL_JUMP_IF_OVF: u8 = 233;
 
 // `switch/id` — RPython `blackhole.py:954-960` `bhimpl_switch` —
 // table-of-cases dispatch keyed by an int register + a descr selecting
@@ -820,6 +836,11 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_add/ii>i", BC_INT_ADD);
     m.insert("int_sub/ii>i", BC_INT_SUB);
     m.insert("int_mul/ii>i", BC_INT_MUL);
+    // blackhole.py:478-497 overflow-checked arithmetic — `Lii>i`: 2-byte label +
+    // 2 int reads + 1 int write (only on the no-overflow path).
+    m.insert("int_add_jump_if_ovf/Lii>i", BC_INT_ADD_JUMP_IF_OVF);
+    m.insert("int_sub_jump_if_ovf/Lii>i", BC_INT_SUB_JUMP_IF_OVF);
+    m.insert("int_mul_jump_if_ovf/Lii>i", BC_INT_MUL_JUMP_IF_OVF);
     // `int_floordiv/ii>i` / `int_mod/ii>i` intentionally absent —
     // `jtransform.py:576-577` rewrites via `_do_builtin_call`, so the
     // SSA-name → bytecode table never matches these.  See the
@@ -1020,6 +1041,14 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("cast_int_to_ptr/i>r", BC_CAST_INT_TO_PTR);
     m.insert("cast_ptr_to_int/r>i", BC_CAST_PTR_TO_INT);
     m.insert("cast_float_to_int/f>i", BC_CAST_FLOAT_TO_INT);
+    m.insert(
+        "convert_float_bytes_to_longlong/f>i",
+        BC_CONVERT_FLOAT_BYTES_TO_LONGLONG,
+    );
+    m.insert(
+        "convert_longlong_bytes_to_float/i>f",
+        BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
+    );
 
     // Switch dispatch — `blackhole.py:954-960` `bhimpl_switch`.
     // Argcodes `id`: int discriminator + descr selecting the case table.
@@ -1180,6 +1209,8 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     m.insert("store_state_field_ref/dr", BC_STORE_STATE_FIELD_REF);
     m.insert("load_state_field/di", BC_LOAD_STATE_FIELD);
     m.insert("store_state_field/di", BC_STORE_STATE_FIELD);
+    m.insert("load_state_field_float/df", BC_LOAD_STATE_FIELD_FLOAT);
+    m.insert("store_state_field_float/df", BC_STORE_STATE_FIELD_FLOAT);
     m.insert("load_state_array/dii", BC_LOAD_STATE_ARRAY);
     m.insert("store_state_array/dii", BC_STORE_STATE_ARRAY);
     // TODO: pyre nested-bytecode `inline_call`.

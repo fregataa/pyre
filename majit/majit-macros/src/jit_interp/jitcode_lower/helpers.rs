@@ -514,6 +514,15 @@ pub(super) fn binop_i_emit_tokens(
     }
 }
 
+pub(super) fn binop_f_emit_tokens(
+    dst: u16,
+    opcode: &Ident,
+    lhs: u16,
+    rhs: u16,
+) -> proc_macro2::TokenStream {
+    quote! { __builder.record_binop_f(#dst, majit_ir::OpCode::#opcode, #lhs, #rhs); }
+}
+
 pub(super) fn opcode_for_binop(op: &BinOp) -> Option<Ident> {
     let name = match op {
         BinOp::Add(_) => "IntAdd",
@@ -541,6 +550,32 @@ pub(super) fn opcode_for_binop(op: &BinOp) -> Option<Ident> {
         BinOp::Le(_) => "IntLe",
         BinOp::Gt(_) => "IntGt",
         BinOp::Ge(_) => "IntGe",
+        _ => return None,
+    };
+    Some(Ident::new(name, proc_macro2::Span::call_site()))
+}
+
+pub(super) fn opcode_for_binop_f(op: &BinOp) -> Option<Ident> {
+    let name = match op {
+        BinOp::Add(_) => "FloatAdd",
+        BinOp::Sub(_) => "FloatSub",
+        BinOp::Mul(_) => "FloatMul",
+        BinOp::Div(_) => "FloatTrueDiv",
+        _ => return None,
+    };
+    Some(Ident::new(name, proc_macro2::Span::call_site()))
+}
+
+/// Float comparison operators. Both operands are float; the result is an
+/// int (`0`/`1`) recorded via `record_compare_f` (`float_lt/ff>i` etc.).
+pub(super) fn opcode_for_compare_f(op: &BinOp) -> Option<Ident> {
+    let name = match op {
+        BinOp::Lt(_) => "FloatLt",
+        BinOp::Le(_) => "FloatLe",
+        BinOp::Eq(_) => "FloatEq",
+        BinOp::Ne(_) => "FloatNe",
+        BinOp::Gt(_) => "FloatGt",
+        BinOp::Ge(_) => "FloatGe",
         _ => return None,
     };
     Some(Ident::new(name, proc_macro2::Span::call_site()))

@@ -110,6 +110,28 @@ fn bh_jitdrivers_sd(
         .collect()
 }
 
+/// Pick the `bh.virtualizable_info` pointer to seed at a guard-failure deopt, or
+/// null to leave it unset. A non-null vinfo lets the blackhole run a mid-body
+/// vable-array op (e.g. the `int_*_jump_if_ovf` overflow guard on a `[int; virt]`
+/// state field). Seed when either the portal-inline experiment is on, or the
+/// machine is a state-field one (`token_offset == 0`) whose `bh_clear_vable_token`
+/// is inert so a non-null vinfo cannot corrupt its non-GC `state` struct. A real
+/// heap virtualizable (`token_offset > 0`, e.g. PyFrame) is left with null vinfo
+/// to preserve its existing resume contract.
+fn seed_deopt_vinfo_ptr(
+    vinfo: Option<&std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
+) -> *const crate::virtualizable::VirtualizableInfo {
+    match vinfo {
+        Some(info)
+            if crate::pyjitpl::dispatch::portal_inline_experiment_enabled()
+                || info.token_offset == 0 =>
+        {
+            std::sync::Arc::as_ptr(info)
+        }
+        _ => std::ptr::null(),
+    }
+}
+
 /// Run one tracing MIFrame forward in the already-ported blackhole.
 ///
 /// This is the single-frame counterpart of the structured back-edge template
@@ -316,7 +338,19 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     }
 
     if length_f != 0 {
-        let _ = LivenessIterator::new(offset, length_f, all_liveness);
+        let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+        for reg_idx in &mut it {
+            let reg_idx = reg_idx as usize;
+            let scalars_end = layout.float_scalar_base + layout.num_float_scalars;
+            if (layout.float_scalar_base..scalars_end).contains(&reg_idx) {
+                if let Some(value) = bh.registers_f.get(reg_idx).copied() {
+                    state.writeback_live_float_scalar_state_field(
+                        reg_idx - layout.float_scalar_base,
+                        value,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3504,7 +3538,7 @@ impl<S: JitState> JitDriver<S> {
                     vable_identity_override,
                     allocator,
                 );
-                if let Some((mut bh, _vable_ptr)) = bh {
+                if let Some((mut bh, vable_ptr)) = bh {
                     // Thread the state-field register layout onto every frame
                     // so the `state_field` handlers map a logical scalar/array
                     // index to the flat register slot the resume reader seeded.
@@ -3514,25 +3548,27 @@ impl<S: JitState> JitDriver<S> {
                     // layout before it runs.
                     let sf_layout = state.state_field_layout();
                     bh.state_field_layout = sf_layout.clone();
-                    // [FR] Seed the reconstructed blackhole chain with the
-                    // registered virtualizable info so an inlined portal
-                    // callee's vable-array opcodes (getarrayitem_vable_*) can
-                    // resolve their vinfo during resume. Gated behind the
-                    // experiment flag: the default state-field path never runs
-                    // vable-array ops in the blackhole, and seeding a non-null
-                    // vinfo would flip the `!vinfo.is_null()` branches in the
-                    // field handlers for existing consumers.
-                    let portal_vinfo_ptr =
-                        if crate::pyjitpl::dispatch::portal_inline_experiment_enabled() {
-                            self.meta
-                                .virtualizable_info()
-                                .map(std::sync::Arc::as_ptr)
-                                .unwrap_or(std::ptr::null())
-                        } else {
-                            std::ptr::null()
-                        };
-                    if !portal_vinfo_ptr.is_null() {
-                        bh.virtualizable_info = portal_vinfo_ptr;
+                    // Seed the reconstructed blackhole chain with the registered
+                    // virtualizable info + identity pointer so a mid-body
+                    // vable-array opcode (`getarrayitem_vable_*` /
+                    // `setarrayitem_vable`) can resolve its vinfo during resume.
+                    // Two sources:
+                    //   * the portal-inline experiment (gated), OR
+                    //   * a state-field machine (`token_offset == 0`), whose
+                    //     `bh_clear_vable_token` is inert (the `state` struct has
+                    //     no heap token), so a non-null vinfo cannot corrupt it.
+                    //     The overflow-guard deopt (`int_*_jump_if_ovf` on the
+                    //     `[int; virt]` regs) is the first path to run a blackhole
+                    //     vable-array op on such a machine.
+                    // A real heap virtualizable (`token_offset > 0`, e.g.
+                    // PyFrame) keeps its existing null-vinfo resume contract.
+                    // The identity pointer must be co-seeded because the GC-root
+                    // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
+                    // whenever `virtualizable_info` is non-null.
+                    let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
+                    if !seed_vinfo_ptr.is_null() {
+                        bh.virtualizable_info = seed_vinfo_ptr;
+                        bh.virtualizable_ptr = vable_ptr;
                     }
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         guard_exc,
@@ -3558,8 +3594,9 @@ impl<S: JitState> JitDriver<S> {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
                                 Some(mut caller) => {
                                     caller.state_field_layout = sf_layout.clone();
-                                    if !portal_vinfo_ptr.is_null() {
-                                        caller.virtualizable_info = portal_vinfo_ptr;
+                                    if !seed_vinfo_ptr.is_null() {
+                                        caller.virtualizable_info = seed_vinfo_ptr;
+                                        caller.virtualizable_ptr = vable_ptr;
                                     }
                                     bh_builder.release_interp(bh);
                                     bh = *caller;
@@ -3646,10 +3683,12 @@ impl<S: JitState> JitDriver<S> {
                                 }
                             }
                             if layout.num_virt_arrays == 0 {
-                                state.restore_banked(
+                                let float_base = layout.float_scalar_base.min(bh.registers_f.len());
+                                state.restore_banked3(
                                     &compiled_meta,
                                     &bh.registers_i[int_base..],
                                     &bh.registers_r[ref_base..],
+                                    &bh.registers_f[float_base..],
                                 );
                             } else {
                                 writeback_live_state_scalars_from_blackhole(
@@ -3702,10 +3741,12 @@ impl<S: JitState> JitDriver<S> {
                             let layout = state.state_field_layout();
                             let int_base = layout.int_scalar_base.min(bh.registers_i.len());
                             let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                            state.restore_banked(
+                            let float_base = layout.float_scalar_base.min(bh.registers_f.len());
+                            state.restore_banked3(
                                 &compiled_meta,
                                 &bh.registers_i[int_base..],
                                 &bh.registers_r[ref_base..],
+                                &bh.registers_f[float_base..],
                             );
                             Some(usize::MAX)
                         }
@@ -4230,6 +4271,12 @@ impl<S: JitState> JitDriver<S> {
     /// Set a callback for guard failure events.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
         self.meta.set_on_guard_failure(f);
+    }
+
+    /// Set a callback for trace abort events. `f` receives `(green_key, permanent)`
+    /// where `permanent` is true when the abort disables the key permanently.
+    pub fn set_on_trace_abort(&mut self, f: impl Fn(u64, bool) + Send + 'static) {
+        self.meta.set_on_trace_abort(f);
     }
 
     /// Set a JIT parameter by name at runtime.
@@ -5807,11 +5854,20 @@ impl<S: JitState> JitDriver<S> {
                     vable_identity_override,
                     allocator,
                 );
-                if let Some((mut bh, _vable_ptr)) = bh {
+                if let Some((mut bh, vable_ptr)) = bh {
                     // Thread the state-field register layout so the
                     // `state_field` handlers map a logical scalar/array index
                     // to the flat register slot the resume reader seeded.
                     bh.state_field_layout = state.state_field_layout();
+                    // Seed vinfo + identity for a state-field machine so a
+                    // mid-body vable-array op resolves during resume (see the
+                    // chain-resume path above for the full rationale). Real heap
+                    // virtualizables (`token_offset > 0`) are left untouched.
+                    let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
+                    if !seed_vinfo_ptr.is_null() {
+                        bh.virtualizable_info = seed_vinfo_ptr;
+                        bh.virtualizable_ptr = vable_ptr;
+                    }
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         result_exc,
                     );
@@ -5858,6 +5914,41 @@ mod tests {
     use super::*;
     use crate::resume::ReconstructedFrame;
     use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
+
+    // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
+    // a non-null `bh.virtualizable_info`. A state-field machine (`token_offset == 0`)
+    // must be seeded so a mid-body vable-array op — the `int_*_jump_if_ovf` overflow
+    // guard on a `[int; virt]` field — resolves its vinfo during resume instead of
+    // panicking. A real heap virtualizable (`token_offset > 0`, e.g. PyFrame) keeps
+    // the prior null-vinfo resume contract unless the portal-inline experiment is on.
+    #[test]
+    fn seed_deopt_vinfo_ptr_seeds_state_field_and_skips_heap_virtualizable() {
+        use crate::virtualizable::VirtualizableInfo;
+
+        // token_offset == 0 → seed the reconstructed vinfo pointer (always, since
+        // its `bh_clear_vable_token` is inert and cannot corrupt the state struct).
+        let state_field = std::sync::Arc::new(VirtualizableInfo::new(0));
+        assert_eq!(
+            seed_deopt_vinfo_ptr(Some(&state_field)),
+            std::sync::Arc::as_ptr(&state_field),
+            "a token_offset==0 state-field machine must seed a non-null vinfo",
+        );
+
+        // No vinfo available → null.
+        assert!(seed_deopt_vinfo_ptr(None).is_null());
+
+        // token_offset > 0 → null while the portal-inline experiment is off, so a
+        // real heap virtualizable keeps its existing null-vinfo resume contract.
+        // (The experiment flag is a process-wide latch; guard the assertion on it
+        // rather than assuming the env is unset.)
+        if !crate::pyjitpl::dispatch::portal_inline_experiment_enabled() {
+            let heap_vable = std::sync::Arc::new(VirtualizableInfo::new(8));
+            assert!(
+                seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
+                "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
+            );
+        }
+    }
 
     #[derive(Default)]
     struct TypedRestoreState {
@@ -6812,7 +6903,8 @@ mod tests {
         // Build the canonical liveness exactly the way the macro expansion
         // does (orth-6 helper + orth-2 _encode_liveness + insns
         // registration mirroring `assembler.py:222 self.insns[key] = opnum`).
-        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0);
+        let (live_i, live_r, live_f) =
+            crate::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0, 0, 0);
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
         asm._encode_liveness(&live_i, &live_r, &live_f, &mut scratch);
