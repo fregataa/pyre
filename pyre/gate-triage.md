@@ -76,9 +76,12 @@ would only manufacture conflicts):
   carrier-boundary raise delivery, now unconditional with the
   `PYRE_FBW_TRYBLOCK_INLINE` / `PYRE_FBW_CARRIER_RAISE` gates retired.
 
-**Judged KEEP** (genuine WIP parity port): `PYRE_FBW_VABLE_SCALAR_CA` (S0 seam
-of the vable-owner rework toward `direct_assembler_call` scalar args);
-`PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
+**Judged KEEP** (genuine WIP parity port): `PYRE_FBW_VABLE_SCALAR_CA` was kept
+here as "S0 seam of the vable-owner rework toward `direct_assembler_call` scalar
+args" — **that judgement was wrong and is reversed in §1d**: the 2026-07-25
+parity pass read `direct_assembler_call` and found its ON design is what
+upstream's `num_red_args` assert forbids. Retired.
+Still kept: `PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
 into the bridge sym for the depth-2 carrier exception-resume slice #343/#126 —
 inert until validated; the seed's `bridge_guard_exc` GC-rooting and the
 unconditional `execute_ll_raised` exception assign are parity gaps to close
@@ -102,6 +105,89 @@ after the 2026-07-05 audit; this pass removes their stale registry rows. The
 | PYRE_P2_FS_COMPILE | PR#374 (`9a97c47f6e9`) | stale §5 deferred entry removed |
 | PYRE_P2_AUTHORITATIVE | reader gone; attribution #374 per re-audit | stale §5 deferred entry removed |
 | PYRE_SAME_GREENKEY | PR#390 (`802b79ff8db`); follow-up `111bdb4eeb8` dropped the gate | stale §1b deferred mention and §5 list entry removed |
+
+## §1d — Parity verdicts for the default-OFF `PYRE_FBW_*` seams (2026-07-25)
+
+The 2026-07-25 pass judged each remaining default-OFF seam by the §1b question —
+**is the ON path a WIP parity port, or a pyre-invented mechanism that
+contradicts the PyPy design?** — reading the vendored `rpython/` + `pypy/`
+sources rather than the gates' own doc comments.  Performance was explicitly
+not a criterion.  Verdicts, each adversarially re-checked against the cited
+upstream lines:
+
+| gate | orthodox side | outcome |
+|---|---|---|
+| PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
+| PYRE_FBW_MULTIFRAME | **ON** | keep; the ON path is the port, and it is unfinished |
+| PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
+
+The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
+
+**`_VABLE_SCALAR_CA` — retired, ON path deleted.**  The gate proposed passing
+the callee's loop-carried locals as *extra scalar* CALL_ASSEMBLER args plus a
+`VableExpansion` mapping each to a callee jitframe slot.  Upstream forbids
+exactly that: `direct_assembler_call` records the op with the target
+jitdriver's red args and asserts `len(args) == targetjitdriver_sd.num_red_args`
+(`rpython/jit/metainterp/pyjitpl.py:3620`), and the PyPy portal's reds are
+`['frame', 'ec']` (`pypy/module/pypyjit/interp_jit.py:67`) — literally the
+`[callee_frame, callee_ec]` pair the OFF path already emits.  Upstream's
+direction of travel is the exact inverse of the gate's: the CALLEE unpacks the
+virtualizable, via `patch_new_loop_to_load_virtualizable_fields`
+(`rpython/jit/metainterp/compile.py:425-461`), which *truncates* the callee
+loop to `inputargs[:num_red_args]` (`:432`) and prepends a GETFIELD_GC /
+GETARRAYITEM_GC per field read off the vable red arg (`:433-457`).  Because
+that loop head dereferences a real heap frame, forcing the still-virtual frame
+at the call — the allocation plus one SETARRAYITEM_GC per known element the
+gate wanted to elide — is the upstream op sequence, not a pyre decline.
+
+The retirement is byte-identical: the ON emitter was scaffolding that produced
+the same red-only CALL_ASSEMBLER as OFF, and the only
+`call_assembler_with_vable_expansion` constructor was `#[cfg(test)]`.
+A follow-up commit deletes the `VableExpansion` type itself (`majit-ir`), the
+`CallAssemblerDescr` accessor and `..._with_vable`/`..._with_expansion`
+constructors (`majit-metainterp`), and the consumer arms in both backends —
+including `genop_call_assembler`'s expansion tail, which allocated a callee
+jitframe with `libc::calloc` and materialised the mapped fields into its slots.
+Nothing in that tail has an upstream counterpart: the callee frame is built by
+`handle_call_assembler` (`rpython/jit/backend/llsupport/rewrite.py:665-695`) and
+the backend only loads `arglocs[0]` and calls the target.
+
+This left an apparent CALLEE-side gap — "pyre does not yet run
+`patch_new_loop_to_load_virtualizable_fields`, so a callee loop still carries
+the vable-expanded inputarg list" — sourced from a comment in
+`majit-backend-cranelift/src/compiler.rs` claiming the helper is held disabled
+pending vable heap-writeback.  **That was false and is now measured.**  Both
+sites were instrumented and the whole 313-benchmark corpus swept: the helper
+truncated **2044 times with zero early returns** (`inputargs=14/15/16 → reds=2`),
+and the caller-side resolver saw **38/38 CALL_ASSEMBLER targets at the expected
+arity**.  The shrink has been universally active since `driver_descriptor()`
+started returning `Some(...)`; the comment predated that flip.  The dead
+fallback it guarded, and the `num_scalar_inputargs` plumbing that fed it, are
+deleted.
+
+**`_MULTIFRAME` — the ON path is the upstream structure.**  Upstream's
+`convert_and_run_from_pyjitpl` (`rpython/jit/metainterp/blackhole.py:1799-1826`)
+*is* "convert the whole metainterp framestack into a chain of
+BlackholeInterpreters and run it", and it is what upstream does when a residual
+call forces the virtualizable (`vable_after_residual_call` →
+`SwitchToBlackhole(ABORT_ESCAPE)`, `pyjitpl.py:3389`).  pyre's port is
+line-faithful.  The OFF path — decline to escape/replay — has no upstream
+analogue at all; upstream cannot decline (`assert False  # ^^^ must raise`,
+`pyjitpl.py:2956`).  Two honest qualifications: (a) upstream also hands control
+back to the plain interpreter, via `ContinueRunningNormally` re-invoking the
+portal (`blackhole.py:1067-1069`, `warmspot.py:970-982`), so "upstream never
+returns to the interpreter" is *not* the reason OFF is a deviation — the reason
+is the blanket decline and the rewind; (b) upstream needs no per-frame
+virtualizable because every non-standard virtualizable degrades at trace time to
+concrete `getfield_gc` / `setarrayitem_gc` on the real heap frame
+(`_nonstandard_virtualizable`, `pyjitpl.py:1120-1146`), leaving all callee
+PyFrames heap-authoritative before the chain is built, whereas pyre's walker
+keeps inlined callee frames unmaterialized (`fbw_strict_fold_frame_reg`,
+`vable_ops.rs:184-192`).  So the remaining work is a materialization step
+upstream does not have — a consequence of pyre's virtual-callee-frame inlining —
+plus per-frame vable binding, since `PyjitplBlackholeFrameConfig` stamps one
+shared `virtualizable_ptr` onto every frame in the chain and the adopt writes
+only `last_instr`.
 
 ## §2 — Not gates (11): Rust identifiers, not env vars
 
@@ -143,6 +229,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
+| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retire once the multi-frame twin (`_MULTIFRAME`) lands and the escape/replay fallback is no longer the only other leg |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
@@ -167,10 +254,41 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (1 remaining)** — triaged in §1b/§1c (4 retired
-  in the 2026-07-05 pass, 8 retired since then, 1 kept as a WIP parity port;
-  `PYRE_P2_DRAIN` retired with the framestack-walk deletion):
-  `PYRE_FBW_VABLE_SCALAR_CA` (keep).
+- **Default-OFF experiments (3 remaining)** — triaged in §1b/§1c (4 retired
+  in the 2026-07-05 pass, 8 retired since then; `PYRE_P2_DRAIN` retired with
+  the framestack-walk deletion; `_VABLE_SCALAR_CA` retired 2026-07-25, see
+  §1d).  Kept: `_MULTIFRAME` (multi-frame blackhole image — the ON path IS the
+  upstream structure, see §1d), `_CALLEE_VSTACK` (callee-local operand-stack
+  mirror), and `PYRE_CARRIER_EXC_RESUME`.  For these the *ON* path is the
+  unattested one, so they are adoption targets rather than retirement targets.
+  `_BLACKHOLE_RESUME` graduated out of this bucket on 2026-07-25 (flipped
+  default-ON, now in §4).
+
+  `_CALLEE_VSTACK` was evaluated for a flip on 2026-07-25 and **declined —
+  the ON path is a half-finished port with no consumer**.  Parity first:
+  upstream has *no* per-frame operand-stack model to port, because the
+  codewriter has already flattened the Python stack into jitcode registers —
+  `MIFrame` carries only `registers_i/r/f` (`pyjitpl.py:65-95`), a callee's
+  resume section is its own registers under the per-pc liveness window
+  (`get_list_of_active_boxes`, `pyjitpl.py:177-234`), and `virtualizable_boxes`
+  is established once for the ONE standard vable
+  (`initialize_virtualizable`, `pyjitpl.py:3314-3331`; `_nonstandard_virtualizable`,
+  `1120-1146`).  So NEITHER side of this gate is an upstream port, and the
+  mirror's own module doc concedes it has no `rpython/jit/metainterp/`
+  counterpart.  What decides it is a defect on the ON side: with the gate on,
+  `seed_callee_vstack_mirror` fills the mirror with CALLEE content
+  (`vstack_mirror.rs:727-742`), but the two maintenance sites still classify
+  `index_value` against the OUTER portal sym's `nlocals()`
+  (`vable_ops.rs:558-570`, `610-645`), and `collect_call_stack_overrides`
+  indexes the mirror with `caller_sym.nlocals()`
+  (`resume_snapshot.rs:1138-1151`) — callee content read through caller frame
+  geometry.  Meanwhile the guard-time consumer is unreachable in a sub-walk
+  (`resume_snapshot.rs:325` gates it behind `!inline_subwalk`), which is why a
+  306-bench corpus A/B on both backends changes the `[vstack-reconcile]` count
+  in 60 benches with byte-identical output and no measurable timing difference:
+  the mirror is seeded and then read by nobody.  Definition of done before
+  re-evaluating: make the maintenance sites read the ACTIVE callee jitcode
+  metadata (what the gate doc already asks for), then land a consumer.
 - **Config / value / master switches (~18)** — tuning, paths, modes; keep:
   `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
@@ -183,11 +301,11 @@ Kept as-is; listed for completeness.
 
 | bucket | count |
 |---|---|
-| retired (§1 default-ON pass + §1b default-OFF pass + §1c re-audit book-keeping) | 5 + 4 + 10 |
+| retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 10 + 1 |
 | not gates (identifiers) | 11 |
-| dead (no read site) | 9 |
-| live default-ON, kept until epic closes | ~26 |
+| dead (no read site) | 10 |
+| live default-ON, kept until epic closes | 9 (+ `PYRE_GC_INTERP`, wasm32-only) |
 | diagnostics (OFF) | ~34 |
-| default-OFF experiments (1 keep + 1 deferred) | 2 |
+| default-OFF experiments (all keep — adoption targets) | 3 |
 | config / value / master | ~18 |
 | test harness | 1 |

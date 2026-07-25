@@ -7810,10 +7810,9 @@ impl JitState for PyreJitState {
         let num_locals = self.local_count();
         let vsd = self.valuestackdepth();
         let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
-        // The valuestackdepth → heap array capacity flip is not used here
-        // because it activates the broken VableExpansion path. The
-        // `capacity` reference uses the pre-flip semantics:
-        // array_capacity == self.array_capacity().
+        // `capacity` is the frame's real heap array capacity, not the
+        // valuestackdepth: the meta describes the allocated slot count that
+        // vable array accesses are bounds-checked against.
         let capacity = self.array_capacity();
         PyreMeta {
             num_locals,
@@ -9878,8 +9877,6 @@ mod tests {
             let info = crate::frame_layout::build_pyframe_virtualizable_info();
             let mut driver = majit_metainterp::JitDriver::new(1);
             driver.set_virtualizable_info(info.clone());
-            driver.meta_interp_mut().num_scalar_inputargs =
-                crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             (driver, info)
         });
     }
