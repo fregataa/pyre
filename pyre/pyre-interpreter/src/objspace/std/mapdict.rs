@@ -448,7 +448,10 @@ pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef>
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
-    node_read(map, inst, Wtf8::new("weakref"), SPECIAL)
+    // A cleared lifeline (mapdict.py:802 writes `None` = null into the retained
+    // node) reads back as a null slot; report it as absent rather than
+    // `Some(null)`.
+    node_read(map, inst, Wtf8::new("weakref"), SPECIAL).filter(|w| !w.is_null())
 }
 
 /// Write the weakref lifeline into the instance's `"weakref"` SPECIAL slot
@@ -1110,7 +1113,7 @@ unsafe fn classify_attr(
 /// `w_descr` must be a live object.
 unsafe fn descr_type_is_heaptype(w_descr: PyObjectRef) -> bool {
     match crate::typedef::r#type(w_descr) {
-        Some(t) => unsafe { pyre_object::typeobject::w_type_is_heaptype(t) },
+        Some(t) => unsafe { pyre_object::typeobject::w_type_is_heaptype(t.as_ptr()) },
         None => true,
     }
 }
@@ -2038,7 +2041,7 @@ unsafe fn is_unboxable_int(w_value: PyObjectRef) -> bool {
     let Some(actual) = crate::typedef::r#type(w_value) else {
         return false;
     };
-    std::ptr::eq(actual, exact)
+    std::ptr::eq(actual.as_ptr(), exact)
 }
 
 /// Float half of `_pick_unbox_type`: PyPy uses
@@ -2055,7 +2058,7 @@ unsafe fn is_unboxable_float(w_value: PyObjectRef) -> bool {
     let Some(actual) = crate::typedef::r#type(w_value) else {
         return false;
     };
-    std::ptr::eq(actual, exact)
+    std::ptr::eq(actual.as_ptr(), exact)
 }
 
 /// mapdict.py:586-590 `UnboxedPlainAttribute._convert_to_boxed` — rebuild the

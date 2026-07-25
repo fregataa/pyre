@@ -2234,8 +2234,8 @@ unsafe fn try_compare_override(
     let comparison_method = |obj: PyObjectRef, name: &str| {
         if is_instance(obj) {
             let w_type = crate::typedef::r#type(obj)?;
-            let method = lookup_in_type_where(w_type, name)?;
-            Some((method, w_type))
+            let method = lookup_in_type_where(w_type.as_ptr(), name)?;
+            Some((method, w_type.as_ptr()))
         } else {
             crate::baseobjspace::subclass_special_override(obj, name)
         }
@@ -2244,8 +2244,7 @@ unsafe fn try_compare_override(
     let b_type = crate::typedef::r#type(b);
     let a_ov = comparison_method(a, dunder);
     let mut b_ov = comparison_method(b, rdunder);
-    if dunder == rdunder && matches!((a_type, b_type), (Some(at), Some(bt)) if std::ptr::eq(at, bt))
-    {
+    if dunder == rdunder && matches!((a_type, b_type), (Some(at), Some(bt)) if at == bt) {
         // descroperation.py: for __eq__ and __ne__, objects of the same
         // class resolve the same method, so do not invoke it twice.
         b_ov = None;
@@ -2258,7 +2257,7 @@ unsafe fn try_compare_override(
     // first.
     let b_first = b_ov.is_some()
         && match (a_type, b_type) {
-            (Some(at), Some(bt)) => !std::ptr::eq(at, bt) && issubtype_cached(bt, at),
+            (Some(at), Some(bt)) => at != bt && issubtype_cached(bt.as_ptr(), at.as_ptr()),
             _ => false,
         };
     let order = if b_first {
@@ -2329,7 +2328,9 @@ unsafe fn try_instance_unaryop(
 /// `str`/`list`/`tuple` install `__add__`/`__radd__` on their own type;
 /// an inherited (non-overridden) lookup resolves back to `tp`.
 unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> bool {
-    match crate::typedef::r#type(obj).and_then(|t| lookup_where_with_method_cache(t, dunder)) {
+    match crate::typedef::r#type(obj)
+        .and_then(|t| lookup_where_with_method_cache(t.as_ptr(), dunder))
+    {
         Some((src, _)) => !std::ptr::eq(src, tp),
         None => false,
     }
@@ -2373,6 +2374,7 @@ unsafe fn needs_seq_binop_dispatch(
     let Some(t) = crate::typedef::gettypefor(tp) else {
         return false;
     };
+    let t = t.as_ptr();
     dunder_overridden(a, fwd, t)
         || dunder_overridden(a, rev, t)
         || dunder_overridden(b, fwd, t)
@@ -2402,6 +2404,7 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     let Some(t) = crate::typedef::gettypefor(tp) else {
         return false;
     };
+    let t = t.as_ptr();
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
@@ -2436,7 +2439,9 @@ unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyTy
 /// UTF-8-keyed cache probe per dunder) are the dominant per-iteration cost
 /// of the interpreter numeric fast path.  This mirrors the exact-builtin
 /// gate already opening `subclass_special_override` / `is_true`.
-unsafe fn numeric_base_type_of_overriding_subclass(obj: PyObjectRef) -> Option<PyObjectRef> {
+unsafe fn numeric_base_type_of_overriding_subclass(
+    obj: PyObjectRef,
+) -> Option<std::ptr::NonNull<pyre_object::PyObject>> {
     if pyre_object::is_exact_builtin_instance(obj) {
         return None;
     }
@@ -2455,6 +2460,7 @@ unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &st
     let Some(t) = numeric_base_type_of_overriding_subclass(obj) else {
         return false;
     };
+    let t = t.as_ptr();
     dunder_overridden(obj, dunder, t) || dunder_overridden(obj, rdunder, t)
 }
 
@@ -2497,7 +2503,7 @@ unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, dunder: &str) -> bool {
     let Some(t) = numeric_base_type_of_overriding_subclass(a) else {
         return false;
     };
-    dunder_overridden(a, dunder, t)
+    dunder_overridden(a, dunder, t.as_ptr())
 }
 
 /// Call the overriding unary special on a numeric subclass operand before
@@ -2513,7 +2519,7 @@ unsafe fn try_numeric_unaryop_override(
     let Some(t) = crate::typedef::r#type(a) else {
         return Ok(None);
     };
-    let Some(method) = lookup_in_type_where(t, dunder) else {
+    let Some(method) = lookup_in_type_where(t.as_ptr(), dunder) else {
         return Ok(None);
     };
     Ok(Some(crate::call::call_function_impl_result(method, &[a])?))
@@ -2815,7 +2821,7 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 crate::baseobjspace::subclass_special_override(b, "__rmod__")
             {
                 let priority = match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
-                    (Some(at), Some(bt)) => !std::ptr::eq(at, bt) && issubtype_cached(bt, at),
+                    (Some(at), Some(bt)) => at != bt && issubtype_cached(bt.as_ptr(), at.as_ptr()),
                     _ => false,
                 };
                 if priority {
@@ -3168,7 +3174,7 @@ pub(crate) fn xor_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// `space.lookup(w_obj, dunder)` — descroperation.py.
 pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Option<PyObjectRef> {
-    crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp, dunder))
+    crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), dunder))
 }
 
 /// Call a special method and treat NotImplemented as "no result", per
@@ -3204,17 +3210,19 @@ pub(crate) fn try_dispatch_binary_special(
         let Some(w_typ2) = crate::typedef::r#type(rhs) else {
             return Ok(None);
         };
-        let (w_left_src, mut w_left_impl) = match lookup_where_with_method_cache(w_typ1, dunder) {
-            Some((src, imp)) => (Some(src), Some(imp)),
-            None => (None, None),
-        };
+        let (w_left_src, mut w_left_impl) =
+            match lookup_where_with_method_cache(w_typ1.as_ptr(), dunder) {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            };
         let mut w_obj1 = lhs;
         let mut w_obj2 = rhs;
         let mut w_right_impl: Option<PyObjectRef> = None;
         // descroperation.py:652 — same type means the reflected method is
         // never considered.
-        if !std::ptr::eq(w_typ1, w_typ2) {
-            let (w_right_src, wri) = match lookup_where_with_method_cache(w_typ2, rdunder) {
+        if w_typ1 != w_typ2 {
+            let (w_right_src, wri) = match lookup_where_with_method_cache(w_typ2.as_ptr(), rdunder)
+            {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             };
@@ -3225,13 +3233,13 @@ pub(crate) fn try_dispatch_binary_special(
                 if !std::ptr::eq(lsrc, rsrc) {
                     // descroperation.py:667-670.
                     let prefer_reverse = (seq_bug_compat
-                        && crate::baseobjspace::flag_sequence_bug_compat(w_typ1)
-                        && !crate::baseobjspace::flag_sequence_bug_compat(w_typ2))
-                        || issubtype_w(w_typ2, w_typ1);
+                        && crate::baseobjspace::flag_sequence_bug_compat(w_typ1.as_ptr())
+                        && !crate::baseobjspace::flag_sequence_bug_compat(w_typ2.as_ptr()))
+                        || issubtype_w(w_typ2.as_ptr(), w_typ1.as_ptr());
                     // descroperation.py:671-672.
                     if prefer_reverse
                         && !p_abstract_issubclass_w(lsrc, rsrc)?
-                        && !p_abstract_issubclass_w(w_typ1, rsrc)?
+                        && !p_abstract_issubclass_w(w_typ1.as_ptr(), rsrc)?
                     {
                         std::mem::swap(&mut w_obj1, &mut w_obj2);
                         std::mem::swap(&mut w_left_impl, &mut w_right_impl);
@@ -3286,8 +3294,8 @@ pub(crate) fn try_inplace_special(
                 if let (Some(lhs_type), Some(rhs_type)) =
                     (crate::typedef::r#type(lhs), crate::typedef::r#type(rhs))
                 {
-                    if crate::baseobjspace::flag_sequence_bug_compat(lhs_type)
-                        && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type)
+                    if crate::baseobjspace::flag_sequence_bug_compat(lhs_type.as_ptr())
+                        && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type.as_ptr())
                     {
                         if let Some(rmethod) = unsafe { lookup_type_special(rhs, rd) } {
                             if let Some(result) = try_call_special(rmethod, &[rhs, lhs])? {
@@ -3393,7 +3401,7 @@ fn pow_mod_result(value: BigInt, all_int_like: bool) -> PyObjectRef {
 fn operand_type_name(obj: PyObjectRef) -> String {
     unsafe {
         match crate::typedef::r#type(obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
             None => (*ll_type(obj)).name.to_string(),
         }
     }
@@ -4180,7 +4188,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // path is the one that succeeds for `set == d.keys()`.
         if !is_instance(a) {
             if let Some(a_type) = crate::typedef::r#type(a) {
-                if let Some(method) = lookup_in_type_where(a_type, dunder) {
+                if let Some(method) = lookup_in_type_where(a_type.as_ptr(), dunder) {
                     // A raised exception (not NotImplemented) propagates; only
                     // NotImplemented falls through to the reflected comparison.
                     let result = crate::call::call_function_impl_result(method, &[a, b])?;
@@ -4193,7 +4201,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         if !is_instance(b) {
             if let Some(rdunder) = reverse_dunder(dunder) {
                 if let Some(b_type) = crate::typedef::r#type(b) {
-                    if let Some(method) = lookup_in_type_where(b_type, rdunder) {
+                    if let Some(method) = lookup_in_type_where(b_type.as_ptr(), rdunder) {
                         let result = crate::call::call_function_impl_result(method, &[b, a])?;
                         if !is_not_implemented(result) {
                             return Ok(result);

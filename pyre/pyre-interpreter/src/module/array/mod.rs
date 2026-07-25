@@ -258,7 +258,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
         if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
         {
-            if !std::ptr::eq(cls, canonical) {
+            if !std::ptr::eq(cls, canonical.as_ptr()) {
                 unsafe {
                     (*obj).w_class = cls;
                 }
@@ -1138,7 +1138,7 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__reduce_ex__")?;
     let obj = args[0];
     let protocol = crate::baseobjspace::int_w(args[1])?;
-    let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+    let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
     let typecode = unsafe { arr::w_array_typecode(obj) };
     let tc = typecode as char;
     let w_typecode = pyre_object::w_str_new(&tc.to_string());
