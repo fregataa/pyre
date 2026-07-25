@@ -2297,11 +2297,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // committed side effect on deopt.
         //
         // Best effort: `compute_inline_caller_frame` returns `Unavailable` for a caller
-        // shape it cannot build yet (a CALL inside a try-block, or no result on
-        // the operand stack at the return point).  Fall back to the single-frame
-        // collapse there (do NOT decline the inline — that shape is served
-        // correctly today), so this never removes a working inline.
-        compute_inline_caller_frame(ctx, op.pc).ok()
+        // shape it cannot build yet (no result on the operand stack at the
+        // return point, missing liveness / resume tables).  Fall back to the
+        // single-frame collapse there (do NOT decline the inline — that shape is
+        // served correctly today), so this never removes a working inline.
+        //
+        // A `TryBlockCatchMarker` decline is different: the CALL is covered by
+        // the caller's exception table.  The collapse resumes at the CALL's
+        // pre-call `-live-`, which precedes the CALL's own `catch_exception`,
+        // so an in-callee `GUARD_NO_EXCEPTION` failing there hands the
+        // blackhole a pending exception at a coordinate from which neither the
+        // forward check nor the bounded backward startpoint scan
+        // (`handle_exception_in_frame`) can reach that catch — the raise exits
+        // the caller frame past its matching handler.  Decline the inline so
+        // the call stays residual, where the post-call catch resume
+        // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
+        match compute_inline_caller_frame(ctx, op.pc) {
+            Ok(pf) => Some(pf),
+            Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            Err(InlineCallerFrameDecline::Unavailable) => None,
+        }
     } else {
         // Single-frame collapse (resume at the CALL boundary, re-execute the
         // whole call on deopt): a nested strict callee
@@ -2777,8 +2794,29 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
-                record_inline_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
-                record_top_level_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
+                // The handler this routes to is part of the trace, so once the
+                // trace runs compiled it catches the exception itself and this
+                // frame never surfaces an error the interpreter's
+                // `handle_exception` could record a node from.  Emit the node
+                // at runtime as well as applying it for the recording pass.
+                let emit_runtime =
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
+                record_top_level_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
                 ctx.last_exc_value = Some(exc);
                 ctx.last_exc_value_concrete = exc_concrete;
                 Ok(Some((DispatchOutcome::Continue, target)))
@@ -3540,8 +3578,29 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
-                record_inline_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
-                record_top_level_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
+                // The handler this routes to is part of the trace, so once the
+                // trace runs compiled it catches the exception itself and this
+                // frame never surfaces an error the interpreter's
+                // `handle_exception` could record a node from.  Emit the node
+                // at runtime as well as applying it for the recording pass.
+                let emit_runtime =
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
+                record_top_level_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
@@ -3684,8 +3743,29 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
-                record_inline_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
-                record_top_level_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
+                // The handler this routes to is part of the trace, so once the
+                // trace runs compiled it catches the exception itself and this
+                // frame never surfaces an error the interpreter's
+                // `handle_exception` could record a node from.  Emit the node
+                // at runtime as well as applying it for the recording pass.
+                let emit_runtime =
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
+                record_top_level_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
@@ -3840,8 +3920,29 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
-                record_inline_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
-                record_top_level_application_traceback(ctx, exc, exc_concrete, op.pc, true, false);
+                // The handler this routes to is part of the trace, so once the
+                // trace runs compiled it catches the exception itself and this
+                // frame never surfaces an error the interpreter's
+                // `handle_exception` could record a node from.  Emit the node
+                // at runtime as well as applying it for the recording pass.
+                let emit_runtime =
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
+                record_top_level_application_traceback(
+                    ctx,
+                    exc,
+                    exc_concrete,
+                    op.pc,
+                    true,
+                    emit_runtime,
+                );
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
