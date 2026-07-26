@@ -292,7 +292,7 @@ macro_rules! py_module {
                         $crate::make_module_builtin_function_with_arity_and_maybe_sig(
                             stringify!($ifn_name),
                             $ifn_name,
-                            $crate::pyre_count_typed_args!($($ifn_args)*) as u16,
+                            $crate::pyre_typed_args_arity!($($ifn_args)*),
                             ::paste::paste! { [<$ifn_name _pyre_sig>]() },
                         ),
                     );
@@ -334,6 +334,34 @@ macro_rules! pyre_count_typed_args {
     ( $(#[$m:meta])* $a:ident : $t:ty, $($rest:tt)* ) => {
         1usize + $crate::pyre_count_typed_args!($($rest)*)
     };
+}
+
+/// Count the leading parameters that a caller must supply — the prefix
+/// before the first `#[default(...)]`.  A `#[default(...)]` arm is listed
+/// ahead of the catch-all so it wins over the `#[$m:meta]` repetition.
+#[macro_export]
+macro_rules! pyre_count_required_typed_args {
+    () => { 0usize };
+    ( #[default($($d:tt)*)] $($rest:tt)* ) => { 0usize };
+    ( $(#[$m:meta])* $a:ident : $t:ty ) => { 1usize };
+    ( $(#[$m:meta])* $a:ident : $t:ty, $($rest:tt)* ) => {
+        1usize + $crate::pyre_count_required_typed_args!($($rest)*)
+    };
+}
+
+/// The `fast_natural_arity` a typed parameter list declares.  A parameter
+/// with a `#[default(...)]` makes the call variadic, so the whole list is
+/// `HOPELESS` rather than a fixed count the call machinery may enforce.
+#[macro_export]
+macro_rules! pyre_typed_args_arity {
+    ( $($args:tt)* ) => {{
+        let total = $crate::pyre_count_typed_args!($($args)*);
+        if total == $crate::pyre_count_required_typed_args!($($args)*) {
+            total as u16
+        } else {
+            $crate::HOPELESS
+        }
+    }};
 }
 
 /// PyPy `class W_X(W_Root) + TypeDef(...)` equivalent — emits a thread-
@@ -766,10 +794,10 @@ pub use error::*;
 pub use executioncontext::*;
 pub use function::*;
 pub use gateway::{
-    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, FLATPYCALL, HOPELESS, PASSTHROUGHARGS1,
-    Signature, SignatureBuilder, builtin_code_get, builtin_code_get_fast_natural_arity,
-    builtin_code_get_signature, builtin_code_name, builtin_code_new,
-    builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
+    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, FLATPYCALL, HOPELESS, MethodOwner,
+    PASSTHROUGHARGS1, Signature, SignatureBuilder, builtin_code_call, builtin_code_get,
+    builtin_code_get_fast_natural_arity, builtin_code_get_signature, builtin_code_name,
+    builtin_code_new, builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
     builtin_code_new_with_signature, is_builtin_code, make_builtin_function,
     make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
     make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,

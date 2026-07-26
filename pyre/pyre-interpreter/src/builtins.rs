@@ -2273,6 +2273,9 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "anext", || {
         make_module_builtin_function("anext", crate::async_operation::builtin_anext)
     });
+    crate::module_ns_get_or_insert_with(ns, "breakpoint", || {
+        make_module_builtin_function("breakpoint", builtin_breakpoint)
+    });
     crate::module_ns_get_or_insert_with(ns, "callable", || {
         make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });
@@ -5357,7 +5360,12 @@ fn make_exc_type_with_init(
     if let Some(cls) = lookup_exc_class(name) {
         return cls;
     }
-    let cls = crate::typedef::make_builtin_type_with_base(
+    // Every exception class shares one instance layout, distinct from
+    // `object`'s: `class E(Exception, ValueError)` is fine, `class E(Exception,
+    // list)` is an instance lay-out conflict.  The subclasses reach the same
+    // Layout object through the reuse rule (their parent layout already names
+    // this typedef).
+    let cls = crate::typedef::make_builtin_type_with_layout(
         name,
         move |ns| {
             unsafe {
@@ -5555,6 +5563,7 @@ fn make_exc_type_with_init(
             }
         },
         base,
+        &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const pyre_object::PyType,
     );
     // Record the class so typedef::r#type can map a raised exception
     // back to its specific builtin class (TypeError, ValueError, ...).
@@ -6716,6 +6725,17 @@ fn parse_int_from_str(
     } else {
         (1i64, s)
     };
+    // intobject.py passes `disallow_whitespace_after_sign=True` to
+    // NumberStringParser.  Its sign branch advances `start` without calling
+    // `_strip_spaces`, so whitespace immediately after either sign remains
+    // part of the digit stream and makes the literal invalid.
+    if rest
+        .as_bytes()
+        .first()
+        .is_some_and(|c| matches!(c, b' ' | b'\x0c' | b'\n' | b'\r' | b'\t' | b'\x0b'))
+    {
+        return Err(invalid_int_literal(w_source, base));
+    }
     let (radix, digits, had_base_prefix, implicit_zero_only) = if base == 0 {
         if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
             (16u32, r, true, false)
@@ -9807,14 +9827,14 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "readline",
-            make_builtin_function_with_arity("readline", file_method_readline, 1),
+            make_builtin_function("readline", file_method_readline),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "readlines",
-            make_builtin_function_with_arity("readlines", file_method_readlines, 1),
+            make_builtin_function("readlines", file_method_readlines),
         )
     };
     unsafe {
@@ -12410,6 +12430,46 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
+/// Call `callable` with a builtin's own argument slice, re-splitting the
+/// trailing `__pyre_kw__` marker back into real keyword arguments.  This is
+/// what a builtin that forwards `*args, **kwargs` onward needs: passing the
+/// slice through unchanged would hand the marker dict over as a positional.
+pub(crate) fn call_forwarding_args(
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if !has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(callable, positional);
+    }
+    let keyword_args: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error("call has no current frame"));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, positional, &keyword_args)
+    })
+}
+
+/// `app_breakpoint.py breakpoint` — forward to `sys.breakpointhook`, which
+/// must accept whatever arguments are passed.  By default that drops into pdb.
+fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(sys) = crate::importing::get_sys_module("sys") else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    call_forwarding_args(hook, args)
+}
+
 /// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.
 fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `__import__(name, globals, locals, fromlist, level)` — PyPy's gateway
@@ -12629,6 +12689,16 @@ mod tests {
             err.message
                 .starts_with("invalid literal for int() with base 10:")
         );
+    }
+
+    #[test]
+    fn int_string_rejects_whitespace_after_sign() {
+        crate::typedef::init_typeobjects();
+        for text in ["- 1", "+ 1", " + 1 "] {
+            let source = w_str_new(text);
+            let err = parse_int_from_str(source, text, 10).unwrap_err();
+            assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        }
     }
 
     /// PyPy `interp_io._open` constructs `W_FileIO`, and
