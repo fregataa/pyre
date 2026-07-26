@@ -3326,6 +3326,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 descr_index,
             })?;
     let descr_key = descr.index();
+    // Copy the recognition tag out of the descr borrow now: the DELETE_ATTR
+    // fold gate below runs after the StoreAttr arm's `descr = specialized_
+    // descr` reassignment, which the live `original_call_descr` borrow would
+    // otherwise forbid (E0506).
+    let pyre_helper_kind = original_call_descr.get_extra_info().pyre_helper;
     // Void shape `_ir_v/iIRd` (`pyjitpl.py opimpl_residual_call_ir_v =
     // _opimpl_residual_call2`) has no `>X` dst byte; see
     // `dispatch_residual_call_iRd_kind` for the void operand-layout note.
@@ -3370,6 +3375,20 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 ctx.trace_ctx.box_value(code_opref),
                 ctx.trace_ctx.box_value(namei_opref),
             ) {
+                // Deterministic immutable-type raise (`int.x = v`) folds to a
+                // traced inline exception construction the optimizer can
+                // virtualize — tried before the unboxed-slot store fold; the
+                // two shapes are disjoint (type receiver vs instance receiver).
+                if let Some(outcome) = try_walker_trace_immutable_type_attr_raise(
+                    ctx,
+                    op,
+                    obj_opref,
+                    Some(value_opref),
+                    w_code_ptr,
+                    namei as usize,
+                )? {
+                    return Ok(outcome);
+                }
                 if let Some(specialization) = try_walker_specialize_store_attr(
                     ctx,
                     op.pc,
@@ -3391,6 +3410,34 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             return Ok((DispatchOutcome::Continue, op.next_pc));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // DELETE_ATTR immutable-type raise fold — the deletion twin of the
+    // STORE_ATTR fold above.  `bh_delete_attr_fn(obj, code, name_idx)`
+    // carries no value operand: r_args = [obj, code], i_args = [name_idx].
+    if ctx.is_authoritative_executor && pyre_helper_kind == majit_ir::PyreHelperKind::DeleteAttr {
+        if let (Some(&obj_opref), Some(&code_opref), Some(&namei_opref)) =
+            (r_args.first(), r_args.get(1), i_args.first())
+        {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+                Some(majit_ir::Value::Int(namei)),
+            ) = (
+                ctx.trace_ctx.box_value(code_opref),
+                ctx.trace_ctx.box_value(namei_opref),
+            ) {
+                if let Some(outcome) = try_walker_trace_immutable_type_attr_raise(
+                    ctx,
+                    op,
+                    obj_opref,
+                    None,
+                    w_code_ptr,
+                    namei as usize,
+                )? {
+                    return Ok(outcome);
                 }
             }
         }

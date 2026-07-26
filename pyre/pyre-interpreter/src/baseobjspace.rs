@@ -9105,6 +9105,69 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
     object_setattr(obj, name, value)
 }
 
+/// Trace-time stability predicate for the walker's immutable-type
+/// STORE_ATTR / DELETE_ATTR raise fold: whether `setattr_str` /
+/// `delattr_str` on `obj` with `name` is *guaranteed* to take the
+/// terminal `object_setattr` / `object_delattr` non-heaptype raise —
+/// not just this call, but on every later call with the same `(obj,
+/// name)` pair.
+///
+/// The raise-path decision consults, in order: the weakref-proxy
+/// `force` (identity for a type receiver), the metaclass
+/// `__setattr__` / `__delattr__` resolution, the metaclass-MRO data
+/// descriptor walk for `name`, and finally `is_heaptype`.  Each input
+/// is frozen once the conditions below hold:
+///
+///   * `obj` is a non-heaptype type object — its dict rejects every
+///     mutation (that IS the raise being folded) and its `__class__`
+///     cannot be reassigned, so `is_heaptype` and the metaclass
+///     identity are permanent.
+///   * The metaclass is the canonical `type`, whose MRO is
+///     `(type, object)` — both non-heap, so both dicts are frozen
+///     after interpreter init and the two lookups are constant.
+///
+/// Returns `false` for any other shape (heap type, custom metaclass,
+/// a metaclass `__setattr__`/`__delattr__` override, or a `name` that
+/// resolves to a metaclass descriptor such as `type.__name__`, whose
+/// setter has its own value-dependent behaviour).
+pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_delete: bool) -> bool {
+    unsafe {
+        if obj.is_null()
+            || !pyre_object::typeobject::is_type(obj)
+            || pyre_object::w_type_is_heaptype(obj)
+        {
+            return false;
+        }
+        let Some(metaclass) = crate::typedef::r#type(obj) else {
+            return false;
+        };
+        let metaclass = metaclass.as_ptr();
+        if !std::ptr::eq(
+            metaclass,
+            pyre_object::get_instantiate(&pyre_object::pyobject::TYPE_TYPE),
+        ) {
+            return false;
+        }
+        if is_delete {
+            // `delattr_str`'s type-receiver branch: a non-default metaclass
+            // `__delattr__` routes to a descriptor call instead of the
+            // terminal raise.
+            if let Some(da) = lookup_in_type(metaclass, "__delattr__") {
+                let is_default = lookup_in_type(crate::typedef::w_object(), "__delattr__")
+                    .is_some_and(|d| std::ptr::eq(da, d));
+                if !is_default {
+                    return false;
+                }
+            }
+        } else if setattr_if_not_from_object(metaclass).is_some() {
+            return false;
+        }
+        // The terminal's metaclass-MRO descriptor walk runs before the
+        // heaptype guard; any hit (`__name__`, `__dict__`, …) diverts.
+        lookup_in_type_where(metaclass, name).is_none()
+    }
+}
+
 /// `objectobject.py descr__setattr__` — the terminal implementation
 /// that bypasses user `__setattr__` overrides and writes directly
 /// through the descriptor / instance-dict path.  Called by
