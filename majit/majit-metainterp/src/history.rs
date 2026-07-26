@@ -2938,93 +2938,21 @@ impl TraceCtx {
     }
 
     /// Record GUARD_NOT_FORCED (must follow a call_may_force).
+    ///
+    /// Recorder-layer primitive only — `history.record0(rop.GUARD_NOT_FORCED,
+    /// None)` (`pyjitpl.py:2598`), NOT `generate_guard`.  The op leaves this
+    /// call with `rd_resume_position == -1`; the metainterp layer owns the
+    /// matching `capture_resumedata(resumepc, after_residual_call=True)`
+    /// (`pyjitpl.py:2603`) and must attach it, or
+    /// `store_final_boxes_in_guard` reaches `resume.py:396-397`
+    /// `assert resume_position >= 0` with nothing to read.  The two production
+    /// recorders both do: `pyjitpl/dispatch.rs
+    /// finalize_standard_virtualizable_may_force` goes through
+    /// `record_state_guard`, and the walker pairs its
+    /// `record_guard(GuardNotForced, …)` with
+    /// `walker_capture_snapshot_for_last_guard`.
     pub fn guard_not_forced(&mut self, num_live: usize) -> OpRef {
         self.record_guard(OpCode::GuardNotForced, &[], num_live)
-    }
-
-    // ── CALL_MAY_FORCE with virtualizable synchronization ─────────
-
-    fn call_may_force_with_jitstate_sync_impl<S, R>(
-        &mut self,
-        state: &S,
-        num_live: usize,
-        record_call: impl FnOnce(&mut Self) -> R,
-    ) -> (R, crate::jit_state::ResidualVirtualizableSync)
-    where
-        S: crate::jit_state::JitState,
-    {
-        state.sync_virtualizable_before_residual_call(self);
-        let result = record_call(self);
-        let sync = state.sync_virtualizable_after_residual_call(self);
-        if !sync.forced {
-            self.guard_not_forced(num_live);
-        }
-        (result, sync)
-    }
-
-    /// Callback-based virtualizable sync for CALL_MAY_FORCE.
-    ///
-    /// Uses JitState's `sync_virtualizable_before/after_residual_call`
-    /// methods to emit the appropriate SETFIELD/GETFIELD ops. This is
-    /// the preferred API for interpreters that implement the JitState
-    /// virtualizable sync hooks.
-    ///
-    /// Returns `(call_result, sync)` where `sync` reports any updated field
-    /// OpRefs and whether the residual call forced the standard virtualizable.
-    pub fn call_may_force_with_jitstate_sync_int<S: crate::jit_state::JitState>(
-        &mut self,
-        func_ptr: *const (),
-        args: &[OpRef],
-        arg_types: &[Type],
-        state: &S,
-        num_live: usize,
-    ) -> (OpRef, crate::jit_state::ResidualVirtualizableSync) {
-        self.call_may_force_with_jitstate_sync_impl(state, num_live, |ctx| {
-            ctx.call_may_force_int_typed(func_ptr, args, arg_types)
-        })
-    }
-
-    /// Ref-returning variant of [`call_may_force_with_jitstate_sync_int`].
-    pub fn call_may_force_with_jitstate_sync_ref<S: crate::jit_state::JitState>(
-        &mut self,
-        func_ptr: *const (),
-        args: &[OpRef],
-        arg_types: &[Type],
-        state: &S,
-        num_live: usize,
-    ) -> (OpRef, crate::jit_state::ResidualVirtualizableSync) {
-        self.call_may_force_with_jitstate_sync_impl(state, num_live, |ctx| {
-            ctx.call_may_force_ref_typed(func_ptr, args, arg_types)
-        })
-    }
-
-    /// Float-returning variant of [`call_may_force_with_jitstate_sync_int`].
-    pub fn call_may_force_with_jitstate_sync_float<S: crate::jit_state::JitState>(
-        &mut self,
-        func_ptr: *const (),
-        args: &[OpRef],
-        arg_types: &[Type],
-        state: &S,
-        num_live: usize,
-    ) -> (OpRef, crate::jit_state::ResidualVirtualizableSync) {
-        self.call_may_force_with_jitstate_sync_impl(state, num_live, |ctx| {
-            ctx.call_may_force_float_typed(func_ptr, args, arg_types)
-        })
-    }
-
-    /// Void-returning variant of [`call_may_force_with_jitstate_sync_int`].
-    pub fn call_may_force_with_jitstate_sync_void<S: crate::jit_state::JitState>(
-        &mut self,
-        func_ptr: *const (),
-        args: &[OpRef],
-        arg_types: &[Type],
-        state: &S,
-        num_live: usize,
-    ) -> crate::jit_state::ResidualVirtualizableSync {
-        let (_, sync) = self.call_may_force_with_jitstate_sync_impl(state, num_live, |ctx| {
-            ctx.call_may_force_void_typed(func_ptr, args, arg_types)
-        });
-        sync
     }
 
     /// Record GUARD_NO_EXCEPTION (check no pending exception).
