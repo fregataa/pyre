@@ -5827,6 +5827,8 @@ impl<'a> Lowering<'a> {
                 // argument directly (same shape as a transparent
                 // ctor alias) instead of emitting a call to core's
                 // identity body, which is not a registered callee.
+                // `is_reflexive_from` takes the same path for the same
+                // impl reached through `From::from` directly.
                 //
                 // The clause-bound variant — `msg.into()` inside a
                 // generic body with `T: Into<String>` — has no
@@ -5837,6 +5839,7 @@ impl<'a> Lowering<'a> {
                 // it takes the same alias path.
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
+                        || self.is_reflexive_from(&reg)
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.is_noop_ptr_cast(&reg)
                         || self.is_reflexive_into_iter(&reg)
@@ -8066,30 +8069,6 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// Devirtualize a callsite of the blanket
-    /// `impl<T, U: From<T>> Into<U> for T` (`core::convert::<Impl>::into`).
-    ///
-    /// The callsite's `generics.trait_refs` carries the resolved
-    /// `U: From<T>` obligation as a trait ref whose `trait_decl_ref`
-    /// names `core::convert::From` and whose `kind` is
-    /// `TraitImpl { id }` — the def_id of the selected `impl From<T>
-    /// for U`.  Two outcomes:
-    ///
-    /// - The obligation's decl-ref type args are equal (`T == U`):
-    ///   the reflexive `impl<T> From<T> for T` was selected and the
-    ///   whole conversion is a `T -> T` identity —
-    ///   [`IntoDevirt::Identity`].
-    /// - Otherwise the impl's `methods` table binds the single `From`
-    ///   method to the concrete `from` FunDecl, whose path is the
-    ///   devirtualized call target — [`IntoDevirt::Target`].  `from`
-    ///   is an associated function (no `self` receiver), so the
-    ///   caller must keep the `FunctionPath` shape (a
-    ///   `CallTarget::Method` hint would bind the *argument* as a
-    ///   receiver).
-    ///
-    /// Returns `None` (caller keeps the blanket-into path) when the
-    /// obligation is unresolved (`kind` is a clause/builtin rather
-    /// than `TraitImpl`) or any table lookup misses.
     /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
     /// change only const/mut, never the pointee type.  The JIT does not
     /// model the mut/const distinction (`Ref` / `RawPtr` lower to a
@@ -8391,6 +8370,12 @@ impl<'a> Lowering<'a> {
                     // the same element sequence — an identity on the list model.
                     | "core::array::<Impl>::into_iter"
                     | "core::array::iter::<Impl>::into_iter"
+                    // `alloc/src/boxed/iter.rs` — the `Box<[T]>` forms, by
+                    // value and by reference; the latter delegates to slice
+                    // iter. A boxed slice is the same element sequence as the
+                    // slice it owns (`project_pyre_field_type` strips the
+                    // `Box`), so both walk the receiver's list.
+                    | "alloc::boxed::iter::<Impl>::into_iter"
             )
         })
     }
@@ -8434,6 +8419,20 @@ impl<'a> Lowering<'a> {
     /// model and the callsite aliases its receiver instead of leaving the
     /// unregistered method callee.
     ///
+    /// The pyre length-prefixed containers `FixedObjectArray` / `IntArray`
+    /// / `FloatArray` expose the same pair of views, each spelled
+    /// `from_raw_parts(self.base(), self.len)` over their own backing
+    /// block (`object_array.rs:853-859`, `int_array.rs:120-125`,
+    /// `float_array.rs:120-125`).  Their receivers are already list-modelled
+    /// — [`Self::is_container_len`] carries the identical object/int/float
+    /// trio — so the same receiver-alias applies, and entering the body
+    /// instead dead-ends at the unregistered `core::slice::raw::from_raw_parts`.
+    ///
+    /// `as_mut_slice` is matched alongside `as_slice`: the mutable view
+    /// addresses the receiver's own storage, so a write through the alias
+    /// *is* a write to the receiver, which is exactly what the list model
+    /// wants.
+    ///
     /// `<[T]>::to_vec` is deliberately NOT matched: it allocates an
     /// independent list, so aliasing it to the receiver would let a later
     /// mutation of the copy (or of the original) be observed through the
@@ -8446,7 +8445,14 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path().as_str(),
-                "core::slice::<Impl>::as_slice" | "alloc::vec::<Impl>::as_slice"
+                "core::slice::<Impl>::as_slice"
+                    | "alloc::vec::<Impl>::as_slice"
+                    | "pyre_object::object_array::<Impl>::as_slice"
+                    | "pyre_object::object_array::<Impl>::as_mut_slice"
+                    | "pyre_object::int_array::<Impl>::as_slice"
+                    | "pyre_object::int_array::<Impl>::as_mut_slice"
+                    | "pyre_object::float_array::<Impl>::as_slice"
+                    | "pyre_object::float_array::<Impl>::as_mut_slice"
             )
         })
     }
@@ -8464,6 +8470,45 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::hint::must_use")
+    }
+
+    /// A callsite of the reflexive `impl<T> From<T> for T`
+    /// (`core::convert::<Impl>::from`), whose whole conversion is a
+    /// `T -> T` identity.  `core` carries no graph body, so without this
+    /// the callsite skips as an unregistered `FunctionPath`; aliasing the
+    /// destination to the argument is the `From` direction of the
+    /// identity [`Self::blanket_into_devirt`] already reports for `Into`
+    /// through [`IntoDevirt::Identity`].
+    ///
+    /// The gate is the *declared* signature rather than the instantiated
+    /// one: the reflexive impl declares `from(T) -> T`, so its input and
+    /// output resolve to the same type expression whatever `T` is bound
+    /// to at the callsite, and no generic substitution has to be walked.
+    /// A conversion between two distinct types declares two distinct
+    /// expressions and keeps the ordinary call — it has a body worth
+    /// entering, or crosses a repr boundary the carrier models.
+    ///
+    /// The live callsite is `pyopcode`'s `u32::from(format.get(op_arg))`:
+    /// [`Self::oparg_value_alias`] already binds `Arg::<T>::get` to its
+    /// `OpArg` argument, so the `From` sees a `u32` on both sides and
+    /// rustc selects the reflexive impl.
+    fn is_reflexive_from(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path() != "core::convert::<Impl>::from" {
+            return false;
+        }
+        let Some(src) = fd.signature.inputs.first() else {
+            return false;
+        };
+        match (self.tyref_body(src), self.tyref_body(&fd.signature.output)) {
+            (Some(src_ty), Some(dst_ty)) => src_ty == dst_ty,
+            _ => false,
+        }
     }
 
     /// `f64::is_nan(self)` — `core` has no graph body (Opaque), so the
@@ -8539,6 +8584,30 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Devirtualize a callsite of the blanket
+    /// `impl<T, U: From<T>> Into<U> for T` (`core::convert::<Impl>::into`).
+    ///
+    /// The callsite's `generics.trait_refs` carries the resolved
+    /// `U: From<T>` obligation as a trait ref whose `trait_decl_ref`
+    /// names `core::convert::From` and whose `kind` is
+    /// `TraitImpl { id }` — the def_id of the selected `impl From<T>
+    /// for U`.  Two outcomes:
+    ///
+    /// - The obligation's decl-ref type args are equal (`T == U`):
+    ///   the reflexive `impl<T> From<T> for T` was selected and the
+    ///   whole conversion is a `T -> T` identity —
+    ///   [`IntoDevirt::Identity`].
+    /// - Otherwise the impl's `methods` table binds the single `From`
+    ///   method to the concrete `from` FunDecl, whose path is the
+    ///   devirtualized call target — [`IntoDevirt::Target`].  `from`
+    ///   is an associated function (no `self` receiver), so the
+    ///   caller must keep the `FunctionPath` shape (a
+    ///   `CallTarget::Method` hint would bind the *argument* as a
+    ///   receiver).
+    ///
+    /// Returns `None` (caller keeps the blanket-into path) when the
+    /// obligation is unresolved (`kind` is a clause/builtin rather
+    /// than `TraitImpl`) or any table lookup misses.
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
@@ -14206,15 +14275,51 @@ fn graph_is_items_block_base_accessor(name: &str) -> bool {
         || name.ends_with("object_array::items_block_items_ptr")
 }
 
+/// One path segment, with a raw-identifier prefix removed.  `r#struct` and
+/// `struct` name the same module: rustc's canonical `DefPath` ident (what
+/// Charon records, and therefore what a `name_path()` carries) drops the
+/// `r#`, while a path spelled by `module_path!()` on the host side keeps it.
+fn path_segment_ident(seg: &str) -> &str {
+    seg.strip_prefix("r#").unwrap_or(seg)
+}
+
+/// Whole-path equality, segment by segment, ignoring raw-identifier
+/// prefixes on either side.
+fn path_eq_ignoring_raw(a: &str, b: &str) -> bool {
+    let mut a = a.split("::");
+    let mut b = b.split("::");
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if path_segment_ident(x) == path_segment_ident(y) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// `key` is a proper `::`-boundary suffix of `path`, compared the same way.
+fn path_has_suffix_ignoring_raw(path: &str, key: &str) -> bool {
+    let mut path = path.rsplit("::");
+    let mut key = key.rsplit("::");
+    loop {
+        let Some(k) = key.next() else {
+            // Key exhausted at a segment boundary; require at least one
+            // more segment so this stays a *proper* suffix (whole-path
+            // equality is the caller's other arm).
+            return path.next().is_some();
+        };
+        match path.next() {
+            Some(p) if path_segment_ident(p) == path_segment_ident(k) => {}
+            _ => return false,
+        }
+    }
+}
+
 fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
-    full == key
-        || stripped == key
-        || full
-            .strip_suffix(key)
-            .is_some_and(|prefix| prefix.ends_with("::"))
-        || stripped
-            .strip_suffix(key)
-            .is_some_and(|prefix| prefix.ends_with("::"))
+    path_eq_ignoring_raw(full, key)
+        || path_eq_ignoring_raw(stripped, key)
+        || path_has_suffix_ignoring_raw(full, key)
+        || path_has_suffix_ignoring_raw(stripped, key)
 }
 
 /// Supply the value of a primitive `f64` associated constant whose
