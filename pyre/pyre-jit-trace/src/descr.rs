@@ -491,11 +491,11 @@ pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;
 pub use pyre_object::listobject::W_LIST_GC_TYPE_ID;
 /// GC type id for the variable-length backing block of `PyObjectArray`
 /// (the list/tuple items storage). Shape matches `rlist.py:84,116`
-/// `GcArray(OBJECTPTR)` — a `T_IS_VARSIZE` block with an 8-byte
-/// single-slot `capacity` header (= upstream's GcArray length header,
+/// `GcArray(OBJECTPTR)` — a `T_IS_VARSIZE` block with a single-slot
+/// `capacity` header (= upstream's GcArray length header,
 /// rlist.py:251 `len(l.items)`) followed by inline `PyObjectRef`
-/// items. Registered via `TypeInfo::varsize(8, 8, 0,
-/// items_have_gc_ptrs=true, [])` so the GC walks each item slot as a
+/// items. Registered from `pyre_object::ITEMS_BLOCK_TOKEN` with
+/// `items_have_gc_ptrs=true` so the GC walks each item slot as a
 /// Ref (`gctypelayout.py:266-291 T_IS_VARSIZE / T_IS_GCARRAY_OF_GCPTR`);
 /// live list length is stored on the enclosing `W_ListObject` wrapper
 /// (`PyObjectArray.len`) to match rlist.py:116 `("length", Signed)`.
@@ -1316,7 +1316,15 @@ static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
         0,
         0,
-        &[("ItemsBlock.capacity", 0, 8, Type::Int, false, true, false)],
+        &[(
+            "ItemsBlock.capacity",
+            pyre_object::object_array::ITEMS_BLOCK_LEN_OFFSET,
+            std::mem::size_of::<usize>(),
+            Type::Int,
+            false,
+            true,
+            false,
+        )],
         "ItemsBlock",
         "object_array::ItemsBlock",
     )
@@ -1762,6 +1770,15 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
     // the first value field, e.g. `W_IntObject.intval`).
     Arc::new(PyreFieldDescr {
         offset: pyre_object::pyobject::W_CLASS_OFFSET,
+        // ⚠️`WORD` on paper — the field is a `*mut PyObject`, so 4 bytes on
+        // wasm32, and the build-time descr pool already sizes it that way
+        // (`call.rs get_type_flag` → `layout::target_word_size()`). Deriving it
+        // here to match makes `synth/exception_traceback_loop_forms` lose one
+        // iteration's `e.__traceback__` on the wasm backend, so the two
+        // universes stay deliberately out of step until that is understood.
+        // `state.rs materialize_virtual_object` keys its w_class branch off
+        // `field_size == size_of::<*mut PyObject>()`, a guard that therefore
+        // never fires on wasm32.
         field_size: 8,
         field_type: Type::Ref,
         signed: false,
@@ -2183,7 +2200,7 @@ pub fn ob_type_descr() -> DescrRef {
 fn new_ob_type_field_descr() -> Arc<dyn FieldDescr> {
     Arc::new(PyreFieldDescr {
         offset: OB_TYPE_OFFSET,
-        field_size: 8,
+        field_size: std::mem::size_of::<*const pyre_object::PyType>(),
         field_type: Type::Int,
         signed: false,
         immutable: true,
@@ -2668,7 +2685,7 @@ pub fn ec_sys_exc_value_descr() -> DescrRef {
                 index: 0,
                 name: "ExecutionContext.sys_exc_value".to_string(),
                 offset: pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
-                field_size: 8,
+                field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
                 field_type: Type::Ref,
                 is_immutable: false,
                 is_quasi_immutable: false,
