@@ -635,6 +635,103 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None)
 }
 
+/// One block's slot-indexed `Option<Variable>` row, stored by bound slot.
+///
+/// Same reasoning as [`PackedFrameState`]: the row is sized by the body's
+/// local count but holds a live-in handful, and one row per block makes
+/// the table `blocks * locals`.
+#[derive(Clone, Default)]
+struct PackedLocalRow {
+    len: usize,
+    bound: Vec<(u32, crate::flowspace::model::Variable)>,
+}
+
+impl PackedLocalRow {
+    fn pack(row: &[Option<crate::flowspace::model::Variable>]) -> Self {
+        Self {
+            len: row.len(),
+            bound: row
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| v.clone().map(|v| (i as u32, v)))
+                .collect(),
+        }
+    }
+
+    fn unpack(&self) -> Vec<Option<crate::flowspace::model::Variable>> {
+        let mut row = vec![None; self.len];
+        for (i, v) in &self.bound {
+            row[*i as usize] = Some(v.clone());
+        }
+        row
+    }
+
+    fn set(&mut self, slot: usize, var: crate::flowspace::model::Variable) {
+        match self.bound.binary_search_by_key(&(slot as u32), |(i, _)| *i) {
+            Ok(at) => self.bound[at].1 = var,
+            Err(at) => self.bound.insert(at, (slot as u32, var)),
+        }
+    }
+}
+
+/// A [`FrameState`] held in a per-block table with its two slot-indexed
+/// rows compressed to the slots that are actually bound.
+///
+/// `entries` / `locals_w` are sized by the body's local count and read
+/// positionally, so a table holding one per block costs
+/// `blocks * locals` cells.  On a large body that product dominates the
+/// whole front end — `transform_graph_to_jitcode` has 15 335 MIR blocks
+/// and 14 215 locals, yet averages ~33 bound slots per block, so the
+/// dense rows are 0.2% occupied.  Packing keeps the same values and the
+/// same row lengths; a row is rebuilt dense at each use, one at a time.
+#[derive(Clone)]
+struct PackedFrameState {
+    /// The other `FrameState` fields, verbatim; its `entries` /
+    /// `locals_w` are left empty and carried in the two sparse rows.
+    rest: FrameState,
+    entries_len: usize,
+    entries: Vec<(u32, crate::flowspace::model::Variable)>,
+    locals_w_len: usize,
+    locals_w: Vec<(u32, crate::flowspace::model::Hlvalue)>,
+}
+
+impl PackedFrameState {
+    fn pack(mut fs: FrameState) -> Self {
+        let entries_len = fs.entries.len();
+        let locals_w_len = fs.locals_w.len();
+        let entries = std::mem::take(&mut fs.entries)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.map(|v| (i as u32, v)))
+            .collect();
+        let locals_w = std::mem::take(&mut fs.locals_w)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.map(|v| (i as u32, v)))
+            .collect();
+        Self {
+            rest: fs,
+            entries_len,
+            entries,
+            locals_w_len,
+            locals_w,
+        }
+    }
+
+    fn unpack(&self) -> FrameState {
+        let mut fs = self.rest.clone();
+        fs.entries = vec![None; self.entries_len];
+        for (i, v) in &self.entries {
+            fs.entries[*i as usize] = Some(v.clone());
+        }
+        fs.locals_w = vec![None; self.locals_w_len];
+        for (i, v) in &self.locals_w {
+            fs.locals_w[*i as usize] = Some(v.clone());
+        }
+        fs
+    }
+}
+
 fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
@@ -745,9 +842,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
-        if fd.unstructured().is_none() {
+        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
+        // every call, so hold the one projection this iteration needs: it
+        // is both the "has a lowerable body" gate and the input the
+        // lowering below reads.
+        let Some(body) = fd.unstructured() else {
             continue;
-        }
+        };
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries with `is_global_initializer` set to the
@@ -789,9 +890,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
-        let graph = match lower_fun_decl_with_static_addrs_and_attrs(
+        let graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
+            &body,
             static_addrs,
             &struct_field_attrs,
         ) {
@@ -1573,7 +1675,16 @@ pub fn lower_fun_decl_with_static_addrs(
     lower_fun_decl_with_static_addrs_and_attrs(llbc, fd, static_addrs, &struct_field_attrs)
 }
 
-fn lower_fun_decl_with_static_addrs_and_attrs(
+/// The `struct_field_attrs` projection of [`derive_program_metadata`] —
+/// the map the whole-program loop lowers this LLBC's decls with.
+pub(crate) fn struct_field_attrs_of(
+    llbc: &Llbc,
+) -> std::collections::HashMap<String, Vec<(String, ValueType)>> {
+    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+    struct_field_attrs
+}
+
+pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
@@ -1585,6 +1696,23 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
             fd.item_meta.name_path()
         ))
     })?;
+    lower_unstructured_with_static_addrs_and_attrs(llbc, fd, &u, static_addrs, struct_field_attrs)
+}
+
+/// Lower `fd` from an already-projected `Unstructured` body.
+///
+/// `FunDecl::body` is retained as raw JSON and `FunDecl::unstructured`
+/// re-parses it on every call, so a caller that has already projected the
+/// body — the whole-program loop, which needs the projection to decide
+/// whether the decl has one at all — passes it in here rather than paying
+/// the parse a second time.
+fn lower_unstructured_with_static_addrs_and_attrs(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    u: &Unstructured,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
@@ -1883,7 +2011,7 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
     // the monotonic one — unless `PYRE_MIR_FRAMESTATE_STRICT` is set,
     // which propagates the error for debugging.
     if framestate_enabled() {
-        let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
+        let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -1915,7 +2043,7 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
             }
         }
     }
-    let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
+    let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -1933,7 +2061,7 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
         // inputargs), which is order-independent.  RPO only resolves the
         // acyclic forward-reference case above.
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
-            let mut lo = Lowering::new(llbc, name, &u, static_addrs, fd.generics.as_ref())?;
+            let mut lo = Lowering::new(llbc, name, u, static_addrs, fd.generics.as_ref())?;
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
             Ok(lo.graph)
@@ -2103,7 +2231,7 @@ struct Lowering<'a> {
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
     block_live_in: Vec<bit_set::BitSet>,
-    block_entry_local_var: Vec<Vec<Option<Variable>>>,
+    block_entry_local_var: Vec<PackedLocalRow>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
     block_positional_conflict: Vec<bit_set::BitSet>,
@@ -2370,11 +2498,17 @@ impl<'a> Lowering<'a> {
         }
         let index_write_extra_live = compute_index_write_extra_live(body, llbc);
         let block_live_in = compute_mir_liveness(body, &index_write_extra_live);
-        let mut block_entry_local_var = vec![vec![None; n_locals]; body.body.len()];
+        let mut block_entry_local_var = vec![
+            PackedLocalRow {
+                len: n_locals,
+                bound: Vec::new()
+            };
+            body.body.len()
+        ];
         let block_entry_positional_aggregate_locals =
             vec![std::collections::HashMap::new(); body.body.len()];
         if !block_entry_local_var.is_empty() {
-            block_entry_local_var[0] = local_var.clone();
+            block_entry_local_var[0] = PackedLocalRow::pack(&local_var);
         }
         for mir_bb in 1..body.body.len() {
             for local_idx in 0..n_locals {
@@ -2386,7 +2520,7 @@ impl<'a> Lowering<'a> {
                 }
                 let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 graph.push_inputarg_var(block_id[mir_bb], var.clone());
-                block_entry_local_var[mir_bb][local_idx] = Some(var);
+                block_entry_local_var[mir_bb].set(local_idx, var);
             }
         }
 
@@ -2799,10 +2933,10 @@ impl<'a> Lowering<'a> {
             block_to_mir[bid.0] = mir;
         }
 
-        let mut entry_state: Vec<Option<FrameState>> = vec![None; n];
-        let mut exit_state: Vec<Option<FrameState>> = vec![None; n];
+        let mut entry_state: Vec<Option<PackedFrameState>> = vec![None; n];
+        let mut exit_state: Vec<Option<PackedFrameState>> = vec![None; n];
         // bb0 enters with the parameter bindings established in `new`.
-        entry_state[0] = Some(self.getstate());
+        entry_state[0] = Some(PackedFrameState::pack(self.getstate()));
 
         // Pass 0 (cyclic only) — pre-seed each loop header's entry
         // framestate with the live-in phis `new` pre-bound for it
@@ -2816,16 +2950,16 @@ impl<'a> Lowering<'a> {
         // set), so its parameter inputargs / `Input` ops stay intact.
         for (h, &is_header) in loop_headers.iter().enumerate().take(n) {
             if is_header && h != 0 {
-                entry_state[h] = Some(FrameState {
-                    entries: self.block_entry_local_var[h].clone(),
+                entry_state[h] = Some(PackedFrameState::pack(FrameState {
+                    entries: self.block_entry_local_var[h].unpack(),
                     ..Default::default()
-                });
+                }));
             }
         }
 
         // Pass 1 — RPO walk: setstate, inputargs, lower, snapshot, union.
         for &bb in &rpo {
-            let st = match entry_state[bb].clone() {
+            let st = match entry_state[bb].as_ref().map(PackedFrameState::unpack) {
                 Some(st) => st,
                 None => {
                     // No live predecessor edge reached this block.  RPO
@@ -2871,7 +3005,7 @@ impl<'a> Lowering<'a> {
                 // positional projection of the framestate entries, whose
                 // Variable cells are the same identities `getvariables`
                 // threaded into `inputargs`.
-                self.block_entry_local_var[bb] = self.local_var.clone();
+                self.block_entry_local_var[bb] = PackedLocalRow::pack(&self.local_var);
             }
             self.lower_block(bb)?;
             let mut ex = self.getstate();
@@ -2898,7 +3032,7 @@ impl<'a> Lowering<'a> {
                     *slot = None;
                 }
             }
-            exit_state[bb] = Some(ex.clone());
+            exit_state[bb] = Some(PackedFrameState::pack(ex.clone()));
             // Union this exit into each model successor's entry state.
             // Successors are read off the just-closed exits (the model
             // edges), skipping the return / except sinks and any
@@ -2926,7 +3060,11 @@ impl<'a> Lowering<'a> {
                 if loop_headers.get(tmir).copied().unwrap_or(false) {
                     continue;
                 }
-                let merged = match entry_state[tmir].take() {
+                let merged = match entry_state[tmir]
+                    .take()
+                    .as_ref()
+                    .map(PackedFrameState::unpack)
+                {
                     None => ex.clone(),
                     Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
                         LowerError::Unsupported(format!(
@@ -2934,7 +3072,7 @@ impl<'a> Lowering<'a> {
                         ))
                     })?,
                 };
-                entry_state[tmir] = Some(merged);
+                entry_state[tmir] = Some(PackedFrameState::pack(merged));
             }
         }
 
@@ -2968,9 +3106,14 @@ impl<'a> Lowering<'a> {
             if self.graph.block(bb_id).dead {
                 continue;
             }
-            let ex = exit_state[bb].clone().ok_or_else(|| {
-                LowerError::Unsupported(format!("framestate: bb{bb} missing exit state in pass 2"))
-            })?;
+            let ex = exit_state[bb]
+                .as_ref()
+                .map(PackedFrameState::unpack)
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "framestate: bb{bb} missing exit state in pass 2"
+                    ))
+                })?;
             let exits_meta: Vec<(usize, BlockId)> = self
                 .graph
                 .block(bb_id)
@@ -2987,11 +3130,14 @@ impl<'a> Lowering<'a> {
                 if tmir == usize::MAX {
                     continue;
                 }
-                let tgt_state = entry_state[tmir].clone().ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "framestate: bb{tmir} missing entry state in pass 2"
-                    ))
-                })?;
+                let tgt_state = entry_state[tmir]
+                    .as_ref()
+                    .map(PackedFrameState::unpack)
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "framestate: bb{tmir} missing entry state in pass 2"
+                        ))
+                    })?;
                 // `try_getoutputargs` (not the panicking `getoutputargs`):
                 // a loop header pre-seeded with live-in phis bypasses the
                 // union's None-kill, so a phantom slot scrubbed to `None`
@@ -3138,7 +3284,7 @@ impl<'a> Lowering<'a> {
 
     fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {
         let bb: &BasicBlock = &self.body.body[mir_bb];
-        self.local_var = self.block_entry_local_var[mir_bb].clone();
+        self.local_var = self.block_entry_local_var[mir_bb].unpack();
         self.positional_aggregate_locals =
             self.block_entry_positional_aggregate_locals[mir_bb].clone();
 
