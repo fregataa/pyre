@@ -1534,24 +1534,31 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
                     "memoryview: negative export count",
                 ));
             }
-            // `_release_underlying`: read the backing before `set_released`
-            // drops the view box.  A slice / copy (`owns_export == false`)
+            // `_release_underlying`.  A slice / copy (`owns_export == false`)
             // shares the export and must not release it.
             if pyre_object::memoryview::w_memoryview_owns_export(mv) {
                 let backing = pyre_object::memoryview::w_memoryview_backing(mv);
-                // Clear the view before invoking the exporter hook so a
-                // re-entrant release is a no-op.
-                pyre_object::memoryview::w_memoryview_set_released(mv);
+                // Mark the view released before invoking the exporter hook so a
+                // re-entrant release is a no-op, but keep the view box until
+                // the hook returns: it is handed this memoryview and reads the
+                // backing back off it to identify the export it is undoing.
+                pyre_object::memoryview::w_memoryview_mark_released(mv);
                 // An `mmap` mapping keeps its count internally — it exposes no
                 // Python-callable release, so the drop cannot be forged from
                 // user code.  Every other exporter runs `__release_buffer__`.
-                if !release_external_backing(backing) {
-                    if let Some(release_fn) =
-                        crate::baseobjspace::lookup(backing, "__release_buffer__")
-                    {
-                        crate::call::call_function_impl_result(release_fn, &[backing, mv])?;
+                let released = if release_external_backing(backing) {
+                    Ok(())
+                } else {
+                    match crate::baseobjspace::lookup(backing, "__release_buffer__") {
+                        Some(release_fn) => {
+                            crate::call::call_function_impl_result(release_fn, &[backing, mv])
+                                .map(|_| ())
+                        }
+                        None => Ok(()),
                     }
-                }
+                };
+                pyre_object::memoryview::w_memoryview_drop_view(mv);
+                released?;
             } else {
                 pyre_object::memoryview::w_memoryview_set_released(mv);
             }
@@ -3215,26 +3222,42 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// keyword (any entry other than the `__pyre_kw__` marker).  An empty
 /// `**{}` therefore reports `false`.
 pub(crate) fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
-    let Some(dict) = kwargs else {
-        return false;
-    };
-    unsafe { pyre_object::w_dict_str_entries(dict) }
-        .iter()
-        .any(|(key, _)| key != "__pyre_kw__")
+    real_kwarg_count(kwargs) > 0
 }
 
 /// Number of real keyword arguments in the kwargs dict from
 /// [`split_builtin_kwargs`] — every entry other than the `__pyre_kw__`
 /// marker.  The clinic-style "takes at most N arguments (M given)" builtins
 /// (`sum`, `round`, `pow`) count positionals plus this against their limit.
+///
+/// Read through the surrogate-preserving iterator, the same one
+/// [`call_forwarding_args`] rebuilds the keywords with: `w_dict_str_entries`
+/// drops a `**{'\udc80': v}` key outright, which would make this report a
+/// keyword-free call and let the keyword be silently discarded.
 pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
     let Some(dict) = kwargs else {
         return 0;
     };
-    unsafe { pyre_object::w_dict_str_entries(dict) }
+    unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
         .iter()
-        .filter(|(key, _)| key != "__pyre_kw__")
+        .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
         .count()
+}
+
+/// The real keyword `(name, value)` pairs in the kwargs dict from
+/// [`split_builtin_kwargs`] — every entry other than the `__pyre_kw__`
+/// marker.  A builtin that has to re-issue its own call as a keyword call
+/// (`_thread._local` replays the constructor per thread, `os_local.py:57`)
+/// hands these to `call::call_with_kwargs`.
+pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf, PyObjectRef)> {
+    let Some(dict) = kwargs else {
+        return Vec::new();
+    };
+    let marker = Wtf8Buf::from_string("__pyre_kw__".to_string());
+    unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
+        .into_iter()
+        .filter(|(key, _)| *key != marker)
+        .collect()
 }
 
 /// Look up a single keyword argument from the kwargs dict produced by
@@ -6169,6 +6192,7 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let canonical = *registry.entry(name).or_insert(cls as usize) as PyObjectRef;
+    crate::typedef::stamp_exception_method_owners(canonical, name);
     if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(name) {
         let by_kind = pyre_object::interp_exceptions::register_exc_class_for_kind(kind, canonical);
         debug_assert_eq!(by_kind, canonical);
@@ -8397,7 +8421,7 @@ unsafe fn classdir_recurse(
 pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let mut names: Vec<Wtf8Buf> = Vec::new();
     unsafe {
-        let w_dict = crate::baseobjspace::getdict(obj);
+        let w_dict = crate::baseobjspace::getdict(obj)?;
         if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
             for (key, _) in pyre_object::w_dict_items(w_dict) {
                 if pyre_object::is_str(key) {
@@ -10371,9 +10395,9 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // descriptors.  Our generic instance layout stores the corresponding
     // fields under private mapdict names so descriptor writes cannot be
     // shadowed by user attributes.
-    if !crate::baseobjspace::setdictvalue(self_obj, "__file_public_mode__", w_str_new(binary_mode))
-        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))
-        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false))
+    if !crate::baseobjspace::setdictvalue(self_obj, "__file_public_mode__", w_str_new(binary_mode))?
+        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))?
+        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false))?
     {
         return Err(crate::PyError::runtime_error(
             "FileIO instance has no state dictionary",
@@ -10386,7 +10410,8 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .and_then(|fd| crate::host_seam::ops::fstat(fd).ok())
         .map(|st| if st.blksize > 1 { st.blksize } else { 8192 })
         .unwrap_or(8192);
-    if !crate::baseobjspace::setdictvalue(self_obj, "__file_blksize__", w_int_new(blksize as i64)) {
+    if !crate::baseobjspace::setdictvalue(self_obj, "__file_blksize__", w_int_new(blksize as i64))?
+    {
         return Err(crate::PyError::runtime_error(
             "FileIO instance has no state dictionary",
         ));
@@ -10423,7 +10448,7 @@ fn file_is_closed(self_obj: PyObjectRef) -> bool {
 
 fn file_set_closed(self_obj: PyObjectRef, closed: bool) -> Result<(), crate::PyError> {
     if crate::baseobjspace::getattr_str(self_obj, "__file_closed__").is_ok() {
-        if crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(closed)) {
+        if crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(closed))? {
             return Ok(());
         }
     }
@@ -10782,7 +10807,7 @@ fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
     // `__setattr__`, `__file_pos__` is not a descriptor), so the write is
     // the infallible instance-dict store `W_Root.setdictvalue`
     // (baseobjspace.py) that `setattr_str` would itself reach.
-    crate::baseobjspace::setdictvalue(self_obj, "__file_pos__", w_int_new(pos as i64));
+    crate::baseobjspace::setdictvalue_native(self_obj, "__file_pos__", w_int_new(pos as i64));
 }
 
 /// The raw file descriptor for an fd-backed file object (`open(fd, ...)`),
@@ -12442,11 +12467,13 @@ pub(crate) fn call_forwarding_args(
     if !has_real_kwargs(kwargs) {
         return crate::call::call_function_impl_result(callable, positional);
     }
+    // The keyword ABI keeps names byte-ish, so the surrogate-preserving reader
+    // is the one to use here: `w_dict_str_entries` drops a `**{'\udc80': v}`
+    // key outright rather than forwarding it.
     let keyword_args: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = unsafe {
-        pyre_object::w_dict_str_entries(kwargs.unwrap())
+        pyre_object::w_dict_str_entries_wtf8(kwargs.unwrap())
             .into_iter()
-            .filter(|(name, _)| name != "__pyre_kw__")
-            .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name), value))
+            .filter(|(name, _)| name.as_str() != Ok("__pyre_kw__"))
             .collect()
     };
     crate::eval::CURRENT_FRAME.with(|current| {

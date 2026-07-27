@@ -11,7 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
-const TIMEOUT_MAX: f64 = i64::MAX as f64 / 1_000_000.0;
+/// `_thread.TIMEOUT_MAX` — the whole-second bound of the nanosecond timestamp
+/// an acquire timeout is converted to.  PyPy exposes the microsecond bound
+/// instead (`moduledef.py:27` `float(os_lock.TIMEOUT_MAX // 1000000)`), which
+/// is a thousand times larger and is its 3.11-era surface.
+const TIMEOUT_MAX: f64 = (i64::MAX / 1_000_000_000) as f64;
 static THREAD_COUNT: AtomicI64 = AtomicI64::new(0);
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
 static FINALIZING: AtomicBool = AtomicBool::new(false);
@@ -322,10 +326,34 @@ pub(crate) fn after_fork_child() {
     majit_gc::gc_sync::after_fork_child();
 }
 
+// os_lock.py:20 `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
+const RPY_LOCK_FAILURE: i64 = 0;
+const RPY_LOCK_ACQUIRED: i64 = 1;
+const RPY_LOCK_INTR: i64 = 2;
+
+/// A `pthread_mutex_t` has no poison state — `thread_pthread.c` inspects only
+/// the status code — so a panic taken while lock bookkeeping was held must not
+/// turn every later acquire into an error.
+fn lock_state<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `os_lock.py:23-40 parse_acquire_args`.  The result is the `microseconds`
+/// argument of the `RPyThreadAcquireLockTimed` ABI: negative blocks forever,
+/// zero polls once.
+///
+/// The argument is rejected the way `lock_acquire_parse_args` does in 3.14,
+/// which is stricter than `os_lock.py`: upstream converts the seconds straight
+/// to microseconds, while 3.14 first builds a nanosecond timestamp, so NaN and
+/// anything outside the nanosecond range are rejected before the microsecond
+/// bound is ever reached — and that bound, being a thousand times wider than
+/// the nanosecond one, is then unreachable and is not tested here.
 fn parse_acquire_args(
     blocking: i64,
     w_timeout: Option<PyObjectRef>,
-) -> Result<Option<Duration>, crate::PyError> {
+) -> Result<i64, crate::PyError> {
     // os_lock.py `@unwrap_spec(blocking=int, timeout=float)`: unlike the
     // macro's concrete `f64` receiver, `space.float_w` performs Python's
     // numeric coercion first, so integer timeout arguments retain their
@@ -335,6 +363,23 @@ fn parse_acquire_args(
         Some(w_timeout) => crate::baseobjspace::float_w(w_timeout)?,
         None => -1.0,
     };
+    // `_PyTime_FromSecondsObject(&timeout, timeout_obj, _PyTime_ROUND_TIMEOUT)`
+    // runs before either check below, so a value it cannot represent is
+    // reported even for a non-blocking call.
+    if timeout.is_nan() {
+        return Err(crate::PyError::value_error(
+            "Invalid value NaN (not a number)",
+        ));
+    }
+    // `rarithmetic.ovfcheck_float_to_longlong` bounds, the ones `time.sleep`
+    // converts its own argument against (`interp_time.rs:122-126`).
+    const NS_MIN: f64 = -9223372036854776832.0;
+    const NS_MAX: f64 = 9223372036854775296.0;
+    if !(NS_MIN..NS_MAX).contains(&(timeout * 1e9).ceil()) {
+        return Err(crate::PyError::overflow_error(
+            "timestamp out of range for platform time_t",
+        ));
+    }
     if !blocking && timeout != -1.0 {
         return Err(crate::PyError::value_error(
             "can't specify a timeout for a non-blocking call",
@@ -342,21 +387,79 @@ fn parse_acquire_args(
     }
     if timeout < 0.0 && timeout != -1.0 {
         return Err(crate::PyError::value_error(
-            "timeout value must be strictly positive",
+            "timeout value must be a non-negative number",
         ));
     }
-    if timeout > TIMEOUT_MAX {
-        return Err(crate::PyError::overflow_error("timeout value is too large"));
-    }
-    Ok(if blocking && timeout >= 0.0 {
-        Some(Duration::from_secs_f64(timeout))
+    if !blocking {
+        Ok(0)
+    } else if timeout == -1.0 {
+        Ok(-1)
     } else {
-        None
-    })
+        // `_PyTime_ROUND_TIMEOUT` rounds away from zero, both in
+        // `lock_acquire_parse_args`' seconds→ns step and in
+        // `_PyTime_AsMicroseconds`.  Truncating instead would collapse any
+        // positive sub-microsecond timeout to 0, which `acquire_timed` reads
+        // as a non-blocking poll rather than a timed wait.
+        Ok((timeout * 1e6).ceil() as i64)
+    }
+}
+
+/// `os_lock.py:49 space.getexecutioncontext().checksignals()`.  The signal
+/// module is not built for wasm32 (`module/mod.rs:94`), where no handler can
+/// be pending, so there the check has nothing to run.
+fn checksignals() -> Result<(), crate::PyError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::module::signal::interp_signal::checksignals_now()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(())
+    }
+}
+
+/// `os_lock.py:43-60 acquire_timed` — "Helper to acquire an interruptible lock
+/// with a timeout."  `RPY_LOCK_INTR` reports a wait that a signal handler cut
+/// short: deliver the signal, then retry with whatever time is left.
+///
+/// `acquire` is the `RPyThreadAcquireLockTimed` primitive of the lock being
+/// taken; upstream reaches it as `lock.acquire_timed`
+/// (`rthread.py:192-197 Lock.acquire_timed`, `intr_flag=1`).
+fn acquire_timed(
+    mut microseconds: i64,
+    mut acquire: impl FnMut(i64) -> i64,
+) -> Result<i64, crate::PyError> {
+    // os_lock.py:45 `endtime`, measured here on the monotonic clock the
+    // `time_sleep` retry loop already uses for its deadline.
+    let start = Instant::now();
+    let endtime = microseconds;
+    loop {
+        let mut result = acquire(microseconds);
+        if result == RPY_LOCK_INTR {
+            // Run signal handlers if we were interrupted
+            checksignals()?;
+            if microseconds >= 0 {
+                microseconds = endtime - start.elapsed().as_micros() as i64;
+                // Check for negative values, since those mean block forever
+                if microseconds <= 0 {
+                    result = RPY_LOCK_FAILURE;
+                }
+            }
+        }
+        if result != RPY_LOCK_INTR {
+            return Ok(result);
+        }
+    }
 }
 
 mod lock_class {
     use super::*;
+    // `pthread_cond_wait` returning without the lock is how
+    // `RPyThreadAcquireLockTimed` detects a signal (thread_pthread.c:466-471),
+    // so the wait must be the bare one-shot call that propagates spurious
+    // wakeups.  `parking_lot`'s condition variable retries internally and
+    // would swallow exactly the wakeup that carries the interrupt.
+    use std::sync::{Condvar, Mutex};
 
     #[crate::pyre_class("_thread.lock")]
     #[derive(Default)]
@@ -380,51 +483,74 @@ mod lock_class {
             Ok(obj)
         }
 
+        /// `thread_pthread.c:427-485 RPyThreadAcquireLockTimed`, the mutex and
+        /// condition-variable build — the shape this lock has — with
+        /// `intr_flag=1`, which is what `rthread.py:195` passes.
+        fn acquire_timed(&self, microseconds: i64) -> i64 {
+            // A potentially blocking native lock wait leaves the collector's
+            // RUNNING census.  This does not serialize Python execution.  The
+            // guard ends with the primitive, so the signal handlers the caller
+            // runs on `RPY_LOCK_INTR` execute back inside the census.
+            let _blocked = before_external_block();
+            let mut locked = lock_state(&self.locked);
+            let mut success;
+            if !*locked {
+                success = RPY_LOCK_ACQUIRED;
+            } else if microseconds == 0 {
+                success = RPY_LOCK_FAILURE;
+            } else {
+                let deadline = (microseconds > 0)
+                    .then(|| Instant::now() + Duration::from_micros(microseconds as u64));
+                success = RPY_LOCK_FAILURE;
+                while success == RPY_LOCK_FAILURE {
+                    if let Some(deadline) = deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let (guard, timeout) = self
+                            .ready
+                            .wait_timeout(locked, deadline - now)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        locked = guard;
+                        if timeout.timed_out() {
+                            break;
+                        }
+                    } else {
+                        locked = self
+                            .ready
+                            .wait(locked)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if *locked {
+                        // We were woken up, but didn't get the lock.  We
+                        // probably received a signal.  Return RPY_LOCK_INTR to
+                        // allow the caller to handle it and retry.
+                        success = RPY_LOCK_INTR;
+                    } else {
+                        success = RPY_LOCK_ACQUIRED;
+                    }
+                }
+            }
+            if success == RPY_LOCK_ACQUIRED {
+                *locked = true;
+            }
+            success
+        }
+
+        /// `os_lock.py:75-85 descr_lock_acquire`.
         fn acquire(
             &self,
             #[default(1)] blocking: i64,
             timeout: Option<PyObjectRef>,
         ) -> Result<bool, crate::PyError> {
-            let timeout = parse_acquire_args(blocking, timeout)?;
-            let blocking = blocking != 0;
-            // A potentially blocking native lock wait leaves the collector's
-            // RUNNING census.  This does not serialize Python execution.
-            let _blocked = before_external_block();
-            let mut locked = self.locked.lock();
-            if !*locked {
-                *locked = true;
-                return Ok(true);
-            }
-            if !blocking {
-                return Ok(false);
-            }
-            match timeout {
-                None => {
-                    while *locked {
-                        self.ready.wait(&mut locked);
-                    }
-                    *locked = true;
-                    Ok(true)
-                }
-                Some(duration) => {
-                    let deadline = Instant::now() + duration;
-                    while *locked {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            return Ok(false);
-                        }
-                        if self.ready.wait_for(&mut locked, deadline - now).timed_out() && *locked {
-                            return Ok(false);
-                        }
-                    }
-                    *locked = true;
-                    Ok(true)
-                }
-            }
+            let microseconds = parse_acquire_args(blocking, timeout)?;
+            let result = super::acquire_timed(microseconds, |us| self.acquire_timed(us))?;
+            Ok(result == RPY_LOCK_ACQUIRED)
         }
 
         fn release(&self) -> Result<(), crate::PyError> {
-            let mut locked = self.locked.lock();
+            let mut locked = lock_state(&self.locked);
             if !*locked {
                 return Err(crate::PyError::runtime_error("release unlocked lock"));
             }
@@ -434,7 +560,7 @@ mod lock_class {
         }
 
         fn locked(&self) -> bool {
-            *self.locked.lock()
+            *lock_state(&self.locked)
         }
 
         fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -468,6 +594,8 @@ use lock_class::W_Lock;
 
 mod rlock_class {
     use super::*;
+    // Same interrupt-detection requirement as `lock_class`.
+    use std::sync::{Condvar, Mutex};
 
     #[derive(Default)]
     struct RLockState {
@@ -501,59 +629,96 @@ mod rlock_class {
             Ok(obj)
         }
 
+        /// The native-lock half of `os_lock.py:206-241 acquire_w`, shaped to
+        /// the `RPyThreadAcquireLockTimed` ABI (thread_pthread.c:427-485) so
+        /// `acquire_timed` can deliver signals between attempts.
+        ///
+        /// Upstream keeps `rlock_count`/`rlock_owner` outside the native lock
+        /// because the GIL serializes them; free-threaded pyre has no such
+        /// serialization, so ownership is claimed under the same mutex the
+        /// wait releases — the place `thread_pthread.c:479` sets `locked`.
+        fn acquire_timed(&self, microseconds: i64, ident: i64) -> i64 {
+            let _blocked = before_external_block();
+            let mut state = lock_state(&self.state);
+            let mut success;
+            if state.count == 0 {
+                success = RPY_LOCK_ACQUIRED;
+            } else if microseconds == 0 {
+                success = RPY_LOCK_FAILURE;
+            } else {
+                let deadline = (microseconds > 0)
+                    .then(|| Instant::now() + Duration::from_micros(microseconds as u64));
+                success = RPY_LOCK_FAILURE;
+                while success == RPY_LOCK_FAILURE {
+                    if let Some(deadline) = deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let (guard, timeout) = self
+                            .ready
+                            .wait_timeout(state, deadline - now)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state = guard;
+                        if timeout.timed_out() {
+                            break;
+                        }
+                    } else {
+                        state = self
+                            .ready
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if state.count != 0 {
+                        // Woken without the lock — probably a signal.
+                        success = RPY_LOCK_INTR;
+                    } else {
+                        success = RPY_LOCK_ACQUIRED;
+                    }
+                }
+            }
+            if success == RPY_LOCK_ACQUIRED {
+                state.owner = ident;
+                state.count = 1;
+            }
+            success
+        }
+
+        /// `os_lock.py:206-241 acquire_w`.
         fn acquire(
             &self,
             #[default(1)] blocking: i64,
             timeout: Option<PyObjectRef>,
         ) -> Result<bool, crate::PyError> {
-            let timeout = parse_acquire_args(blocking, timeout)?;
-            let blocking = blocking != 0;
-            let ident = current_ident();
-            let _blocked = before_external_block();
-            let mut state = self.state.lock();
-            if state.count > 0 && state.owner == ident {
-                state.count = state.count.checked_add(1).ok_or_else(|| {
-                    crate::PyError::overflow_error("internal lock count overflowed")
-                })?;
-                return Ok(true);
-            }
-            if state.count == 0 {
-                state.owner = ident;
-                state.count = 1;
-                return Ok(true);
-            }
-            if !blocking {
-                return Ok(false);
-            }
-            match timeout {
-                None => {
-                    while state.count != 0 {
-                        self.ready.wait(&mut state);
-                    }
-                }
-                Some(duration) => {
-                    let deadline = Instant::now() + duration;
-                    while state.count != 0 {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            return Ok(false);
-                        }
-                        if self.ready.wait_for(&mut state, deadline - now).timed_out()
-                            && state.count != 0
-                        {
-                            return Ok(false);
-                        }
-                    }
+            let microseconds = parse_acquire_args(blocking, timeout)?;
+            let tid = current_ident();
+            {
+                let mut state = lock_state(&self.state);
+                if state.count > 0 && state.owner == tid {
+                    state.count = state.count.checked_add(1).ok_or_else(|| {
+                        crate::PyError::overflow_error("internal lock count overflowed")
+                    })?;
+                    return Ok(true);
                 }
             }
-            state.owner = ident;
-            state.count = 1;
-            Ok(true)
+            // os_lock.py:231-235 — `self.lock.acquire(False)` first; only a
+            // failed poll waits, and only when `blocking`.  The count check
+            // upstream pairs it with is the same predicate the poll tests,
+            // because here the count is the lock.
+            let mut r = self.acquire_timed(0, tid) == RPY_LOCK_ACQUIRED;
+            if !r {
+                if blocking == 0 {
+                    return Ok(false);
+                }
+                r = super::acquire_timed(microseconds, |us| self.acquire_timed(us, tid))?
+                    == RPY_LOCK_ACQUIRED;
+            }
+            Ok(r)
         }
 
         fn release(&self) -> Result<(), crate::PyError> {
             let ident = current_ident();
-            let mut state = self.state.lock();
+            let mut state = lock_state(&self.state);
             if state.count == 0 || state.owner != ident {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
@@ -568,16 +733,16 @@ mod rlock_class {
         }
 
         fn locked(&self) -> bool {
-            self.state.lock().count != 0
+            lock_state(&self.state).count != 0
         }
 
         fn _is_owned(&self) -> bool {
-            let state = self.state.lock();
+            let state = lock_state(&self.state);
             state.count > 0 && state.owner == current_ident()
         }
 
         fn _recursion_count(&self) -> i64 {
-            let state = self.state.lock();
+            let state = lock_state(&self.state);
             if state.owner == current_ident() {
                 state.count
             } else {
@@ -586,7 +751,7 @@ mod rlock_class {
         }
 
         fn _release_save(&self) -> Result<PyObjectRef, crate::PyError> {
-            let mut state = self.state.lock();
+            let mut state = lock_state(&self.state);
             if state.count == 0 {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
@@ -611,15 +776,13 @@ mod rlock_class {
             }
             let count = unsafe { w_int_get_value(items[0]) };
             let owner = unsafe { w_int_get_value(items[1]) };
-            let _blocked = before_external_block();
-            let mut state = self.state.lock();
-            if state.count != 0 {
-                while state.count != 0 {
-                    self.ready.wait(&mut state);
-                }
-            }
-            state.count = count;
-            state.owner = owner;
+            // os_lock.py:286-287 `self.lock.acquire(True)` reaches
+            // `RPyThreadAcquireLockTimed` with `intr_flag=0`
+            // (rthread.py:169-174), so an interrupted wait is retried rather
+            // than reported: restoring a saved state is not a place where a
+            // signal may be delivered.
+            while self.acquire_timed(-1, owner) != RPY_LOCK_ACQUIRED {}
+            lock_state(&self.state).count = count;
             Ok(())
         }
 
@@ -634,7 +797,7 @@ mod rlock_class {
         }
 
         fn __repr__(&self) -> String {
-            let state = self.state.lock();
+            let state = lock_state(&self.state);
             let locked = if state.count == 0 {
                 "unlocked"
             } else {
@@ -809,35 +972,150 @@ mod local_class {
     /// `self.dicts = {}` and keeping every per-ExecutionContext dictionary on the
     /// object's ordinary GC graph.  The integer key is pyre's stable identity for
     /// the current OS-thread ExecutionContext.
+    ///
+    /// `initargs` and `initkwargs` are `Local.__init__`'s `self.initargs`
+    /// (os_local.py:25).  Upstream keeps one `Arguments`; pyre's call surface
+    /// takes the positional and keyword halves separately, so they are stored as
+    /// the positional tuple and the construction call's keyword mapping (null
+    /// when it had none), and `create_new_dict` replays the call from both.
     #[crate::pyre_class("_thread._local")]
     pub struct W_Local {
         dicts: PyObjectRef,
+        initargs: PyObjectRef,
+        initkwargs: PyObjectRef,
         last_dict: PyObjectRef,
         last_ident: i64,
+        /// Guards `dicts` and the `last_dict`/`last_ident` pair.  Upstream
+        /// keeps both unsynchronized — `os_local.py:36` "cache the last seen
+        /// dict, works because we are protected by the GIL" — which
+        /// free-threaded pyre cannot rely on.
         state_lock: Mutex<()>,
     }
 
     impl W_Local {
-        pub(super) fn current_dict(&self) -> PyObjectRef {
-            let _guard = self.state_lock.lock();
+        /// `os_local.py:47-64 create_new_dict`.
+        fn create_new_dict(&self, ident: i64) -> Result<PyObjectRef, crate::PyError> {
             let this = self as *const Self as *mut Self;
-            let ident = current_ident();
-            if self.last_ident == ident && !self.last_dict.is_null() {
-                return self.last_dict;
+            let obj = this as PyObjectRef;
+            // create a new dict for this thread
+            let w_dict = pyre_object::w_dict_new();
+            let roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_dict);
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            // Published before the initializer runs: the `__init__` about to be
+            // entered reaches `getdict` again, and finding this entry is what
+            // stops it recursing back into `create_new_dict` (os_local.py:28-31).
+            {
+                let _guard = self.state_lock.lock();
+                unsafe { pyre_object::w_dict_setitem(self.dicts, ident, w_dict) };
             }
-            let w_dict =
-                unsafe { pyre_object::w_dict_getitem(self.dicts, ident) }.unwrap_or_else(|| {
-                    let w_dict = pyre_object::w_dict_new();
-                    unsafe { pyre_object::w_dict_setitem(self.dicts, ident, w_dict) };
-                    register_local_in_current_ec(self as *const Self as PyObjectRef);
-                    w_dict
+            // call __init__ — `space.call_obj_args(w_init, self, self.initargs)`.
+            // The argument pointers are copied out of the tuple only after the
+            // lookup, which can itself run Python: nothing between the copy and
+            // the callee rooting them allocates, so a collection cannot leave
+            // the copies naming pre-move addresses.
+            let result = crate::typedef::r#type(obj)
+                .ok_or_else(|| crate::PyError::type_error("_local instance has no type"))
+                .and_then(|w_type| crate::baseobjspace::getattr_str(w_type.as_ptr(), "__init__"))
+                .and_then(|w_init| {
+                    let mut call_args = vec![obj];
+                    call_args.extend(unsafe { w_tuple_items_copy_as_vec(self.initargs) });
+                    self.call_init(w_init, &call_args)
                 });
+            if let Err(err) = result {
+                // failed, forget w_dict and propagate the exception
+                let key = w_int_new(ident);
+                let _guard = self.state_lock.lock();
+                unsafe { pyre_object::w_dict_delitem(self.dicts, key) };
+                // The initializer reached `current_dict` before it raised —
+                // assigning an instance attribute is what publishes the dict —
+                // so this thread's cache now names the entry just removed.
+                // Leaving it makes the next access return a half-initialized
+                // dict instead of rerunning `__init__`; `thread_is_stopping`
+                // drops the same pair alongside the same removal.
+                unsafe {
+                    if (*this).last_ident == ident {
+                        (*this).last_ident = 0;
+                        (*this).last_dict = PY_NULL;
+                    }
+                }
+                return Err(err);
+            }
+            // ready.  `register_local_in_current_ec` allocates a weakref, so
+            // the dict stays rooted across it and is reloaded afterwards: it is
+            // still reachable through `self.dicts`, and a moving collection
+            // would relocate it there while this frame's copy kept the pre-move
+            // address for `current_dict` to cache and return.
+            register_local_in_current_ec(obj);
+            let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            drop(roots);
+            Ok(w_dict)
+        }
+
+        /// The call itself of `os_local.py:57 space.call_obj_args(w_init, self,
+        /// self.initargs)`.  `args` is the instance followed by the stored
+        /// positional arguments; the stored keywords are bound by name.
+        ///
+        /// Upstream passes a single `Arguments` to `space.call_args`, which
+        /// binds keywords whatever the caller is.  Pyre splits that surface:
+        /// `call::call_with_kwargs` binds keywords but needs the running frame,
+        /// while the frame-less `call_function_impl_result` is positional only.
+        /// Reaching the frame through the execution context is the same
+        /// resolution `call::call_metaclass_with_kwargs` uses, down to falling
+        /// back to the positional call when there is no frame — a receiver only
+        /// reaches here from Python code, which always has one.
+        fn call_init(
+            &self,
+            w_init: PyObjectRef,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let kwds = crate::builtins::builtin_kwarg_entries(
+                (!self.initkwargs.is_null()).then_some(self.initkwargs),
+            );
+            let frame = {
+                let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+                if ec.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    unsafe { (*ec).gettopframe_raw() }
+                }
+            };
+            if kwds.is_empty() || frame.is_null() {
+                return crate::call::call_function_impl_result(w_init, args);
+            }
+            crate::call::call_with_kwargs(unsafe { &mut *frame }, w_init, args, &kwds)
+        }
+
+        /// `os_local.py:66-76 getdict`.
+        pub(super) fn current_dict(&self) -> Result<PyObjectRef, crate::PyError> {
+            let ident = current_ident();
+            {
+                let _guard = self.state_lock.lock();
+                if self.last_ident == ident && !self.last_dict.is_null() {
+                    return Ok(self.last_dict);
+                }
+            }
+            // `dicts` is mutated under `state_lock` by `create_new_dict` and
+            // `thread_is_stopping`, so the probe takes it too rather than
+            // reading the native dict beside a concurrent write.  The lock is
+            // released before `create_new_dict`, which runs app-level
+            // `__init__` and reenters this method.
+            let existing = {
+                let _guard = self.state_lock.lock();
+                unsafe { pyre_object::w_dict_getitem(self.dicts, ident) }
+            };
+            let w_dict = match existing {
+                Some(w_dict) => w_dict,
+                None => self.create_new_dict(ident)?,
+            };
+            let this = self as *const Self as *mut Self;
+            let _guard = self.state_lock.lock();
             unsafe {
                 (*this).last_ident = ident;
                 (*this).last_dict = w_dict;
             }
             pyre_object::gc_hook::try_gc_write_barrier(this as *mut u8);
-            w_dict
+            Ok(w_dict)
         }
 
         pub(super) fn thread_is_stopping(&self, ident: i64) {
@@ -863,41 +1141,92 @@ mod local_class {
 
     #[crate::pyre_methods(doc = "Thread-local data", weakrefable)]
     impl W_Local {
+        /// `os_local.py:78-88 descr_local__new__`.
         #[staticmethod]
         fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::typedef::check_user_subclass(type_object(), cls)?;
-            // os_local.py:81 rejects construction arguments before
-            // `allocate_instance`, and does so for every subtype that inherits
-            // `object.__init__` — not just for the exact type — so a refused
-            // construction never reaches `_register_in_ec` (os_local.py:40).
-            if args.len() > 1
-                && unsafe { crate::baseobjspace::lookup_where_class_uncached(cls, "__init__") }
-                    == Some(crate::typedef::w_object())
-            {
-                return Err(crate::PyError::type_error(
-                    "Initialization arguments are not supported",
-                ));
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+                // Construction arguments are rejected by the initializer the
+                // subtype inherits, not by the requested type: a subclass that
+                // defines its own `__init__` consumes them, and
+                // `create_new_dict` replays that call on every further thread.
+                // os_local.py:81 runs this ahead of `allocate_instance`, so a
+                // refused construction never reaches `_register_in_ec`
+                // (os_local.py:40).
+                let w_parent_init = unsafe { crate::baseobjspace::lookup_where(cls, "__init__") }
+                    .map(|(w_where, _)| w_where);
+                if w_parent_init == Some(crate::typedef::w_object()) {
+                    return Err(crate::PyError::type_error(
+                        "Initialization arguments are not supported",
+                    ));
+                }
             }
-            // os_local.py installs the first dictionary before app-level
-            // __init__ is entered, preventing recursive initialization.
+            // os_local.py:23-38 `Local.__init__` installs the first dictionary
+            // before app-level __init__ is entered, preventing recursive
+            // initialization.
+            let roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(cls);
+            // A plain `_local()` has no keyword mapping, and a null takes no
+            // shadow-stack slot.
+            let initkwargs_slot = kwargs.map(|w_kwargs| {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(w_kwargs);
+                slot
+            });
+            // Pinned BEFORE the tuple is built: `w_tuple_new` allocates, and
+            // while it roots the elements it is given, `cls` and the keyword
+            // mapping are raw locals of this frame that a moving collection
+            // cannot update.  Pinning them afterwards would record evacuated
+            // addresses, so both are read back from their slots below.
+            let initargs = w_tuple_new(positional.get(1..).unwrap_or(&[]).to_vec());
+            let initargs_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(initargs);
+            let dicts_slot = pyre_object::gc_roots::shadow_stack_len();
             let dicts = pyre_object::w_dict_new();
+            pyre_object::gc_roots::pin_root(dicts);
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let w_dict = pyre_object::w_dict_new();
+            pyre_object::gc_roots::pin_root(w_dict);
             let ident = current_ident();
-            unsafe { pyre_object::w_dict_setitem(dicts, ident, w_dict) };
+            unsafe {
+                pyre_object::w_dict_setitem(
+                    pyre_object::gc_roots::shadow_stack_get(dicts_slot),
+                    ident,
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                )
+            };
+            // The object slots are filled after the allocation, from the
+            // shadow stack, so a collection triggered by `allocate_stable`
+            // cannot leave the fresh instance holding pre-move addresses.
             let obj = Self::allocate_stable(Self {
                 ob: PyObject::default(),
-                dicts,
-                last_dict: w_dict,
+                dicts: PY_NULL,
+                initargs: PY_NULL,
+                initkwargs: PY_NULL,
+                last_dict: PY_NULL,
                 last_ident: ident,
                 state_lock: parking_lot::const_mutex(()),
             });
-            unsafe { (*obj).w_class = cls };
+            unsafe {
+                let this = obj as *mut Self;
+                (*obj).w_class = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+                (*this).dicts = pyre_object::gc_roots::shadow_stack_get(dicts_slot);
+                (*this).initargs = pyre_object::gc_roots::shadow_stack_get(initargs_slot);
+                (*this).initkwargs = initkwargs_slot
+                    .map(pyre_object::gc_roots::shadow_stack_get)
+                    .unwrap_or(PY_NULL);
+                (*this).last_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            }
+            pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            drop(roots);
             register_local_in_current_ec(obj);
             Ok(obj)
         }
 
         #[getter]
-        fn __dict__(&self) -> PyObjectRef {
+        fn __dict__(&self) -> Result<PyObjectRef, crate::PyError> {
             self.current_dict()
         }
     }
@@ -908,10 +1237,18 @@ fn local_type() -> PyObjectRef {
     local_class::type_object()
 }
 
-/// W_Root.getdict dispatch for `os_local.Local.getdict`.
-pub(crate) fn local_getdict(obj: PyObjectRef) -> Option<PyObjectRef> {
+/// W_Root.getdict dispatch for `os_local.Local.getdict`.  `None` means the
+/// receiver is not a `_local`; `Some(Err(..))` is the app-level `__init__` the
+/// first access from a thread runs (`os_local.py:73 create_new_dict`) raising.
+pub(crate) fn local_getdict(obj: PyObjectRef) -> Option<Result<PyObjectRef, crate::PyError>> {
     let local = W_Local::from_obj(obj)?;
     Some(local.current_dict())
+}
+
+/// True when `obj` is a `_thread._local`, the one receiver whose `getdict`
+/// runs app-level code.
+pub(crate) fn is_local(obj: PyObjectRef) -> bool {
+    W_Local::from_obj(obj).is_some()
 }
 
 /// `os_local.py:Local._register_in_ec`.
