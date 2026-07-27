@@ -5380,6 +5380,197 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Walker-native fold for the deterministic immutable-type
+/// STORE_ATTR / DELETE_ATTR raise (`int.x = v` / `del str.x` →
+/// TypeError from the `object_setattr` / `object_delattr` non-heaptype
+/// guard, `typeobject.py:416/437`).
+///
+/// The generic path records the raise as an opaque
+/// `CallMayForceN(bh_store_attr_fn)` + `GuardNotForced` +
+/// `GuardException`, whose result box (the exception materialised
+/// *inside* the residual by `PyError::to_exc_object`) can never
+/// virtualize — every compiled iteration re-allocates the TypeError,
+/// its message string, and its args list through the runtime GC hooks.
+/// PyPy traces `space.setattr` itself, so the same raise shows up as
+/// `new_with_vtable` + `setfield_gc` ops its optimizer removes when the
+/// exception never escapes.
+///
+/// This fold restores that shape for the one attribute-store raise
+/// whose outcome is provably iteration-invariant: when
+/// `type_immutable_attr_raise_is_stable` holds (constant non-heaptype
+/// receiver, canonical `type` metaclass, no metaclass descriptor for
+/// `name` — every consulted dict frozen), the raise and its message
+/// depend only on trace-time constants.  Pin the receiver with
+/// `GuardValue` (when not already constant), run the authentic
+/// `setattr_str` / `delattr_str` concretely for the authoritative
+/// walk's exception, and emit the [`try_walker_trace_exception_new`]
+/// construction (`NewWithVtable` + args-list `SetfieldGc`s, message as
+/// a rooted trace constant) in place of the residual + guards.  The
+/// raise then routes through the ordinary `SubRaise` path with a
+/// virtualizable exception OpRef, and a locally-caught `except` DCEs
+/// the whole allocation exactly as the explicit-`raise` B3 fold does.
+///
+/// Returns `None` (fall through to the generic residual) for any
+/// non-matching or unprovable shape.
+pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    obj_op: OpRef,
+    store_value: Option<OpRef>,
+    w_code_ptr: usize,
+    name_idx: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
+        return Ok(None);
+    };
+    // STORE_ATTR needs the live value operand to run the authentic
+    // concrete `setattr_str` below (the value plays no role in the raise
+    // decision — the terminal raises before consulting it).
+    let concrete_value = match store_value {
+        Some(value_op) => match walker_concrete_ref_object(ctx, value_op) {
+            Some(v) => Some(v),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let name = unsafe {
+        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+        if code_ptr.is_null() {
+            return Ok(None);
+        }
+        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
+            Some(n) => n.to_string(),
+            None => return Ok(None),
+        }
+    };
+    if !pyre_interpreter::baseobjspace::type_immutable_attr_raise_is_stable(
+        concrete_obj,
+        &name,
+        store_value.is_none(),
+    ) {
+        return Ok(None);
+    }
+
+    // --- commit: pin the receiver, run the authentic raise, emit inline ---
+    // The stability predicate makes the raise a pure function of `(obj,
+    // name)`; `GuardValue` pins the one live input (`name` is a co_names
+    // constant).
+    if !obj_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_obj as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[obj_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(obj_op, expected);
+    }
+
+    // The authoritative walk's concrete execution — the same call the
+    // residual executor would have made, raising before any heap
+    // mutation.  Plain eval: the predicate excludes every user-code path.
+    let result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        match concrete_value {
+            Some(value) => pyre_interpreter::baseobjspace::setattr_str(concrete_obj, &name, value),
+            None => pyre_interpreter::baseobjspace::delattr_str(concrete_obj, &name),
+        }
+    };
+    let Err(mut err) = result else {
+        // Unreachable under the predicate (a non-heaptype dict rejects
+        // every mutation).  Fail loud rather than falling through: the
+        // generic residual would re-run the (somehow) committed effect.
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "immutable-type attr raise fold: stable raise unexpectedly succeeded",
+        });
+    };
+    let exc = err.to_exc_object();
+    let kind = unsafe {
+        if !pyre_object::is_exception(exc) {
+            return Ok(None);
+        }
+        pyre_object::interp_exceptions::w_exception_get_kind(exc)
+    };
+    // The folded raise is exactly the immutable-type TypeError; any other
+    // kind means the runtime path diverged from the predicate's model.
+    if kind != pyre_object::interp_exceptions::ExcKind::TypeError {
+        return Ok(None);
+    }
+    let exc_type_ptr = unsafe {
+        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+            .ob_header
+            .ob_type
+    };
+    if !std::ptr::eq(
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+    ) {
+        return Ok(None);
+    }
+
+    // Message as a trace constant: deterministic per `(obj, name)` under
+    // the predicate, so one shared immutable string is exact (the same
+    // sharing a `raise TypeError("...")` gets from co_consts).  Pin the
+    // fresh exception across the string allocation; the recorded ConstPtr
+    // slot is forwarded across minor collections by the op-graph walker
+    // and rooted by the compiled loop's gcref table thereafter.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(exc);
+    let msg = pyre_object::w_str_new(&err.message);
+    let msg_const = ctx.trace_ctx.const_ref(msg as i64);
+    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[msg_const]);
+    // Stamp the canonical list class exactly as `w_list_new` does (the
+    // `try_walker_trace_exception_new` args tail), so a materialised
+    // `args_w` still satisfies `space.type(args_w) is list`.
+    let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
+    let list_w_class_descr = crate::descr::list_w_class_descr();
+    let list_w_class_index = list_w_class_descr.index();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[args_list, list_w_class],
+        list_w_class_descr,
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(args_list, list_w_class_index, list_w_class);
+
+    let class_const = ctx
+        .trace_ctx
+        .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
+    let new_op =
+        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class_const, args_list);
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+    // Inline-built marker: the downstream raise routing records the frame
+    // node via the virtual `record_fresh_application_traceback` instead of
+    // the forcing runtime hook (mirrors `try_walker_trace_raise_bare_class`).
+    fbw_built_exc_insert(new_op);
+
+    // The residual-executor Err-arm state, minus the call itself: seed the
+    // standing exception for the `SubRaise` routing (`execute_raised`
+    // analogue) and restore the blackhole cell so an aborting walk still
+    // delivers the pending raise to the live frame.  The class IS proven
+    // constant here — the `NewWithVtable` vtable pins it.
+    fbw_count_executed_residual(true, true);
+    ctx.last_exc_value = Some(new_op);
+    ctx.last_exc_value_concrete = ConcreteValue::Ref(exc);
+    ctx.fbw_mode.class_of_last_exc_is_const = true;
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
+
+    Ok(Some((
+        DispatchOutcome::SubRaise {
+            exc: new_op,
+            exc_concrete: ConcreteValue::Ref(exc),
+        },
+        op.next_pc,
+    )))
+}
+
 /// B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
 /// exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
 /// `sys_exc_value` slot (`ec_sys_exc_value_descr`).

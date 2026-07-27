@@ -6602,7 +6602,12 @@ where
     let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
     let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
     let name_idx = const_int_for_value_arg(&op.args[2])?;
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Tag the DELETE_ATTR helper calldescr so the full-body walker can fold
+    // the deterministic immutable-type raise to a traced inline exception
+    // construction.  A declined fold continues with this unchanged MayForce
+    // residual — the tag mirror of `lower_setattr_hlop_to_insn`.
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::DeleteAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],

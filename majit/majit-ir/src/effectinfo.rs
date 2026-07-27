@@ -712,6 +712,14 @@ pub enum PyreHelperKind {
     /// inserting a helper in the middle changes existing discriminants consumed
     /// by serialized/stable helper metadata.
     LoadMethodSelf,
+    /// `bh_delete_attr_fn(obj, code, name_idx)` — the plain DELETE_ATTR
+    /// residual (`lower_delete_attr_hlop_to_insn` → `space.delattr`), the
+    /// deletion counterpart of [`StoreAttr`](PyreHelperKind::StoreAttr).
+    /// The full-body walker recognises this tag to fold the deterministic
+    /// immutable-type raise (`del int.x` → TypeError before any dict
+    /// access) to a traced inline exception construction the optimizer
+    /// can virtualize; every other shape keeps the generic residual.
+    DeleteAttr,
 }
 
 impl EffectInfo {
