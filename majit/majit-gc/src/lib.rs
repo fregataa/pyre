@@ -319,6 +319,14 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// `rpython/rlib/rgc.py:1224 do_get_objects`: walk every object reachable
+    /// from the GC roots and visit the `rclass.OBJECT` instances selected by
+    /// the generation argument. The visitor runs before the collector releases
+    /// its inspection pause, so callers can root every returned object without
+    /// exposing unrooted raw addresses to another collection. Collectors
+    /// without an inspector visit no objects.
+    fn get_objects(&mut self, _generation: i8, _visitor: &mut dyn FnMut(GcRef)) {}
+
     /// Trigger a non-moving old-gen-only major collection (sweep dead old-gen
     /// objects without moving the nursery). The default no-ops so a backend
     /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
@@ -787,6 +795,9 @@ impl GcAllocator for GcHandle {
     }
     fn collect_full(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_full())
+    }
+    fn get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
+        gc_sync::gc_op(|gc| gc.get_objects(generation, visitor))
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
@@ -1445,6 +1456,25 @@ pub fn set_active_collect_full(hook: Option<CollectFullFn>) {
 pub fn collect_full() {
     if let Some(f) = ACTIVE_COLLECT_FULL.get() {
         f();
+    }
+}
+
+/// Active-backend trampoline for `rpython/rlib/rgc.py:1224
+/// do_get_objects`. The generation values are CPython 3.14's public
+/// `gc.get_objects` convention. The backend must invoke the visitor while its
+/// inspection pause is still held.
+pub type GetObjectsVisitorFn = fn(GcRef);
+pub type GetObjectsFn = fn(i8, GetObjectsVisitorFn);
+
+global_hook!(static ACTIVE_GET_OBJECTS: GetObjectsFn);
+
+pub fn set_active_get_objects(hook: Option<GetObjectsFn>) {
+    ACTIVE_GET_OBJECTS.set(hook);
+}
+
+pub fn get_objects(generation: i8, visitor: GetObjectsVisitorFn) {
+    if let Some(f) = ACTIVE_GET_OBJECTS.get() {
+        f(generation, visitor);
     }
 }
 

@@ -2047,20 +2047,23 @@ impl MiniMarkGC {
         }
     }
 
-    fn seed_major_roots(&mut self) {
+    /// Snapshot the root walk shared by inspection and major marking. The
+    /// finalizer lists are appended by the caller because
+    /// `gc.enumerate_all_roots` includes live registered finalizers, whereas
+    /// major marking must leave those objects to the finalization-order pass.
+    fn enumerate_root_walker_values(&self) -> Vec<GcRef> {
         // incminimark.py:2717 collect_roots: root_walker.walk_roots()
-        // seeds stack roots for a major marking cycle. Mirror the same
-        // root sets as minor collection, but mark old objects instead of
-        // copying nursery objects.
+        // walks the same root sets as minor collection.
+        let mut result = Vec::new();
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
         for root_ptr in roots {
             let gcref = unsafe { *root_ptr };
-            self.seed_major_root(gcref);
+            result.push(gcref);
         }
 
         let walk_all_mutators = crate::gc_sync::mutators_quiesced();
         let mut visit_shadow_root = |gcref: &mut GcRef| {
-            self.seed_major_root(*gcref);
+            result.push(*gcref);
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
@@ -2068,17 +2071,16 @@ impl MiniMarkGC {
             crate::shadow_stack::walk_roots(&mut visit_shadow_root);
         }
 
-        let mut libc_jf_refs: Vec<GcRef> = Vec::new();
         let mut visit_jf_root = |gcref: &mut GcRef| {
             if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
                 crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
                     let field_ref = unsafe { *slot_ptr };
                     if !field_ref.is_null() {
-                        libc_jf_refs.push(field_ref);
+                        result.push(field_ref);
                     }
                 });
             } else {
-                self.seed_major_root(*gcref);
+                result.push(*gcref);
             }
         };
         if walk_all_mutators {
@@ -2086,12 +2088,9 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
         }
-        for gcref in libc_jf_refs {
-            self.seed_major_root(gcref);
-        }
 
         let mut visit_bh_root = |gcref: &mut GcRef| {
-            self.seed_major_root(*gcref);
+            result.push(*gcref);
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
@@ -2103,7 +2102,7 @@ impl MiniMarkGC {
         // minor-collection path for why the in-flight virtuals_cache /
         // registers_r slices must be seeded as roots.
         let mut visit_resume_root = |gcref: &mut GcRef| {
-            self.seed_major_root(*gcref);
+            result.push(*gcref);
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
@@ -2112,7 +2111,7 @@ impl MiniMarkGC {
         }
 
         let mut visit_extra_area = |gcref: &mut GcRef| {
-            self.seed_major_root(*gcref);
+            result.push(*gcref);
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
@@ -2121,12 +2120,35 @@ impl MiniMarkGC {
         }
 
         crate::walk_active_extra_roots(&mut |gcref| {
-            self.seed_major_root(*gcref);
+            result.push(*gcref);
         });
 
         crate::shadow_stack::walk_extra_roots(|gcref| {
-            self.seed_major_root(*gcref);
+            result.push(*gcref);
         });
+        result
+    }
+
+    /// `inspector.py:get_rpy_roots` / `gc.enumerate_all_roots`: snapshot all
+    /// inspection roots in the order from `gc/base.py:enumerate_all_roots`.
+    /// The returned Vec is raw system-allocator storage, matching
+    /// inspector.py's preallocated raw root list.
+    fn enumerate_all_root_values(&self) -> Vec<GcRef> {
+        let mut result = self.enumerate_root_walker_values();
+        // incminimark.py:2734-2736 `enum_live_with_finalizers`: registered
+        // finalizer objects remain roots even before they become unreachable
+        // and move to an app-visible death queue. AddressDeque.foreach(..., 2)
+        // visits every object address while skipping each paired queue index.
+        result.extend(
+            self.probably_young_objects_with_finalizers
+                .iter()
+                .map(|&(addr, _)| GcRef(addr)),
+        );
+        result.extend(
+            self.old_objects_with_finalizers
+                .iter()
+                .map(|&(addr, _)| GcRef(addr)),
+        );
 
         // gc/base.py `enum_pending_finalizers`: objects already moved to a
         // death queue remain GC roots until app-level code pops them.
@@ -2136,7 +2158,123 @@ impl MiniMarkGC {
             .flat_map(|handler| handler.deque.iter().copied())
             .collect();
         for addr in pending {
-            self.seed_major_root(GcRef(addr));
+            result.push(GcRef(addr));
+        }
+        result
+    }
+
+    fn seed_major_roots(&mut self) {
+        // incminimark.py:2717 collect_roots: root_walker.walk_roots()
+        // seeds stack roots for a major marking cycle. Mirror the same
+        // root sets as minor collection, but mark old objects instead of
+        // copying nursery objects.
+        let mut roots = self.enumerate_root_walker_values();
+        // Objects already moved to a death queue remain ordinary roots until
+        // app-level code pops them. Registered live finalizers are deliberately
+        // absent here; incminimark's finalization-order pass decides whether
+        // they survive or move to the death queue.
+        roots.extend(
+            self.finalizer_handlers
+                .iter()
+                .flat_map(|handler| handler.deque.iter().copied())
+                .map(GcRef),
+        );
+        for gcref in roots {
+            self.seed_major_root(gcref);
+        }
+    }
+
+    /// `inspector.py:get_rpy_referents`: trace one object's direct GC
+    /// referents without changing collection state.
+    fn visit_referents(&self, obj_addr: usize, visitor: &mut dyn FnMut(GcRef)) {
+        let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        self.validate_type_id(type_id, obj_addr, "visit_referents");
+        let type_info = self.types.get(type_id);
+        if let Some(trace_fn) = type_info.custom_trace {
+            unsafe {
+                trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
+                    let field_ref = *slot_ptr;
+                    if !field_ref.is_null() {
+                        visitor(field_ref);
+                    }
+                });
+            }
+            return;
+        }
+        for &offset in &type_info.gc_ptr_offsets {
+            let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
+            if !field_ref.is_null() {
+                visitor(field_ref);
+            }
+        }
+        if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
+            let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+            let items_start = obj_addr + type_info.size;
+            for i in 0..length {
+                let field_ref =
+                    unsafe { *((items_start + i * type_info.item_size) as *const GcRef) };
+                if !field_ref.is_null() {
+                    visitor(field_ref);
+                }
+            }
+        }
+    }
+
+    /// `rpython/rlib/rgc.py:1224 do_get_objects`, using MiniMark's
+    /// GCFLAG_EXTRA exactly as the translated RPython path does.
+    pub fn do_get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
+        if generation == 1 {
+            return;
+        }
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        let roots = self.enumerate_all_root_values();
+        let mut pending = roots.clone();
+        let mut result = Vec::new();
+        while let Some(gcref) = pending.pop() {
+            if gcref.is_null() || !self.is_managed_heap_object(gcref.0) {
+                continue;
+            }
+            let hdr = unsafe { header_of(gcref.0) };
+            if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+                continue;
+            }
+            unsafe { (*hdr).set_flag(flags::EXTRA) };
+            let is_requested_generation = match generation {
+                -1 => true,
+                0 => self.is_in_nursery(gcref.0),
+                2 => !self.is_in_nursery(gcref.0),
+                _ => false,
+            };
+            let type_id = unsafe { (*hdr).type_id() };
+            if is_requested_generation
+                && !unsafe { (*hdr).has_flag(flags::DUMMY) }
+                && self.types.get(type_id).is_object
+            {
+                result.push(gcref);
+            }
+            self.visit_referents(gcref.0, &mut |child| pending.push(child));
+        }
+
+        // rgc.clear_gcflag_extra(roots): repeat the root traversal and restore
+        // every toggled header before returning to app-level code.
+        let mut pending = roots;
+        while let Some(gcref) = pending.pop() {
+            if gcref.is_null() || !self.is_managed_heap_object(gcref.0) {
+                continue;
+            }
+            let hdr = unsafe { header_of(gcref.0) };
+            if unsafe { !(*hdr).has_flag(flags::EXTRA) } {
+                continue;
+            }
+            unsafe { (*hdr).clear_flag(flags::EXTRA) };
+            self.visit_referents(gcref.0, &mut |child| pending.push(child));
+        }
+        for gcref in result {
+            visitor(gcref);
         }
     }
 
@@ -3650,6 +3788,10 @@ impl GcAllocator for MiniMarkGC {
         self.do_collect_full();
     }
 
+    fn get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
+        self.do_get_objects(generation, visitor)
+    }
+
     fn collect_oldgen_nonmoving(&mut self) {
         self.do_collect_oldgen_nonmoving();
     }
@@ -4004,6 +4146,71 @@ mod tests {
             large_object_threshold: nursery_size / 2,
             ..GcConfig::default()
         })
+    }
+
+    #[test]
+    fn get_objects_walks_referents_filters_rpython_structs_and_generations() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let mut holder_info = TypeInfo::object(ptr_size);
+        holder_info.has_gc_ptrs = true;
+        holder_info.gc_ptr_offsets = vec![0];
+        let holder_tid = gc.register_type(holder_info);
+        let raw_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::object(ptr_size));
+
+        let leaf = gc.alloc_with_type(leaf_tid, ptr_size);
+        let raw = gc.alloc_with_type(raw_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(holder_tid, ptr_size);
+        unsafe {
+            *(raw.0 as *mut GcRef) = leaf;
+            *(holder.0 as *mut GcRef) = raw;
+            gc.roots.add(&mut holder);
+        }
+
+        let get_objects = |gc: &mut MiniMarkGC, generation| {
+            let mut result = Vec::new();
+            gc.do_get_objects(generation, &mut |gcref| result.push(gcref));
+            result
+        };
+        let all = get_objects(&mut gc, -1);
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&holder));
+        assert!(all.contains(&leaf));
+        assert_eq!(get_objects(&mut gc, 0).len(), 2);
+        assert!(get_objects(&mut gc, 1).is_empty());
+        assert!(get_objects(&mut gc, 2).is_empty());
+        for object in [holder, raw, leaf] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+        }
+
+        gc.do_collect_nursery();
+        let raw = unsafe { *(holder.0 as *const GcRef) };
+        let leaf = unsafe { *(raw.0 as *const GcRef) };
+        assert!(get_objects(&mut gc, 0).is_empty());
+        let old = get_objects(&mut gc, 2);
+        assert_eq!(old.len(), 2);
+        assert!(old.contains(&holder));
+        assert!(old.contains(&leaf));
+        for object in [holder, raw, leaf] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+        }
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn get_objects_includes_live_objects_registered_with_finalizers() {
+        fn trigger() {}
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let object_tid = gc.register_type(TypeInfo::object(ptr_size));
+        let object = gc.alloc_with_type(object_tid, ptr_size);
+        gc.register_finalizer(0, object, trigger);
+
+        let mut objects = Vec::new();
+        gc.do_get_objects(-1, &mut |gcref| objects.push(gcref));
+        assert!(objects.contains(&object));
     }
 
     #[test]

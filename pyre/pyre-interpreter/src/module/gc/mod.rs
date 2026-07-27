@@ -64,10 +64,19 @@ crate::py_module! {
         "DEBUG_SAVEALL"       => w_int_new(32),
         "DEBUG_LEAK"          => w_int_new(38),
     },
-    functions: {
-        // `interp_gc.py:7-26 collect` — the optional `generation` argument is
-        // ignored per upstream.
-        "collect"       / * = |_| {
+    inline_functions: {
+        fn collect(
+            #[default(w_int_new(2))] generation: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            // PyPy `interp_gc.py:7-26 collect` unwraps the optional generation
+            // as an int before entering the body.  CPython 3.14 gives it the
+            // default 2 and validates the three surviving generations.
+            let generation = crate::baseobjspace::int_w(
+                crate::baseobjspace::space_index(generation)?,
+            )?;
+            if !(0..=2).contains(&generation) {
+                return Err(crate::PyError::value_error("invalid generation"));
+            }
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
@@ -82,7 +91,41 @@ crate::py_module! {
                 }
             }
             Ok(w_int_new(0))
-        },
+        }
+
+        fn get_objects(
+            #[default(w_none())] generation: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            // CPython 3.14 `gc.get_objects(generation=None)`: -1/None means
+            // every generation; 0 through 2 select a generation.
+            let generation = if unsafe { is_none(generation) } {
+                -1
+            } else {
+                crate::baseobjspace::int_w(crate::baseobjspace::space_index(generation)?)?
+            };
+            if generation < -1 {
+                return Err(crate::PyError::value_error(
+                    "generation parameter cannot be negative",
+                ));
+            }
+            if generation > 2 {
+                return Err(crate::PyError::value_error(
+                    "generation parameter must be less than the number of available generations (3)",
+                ));
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let first = pyre_object::gc_roots::shadow_stack_len();
+            fn pin_object(object: majit_ir::GcRef) {
+                pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
+            }
+            majit_gc::get_objects(generation as i8, pin_object);
+            let objects = (first..pyre_object::gc_roots::shadow_stack_len())
+                .map(pyre_object::gc_roots::shadow_stack_get)
+                .collect();
+            Ok(w_list_new_object(objects))
+        }
+    },
+    functions: {
         "disable"       / 0 = |_| {
             pyre_object::gc_hook::try_gc_set_enabled(false);
             GC_ENABLED.store(false, Ordering::Relaxed);
@@ -112,8 +155,6 @@ crate::py_module! {
             };
             Ok(w_bool_from(enabled))
         },
-        // `generation` is optional.
-        "get_objects"   / * = |_| Ok(w_list_new(vec![])),
         "get_referrers" / * = |_| Ok(w_list_new(vec![])),
         "get_referents" / * = |_| Ok(w_list_new(vec![])),
         "set_threshold" / 0 = |_| Ok(w_none()),
