@@ -83,9 +83,113 @@ parity pass read `direct_assembler_call` and found its ON design is what
 upstream's `num_red_args` assert forbids. Retired.
 Still kept: `PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
 into the bridge sym for the depth-2 carrier exception-resume slice #343/#126 —
-inert until validated; the seed's `bridge_guard_exc` GC-rooting and the
-unconditional `execute_ll_raised` exception assign are parity gaps to close
-before it is enabled by default).
+inert until validated).  Two parity gaps were listed here as pre-flip work.  The
+`bridge_guard_exc` GC-rooting is closed by §1e — which also measures the seed
+site as **reachable** (170 bridge-route guard failures carry a live exception),
+so this gate is a live adoption target rather than an inert one.
+
+The second is still open, and the row described it as "the unconditional
+`execute_ll_raised` exception assign", which is not what the divergence is.
+
+pyre's standing-exception maintenance for an exception-guard bridge lives in
+`seed_bridge_standing_exception_from_current` (`state.rs`), which is **not
+gated** and already mirrors upstream's branch: it assigns `last_exc_value` /
+`last_exc_box` when it finds an exception, and clears all four exception slots
+when it does not (`_prepare_exception_resumption`'s
+`else: clear_exception()`).  The divergence is the **source**.  Upstream takes it
+from `cpu.grab_exc_value(deadframe)` — the exception the failing guard carried.
+pyre takes it from `sym.current_exc_value`, falling back to
+`get_current_exception()` — the *execution context's* current exception, which is
+the `sys.exc_info()` mirror, a different slot with different lifetime rules.
+
+`PYRE_CARRIER_EXC_RESUME` is a **back-channel into that function**: its only
+effect is to write `guard_exc` into `current_exc_value` beforehand so the ungated
+code picks it up.  Hence the `is_null` conjunct — it exists to avoid clobbering a
+live `sys.exc_info` value, which also means the injection is suppressed exactly
+when the EC already holds an exception.  That is why forcing the gate on measures
+as a no-op: **dynasm 336/336 with the gate forced on**, correctness results
+matching the default run, and the seven live-exception producers of §1e among
+them, despite the seed site being entered 170 times.
+
+So "inert until validated" should read **inert because the guard's exception
+reaches `last_exc_value` only through a slot it does not belong in**.  A green
+corpus under the gate is not evidence about the gate.  Two further deltas to
+settle before any flip, both in that function: it early-returns when
+`last_exc_box` is already set, and it sets `class_of_last_exc_is_const = true`,
+whereas the `_prepare_exception_resumption` path reaches `execute_ll_raised` with
+the default `constant=False`.
+
+## §1e — The grabbed guard exception is rooted for the whole handoff (2026-07-27)
+
+`bridge_guard_exc` was booked as a pre-flip gap for `PYRE_CARRIER_EXC_RESUME`.
+It is **not gate-specific**: the same grabbed pointer drives the default
+blackhole resume, so the gate never bounded the exposure.
+
+`grab_exc_value` (`llmodel.py:240`) reads `jf_guard_exc` off the deadframe and
+drops the jitframe, which was the collector's only handle on the exception
+(`jitframe_trace`).  The handoff then decodes resume data and rebuilds virtuals
+through the blackhole allocator before anything re-roots the value, so in that
+window the exception — and the young `args` / `__traceback__` reachable only
+through it — live behind a bare `i64` that a precise collector cannot see.
+RPython's `grab_exc_value` result is a shadowstack-rooted local across the same
+span.  Closed the same way as the six sibling raw-exception carriers
+(`walk_jit_exc_value`, `walk_bh_last_exc_value`, …): `GuardExcRoot` parks the
+value and a `GUARD_EXC_VALUE` root walker marks the carrier and forwards its
+young children.  Parked at the three handoff owners — `handle_fail`,
+`blackhole_resume_via_rd_numb` (which also covers the CALL_ASSEMBLER caller),
+and `back_edge_internal`.
+
+### Coverage census (339 files, `bench/` + `bench/synth/`)
+
+Instrumenting `handle_fail` counted **732,660** guard failures:
+
+| `guard_exc` | `is_guard_exc` | `should_bridge` | count |
+|---|---|---|---|
+| NULL | false | false | 648,725 |
+| NULL | **true** | false | 48,327 |
+| **NON-NULL** | **true** | false | **34,620** |
+| NULL | false | **true** | 579 |
+| NULL | **true** | **true** | 239 |
+| **NON-NULL** | **true** | **true** | **170** |
+
+So the window is entered with a live exception **34,790** times, and the 170 in
+the last row are exactly the `bridge_guard_exc` read this section is about — the
+`PYRE_CARRIER_EXC_RESUME` seed site is **reachable**, not inert.  Seven benches
+produce them: `inline_subwalk_property_mutates` and
+`inline_subwalk_mutating_residual_abort` (11,482 each),
+`type_name_surrogate_reject` (9,462), `named_reraise_sibling_hot` (1,418),
+`exc_mixed_classes_bridge_flavor` (410), `handler_reraise_second_exc` (400),
+`sre_pattern_methods` (136).
+
+★ **TRAP** — an earlier revision of this section reported "zero coverage" from a
+sweep whose every invocation had silently failed: `timeout` does not exist on
+macOS, so each run died with `command not found` and produced no lines.  The
+control used to validate that sweep did not go through `timeout`, so it did not
+catch it.  Use `perl -e 'alarm N; exec @ARGV' --` instead.
+
+### The walker is not load-bearing on any measured workload
+
+A `gc_stress` build under `MAJIT_GC_STRESS` (full collection at the start of
+every allocation, so the window's blackhole-allocator calls all collect) was run
+over the producers above with the walker registered and with it suppressed:
+`handler_reraise_second_exc`, `exc_mixed_classes_bridge_flavor`,
+`named_reraise_sibling_hot`, `sre_pattern_methods` and
+`type_name_surrogate_reject` all **pass identically both ways**.
+
+So this stays a **parity fix at a reachable site**, not a demonstrated bug fix.
+The likely reason it cannot be discriminated: on the residual-raise path the
+same exception is still parked in `BH_LAST_EXC_VALUE`, which `walk_bh_last_exc_value`
+already roots, and nothing drains that cell before the handoff completes.  What
+the new walker covers is the case where it *is* drained first — untested,
+because no workload produces it.
+
+★ **TRAP** — the first attempt at this A/B forced `try_gc_collect()` at
+`handle_fail` entry instead of using `MAJIT_GC_STRESS`.  That aborts with
+`GC BUG: invalid type_id … site=object_total_size` on ~8/12 runs **with the
+walker on as well**, which reads like a second defect but is not: an arbitrary
+program point is not a safepoint, and the same bench is clean under the real
+allocation-driven stress.  Force collections through the GC's own stress hook,
+never at a hand-picked instruction.
 
 ## §1c — Retired since the 2026-07-05 audit (10): reader already deleted by a closed epic
 
@@ -118,7 +222,7 @@ upstream lines:
 | gate | orthodox side | outcome |
 |---|---|---|
 | PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
-| PYRE_FBW_MULTIFRAME | **ON** | keep; the ON path is the port, it is unfinished, and §1 measures it as never reached by the corpus |
+| PYRE_FBW_MULTIFRAME | **ON** | keep default-OFF; the ON path is the port and the adopt now works, but §1d measures one remaining wrong answer under it — a `sys._getframe` that is itself the escaping residual reads the caller frame |
 | PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
 
 The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
@@ -185,15 +289,51 @@ PyFrames heap-authoritative before the chain is built, whereas pyre's walker
 keeps inlined callee frames unmaterialized (`fbw_strict_fold_frame_reg`,
 `vable_ops.rs:184-192`).  So the remaining work is a materialization step
 upstream does not have — a consequence of pyre's virtual-callee-frame inlining —
-plus per-frame vable binding, since `PyjitplBlackholeFrameConfig` stamps one
-shared `virtualizable_ptr` onto every frame in the chain and the adopt writes
-only `last_instr`.  A third item sits below both: `try_adopt_multi_frame_blackhole`
-(`pyre-jit-trace/src/trace.rs`) declines outright when the recovered chain is not
-rooted at the walked frame, and names the `jit.virtual_ref` emit at the inline
-push as the prerequisite.  That emit does not exist — `opimpl_virtual_ref` /
-`_finish` are ported in both `majit-metainterp/src/pyjitpl.rs` and
-`pyre-jit-trace/src/state.rs`, and **neither has a caller outside a `#[test]`**,
-so `virtualref_boxes` is empty and no live trace records a `VIRTUAL_REF`.
+and that is the whole of it.  The per-frame vable binding this section used to
+list beside it is already done: `PyjitplBlackholeFrameConfig` carries a
+`per_frame` slice and `convert_and_run_from_pyjitpl` overrides each level's
+`virtualizable_ptr` / `virtualizable_stack_base` from it (`blackhole.rs`), so
+every level already runs against its own frame instead of a shared pointer.
+
+**Resolved 2026-07-26 — the adopt's root-mismatch decline.**
+`try_adopt_multi_frame_blackhole` (`pyre-jit-trace/src/trace.rs`) declined
+whenever the recovered chain's root was not the walked frame, and its comment
+attributed that to "a chain rooted at an intermediate frame", naming the
+`jit.virtual_ref` emit at the inline push as the prerequisite.  Both halves of
+that attribution were wrong.  The chain *is* rooted at the walked frame; the two
+sides of the comparison were two representations of it.  `per_frame[0]` is
+recovered from the trace's frame register, whose root vable identity
+`seed_virtualizable_boxes` bakes against the **live** frame address
+(`set_live_vable_frame_addr`, set before `init_symbolic` precisely so it is not
+the discarded snapshot's), while `cf_addr` is the **snapshot** copy.  Five
+events printed `per_frame[0] == live == 0xa4be2db40` against
+`cf_addr == 0xa4c0515e8`, so the decline was unconditional and no `VIRTUAL_REF`
+emit was involved.  (The emit is still absent — `opimpl_virtual_ref` / `_finish`
+are ported in both `majit-metainterp/src/pyjitpl.rs` and
+`pyre-jit-trace/src/state.rs` and **neither has a caller outside a `#[test]`**,
+so `virtualref_boxes` is empty in every live trace.  That is a real gap; it was
+simply not this one.)
+
+The fix points the two *identity* uses at the live address, under the same
+`!= 0` fallback the identity bake itself uses, and leaves every other use where
+it was:
+
+| use of the walked frame | address | why |
+|---|---|---|
+| root-mismatch comparison | live | must be asked against the address the identity was baked from |
+| root `f_backref` operand | live | the `ptr::eq` skip has to fire for `frames[0]`; the snapshot is freed at walk end, so linking to it would leave a dangling `f_back` for a later `sys._getframe().f_back` |
+| `apply_blackhole_crn` | snapshot | the portal epilogue propagates snapshot → live, the same contract the single-frame arm relies on |
+| `drive_multi_frame_blackhole` vable root + `stack_base` | dead | `per_frame` is always `Some` here and overrides both, per level |
+| `concrete_nlocals`, the `ec` read | either | pycode-derived, and the snapshot copies `execution_context` verbatim |
+
+Opening the comparison exposes one consequence that could not fire while it was
+shut: frame 0's blackhole level runs against `per_frame[0]`, the **live** frame,
+so its `setfield_vable` stores land there while `apply_blackhole_crn` writes the
+snapshot — and the epilogue then copies the snapshot's *whole* locals array onto
+the live frame (`restore_resume_state_from`), reverting every such store the CRN
+write does not happen to cover.  The adopt therefore folds the live frame's
+state into the snapshot before the CRN write, restoring "the snapshot is the
+committed image".
 
 **Measured 2026-07-25: the multi-frame path has no corpus coverage.**  The
 vable-escape latch site was instrumented and all **318** benchmarks
@@ -203,10 +343,87 @@ is reached in **3 benches** (`getframe_escape_flush_writethrough_regression`,
 5 events each, and **all 15 have `inline_subwalk=false`** — every one takes the
 single-frame arm and adopts.  `build_multi_frame_miframe` is therefore never
 called, the image is never latched, and the adopt never sees a candidate.  So
-flipping `_MULTIFRAME` ON is a no-op across the corpus, none of the three items
-above is exercised, and any port of them would be unvalidatable until a
-benchmark that reaches `inline_subwalk=true` at a vable escape exists.  Building
-that benchmark is the prerequisite for the rest.  Note the multi-frame latch is
+flipping `_MULTIFRAME` ON is a no-op across the corpus and none of the items
+above is exercised.  Building a benchmark that reaches `inline_subwalk=true` at
+a vable escape was the prerequisite, and **that benchmark now exists**: a
+`while`-driven loop calling a straight-line inlined callee that calls a
+zero-argument `sys._getframe` reaches the site.  `for` is what every existing
+`getframe_*` bench gets wrong — with a FOR_ITER item in flight the callee's
+nested residual is declined by `fbw_abort_nested_unjournaled_residual` before
+`execute_residual_call` runs, so the force never happens inside the sub-walk.
+Under that shape `build_multi_frame_miframe` **succeeds at depth 2**, so the
+build side was never what blocked.  It is landed as
+`synth/getframe_while_inlined_callee_subwalk`; the three shape choices in its
+header are load-bearing and changing any of them silently stops exercising the
+path.  With the comparison fixed, that fixture under `PYRE_FBW_MULTIFRAME=1`
+reports **5 `BUILT multi-frame depth=2` and 5 `adopted multi-frame terminal`,
+zero declines** (the other 5 escapes in the run have `inline_subwalk=false` and
+take the single-frame arm, as before), and prints the same result as CPython and
+PyPy.
+
+**What the build still declines, and why the decline is right.**  Two shapes
+reach the latch and are then refused by `capture_inline_parent_blackhole`
+(`resume_snapshot.rs`): a caller with an exception handler around the inlined
+call, and two nested inlined levels (depth 3).  Instrumented 2026-07-26, both
+report the same cause — a ref color that is **live at the caller's post-call
+coordinate holds `ConcreteValue::Null`**:
+
+```
+try/except caller: ref color=11 not concrete: Null  result_color=Some(5) nlocals=3 depth=3 live_ref=[0,1,2,5,11]
+depth 3:           ref color=2  not concrete: Null  result_color=Some(0) nlocals=1 depth=1 live_ref=[0,1,2]
+```
+
+Neither is the not-yet-produced result slot, and neither involves the bridge
+parent-frame constructors — every `[s2-gate]` event in both runs prints
+`not_bridge=true`, and the latch requires `!is_bridge_trace`, so those
+constructors are unreachable from here.  `ConcreteValue::Null` is the
+**untracked** sentinel, deliberately distinct from `Ref(PY_NULL)` = "uninitialised
+local" (`state.rs`, `trace_opcode.rs`), so accepting it would fabricate a parent
+frame rather than reproduce one.  Declining is correct; closing these two shapes
+is the outer-locals materialization named above — completing the caller's
+concrete banks at an inline escape — not a change to the capture itself.  Both
+are pinned by `synth/getframe_while_subwalk_decline_shapes` so a decline cannot
+silently become a wrong answer.
+
+**The flip is blocked, and the blocker is a wrong answer, not a decline.**
+Measured 2026-07-26.  The walker executes residuals **concretely** while an
+inline push never runs the interpreter's call sequence, so `ec.topframeref`
+still names the CALLER while an inlined callee body runs.  A `sys._getframe`
+that is *itself* the escaping residual therefore reads the wrong frame at walk
+time, and the adopt commits that answer where legacy escape/replay discards it:
+
+```
+_gf().f_code.co_name   -> "main",     not "leaf"
+_gf(1).f_code.co_name  -> "<module>", not "main"     # one level too far up
+_gf(1).f_locals["k"]   -> KeyError                   # same cause, seen through the argument
+```
+
+**One wrong iteration per multi-frame adopt** — 5 adopts, 5 wrong, in each part
+of `synth/getframe_while_escaping_read_frame_identity`, which is the acceptance
+test: it passes today (gate off, the default) and fails loudly if the gate is
+flipped first.  This is *not* outer-locals staleness.  A `sys._getframe`
+executed **after** the escape, inside the blackhole, is correct — the chain
+publishes each level's frame as it runs — and an in-blackhole read of a caller
+local mutated earlier in the same iteration was measured correct against CPython
+and PyPy.  Closing it needs the inlined-call push to publish the callee frame on
+the execution context, which is what the open `walker_ec_enter` / `walker_ec_leave`
+work does; the `jit.virtual_ref` emit rides along with it.  So the original
+decline comment was right that an inline-push `enter` is the prerequisite, and
+wrong only about which check it gated.
+
+One thing the ON path already fixes: with a side-effecting inlined callee under
+a `while` loop that returns from inside the loop, the OFF path runs the callee's
+side effect ~5.2k extra times (the recorded trace-abort double-run class) while
+the adopt gives the exact count.
+
+Everything else that was thought to block the flip has been measured and does
+not: the full corpus is **336/336 with the gate on (dynasm) and 336/336 with it
+off (cranelift)**, the blast radius is exactly `inline_subwalk = true` at a
+vable escape (the latch is an `if`/`else if` whose single-frame arm requires
+`!inline_subwalk`, so with the gate off that condition latches nothing and falls
+to legacy escape/replay), and the two build-side declines above are correct.
+
+Note the multi-frame latch is
 nested inside `single_frame_blackhole_resume_enabled()`, so it also requires
 `_BLACKHOLE_RESUME` to stay ON.  The pre-existing `[s2-gate]` eprintln (under
 `PYRE_FBW_DEBUG_ABORT`) already reports `inline_subwalk` at that site.
@@ -251,7 +468,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement was conditioned on the multi-frame twin (`_MULTIFRAME`) landing, but §1 now measures that twin as having zero corpus coverage, so the condition is unevaluable — keep the gate and re-open the question only once a benchmark reaches `inline_subwalk=true` at a vable escape |
+| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement was conditioned on the multi-frame twin (`_MULTIFRAME`) landing, but §1 now measures that twin as having zero corpus coverage, so the condition is unevaluable — keep the gate and re-open the question once the multi-frame adopt's root-mismatch decline (§1d) is resolved |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |

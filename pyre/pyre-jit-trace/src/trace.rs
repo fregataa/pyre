@@ -1681,7 +1681,11 @@ fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool 
     adopted
 }
 
-fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
+fn try_adopt_multi_frame_blackhole(
+    ctx: &mut TraceCtx,
+    cf_addr: usize,
+    live_root_addr: usize,
+) -> bool {
     // Every arm below returns to the legacy escape/replay path.  Name each one
     // under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_miframe`'s
     // `s2dbg!` names its own: a silent decline is indistinguishable from the
@@ -1744,63 +1748,88 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
         };
         per_frame.push((frame_ptr, frame_stack_base));
     }
-    // A chain rooted at an intermediate frame means the walk descended into a
-    // residual call and inlined inside it.  Two things then do not hold:
+    // The walked frame has two representations here: `cf_addr` is the
+    // `snapshot_for_tracing` copy the walk steps concretely, and
+    // `live_root_addr` is the frame the compiled loop runs on.  `per_frame[0]`
+    // is recovered from the trace's frame register, and
+    // `seed_virtualizable_boxes` bakes that root vable identity against the
+    // live address whenever there is one (`state.rs`), so an identity question
+    // has to be asked against the same address under the same fallback.
+    let root_addr = if live_root_addr != 0 {
+        live_root_addr
+    } else {
+        cf_addr
+    };
+    // Frame-identity collapse guard.  Every level must be a distinct frame and
+    // only `frames[0]` may be the walked frame: a level whose frame register
+    // resolved to the root would make the relink below write a `f_backref`
+    // cycle and run an inner level against the root's own virtualizable.  No
+    // producer is known — an unseeded inline level has no frame object, so its
+    // register never resolves to a concrete `PyFrame` and the recovery loop
+    // above declines it — but the failure mode is silent, so decline rather
+    // than rely on the absence.  The chain is two or three levels, so the
+    // pairwise scan is free.
+    for i in 0..per_frame.len() {
+        if i > 0 && per_frame[i].0 == root_addr as i64 {
+            mfdbg!("frame {i}: is the walked frame {root_addr:#x}");
+            return false;
+        }
+        if per_frame[..i].iter().any(|&(ptr, _)| ptr == per_frame[i].0) {
+            mfdbg!("frame {i}: {:#x} repeats an earlier level", per_frame[i].0);
+            return false;
+        }
+    }
+    // Identity gate: the recovered chain has to be rooted at the frame this
+    // walk is stepping.  A chain rooted at an intermediate frame means the walk
+    // descended into a residual call and inlined inside it, and then
     // `resume_py_pc` is a coordinate in `frames[0]`'s code while the restart
-    // moves `cf_addr`, and — because the walker executes residuals CONCRETELY
-    // while an inline push never runs the interpreter's call sequence — a
-    // `sys._getframe()` inside the inlined body already read `ec.topframeref`
-    // as the CALLER and committed the wrong frame object, which the adopt
-    // would then publish.  Bracketing each inline level's concrete frame with
-    // an `enter`/`leave` does not fix it: levels that run without a
-    // materialized frame have nothing to publish, so the chain stays short by
-    // one and shifts every `_getframe` result up a level.  Closing this needs
-    // the `jit.virtual_ref` emit at the inline push, so decline to legacy
-    // replay until then.
+    // moves the frame.  There is no upstream counterpart to imitate:
+    // `convert_and_run_from_pyjitpl` converts the whole framestack
+    // unconditionally, and its `frames[0]` is always the portal frame, so this
+    // shape cannot arise there.
     //
-    // Measured by driving the chain with this check lifted, over the
-    // `getframe_inline_subwalk_multiframe` shape: the shift is exactly one
-    // level and it is silent.  A `sys._getframe(2)` meant for the walked frame
-    // lands on the module frame instead, so the same run returns a wrong
-    // integer rather than failing — `f_locals["base"]` raises `KeyError`,
-    // `f_locals.get("base", -1)` scores -1 for 7, `len(f_locals)` scores the
-    // module globals' 12 for the walked frame's 3, and
-    // `len(f_code.co_name)` scores `<module>`'s 8 for `main_loop`'s 9.  The
-    // check is therefore load-bearing for EVERY outcome arm, not only the
-    // `ContinueRunningNormally` one that consumes a `cf_addr` coordinate:
-    // `DoneWithThisFrame*` and `ExitFrameWithExceptionRef` hand back a value
-    // the chain computed off the wrong frame.  It also has to stay AHEAD of
-    // the drive — declining afterwards returns to a legacy replay that
-    // re-executes what the chain already committed.
+    // Passing this gate is NOT sufficient for the adopt to be right, and the
+    // remaining gap is why `PYRE_FBW_MULTIFRAME` is still opt-in.  The walker
+    // executes residuals CONCRETELY while an inline push never runs the
+    // interpreter's call sequence, so `ec.topframeref` still names the CALLER
+    // while an inlined callee body runs.  A `sys._getframe` that is itself the
+    // escaping residual therefore already read the wrong frame at walk time,
+    // and adopting commits that answer where the legacy escape/replay path
+    // discards it — measured as one wrong iteration per adopt
+    // (`synth/getframe_while_escaping_read_frame_identity`).  Closing it needs
+    // the inlined-call push to publish the callee frame on the execution
+    // context; a `sys._getframe` executed later, inside the blackhole, is
+    // already correct because each level is published as it runs.
     mfdbg!(
-        "chain cf_addr={cf_addr:#x} levels=[{}]",
+        "chain root={root_addr:#x} cf_addr={cf_addr:#x} levels=[{}]",
         per_frame
             .iter()
             .map(|&(p, b)| format!("{p:#x}/nl{b}"))
             .collect::<Vec<_>>()
             .join(", "),
     );
-    if per_frame.first().map(|&(frame_ptr, _)| frame_ptr) != Some(cf_addr as i64) {
+    if per_frame.first().map(|&(frame_ptr, _)| frame_ptr) != Some(root_addr as i64) {
         mfdbg!(
-            "chain rooted at {:#x}, not the walked frame {cf_addr:#x} (needs the \
-             virtual_ref emit at the inline push)",
+            "chain rooted at {:#x}, not the walked frame {root_addr:#x}",
             per_frame.first().map(|&(p, _)| p).unwrap_or(0),
         );
         return false;
     }
     // `ExecutionContext::enter` parity for the resumed chain:
-    // `frames[0].f_backref = cf_addr`, `frames[i].f_backref = frames[i - 1]`.
-    // The blackhole re-executes each level's residual `sys._getframe` against
-    // `ec.topframeref`/`f_backref`, so the chain must be live before the run;
-    // it also stays live afterwards for a frame the residual captured.  When
-    // `frames[0]` IS the walked frame it was already entered by its own
-    // caller — linking it would overwrite its `f_backref` with itself and
-    // orphan the frame above it.
+    // `frames[i].f_backref = frames[i - 1]`.  The blackhole re-executes each
+    // level's residual `sys._getframe` against `ec.topframeref`/`f_backref`, so
+    // the chain must be live before the run; it also stays live afterwards for
+    // a frame the residual captured.  `frames[0]` is the walked frame, already
+    // entered by its own caller, so the `ptr::eq` skip leaves its `f_backref`
+    // alone — which is exactly why the root operand must be `root_addr` and not
+    // the snapshot.  The snapshot is freed at the end of this walk, so a link
+    // to it would survive as a dangling `f_back` for any later
+    // `sys._getframe().f_back` or traceback walk.
     unsafe {
         for i in 0..per_frame.len() {
             let callee = per_frame[i].0 as *mut pyre_interpreter::PyFrame;
             let f_back = if i == 0 {
-                cf_addr as i64
+                root_addr as i64
             } else {
                 per_frame[i - 1].0
             } as *mut pyre_interpreter::PyFrame;
@@ -1838,6 +1867,12 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
         &mut latched.framestack,
         majit_metainterp::blackhole::StateFieldLayout::default(),
         virtualizable_info,
+        // `per_frame` is `Some` just below, and `convert_and_run_from_pyjitpl`
+        // then overrides every level's `virtualizable_ptr` /
+        // `virtualizable_stack_base` from it (`blackhole.rs`), so this pair
+        // never reaches a blackhole level.  Frame 0's vable writes land on
+        // `per_frame[0]` — the live frame — which is also what `on_enter_level`
+        // publishes as `ec.topframeref`.
         cf_addr as i64,
         stack_base,
         ctx.metainterp_sd().as_ref(),
@@ -1849,6 +1884,26 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     // `leave`: restore `ec.topframeref` to the portal after the inline chain.
     unsafe {
         (*ec).topframeref = saved_topframeref;
+    }
+    // Frame 0's blackhole level ran against `per_frame[0]`, the LIVE frame,
+    // because `convert_and_run_from_pyjitpl` overrides each level's
+    // `virtualizable_ptr` from `per_frame` — so its `setfield_vable` stores
+    // landed there, not in the snapshot.  EVERY adopted arm below sets
+    // `WALK_END_FLUSH_COMMITTED`, and the portal epilogue then copies the
+    // SNAPSHOT's whole locals array onto the live frame
+    // (`restore_resume_state_from`), which would revert every one of those
+    // stores.  Fold them into the snapshot before the arms so it is once again
+    // the committed image, which is the contract the epilogue and the
+    // single-frame arm both assume.  This has to sit outside the match: a
+    // `DoneWithThisFrame*` or `ExitFrameWithExceptionRef` terminal writes no
+    // resume state of its own, and for the exception terminal the traceback
+    // keeps the root frame reachable, so a stale copy is observable through
+    // `tb_frame.f_locals` long after the walk.
+    if root_addr != cf_addr {
+        unsafe {
+            (*(cf_addr as *mut pyre_interpreter::PyFrame))
+                .restore_resume_state_from(&*(root_addr as *const pyre_interpreter::PyFrame));
+        }
     }
     let adopted = match outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
@@ -1886,6 +1941,9 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
                 );
                 return false;
             };
+            // Snapshot, not `root_addr`: with the fold above the match the
+            // snapshot is the committed image the epilogue propagates,
+            // matching the single-frame arm.
             if !apply_blackhole_crn(
                 cf_addr,
                 terminal_jitcode_index,
@@ -1943,8 +2001,9 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     adopted
 }
 
-fn try_adopt_force_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
-    try_adopt_multi_frame_blackhole(ctx, cf_addr) || try_adopt_single_frame_blackhole(ctx, cf_addr)
+fn try_adopt_force_blackhole(ctx: &mut TraceCtx, cf_addr: usize, live_root_addr: usize) -> bool {
+    try_adopt_multi_frame_blackhole(ctx, cf_addr, live_root_addr)
+        || try_adopt_single_frame_blackhole(ctx, cf_addr)
 }
 
 fn run_perfn_walk<Sym: WalkSym>(
@@ -2658,10 +2717,11 @@ fn run_perfn_walk<Sym: WalkSym>(
         // predicate as the CloseLoop end-flush above.  A latched inline-callee
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.
+        let live_root_addr = sym.live_vable_frame_addr();
         let force_blackhole_adopted = matches!(
             &walk_result,
             Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-        ) && try_adopt_force_blackhole(ctx, cf_addr);
+        ) && try_adopt_force_blackhole(ctx, cf_addr, live_root_addr);
         if !force_blackhole_adopted
             && matches!(
                 &walk_result,
