@@ -1173,11 +1173,9 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
                 .ok_or_else(|| PyError::type_error("list index out of range"));
         }
         if is_str(seq) {
-            // Walk code points through the WTF-8 view so a surrogate-bearing
+            // Read the code point through the WTF-8 view so a surrogate-bearing
             // string yields its lone surrogate instead of panicking.
-            return w_str_get_wtf8(seq)
-                .code_points()
-                .nth(index)
+            return pyre_object::w_str_codepoint_at(seq, index)
                 .map(|c| {
                     let mut one = Wtf8Buf::new();
                     one.push(c);
@@ -1369,6 +1367,8 @@ unsafe fn seq_iter_current_len(seq: PyObjectRef) -> Option<i64> {
             // Code-point count, not byte count (matches the str seq-iter
             // seed in baseobjspace::iter).
             Some(w_str_len(seq) as i64)
+        } else if pyre_object::bytesobject::is_bytes_like(seq) {
+            Some(pyre_object::bytesobject::bytes_like_len(seq) as i64)
         } else if pyre_object::interp_array::is_array(seq) {
             Some(pyre_object::interp_array::w_array_len(seq) as i64)
         } else {
@@ -1447,19 +1447,22 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                 // list); without this arm `seq_iter_current_len` would say
                 // "more" while this helper returned PY_NULL forever, hanging
                 // the loop. Mirrors baseobjspace::next.
-                let s = w_str_get_wtf8(si.seq);
-                let mut found: Option<PyObjectRef> = None;
-                let mut n = 0i64;
-                for cp in s.code_points() {
-                    if n == idx {
-                        let mut one = Wtf8Buf::new();
-                        one.push(cp);
-                        found = Some(w_str_from_wtf8(one));
-                        break;
-                    }
-                    n += 1;
+                pyre_object::w_str_codepoint_at(si.seq, idx as usize).map(|cp| {
+                    let mut one = Wtf8Buf::new();
+                    one.push(cp);
+                    w_str_from_wtf8(one)
+                })
+            } else if pyre_object::bytesobject::is_bytes_like(si.seq) {
+                // Each item is the byte's ordinal, read from the live buffer so
+                // a bytearray resized mid-iteration is observed.
+                if (idx as usize) < pyre_object::bytesobject::bytes_like_len(si.seq) {
+                    Some(w_int_new(pyre_object::bytesobject::bytes_like_getitem(
+                        si.seq,
+                        idx as usize,
+                    ) as i64))
+                } else {
+                    None
                 }
-                found
             } else if pyre_object::interp_array::is_array(si.seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(si.seq) {
                     Some(pyre_object::interp_array::w_array_unpack_item(

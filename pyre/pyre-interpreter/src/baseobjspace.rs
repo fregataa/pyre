@@ -1624,25 +1624,32 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // Index code points through the surrogate-aware WTF-8 view so a
     // surrogateescape / surrogatepass-decoded string can be sliced and
     // indexed without going through `w_str_get_value`.
-    let cps: Vec<CodePoint> = w_str_get_wtf8(obj).code_points().collect();
+    //
+    // `_index_to_byte` (`unicodeobject.py:1251`) reads an ASCII payload's byte
+    // at the code point index; a wide or surrogate-bearing one resolves the
+    // position through the string's cached `rutf8` index table, so a read is
+    // O(1) either way and nothing here has to materialise the code points.
+    let len = w_str_len(obj);
+    let at = |i: usize| -> Option<CodePoint> { pyre_object::w_str_codepoint_at(obj, i) };
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
         // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
         // Use the shared adjusted slice count so very large steps do not
         // overflow the index loop.
-        let len = cps.len() as i64;
         let (rs, rp, st) = crate::sliceobject::slice_unpack(
             w_slice_get_start(index),
             w_slice_get_stop(index),
             w_slice_get_step(index),
         )?;
         let (start, _stop, step, slicelength) =
-            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+            crate::sliceobject::slice_adjust_indices(rs, rp, st, len as i64);
         let mut result = Wtf8Buf::new();
         let mut i = start;
         for n in 0..slicelength {
-            if i >= 0 && (i as usize) < cps.len() {
-                result.push(cps[i as usize]);
+            if i >= 0 {
+                if let Some(cp) = at(i as usize) {
+                    result.push(cp);
+                }
             }
             if n + 1 < slicelength {
                 i += step;
@@ -1678,11 +1685,13 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     } else {
         return Err(string_index_type_error(index));
     };
-    let actual_idx = if idx < 0 { cps.len() as i64 + idx } else { idx } as usize;
-    if actual_idx < cps.len() {
-        let mut one = Wtf8Buf::new();
-        one.push(cps[actual_idx]);
-        return Ok(w_str_from_wtf8(one));
+    let actual_idx = if idx < 0 { len as i64 + idx } else { idx };
+    if actual_idx >= 0 {
+        if let Some(cp) = at(actual_idx as usize) {
+            let mut one = Wtf8Buf::new();
+            one.push(cp);
+            return Ok(w_str_from_wtf8(one));
+        }
     }
     Err(PyError::new(
         PyErrorKind::IndexError,
@@ -2219,14 +2228,22 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// (iterobject.py:16-24): `len(seq) - index` recomputed from the LIVE sequence
 /// — `space.len(w_seq)`, so a subclass `__len__` override or a mutation made
 /// mid-iteration is reflected — clamped to 0.  An exhausted (cleared) sequence
-/// reports 0.  A missing or raising `__len__` propagates as a real error;
-/// `operator.length_hint` then maps a TypeError to its default, exactly as a
-/// direct `space.len` would.
+/// reports 0.
+///
+/// A sequence whose type has no `__len__` reports `NotImplemented` rather than
+/// raising: `iter_len` (`iterobject.c`) guards the length read with
+/// `_PyObject_HasLen`, and a `__getitem__`-only sequence is exactly the case
+/// that guard exists for.  A `__len__` that raises still propagates.  This
+/// intentionally differs from PyPy's `getlength`, which lets `space.len` raise;
+/// the observable behaviour target is 3.14.
 pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
         if seq.is_null() {
             return Ok(w_int_new(0));
+        }
+        if is_instance(seq) && lookup(seq, "__len__").is_none() {
+            return Ok(pyre_object::special::w_not_implemented());
         }
         let length = len_w(seq)?;
         let remaining = length - pyre_object::w_seq_iter_index(args[0]);
@@ -2345,19 +2362,28 @@ pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult 
     pyre_object::gc_roots::pin_root(callable);
     unsafe {
         let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
+        // A spent cursor keeps its list so `__setstate__` can revive it, but
+        // still pickles as `reversed([])`, so the exhausted form is selected
+        // by the cursor rather than by a cleared sequence.
+        let index = pyre_object::w_list_reverse_iter_index(receiver);
+        let seq = if index < 0 {
+            PY_NULL
+        } else {
+            pyre_object::w_list_reverse_iter_seq(receiver)
+        };
         iterator_reduce_tuple(
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
-            pyre_object::w_list_reverse_iter_seq(receiver),
-            pyre_object::w_list_reverse_iter_index(receiver),
+            seq,
+            index,
             2,
         )
     }
 }
 
-/// `list_reverseiterator.__setstate__(index)` — the descending cursor is
-/// clamped to the last valid index, and a negative cursor exhausts the
-/// iterator, which is the state `descr_next` leaves behind once it walks off
-/// the front.
+/// `list_reverseiterator.__setstate__(index)` — the cursor is clamped into
+/// `[-1, len - 1]`, where -1 is the exhausted state `descr_next` leaves behind
+/// once it walks off the front.  The list outlives exhaustion, so this restores
+/// a spent iterator to a live cursor as well.
 pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
     unsafe {
@@ -2365,13 +2391,10 @@ pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResul
         if seq.is_null() {
             return Ok(w_none());
         }
-        if index < 0 {
-            pyre_object::w_list_reverse_iter_set_index(args[0], -1);
-            pyre_object::w_list_reverse_iter_set_seq(args[0], PY_NULL);
-            return Ok(w_none());
-        }
         let length = pyre_object::w_list_len(seq) as i64;
-        if index >= length {
+        if index < -1 {
+            index = -1;
+        } else if index >= length {
             index = length - 1;
         }
         pyre_object::w_list_reverse_iter_set_index(args[0], index);
@@ -11925,15 +11948,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
+            // The cursor holds the bytes object itself, as the str arm above
+            // does: `space.iter` builds a sequence iterator over the sequence
+            // (`iterobject.py W_SeqIterObject`), it does not unpack it.  A
+            // materialised int list would make `iter(b)` cost O(len) before a
+            // single item is consumed, freeze a bytearray against
+            // mid-iteration mutation, and report the list rather than the
+            // bytes in `__reduce__`.
             let len = pyre_object::bytesobject::bytes_like_len(obj);
-            let mut items = Vec::with_capacity(len);
-            for i in 0..len {
-                items.push(w_int_new(
-                    pyre_object::bytesobject::bytes_like_getitem(obj, i) as i64,
-                ));
-            }
-            let list = pyre_object::w_list_new(items);
-            return Ok(pyre_object::w_seq_iter_new(list, len));
+            return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         // dict → iterate over keys (`pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_iter` → `W_DictMultiIterKeysObject`).
@@ -12208,8 +12231,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(item);
                 }
             }
+            // The descending cursor alone marks exhaustion; the list stays
+            // referenced so `__setstate__` can put the cursor back on it.
             pyre_object::w_list_reverse_iter_set_index(obj, -1);
-            pyre_object::w_list_reverse_iter_set_seq(obj, PY_NULL);
             return Err(PyError::stop_iteration());
         }
         if pyre_object::is_tuple_iter(obj) {
@@ -12246,19 +12270,20 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // Box the idx-th code point as a one-character str,
                 // reading the WTF-8 view so a lone surrogate is yielded
                 // instead of panicking.
-                let s = w_str_get_wtf8(seq);
-                let mut found: Option<PyObjectRef> = None;
-                let mut n = 0i64;
-                for cp in s.code_points() {
-                    if n == idx {
-                        let mut one = Wtf8Buf::new();
-                        one.push(cp);
-                        found = Some(w_str_from_wtf8(one));
-                        break;
-                    }
-                    n += 1;
+                pyre_object::w_str_codepoint_at(seq, idx as usize).map(|cp| {
+                    let mut one = Wtf8Buf::new();
+                    one.push(cp);
+                    w_str_from_wtf8(one)
+                })
+            } else if pyre_object::bytesobject::is_bytes_like(seq) {
+                // Each item is the byte's ordinal, read from the live buffer.
+                if (idx as usize) < pyre_object::bytesobject::bytes_like_len(seq) {
+                    Some(w_int_new(
+                        pyre_object::bytesobject::bytes_like_getitem(seq, idx as usize) as i64,
+                    ))
+                } else {
+                    None
                 }
-                found
             } else if pyre_object::interp_array::is_array(seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
                     Some(pyre_object::interp_array::w_array_unpack_item(
