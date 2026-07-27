@@ -17,12 +17,27 @@
 
 use super::*;
 
+/// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
+/// pc.  They differ in exactly the way the walk-end commit contract cares
+/// about, so the epilogue cannot classify the leg without being told.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EscapeResumeKind {
+    /// The latched mid-expression operand stack resolved.  The resume pc still
+    /// re-runs the escaping opcode — both flushes take the same `py_pc` and the
+    /// same `last_instr = py_pc - 1` — but this path is gated:
+    /// [`escape_opcode_window_clean`] ran at the residual before the latch.
+    Exact,
+    /// The latch did not resolve and the flush fell back to the merge-point
+    /// state.  Same resume pc, but NO gate ran on this path at any point.
+    RerunsOpcode,
+}
+
 thread_local! {
     static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<(usize, usize)>> =
         const { std::cell::Cell::new(None) };
     static ACTIVE_FRAME_ESCAPE_STACK: std::cell::RefCell<Option<Vec<OpRef>>> =
         const { std::cell::RefCell::new(None) };
-    static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<usize>> =
+    static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<(usize, EscapeResumeKind)>> =
         const { std::cell::Cell::new(None) };
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
     /// post-call commit withdrawal can put the live frame back.  The legacy
@@ -31,16 +46,29 @@ thread_local! {
     /// adopt the committed resume pc must restore this first.
     static ESCAPE_FLUSH_UNDO: std::cell::RefCell<Option<EscapeFlushUndo>> =
         const { std::cell::RefCell::new(None) };
-    /// Opcode-scoped effect window: `(py_pc, frame_entry_count,
-    /// executed_effect_count)` sampled at the FIRST residual of the Python
-    /// opcode currently being walked.  Re-executing a committed escape re-runs
-    /// the WHOLE opcode, so the latch gate must know whether any EARLIER
-    /// residual of the same opcode ran user bytecode or committed an effect —
-    /// not just the escaping one (rich-compare fallback chains run two
-    /// residuals in one opcode).  Reset at walk start; concrete effects only
-    /// happen through residuals, so anchoring the window at the first residual
-    /// loses nothing.
-    static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, u64, usize)>> =
+    /// Opcode-scoped purity window: `(py_pc, every_prior_residual_reentrant)`
+    /// for the Python opcode currently being walked.  Re-executing a committed
+    /// escape re-runs the WHOLE opcode, so the latch gate must know whether any
+    /// EARLIER residual of the same opcode could have done something — not just
+    /// the escaping one (rich-compare fallback chains run two residuals in one
+    /// opcode).
+    ///
+    /// The verdict comes from each residual's DECLARED effect class
+    /// ([`escape_opcode_window_note`], `EffectInfo::check_is_elidable` or
+    /// `LoopInvariant`), not from counting what happened.  That is the axis
+    /// upstream decides on: the licence to place a resume pc behind an executed
+    /// residual is the codewriter-time `EF_ELIDABLE_CANNOT_RAISE` registration
+    /// (`jtransform.py:620-630`), and upstream's only op counters are
+    /// profiling-only and gate nothing (`jitprof.py:43-44`, `count_ops` is
+    /// `pass`).
+    ///
+    /// Reset at walk start.  Residuals are the only executor that can put
+    /// something irreversible between two points of ONE opcode: the eager
+    /// journaled folds (`fbw_store_journal_push` / `fbw_append_journal_push` /
+    /// `fbw_cell_store_journal_push`) each terminate their own opcode
+    /// (STORE_SUBSCR, the `append` CALL, STORE_NAME/STORE_GLOBAL), so no
+    /// residual of the same opcode instance can follow one.
+    static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, bool)>> =
         const { std::cell::Cell::new(None) };
     /// C3 S1 force-time image of the single live tracing frame.  The
     /// color-indexed concrete banks cease to exist when dispatch unwinds, so
@@ -486,7 +514,12 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 }
             }
             if flushed {
-                COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some(py_pc)));
+                let kind = if latched {
+                    EscapeResumeKind::Exact
+                } else {
+                    EscapeResumeKind::RerunsOpcode
+                };
+                COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
             } else {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
@@ -558,23 +591,41 @@ pub(crate) fn discard_escape_flush_undo() {
 }
 
 /// Opcode-scoped effect window check (see [`ESCAPE_OPCODE_WINDOW`]): true iff
-/// no earlier residual of the CURRENT Python opcode entered a user frame or
-/// committed a concrete effect.  Opens the window on the first residual of
-/// each opcode.  Keyed on `py_pc` alone: an opcode revisited across walked
-/// inner-loop iterations compares against the FIRST visit's snapshot, so
-/// every revisit after any effect declines the latch — conservative (decline
-/// → legacy).  An unexplained latch-decline spike on nested-loop shapes is
-/// this; the refinement would reset the window on back-edge re-entry.
+/// every earlier residual of the CURRENT Python opcode is declared re-runnable.
+/// A pure query — the window is written only by [`escape_opcode_window_note`],
+/// so the residual asking the question never disqualifies itself.
+///
+/// Keyed on `py_pc` alone: an opcode revisited across walked inner-loop
+/// iterations still sees the FIRST visit's verdict, so every revisit after any
+/// non-re-runnable residual declines the latch — conservative (decline →
+/// legacy).  An unexplained latch-decline spike on nested-loop shapes is this;
+/// the refinement would reset the window on back-edge re-entry.
 fn escape_opcode_window_clean(py_pc: usize) -> bool {
-    let frames = pyre_interpreter::call::frame_entry_count();
-    let effects = fbw_executed_effect_count();
     ESCAPE_OPCODE_WINDOW.with(|slot| match slot.get() {
-        Some((pc, f, e)) if pc == py_pc => f == frames && e == effects,
-        _ => {
-            slot.set(Some((py_pc, frames, effects)));
-            true
-        }
+        Some((pc, clean)) if pc == py_pc => clean,
+        _ => true,
     })
+}
+
+/// Declare this residual's re-runnability into the opcode window (see
+/// [`ESCAPE_OPCODE_WINDOW`]).  Called for every residual that reaches
+/// execution, AFTER the latch gate has read the window.
+///
+/// `reentrant` is the declared effect class, `EF_ELIDABLE_*`
+/// (`check_is_elidable`) or `EF_LOOPINVARIANT`.  It is deliberately STRICTER
+/// than `provably_side_effect_free`, which additionally exempts
+/// [`majit_ir::PyreHelperKind::ForIterNext`]: that exemption answers a
+/// different question (the consume is the SOURCE of an in-flight item, not a
+/// body effect for it), and a user-defined `__next__` runs user bytecode that
+/// re-executing the opcode would re-run.
+fn escape_opcode_window_note(py_pc: usize, reentrant: bool) {
+    ESCAPE_OPCODE_WINDOW.with(|slot| {
+        let clean = match slot.get() {
+            Some((pc, clean)) if pc == py_pc => clean,
+            _ => true,
+        };
+        slot.set(Some((py_pc, clean && reentrant)));
+    });
 }
 
 /// Reset the opcode window at walk start so a prior trace's sample cannot
@@ -611,6 +662,47 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
                 _ => return false,
             }
         }
+        // Why this latch exists, checkable at runtime.  Measured over
+        // pyre/bench/synth, the only slot that ever disagrees with the vable
+        // shadow is the in-progress opcode's TOS, and it holds a compile-time
+        // NULL *constant* rather than a stale or absent value: exactly what
+        // `popvalue_maybe_none` writes (`pyframe.py:411-417` →
+        // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
+        // via `jtransform.py:1898`).  The opcode had already popped the slot
+        // before its residual forced.
+        //
+        // So the array is correct and upstream agrees — RPython's `popvalue`
+        // NULLs the slot the same way.  What this latch holds is the operand
+        // the in-flight opcode already consumed, which is what upstream keeps
+        // in `MIFrame.registers_r` and what `convert_and_run_from_pyjitpl`
+        // resumes a blackhole from.  Emitting more vable stores does not
+        // remove the need for it: `LOAD_ATTR` already emits the push mirror
+        // via `emit_pushvalue_ref!` and its slot still reads NULL, because the
+        // pop follows the push.
+        if fbw_debug_abort_enabled() {
+            let base = ctx
+                .virtualizable_info()
+                .map_or(usize::MAX, |info| info.num_static_extra_boxes);
+            let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
+            for (rel, &obj) in stack.iter().enumerate() {
+                let entry =
+                    ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
+                let shadow = entry.map(|(_opref, value)| value);
+                let agrees =
+                    matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
+                if !agrees {
+                    // Report the OpRef too: a live box with a NULL value means
+                    // the symbolic write landed and only the concrete mirror is
+                    // absent, which is a different defect from no write at all.
+                    eprintln!(
+                        "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} box={:?} (DISAGREES)",
+                        stack.len(),
+                        obj as usize,
+                        entry.map(|(opref, _)| opref),
+                    );
+                }
+            }
+        }
         // The flush's Int/Float local boxing can trigger a minor collection;
         // register the resolved refs as resume roots so they are forwarded in
         // place across it (the same discipline as the vable root above).
@@ -628,11 +720,13 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
     })
 }
 
-pub fn take_committed_frame_escape_pc() -> Option<usize> {
+/// Take the committed escape resume pc and which flush produced it (the
+/// walk-end commit contract turns on the difference — see [`EscapeResumeKind`]).
+pub(crate) fn take_committed_frame_escape_pc() -> Option<(usize, EscapeResumeKind)> {
     COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.take())
 }
 
-fn committed_frame_escape_pc() -> Option<usize> {
+fn committed_frame_escape_pc() -> Option<(usize, EscapeResumeKind)> {
     COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.get())
 }
 
@@ -1605,9 +1699,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // consume.
     let ei = call_descr.get_extra_info();
     let helper = ei.pyre_helper;
-    let provably_side_effect_free = ei.check_is_elidable()
-        || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant
-        || helper == majit_ir::PyreHelperKind::ForIterNext;
+    // The declared re-runnability class, the axis `EffectInfo` is decided on at
+    // codewriter time (`jtransform.py:620-630`): re-executing the opcode that
+    // contains this residual re-executes the residual, which is harmless only
+    // for an elidable or loop-hoisted one.  Feeds [`ESCAPE_OPCODE_WINDOW`].
+    let reentrant_residual =
+        ei.check_is_elidable() || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
+    let provably_side_effect_free =
+        reentrant_residual || helper == majit_ir::PyreHelperKind::ForIterNext;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || matches!(
             helper,
@@ -1672,9 +1771,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
     // accounting so an escaping residual later in the same body does not
     // refuse-drop the whole iteration.
-    // `vstack_cur_pypc` points one past the executing op (next-instr
-    // convention), while `body_pc` is the store's own py_pc, so the loop-var
-    // store satisfies `vstack_cur_pypc == body_pc + 1`.
+    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
+    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
+    // the PREVIOUS opcode), so at this residual it names the opcode being
+    // walked.  The loop-var store is recognised by the FOR_ITER body's own
+    // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
+    // opcode past the recorded body pc — not by a next-instr convention.
     let is_loop_var_binding_store = matches!(
         helper,
         majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
@@ -1761,6 +1863,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
+    // Declared only now, so this residual constrains the residuals that FOLLOW
+    // it inside the same opcode and never itself: the gate above read the
+    // window, and a force inside the callee reads it again from
+    // `flush_active_frame_escape` while it is still the gate's view.
+    escape_opcode_window_note(ctx.vstack_cur_pypc as usize, reentrant_residual);
     if !provably_side_effect_free && !is_idempotent_gc_barrier {
         fbw_mark_executed_nonpure_residual();
         // Count only a FOREIGN non-pure residual: a self-recursive call is the

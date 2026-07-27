@@ -2604,82 +2604,102 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // is sampled before the sub-walk and cannot see such a mark; read
             // the flags again, as the loop-header, abort-pc and branch-guard
             // legs do.
-            if is_top_inline
-                && !fbw_has_unjournaled_effect()
-                && fbw_executed_effect_count() != executed_effects_before
-            {
+            //
+            // Attempted whether or not the callee executed anything.
+            // `convert_and_run_from_pyjitpl` (`blackhole.py:1799-1821`) rebuilds
+            // every framestack frame at its own pc unconditionally —
+            // `run_blackhole_interp_to_cancel_tracing` ends `assert False`
+            // (`pyjitpl.py:2956`) — and the caller is resumed PAST its call
+            // (`blackhole.py:1653-1662`), never rewound to it.  The entry
+            // carrier's rewind-to-the-CALL has no upstream counterpart, so it
+            // is the fallback for a callee this one cannot rebuild, not the
+            // preferred leg; `fbw_set_abort_call_resume` keeps that ordering.
+            if is_top_inline && !fbw_has_unjournaled_effect() {
+                // Each refusal names itself so the debug log can say WHICH
+                // narrowing keeps a callee off this leg — the entry carrier
+                // silently absorbs every one of them.
                 let payload = (|| {
-                    let (outer_jitcode_index, call_jitcode_pc) = abort_flush_call_jitcode_coord?;
-                    let callee_pjc = crate::state::pyjitcode_for_code(w_code)?;
+                    let (outer_jitcode_index, call_jitcode_pc) =
+                        abort_flush_call_jitcode_coord.ok_or("no call jitcode coord")?;
+                    let callee_pjc =
+                        crate::state::pyjitcode_for_code(w_code).ok_or("no callee pyjitcode")?;
                     let metadata = &callee_pjc.metadata;
                     let callee_py_pc = python_pc_for_jitcode_pc(metadata, abort_pc) as usize;
-                    let anchor_ok = match abort_kind {
-                        MidBodyAbortKind::Structural => {
-                            exact_floor_segment_anchor(metadata, callee_py_pc, abort_pc)
-                        }
-                        MidBodyAbortKind::Marker => portal_marker_first_jit_anchor(
-                            metadata,
-                            metadata.built_as_portal,
-                            metadata.portal_frame_reg,
-                            callee_perfn_descrs,
-                            body.code,
-                            callee_py_pc,
-                            abort_pc,
-                            |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
-                        ),
-                    };
+                    // Both abort kinds sit at the head of an opcode the walker
+                    // could not take, behind at most that opcode's own vable
+                    // spill; the marker kind is the narrower of the two.
+                    let anchor_ok = portal_vable_bookkeeping_anchor(
+                        metadata,
+                        metadata.built_as_portal,
+                        metadata.portal_frame_reg,
+                        callee_perfn_descrs,
+                        body.code,
+                        callee_py_pc,
+                        abort_pc,
+                        |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
+                    );
                     if !anchor_ok {
-                        return None;
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] gh#467 inexact anchor at abort_pc={abort_pc} \
+                                 callee_py_pc={callee_py_pc} kind={abort_kind:?} \
+                                 would re-run {:?}",
+                                floor_segment_ops_before(metadata, body.code, abort_pc),
+                            );
+                        }
+                        return Err("abort pc is not an exact segment anchor");
                     }
                     let raw = unsafe {
                         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                             as *const pyre_interpreter::CodeObject
                     };
                     if raw.is_null() {
-                        return None;
+                        return Err("null callee code ptr");
                     }
                     let callee_code = unsafe { &*raw };
-                    if pyre_interpreter::pyframe::code_flags_make_generator(callee_code.flags)
-                        || !callee_code.cellvars.is_empty()
-                        || !callee_code.freevars.is_empty()
-                        || !unsafe { pyre_interpreter::function_get_closure(callable) }.is_null()
-                    {
-                        return None;
+                    if pyre_interpreter::pyframe::code_flags_make_generator(callee_code.flags) {
+                        return Err("callee is a generator");
                     }
-                    let depth_twin = callee_pjc.depth_for_jitcode_pc_pred(abort_pc);
-                    let Some(depth) = depth_twin else {
-                        return None;
-                    };
-                    let depth = depth as usize;
+                    if !callee_code.cellvars.is_empty() || !callee_code.freevars.is_empty() {
+                        return Err("callee has cellvars/freevars");
+                    }
+                    if !unsafe { pyre_interpreter::function_get_closure(callable) }.is_null() {
+                        return Err("callee has a closure");
+                    }
+                    let depth = callee_pjc
+                        .depth_for_jitcode_pc_pred(abort_pc)
+                        .ok_or("no stack depth for the abort pc")?
+                        as usize;
                     let nlocals = callee_code.varnames.len();
-                    let pcdep_twin = callee_pjc.pcdep_for_jitcode_pc(abort_pc);
-                    let Some(entries) = pcdep_twin else {
-                        return None;
-                    };
+                    let entries = callee_pjc
+                        .pcdep_for_jitcode_pc(abort_pc)
+                        .ok_or("no pcdep entries for the abort pc")?;
                     let mut live_stack = Vec::with_capacity(depth);
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
                             crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| sub_wc.concrete_registers_r.get(color).copied());
-                        let value = register_value.or_else(|| {
-                            (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
-                                .then(|| {
-                                    callee_vable_ref_at(
-                                        sub_wc.callee_shadow.as_ref(),
-                                        metadata.portal_frame_reg,
-                                        semantic_slot,
-                                    )
-                                })
-                                .flatten()
-                        })?;
+                        let value = register_value
+                            .or_else(|| {
+                                (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
+                                    .then(|| {
+                                        callee_vable_ref_at(
+                                            sub_wc.callee_shadow.as_ref(),
+                                            metadata.portal_frame_reg,
+                                            semantic_slot,
+                                        )
+                                    })
+                                    .flatten()
+                            })
+                            .ok_or("live stack slot has no concrete value")?;
                         if !matches!(value, ConcreteValue::Ref(r) if !r.is_null()) {
-                            return None;
+                            return Err("live stack slot is not a non-null Ref");
                         }
                         live_stack.push(value);
                     }
                     if live_stack.len() != depth {
-                        return None;
+                        return Err("live stack depth mismatch");
                     }
                     let lv = crate::state::liveness_for(raw);
                     let mut live_locals = vec![None; nlocals];
@@ -2700,17 +2720,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                                 Value::Float(v) => Some(ConcreteValue::Float(v)),
                                 Value::Void => None,
                             })
-                            .or_else(|| callee_arg_concretes.get(slot).copied())?;
+                            .or_else(|| callee_arg_concretes.get(slot).copied())
+                            .ok_or("live local has no concrete value")?;
                         if matches!(value, ConcreteValue::Null | ConcreteValue::Bool(_)) {
-                            return None;
+                            return Err("live local is Null/Bool");
                         }
                         *dst = Some(value);
                     }
-                    let Some(ConcreteValue::Ref(x_arg)) = callee_arg_concretes.first().copied()
-                    else {
-                        return None;
-                    };
-                    Some(MidBodyPayload {
+                    Ok(MidBodyPayload {
                         abort_kind,
                         outer_jitcode_index,
                         call_jitcode_pc,
@@ -2720,14 +2737,25 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         callee_py_pc,
                         w_code: w_code as pyre_object::PyObjectRef,
                         w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) },
-                        x_arg,
                         live_locals,
                         live_stack,
                         return_value: pyre_object::PY_NULL,
+                        // Attached later by `fbw_set_abort_call_resume`, which
+                        // runs in the Err arm below under the entry latch's own
+                        // zero-delta gate.
+                        entry_fallback: None,
                     })
                 })();
-                if let Some(payload) = payload {
-                    fbw_set_midbody_abort_resume(payload);
+                match payload {
+                    Ok(payload) => fbw_set_midbody_abort_resume(payload),
+                    Err(reason) => {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] gh#467 callee-rebuild NOT LATCHED at \
+                                 abort_pc={abort_pc} ({reason})"
+                            );
+                        }
+                    }
                 }
             }
         }

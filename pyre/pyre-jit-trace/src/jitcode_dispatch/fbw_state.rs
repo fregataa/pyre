@@ -902,17 +902,43 @@ pub(crate) fn fbw_bump_executed_effect() {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(c.get() + 1));
 }
 
-/// gh#467 latch the inline-abort forward-flush carrier (see [`FBW_ABORT_CALL_RESUME`]).
+/// gh#467 latch the inline-abort forward-flush carrier (see
+/// [`FBW_ABORT_CALL_RESUME`]).
+///
+/// Does not displace an already-latched `MidBody` carrier — it is stored inside
+/// it as [`MidBodyPayload::entry_fallback`] instead.  Rebuilding the callee at
+/// its own pc and resuming the caller past its call is what upstream does
+/// (`blackhole.py:1799-1821`, `:1653-1662`); rewinding the caller TO the call
+/// has no upstream counterpart, so it stands in only for a callee the rebuild
+/// could not describe or could not flush.  Both sites are `is_top_inline` on an
+/// aborting sub-walk, which ends the walk, so at most one of each is latched
+/// per walk, and both read the same outer CALL coordinate.
 pub(crate) fn fbw_set_abort_call_resume(
     outer_jitcode_index: u32,
     call_jitcode_pc: usize,
     stack: Vec<pyre_object::PyObjectRef>,
 ) {
     FBW_ABORT_CALL_RESUME.with(|c| {
-        *c.borrow_mut() = Some(InlineAbortCarrier::Entry {
+        let mut slot = c.borrow_mut();
+        if let Some(InlineAbortCarrier::MidBody(payload)) = slot.as_mut() {
+            if payload.outer_jitcode_index == outer_jitcode_index
+                && payload.call_jitcode_pc == call_jitcode_pc
+            {
+                payload.entry_fallback = Some(crate::jitcode_dispatch::EntryFallback {
+                    call_stack: stack,
+                    entry_executed_effects: fbw_executed_effect_count(),
+                });
+            }
+            return;
+        }
+        *slot = Some(InlineAbortCarrier::Entry {
             outer_jitcode_index,
             call_jitcode_pc,
             call_stack: stack,
+            // The latch is only set at the CALL, and only under the caller's
+            // zero-delta gate, so the odometer read here IS the count at the
+            // pc this carrier resumes at.
+            entry_executed_effects: fbw_executed_effect_count(),
         })
     });
 }
@@ -1110,14 +1136,16 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         }
         // The flush this latch feeds resumes the OUTERMOST caller at the CALL
         // that entered the inline region, re-executing that call from scratch,
-        // while the walk's store journal is committed.  So it is sound only
-        // while the inline region has executed nothing irreversible: an
-        // executed-effect delta means the call would apply its effects a
-        // second time on top of the committed ones.  Same zero-delta gate the
-        // entry carrier applies at its own CALL (`try_walker_inline_user_call`)
-        // and the contract `FBW_EXECUTED_EFFECT_COUNT` documents; declining
-        // here leaves the legacy path, whose journal rollback makes the replay
-        // exactly-once.
+        // while the walk's store journal is committed — a
+        // `WalkEndResume::Rewind` leg.  So it is sound only while the inline
+        // region has executed nothing irreversible: an executed-effect delta
+        // means the call would apply its effects a second time on top of the
+        // committed ones.  Same zero-delta gate the entry carrier applies at
+        // its own CALL (`try_walker_inline_user_call`) and the contract
+        // `FBW_EXECUTED_EFFECT_COUNT` documents; declining here leaves the
+        // legacy path, whose journal rollback makes the replay exactly-once.
+        // The snapshot travels with the latch so `commit_walk_end` re-checks
+        // it at the commit point, not just here.
         let (outer_resume, stack_overrides) = {
             let session = ctx.session.borrow();
             let outermost = session
@@ -1126,9 +1154,13 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
                 .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
             match outermost.and_then(|f| f.parent.as_ref()) {
                 Some(frame) => (
-                    frame
-                        .call_jitcode_pc
-                        .map(|jit_pc| (frame.jitcode_index, jit_pc)),
+                    frame.call_jitcode_pc.map(|jit_pc| {
+                        (
+                            frame.jitcode_index,
+                            jit_pc,
+                            crate::jitcode_dispatch::fbw_executed_effect_count(),
+                        )
+                    }),
                     frame.call_stack_overrides.clone(),
                 ),
                 None => (None, Vec::new()),
@@ -1149,7 +1181,10 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
 /// `abort_overrides`) until [`fbw_abort_outer_stack_overrides_clear`]; the
 /// flush reads them in place from the rooted cell so a minor collection while
 /// boxing Int/Float locals forwards the very refs it writes.
-pub(crate) fn fbw_abort_outer_resume_take() -> Option<(u32, usize)> {
+///
+/// The third element is the executed-effect odometer at the outer CALL this
+/// resumes at — `WalkEndResume::Rewind`'s `effects_at_resume_point`.
+pub(crate) fn fbw_abort_outer_resume_take() -> Option<(u32, usize, usize)> {
     FBW_ABORT_OUTER_RESUME.with(|c| c.replace(None))
 }
 
