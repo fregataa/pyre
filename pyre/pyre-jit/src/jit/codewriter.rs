@@ -1907,6 +1907,20 @@ fn record_graph_op(
 ) -> super::flow::SpaceOperation {
     let op = super::flow::SpaceOperation::new(opname, args, result, offset);
     super::flow::push_op(block, op.clone());
+    // `jtransform.py:311-313` / `handle_residual_call`: an operation
+    // whose lowering can raise is immediately followed by a `-live-`
+    // SpaceOperation in the graph, so `flatten.py:206-217` recognises an
+    // actually-raising block by its structural `[raising_op, -live-]`
+    // tail.  Centralized at the recording funnel: every can-raise op
+    // (residual_call with a can-raise calldescr, pre-rtype HLOp whose
+    // lowering flavor can raise) gets the marker, matching the graph
+    // shape jtransform produces after rewriting.
+    if super::flatten::graph_op_can_raise(&op) {
+        super::flow::push_op(
+            block,
+            super::flow::SpaceOperation::new(super::flatten::OPNAME_LIVE, Vec::new(), None, offset),
+        );
+    }
     op
 }
 
@@ -2062,12 +2076,17 @@ fn record_residual_call_graph_op(
     // `jitcode_dispatch.rs`); mirrors the tag the dedicated walker-emit
     // builders (`flatten.rs build_*_insn`) attach to the same helpers.
     effect_info.pyre_helper = pyre_helper;
-    let can_raise = effect_info.check_can_raise(false);
     op_args.push(
         super::flatten::intern_call_descr_stub(effect_info, arg_kinds, reskind.to_kind()).into(),
     );
 
-    let result_var = match reskind.to_kind() {
+    // `jtransform.py:311-313` / `handle_residual_call`: a residual_call
+    // whose calldescr can raise is immediately followed by a trailing
+    // `-live-` so the liveness pass records the registers alive at the
+    // implicit GUARD_NO_EXCEPTION.  `record_graph_op` appends the marker
+    // via `graph_op_can_raise` (which reads the calldescr just interned
+    // above).
+    match reskind.to_kind() {
         Some(result_kind) => {
             let result = graph.fresh_variable(result_kind);
             record_graph_op(block, opname, op_args, Some(result.into()), offset);
@@ -2077,16 +2096,7 @@ fn record_residual_call_graph_op(
             record_graph_op(block, opname, op_args, None, offset);
             None
         }
-    };
-    // `jtransform.py:311-313` / `handle_residual_call`: a residual_call
-    // whose calldescr can raise is immediately followed by a trailing
-    // `-live-` so the liveness pass records the registers alive at the
-    // implicit GUARD_NO_EXCEPTION.  `flatten.py:206-217` recognises an
-    // actually-raising block by scanning this trailing `-live-`.
-    if can_raise {
-        record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
     }
-    result_var
 }
 
 /// Emit a void-result `SpaceOperation` into `block` and return it.
@@ -3223,29 +3233,6 @@ fn attach_catch_exception_edge(
     append_exit(block, link.clone());
     target.add_incoming_exception_link(link.clone());
     link
-}
-
-fn carry_explicit_raise_value_on_catch_stack(
-    link: &super::flow::LinkRef,
-    target: &SpamBlockRef,
-    raised_value: super::flow::FlowValue,
-) {
-    let target_state = target
-        .framestate()
-        .expect("explicit raise catch landing must carry a FrameState");
-    let stack_value = target_state
-        .stack
-        .last()
-        .and_then(super::flow::FlowValue::as_variable)
-        .expect("catch landing must end its stack with the raised value");
-    let input_index = target
-        .block()
-        .borrow()
-        .inputargs
-        .iter()
-        .position(|value| value.as_variable().is_some_and(|v| v.id == stack_value.id))
-        .expect("catch stack value must appear in landing inputargs");
-    link.borrow_mut().args[input_index] = Some(raised_value);
 }
 
 fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
@@ -4778,215 +4765,6 @@ fn uf_find(parent: &std::collections::HashMap<u32, u32>, mut x: u32) -> u32 {
     x
 }
 
-/// Build the value-equivalence union-find parent map from the splice
-/// coalesce pairs (same-slot + CFG, cross-slot filtered — the exact set
-/// the splice regalloc merges). Two Variables in one group are copy-
-/// coalesced (same value / same color), so they must NOT be separated by
-/// the co-live interference below.
-fn build_value_parent(
-    pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-) -> std::collections::HashMap<u32, u32> {
-    let mut value_parent: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for (a, b) in pairs {
-        let (a, b) = (a.0, b.0);
-        value_parent.entry(a).or_insert(a);
-        value_parent.entry(b).or_insert(b);
-        let ra = uf_find(&value_parent, a);
-        let rb = uf_find(&value_parent, b);
-        if ra != rb {
-            value_parent.insert(ra, rb);
-        }
-    }
-    value_parent
-}
-
-/// Liveness-correct CPython-co-live interference for the splice regalloc.
-/// For each resume PC, every pair of simultaneously-CPython-live (locals
-/// via `is_local_live`, stack via `depth_at_pc`), colored, NON-value-
-/// equivalent Variables gets an interference edge so the chordal coloring
-/// keeps them on distinct colors — the precondition for a color-indexed
-/// per-PC resume map. The liveness-correct successor to the retired
-/// blanket `collect_distinct_slot_interference_pairs` clique: constrains
-/// ONLY slots co-live at a guard, not every distinct slot.
-///
-/// Edges are gathered from BOTH the post-dispatch snapshot
-/// (`pcdep_slot_var`, the after-opcode `-live-` markers) AND the
-/// pre-dispatch resume-depth snapshot (`pcdep_slot_var_resume`, the snapshot
-/// the shipped per-PC map is built from in `build_pcdep_color_slots`). A
-/// branch guard at orgpc resumes with the deeper pre-dispatch operand stack
-/// carrying the mid-opcode kept temps, so two Variables simultaneously live
-/// at that depth must also separate; without the resume-depth edges the
-/// coloring is free to collapse them onto one color and the color-indexed
-/// resume inversion is ambiguous (the kept-operand-stack `#424` family).
-fn build_colive_interference(
-    pcdep_slot_var: &[Vec<(u16, u32)>],
-    pcdep_slot_var_resume: &[Vec<(u16, u32)>],
-    value_parent: &std::collections::HashMap<u32, u32>,
-    ref_coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
-    depth_at_pc: &[u16],
-    code: &CodeObject,
-) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
-    let lv = pyre_jit_trace::state::liveness_for(code as *const _);
-    let nloc = code.varnames.len();
-    let mut interference_set: std::collections::HashSet<(u32, u32)> =
-        std::collections::HashSet::new();
-    let mut live_here: Vec<u32> = Vec::new();
-    for snap_table in [pcdep_slot_var, pcdep_slot_var_resume] {
-        for (py_pc, snap) in snap_table.iter().enumerate() {
-            if snap.is_empty() || !lv.is_reachable(py_pc) {
-                continue;
-            }
-            let depth = depth_at_pc.get(py_pc).copied().unwrap_or(0) as usize;
-            live_here.clear();
-            for &(slot, var_id) in snap {
-                let slot = slot as usize;
-                if slot < nloc {
-                    if !lv.is_local_live(py_pc, slot) {
-                        continue;
-                    }
-                } else if slot - nloc >= depth {
-                    continue;
-                }
-                if ref_coloring.contains_key(&super::flow::VariableId(var_id)) {
-                    live_here.push(var_id);
-                }
-            }
-            for i in 0..live_here.len() {
-                for j in (i + 1)..live_here.len() {
-                    let (a, b) = (live_here[i], live_here[j]);
-                    if a == b || uf_find(value_parent, a) == uf_find(value_parent, b) {
-                        continue;
-                    }
-                    interference_set.insert(if a < b { (a, b) } else { (b, a) });
-                }
-            }
-        }
-    }
-    interference_set
-        .into_iter()
-        .map(|(a, b)| (super::flow::VariableId(a), super::flow::VariableId(b)))
-        .collect()
-}
-
-/// Derive each Variable's canonical CPython slot from the pcdep snapshots:
-/// the slot it occupies at the earliest resume PC it appears in (POST before
-/// RESUME within a PC).  The inlined-callee frames record their own slots at
-/// the callee PCs (the callee's operand-stack temp sits at its frame-stack
-/// slot), so this spans all inline frames — unlike the outer-frame-only
-/// co-live snapshot pairs.  Each Variable takes the first slot seen for it in
-/// resume-PC order.
-fn pcdep_canonical_slot(
-    pcdep_slot_var: &[Vec<(u16, u32)>],
-    pcdep_slot_var_resume: &[Vec<(u16, u32)>],
-) -> Vec<Option<u16>> {
-    // Slot-indexed by `VariableId.0`.  `None` = the Variable is absent from
-    // every pcdep snapshot (never live at a resume PC).
-    let mut slot_of: Vec<Option<u16>> = Vec::new();
-    let n = pcdep_slot_var.len().max(pcdep_slot_var_resume.len());
-    for py_pc in 0..n {
-        for tbl in [pcdep_slot_var, pcdep_slot_var_resume] {
-            if let Some(snap) = tbl.get(py_pc) {
-                for &(slot, var_id) in snap {
-                    let idx = var_id as usize;
-                    if idx >= slot_of.len() {
-                        slot_of.resize(idx + 1, None);
-                    }
-                    if slot_of[idx].is_none() {
-                        slot_of[idx] = Some(slot);
-                    }
-                }
-            }
-        }
-    }
-    slot_of
-}
-
-/// Slot-identity interference for the splice coalesce filter: a coalesce
-/// candidate whose two endpoints hold DISTINCT canonical CPython slots must
-/// not merge, even when their SSA / CPython-slot live ranges are disjoint
-/// (never co-live at a single resume PC).  Merging two distinct-slot
-/// Variables onto one color extends that color's liveness across a region
-/// where no box is live in it — the liveness side-table then marks the color
-/// active at a resume PC where `regs_r[color]` is `OpRef::NONE`
-/// (`collect_outer_active_boxes` panics).  This is broader than co-liveness:
-/// the inline-callee operand-stack temp and the outer merge inputarg live at
-/// disjoint PCs yet occupy distinct frame-stack slots, so `build_colive_
-/// interference` (which only edges simultaneously-live pairs) never separates
-/// them.  Feeding these edges into the coalesce `has_edge` oracle rejects the
-/// cross-slot merge directly — the pcdep-sourced replacement for the retired
-/// walker-slot cross-slot coalesce filter.  Same-slot pairs (the walker's
-/// COPY/SWAP value lineage) are untouched, so no extra color separation is
-/// forced beyond the merges that were already dropped.
-///
-/// The slot claim is propagated through a union-find over the pairs, so a
-/// TRANSITIVE cross-slot chain is caught even when the bridging Variable has
-/// no canonical slot of its own.  A pass-through link/inputarg temp that never
-/// appears at a resume PC is absent from the pcdep snapshots, so the pairs
-/// `(slot0_var, temp)` and `(temp, slot1_var)` name no directly-distinct
-/// slots; but merging both aliases slot0 and slot1 onto one color.  The group
-/// carries slot0's claim through the first merge, so the second pair's slot1
-/// conflicts and is rejected.  A slot number is unique across locals and stack
-/// (stack slots are `>= nlocals`), so one claim per group suffices — a group
-/// holds at most one distinct slot, and any second distinct slot rejects.  The
-/// rejecting edge is emitted between the pair's direct endpoints;
-/// `DependencyGraph::coalesce` in `filter_coalesce_pairs_by_interference` moves
-/// the edge onto the surviving rep as earlier pairs merge, so the `has_edge`
-/// replay sees it.
-fn build_slot_disjoint_interference(
-    pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    canonical_slot: &[Option<u16>],
-) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
-    use super::flow::VariableId;
-    let slot_of =
-        |id: VariableId| -> Option<u16> { canonical_slot.get(id.0 as usize).copied().flatten() };
-    fn find(parent: &mut HashMap<VariableId, VariableId>, x: VariableId) -> VariableId {
-        let mut root = x;
-        while let Some(&p) = parent.get(&root) {
-            if p == root {
-                break;
-            }
-            root = p;
-        }
-        let mut cur = x;
-        while let Some(&p) = parent.get(&cur) {
-            if p == root {
-                break;
-            }
-            parent.insert(cur, root);
-            cur = p;
-        }
-        root
-    }
-    let mut parent: HashMap<VariableId, VariableId> = HashMap::new();
-    // Canonical slot claimed by each union-find root (absent = the group
-    // touches no slotted Variable yet).
-    let mut group_slot: HashMap<VariableId, u16> = HashMap::new();
-    let mut edges = Vec::new();
-    for &(a, b) in pairs {
-        parent.entry(a).or_insert(a);
-        parent.entry(b).or_insert(b);
-        let ra = find(&mut parent, a);
-        let rb = find(&mut parent, b);
-        if ra == rb {
-            continue;
-        }
-        let sa = group_slot.get(&ra).copied().or_else(|| slot_of(a));
-        let sb = group_slot.get(&rb).copied().or_else(|| slot_of(b));
-        if let (Some(x), Some(y)) = (sa, sb) {
-            if x != y {
-                // Merging would alias two distinct slots onto one color.
-                edges.push((a, b));
-                continue;
-            }
-        }
-        parent.insert(rb, ra);
-        if let Some(s) = sa.or(sb) {
-            group_slot.insert(ra, s);
-        }
-    }
-    edges
-}
-
 /// #348 Part (2): build the per-PC `(color, semantic_slot)` map shipped in
 /// `PyJitCodeMetadata::pcdep_color_slots`. For each reachable PC, every slot
 /// live and restorable there contributes `(true SSA color, slot)`, sorted by
@@ -5097,9 +4875,27 @@ fn validate_pcdep_color_map(
     rename: &[Vec<u16>; 3],
     code: &CodeObject,
     depth_at_pc: &[u16],
-    value_parent: &std::collections::HashMap<u32, u32>,
+    coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
     label: &str,
 ) {
+    // Value-equivalence partition of the accepted coalesce pairs: two
+    // Variables in one group are copy-coalesced (same value / same color),
+    // so their sharing a color is not an injectivity violation.
+    let value_parent: std::collections::HashMap<u32, u32> = {
+        let mut parent: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (a, b) in coalesce_pairs {
+            let (a, b) = (a.0, b.0);
+            parent.entry(a).or_insert(a);
+            parent.entry(b).or_insert(b);
+            let ra = uf_find(&parent, a);
+            let rb = uf_find(&parent, b);
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+        parent
+    };
+    let value_parent = &value_parent;
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let mut checked = 0usize;
@@ -6331,16 +6127,15 @@ impl CodeWriter {
         // constant / sentinel rather than a Variable.
         let mut top_of_stack_var_at_pc: Vec<Option<super::flow::VariableId>> =
             vec![None; num_instrs];
-        // Stage 1a (#348, ADDITIVE / gated by `PYRE_PCDEP_VALIDATE`):
-        // per-PC snapshot of `slot -> SSA Variable.id` taken from the
-        // post-opcode FrameState. The splice regalloc derives the
-        // liveness-correct CPython-co-live interference from it (each
-        // resume PC's simultaneously-live, non-value-equivalent locals
-        // must land on distinct colors); the `PYRE_PCDEP_VALIDATE` gate
-        // additionally validates the resulting per-PC color map. Each
-        // entry is `(slot, Variable.id)` where `slot` is the local index
-        // in `[0..nlocals)` or `nlocals + stack_depth` for an operand-
-        // stack value.
+        // CPython liveness oracle for the per-PC `-live-` force-alive args
+        // below (locals gated by `is_local_live`, matching
+        // `filter_liveness_in_place` / `build_pcdep_color_slots`).
+        let frame_liveness = pyre_jit_trace::state::liveness_for(code as *const _);
+        // #348: per-PC snapshot of `slot -> SSA Variable.id` taken from the
+        // post-opcode FrameState. Feeds the gated `PYRE_PCDEP_VALIDATE`
+        // injectivity check. Each entry is `(slot, Variable.id)` where
+        // `slot` is the local index in `[0..nlocals)` or
+        // `nlocals + stack_depth` for an operand-stack value.
         let pcdep_validate = std::env::var_os("PYRE_PCDEP_VALIDATE").is_some();
         let mut pcdep_slot_var: Vec<Vec<(u16, u32)>> = vec![Vec::new(); num_instrs];
         // #355 B2: the PRE-dispatch resume-depth `slot -> Variable.id` snapshot,
@@ -6733,30 +6528,24 @@ impl CodeWriter {
                     None
                 };
                 if let Some(catch_label) = catch_label_opt {
-                    // Raise inside a try/except range: RPython
-                    // canraise-arm shape. The block's exception edge
-                    // goes to the catch landing, not `graph.exceptblock`.
-                    // `emit_catch_exception!` both pushes the
-                    // `catch_exception/L<catch_landing_{label}>` insn
-                    // AND calls `attach_catch_exception_edge` (the
-                    // exception Link onto `current_block.exits`).
+                    // Raise inside a try/except range: the `raise` op
+                    // closes the block as its last operation and the sole
+                    // exit is the exception edge to the catch landing.
+                    // The standard flattener serializes `raise <value>`
+                    // from the block body and emits the byte-adjacent
+                    // `catch_exception` dispatch from the graph shape
+                    // alone (single-exit canraise arm); the raised value
+                    // reaches the handler through the runtime exception
+                    // state (`route_to_catch` → `last_exc_value`), the
+                    // same delivery every canraise catch uses.
+                    record_graph_op(
+                        &current_block.block(),
+                        "raise",
+                        vec![evalue_fv.into()],
+                        None,
+                        offset,
+                    );
                     emit_catch_exception!(catch_label);
-                    // Carry the normalized raised value on the
-                    // just-attached exception edge.  Unlike the
-                    // `graph.exceptblock` arm below (whose
-                    // `explicit_raise_state` puts the raised value in
-                    // `link.args[1]`), `attach_catch_exception_edge`
-                    // links directly to the catch landing and seeds
-                    // `extravars` with a FRESH (type, value) read-back
-                    // pair — so the canonical flatten cannot recover the
-                    // `raise` operand from the link.  Record it here so
-                    // `insert_exits`' single-exit explicit-raise arm
-                    // emits `raise <getcolor(value)>`.
-                    if let Some(raised) = evalue_fv.as_variable() {
-                        if let Some(exc_link) = current_block.block().borrow().exits.last() {
-                            exc_link.borrow_mut().explicit_raise_value = Some(raised);
-                        }
-                    }
                 } else {
                     // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
                     //   link = Link([w_exc.w_type, w_exc.w_value],
@@ -6960,13 +6749,14 @@ impl CodeWriter {
                 // merge PC, so `mergeblock` appends a spurious normal exit onto
                 // the raise-terminated block (making it multi-exit); then
                 // `insert_exits` lowers the raise edge as a plain catch and
-                // drops the `raise` op, so the handler never runs.
+                // drops the `raise` op, so the handler never runs.  A
+                // raise-terminated block is recognized structurally: its
+                // raising op (last non-`-live-` operation) is the `raise`.
                 let has_explicit_raise = current_block
                     .block()
                     .borrow()
-                    .exits
-                    .iter()
-                    .any(|e| e.borrow().explicit_raise_value.is_some());
+                    .raising_op()
+                    .is_some_and(|op| op.opname == "raise");
                 let canraise_pending = !has_explicit_raise
                     && matches!(
                         current_block.block().borrow().exitswitch,
@@ -7218,12 +7008,61 @@ impl CodeWriter {
         // every PC would create a `-live-` cluster the upstream graph
         // never holds.
         macro_rules! emit_live_placeholder {
-            () => {{
-                // Per-PC `-live-` is produced by the canonical splice from
-                // the graph; the portal red args (`pypy/module/pypyjit/
-                // interp_jit.py:67 reds = ['frame', 'ec']`) are kept alive by
-                // the splice's force-alive mechanism (`liveness.py:11-12`).
-                // The walker no longer emits a per-block copy.
+            ($py_pc:expr) => {{
+                let py_pc: usize = $py_pc;
+                // Only real instruction starts are resume points; a CACHE
+                // unit inside a multi-unit instruction (or an EXTENDED_ARG
+                // prefix) carries a mid-instruction FrameState that must not
+                // be forced alive.
+                let at_instruction_start = !matches!(
+                    pyre_interpreter::decode_instruction_at(code, py_pc),
+                    None | Some((
+                        Instruction::Cache | Instruction::ExtendedArg | Instruction::NotTaken,
+                        _
+                    ))
+                );
+                // Per-PC `-live-` graph op with force-alive args
+                // (`liveness.py:8-12`: "You can also force extra variables
+                // to be alive by putting them as args of the '-live-'
+                // operation in the first place").  Every CPython-frame-live
+                // Ref Variable at this resume point — locals gated by the
+                // liveness oracle, the whole operand stack — is an explicit
+                // arg, so `RegAllocator.make_dependencies` sees each frame
+                // slot's value live across the marker: co-live frame slots
+                // interfere structurally and the ordinary
+                // dependency/coalesce/color pass keeps them on distinct
+                // colors without a side-table interference oracle.  The
+                // portal reds (`interp_jit.py:67 reds = ['frame', 'ec']`)
+                // are excluded — they keep their dedicated colors above the
+                // allocator range via the post-color pin.
+                // A closed block accepts no further operations; the next
+                // boundary (mergeblock / catch landing) opens the block the
+                // resume point belongs to.
+                let block_open = current_block.block().borrow().exits.is_empty();
+                let mut live_args: Vec<super::flow::SpaceOperationArg> = Vec::new();
+                for (i, lv) in current_state.locals_w.iter().enumerate() {
+                    if let Some(super::flow::FlowValue::Variable(v)) = lv {
+                        if v.kind == Some(Kind::Ref) && frame_liveness.is_local_live(py_pc, i) {
+                            live_args.push((*v).into());
+                        }
+                    }
+                }
+                for sv in &current_state.stack {
+                    if let super::flow::FlowValue::Variable(v) = sv {
+                        if v.kind == Some(Kind::Ref) {
+                            live_args.push((*v).into());
+                        }
+                    }
+                }
+                if block_open && at_instruction_start {
+                    record_graph_op(
+                        &current_block.block(),
+                        super::flatten::OPNAME_LIVE,
+                        live_args,
+                        None,
+                        py_pc as i64,
+                    );
+                }
             }};
         }
 
@@ -7811,10 +7650,8 @@ impl CodeWriter {
                     let block_closed_by_terminator = {
                         let block_rc = current_block.block();
                         let block = block_rc.borrow();
-                        let has_explicit_raise = block
-                            .exits
-                            .iter()
-                            .any(|e| e.borrow().explicit_raise_value.is_some());
+                        let has_explicit_raise =
+                            block.raising_op().is_some_and(|op| op.opname == "raise");
                         !block.exits.is_empty()
                             && (has_explicit_raise
                                 || !matches!(
@@ -7830,7 +7667,7 @@ impl CodeWriter {
                     if loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
-                        emit_live_placeholder!();
+                        emit_live_placeholder!(py_pc);
                         if is_true_portal {
                             let jdindex = portal_jd_index
                                 .expect("portal jit_merge_point requires a registered jitdriver");
@@ -7885,7 +7722,9 @@ impl CodeWriter {
                         }
                     }
 
-                    emit_live_placeholder!();
+                    if !block_closed_by_terminator {
+                        emit_live_placeholder!(py_pc);
+                    }
 
                     // Dead-code dispatch gate: `current_block` has already
                     // been closed by a previous terminator emit (`emit_goto!`,
@@ -12103,25 +11942,7 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             let exc_flow: super::flow::FlowValue = exc_value.into();
-                            emit_raise!(0u16, exc_flow.clone(), py_pc as i64, true);
-                            if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten() {
-                                let site = catch_sites
-                                    .iter()
-                                    .find(|site| site.landing_label == catch_label)
-                                    .expect("catch site for DELETE_FAST raise");
-                                let link = current_block
-                                    .block()
-                                    .borrow()
-                                    .exits
-                                    .last()
-                                    .cloned()
-                                    .expect("DELETE_FAST raise catch edge");
-                                carry_explicit_raise_value_on_catch_stack(
-                                    &link,
-                                    &site.landing,
-                                    exc_flow,
-                                );
-                            }
+                            emit_raise!(0u16, exc_flow, py_pc as i64, true);
 
                             // The bound arm is the continuing block. The
                             // clear is one PY_NULL write, matching
@@ -12430,19 +12251,134 @@ impl CodeWriter {
                         // stray catch link to a block whose exits the
                         // just-emitted opcode already closed.
                         let block_already_closed = !current_block.block().borrow().exits.is_empty();
-                        if !block_already_closed {
-                            // `flatten.py:206-217` + `jtransform.py:311-313`:
-                            // a `catch_exception` must be immediately
-                            // preceded by a `-live-` so the blackhole's
-                            // after-residual-call resume
-                            // (`pyjitpl.py:2610-2624 capture_resumedata`,
-                            // `resumepc=-1`) lands on a marker it can
-                            // decode (`blackhole.py:396-410
-                            // handle_exception_in_frame` skips one
-                            // `-live-` then reads the catch).  A repeated
-                            // `-live-` here folds in `remove_repeated_live`.
-                            emit_live_placeholder!();
+                        // `guessexception` closes the block AT the caught
+                        // can-raise operation, so the block tail is
+                        // structurally `[raising_op, -live-]` and any
+                        // later operation belongs to the normal-flow
+                        // successor.  Find the last can-raise op this
+                        // opcode recorded (`record_graph_op` appended its
+                        // `-live-`); a covered PC whose opcode recorded no
+                        // can-raise op attaches no exception edge — same
+                        // set of catch edges the flatten early-return used
+                        // to drop post-hoc.
+                        let split_at = if block_already_closed {
+                            None
+                        } else {
+                            current_block
+                                .block()
+                                .borrow()
+                                .operations
+                                .iter()
+                                .rposition(|op| {
+                                    op.offset == py_pc as i64
+                                        && super::flatten::graph_op_can_raise(op)
+                                })
+                                .map(|raising_pos| raising_pos + 2)
+                        };
+                        if let Some(split_at) = split_at {
+                            debug_assert!(
+                                current_block
+                                    .block()
+                                    .borrow()
+                                    .operations
+                                    .get(split_at - 1)
+                                    .is_some_and(|op| op.opname == super::flatten::OPNAME_LIVE),
+                                "can-raise graph op must carry its trailing -live- \
+                                 (record_graph_op invariant) at py_pc {py_pc}",
+                            );
+                            // Move the opcode's post-raise operations (vable
+                            // mirror stores of the pushed result, vsd syncs)
+                            // into the normal-flow successor — the
+                            // `unsimplify.py:44 split_block` shape.  The
+                            // walker keeps emitting into the successor, so
+                            // subsequent PCs land there.
+                            let moved: Vec<super::flow::SpaceOperation> = current_block
+                                .block()
+                                .borrow_mut()
+                                .operations
+                                .split_off(split_at);
                             emit_catch_exception!(catch_label);
+                            // Successor continuation: identity split — same
+                            // Variables, no freshening (the UNPACK_SEQUENCE /
+                            // FOR_ITER split precedent).  The block's own
+                            // framestate stays at `py_pc` (mid-opcode
+                            // continuation, like those precedents) so the
+                            // next PC's boundary machinery — branch-target
+                            // force, joinpoint merge — still observes a
+                            // block that did not start there.  The walker's
+                            // `current_state` keeps its already-advanced
+                            // `next_offset = py_pc + 1`.
+                            let mut next_state = current_state.clone();
+                            next_state.next_offset = py_pc;
+                            next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                            let next_block = SpamBlockRef::new(
+                                graph.new_block(Vec::new()),
+                                Some(next_state.clone()),
+                            );
+                            all_walker_blocks.push(next_block.clone());
+                            // `unsimplify.py:59-76 split_block` varmap rules:
+                            //   * a Variable PRODUCED by a moved op
+                            //     (`vars_produced_in_new_block`) is defined
+                            //     inside the successor — it must NOT be
+                            //     passed on the link even when the
+                            //     FrameState already lists it (e.g. a
+                            //     follow-up op's result the dispatch pushed
+                            //     onto the symbolic stack);
+                            //   * a Variable a moved op CONSUMES that the
+                            //     FrameState no longer lists (a receiver
+                            //     popped before the raising op) must be
+                            //     threaded through the link so the
+                            //     successor's inputargs cover every use.
+                            let moved_results: Vec<u32> = moved
+                                .iter()
+                                .filter_map(|op| match &op.result {
+                                    Some(super::flow::FlowValue::Variable(r)) => Some(r.id.0),
+                                    _ => None,
+                                })
+                                .collect();
+                            let mut inputargs: Vec<super::flow::FlowValue> = next_state
+                                .getvariables()
+                                .into_iter()
+                                .filter(|value| {
+                                    value
+                                        .as_variable()
+                                        .is_none_or(|v| !moved_results.contains(&v.id.0))
+                                })
+                                .collect();
+                            // Identity split: the link passes each surviving
+                            // Variable through unchanged, so `link_args`
+                            // mirrors `inputargs`.
+                            let mut link_args = inputargs.clone();
+                            {
+                                let mut known: Vec<u32> = inputargs
+                                    .iter()
+                                    .filter_map(super::flow::FlowValue::as_variable)
+                                    .map(|v| v.id.0)
+                                    .collect();
+                                known.extend(moved_results.iter().copied());
+                                for op in &moved {
+                                    for arg in &op.args {
+                                        for v in arg.variables() {
+                                            if !known.contains(&v.id.0) {
+                                                known.push(v.id.0);
+                                                inputargs.push(v.into());
+                                                link_args.push(v.into());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            next_block.block().borrow_mut().inputargs = inputargs;
+                            append_exit(
+                                &current_block.block(),
+                                super::flow::Link::new(link_args, Some(next_block.block()), None)
+                                    .into_ref(),
+                            );
+                            restore_canraise_exit_order(&current_block.block());
+                            for op in moved {
+                                super::flow::push_op(&next_block.block(), op);
+                            }
+                            current_block = next_block;
                         }
                     }
                 }
@@ -12787,16 +12723,15 @@ impl CodeWriter {
         // short-circuit `(i and C)` PHI ↔ loop-var merge that collapses the
         // kept operand-stack slot's color onto the loop var (#124 float).
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
-        // `&[]`: honour SSA-liveness interference only, seeding the gate-off
-        // `graph_regallocs` coloring. The CPython-slot co-live / cross-slot
-        // merges this SSA-only pass misses are rejected on the SPLICE pairs
-        // below, where the co-live + slot-identity edges feed this same filter's
-        // `has_edge` oracle.
+        // The per-PC `-live-` graph ops force every frame-live Ref Variable
+        // alive, so `make_dependencies` inside the filter models CPython
+        // frame-slot liveness alongside SSA liveness and the `has_edge`
+        // guard rejects both the co-live and the frame-lifetime-overlap
+        // merges in one pass.
         let cfg_variable_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
             &graph,
             Kind::Ref,
             &cfg_variable_pairs,
-            &[],
         );
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,
@@ -12817,98 +12752,19 @@ impl CodeWriter {
         // color space — the spliced body carries graph-lifetime colors,
         // not walker stack-slot register numbers.
         //
-        // Splice coalesce pairs (same-slot + CFG, cross-slot filtered).
-        // Built once here — outside the IIFE — so the same set feeds the
-        // splice regalloc, the co-live interference, the value-equivalence
-        // partition, and the gated validation below.
-        //
-        // Order `same_slot` BEFORE `cfg` so each walker slot's Variables
-        // first cohere into one union-find group; the cfg pairs then fold
-        // those whole groups into the frame-local groups consistently. With
-        // the reverse order, a cfg chain can split one slot's Variables
-        // across two different frame-local groups and the later same_slot
-        // pair that would reunite them is dropped by the filter — leaving
-        // that slot with two colors. When the filter drops nothing (graphs
-        // with no cross-slot merge) the union-find partition is order-
-        // independent, so this reorder is a no-op there. The cross-slot
-        // filter drops coalesce pairs whose union would transitively merge
-        // two distinct frame-local slots into one regalloc group —
-        // otherwise the slots share a union-find rep and the co-live
-        // interference between them is a self-edge no-op.
-        // Same-slot coalescing retired (#267): RPython's flatten has no
-        // walker-slot coalescing. Body locals are colored freely by the chordal
-        // coloring; a guard resume reconstructs each live local/stack value via
-        // the per-PC color→slot map plus the virtualizable-frame overlay
-        // (`overlay_local` in `setup_bridge_sym`), so a frame slot no longer
-        // needs one canonical color across its re-read Variables. Only the CFG
-        // value-equivalence pairs (the walker's COPY/SWAP lineage) remain, to
-        // merge provably-equal Variables.
-        //
-        // Reject the coalesce merges that would break the color-indexed per-PC
-        // resume via the interference `has_edge` oracle (the RPython-faithful
-        // `regalloc.py:105` guard), replacing the walker-slot post-filter.  The
-        // filter was purely slot-based, so its pcdep-sourced successor is too:
-        // `build_slot_disjoint_interference` edges any coalesce candidate whose
-        // endpoints hold distinct canonical CPython slots.  This covers the
-        // disjoint-live case (never co-live at a single PC) that dominates
-        // inlined callees — a callee operand-stack temp and the outer merge
-        // inputarg occupy distinct frame-stack slots but live at disjoint PCs,
-        // so merging them extends a color's liveness across a box-less region
-        // and the resume reads `OpRef::NONE`.  Canonical slots come from the
-        // pcdep snapshots (which record each inline frame's slots at that
-        // frame's PCs), so no walker slot map is consulted here.  Co-liveness is
-        // NOT needed to gate coalescing — the co-live separations the coloring
-        // needs are applied to the interference graph below (`splice_
-        // interference`), not to the coalesce filter.
-        let canonical_slot = pcdep_canonical_slot(&pcdep_slot_var, &pcdep_slot_var_resume);
-        let splice_coalesce_oracle =
-            build_slot_disjoint_interference(&cfg_variable_pairs, &canonical_slot);
-        let splice_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
-            &graph,
-            Kind::Ref,
-            &cfg_variable_pairs,
-            &splice_coalesce_oracle,
-        );
-        // Liveness-correct CPython-co-live interference: each resume PC's
-        // simultaneously-CPython-live, non-value-equivalent locals/stack
-        // Variables interfere, so the chordal coloring keeps them on
-        // distinct colors. Without it the coloring is free to give two
-        // frame-live locals one color (their SSA live ranges are disjoint
-        // between `LOAD_FAST` re-reads, but CPython slot liveness keeps the
-        // dead one live across its SSA death), which a color-indexed per-PC
-        // resume map cannot disambiguate. The liveness-correct successor to
-        // the retired blanket `collect_distinct_slot_interference_pairs`
-        // clique: it constrains only slots co-live at a guard.
-        let splice_value_parent = build_value_parent(&splice_pairs);
-        let splice_interference = build_colive_interference(
-            &pcdep_slot_var,
-            &pcdep_slot_var_resume,
-            &splice_value_parent,
-            &graph_regallocs[Kind::Ref.index()].coloring,
-            &depth_at_pc,
-            code,
-        );
+        // The per-PC `-live-` graph ops carry every frame-live Ref Variable
+        // as a force-alive arg (`liveness.py:8-12`), so
+        // `RegAllocator.make_dependencies` sees each frame slot's value live
+        // through every resume point it covers: co-live frame slots
+        // interfere structurally and a coalesce whose endpoints' frame
+        // lifetimes overlap is rejected by the ordinary `regalloc.py:105
+        // has_edge` guard inside the filter above.  One
+        // dependency/coalesce/color pass therefore suffices — the
+        // pcdep-derived slot-identity + co-live interference side tables and
+        // the second Ref allocation are retired (#371).
+        let splice_pairs = cfg_variable_pairs;
         let (canonical, splice_regallocs) = (|| {
-            // Re-run regalloc with the merged pairs + co-live interference
-            // so the chordal coloring re-optimizes the surrounding
-            // Variables around the forced merges/separations — a naive
-            // post-hoc color rewrite would not. Kept separate from
-            // production `graph_regallocs` (the gate-off path) so gate-off
-            // stays byte-identical.
-            //
-            // Body locals are colored freely by the chordal coloring;
-            // `same_slot_pairs` merges each slot's re-read Variables onto
-            // one color, the co-live interference separates distinct
-            // frame-live locals, and the per-PC resume map
-            // (`pcdep_color_slots` → `semantic_ref_slot_for_reg_color`)
-            // records each local's color so the decode never assumes
-            // `color == slot`.
-            let mut splice_regallocs =
-                super::regalloc::perform_register_allocation_all_kinds_with_pairs_and_interference(
-                    &graph,
-                    &splice_pairs,
-                    &splice_interference,
-                );
+            let mut splice_regallocs = graph_regallocs.clone();
             // `interp_jit.py:67 reds = ['frame', 'ec']`: both portal inputs
             // are live in every MIFrame at every guard. Give them dedicated
             // Ref colors above the ordinary allocator range so neither can be
@@ -13234,17 +13090,13 @@ impl CodeWriter {
             &depth_at_pc,
         );
         // #348 (gated, no runtime effect): self-check that the production
-        // splice coloring — now built with the co-live interference — gives
-        // an injective per-PC color map. `splice_value_parent` is the same
-        // value-equivalence partition the interference excluded, so the
-        // check only flags a clash between two DIFFERENT-value (different
-        // union-find rep) live Variables sharing one color. Expectation:
-        // `inj_violations=0`. Only runs under `PYRE_PCDEP_VALIDATE`.
+        // coloring gives an injective per-PC color map. The value-equivalence
+        // partition (built inside the validator from the accepted coalesce
+        // pairs) excludes copy-coalesced Variables, so the check only flags a
+        // clash between two DIFFERENT-value (different union-find rep) live
+        // Variables sharing one color. Expectation: `inj_violations=0`. Only
+        // runs under `PYRE_PCDEP_VALIDATE`.
         if pcdep_validate {
-            eprintln!(
-                "PCDEP[production] PAIRS: {} co-live interference edges",
-                splice_interference.len(),
-            );
             validate_pcdep_color_map(
                 &pcdep_slot_var,
                 [
@@ -13260,7 +13112,7 @@ impl CodeWriter {
                 &alloc_result.rename,
                 code,
                 &depth_at_pc,
-                &splice_value_parent,
+                &splice_pairs,
                 "production",
             );
             // The SHIPPED per-PC map is built from `pcdep_slot_var_resume`
@@ -13268,10 +13120,8 @@ impl CodeWriter {
             // (post-dispatch): a branch guard at orgpc resumes with the deeper
             // operand stack carrying the mid-opcode kept temps. Those temps
             // live only in the resume snapshot, so the "production" check above
-            // does not cover them. Validate the actual shipped source — its
-            // injectivity is what the resume-depth co-live interference in
-            // `build_colive_interference` now guarantees (expectation:
-            // `inj_violations=0`).
+            // does not cover them. Validate the actual shipped source
+            // (expectation: `inj_violations=0`).
             validate_pcdep_color_map(
                 &pcdep_slot_var_resume,
                 [
@@ -13287,7 +13137,7 @@ impl CodeWriter {
                 &alloc_result.rename,
                 code,
                 &depth_at_pc,
-                &splice_value_parent,
+                &splice_pairs,
                 "production-resume",
             );
         }
@@ -13649,6 +13499,20 @@ impl CodeWriter {
         let merge_entry_by_green: Vec<(u32, u32)> = trace_entry_pcs
             .into_iter()
             .filter_map(|py_pc| {
+                // A truncated body (an untranslatable opcode bakes
+                // `abort_permanent` mid-function) emits no ops at-or-after a
+                // later trace entry, yet the dense pc_map still hands that
+                // py_pc the LAST marker by carry-forward.  Walking from such
+                // a bogus entry re-reaches the abort marker, and the abort
+                // flush rewinds the live frame to the marker's own py_pc —
+                // re-executing bytecode the frame already ran (duplicate
+                // side effects).  Cover only entries the body reaches.
+                let covered = first_jit_pc_by_py_pc
+                    .get(py_pc..)
+                    .is_some_and(|tail| tail.iter().any(|&v| v != usize::MAX));
+                if !covered {
+                    return None;
+                }
                 let off = resolve_marker(py_pc);
                 off.map(|off| (py_pc as u32, off as u32))
             })
@@ -14655,6 +14519,22 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Last recorded non-`-live-` op.  A can-raise HLOp/residual is
+    /// followed by its structural `-live-` marker (`record_graph_op` via
+    /// `graph_op_can_raise`), so shape assertions read past it.
+    fn last_recorded_op(
+        block: &super::super::flow::BlockRef,
+    ) -> super::super::flow::SpaceOperation {
+        block
+            .borrow()
+            .operations
+            .iter()
+            .rev()
+            .find(|op| op.opname != super::super::flatten::OPNAME_LIVE)
+            .cloned()
+            .expect("a non--live- op should be recorded")
+    }
     use super::{
         FrameState, SpamBlockRef, attach_catch_exception_edge, entry_arg_slots, entry_frame_state,
         entry_inputargs, mergeblock, new_shadow_graph,
@@ -14668,51 +14548,6 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
-
-    /// A coalesce candidate whose two endpoints hold distinct canonical
-    /// CPython slots — including the disjoint-live inline-callee case that is
-    /// never co-live at a single resume PC — yields a slot-identity
-    /// interference edge, while a within-slot pair yields none.
-    #[test]
-    fn build_slot_disjoint_interference_edges_cross_slot_only() {
-        // v0 → slot 0, v1 → slot 3, v2 → slot 3, v3 → (no snapshot).
-        let canonical = vec![Some(0u16), Some(3), Some(3)];
-        let pairs = vec![
-            (VariableId(0), VariableId(1)), // slot 0 ≠ 3 → edge
-            (VariableId(1), VariableId(2)), // slot 3 == 3 → no edge (COPY lineage)
-            (VariableId(1), VariableId(3)), // v3 absent → no edge (never live at a resume)
-        ];
-        let edges = build_slot_disjoint_interference(&pairs, &canonical);
-        assert_eq!(edges, vec![(VariableId(0), VariableId(1))]);
-    }
-
-    /// A transitive cross-slot chain through a Variable with no canonical slot
-    /// is still rejected: `(slot0_var, temp)` then `(temp, slot1_var)` where
-    /// `temp` is absent from the pcdep snapshots (never live at a resume PC).
-    /// The union-find carries slot0's claim through the first merge, so the
-    /// second pair's slot1 conflicts and is edged.
-    #[test]
-    fn build_slot_disjoint_interference_rejects_transitive_cross_slot_chain() {
-        // v0 → slot 0, v2 → slot 1, v1 (temp) → no snapshot.
-        let canonical = vec![Some(0u16), None, Some(1)];
-        let pairs = vec![
-            (VariableId(0), VariableId(1)), // slot0_var → temp: merge, group claims slot 0
-            (VariableId(1), VariableId(2)), // temp → slot1_var: group slot 0 ≠ 1 → edge
-        ];
-        let edges = build_slot_disjoint_interference(&pairs, &canonical);
-        assert_eq!(edges, vec![(VariableId(1), VariableId(2))]);
-    }
-
-    /// The canonical slot is the slot a Variable occupies at the earliest PC
-    /// it appears in across the pcdep snapshots (POST before RESUME).
-    #[test]
-    fn pcdep_canonical_slot_takes_earliest_pc() {
-        // v5 first appears at py_pc 1 slot 2, later at slot 0 → canonical 2.
-        let post = vec![vec![], vec![(2u16, 5u32)], vec![(0u16, 5u32)]];
-        let resume: Vec<Vec<(u16, u32)>> = vec![vec![], vec![], vec![(0u16, 5u32)]];
-        let slots = pcdep_canonical_slot(&post, &resume);
-        assert_eq!(slots.get(5).copied().flatten(), Some(2));
-    }
 
     #[test]
     fn frame_layout_slot_places_operand_stack_after_non_argument_deref_slots() {
@@ -14897,8 +14732,7 @@ mod tests {
 
         let result = emit_frontend_neg(&mut graph, &start, operand.into(), 33);
 
-        let block = start.borrow();
-        let op = block.operations.last().expect("neg op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "neg");
         assert_eq!(op.offset, 33);
         assert_eq!(op.args, vec![operand.into()]);
@@ -14922,11 +14756,7 @@ mod tests {
             46,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("newslice op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 46);
         assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
@@ -14949,11 +14779,7 @@ mod tests {
             44,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("newlist op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newlist");
         assert_eq!(op.offset, 44);
         assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
@@ -14976,11 +14802,7 @@ mod tests {
             45,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("newtuple op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newtuple");
         assert_eq!(op.offset, 45);
         assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
@@ -15001,9 +14823,20 @@ mod tests {
         lower_frontend_collection_ops(&graph);
 
         let block = start.borrow();
-        let ops = &block.operations;
-        // new_array_clear(Const(2)) + 2× setarrayitem_gc_r + newlist_from_array.
+        // new_array_clear(Const(2)) + 2× setarrayitem_gc_r + newlist_from_array;
+        // the can-raise `newlist` HLOp's structural trailing `-live-`
+        // survives the lowering after the `*_from_array` residual.
+        let ops: Vec<_> = block
+            .operations
+            .iter()
+            .filter(|op| op.opname != super::super::flatten::OPNAME_LIVE)
+            .cloned()
+            .collect();
         assert_eq!(ops.len(), 4);
+        assert_eq!(
+            block.operations.last().map(|op| op.opname.as_str()),
+            Some(super::super::flatten::OPNAME_LIVE),
+        );
         assert_eq!(ops[0].opname, "new_array_clear");
         assert_eq!(
             ops[0].args,
@@ -15042,8 +14875,14 @@ mod tests {
         lower_frontend_collection_ops(&graph);
 
         let block = start.borrow();
-        let ops = &block.operations;
-        // new_array_clear(Const(1)) + 1× setarrayitem_gc_r + newtuple_from_array.
+        // new_array_clear(Const(1)) + 1× setarrayitem_gc_r + newtuple_from_array,
+        // followed by the can-raise HLOp's structural trailing `-live-`.
+        let ops: Vec<_> = block
+            .operations
+            .iter()
+            .filter(|op| op.opname != super::super::flatten::OPNAME_LIVE)
+            .cloned()
+            .collect();
         assert_eq!(ops.len(), 3);
         assert_eq!(ops[0].opname, "new_array_clear");
         assert_eq!(ops[1].opname, "setarrayitem_gc_r");
@@ -15069,11 +14908,7 @@ mod tests {
             47,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("BUILD_SLICE argc=2 should record newslice");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 47);
         assert_eq!(op.args[0], w_start.into());
@@ -15109,11 +14944,7 @@ mod tests {
             48,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("BUILD_SLICE argc=3 should record newslice");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 48);
         assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
@@ -15138,11 +14969,7 @@ mod tests {
             55,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("setitem op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "setitem");
         assert_eq!(op.offset, 55);
         assert_eq!(op.args, vec![obj.into(), key.into(), value.into()]);
@@ -15201,11 +15028,7 @@ mod tests {
             57,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("getattr op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "getattr");
         assert_eq!(op.offset, 57);
         assert_eq!(
@@ -15236,11 +15059,7 @@ mod tests {
             66,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("binary op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "inplace_add");
         assert_eq!(op.offset, 66);
         assert_eq!(op.args, vec![lhs.into(), rhs.into()]);
@@ -15263,11 +15082,7 @@ mod tests {
             77,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("compare op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "le");
         assert_eq!(op.offset, 77);
         assert_eq!(op.args, vec![lhs.into(), rhs.into()]);
@@ -15283,8 +15098,7 @@ mod tests {
         let result = emit_frontend_bool(&mut graph, &start, operand.into(), 78);
 
         assert_eq!(result.kind, Some(Kind::Int));
-        let block = start.borrow();
-        let op = block.operations.last().expect("bool op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "bool");
         assert_eq!(op.offset, 78);
         assert_eq!(op.args, vec![operand.into()]);
@@ -15394,11 +15208,7 @@ mod tests {
             88,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("simple_call op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "simple_call");
         assert_eq!(op.offset, 88);
         assert_eq!(
@@ -16638,47 +16448,6 @@ def f(i):
             .framestate()
             .expect("catch landing should acquire a FrameState");
         assert!(catch_state.last_exception.is_some());
-    }
-
-    #[test]
-    fn explicit_raise_stack_value_preserves_exception_link_kinds() {
-        let code = first_nested_function_code("def f(a):\n    return a\n");
-        let mut graph = new_shadow_graph(&code);
-        let catch_block = graph.new_block(Vec::new());
-        let catch_ref = SpamBlockRef::new(catch_block, None);
-        let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
-        let startblock_ref = graph.startblock.clone();
-        let site = synthetic_catch_site(&catch_ref);
-        let link = attach_catch_exception_edge(
-            &code,
-            &mut graph,
-            &startblock_ref,
-            &catch_ref,
-            &source_state,
-            &site,
-        );
-        let (last_exception, last_exc_value) = {
-            let link = link.borrow();
-            (link.last_exception, link.last_exc_value)
-        };
-
-        carry_explicit_raise_value_on_catch_stack(
-            &link,
-            &catch_ref,
-            Variable::new(VariableId(100), Kind::Ref).into(),
-        );
-
-        let link = link.borrow();
-        assert_eq!(link.last_exception, last_exception);
-        assert_eq!(link.last_exc_value, last_exc_value);
-        assert_eq!(
-            link.last_exception.and_then(|variable| variable.kind),
-            Some(Kind::Int)
-        );
-        assert_eq!(
-            link.last_exc_value.and_then(|variable| variable.kind),
-            Some(Kind::Ref)
-        );
     }
 
     #[test]
