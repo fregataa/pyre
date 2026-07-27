@@ -3434,6 +3434,11 @@ struct FnPtrIndices {
     unary_positive_fn: HelperHandle,
     load_common_constant_fn: HelperHandle,
     list_to_tuple_fn: HelperHandle,
+    get_len_fn: HelperHandle,
+    match_sequence_fn: HelperHandle,
+    match_mapping_fn: HelperHandle,
+    match_keys_fn: HelperHandle,
+    match_class_fn: HelperHandle,
     load_from_dict_or_globals_fn: HelperHandle,
     call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
@@ -4108,6 +4113,32 @@ fn register_helper_fn_pointers(
         cpu.unbound_local_error_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
+    // Pattern matching (PEP 634).  `bh_get_len_fn` runs `__len__`,
+    // `bh_match_keys_fn` runs the subject's `get`, `bh_match_class_fn` runs
+    // `isinstance` plus attribute lookups → `MayForce`.  MATCH_SEQUENCE /
+    // MATCH_MAPPING only read the subject type's PATMA marker → `Plain`.
+    // Appended last to preserve fn_ptr indices.
+    let get_len_fn = bind(assembler, cpu.get_len_fn as *const (), CallFlavor::MayForce);
+    let match_sequence_fn = bind(
+        assembler,
+        cpu.match_sequence_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let match_mapping_fn = bind(
+        assembler,
+        cpu.match_mapping_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let match_keys_fn = bind(
+        assembler,
+        cpu.match_keys_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let match_class_fn = bind(
+        assembler,
+        cpu.match_class_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4183,6 +4214,11 @@ fn register_helper_fn_pointers(
         map_add_fn,
         dict_merge_fn,
         list_to_tuple_fn,
+        get_len_fn,
+        match_sequence_fn,
+        match_mapping_fn,
+        match_keys_fn,
+        match_class_fn,
         load_from_dict_or_globals_fn,
         call_function_ex_fn,
         call_kw_fn_0,
@@ -5652,6 +5688,31 @@ impl CodeWriter {
                     idx: list_to_tuple_fn_idx,
                     flavor: _list_to_tuple_fn_flavor,
                 },
+            get_len_fn:
+                HelperHandle {
+                    idx: get_len_fn_idx,
+                    flavor: _get_len_fn_flavor,
+                },
+            match_sequence_fn:
+                HelperHandle {
+                    idx: match_sequence_fn_idx,
+                    flavor: _match_sequence_fn_flavor,
+                },
+            match_mapping_fn:
+                HelperHandle {
+                    idx: match_mapping_fn_idx,
+                    flavor: _match_mapping_fn_flavor,
+                },
+            match_keys_fn:
+                HelperHandle {
+                    idx: match_keys_fn_idx,
+                    flavor: _match_keys_fn_flavor,
+                },
+            match_class_fn:
+                HelperHandle {
+                    idx: match_class_fn_idx,
+                    flavor: _match_class_fn_flavor,
+                },
             load_from_dict_or_globals_fn:
                 HelperHandle {
                     idx: load_from_dict_or_globals_fn_idx,
@@ -5910,6 +5971,11 @@ impl CodeWriter {
                 unary_positive_fn_idx,
                 load_common_constant_fn_idx,
                 list_to_tuple_fn_idx,
+                get_len_fn_idx,
+                match_sequence_fn_idx,
+                match_mapping_fn_idx,
+                match_keys_fn_idx,
+                match_class_fn_idx,
                 load_from_dict_or_globals_fn_idx,
                 call_function_ex_fn_idx,
                 unary_not_fn_idx,
@@ -10868,10 +10934,11 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(result);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects END_SEND
-                            // with `unsupported_rpython("async iteration is not
-                            // RPython")` — the generated JIT cannot trace it
-                            // either, so abort_permanent is parity-correct.
+                            // Genuine trace boundary: END_SEND terminates a
+                            // `yield from` / `await` delegation, whose partner
+                            // opcode SEND suspends the frame. A trace records one
+                            // continuous execution, so no residual can express the
+                            // resume; abort_permanent is the only correct choice.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11177,10 +11244,10 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // BUILD_INTERPOLATION with `unsupported_rpython(
-                            // "f-strings and template strings are not RPython")`
-                            // — abort is parity-correct.
+                            // Portable in principle (PEP 750 t-strings build an
+                            // Interpolation object — an ordinary call), but no
+                            // residual is written yet: t-strings appear in
+                            // formatting code, not in hot loop bodies.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11191,10 +11258,8 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // BUILD_TEMPLATE with `unsupported_rpython("f-strings
-                            // and template strings are not RPython")` — abort is
-                            // parity-correct.
+                            // Portable in principle, unported for the same
+                            // reason as BUILD_INTERPOLATION above.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11206,11 +11271,11 @@ impl CodeWriter {
                         Instruction::CallIntrinsic1 { func } => {
                             use pyre_interpreter::bytecode::IntrinsicFunction1;
                             // UnaryPositive→`pos`, ListToTuple→`list_to_tuple`
-                            // are the two portable CALL_INTRINSIC_1 variants
-                            // (flowcontext.rs:2422-2431 record real ops); both
-                            // are single-Ref→Ref residuals.  Every other variant
-                            // is `unsupported_rpython` (flowcontext.rs:2435) —
-                            // abort_permanent is parity-correct there.
+                            // are the two CALL_INTRINSIC_1 variants with a
+                            // residual; both are single-Ref→Ref.  The remaining
+                            // variants (import-star, stopiteration-error, the PEP
+                            // 695 type-param helpers) are def-time or error-path
+                            // only, so no residual has been written for them.
                             let opname = match func.get(op_arg) {
                                 IntrinsicFunction1::UnaryPositive => Some("pos"),
                                 IntrinsicFunction1::ListToTuple => Some("list_to_tuple"),
@@ -11240,12 +11305,9 @@ impl CodeWriter {
                         // Other variants: general pop 2, push 1. Net: -1.
                         // pyopcode.rs:1302-1316.
                         //
-                        // Only SetTypeparamDefault is portable (flowspace
-                        // `set_typeparam_default` pure op); the rest are genuine
-                        // boundaries (`unsupported_rpython`).  The portable one is
-                        // deeply latent — a PEP 695 def-time intrinsic that
+                        // Every variant is a PEP 695 / def-time intrinsic that
                         // imports `_typing` and calls a Python helper, never a hot
-                        // loop body. No residual.
+                        // loop body, so none carries a residual.
                         Instruction::CallIntrinsic2 { func } => {
                             use pyre_interpreter::bytecode::IntrinsicFunction2;
                             match func.get(op_arg) {
@@ -11264,15 +11326,23 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // GetLen: peeks obj, pushes len. Net: +1.
+                        // GetLen: peeks obj (does NOT pop), pushes len. Net: +1.
+                        // `get_len(subject)` HLOp → `bh_get_len_fn` residual.
                         Instruction::GetLen => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects GET_LEN
-                            // with `unsupported_rpython("GET_LEN is used by match
-                            // statements (not RPython)")` — abort is
-                            // parity-correct.
-                            emit_abort_permanent!(py_pc);
+                            let subject = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "get_len",
+                                vec![subject.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
@@ -11374,10 +11444,10 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            // Genuine trace boundary: flowspace rejects
-                            // LOAD_FROM_DICT_OR_DEREF with `unsupported_rpython(
-                            // "closure cell mutation is not RPython")` — abort is
-                            // parity-correct.
+                            // No residual is possible while the interpreter
+                            // itself raises here: the trait default
+                            // (pyopcode.rs:1247) never implements the opcode, so
+                            // there is no value-level function to call.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11567,11 +11637,10 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // Genuine trace boundaries: flowspace rejects both —
-                        // LOAD_LOCALS with `unsupported_rpython("locals() is not
-                        // RPython")` and LOAD_BUILD_CLASS with `unsupported_rpython(
-                        // "defining classes inside functions is not RPython")`.
-                        // abort is parity-correct.
+                        // Both are portable (plain value-level reads), but both
+                        // occur only in a class body, which runs once per class
+                        // definition — never a hot loop body — so no residual has
+                        // been written.
                         Instruction::LoadLocals | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -11679,10 +11748,9 @@ impl CodeWriter {
                         Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            // Genuine trace boundary: flowspace rejects
-                            // GET_YIELD_FROM_ITER with `unsupported_rpython(
-                            // "`yield from` is not supported by flowspace yet")`
-                            // — abort is parity-correct.
+                            // Genuine trace boundary: this only heads a
+                            // `yield from` delegation, whose SEND suspends the
+                            // frame — not expressible as a residual call.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -12052,16 +12120,14 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ExitInitCheck: no-op in pyre (pyopcode.rs:2069). Net: 0.
+                        // ExitInitCheck: no-op in pyre. Net: 0.
                         // RustPython pops the __init__ return value, but pyre's
-                        // dispatch is a plain Ok(StepResult::Continue).
-                        // Genuine trace boundary: flowspace rejects
-                        // EXIT_INIT_CHECK with `unsupported_rpython("`__init__`
-                        // return-None check is not RPython")` — abort is
-                        // parity-correct.
-                        Instruction::ExitInitCheck => {
-                            emit_abort_permanent!(py_pc);
-                        }
+                        // dispatch is a plain `Ok(StepResult::Continue)`
+                        // (pyopcode.rs), and liveness.rs:579 models it as pop 0 /
+                        // push 0 to match. An opcode the interpreter executes as a
+                        // no-op has nothing to residualize and nothing to bail for,
+                        // so the trace just carries on.
+                        Instruction::ExitInitCheck => {}
 
                         // StoreName pops 1 value from the stack.
                         // (This is separate from the above because pyopcode.rs pops.)
@@ -12101,9 +12167,10 @@ impl CodeWriter {
                         Instruction::Send { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            // Genuine trace boundary: flowspace rejects SEND with
-                            // `unsupported_rpython("async iteration is not
-                            // RPython")` — abort is parity-correct.
+                            // Genuine trace boundary: SEND suspends the frame
+                            // (StepResult::Yield) and resumes it in a different
+                            // stack context, which a residual call cannot express —
+                            // the same reason YIELD_VALUE aborts above.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -12123,10 +12190,9 @@ impl CodeWriter {
                         // on the StopAsyncIteration path (assemble.py:1578). Structural
                         // adaptation: pyre targets CPython opcode shape here.
                         //
-                        // Genuine trace boundary: flowspace rejects END_ASYNC_FOR
-                        // with `unsupported_rpython` (the async cluster —
-                        // GET_AITER/GET_AWAITABLE/GET_ANEXT/SEND/END_ASYNC_FOR —
-                        // `async for` is not RPython), so abort is parity-correct.
+                        // Genuine trace boundary: END_ASYNC_FOR closes an
+                        // `async for`, whose body suspends the frame through SEND
+                        // on every iteration — not expressible as a residual.
                         Instruction::EndAsyncFor => {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
@@ -12141,55 +12207,85 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // CLEANUP_THROW with `unsupported_rpython("async
-                            // iteration is not RPython")` — abort is
-                            // parity-correct.
+                            // Genuine trace boundary: CLEANUP_THROW runs on the
+                            // throw() path of a suspended generator, which a trace
+                            // never records — the resume happens elsewhere.
                             emit_abort_permanent!(py_pc);
                         }
 
                         // MatchSequence: peeks TOS (subject), pushes bool. Net: +1.
-                        // assemble.py:1614, liveness.rs:601.
-                        Instruction::MatchSequence => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // MATCH_SEQUENCE with `unsupported_rpython("structural
-                            // pattern matching is not RPython")` — abort is
-                            // parity-correct.
-                            emit_abort_permanent!(py_pc);
-                        }
-
-                        // MatchMapping: peeks TOS (subject), pushes bool. Net: +1.
-                        Instruction::MatchMapping => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // assemble.py:1614, liveness.rs:601.  `match_sequence(
+                        // subject)` HLOp → `bh_match_sequence_fn` residual.
+                        Instruction::MatchSequence | Instruction::MatchMapping => {
+                            let opname = if matches!(instruction, Instruction::MatchSequence) {
+                                "match_sequence"
+                            } else {
+                                "match_mapping"
+                            };
+                            let subject = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                opname,
+                                vec![subject.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // MatchKeys: peeks subject + keys tuple (TOS), pushes a
-                        // values tuple or None. Net: +1.
+                        // values tuple or None. Net: +1.  `match_keys(subject,
+                        // keys)` HLOp → `bh_match_keys_fn` residual.
                         Instruction::MatchKeys => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let depth = current_state.stack.len();
+                            let keys = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let subject = depth
+                                .checked_sub(2)
+                                .and_then(|i| current_state.stack.get(i).cloned())
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "match_keys",
+                                vec![subject.into(), keys.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // MatchClass: pops subject, type and the keyword-names
                         // tuple (3), pushes the extracted-attrs tuple or None (1).
-                        // Net: -2. The stack effect MUST be modelled even though
-                        // the trace aborts: an unmodelled MATCH_CLASS (via the
-                        // catch-all below) left the operand-stack depth 2 too high,
-                        // so the enclosing block's return link carried stale pattern
-                        // temporaries and tripped `make_return`'s arity assert in
-                        // the flatten pass.
-                        Instruction::MatchClass { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // Net: -2.  `match_class(subject, cls, kwd_attrs, count)`
+                        // HLOp → `bh_match_class_fn` residual.
+                        Instruction::MatchClass { count } => {
+                            let count = count.get(op_arg) as i64;
+                            let _kwd_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let kwd_attrs = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _cls_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cls = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _subject_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let subject = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let v_count: super::flow::FlowValue =
+                                super::flow::Constant::signed(count).into();
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "match_class",
+                                vec![subject.into(), cls.into(), kwd_attrs.into(), v_count.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // Catch-all: unknown instruction.

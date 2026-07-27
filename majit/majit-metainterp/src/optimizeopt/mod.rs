@@ -1890,6 +1890,27 @@ impl OptContext {
         self.new_operations.push(op);
     }
 
+    /// Overwrite an already-emitted op in place (the guard-strengthening
+    /// replacements of `optimizer.py:716-718` / `rewrite.py:343`) and mirror
+    /// the new op into `new_operations_index`, so the index keeps agreeing
+    /// with `new_operations` for the rest of the forward phase.
+    pub(crate) fn replace_new_operation(&mut self, idx: usize, op: majit_ir::OpRc) {
+        self.new_operations_index.insert(op.pos.get(), op.clone());
+        self.new_operations[idx] = op;
+    }
+
+    /// The producer of `opref` among the ops emitted so far by this optimizer
+    /// run, or `None` when nothing at that position has been emitted.
+    /// Unlike [`Self::find_producer_op`] this consults only `new_operations`,
+    /// which is what optimizer.py:369-377 `as_operation` tests
+    /// (`op in self._emittedoperations`).
+    pub(crate) fn producer_in_new_operations(&self, opref: OpRef) -> Option<majit_ir::OpRc> {
+        if opref.is_none() || opref.is_constant() {
+            return None;
+        }
+        self.new_operations_index.get(&opref).cloned()
+    }
+
     /// Rebuild `new_operations_index` from the current `new_operations`.
     /// Called after the rare structural mutations (tail truncate, jump
     /// reorder) that the incremental `push_new_operation` maintenance cannot
@@ -2653,9 +2674,25 @@ impl OptContext {
         // `resop_refs` is keyed by the full type-tagged `OpRef`; a raw `u32`
         // can host more than one entry (typed vs untyped). Any host at this
         // raw carrying `Forwarded::Const` claims the position.
-        let resop_const = self.resop_refs.values().any(|op| {
-            op.pos.get().raw() == raw && matches!(*op.forwarded.borrow(), Forwarded::Const(_))
-        });
+        //
+        // Every key is the value's own `op.pos` (`install_canonical_producer`,
+        // `materialize_operand_at`), so the hosts at `raw` are exactly the
+        // OpRef variants that carry it. Probing those keys keeps this O(1):
+        // scanning `resop_refs` made `allocate_next_pos_raw` linear in the
+        // trace, and it runs once per `reserve_pos_typed`, so the whole
+        // optimizer emit path was quadratic in trace length.
+        let resop_const = [
+            OpRef::IntOp(raw),
+            OpRef::FloatOp(raw),
+            OpRef::RefOp(raw),
+            OpRef::VoidOp(raw),
+            OpRef::InputArgInt(raw),
+            OpRef::InputArgFloat(raw),
+            OpRef::InputArgRef(raw),
+        ]
+        .iter()
+        .filter_map(|key| self.resop_refs.get(key))
+        .any(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
         let inputarg_const = self
             .inputarg_refs
             .get(idx)

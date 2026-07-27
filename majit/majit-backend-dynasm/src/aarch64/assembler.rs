@@ -343,14 +343,18 @@ pub struct AssemblerARM64<'a> {
     /// references no reference constants. Set before `assemble_loop` /
     /// `assemble_bridge` via [`set_gc_table_base`](Self::set_gc_table_base).
     gc_table_base: usize,
-    /// Address of the owning `JitCellToken.invalidated` `AtomicBool`.
-    /// `GUARD_NOT_INVALIDATED` bakes it as a 64-bit immediate and loads
-    /// the byte at runtime, branching to its recovery stub when set.
-    /// PyPy instead emits no runtime code and patches the guard site
-    /// (`invalidate_positions`) when the quasi-immutable field mutates;
-    /// pyre reads the flag live so re-entry through any path (warm entry,
-    /// CALL_ASSEMBLER, resume) observes the invalidation. 0 leaves the
-    /// guard as a no-op (bridges / tests with no owning token).
+    /// Address of the owning `JitCellToken.invalidated` `AtomicBool`
+    /// (`history.py:443`). `GUARD_NOT_INVALIDATED` bakes it as a 64-bit
+    /// immediate and loads the byte at runtime, branching to its recovery
+    /// stub when set — the shape `llgraph/runner.py:375` uses, where
+    /// `invalidate_loop` sets a per-trace `invalid` flag that the guard
+    /// reads live at execution. The machine backends instead emit no
+    /// runtime code and patch the recorded guard sites
+    /// (`clt.invalidate_positions`) on invalidation; reading the flag live
+    /// makes re-entry through any path (warm entry, CALL_ASSEMBLER,
+    /// resume) observe it without a second code-patching channel, and is
+    /// the only formulation cranelift and wasm can express at all. 0
+    /// leaves the guard a no-op (bridges / tests with no owning token).
     invalidated_flag_addr: usize,
 }
 
@@ -3853,9 +3857,17 @@ impl<'a> AssemblerARM64<'a> {
         let fail_label = self.mc.new_dynamic_label();
         if self.invalidated_flag_addr != 0 {
             self.emit_mov_imm64(16, self.invalidated_flag_addr as i64);
+            // `CBNZ` reaches +-32KB, but this guard sits at the head of the
+            // peeled loop body while its recovery stub is emitted after the
+            // whole trace, so a long body puts the stub out of range and
+            // dynasm rejects the relocation at commit. Branch over an
+            // unconditional `B` (+-128MB) instead, the standard veneer.
+            let continue_label = self.mc.new_dynamic_label();
             dynasm!(self.mc ; .arch aarch64
                 ; ldrb w17, [x16]
-                ; cbnz w17, =>fail_label
+                ; cbz w17, =>continue_label
+                ; b =>fail_label
+                ; =>continue_label
             );
         }
         self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
