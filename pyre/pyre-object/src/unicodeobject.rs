@@ -241,6 +241,47 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     }
 }
 
+/// `_utf8_sliced` (unicodeobject.py:1373-1379) — wrap a piece cut out of
+/// `recv`'s own WTF-8 storage.
+///
+/// The cut goes through `self._utf8[start:stop]`, and
+/// `ll_stringslice_startstop` (rstr.py:867-869) hands the source string back
+/// unchanged when the cut spans it whole (`start == 0 and stop >= len`).  The
+/// piece then shares its operand's storage, so `is_w` (unicodeobject.py:110-111)
+/// reports the two identical.  A piece cut from `recv` spans it whole exactly
+/// when their WTF-8 byte counts agree.
+///
+/// Only an exact `str` comes back unchanged: a subclass cuts to a fresh base
+/// `str`, and `is_w` rejects a `user_overridden_class` operand anyway
+/// (unicodeobject.py:106).
+///
+/// Restricted to cuts.  A transform (`lower`, `casefold`, a `replace` that did
+/// work) can preserve the byte count while changing the bytes, and none of
+/// those has an upstream identity shortcut, so routing one through here would
+/// manufacture a divergence rather than close one.
+///
+/// Restricted further to cuts upstream spells with **both** bounds.  Only
+/// `ll_stringslice_startstop` carries the shortcut; a one-bound `s[start:]`
+/// goes through `ll_stringslice_startonly` (rstr.py:857-858), which calls
+/// `_ll_stringslice` directly and always builds a fresh string.  So a method
+/// whose match arm slices with a single bound — `descr_removeprefix`'s
+/// `selfval[len(prefix):]` (stringmethods.py:879) — must allocate even when an
+/// empty argument makes the cut span the receiver whole, and must not come
+/// here.  Check which helper the upstream arm resolves to before routing a new
+/// call site through this function.
+///
+/// # Safety
+/// `recv` must point to a valid `W_UnicodeObject`, and `piece` must be a
+/// contiguous cut of its WTF-8 storage.
+pub unsafe fn w_str_cut(recv: PyObjectRef, piece: &Wtf8) -> PyObjectRef {
+    if piece.len() == unsafe { w_str_get_wtf8(recv) }.len()
+        && unsafe { is_exact_type(recv, &STR_TYPE) }
+    {
+        return recv;
+    }
+    w_str_from_wtf8_managed(piece.to_wtf8_buf())
+}
+
 /// Immortal `w_str_from_wtf8`: always allocates through `malloc_typed`,
 /// bypassing the `gc_interp` gate so the result is never collected.
 ///
