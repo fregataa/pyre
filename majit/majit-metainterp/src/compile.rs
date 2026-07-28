@@ -5271,6 +5271,31 @@ impl TraceCtx {
 
     /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),
     /// searching in reverse order (most recent first).
+    /// pyjitpl.py:3039-3041 `compile_loop(original_boxes, live_arg_boxes,
+    /// start)`: the closing JUMP's args belong to the label of the loop being
+    /// CLOSED — `original_boxes`, taken from the merge point that matched —
+    /// not to the trace's own inputargs. The two name the same list only when
+    /// the trace closes at its own head; a close at a later-registered header
+    /// (the cross-loop cut, compile.py:269) re-labels the loop from that
+    /// merge point instead.
+    ///
+    /// `header_pc` identifies the header on its own here: a merge point's
+    /// `green_key` is derived from `(code, header_pc)`, so the reverse scan's
+    /// first hit is the same entry [`get_merge_point_at`] would return.
+    /// Only entries recorded during the walk (`position > 0`) answer here.
+    /// The entry at position 0 is the synthetic trace-start seed, whose boxes
+    /// were built from the trace's own `inputarg_types()`; leaving it out lets
+    /// callers keep their existing fallback for a head close and reserves this
+    /// lookup for the case it is meant to fix — closing at a header the walk
+    /// reached later.
+    pub fn merge_point_arg_types_at_header(&self, header_pc: usize) -> Option<Vec<majit_ir::Type>> {
+        self.current_merge_points
+            .iter()
+            .rev()
+            .find(|mp| mp.header_pc == header_pc && mp.position._pos > 0)
+            .map(|mp| mp.green_boxes.iter().map(|green| green.ty).collect())
+    }
+
     pub fn get_merge_point_at(&self, key: u64, header_pc: usize) -> Option<&MergePoint> {
         self.current_merge_points
             .iter()
