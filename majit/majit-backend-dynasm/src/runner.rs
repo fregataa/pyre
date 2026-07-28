@@ -180,6 +180,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
+        dynasm_alloc_nursery_headerless_no_collect,
+    ));
     majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
         dynasm_alloc_nursery_typed_with_placement,
     ));
@@ -357,6 +360,26 @@ pub(crate) extern "C" fn dynasm_new_alloc(size: usize) -> *mut u8 {
     })
 }
 
+/// Headerless no-collect nursery trampoline for backend-agnostic callers.
+///
+/// The metainterp's jitcode tracer allocates a `NEW` on a `headerless` descr
+/// through here so the object lands in the interpreter's own collected pool
+/// rather than the host heap, where its collector could not see it. Returns
+/// null when no GC is bound, leaving the caller on its own path.
+fn dynasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
+    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+        c.borrow_mut()
+            .as_deref_mut()
+            .map(|g| g.alloc_nursery_headerless_no_collect(size))
+    }) {
+        return r;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_headerless_no_collect(size));
+    }
+    GcRef::NULL
+}
+
 /// Host-side nursery allocation trampoline. Published via
 /// `majit_gc::set_active_alloc_nursery_typed` from `set_gc_allocator`
 /// so backend-agnostic callers (e.g. pyre-object `w_int_new`) can
@@ -463,6 +486,49 @@ fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.alloc_oldgen_typed(type_id, size))
+}
+
+/// Allocate the struct a `bh_new` / `bh_new_with_vtable` descr describes
+/// (`llmodel.py:775-786`).
+///
+/// A GC-managed struct (real `type_id`) MUST be allocated through the GC so the
+/// collector can trace its pointer fields: a resume-materialized virtual (e.g.
+/// an inlined-callee `PyFrame`) holds a `locals_cells_stack` ref to its arrays,
+/// and a raw `libc::malloc` block is invisible to the GC, so a minor collection
+/// during the blackhole forward run frees those arrays out from under the
+/// frame.  Allocate in the non-moving old generation (mark-sweep), mirroring
+/// `w_int_new`/`w_float_new`: the blackhole register file and the deep forward
+/// recursion capture raw pointers to the materialized struct that the resume
+/// path does not re-root across the minor collections it triggers, so a moving
+/// nursery object would leave those captures stale.  Old-gen keeps every
+/// materialized pointer stable for the lifetime of the resume.
+///
+/// A headerless struct lives in the interpreter's own `headerless_structs` pool
+/// and carries no `type_id` word at `ref - 8`, so it takes the headerless
+/// nursery allocator instead: `alloc_oldgen_typed` returns
+/// `base + GcHeader::SIZE`, which would shift every field offset the descr
+/// carries.
+///
+/// Non-GC descrs (`type_id == 0`, raw buffers) and a runtime with no allocator
+/// hook installed (unit tests) keep the plain zeroed malloc.
+fn bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> *mut libc::c_void {
+    let size = sizedescr.as_size();
+    let gc_ptr = if sizedescr.is_headerless() {
+        majit_gc::alloc_nursery_headerless_no_collect(size).0
+    } else {
+        match sizedescr.resolve_gc_tid() {
+            0 => 0,
+            type_id => dynasm_alloc_oldgen_typed(type_id, size).0,
+        }
+    };
+    if gc_ptr != 0 {
+        return gc_ptr as *mut libc::c_void;
+    }
+    let ptr = unsafe { libc::malloc(size) };
+    if !ptr.is_null() {
+        unsafe { libc::memset(ptr, 0, size) };
+    }
+    ptr
 }
 
 /// User-level `gc.collect()` trampoline — drives `GcAllocator::collect_full`
@@ -2965,40 +3031,12 @@ impl Backend for DynasmBackend {
     }
 
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let size = sizedescr.as_size();
-        let ptr = unsafe { libc::malloc(size) };
-        if !ptr.is_null() {
-            unsafe { libc::memset(ptr, 0, size) };
-        }
-        ptr as i64
+        bh_alloc_struct(sizedescr) as i64
     }
 
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
-        // A GC-managed struct (real `type_id`) MUST be allocated through the GC
-        // so the collector can trace its pointer fields: a resume-materialized
-        // virtual (e.g. an inlined-callee `PyFrame`) holds a `locals_cells_stack`
-        // ref to its arrays, and a raw `libc::malloc` block is invisible to the
-        // GC, so a minor collection during the blackhole forward run frees those
-        // arrays out from under the frame.  Allocate in the non-moving old
-        // generation (mark-sweep), mirroring `w_int_new`/`w_float_new`: the
-        // blackhole register file and the deep forward recursion capture raw
-        // pointers to the materialized struct that the resume path does not
-        // re-root across the minor collections it triggers, so a moving nursery
-        // object would leave those captures stale.  Old-gen keeps every
-        // materialized pointer stable for the lifetime of the resume.  Non-GC
-        // descrs (`type_id == 0`, raw buffers) keep the plain malloc.
-        let type_id = sizedescr.resolve_gc_tid();
-        let ptr = if type_id != 0 {
-            dynasm_alloc_oldgen_typed(type_id, size).0 as *mut libc::c_void
-        } else {
-            let ptr = unsafe { libc::malloc(size) };
-            if !ptr.is_null() {
-                unsafe { libc::memset(ptr, 0, size) };
-            }
-            ptr
-        };
+        let ptr = bh_alloc_struct(sizedescr);
         if !ptr.is_null() {
             unsafe {
                 // llmodel.py:780-782: if self.vtable_offset is not None:

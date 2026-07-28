@@ -1,4 +1,4 @@
-pub(crate) mod dispatch;
+pub mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
@@ -1247,7 +1247,7 @@ pub struct MetaInterp<M: Clone> {
     pending_preamble_tokens: indexmap::IndexMap<u64, Vec<crate::history::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
-    // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
+    // Access via `self.staticdata.all_descrs()`.
     /// bridgeopt.py:124 frontend_boxes parity: runtime values from the
     /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
     /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
@@ -2633,6 +2633,47 @@ impl<M: Clone> MetaInterp<M> {
         staticdata.install_canonical_liveness(asm);
     }
 
+    /// warmspot.py:281-282 `self.metainterp_sd.jitcodes = jitcodes` — hand the
+    /// codewriter's drained jitcode list to the staticdata, the single table
+    /// `resume.py:1051` indexes.
+    ///
+    /// Same single-owner window as [`Self::install_canonical_liveness`], which
+    /// the install pipeline runs immediately before this.
+    pub fn install_jitcodes(&mut self, jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::install_jitcodes called after `staticdata` was cloned; \
+             RPython warmspot.py:281-282 installs the table while the \
+             MetaInterpStaticData still has a single owner",
+        );
+        staticdata.install_jitcodes(jitcodes);
+    }
+
+    /// resume.py:1051 `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
+    pub fn jitcodes(&self) -> &[std::sync::Arc<crate::jitcode::JitCode>] {
+        &self.staticdata.jitcodes
+    }
+
+    /// Mutable borrow of one `jitdrivers_sd` slot, for the install-time wiring
+    /// `warmspot.py` performs on `jd` before the staticdata is shared.
+    pub fn jitdriver_sd_mut(
+        &mut self,
+        index: usize,
+    ) -> Option<&mut crate::jitdriver::JitDriverStaticData> {
+        std::sync::Arc::get_mut(&mut self.staticdata)
+            .expect("jitdriver_sd_mut: staticdata has other owners")
+            .jitdrivers_sd
+            .get_mut(index)
+    }
+
+    /// call.py:147 `jd.mainjitcode` for a `jitdrivers_sd` slot.
+    pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
+        self.staticdata
+            .jitdrivers_sd
+            .get(index)?
+            .mainjitcode
+            .as_ref()
+    }
+
     /// Copy a freshly-snapshotted `all_liveness`
     /// byte stream into `staticdata.liveness_info` without re-running
     /// the full `install_canonical_liveness` insn-id seeding.
@@ -2913,9 +2954,31 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:2289 / descr.py:25-47 parity: take back all_descrs from
     /// optimizer after compilation. Optimizer.ensure_descr_index() assigns
-    /// sequential descr_index during collect_optimizer_knowledge_for_resume().
+    /// sequential descr_index during collect_optimizer_knowledge_for_resume(),
+    /// and may append, so the optimizer's copy is written back wholesale.
+    ///
+    /// The optimizer is handed a **clone**, not `std::mem::take` of the slot:
+    /// `pyjitpl.py:2290` treats `metainterp_sd.all_descrs` as read-only after
+    /// `setup_descrs`, and emptying it for the duration of an optimize left any
+    /// reader that ran inside that window with a zero-length universe.
+    /// `bridgeopt.py:155 descr = metainterp_sd.all_descrs[descr_index]` is one
+    /// such reader (the bridge's `PendingBridgeRd` snapshot), and it indexes
+    /// blind.
+    ///
+    /// The list is **monotone**: `descr.py:25-47 setup_descrs` numbers it once
+    /// and `descr.py:28 v.descr_index = len(all_descrs); all_descrs.append(v)`
+    /// only ever appends, so a shorter write-back cannot be a legitimate new
+    /// universe.  It comes from an optimizer that never received the seed —
+    /// `unroll.rs` hands `all_descrs` to each phase with `std::mem::take` and
+    /// restores it on the way out, so any early exit between the two leaves
+    /// the outer `UnrollOptimizer` holding an empty vector, which
+    /// `compile_loop` then publishes.  Ignore those instead of invalidating
+    /// every `descr_index` already serialized into a compiled bridge.
     pub(crate) fn take_back_all_descrs(&mut self, all_descrs: Vec<DescrRef>) {
-        *self.staticdata.all_descrs.lock().unwrap() = all_descrs;
+        let mut slot = self.staticdata.all_descrs().lock().unwrap();
+        if all_descrs.len() >= slot.len() {
+            *slot = all_descrs;
+        }
     }
 
     /// Accessor for `pending_frontend_boxes` without consuming it.
@@ -5520,7 +5583,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
-        unroll_opt.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = prior_retraced_count_early;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
@@ -5677,7 +5740,15 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             Optimizer::default_pipeline()
                         };
-                        simple_opt.all_descrs = std::mem::take(&mut unroll_opt.all_descrs);
+                        // Clone rather than move: only the success arm below hands
+                        // the list back, so a retry that aborts would otherwise
+                        // leave `unroll_opt.all_descrs` empty, and the
+                        // `take_back_all_descrs` at the end of compile_loop would
+                        // blank `metainterp_sd.all_descrs` for the rest of the
+                        // process.  `pyjitpl.py:2288-2290` treats that list as
+                        // read-only after `setup_descrs`; `bridgeopt.py:155`
+                        // indexes it blind.
+                        simple_opt.all_descrs = unroll_opt.all_descrs.clone();
                         // history.py:220/261/307: `Const.type` /
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
@@ -6930,7 +7001,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
-        unroll_opt.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = self
             .compiled_loops
@@ -7481,7 +7552,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
@@ -7904,7 +7975,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:220/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself (recovered via `OpRef::ty()` from
@@ -8992,6 +9063,32 @@ impl<M: Clone> MetaInterp<M> {
     pub fn remove_compiled_loop(&mut self, green_key: u64) {
         self.compiled_loops.swap_remove(&green_key);
         self.pending_preamble_tokens.swap_remove(&green_key);
+        self.forget_loop_side_tables(green_key);
+    }
+
+    /// Drop every compiled loop whose root trace is `trace_id`, with the
+    /// per-loop side tables that belong to it.
+    pub fn invalidate_compiled_trace(&mut self, trace_id: u64) {
+        let stale: Vec<u64> = self
+            .compiled_loops
+            .iter()
+            .filter(|(_, entry)| entry.root_trace_id == trace_id)
+            .map(|(green_key, _)| *green_key)
+            .collect();
+        for green_key in stale {
+            self.compiled_loops.swap_remove(&green_key);
+            self.forget_loop_side_tables(green_key);
+        }
+    }
+
+    /// Drop the per-loop side tables (`loop_header_pcs`, `loop_header_greens`)
+    /// when a loop is retired, so they cannot outlive `compiled_loops`.
+    /// `compiled_key_for_greens` already skips keys without compiled targets,
+    /// so a leftover entry could not mis-target a bridge — but keeping them
+    /// would grow both maps without bound over a long run.
+    fn forget_loop_side_tables(&mut self, green_key: u64) {
+        self.loop_header_pcs.swap_remove(&green_key);
+        self.loop_header_greens.swap_remove(&green_key);
     }
 
     /// rpython/rlib/rstack.py:75-90 `stack_almost_full` — delegates to
@@ -9085,6 +9182,7 @@ impl<M: Clone> MetaInterp<M> {
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
                 self.compiled_loops.swap_remove(&gk);
+                self.forget_loop_side_tables(gk);
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-mem-collect",
@@ -9614,8 +9712,15 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Remove all compiled loops. Used when guard-fail recovery is
     /// unrecoverable (null Ref in resume data).
+    ///
+    /// Bulk form of `remove_compiled_loop`, so it drops the per-loop side
+    /// tables too — see `forget_loop_side_tables`. `pending_preamble_tokens`
+    /// is left alone: it is keyed by green key but holds tokens for a
+    /// recompile that has not happened yet, not for the loops being dropped.
     pub fn clear_compiled_loops(&mut self) {
         self.compiled_loops.clear();
+        self.loop_header_pcs.clear();
+        self.loop_header_greens.clear();
     }
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
@@ -10130,7 +10235,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
@@ -10644,7 +10749,7 @@ impl<M: Clone> MetaInterp<M> {
                     frontend_boxes,
                     liveboxes,
                     livebox_types,
-                    all_descrs: self.staticdata.all_descrs.lock().unwrap().clone(),
+                    all_descrs: self.staticdata.all_descrs().lock().unwrap().clone(),
                     cpu: self.cpu.clone(),
                 })
             });
@@ -10728,7 +10833,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         if let Some(prd) = pending_bridge_rd.as_ref() {
             // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)`.
             // The concrete values belong on the fresh bridge InputArg objects
@@ -15251,6 +15356,20 @@ pub struct MetaInterpStaticData {
     /// `pyjitpl.py:2334-2342`), but pyre has not yet switched this
     /// storage edge over to the canonical codewriter `JitCode`.
     pub indirectcalltargets: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// warmspot.py:281-282 `metainterp_sd.jitcodes = codewriter.make_jitcodes()`.
+    ///
+    /// The one flat jitcode table. `codewriter.py:68` stamps each entry with
+    /// its position (`jitcode.index = len(all_jitcodes)` at the drain in
+    /// `codewriter.py:80`), and every resume frame carries that absolute index,
+    /// so `resume.py:1051 jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
+    /// resolves a frame with no per-driver or parent-relative bookkeeping.
+    ///
+    /// Upstream fills this once at translation, but the structure itself is a
+    /// growable memoized worklist — `call.py:155-172 get_jitcode` appends on a
+    /// miss and `codewriter.py:79-81` numbers each entry as it drains. Indices
+    /// are therefore append-only: published resume data bakes them
+    /// (`resume.py:250-252`), so an entry's index must never be reassigned.
+    pub jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
     /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
     /// Pair-list of (fnaddr, name) for debug introspection.
     pub _addr2name_keys: Vec<usize>,
@@ -15332,26 +15451,6 @@ pub struct MetaInterpStaticData {
     /// default; Rust needs interior mutability for the same
     /// behavior.
     pub globaldata: std::sync::Mutex<MetaInterpGlobalData>,
-    /// pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()`.
-    /// descr.py:25-47: dense list indexed by `descr_index`.
-    ///
-    /// RPython stores this on `metainterp_sd` (the static data object),
-    /// not on the live `MetaInterp` — opencoder / bridgeopt / optimizer
-    /// all read `metainterp_sd.all_descrs`. Pyre mirrors that location
-    /// so `opencoder::Trace` (which lives in this crate now) can read
-    /// the length directly via `self.metainterp_sd.all_descrs.lock().unwrap().len()`
-    /// from `_encode_descr` and the TraceIterator.
-    ///
-    /// TODO: wrapped in `Mutex` because
-    /// `MetaInterp.staticdata` is `Arc<MetaInterpStaticData>` and the
-    /// `TraceRecordBuffer` inside `TraceCtx` holds a clone of this Arc
-    /// (opencoder.py:471 `self.metainterp_sd = metainterp_sd` —
-    /// shared Python reference; lifts to Arc in Rust). With refcount ≥ 2,
-    /// `Arc::get_mut` fails, so `mem::take` at compile time and
-    /// `take_back_all_descrs` at post-optimize both route through a
-    /// Mutex lock. RPython's Python dicts are shared mutable references
-    /// by default; Rust needs interior mutability for the same behavior.
-    pub all_descrs: std::sync::Mutex<Vec<DescrRef>>,
     /// `descr.py:20 GcCache._cache_array` parity for the dispatch JitCode
     /// trace-side `BC_GETARRAYITEM_GC_I` recorder.
     ///
@@ -15512,6 +15611,19 @@ impl crate::compile::DescrContainer for MetaInterpStaticData {
 }
 
 impl MetaInterpStaticData {
+    /// pyjitpl.py:2289 `self.all_descrs = self.cpu.setup_descrs()` —
+    /// descr.py:25-47's dense list, indexed by `descr_index`.  opencoder /
+    /// bridgeopt / optimizer all read `metainterp_sd.all_descrs`; this is
+    /// that slot.
+    ///
+    /// Upstream's is a plain attribute on the one `metainterp_sd`.  Pyre's
+    /// backing store is `descr_registry::all_descrs()` because `descr_index`
+    /// is stamped off the process-wide `GcCache` — see that static's docs for
+    /// why the list cannot be per-instance.
+    pub fn all_descrs(&self) -> &'static std::sync::Mutex<Vec<DescrRef>> {
+        majit_ir::descr_registry::all_descrs()
+    }
+
     pub fn new() -> Self {
         // `pyjitpl.py:2222` `compile.make_and_attach_done_descrs([self, cpu])`.
         // RPython passes `[self, cpu]` — the same `Arc<DoneWithThisFrameDescr*>`
@@ -15894,6 +16006,19 @@ impl MetaInterpStaticData {
     /// same bitstrings (compute_bitstrings's class assignment is
     /// deterministic for a given EI population).
     pub fn finish_setup_descrs(&self) {
+        // `warmspot.py:289` runs `finish_setup` once, in one process,
+        // before any tracing, so its writes onto the shared descrs have a
+        // single writer by construction.  Pyre keeps `MetaInterpStaticData`
+        // per thread while the descrs it mutates here (`set_descr_index`,
+        // `set_ei_index`, `set_effect_bitstrings`) live in the
+        // process-global `GcCache`, so two threads reaching this at once
+        // are two writers over one `EffectInfoCell` — each dropping the
+        // other's just-installed bitstring `Vec`.  Serialise the publish so
+        // the single-writer contract `EffectInfoCell::set_bitstrings`
+        // documents holds for real.
+        static PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _publish = PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+
         // PyPy `backend/llsupport/descr.py:25-47 setup_descrs` walks
         // `gc_cache` per-category in this fixed order: size, field,
         // array, arraylen, call, interiorfield.  Each visit assigns
@@ -15919,7 +16044,7 @@ impl MetaInterpStaticData {
 
         // Publish onto staticdata.all_descrs so opencoder / bridgeopt /
         // optimizer reads pick up the same length.
-        *self.all_descrs.lock().unwrap() = all_descrs.clone();
+        *self.all_descrs().lock().unwrap() = all_descrs.clone();
 
         // pyjitpl.py:2290 `effectinfo.compute_bitstrings(self.all_descrs)`.
         // Two-pass mutation: clone each call descr's EI for the algorithm
@@ -16014,6 +16139,18 @@ impl MetaInterpStaticData {
         self.indirectcalltargets = targets;
         // Force a rebuild of the lazy lookup on next access.
         self.globaldata.lock().unwrap().indirectcall_dict = None;
+    }
+
+    /// warmspot.py:281-282 `self.metainterp_sd.jitcodes = jitcodes` — install
+    /// a codewriter's drained jitcode list. Each entry must already carry its
+    /// absolute index (`codewriter.py:68`).
+    pub fn install_jitcodes(&mut self, jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>) {
+        self.jitcodes = jitcodes;
+    }
+
+    /// resume.py:1051 `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
+    pub fn jitcode_at(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
+        self.jitcodes.get(index)
     }
 
     /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
@@ -21777,5 +21914,80 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
+    }
+}
+
+/// Every path that retires a `compiled_loops` entry must also retire the
+/// per-loop side tables keyed by the same green key, so they cannot outlive
+/// the loop and grow without bound over a long run.
+#[cfg(test)]
+mod loop_side_table_tests {
+    use super::*;
+
+    fn compiled_entry(root_trace_id: u64) -> CompiledEntry<()> {
+        CompiledEntry {
+            token: std::sync::Weak::new(),
+            meta: (),
+            front_target_tokens: Vec::new(),
+            front_target_source_positions: None,
+            root_trace_id,
+            traces: indexmap::IndexMap::new(),
+            previous_tokens: Vec::new(),
+            next_global_opref: 0,
+        }
+    }
+
+    /// Register a loop at `green_key` with both side tables populated.
+    fn record_loop(meta: &mut MetaInterp<()>, green_key: u64, root_trace_id: u64) {
+        meta.compiled_loops
+            .insert(green_key, compiled_entry(root_trace_id));
+        meta.record_loop_header_pc(green_key, green_key as usize);
+        meta.record_loop_header_greens(green_key, (vec![green_key as i64], vec![], vec![]));
+    }
+
+    fn has_side_tables(meta: &MetaInterp<()>, green_key: u64) -> bool {
+        meta.loop_header_pcs.contains_key(&green_key)
+            || meta.loop_header_greens.contains_key(&green_key)
+    }
+
+    #[test]
+    fn remove_compiled_loop_drops_the_side_tables() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7, 100);
+        record_loop(&mut meta, 8, 101);
+
+        meta.remove_compiled_loop(7);
+
+        assert!(!has_side_tables(&meta, 7));
+        assert!(has_side_tables(&meta, 8));
+    }
+
+    #[test]
+    fn clear_compiled_loops_drops_every_side_table() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7, 100);
+        record_loop(&mut meta, 8, 101);
+
+        meta.clear_compiled_loops();
+
+        assert!(meta.compiled_loops.is_empty());
+        assert!(meta.loop_header_pcs.is_empty());
+        assert!(meta.loop_header_greens.is_empty());
+    }
+
+    #[test]
+    fn invalidate_compiled_trace_drops_the_side_tables_of_the_matching_loops_only() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7, 100);
+        record_loop(&mut meta, 8, 100);
+        record_loop(&mut meta, 9, 101);
+
+        meta.invalidate_compiled_trace(100);
+
+        assert_eq!(meta.compiled_loops.len(), 1);
+        assert!(meta.compiled_loops.contains_key(&9));
+        assert!(!has_side_tables(&meta, 7));
+        assert!(!has_side_tables(&meta, 8));
+        assert!(has_side_tables(&meta, 9));
     }
 }

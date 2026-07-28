@@ -302,6 +302,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
+        wasm_alloc_nursery_headerless_no_collect,
+    ));
     majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
         wasm_alloc_nursery_typed_with_placement,
     ));
@@ -518,6 +521,15 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // is not a registered GC root.
     with_wasm_active_gc_mut(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size))
         .unwrap_or(GcRef(0))
+}
+
+/// `majit_gc::AllocNurseryHeaderlessNoCollectFn`. The metainterp's jitcode
+/// tracer allocates a `NEW` on a `headerless` descr through here so the object
+/// lands in the interpreter's own collected pool rather than the host heap,
+/// where its collector could not see it. Returns `GcRef(0)` when no GC is
+/// bound, leaving the caller on its own path.
+fn wasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
+    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size)).unwrap_or(GcRef(0))
 }
 
 /// Placement-reporting companion of [`wasm_alloc_nursery_typed`].
@@ -1569,6 +1581,27 @@ impl majit_backend::Backend for WasmBackend {
         arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         self.bh_new_array(length, arraydescr)
+    }
+
+    /// llmodel.py:585-588 bh_arraylen_gc: read the length prefix at
+    /// `lendescr.offset`. Word-width (`*const usize`), matching the store
+    /// `bh_new_array` makes at the same offset — a fixed 8-byte read would fold
+    /// the first item into the high half on wasm32.
+    ///
+    /// Without this the trait stub answers `0` for every array length reached
+    /// at trace time, so a spare-capacity test (`length < len(items)`) records
+    /// its at-capacity arm on a list that has room. The compiled code reads the
+    /// real length, so that guard then fails on nearly every iteration and the
+    /// trace never stays in compiled code.
+    fn bh_arraylen_gc(
+        &self,
+        array_ptr: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        let ofs = arraydescr
+            .array_len_offset()
+            .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
+        unsafe { *((array_ptr as *const u8).add(ofs) as *const usize) as i64 }
     }
 
     fn compile_loop(
@@ -2723,7 +2756,18 @@ impl majit_backend::Backend for WasmBackend {
                     wasm_alloc_oldgen_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth));
                 assert!(jf_ref.0 != 0, "wasm JitFrame allocation failed");
                 let jf = jf_ref.0 as *mut JitFrame;
-                unsafe { JitFrame::init(jf, std::ptr::null(), depth) };
+                // `JitFrame::init` requires zero-filled storage, which the
+                // native `calloc` entry (`runner.rs` `execute_token`) and the
+                // wasm nursery reset (`nursery.rs` `reset`) both provide but
+                // the old-gen arena does not — `ArenaCollection::malloc`
+                // deliberately returns recycled bytes. `build_home_gcmap`
+                // marks every Ref home of the frozen geometry, so a home the
+                // trace has not defined yet when a collection lands must read
+                // as null rather than as a stale word.
+                unsafe {
+                    std::ptr::write_bytes(jf as *mut u8, 0, JitFrame::alloc_size(depth));
+                    JitFrame::init(jf, std::ptr::null(), depth);
+                }
 
                 // Per-loop gcmap over the surviving Ref-home region. Held in this
                 // stack frame (jf_gcmap points at it) until the outputs are read

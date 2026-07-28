@@ -455,7 +455,14 @@ pub struct PyreSizeDescr {
 }
 
 struct PyreObjectDescrGroup {
-    size_descr: Arc<PyreSizeDescr>,
+    size_descr: Arc<majit_ir::descr::SimpleSizeDescr>,
+    /// This group's own fields, in the order its static table declared them.
+    ///
+    /// Static accessors index by their table position, so they must read this
+    /// list. `descr.py:218-239` still makes each Arc shared by
+    /// `(STRUCT, fieldname)`, while each SizeDescr keeps its own frozen
+    /// positional field list.
+    field_descrs: Vec<Arc<majit_ir::descr::SimpleFieldDescr>>,
 }
 
 /// GC type id for the `rclass.OBJECT` root — pyre's static `INSTANCE_TYPE`
@@ -625,13 +632,11 @@ pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 pub use pyre_interpreter::pyframe::{FRAME_BLOCK_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID};
 
 fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
-    let field_descr = group
-        .size_descr
-        .all_fielddescrs
+    group
+        .field_descrs
         .get(index)
         .expect("field descriptor index out of bounds")
-        .clone();
-    field_descr
+        .clone() as DescrRef
 }
 
 /// Build a SizeDescr group for a runtime PyObject layout and publish
@@ -645,11 +650,8 @@ fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRe
 /// alias for the future analyzer use-import resolver (B-5 follow-up):
 /// when that lands, analyzer's `owner_root` switches to qualified
 /// form and the SAME `Arc<PyreSizeDescr>` is reachable via the
-/// qualified hash.  `register_keyed_size` is first-write-wins per
-/// `descr.py:25-47 setup_descrs` cache-iteration invariant — the
-/// second publish's losing Arc does NOT enter `_cache_size_order`,
-/// so `all_descrs` enumerates exactly one entry per logical
-/// SizeDescr (PyPy's per-tuple identity).
+/// qualified hash. `register_keyed_size` keeps one `_cache_size_order`
+/// entry per logical SizeDescr while allowing fuller-layout upgrades.
 ///
 /// `def_path` empty (or equal to `simple_name`) → single publish.
 fn build_object_descr_group_with_def_path(
@@ -660,79 +662,55 @@ fn build_object_descr_group_with_def_path(
     simple_name: &str,
     def_path: &str,
 ) -> PyreObjectDescrGroup {
-    let size_descr = Arc::new_cyclic(|weak_size: &Weak<PyreSizeDescr>| {
-        let parent_descr: Weak<dyn Descr> = weak_size.clone();
-        let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = fields
-            .iter()
-            .enumerate()
-            .map(
-                |(
-                    index_in_parent,
-                    &(name, offset, field_size, field_type, signed, immutable, quasi_immutable),
-                )| {
-                    Arc::new(PyreFieldDescr {
-                        offset,
-                        field_size,
-                        field_type,
-                        signed,
-                        immutable,
-                        quasi_immutable,
-                        name,
-                        index_in_parent,
-                        parent_descr: Some(parent_descr.clone()),
-                        ei_index: AtomicU32::new(u32::MAX),
-                    }) as Arc<dyn FieldDescr>
+    let cache_key = if !def_path.is_empty() {
+        majit_ir::descr::path_hash(def_path)
+    } else if !simple_name.is_empty() {
+        majit_ir::descr::path_hash(simple_name)
+    } else {
+        0
+    };
+    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = fields
+        .iter()
+        .enumerate()
+        .map(
+            |(
+                index_in_parent,
+                &(field_key, offset, field_size, field_type, signed, immutable, quasi_immutable),
+            )| majit_ir::descr::SimpleFieldDescrSpec {
+                index: stable_field_index(offset, field_size, field_type, signed),
+                field_key: field_key.to_string(),
+                name: if simple_name.is_empty() {
+                    field_key.to_string()
+                } else {
+                    format!("{simple_name}.{field_key}")
                 },
-            )
-            .collect();
-        // descr.py:123-126 precompute both lists; `gc_fielddescrs` is
-        // `all_fielddescrs(only_gc=True)` per heaptracker.py:94-95.
-        let mut gc_fielddescrs: Vec<Arc<dyn FieldDescr>> = all_fielddescrs
-            .iter()
-            .filter(|fd| fd.is_pointer_field())
-            .cloned()
-            .collect();
-        // descr.py:121-126 + heaptracker.py:94-95: gc_fielddescrs walks
-        // the complete GC struct, including inherited fields.  Every
-        // runtime object group built here embeds PyObject, whose `w_class`
-        // is a GC reference even when the leaf field list only names the
-        // concrete payload (for example W_IntObject.intval).  Keep the
-        // leaf-only all_fielddescrs indexing used by OptVirtualize, but add
-        // the inherited header edge to the allocation-clear census unless
-        // a group already declared that offset explicitly.
-        if !gc_fielddescrs
-            .iter()
-            .any(|fd| fd.offset() == pyre_object::pyobject::W_CLASS_OFFSET)
-        {
-            gc_fielddescrs.push(W_CLASS_FIELD_DESCR.clone());
-        }
-        // `descr.py:108-118 get_size_descr` cache key — `path_hash`로
-        // 만들어진 lltype-object identity.  Prefer the canonical
-        // *def-path* qualifier (PyPy's `lltype.Struct` identity has
-        // a single module-path keyed slot); fall back to simple-name
-        // for legacy registrations without `def_path`.  Both
-        // `path_hash(simple_name)` and `path_hash(def_path)` are still
-        // dual-published as Arc aliases so untransformed bare-name
-        // analyzer lookups (pending the use_imports lexical resolver,
-        // [[orthodox-6item-2026-05-17]]) still hit.  Round-trip via
-        // `bh_size_spec_from_descr` lands on the canonical def-path
-        // slot.
-        let cache_key = if !def_path.is_empty() {
-            majit_ir::descr::path_hash(def_path)
-        } else if !simple_name.is_empty() {
-            majit_ir::descr::path_hash(simple_name)
-        } else {
-            0
-        };
-        PyreSizeDescr {
-            obj_size,
-            type_id,
-            cache_key,
-            vtable,
-            all_fielddescrs,
-            gc_fielddescrs,
-        }
-    });
+                offset,
+                field_size,
+                field_type,
+                is_immutable: immutable,
+                is_quasi_immutable: quasi_immutable,
+                flag: runtime_array_flag(field_type, signed),
+                virtualizable: false,
+                index_in_parent,
+            },
+        )
+        .collect();
+    let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        SIZE_DESCR_TAG | (obj_size as u32 & 0x0FFF_FFFF),
+        obj_size,
+        type_id,
+        cache_key,
+        vtable,
+        true,
+        false,
+        &specs,
+        &[W_CLASS_FIELD_DESCR.clone()],
+    );
+    let field_descrs = group.field_descrs;
+    let size_descr = group.size_descr;
+    // heaptracker.py:50-73 recurses into the inherited header, and
+    // heaptracker.py:70 includes the embedded `PyObject.w_class` GC edge.
+    // The factory keeps that extra edge out of the positional list.
     // Dual-publish: register under BOTH the simple-name slot AND
     // (when supplied) the crate-stripped def-path slot.
     //
@@ -745,11 +723,8 @@ fn build_object_descr_group_with_def_path(
     // analyzer use-import resolver (B-5 follow-up): when that lands,
     // analyzer's `owner_root` switches to qualified form and the
     // SAME `Arc<PyreSizeDescr>` is reachable via the qualified
-    // hash.  `register_keyed_size` is first-write-wins per
-    // `descr.py:25-47 setup_descrs` cache-iteration invariant — the
-    // second registration's losing Arc does NOT enter
-    // `_cache_size_order`, so `all_descrs` enumerates exactly one
-    // entry per logical SizeDescr (PyPy's per-tuple identity).
+    // hash. `register_keyed_size` keeps one `_cache_size_order` entry
+    // per logical SizeDescr while allowing fuller-layout upgrades.
     if !simple_name.is_empty() {
         let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(simple_name));
         majit_ir::descr_registry::register_keyed_size(
@@ -764,7 +739,10 @@ fn build_object_descr_group_with_def_path(
             size_descr.clone() as majit_ir::DescrRef,
         );
     }
-    PyreObjectDescrGroup { size_descr }
+    PyreObjectDescrGroup {
+        size_descr,
+        field_descrs,
+    }
 }
 
 static W_INT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -772,15 +750,7 @@ static W_INT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         std::mem::size_of::<W_IntObject>(),
         W_INT_GC_TYPE_ID,
         &INT_TYPE as *const _ as usize,
-        &[(
-            "W_IntObject.intval",
-            INT_INTVAL_OFFSET,
-            8,
-            Type::Int,
-            true,
-            true,
-            false,
-        )],
+        &[("intval", INT_INTVAL_OFFSET, 8, Type::Int, true, true, false)],
         "W_IntObject",
         "intobject::W_IntObject",
     )
@@ -792,7 +762,7 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         W_FLOAT_GC_TYPE_ID,
         &FLOAT_TYPE as *const _ as usize,
         &[(
-            "W_FloatObject.floatval",
+            "floatval",
             FLOAT_FLOATVAL_OFFSET,
             8,
             Type::Float,
@@ -811,7 +781,7 @@ static W_LONG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         pyre_object::longobject::W_LONG_GC_TYPE_ID,
         &pyre_object::pyobject::LONG_TYPE as *const _ as usize,
         &[(
-            "W_LongObject.value",
+            "value",
             pyre_object::longobject::LONG_VALUE_OFFSET,
             8,
             // The `value` slot is a gc-pointer to the BigInt payload, so it
@@ -833,7 +803,7 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         W_BOOL_GC_TYPE_ID,
         &pyre_object::pyobject::BOOL_TYPE as *const _ as usize,
         &[(
-            "W_BoolObject.intval",
+            "intval",
             BOOL_INTVAL_OFFSET,
             8,
             Type::Int,
@@ -853,7 +823,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
         &pyre_object::functional::RANGE_ITER_TYPE as *const _ as usize,
         &[
             (
-                "W_IntRangeIterator.current",
+                "current",
                 RANGE_ITER_CURRENT_OFFSET,
                 8,
                 Type::Int,
@@ -862,7 +832,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
             (
-                "W_IntRangeIterator.remaining",
+                "remaining",
                 RANGE_ITER_REMAINING_OFFSET,
                 8,
                 Type::Int,
@@ -871,7 +841,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
             (
-                "W_IntRangeIterator.step",
+                "step",
                 RANGE_ITER_STEP_OFFSET,
                 8,
                 Type::Int,
@@ -892,7 +862,7 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_object::functional::RANGE_TYPE as *const _ as usize,
         &[
             (
-                "W_Range.start",
+                "start",
                 RANGE_START_OFFSET,
                 8,
                 Type::Ref,
@@ -900,17 +870,9 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
             ),
+            ("step", RANGE_STEP_OFFSET, 8, Type::Ref, false, true, false),
             (
-                "W_Range.step",
-                RANGE_STEP_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                true,
-                false,
-            ),
-            (
-                "W_Range.length",
+                "length",
                 RANGE_LENGTH_OFFSET,
                 8,
                 Type::Ref,
@@ -945,7 +907,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_object::function::METHOD_TYPE as *const _ as usize,
         &[
             (
-                "Method.w_function",
+                "w_function",
                 METHOD_W_FUNCTION_OFFSET,
                 8,
                 Type::Ref,
@@ -954,7 +916,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "Method.w_self",
+                "w_self",
                 METHOD_W_SELF_OFFSET,
                 8,
                 Type::Ref,
@@ -963,7 +925,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "Method.w_class",
+                "w_class",
                 METHOD_W_CLASS_OFFSET,
                 8,
                 Type::Ref,
@@ -1007,7 +969,7 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
         W_OBJECT_MUTABLE_CELL_GC_TYPE_ID,
         &OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
         &[(
-            "ObjectMutableCell.w_value",
+            "w_value",
             W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS[0],
             8,
             Type::Ref,
@@ -1040,7 +1002,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 // out-of-bounds list access. Same fix as `str_len_descr`; the
                 // `usize`/pointer fields below follow suit (the `Type::Ref`
                 // fields are safe — read at pointer width regardless of size).
-                "W_ListObject.length",
+                "length",
                 std::mem::offset_of!(W_ListObject, length),
                 std::mem::size_of::<usize>(),
                 Type::Int,
@@ -1054,7 +1016,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // (`list.object_grow` → `grow_list_items_block`) or when the
             // strategy switches.
             (
-                "W_ListObject.items",
+                "items",
                 std::mem::offset_of!(W_ListObject, items),
                 8,
                 Type::Ref,
@@ -1076,7 +1038,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 // pyre has no such hook yet, so `strategy` stays
                 // plain-mutable. TODO — strategy split itself
                 // is a pyre-only adaptation vs rlist.py.
-                "W_ListObject.strategy",
+                "strategy",
                 std::mem::offset_of!(W_ListObject, strategy),
                 1,
                 Type::Int,
@@ -1090,7 +1052,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // the unwrap inline and doesn't add a separate backing
             // array).
             (
-                "W_ListObject.int_items.len",
+                "int_items.len",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
                 std::mem::size_of::<usize>(),
                 Type::Int,
@@ -1100,7 +1062,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             ),
             // Float-strategy typed storage.
             (
-                "W_ListObject.float_items.len",
+                "float_items.len",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
                 std::mem::size_of::<usize>(),
                 Type::Int,
@@ -1114,7 +1076,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // items[i] through the heap cache. Mutable: re-pointed on grow /
             // strategy switch (like `W_ListObject.items`).
             (
-                "W_ListObject.int_items.block",
+                "int_items.block",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_BLOCK_OFFSET,
                 8,
                 Type::Ref,
@@ -1123,7 +1085,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_ListObject.float_items.block",
+                "float_items.block",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_BLOCK_OFFSET,
                 8,
                 Type::Ref,
@@ -1165,7 +1127,7 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &[
             // `Ptr(GcArray(OBJECTPTR))` — wrappeditems body. Immutable.
             (
-                "W_TupleObject.wrappeditems",
+                "wrappeditems",
                 std::mem::offset_of!(W_TupleObject, wrappeditems),
                 8,
                 Type::Ref,
@@ -1199,7 +1161,7 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
         &SPECIALISED_TUPLE_II_TYPE as *const _ as usize,
         &[
             (
-                "W_SpecialisedTupleObject_ii.value0",
+                "value0",
                 SPECIALISED_TUPLE_II_VALUE0_OFFSET,
                 8,
                 Type::Int,
@@ -1208,7 +1170,7 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
             (
-                "W_SpecialisedTupleObject_ii.value1",
+                "value1",
                 SPECIALISED_TUPLE_II_VALUE1_OFFSET,
                 8,
                 Type::Int,
@@ -1239,7 +1201,7 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
         &SPECIALISED_TUPLE_FF_TYPE as *const _ as usize,
         &[
             (
-                "W_SpecialisedTupleObject_ff.value0",
+                "value0",
                 SPECIALISED_TUPLE_FF_VALUE0_OFFSET,
                 8,
                 Type::Float,
@@ -1248,7 +1210,7 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
             (
-                "W_SpecialisedTupleObject_ff.value1",
+                "value1",
                 SPECIALISED_TUPLE_FF_VALUE1_OFFSET,
                 8,
                 Type::Float,
@@ -1279,7 +1241,7 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
         &SPECIALISED_TUPLE_OO_TYPE as *const _ as usize,
         &[
             (
-                "W_SpecialisedTupleObject_oo.value0",
+                "value0",
                 SPECIALISED_TUPLE_OO_VALUE0_OFFSET,
                 8,
                 Type::Ref,
@@ -1288,7 +1250,7 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
             (
-                "W_SpecialisedTupleObject_oo.value1",
+                "value1",
                 SPECIALISED_TUPLE_OO_VALUE1_OFFSET,
                 8,
                 Type::Ref,
@@ -1317,7 +1279,7 @@ static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         0,
         0,
         &[(
-            "ItemsBlock.capacity",
+            "capacity",
             pyre_object::object_array::ITEMS_BLOCK_LEN_OFFSET,
             std::mem::size_of::<usize>(),
             Type::Int,
@@ -1344,7 +1306,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_object::sliceobject::SLICE_TYPE as *const _ as usize,
         &[
             (
-                "W_SliceObject.w_start",
+                "w_start",
                 SLICE_START_OFFSET,
                 8,
                 Type::Ref,
@@ -1353,7 +1315,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_SliceObject.w_stop",
+                "w_stop",
                 SLICE_STOP_OFFSET,
                 8,
                 Type::Ref,
@@ -1362,7 +1324,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_SliceObject.w_step",
+                "w_step",
                 SLICE_STEP_OFFSET,
                 8,
                 Type::Ref,
@@ -1387,7 +1349,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
         &[
             (
-                "PyFrame.locals_cells_stack_w",
+                "locals_cells_stack_w",
                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
                 8,
                 Type::Ref,
@@ -1396,7 +1358,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.valuestackdepth",
+                "valuestackdepth",
                 crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
                 8,
                 Type::Int,
@@ -1405,7 +1367,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.last_instr",
+                "last_instr",
                 crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET,
                 8,
                 Type::Int,
@@ -1414,7 +1376,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.pycode",
+                "pycode",
                 crate::frame_layout::PYFRAME_PYCODE_OFFSET,
                 8,
                 Type::Ref,
@@ -1422,6 +1384,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pyframe.py:49 self.w_globals` — the slot the inline
+            // new-PyFrame helper populates from the function's globals dict.
             (
                 "PyFrame.w_globals",
                 crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
@@ -1498,17 +1462,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // `pyframe.py:49 self.w_globals` parity. The inline new-PyFrame
-            // helper populates this slot from the function's globals dict.
-            (
-                "PyFrame.w_globals",
-                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
         ],
         "PyFrame",
         "pyframe::PyFrame",
@@ -1552,21 +1505,8 @@ impl SizeDescr for PyreSizeDescr {
         self.vtable
     }
 
-    /// The canonical `w_class` (Python class object) for instances of
-    /// this type — `get_instantiate(vtable_type)`. Read live (not cached
-    /// at construction) since the type objects are installed after the
-    /// descrs are built. `None` before `init_typeobjects()` runs.
     fn w_class_obj(&self) -> Option<i64> {
-        if self.vtable == 0 {
-            return None;
-        }
-        let tp = self.vtable as *const pyre_object::pyobject::PyType;
-        let w_class = unsafe { pyre_object::pyobject::get_instantiate(&*tp) };
-        if w_class.is_null() {
-            None
-        } else {
-            Some(w_class as i64)
-        }
+        w_class_obj_for_vtable(self.vtable)
     }
 
     fn is_immutable(&self) -> bool {
@@ -1806,6 +1746,30 @@ pub fn w_class_descr() -> DescrRef {
     W_CLASS_FIELD_DESCR.clone() as DescrRef
 }
 
+/// The canonical `w_class` (Python class object) for instances of the type
+/// `vtable` names — `get_instantiate(vtable_type)`. Read live (not cached at
+/// construction) since the type objects are installed after the descrs are
+/// built. `None` before `init_typeobjects()` runs.
+///
+/// Registered as majit's [`majit_ir::descr::WClassObjFn`] so the generic
+/// `SimpleSizeDescr` — which every runtime PyObject group and every
+/// blackhole-dispatch size descr is built as — answers `w_class_obj` the same
+/// way `PyreSizeDescr` does. Without it `OptVirtualize` cannot fold the
+/// `w_class` header read off a `new_with_vtable` virtual and forces the
+/// virtual instead.
+pub fn w_class_obj_for_vtable(vtable: usize) -> Option<i64> {
+    if vtable == 0 {
+        return None;
+    }
+    let tp = vtable as *const pyre_object::pyobject::PyType;
+    let w_class = unsafe { pyre_object::pyobject::get_instantiate(&*tp) };
+    if w_class.is_null() {
+        None
+    } else {
+        Some(w_class as i64)
+    }
+}
+
 /// Alias for backward compatibility — same as w_class_descr().
 pub fn instance_w_type_descr() -> DescrRef {
     w_class_descr()
@@ -1932,6 +1896,7 @@ pub fn int_mutable_cell_value_descr() -> DescrRef {
                 false,
                 majit_ir::descr::ArrayFlag::Signed,
                 "IntMutableCell.intvalue".to_string(),
+                "intvalue".to_string(),
             ))
         })
         .clone()
@@ -2683,6 +2648,7 @@ pub fn ec_sys_exc_value_descr() -> DescrRef {
             0,
             &[SimpleFieldDescrSpec {
                 index: 0,
+                field_key: "sys_exc_value".to_string(),
                 name: "ExecutionContext.sys_exc_value".to_string(),
                 offset: pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
                 field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
@@ -2756,7 +2722,7 @@ pub fn pyframe_code_descr() -> DescrRef {
 /// PyObjectRef.  `PyFrame.w_globals` is the single globals slot;
 /// the raw dict-storage accessor has been retired.
 pub fn pyframe_w_globals_obj_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 12)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
 }
 
 /// rewrite.py:665-695 handle_call_assembler scalar field read for the
@@ -2965,6 +2931,7 @@ mod tests {
             all_fielddescrs: vec![
                 BhFieldSpec {
                     index: 0,
+                    field_key: "next".into(),
                     name: "Cell.next".into(),
                     offset: 8,
                     field_size: 8,
@@ -2977,6 +2944,7 @@ mod tests {
                 },
                 BhFieldSpec {
                     index: 1,
+                    field_key: "value".into(),
                     name: "Cell.value".into(),
                     offset: 16,
                     field_size: 8,
@@ -3194,6 +3162,7 @@ mod tests {
         let fields = vec![
             BhFieldSpec {
                 index: 0,
+                field_key: "x".into(),
                 name: "Point.x".into(),
                 offset: 0,
                 field_size: 8,
@@ -3206,6 +3175,7 @@ mod tests {
             },
             BhFieldSpec {
                 index: 1,
+                field_key: "y".into(),
                 name: "Point.y".into(),
                 offset: 8,
                 field_size: 8,
@@ -3321,6 +3291,7 @@ fn simple_field_spec_from_bh(
 ) -> majit_ir::descr::SimpleFieldDescrSpec {
     majit_ir::descr::SimpleFieldDescrSpec {
         index: spec.index,
+        field_key: spec.field_key().to_string(),
         name: spec.name.clone(),
         offset: spec.offset,
         field_size: spec.field_size,
@@ -3357,138 +3328,41 @@ fn simple_field_spec_from_bh(
 /// never aliases distinct STRUCTs; absent a real identity carrier,
 /// the closest orthodox behaviour is "each call is a distinct
 /// STRUCT" — mint fresh per call.
-static SIMPLE_DESCR_GROUP_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<indexmap::IndexMap<u64, majit_ir::descr::SimpleDescrGroup>>,
-> = std::sync::OnceLock::new();
-
 fn simple_descr_group_from_bh_size(
     spec: &majit_translate::jitcode::BhSizeSpec,
 ) -> majit_ir::descr::SimpleDescrGroup {
-    let mint = || -> majit_ir::descr::SimpleDescrGroup {
-        let field_specs: Vec<_> = spec
-            .all_fielddescrs
-            .iter()
-            .map(simple_field_spec_from_bh)
-            .collect();
-        // `descr.py:108-118 get_size_descr` + `:218-239 get_field_descr`
-        // keyed publish: `spec.type_id` is the u64 `path_hash` cache
-        // key matching the runtime macro's `__majit_type_id`.  Route
-        // through the keyed factory so analyzer-side `cc.fielddescrof`
-        // lookups (via `gc_cache.get_field_descr(LLType::Struct(key),
-        // name, ...)`) resolve to the same Arc this mint produces —
-        // restoring PyPy `cpu.fielddescrof` per-`(STRUCT, name)`
-        // identity.  The u32 truncation for the SimpleSizeDescr's gc
-        // tid is a TODO (the tid is allocated by
-        // gc_cache.init_size_descr in the canonical path; this factory
-        // bypasses that, so the tid stays a path_hash-derived u32 with
-        // birthday-paradox collision risk around 2^16 distinct STRUCTs).
-        majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
-            u32::MAX,
-            spec.size,
-            spec.type_id as u32,
-            spec.type_id,
-            spec.vtable as usize,
-            spec.is_gc_managed,
-            spec.headerless,
-            &field_specs,
-        )
-    };
+    let field_specs: Vec<_> = spec
+        .all_fielddescrs
+        .iter()
+        .map(simple_field_spec_from_bh)
+        .collect();
 
     if spec.type_id == 0 {
         // No STRUCT-identity carrier — mint fresh per call so distinct
         // type_id-less STRUCTs don't collapse onto the first-inserted
         // descr group.  Per-STRUCT caching kicks in only when callers
         // route through a real `type_id` source.
-        return mint();
+        return majit_ir::descr::make_simple_descr_group(
+            u32::MAX,
+            spec.size,
+            spec.type_id as u32,
+            spec.vtable as usize,
+            &field_specs,
+        );
     }
-
-    let cache =
-        SIMPLE_DESCR_GROUP_CACHE.get_or_init(|| std::sync::Mutex::new(indexmap::IndexMap::new()));
-    {
-        let cache = cache.lock().unwrap();
-        if let Some(group) = cache.get(&spec.type_id) {
-            return group.clone();
-        }
-    }
-    let group = mint();
-    let mut cache = cache.lock().unwrap();
-    cache.entry_or_insert_with(spec.type_id, || group).clone()
-}
-
-#[derive(Debug)]
-struct ParentBackedFieldDescr {
-    field: Arc<majit_ir::descr::SimpleFieldDescr>,
-    parent: Arc<majit_ir::descr::SimpleSizeDescr>,
-}
-
-impl Descr for ParentBackedFieldDescr {
-    fn index(&self) -> u32 {
-        self.field.index()
-    }
-    fn get_descr_index(&self) -> i32 {
-        self.field.get_descr_index()
-    }
-    fn set_descr_index(&self, index: i32) {
-        self.field.set_descr_index(index);
-    }
-    fn is_always_pure(&self) -> bool {
-        self.field.is_always_pure()
-    }
-    fn is_quasi_immutable(&self) -> bool {
-        self.field.is_quasi_immutable()
-    }
-    fn is_virtualizable(&self) -> bool {
-        self.field.is_virtualizable()
-    }
-    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
-        Some(self)
-    }
-    /// `effectinfo.py:526` `descr.ei_index = …` parity — delegate to
-    /// the inner `SimpleFieldDescr`'s atomic so `compute_bitstrings`'s
-    /// `set_ei_index` write reaches the same storage that
-    /// `heap.rs::field_effect_index` reads through any cloned wrapper.
-    fn get_ei_index(&self) -> u32 {
-        self.field.get_ei_index()
-    }
-    fn set_ei_index(&self, index: u32) {
-        self.field.set_ei_index(index);
-    }
-}
-
-impl FieldDescr for ParentBackedFieldDescr {
-    fn offset(&self) -> usize {
-        self.field.offset()
-    }
-    fn field_size(&self) -> usize {
-        self.field.field_size()
-    }
-    fn field_type(&self) -> Type {
-        self.field.field_type()
-    }
-    fn is_pointer_field(&self) -> bool {
-        self.field.is_pointer_field()
-    }
-    fn is_float_field(&self) -> bool {
-        self.field.is_float_field()
-    }
-    fn is_field_signed(&self) -> bool {
-        self.field.is_field_signed()
-    }
-    fn is_immutable(&self) -> bool {
-        self.field.is_immutable()
-    }
-    fn field_name(&self) -> &str {
-        self.field.field_name()
-    }
-    fn index_in_parent(&self) -> usize {
-        self.field.index_in_parent()
-    }
-    fn get_parent_descr(&self) -> Option<DescrRef> {
-        Some(self.parent.clone() as DescrRef)
-    }
-    fn get_vinfo(&self) -> Option<Arc<dyn majit_ir::descr::VinfoMarker>> {
-        self.field.get_vinfo()
-    }
+    // `descr.py:108-118 get_size_descr` + `:218-239 get_field_descr`
+    // keyed publish: GcCache is the sole owner/cache for this STRUCT.
+    majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        u32::MAX,
+        spec.size,
+        spec.type_id as u32,
+        spec.type_id,
+        spec.vtable as usize,
+        spec.is_gc_managed,
+        spec.headerless,
+        &field_specs,
+        &[],
+    )
 }
 
 fn field_descr_from_bh_field(
@@ -3502,42 +3376,55 @@ fn field_descr_from_bh_field(
         // runtime `PyreFieldDescr` (or analyzer-published
         // `SimpleFieldDescr`).  Both back-reference the same parent
         // SizeDescr via `parent_descr` (descr.py:200), so the
-        // `ParentBackedFieldDescr` wrapper is unnecessary on this path
-        // — analyzer raw-set Arcs and runtime allocator descrs share
+        // an adapter wrapper is unnecessary on this path — analyzer
+        // raw-set Arcs and runtime allocator descrs share
         // one identity slot.
         if parent.type_id != 0 {
             let key = majit_ir::descr::LLType::Struct(parent.type_id);
-            let parent_size = majit_ir::descr::gc_cache()
-                .lock()
-                .unwrap()
-                ._cache_size
+            let field_key = field.field_key().to_string();
+            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+            // `descr.py:220-221 cache[STRUCT][fieldname]` hit.
+            if let Some(fd) = gc
+                ._cache_field
                 .get(&key)
-                .cloned();
-            if let Some(parent_descr) = parent_size {
-                if let Some(parent_sd) = parent_descr.as_size_descr() {
-                    for fd in parent_sd.all_fielddescrs() {
-                        if fd.index_in_parent() == field.index_in_parent
-                            && (fd.field_name() == field.name
-                                || fd.field_name().ends_with(&format!(".{}", field.name)))
-                        {
-                            return fd.clone() as DescrRef;
-                        }
-                    }
-                }
+                .and_then(|inner| inner.get(&field_key))
+            {
+                return fd.clone() as DescrRef;
+            }
+            // Miss with the parent STRUCT published: mint through
+            // `descr.py:225-238 get_field_descr` so this resolution and the
+            // walker's (`pyjitpl/dispatch.rs field_descr_ref_from_bh`) share
+            // one Arc.  `descr.py:238 parent_descr = get_size_descr(STRUCT)`
+            // needs the `_cache_size` slot, so only take this route when it
+            // is populated.
+            if gc._cache_size.contains_key(&key) {
+                let fd = gc.get_field_descr(
+                    key,
+                    &field_key,
+                    Some(field.name.as_str()),
+                    field.offset,
+                    field.field_size,
+                    field.field_type,
+                    field.is_immutable,
+                    field.is_quasi_immutable,
+                    field.field_flag,
+                    field.index,
+                    false,
+                    field.index_in_parent,
+                );
+                return fd as DescrRef;
             }
         }
-        // Cache miss / non-keyed parent — fall back to the legacy
-        // SimpleDescrGroup mint + `ParentBackedFieldDescr` wrapper so
-        // the cyclic parent_descr Weak still binds correctly.
+        // Cache miss / non-keyed parent — fall back to the descr group
+        // field itself; the keyed path minted it through get_field_descr.
         let group = simple_descr_group_from_bh_size(parent);
-        if let Some((pos, _)) = parent.all_fielddescrs.iter().enumerate().find(|(_, spec)| {
-            spec.index_in_parent == field.index_in_parent && spec.name == field.name
-        }) {
+        if let Some((pos, _)) =
+            parent.all_fielddescrs.iter().enumerate().find(|(_, spec)| {
+                spec.offset == field.offset && spec.field_key() == field.field_key()
+            })
+        {
             if let Some(descr) = group.field_descrs.get(pos) {
-                return Arc::new(ParentBackedFieldDescr {
-                    field: descr.clone(),
-                    parent: group.size_descr.clone(),
-                });
+                return descr.clone() as DescrRef;
             }
         }
     }
@@ -3550,6 +3437,7 @@ fn field_descr_from_bh_field(
         field.is_immutable,
         field.field_flag,
         field.name.clone(),
+        field.field_key().to_string(),
     )
     .with_quasi_immutable(field.is_quasi_immutable);
     let arc: DescrRef = Arc::new(descr);
@@ -3557,6 +3445,14 @@ fn field_descr_from_bh_field(
     // freshly-minted field descr so `compute_bitstrings` enumerates it.
     majit_ir::descr_registry::register_field(arc.clone());
     arc
+}
+
+fn bh_field_cache_key(owner: &str, name: &str) -> String {
+    if owner.is_empty() {
+        return name.to_string();
+    }
+    let prefix = format!("{owner}.");
+    name.strip_prefix(&prefix).unwrap_or(name).to_string()
 }
 
 /// Keyed sibling: accepts the u64 `cache_key` (= `path_hash(array_type_id)`)
@@ -3911,6 +3807,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             owner,
             ..
         } => {
+            let field_key = bh_field_cache_key(owner, name);
             // #171 codewriter descr-bridge: `_handle_list_call`
             // (codewriter/jtransform.rs) lowers Integer-strategy list
             // ops to fields on the dotted nested names
@@ -3923,6 +3820,20 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // list specializations already use so an assembled codewriter
             // list body addresses `IntArray.{len,block}` rather
             // than the header.
+            //
+            // This runs BEFORE the parent-group lookup below, not after: when
+            // the codewriter DOES model the parent struct, that lookup answers
+            // with the parent group's own entry for the same offset, and the
+            // field ends up carrying two descrs — the parent group's for a
+            // codewriter-lowered body, `W_LIST_DESCR_GROUP`'s for the
+            // walker-native specializations.  The heapcache and the optimizer's
+            // heap pass both key on descr identity, so the split silently
+            // breaks aliasing: the `w_list_append` sub-walk's
+            // `SetfieldGc(int_items.len)` does not invalidate the `len(xs)`
+            // read that follows it, which then folds to the pre-append length
+            // (one skipped `list.pop(0)` per compiled loop entry). One field is
+            // one descr — `metainterp_sd.all_descrs` has no second entry for a
+            // field just because a different interpreter reached it.
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
@@ -3949,6 +3860,30 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "length" => return list_length_descr(),
                     "items" => return list_items_descr(),
                     _ => {}
+                }
+            }
+            if let Some(parent) = parent {
+                if parent.type_id != 0 {
+                    let key = majit_ir::descr::LLType::Struct(parent.type_id);
+                    if let Some(fd) = majit_ir::descr::gc_cache()
+                        .lock()
+                        .unwrap()
+                        ._cache_field
+                        .get(&key)
+                        .and_then(|inner| inner.get(&field_key))
+                    {
+                        return fd.clone() as DescrRef;
+                    }
+                    let group = simple_descr_group_from_bh_size(parent);
+                    if let Some((pos, _)) =
+                        parent.all_fielddescrs.iter().enumerate().find(|(_, spec)| {
+                            spec.offset == *offset && spec.field_key() == field_key
+                        })
+                    {
+                        if let Some(descr) = group.field_descrs.get(pos) {
+                            return descr.clone() as DescrRef;
+                        }
+                    }
                 }
             }
             // #171 object-strategy capacity read: `list.obj_capacity` lowers
@@ -3998,6 +3933,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // upstream value rather than a `u32::MAX` sentinel.
             let field = majit_translate::jitcode::BhFieldSpec {
                 index: *index_in_parent as u32,
+                field_key,
                 name: full_name,
                 offset: *offset,
                 field_size: *field_size,
@@ -4254,6 +4190,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     field_type,
                     false,
                     field_flag,
+                    name.clone(),
                     name,
                 )
                 .with_index_in_parent(index_in_parent),
@@ -4301,6 +4238,217 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             method_name.clone(),
         )),
     }
+}
+
+/// Look a serialized raw-set member back up in the process-global gccache.
+///
+/// **Lookup only — never mint.** `descr.py:218-239 get_field_descr` is
+/// cache-or-mint because upstream calls it from `heaptracker.all_fielddescrs
+/// (STRUCT)`, which always has the whole `STRUCT` in hand and therefore mints
+/// the parent `SizeDescr` with its complete `all_fielddescrs` list
+/// (`descr.py:188 init_size_descr`). A serialized member carries only its own
+/// slot, so minting through it would publish a parent with an empty field
+/// list, win `_cache_field` by first-write, and leave
+/// `SizeDescr.all_fielddescrs` and `_cache_field` describing different
+/// objects — breaking the positional invariant `heaptracker.py:76-101
+/// get_fielddescr_index_in` establishes and `optimizeopt/info.rs force_box`
+/// asserts.
+///
+/// Outcome of looking one serialized raw-set member back up.
+enum SetMemberLookup {
+    /// The gccache holds the slot the analyzer minted through.
+    Resolved(majit_ir::DescrRef),
+    /// The *container* (`STRUCT` / `ARRAY`) is absent from this process's
+    /// descr universe entirely, so no operation recorded here can carry a
+    /// descr for it and the member cannot participate in any
+    /// `check_*_descr_*` answer.  Dropping it is the faithful projection of
+    /// the analyzer's frozenset onto the runtime universe — the analyzer
+    /// walks the whole translated program, the runtime only registers what
+    /// it actually traces.  Upstream has no counterpart because
+    /// `cpu.*descrof` and `compute_bitstrings` share one process.
+    ///
+    /// KNOWN GAP: "absent" is evaluated once, when the `BhCallDescr` is
+    /// materialised (`jitcode_runtime.rs rehydrated_call_descr_ref`), but the
+    /// runtime universe keeps growing after that.  A container registered
+    /// later — under the same `path_hash` key — leaves this EI permanently
+    /// claiming "not written" for a field the callee does write, so the
+    /// heapcache would not invalidate a read across the call.  No corpus
+    /// fixture reproduces it today.
+    ///
+    /// The conservative repair (treat this like [`Self::Ambiguous`] and
+    /// degrade the EI to `EF_RANDOM_EFFECTS`) is not taken here: a probe over
+    /// `bench/synth/comprehension_object_append_hot` counts 211 drops across
+    /// ~40 distinct containers (`W_TupleObject.wrappeditems`,
+    /// `PyFrame.w_globals`, `intval`, rbigint `_digits`/`_size`, …), so it
+    /// would turn most residual calls into whole-heap barriers.  The
+    /// convergence path is to stop freezing the sets at materialisation and
+    /// re-resolve from the retained `ei.descr_set_keys` as the universe grows
+    /// (i.e. inside `compute_bitstrings`, which already re-runs); that is
+    /// blocked on the descr-universe work and on `compute_bitstrings`' own
+    /// per-`jitcode_for` cost.
+    AbsentContainer,
+    /// The container IS published but not under this member's key.  A real
+    /// runtime descr for the field may exist under a different spelling, so
+    /// dropping the member would answer "not written" for a field that is;
+    /// the caller must fall back to the wildcard instead.
+    Ambiguous,
+}
+
+/// Look a serialized raw-set member back up in the process-global gccache.
+///
+/// **Lookup only — never mint.** `descr.py:218-239 get_field_descr` is
+/// cache-or-mint because upstream calls it from `heaptracker.all_fielddescrs
+/// (STRUCT)`, which always has the whole `STRUCT` in hand and therefore mints
+/// the parent `SizeDescr` with its complete `all_fielddescrs` list
+/// (`descr.py:188 init_size_descr`). A serialized member carries only its own
+/// slot, so minting through it would publish a parent with an empty field
+/// list, win `_cache_field` by first-write, and leave
+/// `SizeDescr.all_fielddescrs` and `_cache_field` describing different
+/// objects — breaking the positional invariant `heaptracker.py:76-101
+/// get_fielddescr_index_in` establishes and `optimizeopt/info.rs force_box`
+/// asserts.
+fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
+    use majit_ir::descr::{LLType, gc_cache};
+
+    match m {
+        majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id,
+            field_name,
+            ..
+        } => {
+            let struct_key = LLType::Struct(*struct_id);
+            let gc = gc_cache().lock().unwrap();
+            match gc._cache_field.get(&struct_key) {
+                Some(inner) => match inner.get(field_name.as_str()) {
+                    Some(fd) => SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef),
+                    None => SetMemberLookup::Ambiguous,
+                },
+                // No field map and no size slot: nothing in this process
+                // ever named the struct.
+                None if !gc._cache_size.contains_key(&struct_key) => {
+                    SetMemberLookup::AbsentContainer
+                }
+                None => SetMemberLookup::Ambiguous,
+            }
+        }
+        majit_ir::effectinfo::DescrSetMember::Array { array_id, .. } => {
+            match gc_cache()
+                .lock()
+                .unwrap()
+                ._cache_array
+                .get(&LLType::Array(*array_id))
+            {
+                Some(ad) => SetMemberLookup::Resolved(ad.clone()),
+                None => SetMemberLookup::AbsentContainer,
+            }
+        }
+        majit_ir::effectinfo::DescrSetMember::InteriorField { array_id, name, .. } => {
+            let gc = gc_cache().lock().unwrap();
+            let array_key = LLType::Array(*array_id);
+            match gc
+                ._cache_interiorfield
+                .get(&(array_key.clone(), name.clone(), String::new()))
+            {
+                Some(d) => SetMemberLookup::Resolved(d.clone()),
+                None if !gc._cache_array.contains_key(&array_key) => {
+                    SetMemberLookup::AbsentContainer
+                }
+                None => SetMemberLookup::Ambiguous,
+            }
+        }
+    }
+}
+
+/// Fill the six `_*_descrs_*` raw sets from `descr_set_keys`, canonicalising
+/// exactly as `effectinfo.py:128-145 frozenset_or_none` /
+/// `canonicalize_descr_set`.
+///
+/// All six sets or none of them: `effectinfo.py:149-162` makes them `None`
+/// **iff** the EI is `EF_RANDOM_EFFECTS`, and `compute_bitstrings`
+/// (`effectinfo.py:484-489`) asserts that biconditional before deciding
+/// whether to clear the bitstrings.  A half-populated EI would clear them
+/// while `extraeffect` still claims concrete effects, and the next
+/// `check_readonly_descr_field` would then read a `None` bitstring.
+pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
+    // `effectinfo.py:285-292` wildcard: the shape to fall back to whenever
+    // the concrete sets cannot be rebuilt faithfully.  Conservative in the
+    // sound direction — `has_random_effects()` makes every heap consumer
+    // assume the call touched everything.
+    fn degrade(ei: &mut majit_ir::EffectInfo) {
+        ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
+        // effectinfo.py:364-365 — the wildcard forces can_collect.
+        ei.can_collect = true;
+        ei._readonly_descrs_fields = None;
+        ei._write_descrs_fields = None;
+        ei._readonly_descrs_arrays = None;
+        ei._write_descrs_arrays = None;
+        ei._readonly_descrs_interiorfields = None;
+        ei._write_descrs_interiorfields = None;
+        ei.readonly_descrs_fields = None;
+        ei.write_descrs_fields = None;
+        ei.readonly_descrs_arrays = None;
+        ei.write_descrs_arrays = None;
+        ei.readonly_descrs_interiorfields = None;
+        ei.write_descrs_interiorfields = None;
+        ei.single_write_descr_array = None;
+    }
+
+    let Some(keys) = ei.descr_set_keys.as_ref() else {
+        // No serialized key channel.  For a build-time EI that means the
+        // codewriter already emitted the `EF_RANDOM_EFFECTS` wildcard, so
+        // the six raw sets are `None` and there is nothing to rebuild.  Any
+        // other shape lost its sets somewhere the invariant above does not
+        // cover; restore the wildcard rather than leave a concrete
+        // `extraeffect` pointing at absent sets.
+        if ei.extraeffect != majit_ir::ExtraEffect::RandomEffects {
+            degrade(ei);
+        }
+        return;
+    };
+    let resolve = |members: &[majit_ir::effectinfo::DescrSetMember]| {
+        let mut out = Vec::with_capacity(members.len());
+        for m in members {
+            match descr_from_set_member(m) {
+                SetMemberLookup::Resolved(d) => out.push(d),
+                SetMemberLookup::AbsentContainer => {}
+                SetMemberLookup::Ambiguous => return None,
+            }
+        }
+        Some(majit_ir::effectinfo::canonicalize_descr_set(out))
+    };
+    let resolved = (
+        resolve(&keys.readonly_fields),
+        resolve(&keys.write_fields),
+        resolve(&keys.readonly_arrays),
+        resolve(&keys.write_arrays),
+        resolve(&keys.readonly_interiorfields),
+        resolve(&keys.write_interiorfields),
+    );
+    let (
+        Some(readonly_fields),
+        Some(write_fields),
+        Some(readonly_arrays),
+        Some(write_arrays),
+        Some(readonly_interiorfields),
+        Some(write_interiorfields),
+    ) = resolved
+    else {
+        degrade(ei);
+        return;
+    };
+    ei._readonly_descrs_fields = Some(readonly_fields);
+    ei._write_descrs_fields = Some(write_fields);
+    ei._readonly_descrs_arrays = Some(readonly_arrays);
+    // effectinfo.py:201-206 single_write_descr_array — also `serde(skip)`,
+    // and read in production by `heap.rs force_from_effectinfo`, so it is
+    // re-derived from the set that just came back rather than left `None`.
+    ei.single_write_descr_array = match write_arrays.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    };
+    ei._write_descrs_arrays = Some(write_arrays);
+    ei._readonly_descrs_interiorfields = Some(readonly_interiorfields);
+    ei._write_descrs_interiorfields = Some(write_interiorfields);
 }
 
 /// `BhCallDescr` -> `CallDescr` adapter. RPython parity: codewriter

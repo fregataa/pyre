@@ -3183,7 +3183,28 @@ impl Optimizer {
                         // preamble target (unroll.py:238-242). Only the
                         // loop/peeled-loop path (optimize_peeled_loop
                         // unroll.py:135-145) keeps this fatal.
+                        //
+                        // Neither arm is reachable today: the preview exports
+                        // its state from `post_force_args` and re-matches that
+                        // same list, so every `state[i]` was derived from
+                        // `args[i]` and the walk is self-consistent. Probed
+                        // with five virtual-carrying fixtures (escaping tuple,
+                        // escaping instance, aliased list, varying-length
+                        // array, nested virtual), two of which do compile
+                        // bridges — zero hits, as with the aheui corpus and
+                        // pyre/bench + pyre/extra_tests. Upstream matches
+                        // against a *different* loop's stored state in
+                        // `jump_to_existing_trace` (unroll.py:207);
+                        // `export_state_re_matched_against_its_own_args_cannot_fail`
+                        // (virtualstate.rs) pins the self-match, so moving the
+                        // preview to the upstream shape breaks that test and
+                        // flags this branch as newly live.
                         if building_bridge {
+                            if crate::bridge_debug_enabled() {
+                                eprintln!(
+                                    "[bridgeB] preview virtual-state mismatch — leaving the export empty for the jump_to_existing_trace ladder"
+                                );
+                            }
                             break 'export None;
                         }
                         return Err(crate::optimize::InvalidLoop(
@@ -5821,6 +5842,7 @@ mod tests {
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
                 index: 91,
+                field_key: "CallResult.field".to_string(),
                 name: "CallResult.field".to_string(),
                 offset: 0,
                 field_size: 8,
@@ -5912,6 +5934,7 @@ mod tests {
             &[
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: 101,
+                    field_key: "CallResult.type".to_string(),
                     name: "CallResult.type".to_string(),
                     offset: 0,
                     field_size: 8,
@@ -5924,6 +5947,7 @@ mod tests {
                 },
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: 102,
+                    field_key: "CallResult.value".to_string(),
                     name: "CallResult.value".to_string(),
                     offset: 8,
                     field_size: 8,

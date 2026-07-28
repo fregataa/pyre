@@ -1009,6 +1009,8 @@ impl Default for BhCallDescr {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BhFieldSpec {
     pub index: u32,
+    #[serde(default)]
+    pub field_key: String,
     pub name: String,
     pub offset: usize,
     pub field_size: usize,
@@ -1021,6 +1023,14 @@ pub struct BhFieldSpec {
 }
 
 impl BhFieldSpec {
+    pub fn field_key(&self) -> &str {
+        if self.field_key.is_empty() {
+            &self.name
+        } else {
+            &self.field_key
+        }
+    }
+
     /// Mirror an `Arc<dyn FieldDescr>` into the serializable
     /// `BhFieldSpec` shape so producers outside the codewriter
     /// (e.g. blackhole-allocator dispatch in `pyre-jit`) can build
@@ -1040,6 +1050,7 @@ impl BhFieldSpec {
         };
         Self {
             index: fd.index(),
+            field_key: fd.field_key().to_string(),
             name: fd.field_name().to_string(),
             offset: fd.offset(),
             field_size: fd.field_size(),
@@ -1135,6 +1146,10 @@ fn ir_type_to_result_char(result_type: majit_ir::value::Type) -> char {
         majit_ir::value::Type::Void => 'v',
     }
 }
+
+/// `owner` sentinel marking a [`BhDescr::Size`] as headerless.  See
+/// [`BhDescr::is_headerless`] for why the flag rides in the owner slot.
+pub const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BhDescr {
@@ -1352,6 +1367,21 @@ impl BhDescr {
         }
     }
 
+    /// Whether the described struct is headerless — allocated from the
+    /// interpreter's own `headerless_structs` pool with no `type_id` word at
+    /// `ref - 8`.  A headerless struct must never be handed to a header-writing
+    /// allocator (`alloc_oldgen_typed`, `alloc_nursery_typed`): those return
+    /// `base + GcHeader::SIZE`, which shifts every field offset the descr
+    /// carries.  The wire format has no dedicated flag, so the assembler stamps
+    /// [`HEADERLESS_SIZE_OWNER_MARKER`] into the `owner` slot it would
+    /// otherwise leave empty for a transient size descr.
+    pub fn is_headerless(&self) -> bool {
+        match self {
+            BhDescr::Size { owner, .. } => owner == HEADERLESS_SIZE_OWNER_MARKER,
+            _ => false,
+        }
+    }
+
     /// Resolve the dense GC `tid` for a blackhole/resume header write from
     /// the identity this descr carries in [`get_type_id`].  Producers are
     /// mixed: `allocate_with_vtable` and the walker struct path widen the
@@ -1531,7 +1561,7 @@ impl BhDescr {
             // fields only; the parent SizeDescr backref is not surfaced
             // by the live `FieldDescr` trait.
             parent: None,
-            name: spec.name,
+            name: spec.field_key,
             owner: String::new(),
         }
     }

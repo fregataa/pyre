@@ -15,8 +15,6 @@ use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
 use crate::{TraceAction, TraceCtx};
 
-const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
-
 /// Decode a virtualizable shadow Value (RPython Box concrete) back into the
 /// raw int/ref/float bit pattern that pyre stores in register shadows
 /// (`frame.int_values`, `frame.ref_values`, `frame.float_values`).
@@ -54,6 +52,7 @@ fn field_spec_from_bh(
 ) -> majit_ir::descr::SimpleFieldDescrSpec {
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
+        field_key: f.field_key().to_string(),
         name: f.name.clone(),
         offset: f.offset,
         field_size: f.field_size,
@@ -77,11 +76,11 @@ fn field_spec_from_bh(
 /// A transient fieldless allocation carries only size + vtable + type
 /// identity, matching `bh_new`/`bh_new_with_vtable` dispatch descrs.
 fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrRef {
+    let headerless = descr.is_headerless();
     if let crate::blackhole::BhDescr::Size {
         size,
         type_id,
         vtable,
-        owner,
         all_fielddescrs,
         is_gc_managed,
         ..
@@ -96,8 +95,9 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
                 *type_id,
                 *vtable as usize,
                 *is_gc_managed,
-                owner == HEADERLESS_SIZE_OWNER_MARKER,
+                headerless,
                 &specs,
+                &[],
             );
             let sd: majit_ir::DescrRef = group.size_descr;
             return sd;
@@ -106,11 +106,6 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
     let size = descr.as_size();
     let vtable = descr.get_vtable();
     let type_id = descr.get_type_id() as u32;
-    let headerless = if let crate::blackhole::BhDescr::Size { owner, .. } = descr {
-        owner == HEADERLESS_SIZE_OWNER_MARKER
-    } else {
-        false
-    };
     let mut sd = if vtable != 0 {
         majit_ir::descr::SimpleSizeDescr::with_vtable(u32::MAX, size, type_id, vtable)
     } else {
@@ -131,7 +126,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
 /// (`optimizeopt/virtualize.rs:689`) requires the parent to virtualize
 /// the store.  A parentless field (getfield round-trip / non-virtualized
 /// store) keeps the placeholder builder.
-fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
+pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
     match descr {
         crate::blackhole::BhDescr::Field {
             offset,
@@ -141,6 +136,8 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
             index_in_parent,
             parent,
             name,
+            is_immutable,
+            is_quasi_immutable,
             ..
         } => {
             if let Some(p) = parent {
@@ -163,6 +160,7 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                         p.is_gc_managed,
                         p.headerless,
                         &specs,
+                        &[],
                     );
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
                     let cached = majit_ir::descr::gc_cache()
@@ -176,35 +174,37 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                         let fd: majit_ir::DescrRef = fd;
                         return (*offset, fd);
                     }
-                    // Name-miss: the getfield names a Rust field (e.g.
-                    // `strategy`) that the flattened layout represents under a
-                    // different name — an inline enum's `__discriminant` at its
-                    // sub-struct-relative offset — so the by-name lookup finds
-                    // nothing.  The getfield's own baked offset is the
-                    // authoritative absolute offset; wire it to the containing
-                    // struct's cache-owned SizeDescr so the FieldDescr satisfies
-                    // `descr.py:238 get_parent_descr()` for
-                    // `ensure_ptr_info_arg0` (`optimizer.py:478`) instead of
-                    // falling to the parentless placeholder.
-                    let parent_size = majit_ir::descr::gc_cache()
-                        .lock()
-                        .unwrap()
-                        ._cache_size
-                        .get(&struct_key)
-                        .cloned();
-                    if let Some(parent_size) = parent_size {
-                        return (
+                    // Name-miss: the getfield names an inline aggregate
+                    // (`ob_header`, `int_items`, an enum's `__pos_0`) that the
+                    // flattened layout only represents through its leaves, so
+                    // the by-name lookup finds nothing.  `heaptracker.py:68-69`
+                    // recurses into a nested `lltype.Struct` without minting a
+                    // descr for the container at all — `jtransform.py:942
+                    // rewrite_op_getsubstruct` lowers that access to
+                    // `int_add(ptr, offset)`, no descr — so this whole branch
+                    // exists only because pyre still emits a `getfield_gc` here.
+                    // Until that lowering is ported, the container descr must at
+                    // least obey the single-mint rule: go through
+                    // `descr.py:218-239 get_field_descr` so the pool-side and
+                    // walker-side resolutions land on one Arc instead of each
+                    // minting a fresh one per resolution.
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    if gc._cache_size.contains_key(&struct_key) {
+                        let fd = gc.get_field_descr(
+                            struct_key,
+                            name,
+                            None,
                             *offset,
-                            majit_ir::descr::make_field_descr_with_parent(
-                                *offset,
-                                *field_size,
-                                *field_type,
-                                *field_flag,
-                                *index_in_parent,
-                                name.clone(),
-                                &parent_size,
-                            ),
+                            *field_size,
+                            *field_type,
+                            *is_immutable,
+                            *is_quasi_immutable,
+                            *field_flag,
+                            *index_in_parent as u32,
+                            false,
+                            *index_in_parent,
                         );
+                        return (*offset, fd as majit_ir::DescrRef);
                     }
                 }
             }
@@ -263,6 +263,7 @@ pub fn struct_fields_write_effect_info(
                 };
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: u32::MAX,
+                    field_key: name.to_string(),
                     name: name.to_string(),
                     offset,
                     // Same width rule as the `field_specs_from_layout` twin
@@ -1541,6 +1542,7 @@ where
                 majit_ir::value::Type::Int,
                 false,
                 majit_ir::descr::ArrayFlag::Signed,
+                "len".to_string(),
                 "len".to_string(),
             ));
             d
@@ -2912,7 +2914,7 @@ where
                 // *records* New / NewWithVtable so the optimizer can virtualize
                 // the struct away when it does not escape.
                 let with_vtable = bytecode == jitcode::insns::BC_NEW_WITH_VTABLE;
-                let (size, vtable, descr, dest) = {
+                let (size, vtable, type_id, headerless, descr, dest) = {
                     let frame = self.frames.current_mut();
                     let (descr_idx, dest) = frame.read_new();
                     let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
@@ -2921,16 +2923,57 @@ where
                     (
                         bh.as_size(),
                         bh.get_vtable(),
+                        bh.resolve_gc_tid(),
+                        bh.is_headerless(),
                         size_descr_ref_from_bh(bh),
                         dest,
                     )
                 };
-                // Mirror runner.rs bh_new / bh_new_with_vtable: malloc + zero,
-                // then write the vtable word at offset 0 (the OBJECTPTR typeptr
-                // slot) so a trace-time GuardClass reads the right class.
-                let layout = std::alloc::Layout::from_size_align(size.max(1), 8)
-                    .expect("BC_NEW: invalid struct layout");
-                let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as i64;
+                // A `headerless` descr means the interpreter owns this struct in
+                // its own collected pool (`headerless_structs`), which is what
+                // compiled code allocates it from, through
+                // `call_malloc_nursery_headerless`. Putting it on the host heap
+                // instead hands the interpreter an object its collector cannot
+                // see: a moving collector range-checks its own pool, so it
+                // neither traces through the object nor forwards the references
+                // hanging off it, and the reachable graph below it is lost on
+                // the next collection.
+                //
+                // A headered GC-managed descr (real `type_id`) is the same
+                // problem one field deeper: a host-heap block carries no type
+                // word at `ref - 8`, so the collector never traces the struct
+                // and whatever its ref fields point at dies while the following
+                // `getfield` steps of this same trace still read them. It goes
+                // to the non-moving old generation, matching `runner.rs`
+                // bh_new / bh_new_with_vtable.
+                //
+                // The allocation must not collect. This runs mid-jitcode with
+                // raw object pointers live in the machine's own register bank —
+                // the `getfield` result feeding the `setfield` that follows this
+                // `new` — and that bank belongs to no root set, so a moving
+                // collection here would strand them. Both GC paths are
+                // no-collect, and old-gen is mark-sweep, so the pointer handed
+                // back to the register bank also survives later collections.
+                //
+                // A non-GC descr (`type_id == 0`, raw buffer) and an allocation
+                // the GC declines keep the host heap; the vtable word at offset
+                // 0 (the OBJECTPTR typeptr slot) is written either way so a
+                // trace-time GuardClass reads the right class.
+                let size = size.max(1);
+                let gc_ptr = if headerless {
+                    majit_gc::alloc_nursery_headerless_no_collect(size).0
+                } else if type_id != 0 {
+                    majit_gc::alloc_oldgen_typed(type_id, size).0
+                } else {
+                    0
+                };
+                let ptr = if gc_ptr != 0 {
+                    gc_ptr as i64
+                } else {
+                    let layout = std::alloc::Layout::from_size_align(size, 8)
+                        .expect("BC_NEW: invalid struct layout");
+                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+                };
                 if with_vtable && vtable != 0 {
                     unsafe { *(ptr as *mut usize) = vtable };
                 }
@@ -2981,6 +3024,13 @@ where
                 );
                 if struct_ptr != 0 {
                     unsafe { *((struct_ptr as *mut u8).add(offset) as *mut i64) = concrete };
+                    // A ref store adds a heap edge struct→value; notify the GC
+                    // on the container so a young value survives a minor
+                    // collection triggered later in the walk (mirrors
+                    // `bh_setfield_gc_r` and the setarrayitem case below).
+                    if bytecode == jitcode::insns::BC_SETFIELD_GC_R {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+                    }
                 }
             }
             jitcode::insns::BC_RAW_STORE_I => {

@@ -99,6 +99,12 @@ struct MetaInterpStaticData {
     /// cached opcode ids and liveness bytes in place.
     finish_setup_done: bool,
 
+    /// `Assembler.insns` length the cached `op_*` ids above were read off.
+    /// Paired with `liveness_info.len()` it decides whether a refresh would
+    /// observe anything new — both writer-side buffers are append-only
+    /// (`assembler.py:29-31`), so equal lengths mean equal contents.
+    insns_len: usize,
+
     // pyjitpl.py:2236-2243 opcode number cache filled by `setup_insns`.
     // RPython stores every field even when the runtime currently does
     // not read them, so the structural parity is preserved. Sentinel
@@ -139,6 +145,7 @@ impl MetaInterpStaticData {
             jitcodes: Vec::new(),
             liveness_info: std::sync::Arc::<[u8]>::from(Vec::<u8>::new().into_boxed_slice()),
             finish_setup_done: false,
+            insns_len: 0,
             op_live: u8::MAX,
             op_goto: u8::MAX,
             op_catch_exception: u8::MAX,
@@ -186,6 +193,19 @@ impl MetaInterpStaticData {
         self.op_ref_return = insns.get("ref_return/r").copied().unwrap_or(u8::MAX);
         self.op_float_return = insns.get("float_return/f").copied().unwrap_or(u8::MAX);
         self.op_void_return = insns.get("void_return/").copied().unwrap_or(u8::MAX);
+        self.insns_len = insns.len();
+    }
+
+    /// Whether a `finish_setup_if_needed` call with these writer-side buffer
+    /// lengths would republish anything. `ensure_finish_setup` runs on every
+    /// `jitcode_for`, and building its arguments copies both buffers whole;
+    /// `assembler.py:29-31` seeds them from the build-time tables, so that
+    /// copy is proportional to the whole opcode and liveness universe rather
+    /// than to what the call would change.
+    fn finish_setup_would_republish(&self, insns_len: usize, all_liveness_len: usize) -> bool {
+        !self.finish_setup_done
+            || insns_len != self.insns_len
+            || all_liveness_len != self.liveness_info.len()
     }
 
     /// pyjitpl.py:2255-2264 `finish_setup`: wire the assembler's opcode table
@@ -209,6 +229,12 @@ impl MetaInterpStaticData {
         // descr's `ei_index` slot via `effectinfo::compute_bitstrings`
         // (`effectinfo.py:526 descr.ei_index = …`); no process-global
         // side table.
+        //
+        // This staticdata is not the one the tracing `MetaInterp` owns —
+        // pyre carries two — so the `all_descrs` list this publishes has to
+        // be the process-wide one `descr_index` is stamped against
+        // (`MetaInterpStaticData::all_descrs`), or `bridgeopt.py:155
+        // metainterp_sd.all_descrs[descr_index]` indexes an empty list.
         if !was_done {
             self.canonical.finish_setup_descrs();
         }
@@ -580,10 +606,18 @@ fn ensure_finish_setup() {
     FRAME_VALUE_COUNT_INIT.call_once(|| {
         majit_ir::resumedata::set_frame_value_count_fn(frame_value_count_at);
     });
-    let (insns, all_liveness) = ASSEMBLER_STATE.with(|a| {
+    let snapshot = ASSEMBLER_STATE.with(|a| {
         let asm = a.borrow();
-        (asm.insns.clone(), asm.all_liveness.clone())
+        let republishes = METAINTERP_SD.with(|r| {
+            r.borrow()
+                .finish_setup_would_republish(asm.insns.len(), asm.all_liveness.len())
+        });
+        republishes.then(|| (asm.insns.clone(), asm.all_liveness.clone()))
     });
+    let Some((insns, all_liveness)) = snapshot else {
+        return;
+    };
+    crate::jitcode_runtime::rehydrate_build_descr_raw_sets();
     METAINTERP_SD.with(|r| {
         r.borrow_mut().finish_setup_if_needed(&insns, all_liveness);
     });
@@ -1169,20 +1203,23 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 ///
 /// pyre has two jitcode numbering spaces. jd0 (`pyframe_driver`) numbers
 /// Python-bytecode jitcodes into `MetaInterpStaticData.jitcodes`, keyed by
-/// CodeObject, and interns their `-live-` triples into
-/// `metainterp_sd.liveness_info` (`pyjitpl.py:2264`) as tracing discovers them.
-/// A novable driver over an extracted interpreter body — jd1
+/// CodeObject. A novable driver over an extracted interpreter body — jd1
 /// `unpackiterable_driver`, whose jitcode is the
 /// `_unpackiterable_unknown_length` graph plus its inlined build-time callees —
-/// numbers against `jitcode_runtime::all_jitcodes()`, with `-live-` offsets
-/// baked at extraction into `jitcode_runtime::all_liveness()`.
+/// numbers against `jitcode_runtime::all_jitcodes()`.
 ///
-/// Decoding one space's coordinate against the other's tables does not fail
-/// loudly, which is why the store has to be picked per driver rather than tried
-/// and retried: the runtime store's low indices hold unrelated PyCode jitcodes
-/// that decode at the same pc and hand back a mistyped count (the drain's 2 refs
+/// Decoding one space's index against the other's table does not fail loudly,
+/// which is why the store has to be picked per driver rather than tried and
+/// retried: the runtime store's low indices hold unrelated PyCode jitcodes that
+/// decode at the same pc and hand back a mistyped count (the drain's 2 refs
 /// read as ints → `Const::getint on Ref`). Same split, and same reasoning, as
-/// the `novable` arms of `call_jit.rs`'s `blackhole_resume_via_rd_numb`.
+/// the `novable` arm of `resolve_jitcode` in `call_jit.rs`.
+///
+/// The `-live-` *offsets* are no longer split: the build-time byte stream is
+/// the prefix of `metainterp_sd.liveness_info`
+/// (`Assembler::resuming_build_time_liveness`), so this reads the one pool
+/// `resume.py:1022` reads, exactly like [`frame_value_count_at`]. Only the
+/// jitcode table below is still per-space.
 ///
 /// Installed on jd1's `JitDriverStaticData::frame_value_count_fn`, so only that
 /// driver's guard metadata decodes here.
@@ -1203,7 +1240,7 @@ pub fn build_time_frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         Some(jc) => jc,
         None => return 0,
     };
-    let all_liveness = crate::jitcode_runtime::all_liveness();
+    let all_liveness = liveness_info_snapshot();
     if pc >= 0 && jitcode.can_decode_live_vars(pc as usize, op_live) {
         let off = jitcode.get_live_vars_info(pc as usize, op_live);
         if off + 2 < all_liveness.len() {
@@ -3059,14 +3096,7 @@ pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrR
     // allocation).  The folded box still feeds `arraylen_now_known`,
     // matching `opimpl_arraylen_gc`'s unconditional cache write.
     //
-    // Not on wasm32: `WasmBackend` inherits the `bh_arraylen_gc` trait
-    // stub (returns 0), so the fold would bake a wrong `ConstInt(0)`
-    // length.  Overriding the stub to read the real length was tried and
-    // exposes a latent wasm-JIT defect (real arraylen concrete stamps
-    // change trace shapes: `synth/comprehension_object_append_hot` GC
-    // crash at `copy_nursery_object` + 2 wrong outputs), so the stub —
-    // and this gate — stay until that defect is fixed.
-    if !cfg!(target_arch = "wasm32") && array.is_constant() {
+    if array.is_constant() {
         if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(array) {
             let struct_ptr = struct_ref.0 as i64;
             if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
@@ -5676,6 +5706,17 @@ impl PyreJitState {
             Some("frame"),
         );
         descriptor.is_recursive = true;
+        // The portal's frames are numbered in the CodeObject-keyed runtime
+        // store this crate grows, so name that decoder on the driver rather
+        // than leaning on the process-global slot. The global has one writer
+        // per store and no arbitration between them
+        // (`ensure_finish_setup` here, `install_state_field_fvc` in
+        // majit-metainterp), so a driver that leaves this `None` decodes
+        // against whichever store registered last — and the wrong store
+        // returns a mistyped count instead of failing (see the field's doc).
+        // jd1 names its build-time store the same way
+        // (`unpackiterable_driver_descriptor`).
+        descriptor.frame_value_count_fn = Some(frame_value_count_at);
         descriptor
     }
 

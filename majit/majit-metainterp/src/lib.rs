@@ -109,7 +109,7 @@ pub use call_descr::{
     INT_PY_MOD_EFFECT_INFO, LOOPINVARIANT_EFFECT_INFO, cannot_raise_effect_info,
     default_effect_info, effect_info_for_slot, forces_virtual_or_virtualizable_effect_info,
     make_call_assembler_descr, make_call_descr, make_call_descr_from_target_slot,
-    make_call_descr_with_effect, nursery_alloc_effect_info,
+    make_call_descr_sized_with_effect, make_call_descr_with_effect, nursery_alloc_effect_info,
 };
 pub use compile::{
     make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
@@ -124,8 +124,8 @@ pub use jit_state::{
     bridge_decode_red,
 };
 pub use jitcode::{
-    BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr, insns,
-    live_slots_for_state_field_jit, set_global_build_descr_pool,
+    BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr,
+    init_global_build_descr_pool, insns, live_slots_for_state_field_jit,
 };
 pub use jitdriver::{
     DeclarativeJitDriver, JitDriver, JitDriverStaticData, MultiFrameBlackholeResult,
@@ -141,6 +141,11 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 // for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs:4`).
 pub use majit_translate::codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
+/// The walker's own `getfield_gc` / `setfield_gc` descr resolution
+/// (`blackhole.py:1432-1483` reads the descr straight out of the constant
+/// pool).  Exported so the descr-identity census can compare it against the
+/// pool-side resolution without re-deriving a second copy of the logic.
+pub use pyjitpl::dispatch::field_descr_ref_from_bh;
 pub use pyjitpl::{
     BackEdgeAction, BridgeRetraceResult, ClosureRuntime, ClosureRuntimeWithResolver,
     CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,

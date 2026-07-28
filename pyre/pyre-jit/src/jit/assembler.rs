@@ -122,6 +122,53 @@ impl Assembler {
         Self::default()
     }
 
+    /// `assembler.py:19-32` `Assembler()` as `CodeWriter.__init__` builds it
+    /// (codewriter.py:21), for a codewriter that continues the build-time
+    /// drain rather than starting a fresh one.
+    ///
+    /// Upstream has one `Assembler` per program and `codewriter.py:73-86
+    /// make_jitcodes` runs every pending graph through it, so `all_liveness`
+    /// is a single offset space. pyre assembles the extracted interpreter
+    /// graphs in `build.rs` and the Python-bytecode graphs at runtime; the
+    /// build-time offsets are baked into those jitcodes' `-live-` operands,
+    /// and a resume decodes them against `metainterp_sd.liveness_info`
+    /// (`resume.py:1022`). Seeding the buffer with the build-time bytes is
+    /// what keeps that one offset space: the baked offsets stay addressable
+    /// and `_encode_liveness` hands out positions strictly above them.
+    ///
+    /// The reader-side mirror seeds identically
+    /// (`pyre_jit_trace::assembler::AssemblerState::new`), so the wholesale
+    /// replace in `publish_state` never rewinds past this prefix.
+    /// `assembler.py:20 self.insns = {}` is the other half of the same
+    /// continuation, and it is load-bearing for the same reason. The build-time
+    /// jitcodes' `-live-` markers are written with the canonical opcode byte,
+    /// and `blackhole.py:55-61 BlackholeInterpBuilder.__init__` recovers it as
+    /// `asm.insns['live/']` — one dict, because upstream has one assembler.
+    /// A runtime `insns` that starts empty leaves
+    /// `MetaInterpStaticData.op_live` at its unset sentinel until some Python
+    /// bytecode graph happens to assemble a `-live-`, and until then
+    /// `JitCode::can_decode_live_vars` looks for the sentinel as a marker byte,
+    /// finds none, and declines every resume against a build-time jitcode.
+    /// That decline is silent and lossy: a jd1 drain guard that has already run
+    /// its `self.next(w_iterator)` cannot be re-executed, so the fetched item
+    /// is dropped instead of appended.
+    ///
+    /// Seeding is sound because the bytes are not allocated here — they come
+    /// from the fixed `wellknown_bh_insns` / `pyre_extension_insns` tables, so
+    /// the build-time and runtime spellings of an opname already agree on a
+    /// byte; the map only records which opnames exist.
+    pub fn resuming_build_time_liveness() -> Self {
+        let all_liveness = pyre_jit_trace::jitcode_runtime::all_liveness().to_vec();
+        let all_liveness_length = all_liveness.len();
+        let insns = pyre_jit_trace::jitcode_runtime::insns_opname_to_byte().clone();
+        Self {
+            insns,
+            all_liveness,
+            all_liveness_length,
+            ..Self::default()
+        }
+    }
+
     /// `assembler.py:29` accessor.
     pub fn all_liveness(&self) -> &[u8] {
         &self.all_liveness
@@ -376,9 +423,17 @@ impl Assembler {
         let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
             cached
         } else {
+            // The 2-byte `-live-` operand caps the buffer at 64 KiB, upstream
+            // included. pyre spends the low end of that budget on the
+            // build-time drain's bytes (`resuming_build_time_liveness`), so
+            // name both halves — an overflow here is "the shared pool filled
+            // up", not "the runtime codewriter alone ran away".
             assert!(
                 self.all_liveness_length <= u16::MAX as usize,
-                "all_liveness offset overflow"
+                "all_liveness offset overflow at {} bytes ({} of them the \
+                 build-time drain's prefix); a `-live-` operand is 2 bytes",
+                self.all_liveness_length,
+                pyre_jit_trace::jitcode_runtime::all_liveness().len(),
             );
             assert!(
                 live_i.len() <= u8::MAX as usize

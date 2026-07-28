@@ -19,11 +19,14 @@
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 
 use majit_ir::DescrRef;
 use majit_translate::CompiledJitDriver;
 use majit_translate::jitcode::{BhDescr, JitCode};
+
+static REHYDRATED_CALL_DESCR_REFS: LazyLock<Mutex<Vec<Option<DescrRef>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 thread_local! {
     /// Per-thread cached `&'static` to the build-time `pipeline.jitcodes`
@@ -429,6 +432,73 @@ pub fn all_liveness() -> &'static [u8] {
     &ALL_LIVENESS
 }
 
+fn call_descr_arg_types(arg_classes: &str) -> Vec<majit_ir::Type> {
+    arg_classes
+        .chars()
+        .filter_map(|c| match c {
+            'i' | 'S' => Some(majit_ir::Type::Int),
+            'r' => Some(majit_ir::Type::Ref),
+            'f' | 'L' => Some(majit_ir::Type::Float),
+            _ => None,
+        })
+        .collect()
+}
+
+fn call_descr_result_type(result_type: char) -> majit_ir::Type {
+    match result_type {
+        'i' | 'S' => majit_ir::Type::Int,
+        'r' => majit_ir::Type::Ref,
+        'f' | 'L' => majit_ir::Type::Float,
+        _ => majit_ir::Type::Void,
+    }
+}
+
+fn rehydrated_call_descr_ref(bh: &majit_translate::jitcode::BhCallDescr) -> majit_ir::DescrRef {
+    let arg_types = call_descr_arg_types(&bh.arg_classes);
+    let result_type = call_descr_result_type(bh.result_type);
+    let mut effect_info = bh.extra_info.clone();
+    crate::descr::rehydrate_effect_info(&mut effect_info);
+    majit_metainterp::make_call_descr_sized_with_effect(
+        &arg_types,
+        result_type,
+        bh.result_signed,
+        bh.result_size,
+        effect_info,
+    )
+}
+
+/// Rehydrate build-time EffectInfo raw descr sets before
+/// `finish_setup_descrs`. `finish_setup_done` is per-thread, but the
+/// rehydrated raw sets live in the process-global `GcCache`, so this guard is
+/// process-global.
+pub fn rehydrate_build_descr_raw_sets() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let all = all_descrs();
+        // `descr.py:25-47 setup_descrs` group order — every non-call slot
+        // first.  Each `Size` / `Field` entry publishes its parent's FULL
+        // `heaptracker.all_fielddescrs(STRUCT)` list into the gccache, and
+        // `descr_from_set_member` is lookup-only, so the raw-set members
+        // below can only land on slots that already carry their complete
+        // layout.  Resolving in the other order would leave every member
+        // whose struct has not been published yet unresolvable.
+        for bh in all.iter() {
+            if !matches!(bh, BhDescr::Call { .. } | BhDescr::JitCode { .. }) {
+                crate::descr::make_descr_from_bh(bh);
+            }
+        }
+        let mut refs = vec![None; all.len()];
+        for (i, bh) in all.iter().enumerate() {
+            let calldescr = match bh {
+                BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
+                _ => continue,
+            };
+            refs[i] = Some(rehydrated_call_descr_ref(calldescr));
+        }
+        *REHYDRATED_CALL_DESCR_REFS.lock().unwrap() = refs;
+    });
+}
+
 /// Pool of `DescrRef`s indexed alongside [`all_descrs`] so the
 /// trace-side jitcode walker
 /// ([`crate::jitcode_dispatch::dispatch_via_miframe`]) can resolve each
@@ -462,11 +532,194 @@ pub fn all_liveness() -> &'static [u8] {
 /// `Arc` instance still build their own at the call site
 /// until the by-index identity factories land.
 static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
-    all_descrs()
+    let refs: Vec<DescrRef> = all_descrs()
         .iter()
-        .map(crate::descr::make_descr_from_bh)
-        .collect()
+        .enumerate()
+        .map(|(i, bh)| match bh {
+            BhDescr::Call { .. } => REHYDRATED_CALL_DESCR_REFS
+                .lock()
+                .unwrap()
+                .get(i)
+                .and_then(Clone::clone)
+                .unwrap_or_else(|| crate::descr::make_descr_from_bh(bh)),
+            _ => crate::descr::make_descr_from_bh(bh),
+        })
+        .collect();
+    if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
+        field_descr_identity_census(&refs);
+    }
+    refs
 });
+
+/// S4c prerequisite measurement — how many build-time `BhDescr::Field` slots
+/// resolve to the SAME `Arc` the runtime `descr.py:218-239 get_field_descr`
+/// cache holds for their `(STRUCT, fieldname)` key.
+///
+/// `effectinfo.py:465-547 compute_bitstrings` partitions descrs by object
+/// identity, so an `EffectInfo` raw set rehydrated from `descrs.bin` is only
+/// meaningful if each member lands on the descr the trace itself caches.  A
+/// slot that mints a fresh `Arc` instead is a silent mis-partition, which is
+/// strictly worse than the missing raw set it would replace — hence this runs
+/// before the format change, not after.
+pub fn field_descr_identity_census_now() {
+    field_descr_identity_census(all_descr_refs());
+}
+
+/// Same-Arc test for two `DescrRef`s.  `Arc::ptr_eq` on `Arc<dyn Descr>`
+/// compares the fat pointer (data + vtable); two upcasts of the same
+/// allocation through the same concrete type agree on both halves, and an
+/// upcast of a *different* concrete type must not compare equal anyway.
+fn same_arc(a: &DescrRef, b: &DescrRef) -> bool {
+    std::sync::Arc::as_ptr(a) as *const () == std::sync::Arc::as_ptr(b) as *const ()
+}
+
+/// Why a build-time `Field` slot fails to land on the canonical
+/// `_cache_field[STRUCT][fieldname]` Arc.  `descr.py:218-239 get_field_descr`
+/// admits exactly one outcome — cache hit or cache-miss mint — so every
+/// class below except `Converged` marks a place where pyre mints a second
+/// FieldDescr for a `(STRUCT, fieldname)` PyPy keeps single.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+enum FieldIdentityClass {
+    Converged,
+    /// `_cache_size[STRUCT]` empty — the parent was never published, so
+    /// `get_field_descr` could not have set `parent_descr` either.
+    NoParentSlot,
+    /// Parent published, but `_cache_field` has no inner map for it:
+    /// `heaptracker.all_fielddescrs` never ran through `get_field_descr`.
+    NoFieldMap,
+    /// Inner map exists but not under this spelling — pyre's cache key and
+    /// its lookup key disagree (PyPy keys on `fieldname`, displays
+    /// `'%s.%s' % (STRUCT._name, fieldname)`; pyre conflates the two).
+    NameMiss,
+    /// Entry exists and is a different Arc: two mint points for one field.
+    DoubleMint,
+}
+
+impl FieldIdentityClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Converged => "converged",
+            Self::NoParentSlot => "no _cache_size[STRUCT]",
+            Self::NoFieldMap => "no _cache_field[STRUCT]",
+            Self::NameMiss => "name not in _cache_field[STRUCT]",
+            Self::DoubleMint => "different Arc (double mint)",
+        }
+    }
+}
+
+fn field_descr_identity_census(refs: &[DescrRef]) {
+    use std::collections::BTreeMap;
+
+    let (mut fields, mut keyed, mut parentless) = (0usize, 0usize, 0usize);
+    // Pool-side (`field_descr_from_bh_field`) vs `_cache_field`.
+    let mut pool_classes: BTreeMap<FieldIdentityClass, usize> = BTreeMap::new();
+    // Walker-side (`field_descr_ref_from_bh`, the Arc actually baked into
+    // recorded getfield/setfield ops) vs `_cache_field`.
+    let mut walker_classes: BTreeMap<FieldIdentityClass, usize> = BTreeMap::new();
+    // Pool-side vs walker-side: the split that makes an `EffectInfo` raw set
+    // rehydrated from `descrs.bin` unable to reach the recorded op's descr.
+    let mut pool_vs_walker_same = 0usize;
+    // How often the pool Arc is one of the parent SizeDescr's
+    // `all_fielddescrs()` (the second mint point).
+    let mut pool_from_all_fielddescrs = 0usize;
+    let mut samples: Vec<String> = Vec::new();
+
+    for (i, bh) in all_descrs().iter().enumerate() {
+        let BhDescr::Field {
+            parent,
+            name,
+            owner,
+            index_in_parent,
+            ..
+        } = bh
+        else {
+            continue;
+        };
+        fields += 1;
+        let Some(parent) = parent.as_ref().filter(|p| p.type_id != 0) else {
+            parentless += 1;
+            continue;
+        };
+        keyed += 1;
+        let key = majit_ir::descr::LLType::Struct(parent.type_id);
+        let (parent_size, cached, field_keys) = {
+            let gc = majit_ir::descr::gc_cache().lock().unwrap();
+            let inner = gc._cache_field.get(&key);
+            (
+                gc._cache_size.get(&key).cloned(),
+                inner.and_then(|m| m.get(name.as_str())).cloned(),
+                inner.map(|m| {
+                    let mut ks: Vec<String> = m.keys().cloned().collect();
+                    ks.sort();
+                    ks
+                }),
+            )
+        };
+        let cached_ref: Option<DescrRef> = cached.map(|fd| fd as DescrRef);
+        let classify = |candidate: &DescrRef| -> FieldIdentityClass {
+            match (&parent_size, &cached_ref, &field_keys) {
+                (None, _, _) => FieldIdentityClass::NoParentSlot,
+                (_, Some(c), _) if same_arc(c, candidate) => FieldIdentityClass::Converged,
+                (_, Some(_), _) => FieldIdentityClass::DoubleMint,
+                (_, None, None) => FieldIdentityClass::NoFieldMap,
+                (_, None, Some(_)) => FieldIdentityClass::NameMiss,
+            }
+        };
+
+        let pool = &refs[i];
+        let (_, walker) = majit_metainterp::field_descr_ref_from_bh(bh);
+        let pool_class = classify(pool);
+        let walker_class = classify(&walker);
+        *pool_classes.entry(pool_class).or_default() += 1;
+        *walker_classes.entry(walker_class).or_default() += 1;
+        if same_arc(pool, &walker) {
+            pool_vs_walker_same += 1;
+        }
+        if let Some(sd) = parent_size.as_ref().and_then(|p| p.as_size_descr()) {
+            if sd
+                .all_fielddescrs()
+                .iter()
+                .any(|fd| same_arc(&(fd.clone() as DescrRef), pool))
+            {
+                pool_from_all_fielddescrs += 1;
+            }
+        }
+
+        if pool_class != FieldIdentityClass::Converged && samples.len() < 25 {
+            let n_all = parent_size
+                .as_ref()
+                .and_then(|p| p.as_size_descr())
+                .map(|sd| sd.all_fielddescrs().len());
+            samples.push(format!(
+                "{owner}.{name}[{index_in_parent}] T{:#x} pool={} walker={} \
+                 all_fielddescrs={n_all:?} _cache_field keys={:?}",
+                parent.type_id,
+                pool_class.label(),
+                walker_class.label(),
+                field_keys.as_deref().unwrap_or(&[]),
+            ));
+        }
+    }
+
+    eprintln!("[field-identity] {fields} Field slots: {keyed} keyed, {parentless} parentless");
+    for (label, classes) in [("pool", &pool_classes), ("walker", &walker_classes)] {
+        let rendered: Vec<String> = classes
+            .iter()
+            .map(|(c, n)| format!("{}={n}", c.label()))
+            .collect();
+        eprintln!(
+            "[field-identity] {label} vs _cache_field: {}",
+            rendered.join(", ")
+        );
+    }
+    eprintln!(
+        "[field-identity] pool==walker: {pool_vs_walker_same}/{keyed}; \
+         pool Arc came from parent.all_fielddescrs(): {pool_from_all_fielddescrs}/{keyed}"
+    );
+    for s in &samples {
+        eprintln!("[field-identity]   {s}");
+    }
+}
 
 /// `&'static [DescrRef]` view over [`ALL_DESCR_REFS`] for the walker's
 /// `WalkContext::descr_refs` parameter.
@@ -512,22 +765,30 @@ pub fn build_time_field_offset(owner: &str, name: &str) -> Option<usize> {
 /// `as_bh_descr()`.
 ///
 /// Idempotent: the metainterp `OnceLock` keeps the first pool, so repeated
-/// calls (harness + production init) are safe.
+/// calls (harness + production init) are safe.  The pool is built inside the
+/// `OnceLock` initializer, so a repeat call costs a load and nothing else —
+/// `drive_unpack_iterable_trace` reaches here once per
+/// `_unpackiterable_unknown_length`, and cloning every `BhDescr` (each call
+/// descr carrying its `EffectInfo` raw descr sets) only to drop it is the
+/// dominant cost of an unpack-heavy program.
 pub fn install_global_build_descr_pool() {
     use majit_metainterp::RuntimeBhDescr;
-    let pool: Vec<RuntimeBhDescr> = all_descrs()
-        .iter()
-        .map(|bh| match bh {
-            BhDescr::JitCode { jitcode_index, .. } => match get_jitcode_by_index(*jitcode_index) {
-                Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
-                    majit_metainterp::JitCode::from_canonical((*canonical).clone()),
-                )),
-                None => RuntimeBhDescr::Descr(bh.clone()),
-            },
-            other => RuntimeBhDescr::Descr(other.clone()),
-        })
-        .collect();
-    majit_metainterp::set_global_build_descr_pool(pool);
+    majit_metainterp::init_global_build_descr_pool(|| {
+        all_descrs()
+            .iter()
+            .map(|bh| match bh {
+                BhDescr::JitCode { jitcode_index, .. } => {
+                    match get_jitcode_by_index(*jitcode_index) {
+                        Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
+                            majit_metainterp::JitCode::from_canonical((*canonical).clone()),
+                        )),
+                        None => RuntimeBhDescr::Descr(bh.clone()),
+                    }
+                }
+                other => RuntimeBhDescr::Descr(other.clone()),
+            })
+            .collect()
+    });
 }
 
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's
