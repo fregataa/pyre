@@ -141,11 +141,11 @@ fn pyre_object_gc_collect_oldgen_trampoline() {
     majit_gc::collect_oldgen_nonmoving();
 }
 
-/// Trampoline for the interpreter safepoint's `(oldgen_total, nursery_used)`
-/// read, used to re-derive its next-major threshold from what survived a
-/// collection (`set_major_threshold_from`, incminimark.py:575-594).
-fn pyre_object_gc_heap_stats_trampoline() -> (usize, usize) {
-    majit_gc::active_heap_stats()
+/// Trampoline for the interpreter safepoint's next-major-threshold question
+/// (`threshold_reached`, incminimark.py:1288-1290). The collector owns the
+/// threshold and every bound on it, so the safepoint asks rather than models.
+fn pyre_object_gc_major_threshold_reached_trampoline() -> bool {
+    majit_gc::active_major_threshold_reached()
 }
 
 fn pyre_object_gc_set_enabled_trampoline(enabled: bool) {
@@ -164,13 +164,6 @@ fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object
     majit_gc::gc_fq_next_dead(fq_index)
         .map(|obj| obj.0 as pyre_object::PyObjectRef)
         .unwrap_or(pyre_object::PY_NULL)
-}
-
-/// Jitframe-empty trampoline for the interpreter GC safepoint. Bridges
-/// pyre-object's hook to `majit_gc::jitframe_shadow_stack_empty`, so the
-/// safepoint can skip collecting while a compiled trace is suspended.
-fn pyre_object_gc_jitframe_empty_trampoline() -> bool {
-    majit_gc::jitframe_shadow_stack_empty()
 }
 
 /// Trampoline: register a caller-owned slot as
@@ -3538,13 +3531,14 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
-    pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
+    pyre_object::gc_hook::register_gc_major_threshold_reached_hook(
+        pyre_object_gc_major_threshold_reached_trampoline,
+    );
     pyre_object::gc_hook::register_gc_set_enabled_hook(pyre_object_gc_set_enabled_trampoline);
     pyre_object::gc_hook::register_gc_finalizer_hooks(
         pyre_object_gc_register_finalizer_trampoline,
         pyre_object_gc_finalizer_next_dead_trampoline,
     );
-    pyre_object::gc_hook::register_gc_jitframe_empty_hook(pyre_object_gc_jitframe_empty_trampoline);
     pyre_object::register_gc_root_hooks(
         pyre_object_gc_add_root_trampoline,
         pyre_object_gc_remove_root_trampoline,

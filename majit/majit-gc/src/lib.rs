@@ -299,6 +299,17 @@ pub trait GcAllocator: Send {
     /// `alloc_nursery_no_collect_typed` so backends without a
     /// distinct old-gen still compile; backends with a real old-gen
     /// override to force placement there.
+    ///
+    /// Non-collecting, unlike its structural counterpart
+    /// `external_malloc` (incminimark.py:987-994), which tests
+    /// `threshold_reached(raw_malloc_usage(totalsize))` before allocating and
+    /// drives `minor_collection_with_major_progress` when it holds. That check
+    /// cannot be made here: an RPython caller's locals are shadow-stack roots,
+    /// so upstream may collect mid-allocation, while the callers this entry
+    /// exists for are holding the raw pointer on the Rust stack precisely
+    /// because it is not a root. Old-gen growth is instead answered by the
+    /// interpreter safepoint's `threshold_reached` poll, which runs where the
+    /// root set is known (`pyre-object`'s `gc_interp::safepoint`).
     fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         self.alloc_nursery_no_collect_typed(type_id, size)
     }
@@ -524,6 +535,18 @@ pub trait GcAllocator: Send {
     /// allocators with no byte accounting.
     fn heap_byte_stats(&self) -> (usize, usize) {
         (0, 0)
+    }
+
+    /// incminimark.py:1288-1290 `threshold_reached(0)`: whether the memory the
+    /// collector is responsible for has caught up to the threshold it set for
+    /// the next major collection. Everything that shapes that threshold — the
+    /// growth ratio, `growth_rate_max`, `max_delta`, `min_heap_size`,
+    /// `max_heap_size` — lives behind this answer, so a caller that cannot
+    /// drive collection from the allocator can ask here instead of modelling
+    /// heap growth itself. Default `false` for stub allocators with no
+    /// threshold accounting.
+    fn major_threshold_reached(&self) -> bool {
+        false
     }
 
     /// Diagnostic only: `(minor_collections, major_collections)` run so far.
@@ -927,6 +950,9 @@ impl GcAllocator for GcHandle {
     }
     fn heap_byte_stats(&self) -> (usize, usize) {
         gc_sync::gc_query_reentrant(|gc| gc.heap_byte_stats())
+    }
+    fn major_threshold_reached(&self) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.major_threshold_reached())
     }
     fn collection_counts(&self) -> (usize, usize) {
         gc_sync::gc_query_reentrant(|gc| gc.collection_counts())
@@ -1609,10 +1635,11 @@ pub fn collect_oldgen_nonmoving() {
 }
 
 /// Process-global callback reporting the active GC's `heap_byte_stats`
-/// (`(oldgen_total, nursery_used)`). Lets the interpreter safepoint
-/// (`pyre_object::gc_interp`) gate a collection on an empty nursery,
-/// where the embedded minor cycle moves nothing and is therefore safe
-/// even without a shadowstack pass over Rust-stack temporaries.
+/// (`(oldgen_total, nursery_used)`). Diagnostic: it lets a host runner split
+/// GC-retained memory from host-heap growth. Deciding when to collect is not
+/// among its uses — that question is [`active_major_threshold_reached`], which
+/// answers it from the collector's own threshold rather than from a number a
+/// caller would have to compare against a threshold of its own.
 pub type HeapStatsFn = fn() -> (usize, usize);
 
 global_hook!(static ACTIVE_HEAP_STATS: HeapStatsFn);
@@ -1631,15 +1658,28 @@ pub fn active_heap_stats() -> (usize, usize) {
     }
 }
 
-/// Whether the JIT-frame shadow stack is empty — i.e. no compiled trace
-/// is suspended on this thread. The interpreter GC safepoint only
-/// collects when this holds: a suspended jitframe's gcmap describes its
-/// own suspension PC, and a collection driven from the nested interpreter
-/// (not from compiled code at a real safepoint) can mis-root it. The
-/// JIT's own nursery-full collections are safe; this gate keeps the
-/// interpreter-driven one out of the trace-suspended window.
-pub fn jitframe_shadow_stack_empty() -> bool {
-    shadow_stack::jf_top_ptr().is_null()
+/// Process-global callback reporting the active GC's `major_threshold_reached`
+/// (incminimark.py:1288-1290). The interpreter GC safepoint
+/// (`pyre_object::gc_interp`) collects when this says the collector wants a
+/// major, instead of keeping a second, poorer model of heap growth beside the
+/// collector's own.
+pub type MajorThresholdReachedFn = fn() -> bool;
+
+global_hook!(static ACTIVE_MAJOR_THRESHOLD_REACHED: MajorThresholdReachedFn);
+
+/// Install the active backend's `major_threshold_reached` trampoline.
+pub fn set_active_major_threshold_reached(hook: Option<MajorThresholdReachedFn>) {
+    ACTIVE_MAJOR_THRESHOLD_REACHED.set(hook);
+}
+
+/// Whether the active backend's GC has reached its next-major threshold.
+/// `false` when no backend has installed a hook, so a caller with no collector
+/// behind it never collects.
+pub fn active_major_threshold_reached() -> bool {
+    match ACTIVE_MAJOR_THRESHOLD_REACHED.get() {
+        Some(f) => f(),
+        None => false,
+    }
 }
 
 /// Process-global callback that reports whether a raw address is owned
