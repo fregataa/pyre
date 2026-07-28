@@ -11889,13 +11889,23 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 }
 
 /// Collect, from the lowered MIR,
-/// `(path-segments, Signature, return-lltype)` for every local `unsafe
-/// fn` / unsafe impl-method whose return type projects to `Void` (unit)
-/// or `Bool`.  These callees cannot lower their bodies (raw-pointer
-/// access the flowspace adapter does not model), but downstream
+/// `(path-segments, Signature, FUNC.RESULT token)` for every local `unsafe
+/// fn` / unsafe impl-method whose return type projects to a token
+/// [`crate::translator::rtyper::cutover::residual_return_shell`] can model.
+/// These callees cannot lower their bodies (raw-pointer access the
+/// flowspace adapter does not model), but downstream
 /// `OpKind::Call::FunctionPath` sites still need their signature
 /// registered so the dual gate does not Skip with "not registered in
 /// PyreCallRegistry".
+///
+/// An `unsafe fn` is never lowered, so it never enters
+/// `CallControl::function_graphs` and its call sites already residualize
+/// whether or not it is registered here — registration changes only
+/// whether the *caller* can annotate past the call.  That is why the
+/// result token is projected through the same
+/// [`dont_look_inside_return_token`] the `@jit.dont_look_inside` residual
+/// path uses: both describe one residual boundary's declared result, and
+/// keeping one projection keeps the two in step.
 ///
 /// The single registration key must equal the call-site lookup. A free
 /// fn keys as the crate-included `name_path()` split on every `::`
@@ -11914,18 +11924,16 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// through an `FnDef` constant fall back to `CallTarget::FunctionPath {
 /// name_path }`, whose lookup is served only by this registry.  Argument
 /// names come from the Charon body locals, falling back to `arg{N}`.
-/// Return types other than unit / bool surface no entry, preserving the
-/// original "not registered" Skip for those fns — matches
-/// `simple_return_type_to_lltype`'s Void/Bool-only projection.
+/// A return type `residual_return_shell` declines surfaces no entry,
+/// preserving the original "not registered" Skip for that fn.
 pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
     llbc: &Llbc,
 ) -> Vec<(
     Vec<String>,
     crate::flowspace::argument::Signature,
-    crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    Option<String>,
 )> {
     use crate::flowspace::argument::Signature;
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     let mut out = Vec::new();
     for fd in llbc.iter_local_fns() {
         if !fd.signature.is_unsafe {
@@ -11936,19 +11944,37 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
         if fd.is_global_initializer.is_some() {
             continue;
         }
-        // Reference returns (`&bool`, `&()`, …) are not plain unit/bool
-        // stubs: `tyref_to_ast_string` strips the reference to its
-        // referent, which would misclassify `&bool` as `bool`.  The syn
-        // extractor's `simple_return_type_to_lltype` rejects
-        // `syn::Type::Reference`, so skip references here to match it.
+        // Reference returns (`&bool`, `&()`, …) stay out.  The projection
+        // below would give them the `ref` token, which is defensible — a
+        // reference is one pointer word — but widening the collector's
+        // return types and its reference policy at once would make an A/B
+        // unattributable.  Held for its own slice.
         if output_type_is_ref(&fd.signature.output, llbc) {
             continue;
         }
-        let lltype = match tyref_to_ast_string(&fd.signature.output, llbc).as_str() {
-            "()" => LowLevelType::Void,
-            "bool" => LowLevelType::Bool,
-            _ => continue,
-        };
+        // `None` here means unit, which `residual_return_shell` maps to
+        // `Void`; a return type it cannot model still reaches this arm as
+        // a token it declines, and the fn then keeps its original "not
+        // registered" Skip.
+        let token = dont_look_inside_return_token(&fd.signature.output, llbc);
+        if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
+            continue;
+        }
+        // The `ref` token collapses every non-`*mut PyObject` ADT onto one
+        // GC-reference word, so on its own it would also admit a by-value
+        // aggregate — `w_tuple_items_copy_as_vec` returns
+        // `Vec<PyObjectRef>`, three words returned through `sret`.  The
+        // hand-written residuals that do return a `Vec` (`compute_mro`,
+        // `memoryview_gather_bytes`) work because each carries an explicit
+        // `jit_fnaddr` `push_alias_pair` row arranging that ABI; a stub
+        // this collector mints has no such row, so a caller would annotate
+        // the one-word shell against a multiword ABI.  Admit `ref` only
+        // for returns that genuinely are one word.
+        if token.as_deref() == Some("ref")
+            && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
+        {
+            continue;
+        }
         // Both free functions and impl-owned functions are collected,
         // keyed on `name_path()` — the segment vector
         // `call_target_segments` emits for a `CallKind::Fun(Regular)`
@@ -11978,7 +12004,7 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
                     .unwrap_or_else(|| format!("arg{i}"))
             })
             .collect();
-        out.push((segments, Signature::new(argnames, None, None), lltype));
+        out.push((segments, Signature::new(argnames, None, None), token));
     }
     out
 }
@@ -13572,6 +13598,41 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `dont_look_inside` residual prefill (`cutover.rs`): without a
 /// `return_type` marker an object-pointer-returning opaque callee maps
 /// `None`→`Void`, residualizing to a void result the caller cannot use.
+/// True when a `ref`-tokened return is genuinely one machine word, so the
+/// token's one-word `SomeInstance` shell matches the callee's return ABI.
+///
+/// Reads the `tyref_to_ast_string` spelling because the `ref` token itself
+/// has already erased the distinction: `tyref_to_value_type` maps every
+/// non-primitive ADT to `ValueType::Ref`, a `Vec<T>` (three words, `sret`)
+/// exactly like a `*mut T`.
+///
+/// Admitted:
+/// - a raw pointer (`*mut T` / `*const T`), one word by construction;
+/// - `Result<T, PyError>` whose `Ok` payload is itself one word.  That is
+///   the shape the exception bridge already gives a one-word ABI — the `Ok`
+///   payload is returned in the result register and the `Err` rides
+///   `BH_LAST_EXC_VALUE` + `jit_publish_exception` — and it is what
+///   `PyResult` spells.
+///
+/// Everything else — `Vec<T>`, `String`, tuples, `Option<T>`, a named ADT by
+/// value — is declined, and its callers keep their "not registered" Skip.
+fn ref_return_is_single_word(ast: &str) -> bool {
+    let ast = ast.trim();
+    if ast.starts_with("*mut ") || ast.starts_with("*const ") {
+        return true;
+    }
+    // `Result<T,PyError>` — `tyref_to_ast_string` comma-joins type args
+    // without spaces, so split the payload off the trailing `,PyError>`.
+    if let Some(args) = ast
+        .strip_prefix("Result<")
+        .and_then(|s| s.strip_suffix(">"))
+        && let Some(ok) = args.strip_suffix(",PyError")
+    {
+        return ok == "()" || ref_return_is_single_word(ok);
+    }
+    false
+}
+
 fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))

@@ -19,6 +19,34 @@ use super::{
     RuntimeBhDescr,
 };
 
+/// Byte width of one scalar of `ty` in memory — a struct field or an array
+/// item.
+///
+/// Only `Ref` follows the target word: its storage IS a pointer, so on
+/// wasm32 it is 4 and a literal 8 would make the backend pick a load width
+/// (`majit-backend-wasm codegen.rs emit_sized_int_load`) wide enough to fold
+/// in the following slot's bytes.
+///
+/// `Int` does NOT follow the word.  It names the interpreter's integer
+/// *bank*, whose values are `i64` (`majit_ir::value::Type` doc), and the
+/// storage a descr describes is the source declaration, not the bank: a
+/// `jit_interp` `[int; virt]` array is backed by the caller's `Vec<i64>`
+/// (`majit/examples/spcount/src/main.rs:96`) and an `int` struct field by an
+/// `i64` (`majit-metainterp/tests/jit_interp_inline_helper_typed_return.rs:57`).
+/// Narrowing those to 4 on wasm32 strides past half of every item and
+/// truncates the value.  `Float` is `f64` on every target for the same
+/// reason.
+///
+/// This crate is compiled into the wasm guest, so `size_of::<usize>()` is
+/// the target word here; build-time host code in `majit-translate` must use
+/// `layout::target_word_size()` instead.
+pub(crate) fn scalar_size(ty: majit_ir::value::Type) -> usize {
+    match ty {
+        majit_ir::value::Type::Ref => std::mem::size_of::<usize>(),
+        _ => std::mem::size_of::<i64>(),
+    }
+}
+
 #[derive(Default)]
 pub struct JitCodeBuilder {
     /// RPython `jitcode.py:15` `self.name = name`. Propagated to the
@@ -592,8 +620,9 @@ impl JitCodeBuilder {
     /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,
     /// mirroring `descr.py:230-231 FieldDescr(name, offset, size, flag,
     /// index_in_parent, is_pure)` for each field.  Scalar fields are one
-    /// machine word (`field_size = 8`); the flag/sign follow the field
-    /// kind (pointer vs signed int).
+    /// machine word (`symbolic.py:12 WORD = sizeof(lltype.Signed)`, so 4
+    /// on wasm32); the flag/sign follow the field kind (pointer vs signed
+    /// int).
     ///
     /// `index_in_parent` is the field's rank by byte offset, not its order
     /// in the incoming slice.  `heaptracker.get_fielddescr_index_in`
@@ -631,7 +660,7 @@ impl JitCodeBuilder {
                     index: u32::MAX,
                     name: name.to_string(),
                     offset,
-                    field_size: 8,
+                    field_size: scalar_size(field_type),
                     field_type,
                     field_flag,
                     is_field_signed,
@@ -655,7 +684,7 @@ impl JitCodeBuilder {
         };
         self.add_bh_descr(CanonicalBhDescr::Field {
             offset,
-            field_size: 8,
+            field_size: scalar_size(field_type),
             field_type,
             field_flag,
             is_field_signed,
@@ -705,7 +734,7 @@ impl JitCodeBuilder {
             .unwrap_or((0, String::new()));
         self.add_bh_descr(CanonicalBhDescr::Field {
             offset,
-            field_size: 8,
+            field_size: scalar_size(field_type),
             field_type,
             field_flag,
             is_field_signed,
@@ -1486,7 +1515,9 @@ impl JitCodeBuilder {
     pub fn add_raw_float_array_descr(&mut self) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Array {
             base_size: 0,
-            itemsize: 8,
+            // f64 items are 8 bytes on every target — the one scalar width
+            // that does not follow the word.
+            itemsize: std::mem::size_of::<f64>(),
             len_offset: None,
             type_id: 0,
             item_type: majit_ir::value::Type::Float,
@@ -1588,7 +1619,7 @@ impl JitCodeBuilder {
         })
     }
 
-    /// Add a GC-array descriptor for a raw-pointer-element array (8-byte
+    /// Add a GC-array descriptor for a raw-pointer-element array (one-word
     /// `*mut T` items) to the descrs pool; returns the descr index for
     /// `getarrayitem_gc_r`.  Models a length-prefixed `{ len: usize,
     /// items: [*mut T; N] }` whose base pointer points at the `len` word:
@@ -1603,7 +1634,7 @@ impl JitCodeBuilder {
     pub fn add_ptr_array_descr(&mut self) -> u16 {
         self.add_array_descr(CanonicalBhDescr::Array {
             base_size: std::mem::size_of::<usize>(),
-            itemsize: 8,
+            itemsize: scalar_size(majit_ir::value::Type::Ref),
             len_offset: Some(0),
             type_id: 0,
             item_type: majit_ir::value::Type::Ref,
@@ -4660,7 +4691,13 @@ impl JitCodeBuilder {
     ) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Array {
             base_size: std::mem::size_of::<usize>(),
-            itemsize: 8,
+            // A `[ref; virt]` array's runtime twin reads its item size from
+            // `pyre_object::ITEMS_BLOCK_TOKEN`
+            // (`pyre-jit-trace virtualizable_gen.rs`), which is
+            // `size_of::<PyObjectRef>()`; a literal 8 makes the two descr
+            // universes disagree on wasm32.  A `[int; virt]` array keeps 8 —
+            // it is backed by the caller's `Vec<i64>`, not by words.
+            itemsize: scalar_size(item_type),
             len_offset: Some(0),
             type_id: 0,
             item_type,
