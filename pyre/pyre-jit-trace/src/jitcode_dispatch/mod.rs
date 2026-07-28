@@ -4638,10 +4638,10 @@ struct InlineParentBlackhole {
     /// return value through `call_result_reg()` before this caller runs.
     resume_pc: usize,
     int_values: Vec<(usize, i64)>,
-    /// `(register color, semantic slot, value)`.  Keeping both indices makes
-    /// the semantic Ref shadow's source explicit while the MIFrame consumer
-    /// restores the color-indexed bank.
-    ref_values: Vec<(usize, usize, pyre_object::PyObjectRef)>,
+    /// `(register color, value)`, read out of the color-indexed
+    /// `concrete_registers_r` shadow and restored into the MIFrame's
+    /// color-indexed Ref bank.
+    ref_values: Vec<(usize, pyre_object::PyObjectRef)>,
     /// Float values have no concrete shadow bank; retain their OpRefs and
     /// resolve them at force time while the trace context is still live.
     float_values: Vec<(usize, OpRef)>,
@@ -5356,7 +5356,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                     visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                 }
                 if let Some(blackhole) = parent.blackhole.as_mut() {
-                    for (_color, _semantic_slot, value) in blackhole.ref_values.iter_mut() {
+                    for (_color, value) in blackhole.ref_values.iter_mut() {
                         visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                     }
                 }
@@ -5941,10 +5941,18 @@ pub(crate) unsafe fn resolve_inlinable_callee(
         if raw.is_null() {
             return None;
         }
-        // Calling a generator / coroutine / async-generator function does NOT
-        // run its body — it builds the iterator and returns.  Inlining the
-        // body at the call site walks code the call never reaches, so the
-        // attempt can only end in an abort that discards the whole trace.
+        // Calling a generator / coroutine / async-generator function does not
+        // run its body — it builds a suspended frame object and returns it.
+        // Its jitcode therefore starts at `RETURN_GENERATOR`, which the
+        // codewriter lowers to an `abort_permanent` marker: inlining the body
+        // at the call site walks code the call never reaches, so the attempt
+        // can only end in an abort that discards the whole trace.  Decline to
+        // the residual call instead — the creation is an ordinary allocating
+        // call the walk steps over, and the body's suspension never enters the
+        // trace.  `generator.py:614-634` `should_not_inline` (consumed at
+        // `:63`) is upstream's decision point for the same boundary; it governs
+        // the *body* at `send_ex`, which is a separate question from the
+        // creation call.
         if pyre_interpreter::pyframe::code_flags_make_generator((*raw).flags) {
             return None;
         }

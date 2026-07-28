@@ -276,16 +276,35 @@ pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
 /// the equivalent `Assembler.insns` object on the translated staticdata /
 /// blackhole-builder path; pyre's `LazyLock` is the binary-embedded form
 /// of that same single translated table.
-static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock::new(|| {
+/// Build-time `pipeline.insns` exactly as the assembler serialised it —
+/// the opnames `make_jitcodes` actually emitted into this binary's
+/// jitcodes, with no canonical-universe overlay.
+///
+/// This is the direct analogue of upstream's `asm.insns`, which is what
+/// `BlackholeInterpBuilder.__init__` hands to `setup_insns`
+/// (`blackhole.py:58-59`): upstream registers exactly what was emitted,
+/// so its dispatch table covers the whole reachable bytecode universe by
+/// construction.  Any byte in this map that the production blackhole
+/// builder leaves unregistered is a byte a real jitcode can carry and the
+/// blackhole cannot execute — see
+/// `production_bh_builder_covers_every_build_emitted_opname`.
+static BUILD_EMITTED_INSNS: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock::new(|| {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/insns.bin"));
-    let mut table: indexmap::IndexMap<String, u8> =
-        bincode::deserialize(BYTES).unwrap_or_else(|e| {
-            panic!(
-                "pyre-jit-trace: failed to deserialize insns.bin \
-                     ({} bytes): {e}",
-                BYTES.len(),
-            )
-        });
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize insns.bin ({} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+});
+
+/// The build-emitted opname → byte table (upstream `asm.insns`).
+pub fn build_emitted_insns() -> &'static indexmap::IndexMap<String, u8> {
+    &BUILD_EMITTED_INSNS
+}
+
+static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock::new(|| {
+    let mut table = BUILD_EMITTED_INSNS.clone();
     // Overlay the canonical `wellknown_bh_insns` and pyre-only
     // `pyre_extension_insns` keys so the runtime table covers every
     // opname a `BlackholeInterpBuilder` could be asked to dispatch.
@@ -1382,6 +1401,156 @@ mod tests {
                  (for forward key {key:?})",
             );
         }
+    }
+
+    /// Coverage of the *production* builder, which is not the default one.
+    ///
+    /// `build_pyre_production_bh_builder` delegates to
+    /// `build_inline_call_only_bh_builder`, which hand-curates its registered
+    /// set family by family, so an emitted byte outside that surface reaches
+    /// `dispatch_step`'s unwired-opcode panic — and only once a forward resume
+    /// happens to land on it.  Upstream cannot have this failure mode:
+    /// `setup_insns(asm.insns)` (`blackhole.py:58-59`, :66) resolves every
+    /// opname the assembler emitted, so its dispatch table spans the reachable
+    /// bytecode universe by construction.
+    ///
+    /// This is the structural form of that guarantee: `build_emitted_insns()`
+    /// IS pyre's `asm.insns` — the serialised build-time `pipeline.insns`,
+    /// before the canonical-universe overlay — so every key in it names a byte
+    /// a real jitcode in this binary can carry.  Each must be dispatchable.
+    ///
+    /// Deliberately NOT asserted over `insns_opname_to_byte()`: that map
+    /// additionally carries the `wellknown_bh_insns` / `pyre_extension_insns`
+    /// overlay, i.e. canonical opnames this build never emitted. Their bytes
+    /// cannot appear in any jitcode here, so leaving them unregistered is the
+    /// same state upstream is in — its `asm.insns` would not list them either.
+    #[test]
+    fn production_bh_builder_covers_every_build_emitted_opname() {
+        let builder = build_pyre_production_bh_builder();
+        let mut unregistered: Vec<String> = build_emitted_insns()
+            .iter()
+            .filter(|(_key, byte)| {
+                builder
+                    ._insns
+                    .get(**byte as usize)
+                    .is_none_or(|name| name.is_empty())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        unregistered.sort();
+        assert_eq!(
+            unregistered,
+            Vec::<String>::new(),
+            "the production blackhole cannot dispatch an opname this build's \
+             jitcodes actually contain; register it in \
+             `build_inline_call_only_bh_builder` (and confirm the emit-side \
+             operand shape matches the wired handler's decoder) rather than \
+             widening this assertion",
+        );
+        let mut unwired: Vec<String> = builder
+            .unwired_opnames()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        unwired.sort();
+        assert_eq!(
+            unwired,
+            Vec::<String>::new(),
+            "production builder registered an opname without a handler",
+        );
+        // The curated list spells each byte as a `BC_*` constant by hand, so it
+        // can also drift the other way: a key bound to a byte the canonical
+        // table gives to a different opname would decode every occurrence as
+        // the wrong instruction.  `setup_insns` only rejects two keys claiming
+        // one byte *within* this builder, so nothing else catches it.
+        let mut mismatched: Vec<String> = Vec::new();
+        for (byte, key) in builder._insns.iter().enumerate() {
+            if key.is_empty() {
+                continue;
+            }
+            match insns_opname_to_byte().get(key) {
+                Some(&canonical) if canonical as usize == byte => {}
+                Some(&canonical) => mismatched.push(format!(
+                    "{key:?} registered at byte {byte}, canonical byte is {canonical}"
+                )),
+                None => mismatched.push(format!(
+                    "{key:?} registered at byte {byte} but is not a canonical opname"
+                )),
+            }
+        }
+        mismatched.sort();
+        assert_eq!(
+            mismatched,
+            Vec::<String>::new(),
+            "production builder's hand-spelled bytes disagree with the canonical \
+             opname table",
+        );
+    }
+
+    /// The overlay-only remainder: canonical opnames that exist in the
+    /// blackhole's key universe but that this build never emitted.
+    ///
+    /// Every entry has a `bhimpl_*` handler — `build_default_bh_builder` wires
+    /// all of them and its unwired set is empty (see the snapshot test below)
+    /// — so this is a registration gap, not an implementation gap, and it is
+    /// unreachable: no jitcode in this binary carries these bytes.  It is
+    /// pinned so that an opname MOVING out of this list (because the codewriter
+    /// started emitting it) shows up as a test failure to be classified,
+    /// instead of silently becoming a live `dispatch_step` panic.
+    #[test]
+    fn production_bh_builder_overlay_only_gap_snapshot() {
+        let builder = build_pyre_production_bh_builder();
+        let mut gap: Vec<String> = insns_opname_to_byte()
+            .iter()
+            .filter(|(key, byte)| {
+                !build_emitted_insns().contains_key(*key)
+                    && builder
+                        ._insns
+                        .get(**byte as usize)
+                        .is_none_or(|name| name.is_empty())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        gap.sort();
+        let expected = [
+            "abort/>r",
+            "assert_not_none/r",
+            "cast_float_to_int/f>i",
+            "cast_int_to_float/i>f",
+            "cast_int_to_ptr/i>r",
+            "check_neg_index/rid>i",
+            "conditional_call_ir_v/iiIRd",
+            "conditional_call_value_ir_i/iiIRd>i",
+            "conditional_call_value_ir_r/riIRd>r",
+            "convert_float_bytes_to_longlong/f>i",
+            "convert_longlong_bytes_to_float/i>f",
+            "gc_load_indexed_f/riiii>f",
+            "gc_load_indexed_i/riiii>i",
+            "getinteriorfield_gc_f/rid>f",
+            "getinteriorfield_gc_i/rid>i",
+            "getinteriorfield_gc_r/rid>r",
+            "getlistitem_gc_f/ridd>f",
+            "getlistitem_gc_i/ridd>i",
+            "getlistitem_gc_r/ridd>r",
+            "int_between/iii>i",
+            "new/d>r",
+            "new_array/id>r",
+            "newlist/idddd>r",
+            "newlist_clear/idddd>r",
+            "newlist_hint/idddd>r",
+            "record_exact_class/ri",
+            "record_known_result_i_ir_v/iiIRd",
+            "record_known_result_r_ir_v/riIRd",
+            "record_quasiimmut_field/rdd",
+            "rvmprof_code/ii",
+            "vtable_method_ptr/rd>i",
+        ];
+        assert_eq!(
+            gap, expected,
+            "the unreachable production-blackhole registration gap drifted; if \
+             an opname LEFT this list the codewriter now emits it, so it must \
+             be registered in `build_inline_call_only_bh_builder`",
+        );
     }
 
     #[test]
