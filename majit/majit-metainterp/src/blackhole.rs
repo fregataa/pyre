@@ -6062,10 +6062,15 @@ fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a
 /// RPython: fielddescr carries byte offset directly; pyre VableField.index
 /// needs vinfo.static_fields[index].offset resolution.
 ///
-/// Vable scalar word-size invariant: `field_size: 8`, `field_type: Ref`,
-/// `field_flag: Pointer`, `is_field_signed: false`.  Every vable scalar
-/// field in pyre is laid out as a single machine word, so the synthesized
-/// BhDescr can hard-code these.  The dynasm / cranelift `bh_getfield_gc_*`
+/// Vable scalar word-size invariant: `field_size: size_of::<usize>()`,
+/// `field_type: Ref`, `field_flag: Pointer`, `is_field_signed: false`.
+/// Every vable scalar field in pyre is laid out as a single machine word,
+/// so the synthesized BhDescr can derive these.  The width has to be the
+/// target's word, not a literal 8: the size-dispatching
+/// `Backend::bh_setfield_gc_i` picks its store width from it, and on a
+/// 32-bit target an 8-byte store at `valuestackdepth` runs past the field
+/// and clears the `last_instr` that follows it.  The dynasm / cranelift
+/// `bh_getfield_gc_*`
 /// overrides on this BhDescr therefore read i64 / GcRef / f64 at the
 /// resolved offset without consulting size/sign — equivalent to the
 /// llmodel.py:705 `read_int_at_mem(struct, ofs, 8, False)` call.
@@ -6104,7 +6109,7 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
         BhDescr::Field {
             offset,
             // Vable scalar word-size invariant — see fn doc-block.
-            field_size: 8,
+            field_size: std::mem::size_of::<usize>(),
             field_type: majit_ir::value::Type::Ref,
             field_flag: majit_ir::descr::ArrayFlag::Pointer,
             is_field_signed: false,
@@ -6150,7 +6155,11 @@ fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     (
         BhDescr::Field {
             offset,
-            field_size: 8,
+            // The array field is a pointer, so its width is the target word
+            // like the scalars above.  Latent rather than live: the `_gc_r`
+            // accessors this descr reaches take `as_offset()` and store at
+            // pointer width without consulting the size.
+            field_size: std::mem::size_of::<usize>(),
             field_type: majit_ir::value::Type::Ref,
             field_flag: majit_ir::descr::ArrayFlag::Pointer,
             is_field_signed: false,
