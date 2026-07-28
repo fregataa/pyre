@@ -854,6 +854,89 @@ pub fn python_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Optio
     )
 }
 
+/// `majit_metainterp::blackhole::LiveMarkerHook` implementation: stamp the
+/// instruction the blackhole is about to replay into the frame's `last_instr`.
+///
+/// `dispatch_bytecode` (pyopcode.py) writes `self.last_instr = intmask(
+/// next_instr)` before every opcode, and the interpreter's own loop
+/// (`eval.rs::eval_loop`) mirrors it, so anything that reads the frame while it
+/// is running — `f_lineno`, `f_lasti`, a traceback node, the exception-table
+/// lookup — sees the instruction actually executing. Upstream gets the same
+/// invariant during blackhole replay for free, because that write is a
+/// source-level store its codewriter lowers into the jitcode. pyre's codewriter
+/// cannot: it unrolls the bytecode per PC, so the store would need one distinct
+/// int pool constant per instruction against `check_result`'s 256-entry cap.
+/// Publishing here costs no jitcode, no recorded operation and no pool entry,
+/// and only the replay pays for it.
+///
+/// The frame is the one THIS level reads and writes — the portal red the
+/// codewriter threads through every `getarrayitem_vable_r`, taken from this
+/// level's own register bank. `virtualizable_ptr` is deliberately not a
+/// fallback: a nested level that carries no frame of its own would resolve it
+/// to the level ABOVE, and direct recursion would then get the callee's
+/// coordinate written into the caller's frame, past the code-object check.
+/// That check stays as the second half of the same argument — the frame must
+/// also be running the function this JitCode was built for.
+///
+/// This runs once per replayed instruction, so it resolves everything under a
+/// single store borrow and takes no reference count: the `Arc`-cloning
+/// accessors (`pyjitcode_for_jitcode_index`, `pyjitcode_for_code`) each re-run
+/// `ensure_finish_setup`, whose opname-map clone alone costs more than the
+/// replayed instruction, and `compiled_jitcode_lookup` is a linear scan.
+pub fn publish_last_instr_at_live_marker(
+    bh: &majit_metainterp::blackhole::BlackholeInterpreter,
+    marker_pc: usize,
+) {
+    // A JitCode only exists once `finish_setup` has run, so the store is read
+    // directly here rather than through `ensure_finish_setup`. A borrow already
+    // held (a reentrant walker path) skips the publish rather than panicking.
+    METAINTERP_SD.with(|r| {
+        let Ok(sd) = r.try_borrow() else {
+            return;
+        };
+        let Some(jitcode) = sd.jitcodes.get(bh.jitcode.index()) else {
+            return;
+        };
+        let metadata = &jitcode.payload.metadata;
+        let frame = match bh
+            .registers_r
+            .get(metadata.portal_frame_reg as usize)
+            .copied()
+        {
+            Some(value) if value > 0 => value as usize,
+            _ => return,
+        };
+        // SAFETY: the portal red holds the concrete `PyFrame` the blackhole
+        // runs against, and `frame_layout` pins `pycode` to this offset with a
+        // compile-time assertion against the interpreter's own constant.
+        let w_code =
+            unsafe { *((frame + crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+        // A non-standard virtualizable frame from a bridge sub-walk carries the
+        // `GcRef(usize::MAX)` sentinel (or null) here instead of a real
+        // `PyCode`. `w_code_get_ptr` requires a valid code object, so the null
+        // and sentinel tests run first, and `is_code` before the deref for the
+        // same reason its other callers order them that way — `py_type_check`
+        // would itself dereference a raw sentinel.
+        if w_code.is_null() || w_code as usize == usize::MAX {
+            return;
+        }
+        if !unsafe { pyre_interpreter::pycode::is_code(w_code as PyObjectRef) } {
+            return;
+        }
+        let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
+        if raw_code as *const CodeObject != jitcode.payload.code_ptr {
+            return;
+        }
+        let py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(metadata, marker_pc);
+        // SAFETY: same frame, and `last_instr` carries the same compile-time
+        // offset assertion.
+        unsafe {
+            *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
+                py_pc as isize;
+        }
+    });
+}
+
 /// Whether a JitCode exception exit came from the Python bare-reraise
 /// instruction path. `RAISE_VARARGS 0` and `RERAISE` both use
 /// RaiseWithExplicitTraceback and skip record_application_traceback.
@@ -4719,6 +4802,58 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     !arr_ptr.is_null() && unsafe { &*arr_ptr }.as_slice().len() >= nlocals + below.len() + 1
 }
 
+/// Take a copy of `frame`'s locals so a caller that publishes over them can put
+/// the frame back exactly as it found it.  Returned as raw words: boxing a slot
+/// during the publish can collect, so the copy has to be registered as resume
+/// roots (`push_resume_ref_roots`) for the duration, like the register image
+/// `apply_blackhole_crn` holds.
+///
+/// Upstream needs no counterpart. `resume.py`'s virtualizable write-back
+/// (`VirtualizableInfo.write_from_resume_data`) runs on a per-call `MIFrame`
+/// whose values RPython's GC sees through ordinary object references, so the
+/// question of publishing over a live frame and taking it back never arises;
+/// carrying the old slots as raw words, and rooting them by hand, is what
+/// replaces that ownership.
+pub(crate) fn capture_frame_locals(frame: usize) -> Option<Vec<i64>> {
+    if frame == 0 {
+        return None;
+    }
+    let nlocals = concrete_nlocals(frame)?;
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() {
+        return None;
+    }
+    let slots = unsafe { &*arr_ptr }.as_slice();
+    if slots.len() < nlocals {
+        return None;
+    }
+    Some(slots[..nlocals].iter().map(|&o| o as i64).collect())
+}
+
+/// Put back what [`capture_frame_locals`] took.
+pub(crate) fn restore_frame_locals(frame: usize, saved: &[i64]) {
+    if frame == 0 {
+        return;
+    }
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() {
+        return;
+    }
+    let len = unsafe { &*arr_ptr }.as_slice().len();
+    for (abs, &value) in saved.iter().enumerate().take(len) {
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = value as usize as PyObjectRef;
+        }
+    }
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
+}
+
 /// Materialize the outer frame's locals from the virtualizable shadow.
 /// Callers must run their complete preflight before executing a rebuilt
 /// callee; after that point a failure would make replay unsafe.
@@ -4741,6 +4876,13 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
         return false;
     }
     let base = info.num_static_extra_boxes;
+    // Every slot has to resolve before the first store, the way the merge-point
+    // flush validates ahead of its commit loop: bailing partway through leaves
+    // the frame carrying a mix of walk-current and pre-walk locals, which is
+    // neither of the two states a caller can recover from.
+    if (0..nlocals).any(|abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
+        return false;
+    }
     // Boxing an Int/Float slot allocates; the detached frame array is
     // forwarded only while it is in the remembered set, and each minor
     // consumes that entry, so re-arm the barrier after every store.

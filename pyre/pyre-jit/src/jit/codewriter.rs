@@ -7824,7 +7824,7 @@ impl CodeWriter {
                     let (instruction, op_arg) = arg_state.get(code_unit);
                     let mut exception_edge_handled = false;
 
-                    // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
+                    // pyframe.py pushvalue/popvalue_maybe_none parity:
                     // RPython's push/pop each write `self.valuestackdepth = depth +/- 1`.
                     // On the JIT, these map to per-push `setfield_vable_i`. pyre's
                     // codewriter stores stack values in typed registers rather than
@@ -7832,20 +7832,28 @@ impl CodeWriter {
                     // setitem for each push. As the coarsest RPython-compatible
                     // approximation we flush `valuestackdepth` once at opcode entry,
                     // reflecting the pre-opcode stack depth — which is what the
-                    // interpreter (eval.rs:92 `target_depth = frame.nlocals() +
-                    // frame.ncells() + entry.depth`) uses when an exception handler
-                    // unwinds the frame.
+                    // interpreter's `target_depth` (`eval.rs`) uses when an exception
+                    // handler unwinds the frame.
                     //
-                    // RPython interp_jit.py keeps `next_instr` as a green portal
-                    // argument and updates `last_instr` in the interpreter loop; it
-                    // does not lower a per-bytecode virtualizable write here. pyre's
-                    // portal entry / guard-resume paths already restore
-                    // `frame.next_instr`, and the interpreter updates `last_instr`
-                    // once execution returns there. Emitting `py_pc + 1` here only
-                    // grows the int constant pool linearly with function size and
-                    // trips assembler.py's 256-entry cap.
-                    // pyframe.py:379-417: valuestackdepth is written per-push/per-pop
-                    // via setfield_vable_i (jtransform.py:923-928), NOT once at opcode
+                    // `dispatch_bytecode` (pyopcode.py) DOES write `last_instr` once
+                    // per opcode, and that write is part of the traced portal, so
+                    // upstream's jitcode carries it and the blackhole replays it.
+                    // pyre cannot mirror it here: upstream's `next_instr` is a live
+                    // RPython variable, while this codewriter unrolls the bytecode
+                    // per PC, so the same store needs one distinct int pool constant
+                    // per PC and `assembler.py check_result`'s 256-entry
+                    // `num_regs_i + constants_i` cap rejects any function past a few
+                    // hundred instructions.  Convergence path: a value operand that
+                    // encodes the immediate inline instead of through the per-kind
+                    // pool, after which this becomes an unconditional per-PC store.
+                    // Until then the coordinate is published only where the frame
+                    // stops being replayed — the frame exits (`ReturnValue`,
+                    // `emit_abort_permanent!`) and the raises that resume in the
+                    // interpreter — so a frame observed MID-replay (via a callee's
+                    // `sys._getframe` or traceback) still reports the last published
+                    // coordinate.
+                    // pyframe.py: valuestackdepth is written per-push/per-pop
+                    // via setfield_vable_i (jtransform.py), NOT once at opcode
                     // entry. The per-push/per-pop emit_vsd! calls below mirror that.
                     // (The old single-entry flush is removed.)
 
@@ -8406,6 +8414,52 @@ impl CodeWriter {
                         Instruction::ReturnValue => {
                             let retval_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let retval = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `dispatch_bytecode` (pyopcode.py) stamps
+                            // `self.last_instr = intmask(next_instr)` before running
+                            // each opcode, so a frame that has returned answers
+                            // `offset2lineno` — `f_lineno`, and every traceback that
+                            // outlives the frame — for its `return`.  The blackhole
+                            // replays this jitcode instead of that loop and syncs only
+                            // `valuestackdepth` (`emit_vsd!`), so a frame finished by a
+                            // guard-failure resume would otherwise keep whichever
+                            // coordinate the trace last published: for a loop whose body
+                            // raises and catches, the raise.  Store `py_pc`, not the
+                            // `py_pc - 1` of the resume-at sites (`emit_abort_permanent!`)
+                            // — this opcode is dispatched here, not resumed at.
+                            //
+                            // Portal jitcode only.  In a non-portal callee
+                            // `frame_var` aliases the OUTERMOST frame rather
+                            // than naming that callee's own (the same aliasing
+                            // the `LoadGlobal` register-form namespace declines
+                            // for below), so the store would stamp the callee's
+                            // coordinate into its caller and the caller would
+                            // then resolve it against its own line table.  A
+                            // frame observed after an inlined callee returned —
+                            // through `sys._getframe(1)` or a retained traceback
+                            // — would report an unrelated line, which is the
+                            // very failure this store exists to remove.
+                            // Declining leaves the caller's own coordinate
+                            // intact.  The inlined callee's own frame stays
+                            // unpublished, the same inner-level gap the
+                            // `-live-` marker hook declines on
+                            // (`publish_last_instr_at_live_marker` resolves the
+                            // frame from the replaying level's own portal red
+                            // and requires a code-object match).
+                            if is_true_portal {
+                                let v_li: super::flow::FlowValue =
+                                    super::flow::Constant::signed(py_pc as i64).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setfield_vable_i",
+                                    vable_setfield_int_graph_args(
+                                        frame_var.into(),
+                                        v_li.into(),
+                                        VABLE_LAST_INSTR_FIELD_IDX,
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
+                            }
                             // ref_return reads from the stack slot
                             // directly — the obj_tmp0 staging was redundant since
                             // this is the terminating op of the block.
