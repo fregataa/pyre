@@ -342,6 +342,77 @@ thread_local! {
     /// [`INLINE_CONCRETE_FRAME`], which stays set across the whole sub-walk.
     static PUBLISHED_INLINE_FRAME: std::cell::Cell<*mut pyre_interpreter::PyFrame> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+
+    /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
+    /// with the resume coordinate it displaced.
+    static PUBLISHED_LAST_INSTR: std::cell::Cell<Option<(usize, isize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `_opimpl_setfield_vable`'s heap half for the recording walk.  While a
+/// residual runs concretely the live frame must name the EXECUTING opcode, so
+/// that a frame reader inside the callee reports the line the opcode is on —
+/// what `eval.rs` `frame.last_instr = pc` gives an interpreted opcode.  The
+/// walk dispatches opcodes itself instead of through `execute_opcode_step`, so
+/// nothing else advances the field and the frame still carries the pc of the
+/// last resume point; `_warnings::setup_context` then keys its registry on
+/// that line and re-issues a warning the interpreted run already deduplicated.
+///
+/// Restored on the way out, because `last_instr` doubles as the resume
+/// coordinate: `flush_walk_end_state_to_frame_inner` writes `resume_py_pc - 1`
+/// and the escape guard's resume pc is this same pc, so the two meanings
+/// differ by exactly one and may only coexist for the residual's duration.
+/// Leaving the executing value behind makes an abort replay one opcode late.
+struct LiveLastInstrGuard {
+    frame: *mut pyre_interpreter::PyFrame,
+    saved: isize,
+    prev: Option<(usize, isize)>,
+}
+
+impl LiveLastInstrGuard {
+    /// Publishes onto the frame `py_pc` indexes.  Inside an inline sub-walk
+    /// that is the callee's concrete frame, NOT the walk's virtualizable: a
+    /// sub-walk's pc is in the callee's code (the same reason `escape_stack`
+    /// declines to latch a sub-walk's mirror), and writing it onto the outer
+    /// frame strands that frame's replay on a stack depth it never had.
+    fn enter(live_frame: usize, py_pc: u32) -> Option<Self> {
+        let inline = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        let frame = if inline.is_null() {
+            live_frame as *mut pyre_interpreter::PyFrame
+        } else {
+            inline
+        };
+        if frame.is_null() {
+            return None;
+        }
+        let saved = unsafe { (*frame).last_instr };
+        unsafe { (*frame).last_instr = py_pc as isize };
+        // Save/restore rather than set/clear: a residual can run user code that
+        // records a nested walk whose own residual enters a second guard, and
+        // clearing on the inner drop would leave the still-live outer
+        // publication invisible — `capture_escape_flush_undo` would then snapshot
+        // the executing pc as if it were the outer frame's resume coordinate.
+        // Same discipline as [`InlineConcreteFrameGuard`] and
+        // [`ResidualFrameChainGuard`].
+        let prev = PUBLISHED_LAST_INSTR.with(|slot| slot.replace(Some((frame as usize, saved))));
+        Some(Self { frame, saved, prev })
+    }
+}
+
+impl Drop for LiveLastInstrGuard {
+    fn drop(&mut self) {
+        PUBLISHED_LAST_INSTR.with(|slot| slot.set(self.prev));
+        // A flush that committed onto this frame wrote the resume coordinate
+        // itself and is authoritative.  Its undo capture holds the value this
+        // guard displaced (see [`capture_escape_flush_undo`]), so a later
+        // commit withdrawal still restores the resume pc rather than the
+        // executing one.
+        let flushed = ESCAPE_FLUSH_UNDO.with(|slot| slot.borrow().as_ref().map(|undo| undo.frame))
+            == Some(self.frame as usize);
+        if !flushed {
+            unsafe { (*self.frame).last_instr = self.saved };
+        }
+    }
 }
 
 /// Names the frame an inline sub-walk executes concretely for the duration of
@@ -559,9 +630,17 @@ fn capture_escape_flush_undo(frame: usize) {
             None => {}
         }
         let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+        // With a [`LiveLastInstrGuard`] live on this frame the field holds the
+        // EXECUTING pc, not the resume coordinate.  The undo exists to hand a
+        // legacy replay a pristine pre-flush frame, and a replay needs the
+        // resume pc — so capture the value the guard displaced.
+        let last_instr = PUBLISHED_LAST_INSTR
+            .with(|slot| slot.get())
+            .filter(|(published, _)| *published == frame)
+            .map_or(pf.last_instr, |(_, saved)| saved);
         *slot = Some(EscapeFlushUndo {
             frame,
-            last_instr: pf.last_instr,
+            last_instr,
             valuestackdepth: pf.valuestackdepth,
             slots: pf.locals_w().as_slice().to_vec(),
         });
@@ -1750,13 +1829,44 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // Publish the current Python pc so a force inside the callee reports
         // the executing line rather than the one the last resume point left
         // behind.
-        let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "last_instr",
-            last_instr,
-            majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
-        );
+        //
+        // Only while the pc indexes the walk's own virtualizable.  Inside an
+        // inline sub-walk `vstack_cur_pypc` is in the CALLEE's code, and both
+        // halves below name the outer frame, so publishing there stamps a
+        // foreign pc onto it — `offset2lineno` then resolves it against the
+        // outer code object and reports whatever line that byte happens to sit
+        // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
+        // concrete store, publishing onto the callee's own frame instead.
+        if INLINE_CONCRETE_FRAME.with(|slot| slot.get()).is_null() {
+            let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "last_instr",
+                last_instr,
+                majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
+            );
+            // …and the heap half of the same `_opimpl_setfield_vable` shape
+            // (`virtualizable_boxes[index] = valuebox; synchronize_virtualizable()`
+            // — the mirror above is only the box half, and writes the trace's
+            // shadow, never the frame).  The same constant feeds both so the
+            // shadow and the heap cannot disagree.
+            //
+            // Upstream needs neither at a residual call: its frame readers are
+            // traced in and read `last_instr` off the virtual frame.  pyre
+            // residualizes them and reads the heap, and the frame-chain walk no
+            // longer forces (`ExecutionContext::force_frame`), so without this
+            // store nothing keeps the field current in compiled code: left at
+            // the last resume point, `_warnings::setup_context` keys its
+            // registry on the wrong line and re-issues a warning the
+            // interpreted run already deduplicated.
+            if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
+                && let Some(idx) = info.static_field_index_by_name("last_instr")
+            {
+                let descr = info.static_field_descr(idx);
+                ctx.trace_ctx
+                    .vable_setfield_descr(vable_ref, last_instr, descr);
+            }
+        }
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
             info.tracing_before_residual_call(**obj as usize as *mut u8);
@@ -1866,6 +1976,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // `executioncontext.py:85 enter` for the inlined callee this residual
         // runs inside of.
         let _frame_chain = ResidualFrameChainGuard::enter();
+        let _last_instr = LiveLastInstrGuard::enter(live_frame, ctx.vstack_cur_pypc);
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
@@ -1998,6 +2109,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // leg must not assume walk-end shadow state after a cancelled
             // commit.
             ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
+            if fbw_debug_abort_enabled() {
+                // `vable_after_residual_call`'s
+                // `debug_print('vable escaped during a call in %s')`: name the
+                // callee through `get_name_from_address`, falling back to the
+                // raw address.  Which helper forced the virtualizable is the
+                // only thing that distinguishes one ABORT_ESCAPE from another,
+                // and the trace is gone by the time the abort surfaces.
+                let addr = match ctx.trace_ctx.box_value(allboxes[0]) {
+                    Some(majit_ir::Value::Int(a)) => a,
+                    _ => 0,
+                };
+                match pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .find(|(_, a)| *a == addr)
+                {
+                    Some((name, _)) => eprintln!(
+                        "[fbw-escape] pc={op_pc} vable escaped during a call in ConstClass({name})"
+                    ),
+                    None => {
+                        eprintln!(
+                            "[fbw-escape] pc={op_pc} vable escaped during a call in {addr:#x}"
+                        )
+                    }
+                }
+            }
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }

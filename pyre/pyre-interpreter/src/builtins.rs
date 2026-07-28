@@ -4408,9 +4408,36 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             )));
         }
     }
-    let args_list = pyre_object::w_list_new(positional.to_vec());
-    unsafe { pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list) };
+    // `interp_exceptions.py:123-124 descr_init` and `:277-282
+    // descr_new_base_exception` both store the `args_w` list their own
+    // signature was bound to, so `type.__call__` reaches here holding a list
+    // that already contains exactly these objects.  Keep it rather than build
+    // a second one over the same elements: `args` is read out as a fresh
+    // tuple and the storage is never handed out, so its identity is not
+    // observable.
+    if !exception_args_already(w_self, positional) {
+        let args_list = pyre_object::w_list_new(positional.to_vec());
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list) };
+    }
     Ok(pyre_object::w_none())
+}
+
+/// Whether `w_self`'s `args_w` storage already holds exactly `positional`,
+/// element for element by identity.
+fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bool {
+    unsafe {
+        let stored = pyre_object::interp_exceptions::w_exception_get_args_storage(w_self);
+        if stored.is_null() || !pyre_object::is_list(stored) {
+            return false;
+        }
+        if pyre_object::w_list_len(stored) != positional.len() {
+            return false;
+        }
+        positional.iter().enumerate().all(|(i, &item)| {
+            pyre_object::w_list_getitem(stored, i as i64)
+                .is_some_and(|held| std::ptr::eq(held, item))
+        })
+    }
 }
 
 /// `interp_exceptions.py:551-652 W_OSError._parse_init_args` + `_init_error`.
@@ -6197,11 +6224,16 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
 /// Look up a builtin exception class by its `ExcKind` name. Returns
 /// `None` if the registry hasn't been populated yet (e.g. before
 /// install_default_builtins).
-/// Reads the runtime-populated `EXC_CLASS_REGISTRY` `OnceLock`, not a
-/// build-time constant, so the JIT residualizes the call instead of tracing
-/// into it (`@dont_look_inside`). The scalar-`Option<PyObjectRef>` result is
-/// the same residual boundary shape as
-/// `baseobjspace::lookup_in_type_where_uncached`.
+///
+/// `dont_look_inside` because the body reads `EXC_CLASS_REGISTRY`, a
+/// runtime-populated `static` of a host type rather than a build-time constant,
+/// so the front-end cannot lift it. Reaching it from a lifted body fails that
+/// callee's lift and, transitively, every caller's — which is how
+/// `warn::warn_category_w` lost its jitcode and made every interpreter-level
+/// warning an opaque residual. Hiding the registry behind the opaque call keeps
+/// the callers liftable, exactly as `w_dict_new` does for its host `IndexMap`,
+/// and the scalar `Option<PyObjectRef>` result is the same residual boundary
+/// shape as `baseobjspace::lookup_in_type_where_uncached`.
 #[majit_macros::dont_look_inside]
 pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
     let registry = EXC_CLASS_REGISTRY.get()?;
@@ -8676,6 +8708,27 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
+    // The scalar builtins are not subclassable in place: an *exact* instance
+    // can only ever reach the `__hash__` these arms of `hash_value` already
+    // compute, so the slot lookup and the call protocol below would just
+    // route back here.  This is the digest every interpreter-level dict probe
+    // needs, and it is on the path of every module / `sys.modules` /
+    // namespace lookup — `UnicodeDictStrategy`'s upstream storage hashes its
+    // unwrapped key the same way, without an app-level call.
+    unsafe {
+        for tp in [
+            &pyre_object::STR_TYPE,
+            &pyre_object::INT_TYPE,
+            &pyre_object::BOOL_TYPE,
+            &pyre_object::LONG_TYPE,
+            &pyre_object::FLOAT_TYPE,
+            &pyre_object::bytesobject::BYTES_TYPE,
+        ] {
+            if is_exact_type(obj, tp) {
+                return Ok(hash_value(obj));
+            }
+        }
+    }
     unsafe {
         let kind = if pyre_object::is_dict(obj) {
             Some("dict")
@@ -8756,6 +8809,11 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
         }
         if is_tuple(obj) {
+            // The element walk is the one recursive step here, and the scalar
+            // fast path above no longer reaches the call protocol's own
+            // guard, so a nest deep enough to exhaust the C stack has to be
+            // caught on the way down.
+            crate::stack_check::stack_check()?;
             let n = w_tuple_len(obj);
             let mut hashes = Vec::with_capacity(n);
             for i in 0..(n as i64) {
@@ -8962,7 +9020,12 @@ pub(crate) fn _hash_float(v: f64) -> i64 {
 /// it.
 #[inline]
 fn _hash_tuple_xx(items: &[i64]) -> i64 {
-    rustpython_common::hash::hash_tuple(items.iter().map(|&h| Ok::<i64, ()>(h)))
+    _hash_tuple_xx_iter(items.iter().copied())
+}
+
+/// `_hash_tuple_xx` over element digests produced on the fly.
+fn _hash_tuple_xx_iter(items: impl Iterator<Item = i64>) -> i64 {
+    rustpython_common::hash::hash_tuple(items.map(Ok::<i64, ()>))
         .expect("element hashes are precomputed, so the fold cannot fail")
 }
 
@@ -8992,12 +9055,7 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
 /// instead of panicking on the `&str` view.
 fn _hash_str(bytes: &[u8]) -> i64 {
     use core::hash::Hasher;
-    // Empty input hashes to 0 (`""` and `b""`), short-circuiting the
-    // siphash digest.
-    if bytes.is_empty() {
-        return 0;
-    }
-    // `rpython/rlib/rsiphash.py:60-62 _build_key_from_seed` — when
+    // `rpython/rlib/rsiphash.py _build_key_from_seed` — when
     // `PYTHONHASHSEED=0` the key is the 16-byte all-zero buffer.
     // Pyre runs with the deterministic seed for reproducibility,
     // matching PyPy's `PYTHONHASHSEED=0` byte-for-byte.  Wiring a
@@ -9014,7 +9072,15 @@ fn _hash_str(bytes: &[u8]) -> i64 {
     let mut hasher = siphasher::sip::SipHasher24::new_with_key(&SECRET);
     hasher.write(bytes);
     let raw = hasher.finish() as i64;
-    raw - ((raw == -1) as i64)
+    let raw = raw - ((raw == -1) as i64);
+    // `rstr.py _ll_strhash` — a string caches its digest in a slot that
+    // `malloc` zeroed, so zero doubles as "not computed yet" and a digest that
+    // lands on it is replaced by this fixed substitute.  Applied here rather
+    // than at the caching str caller so every digest consumer (bytes,
+    // memoryview) agrees with the cached one on the same bytes.  Empty input
+    // is NOT special-cased: `ll_strhash`'s `return 0` arm is a null-pointer
+    // check, and upstream digests `b""` like any other value.
+    if raw == 0 { 29872897 } else { raw }
 }
 
 /// `space.hash_w` digest for a `str` computed directly from its WTF-8 bytes
@@ -9107,7 +9173,19 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             );
         }
         if is_str(obj) {
-            return _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
+            // `unicodeobject.py hash_w` digests `self._utf8`, and
+            // `compute_hash` on an RPython string is `ll_strhash`, which keeps
+            // the result in the string and recomputes only while the slot
+            // still reads zero.  `_hash_str` already substitutes a zero
+            // digest, so the value cached here is never the "not computed"
+            // sentinel.
+            let cached = pyre_object::w_str_get_hash(obj);
+            if cached != 0 {
+                return cached;
+            }
+            let hash = _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
+            pyre_object::w_str_set_hash(obj, hash);
+            return hash;
         }
         // `bytesobject.py descr_hash` — `compute_hash(self._value)`, the same
         // byte-string digest str uses (bytearray is mutable / unhashable).
@@ -9134,14 +9212,13 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return 0xFCA8_6420;
         }
         if is_tuple(obj) {
-            let n = w_tuple_len(obj);
-            let mut hashes = Vec::with_capacity(n);
-            for i in 0..(n as i64) {
-                if let Some(item) = w_tuple_getitem(obj, i) {
-                    hashes.push(hash_value(item));
-                }
-            }
-            return _hash_tuple_xx(&hashes);
+            // `tupleobject.py:409-420 _descr_hash_unroll` folds the element
+            // digests straight into the accumulator; collecting them into a
+            // list first would allocate one per hashed tuple.
+            let n = w_tuple_len(obj) as i64;
+            return _hash_tuple_xx_iter(
+                (0..n).filter_map(|i| w_tuple_getitem(obj, i).map(hash_value)),
+            );
         }
         if pyre_object::is_frozenset(obj) {
             return frozenset_hash_from_storage(obj);
@@ -10377,7 +10454,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .unwrap_or_else(|| w_bool_from(true));
     let closefd = crate::baseobjspace::is_true(closefd_obj)?;
     if unsafe { pyre_object::is_bool(file) } {
-        crate::warn::warn_category("bool is used as a file descriptor", "RuntimeWarning", 1)?;
+        crate::warn::warn_category("bool is used as a file descriptor", "RuntimeWarning", 2)?;
     }
     if !unsafe { pyre_object::is_int(file) } && !closefd {
         return Err(crate::PyError::value_error(
@@ -12666,12 +12743,14 @@ mod tests {
         }
     }
 
-    /// Empty `str`/`bytes` hash to 0; non-empty inputs take the siphash
-    /// digest.
+    /// Empty input is digested like any other: SipHash-2-4 under the all-zero
+    /// key gives `0x1e924b9d737700d7`, which is what PyPy reports for
+    /// `hash("")` under `PYTHONHASHSEED=0`.  A digest never reads back as the
+    /// zero "not computed yet" sentinel.
     #[test]
-    fn empty_str_and_bytes_hash_to_zero() {
-        assert_eq!(_hash_str(b""), 0);
-        assert_eq!(hash_str_bytes(b""), 0);
+    fn empty_str_and_bytes_digest_like_pypy() {
+        assert_eq!(_hash_str(b""), 0x1e92_4b9d_7377_00d7);
+        assert_eq!(hash_str_bytes(b""), 0x1e92_4b9d_7377_00d7);
         assert_ne!(_hash_str(b"a"), 0);
     }
 

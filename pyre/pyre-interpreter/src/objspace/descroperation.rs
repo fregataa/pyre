@@ -4379,6 +4379,30 @@ pub fn neg(a: PyObjectRef) -> PyResult {
     }
 }
 
+const BOOL_INVERT_DEPRECATION_TEXT: &str = "Bitwise inversion '~' on bool is deprecated and will be removed in \
+Python 3.16. This returns the bitwise inversion of the underlying int \
+object and is usually not what you expect from negating a bool. \
+Use the 'not' operator for boolean negation or ~int(x) if you really want \
+the bitwise inversion of the underlying int.";
+
+/// The wrapped form of [`BOOL_INVERT_DEPRECATION_TEXT`]: `~True` in a loop
+/// issues the same message on every iteration, and the registry lookup that
+/// deduplicates it hashes and compares the message each time.
+///
+/// `dont_look_inside` because the cell is a `static` of a host type, which
+/// the front-end cannot lift: reaching it from a lifted body fails the
+/// callee's own lift and, transitively, every caller's — [`invert`] then has
+/// no jitcode, the tracer has to residualise the whole `~` opcode, and a
+/// virtualizable forced inside that residual aborts the trace
+/// (`ABORT_ESCAPE`), so a `~bool` in a hot loop stops the loop compiling at
+/// all.  Hiding the static behind an opaque accessor keeps the body out of
+/// the lift, exactly as `w_dict_new` does for its host `IndexMap`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn bool_invert_deprecation_text() -> PyObjectRef {
+    static CELL: crate::warn::PrebuiltText = crate::warn::PrebuiltText::new();
+    CELL.get(BOOL_INVERT_DEPRECATION_TEXT)
+}
+
 /// Unary bitwise inversion.
 
 pub fn invert(a: PyObjectRef) -> PyResult {
@@ -4390,13 +4414,7 @@ pub fn invert(a: PyObjectRef) -> PyResult {
             // CPython 3.14 `Objects/boolobject.c:bool_invert`.  The bundled
             // PyPy source inherits `W_IntObject.descr_invert`; 3.14 inserts
             // this warning-bearing bool slot before the integer inversion.
-            crate::warn::warn_deprecation(
-                "Bitwise inversion '~' on bool is deprecated and will be removed in \
-Python 3.16. This returns the bitwise inversion of the underlying int \
-object and is usually not what you expect from negating a bool. \
-Use the 'not' operator for boolean negation or ~int(x) if you really want \
-the bitwise inversion of the underlying int.",
-            )?;
+            crate::warn::warn_category_w(bool_invert_deprecation_text(), "DeprecationWarning", 2)?;
             return Ok(w_int_new(!int_value(a)));
         }
         if is_int(a) {

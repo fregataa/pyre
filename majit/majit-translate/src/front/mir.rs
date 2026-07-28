@@ -4523,10 +4523,22 @@ impl<'a> Lowering<'a> {
                 // shape (`flowspace_adapter.rs::is_str_const_define`).
                 result_ty: ValueType::Ref(None),
             },
+            // A function item's value is its address.  Upstream materialises
+            // it as `Constant(funcptr)` of lltype `Ptr(FuncType)`
+            // (`rtyper.getcallable`, and `sub_helper_funcptr_constant` for the
+            // sub-helper twins), whose `getkind` is `r` — the same reason the
+            // `Str` arm above declares a Ref.  The synthetic define reuses the
+            // callee's real path so a value threaded into a call site still
+            // resolves, which also puts it in front of `getcalldescr`'s
+            // `RESULT == FUNC.RESULT` check (`call.py`): an `Int` here read as
+            // a 0-arg call to that function and hard-failed against any callee
+            // whose graph carries a `FUNC.RESULT` token — `w_dict_new`
+            // (`dont_look_inside`) threaded through `Option::unwrap_or_else` is
+            // the shape that surfaces it.
             DecodedConst::FnPath(segments) => OpKind::Call {
                 target: CallTarget::FunctionPath { segments },
                 args: vec![],
-                result_ty: ValueType::Int,
+                result_ty: ValueType::Ref(None),
             },
         };
         let var = self
@@ -12783,10 +12795,24 @@ fn tyref_fieldless_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// `Unknown` results (whose legacy concrete is also Unknown — the
 /// dead-var backfill family, not a genuine kind mismatch).
 fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> {
-    if is_unit_type(output, llbc) {
+    // A `Result<T, PyError>` callee is reached through the residual-call
+    // ABI, which hands back the `Ok` payload and routes the error through
+    // `BH_LAST_EXC_VALUE`, so `FUNC.RESULT` is `T`.  Reading the kind off
+    // the `Result` ADT instead reports `ref` whatever `T` is, and the
+    // caller — whose call result is the unwrapped payload — then disagrees
+    // with the token for every non-reference `T` (`getcalldescr`'s
+    // `RESULT == FUNC.RESULT` check).  `Result<(), PyError>` reaches the
+    // unit arm the same way its callee reaches `widen_unit_return_to_void`.
+    //
+    // The `OBJECTPTR` carve-out below deliberately keeps reading the
+    // declared `output`: it decides the pointer's lowering, not its bank,
+    // and a `Result`-typed output has never taken it.
+    let payload = crate::front::result_exc::tyref_result_ok(output, llbc);
+    let kind_src = payload.as_ref().unwrap_or(output);
+    if is_unit_type(kind_src, llbc) {
         return None;
     }
-    let token = match tyref_to_value_type(output, llbc) {
+    let token = match tyref_to_value_type(kind_src, llbc) {
         ValueType::Bool => "bool",
         ValueType::Int => "i64",
         ValueType::Unsigned => "u64",
