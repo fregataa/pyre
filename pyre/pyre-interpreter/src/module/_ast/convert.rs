@@ -30,6 +30,8 @@ pub fn compile_object(
         depth: 0,
     };
     let module = converter.module(object)?;
+    // compiling.py:73 — the tree is walked before it reaches the compiler.
+    crate::astcompiler::validate::validate_ast(&module)?;
     let source_file = rustpython_compiler::core::SourceFileBuilder::new(filename, "").finish();
     rustpython_compiler::codegen::compile::compile_top(module, source_file, mode, opts)
         .map_err(|error| crate::PyError::syntax_error(error.to_string()))
@@ -80,8 +82,8 @@ impl ObjectConverter {
         let value = self.field(object, field, node)?;
         if !unsafe { pyre_object::is_list(value) } {
             return Err(crate::PyError::type_error(format!(
-                "AST list field must be a list, not {}",
-                unsafe { pyre_object::type_name_of(value) }
+                "{node} field {field:?} must be a list, not a {}",
+                class_name(value)
             )));
         }
         Ok(unsafe { pyre_object::w_list_items_copy_as_vec(value) })
@@ -98,80 +100,55 @@ impl ObjectConverter {
     }
 
     fn module(&mut self, object: PyObjectRef) -> AstResult<ast::Mod> {
-        if self.is_node(object, "Module")? {
-            let values = self.list(object, "body", "Module")?;
-            let body = values
-                .into_iter()
-                .map(|value| self.recurse(|this| this.stmt(value)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ast::Mod::Module(ast::ModModule {
-                node_index: Default::default(),
-                range: Default::default(),
-                body,
-                runtime_body: None,
-            }))
+        let node = if self.is_node(object, "Module")? {
+            "Module"
         } else if self.is_node(object, "Interactive")? {
-            let values = self.list(object, "body", "Interactive")?;
-            let body = values
-                .into_iter()
-                .map(|value| self.recurse(|this| this.stmt(value)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ast::Mod::Module(ast::ModModule {
-                node_index: Default::default(),
-                range: Default::default(),
-                body,
-                runtime_body: None,
-            }))
+            "Interactive"
         } else if self.is_node(object, "Expression")? {
             let body = self.field(object, "body", "Expression")?;
-            Ok(ast::Mod::Expression(ast::ModExpression {
+            return Ok(ast::Mod::Expression(ast::ModExpression {
                 node_index: Default::default(),
                 range: Default::default(),
                 body: Box::new(self.recurse(|this| this.expr(body))?),
-            }))
+            }));
         } else {
-            Err(crate::PyError::type_error(format!(
+            return Err(crate::PyError::type_error(format!(
                 "expected some sort of mod, but got {}",
                 unsafe { pyre_object::type_name_of(object) }
-            )))
-        }
+            )));
+        };
+        Ok(ast::Mod::Module(ast::ModModule {
+            node_index: Default::default(),
+            range: Default::default(),
+            body: self.body(object, "body", node)?,
+            runtime_body: None,
+        }))
     }
 
     fn stmt(&mut self, object: PyObjectRef) -> AstResult<ast::Stmt> {
         if self.is_node(object, "FunctionDef")? || self.is_node(object, "AsyncFunctionDef")? {
             let is_async = self.is_node(object, "AsyncFunctionDef")?;
-            let name = ast::Identifier::new(
-                self.string(
-                    object,
-                    "name",
-                    if is_async {
-                        "AsyncFunctionDef"
-                    } else {
-                        "FunctionDef"
-                    },
-                )?,
-                Default::default(),
-            );
-            let args = self.field(object, "args", "FunctionDef")?;
+            let node = if is_async {
+                "AsyncFunctionDef"
+            } else {
+                "FunctionDef"
+            };
+            let name = self.identifier(object, "name", node)?;
+            let args = self.field(object, "args", node)?;
             let parameters = Box::new(self.recurse(|this| this.parameters(args))?);
-            let body = self
-                .list(object, "body", "FunctionDef")?
-                .into_iter()
-                .map(|value| self.recurse(|this| this.stmt(value)))
-                .collect::<Result<Vec<_>, _>>()?;
-            // `type_params` was added after the original positional
-            // FunctionDef constructor.  Like RustPython/PyPy, a missing field
-            // on a manually constructed legacy node means an empty list.
-            let _type_params = self.optional_field(object, "type_params")?;
+            let body = self.body(object, "body", node)?;
+            let decorator_list = self.decorators(object, node)?;
+            let returns = self.opt_expr(object, "returns")?;
+            let type_params = self.type_params(object, node)?;
             Ok(ast::Stmt::FunctionDef(ast::StmtFunctionDef {
                 node_index: Default::default(),
                 range: Default::default(),
                 is_async,
-                decorator_list: Vec::new(),
+                decorator_list,
                 name,
-                type_params: None,
+                type_params,
                 parameters,
-                returns: None,
+                returns,
                 body,
                 runtime_decorator_list: None,
                 runtime_type_comment: None,
@@ -203,7 +180,10 @@ impl ObjectConverter {
             let targets = self
                 .list(object, "targets", "Assign")?
                 .into_iter()
-                .map(|value| self.recurse(|this| this.expr(value)))
+                .map(|value| {
+                    self.require_node(value, "expression")?;
+                    self.recurse(|this| this.expr(value))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let value = self.field(object, "value", "Assign")?;
             Ok(ast::Stmt::Assign(ast::StmtAssign {
@@ -215,6 +195,295 @@ impl ObjectConverter {
                 runtime_type_comment: None,
                 runtime_type_comment_bytes: None,
             }))
+        } else if self.is_node(object, "ClassDef")? {
+            let name = self.identifier(object, "name", "ClassDef")?;
+            let bases = self.exprs(object, "bases", "ClassDef")?;
+            let keywords = self
+                .list(object, "keywords", "ClassDef")?
+                .into_iter()
+                .map(|keyword| self.recurse(|this| this.keyword(keyword)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let body = self.body(object, "body", "ClassDef")?;
+            let decorator_list = self.decorators(object, "ClassDef")?;
+            let type_params = self.type_params(object, "ClassDef")?;
+            // An absent argument list and an empty one are different trees, and
+            // only the former elides the parentheses.
+            let arguments = if bases.is_empty() && keywords.is_empty() {
+                None
+            } else {
+                Some(Box::new(ast::Arguments {
+                    node_index: Default::default(),
+                    range: Default::default(),
+                    args: bases.into_boxed_slice(),
+                    keywords: keywords.into_boxed_slice(),
+                    runtime_args: None,
+                    runtime_bases: None,
+                }))
+            };
+            Ok(ast::Stmt::ClassDef(ast::StmtClassDef {
+                node_index: Default::default(),
+                range: Default::default(),
+                decorator_list,
+                name,
+                type_params,
+                arguments,
+                body,
+                runtime_decorator_list: None,
+                runtime_body: None,
+            }))
+        } else if self.is_node(object, "Delete")? {
+            Ok(ast::Stmt::Delete(ast::StmtDelete {
+                node_index: Default::default(),
+                range: Default::default(),
+                targets: self.exprs(object, "targets", "Delete")?,
+                runtime_targets: None,
+            }))
+        } else if self.is_node(object, "TypeAlias")? {
+            let name = self.req_expr(object, "name", "TypeAlias")?;
+            let type_params = self.type_params(object, "TypeAlias")?;
+            let value = self.req_expr(object, "value", "TypeAlias")?;
+            Ok(ast::Stmt::TypeAlias(ast::StmtTypeAlias {
+                node_index: Default::default(),
+                range: Default::default(),
+                name,
+                type_params,
+                value,
+            }))
+        } else if self.is_node(object, "AugAssign")? {
+            let target = self.req_expr(object, "target", "AugAssign")?;
+            let op = self.field(object, "op", "AugAssign")?;
+            let value = self.req_expr(object, "value", "AugAssign")?;
+            Ok(ast::Stmt::AugAssign(ast::StmtAugAssign {
+                node_index: Default::default(),
+                range: Default::default(),
+                target,
+                op: self.operator(op)?,
+                value,
+            }))
+        } else if self.is_node(object, "AnnAssign")? {
+            let target = self.req_expr(object, "target", "AnnAssign")?;
+            let annotation = self.req_expr(object, "annotation", "AnnAssign")?;
+            let value = self.opt_expr(object, "value")?;
+            let simple = self.int_field(object, "simple", "AnnAssign")?;
+            Ok(ast::Stmt::AnnAssign(ast::StmtAnnAssign {
+                node_index: Default::default(),
+                range: Default::default(),
+                target,
+                annotation,
+                value,
+                simple: simple != 0,
+                runtime_simple: None,
+            }))
+        } else if self.is_node(object, "For")? || self.is_node(object, "AsyncFor")? {
+            let is_async = self.is_node(object, "AsyncFor")?;
+            let node = if is_async { "AsyncFor" } else { "For" };
+            let target = self.req_expr(object, "target", node)?;
+            let iter = self.req_expr(object, "iter", node)?;
+            let body = self.body(object, "body", node)?;
+            let orelse = self.body(object, "orelse", node)?;
+            Ok(ast::Stmt::For(ast::StmtFor {
+                node_index: Default::default(),
+                range: Default::default(),
+                is_async,
+                target,
+                iter,
+                body,
+                orelse,
+                runtime_type_comment: None,
+                runtime_type_comment_bytes: None,
+                runtime_body: None,
+                runtime_orelse: None,
+            }))
+        } else if self.is_node(object, "While")? {
+            let test = self.req_expr(object, "test", "While")?;
+            let body = self.body(object, "body", "While")?;
+            let orelse = self.body(object, "orelse", "While")?;
+            Ok(ast::Stmt::While(ast::StmtWhile {
+                node_index: Default::default(),
+                range: Default::default(),
+                test,
+                body,
+                orelse,
+                runtime_body: None,
+                runtime_orelse: None,
+            }))
+        } else if self.is_node(object, "If")? {
+            let test = self.req_expr(object, "test", "If")?;
+            let body = self.body(object, "body", "If")?;
+            // `If` carries its alternatives as a nested `orelse`, while the
+            // compiler AST keeps them in one flat clause list.  An `elif` and an
+            // `else` holding a single `if` are indistinguishable here, exactly as
+            // they are to the parser, so both flatten the same way.
+            let mut elif_else_clauses = Vec::new();
+            let mut orelse = self.list(object, "orelse", "If")?;
+            while !orelse.is_empty() {
+                if orelse.len() == 1 && self.is_node(orelse[0], "If")? {
+                    let nested = orelse[0];
+                    let clause_test = self.req_expr(nested, "test", "If")?;
+                    let clause_body = self.body(nested, "body", "If")?;
+                    elif_else_clauses.push(ast::ElifElseClause {
+                        range: Default::default(),
+                        node_index: Default::default(),
+                        test: Some(*clause_test),
+                        body: clause_body,
+                        runtime_body: None,
+                        runtime_orelse: None,
+                    });
+                    orelse = self.list(nested, "orelse", "If")?;
+                } else {
+                    let values = std::mem::take(&mut orelse);
+                    let clause_body = values
+                        .into_iter()
+                        .map(|value| {
+                            self.require_node(value, "statement")?;
+                            self.recurse(|this| this.stmt(value))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    elif_else_clauses.push(ast::ElifElseClause {
+                        range: Default::default(),
+                        node_index: Default::default(),
+                        test: None,
+                        body: clause_body,
+                        runtime_body: None,
+                        runtime_orelse: None,
+                    });
+                }
+            }
+            Ok(ast::Stmt::If(ast::StmtIf {
+                node_index: Default::default(),
+                range: Default::default(),
+                test,
+                body,
+                elif_else_clauses,
+                runtime_body: None,
+            }))
+        } else if self.is_node(object, "With")? || self.is_node(object, "AsyncWith")? {
+            let is_async = self.is_node(object, "AsyncWith")?;
+            let node = if is_async { "AsyncWith" } else { "With" };
+            let items = self
+                .list(object, "items", node)?
+                .into_iter()
+                .map(|item| self.recurse(|this| this.with_item(item)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let body = self.body(object, "body", node)?;
+            Ok(ast::Stmt::With(ast::StmtWith {
+                node_index: Default::default(),
+                range: Default::default(),
+                is_async,
+                items,
+                body,
+                runtime_type_comment: None,
+                runtime_type_comment_bytes: None,
+                runtime_body: None,
+            }))
+        } else if self.is_node(object, "Raise")? {
+            Ok(ast::Stmt::Raise(ast::StmtRaise {
+                node_index: Default::default(),
+                range: Default::default(),
+                exc: self.opt_expr(object, "exc")?,
+                cause: self.opt_expr(object, "cause")?,
+            }))
+        } else if self.is_node(object, "Try")? || self.is_node(object, "TryStar")? {
+            let is_star = self.is_node(object, "TryStar")?;
+            let node = if is_star { "TryStar" } else { "Try" };
+            let body = self.body(object, "body", node)?;
+            let handlers = self
+                .list(object, "handlers", node)?
+                .into_iter()
+                .map(|handler| self.recurse(|this| this.handler(handler)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let orelse = self.body(object, "orelse", node)?;
+            let finalbody = self.body(object, "finalbody", node)?;
+            Ok(ast::Stmt::Try(ast::StmtTry {
+                node_index: Default::default(),
+                range: Default::default(),
+                body,
+                handlers,
+                orelse,
+                finalbody,
+                is_star,
+                runtime_body: None,
+                runtime_handlers: None,
+                runtime_orelse: None,
+                runtime_finalbody: None,
+            }))
+        } else if self.is_node(object, "Assert")? {
+            let test = self.req_expr(object, "test", "Assert")?;
+            let msg = self.opt_expr(object, "msg")?;
+            Ok(ast::Stmt::Assert(ast::StmtAssert {
+                node_index: Default::default(),
+                range: Default::default(),
+                test,
+                msg,
+            }))
+        } else if self.is_node(object, "Import")? {
+            Ok(ast::Stmt::Import(ast::StmtImport {
+                node_index: Default::default(),
+                range: Default::default(),
+                names: self.aliases(object, "Import")?,
+                is_lazy: false,
+            }))
+        } else if self.is_node(object, "ImportFrom")? {
+            let module = self.opt_identifier(object, "module")?;
+            let names = self.aliases(object, "ImportFrom")?;
+            // `level` is optional on a hand-built node and defaults to absolute.
+            let level = match self.optional_field(object, "level")? {
+                Some(value) => crate::builtins::space_index_w(value)?,
+                None => 0,
+            };
+            if level < 0 {
+                return Err(crate::PyError::value_error("Negative ImportFrom level"));
+            }
+            // The field is read as a Python index, so a value past the range a
+            // level is stored in has to stop here rather than wrap and turn a
+            // relative import into an absolute one.
+            let level = u32::try_from(level).map_err(|_| {
+                crate::PyError::overflow_error("Python int too large to convert to C int")
+            })?;
+            Ok(ast::Stmt::ImportFrom(ast::StmtImportFrom {
+                node_index: Default::default(),
+                range: Default::default(),
+                module,
+                names,
+                level,
+                is_lazy: false,
+                runtime_level: None,
+            }))
+        } else if self.is_node(object, "Global")? {
+            Ok(ast::Stmt::Global(ast::StmtGlobal {
+                node_index: Default::default(),
+                range: Default::default(),
+                names: self.identifiers(object, "names", "Global")?,
+            }))
+        } else if self.is_node(object, "Nonlocal")? {
+            Ok(ast::Stmt::Nonlocal(ast::StmtNonlocal {
+                node_index: Default::default(),
+                range: Default::default(),
+                names: self.identifiers(object, "names", "Nonlocal")?,
+            }))
+        } else if self.is_node(object, "Break")? {
+            Ok(ast::Stmt::Break(ast::StmtBreak {
+                node_index: Default::default(),
+                range: Default::default(),
+            }))
+        } else if self.is_node(object, "Continue")? {
+            Ok(ast::Stmt::Continue(ast::StmtContinue {
+                node_index: Default::default(),
+                range: Default::default(),
+            }))
+        } else if self.is_node(object, "Match")? {
+            let subject = self.req_expr(object, "subject", "Match")?;
+            let cases = self
+                .list(object, "cases", "Match")?
+                .into_iter()
+                .map(|case| self.recurse(|this| this.match_case(case)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::Stmt::Match(ast::StmtMatch {
+                node_index: Default::default(),
+                range: Default::default(),
+                subject,
+                cases,
+            }))
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected some sort of stmt, but got {}",
@@ -224,29 +493,500 @@ impl ObjectConverter {
     }
 
     fn parameters(&mut self, object: PyObjectRef) -> AstResult<ast::Parameters> {
-        // Preserve the ASDL field reads even for empty argument lists.  Defaults
-        // are paired with parameters in source order by the complete converter.
-        for field in [
-            "posonlyargs",
-            "args",
-            "kwonlyargs",
-            "kw_defaults",
-            "defaults",
-        ] {
-            if !self.list(object, field, "arguments")?.is_empty() {
-                return Err(crate::PyError::not_implemented(
-                    "compiling AST functions with parameters is not implemented",
-                ));
-            }
-        }
-        if self.optional_field(object, "vararg")?.is_some()
-            || self.optional_field(object, "kwarg")?.is_some()
-        {
-            return Err(crate::PyError::not_implemented(
-                "compiling AST functions with variadic parameters is not implemented",
+        let posonlyargs = self.parameter_list(object, "posonlyargs")?;
+        let args = self.parameter_list(object, "args")?;
+        let kwonlyargs = self.parameter_list(object, "kwonlyargs")?;
+        let vararg = self.opt_parameter(object, "vararg")?;
+        let kwarg = self.opt_parameter(object, "kwarg")?;
+        // `defaults` covers the tail of posonlyargs ++ args, while `kw_defaults`
+        // runs alongside kwonlyargs with a hole for every parameter that has
+        // none.  The compiler AST carries each default on its own parameter, so
+        // both lists are distributed here.
+        let defaults = self.exprs(object, "defaults", "arguments")?;
+        let kw_defaults = self.list(object, "kw_defaults", "arguments")?;
+        if kw_defaults.len() != kwonlyargs.len() {
+            return Err(crate::PyError::value_error(
+                "length of kwonlyargs is not the same as kw_defaults on arguments",
             ));
         }
-        Ok(ast::Parameters::default())
+        let mut positional: Vec<ast::Parameter> = posonlyargs;
+        let posonly_count = positional.len();
+        positional.extend(args);
+        if defaults.len() > positional.len() {
+            return Err(crate::PyError::value_error(
+                "more positional defaults than args on arguments",
+            ));
+        }
+        let first_default = positional.len() - defaults.len();
+        let mut positional: Vec<ast::ParameterWithDefault> = positional
+            .into_iter()
+            .map(|parameter| ast::ParameterWithDefault {
+                range: Default::default(),
+                node_index: Default::default(),
+                parameter,
+                default: None,
+            })
+            .collect();
+        for (offset, default) in defaults.into_iter().enumerate() {
+            positional[first_default + offset].default = Some(Box::new(default));
+        }
+        let args = positional.split_off(posonly_count);
+        let posonlyargs = positional;
+        let mut kwonly: Vec<ast::ParameterWithDefault> = kwonlyargs
+            .into_iter()
+            .map(|parameter| ast::ParameterWithDefault {
+                range: Default::default(),
+                node_index: Default::default(),
+                parameter,
+                default: None,
+            })
+            .collect();
+        for (index, default) in kw_defaults.into_iter().enumerate() {
+            if unsafe { pyre_object::is_none(default) } {
+                continue;
+            }
+            kwonly[index].default = Some(Box::new(self.recurse(|this| this.expr(default))?));
+        }
+        Ok(ast::Parameters {
+            range: Default::default(),
+            node_index: Default::default(),
+            posonlyargs,
+            args,
+            vararg,
+            kwonlyargs: kwonly,
+            kwarg,
+            runtime_defaults: None,
+        })
+    }
+
+    fn parameter_list(
+        &mut self,
+        object: PyObjectRef,
+        field: &str,
+    ) -> AstResult<Vec<ast::Parameter>> {
+        self.list(object, field, "arguments")?
+            .into_iter()
+            .map(|value| self.recurse(|this| this.parameter(value)))
+            .collect()
+    }
+
+    fn opt_parameter(
+        &mut self,
+        object: PyObjectRef,
+        field: &str,
+    ) -> AstResult<Option<Box<ast::Parameter>>> {
+        self.optional_field(object, field)?
+            .map(|value| self.recurse(|this| this.parameter(value)).map(Box::new))
+            .transpose()
+    }
+
+    fn parameter(&mut self, object: PyObjectRef) -> AstResult<ast::Parameter> {
+        Ok(ast::Parameter {
+            range: Default::default(),
+            node_index: Default::default(),
+            name: self.identifier(object, "arg", "arg")?,
+            annotation: self.opt_expr(object, "annotation")?,
+            runtime_type_comment: None,
+            runtime_type_comment_bytes: None,
+        })
+    }
+
+    fn with_item(&mut self, object: PyObjectRef) -> AstResult<ast::WithItem> {
+        let context_expr = self.req_expr(object, "context_expr", "withitem")?;
+        Ok(ast::WithItem {
+            range: Default::default(),
+            node_index: Default::default(),
+            context_expr: *context_expr,
+            optional_vars: self.opt_expr(object, "optional_vars")?,
+        })
+    }
+
+    fn handler(&mut self, object: PyObjectRef) -> AstResult<ast::ExceptHandler> {
+        if !self.is_node(object, "ExceptHandler")? {
+            return Err(crate::PyError::type_error(format!(
+                "expected some sort of excepthandler, but got {}",
+                unsafe { pyre_object::type_name_of(object) }
+            )));
+        }
+        Ok(ast::ExceptHandler::ExceptHandler(
+            ast::ExceptHandlerExceptHandler {
+                range: Default::default(),
+                node_index: Default::default(),
+                type_: self.opt_expr(object, "type")?,
+                name: self.opt_identifier(object, "name")?,
+                body: self.body(object, "body", "ExceptHandler")?,
+                runtime_body: None,
+            },
+        ))
+    }
+
+    fn comprehension(&mut self, object: PyObjectRef) -> AstResult<ast::Comprehension> {
+        let target = self.req_expr(object, "target", "comprehension")?;
+        let iter = self.req_expr(object, "iter", "comprehension")?;
+        let ifs = self.exprs(object, "ifs", "comprehension")?;
+        let is_async = self.int_field(object, "is_async", "comprehension")?;
+        Ok(ast::Comprehension {
+            range: Default::default(),
+            node_index: Default::default(),
+            target: *target,
+            iter: *iter,
+            ifs,
+            is_async: is_async != 0,
+            runtime_ifs: None,
+            runtime_is_async: None,
+        })
+    }
+
+    fn comprehensions(
+        &mut self,
+        object: PyObjectRef,
+        node: &str,
+    ) -> AstResult<Vec<ast::Comprehension>> {
+        self.list(object, "generators", node)?
+            .into_iter()
+            .map(|value| self.recurse(|this| this.comprehension(value)))
+            .collect()
+    }
+
+    fn aliases(&mut self, object: PyObjectRef, node: &str) -> AstResult<Vec<ast::Alias>> {
+        self.list(object, "names", node)?
+            .into_iter()
+            .map(|value| {
+                Ok(ast::Alias {
+                    range: Default::default(),
+                    node_index: Default::default(),
+                    name: self.identifier(value, "name", "alias")?,
+                    asname: self.opt_identifier(value, "asname")?,
+                })
+            })
+            .collect()
+    }
+
+    fn decorators(&mut self, object: PyObjectRef, node: &str) -> AstResult<Vec<ast::Decorator>> {
+        self.list(object, "decorator_list", node)?
+            .into_iter()
+            .map(|value| {
+                self.require_node(value, "expression")?;
+                Ok(ast::Decorator {
+                    range: Default::default(),
+                    node_index: Default::default(),
+                    expression: self.recurse(|this| this.expr(value))?,
+                })
+            })
+            .collect()
+    }
+
+    /// `type_params` postdates the original positional constructors, so a
+    /// manually built legacy node without the field means an empty list.
+    fn type_params(
+        &mut self,
+        object: PyObjectRef,
+        node: &str,
+    ) -> AstResult<Option<Box<ast::TypeParams>>> {
+        let Some(field) = self.optional_field(object, "type_params")? else {
+            return Ok(None);
+        };
+        if !unsafe { pyre_object::is_list(field) } {
+            return Err(crate::PyError::type_error(format!(
+                "{node} field \"type_params\" must be a list, not a {}",
+                class_name(field)
+            )));
+        }
+        let values = unsafe { pyre_object::w_list_items_copy_as_vec(field) };
+        if values.is_empty() {
+            return Ok(None);
+        }
+        let type_params = values
+            .into_iter()
+            .map(|value| self.recurse(|this| this.type_param(value)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Box::new(ast::TypeParams {
+            range: Default::default(),
+            node_index: Default::default(),
+            type_params,
+            runtime_type_params: None,
+        })))
+    }
+
+    fn type_param(&mut self, object: PyObjectRef) -> AstResult<ast::TypeParam> {
+        if self.is_node(object, "TypeVar")? {
+            let name = self.identifier(object, "name", "TypeVar")?;
+            Ok(ast::TypeParam::TypeVar(ast::TypeParamTypeVar {
+                node_index: Default::default(),
+                range: Default::default(),
+                name,
+                bound: self.opt_expr(object, "bound")?,
+                default: self.opt_expr(object, "default_value")?,
+            }))
+        } else if self.is_node(object, "TypeVarTuple")? {
+            let name = self.identifier(object, "name", "TypeVarTuple")?;
+            Ok(ast::TypeParam::TypeVarTuple(ast::TypeParamTypeVarTuple {
+                node_index: Default::default(),
+                range: Default::default(),
+                name,
+                default: self.opt_expr(object, "default_value")?,
+            }))
+        } else if self.is_node(object, "ParamSpec")? {
+            let name = self.identifier(object, "name", "ParamSpec")?;
+            Ok(ast::TypeParam::ParamSpec(ast::TypeParamParamSpec {
+                node_index: Default::default(),
+                range: Default::default(),
+                name,
+                default: self.opt_expr(object, "default_value")?,
+            }))
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "expected some sort of type_param, but got {}",
+                unsafe { pyre_object::type_name_of(object) }
+            )))
+        }
+    }
+
+    fn match_case(&mut self, object: PyObjectRef) -> AstResult<ast::MatchCase> {
+        let pattern = self.field(object, "pattern", "match_case")?;
+        let pattern = self.recurse(|this| this.pattern(pattern))?;
+        Ok(ast::MatchCase {
+            range: Default::default(),
+            node_index: Default::default(),
+            pattern,
+            guard: self.opt_expr(object, "guard")?,
+            body: self.body(object, "body", "match_case")?,
+            runtime_body: None,
+        })
+    }
+
+    fn patterns(
+        &mut self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+    ) -> AstResult<Vec<ast::Pattern>> {
+        self.list(object, field, node)?
+            .into_iter()
+            .map(|value| self.recurse(|this| this.pattern(value)))
+            .collect()
+    }
+
+    fn pattern(&mut self, object: PyObjectRef) -> AstResult<ast::Pattern> {
+        if self.is_node(object, "MatchValue")? {
+            Ok(ast::Pattern::MatchValue(ast::PatternMatchValue {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: self.req_expr(object, "value", "MatchValue")?,
+            }))
+        } else if self.is_node(object, "MatchSingleton")? {
+            let value = self.field(object, "value", "MatchSingleton")?;
+            let value = unsafe {
+                if pyre_object::is_none(value) {
+                    ast::Singleton::None
+                } else if pyre_object::is_bool(value) {
+                    if pyre_object::w_bool_get_value(value) {
+                        ast::Singleton::True
+                    } else {
+                        ast::Singleton::False
+                    }
+                } else {
+                    return Err(crate::PyError::value_error(
+                        "MatchSingleton can only contain True, False and None",
+                    ));
+                }
+            };
+            Ok(ast::Pattern::MatchSingleton(ast::PatternMatchSingleton {
+                node_index: Default::default(),
+                range: Default::default(),
+                value,
+            }))
+        } else if self.is_node(object, "MatchSequence")? {
+            Ok(ast::Pattern::MatchSequence(ast::PatternMatchSequence {
+                node_index: Default::default(),
+                range: Default::default(),
+                patterns: self.patterns(object, "patterns", "MatchSequence")?,
+                runtime_patterns: None,
+            }))
+        } else if self.is_node(object, "MatchMapping")? {
+            let keys = self.exprs(object, "keys", "MatchMapping")?;
+            let patterns = self.patterns(object, "patterns", "MatchMapping")?;
+            Ok(ast::Pattern::MatchMapping(ast::PatternMatchMapping {
+                node_index: Default::default(),
+                range: Default::default(),
+                keys,
+                patterns,
+                rest: self.opt_identifier(object, "rest")?,
+                runtime_keys: None,
+                runtime_patterns: None,
+            }))
+        } else if self.is_node(object, "MatchClass")? {
+            let cls = self.req_expr(object, "cls", "MatchClass")?;
+            let patterns = self.patterns(object, "patterns", "MatchClass")?;
+            let attrs = self.identifiers(object, "kwd_attrs", "MatchClass")?;
+            let kwd_patterns = self.patterns(object, "kwd_patterns", "MatchClass")?;
+            if attrs.len() != kwd_patterns.len() {
+                return Err(crate::PyError::value_error(
+                    "MatchClass doesn't have the same number of keyword attributes as patterns",
+                ));
+            }
+            let keywords = attrs
+                .into_iter()
+                .zip(kwd_patterns)
+                .map(|(attr, pattern)| ast::PatternKeyword {
+                    range: Default::default(),
+                    node_index: Default::default(),
+                    attr,
+                    pattern,
+                })
+                .collect();
+            Ok(ast::Pattern::MatchClass(ast::PatternMatchClass {
+                node_index: Default::default(),
+                range: Default::default(),
+                cls,
+                arguments: ast::PatternArguments {
+                    range: Default::default(),
+                    node_index: Default::default(),
+                    patterns,
+                    keywords,
+                },
+                runtime_patterns: None,
+                runtime_kwd_attrs: None,
+                runtime_kwd_patterns: None,
+            }))
+        } else if self.is_node(object, "MatchStar")? {
+            Ok(ast::Pattern::MatchStar(ast::PatternMatchStar {
+                node_index: Default::default(),
+                range: Default::default(),
+                name: self.opt_identifier(object, "name")?,
+            }))
+        } else if self.is_node(object, "MatchAs")? {
+            let pattern = self
+                .optional_field(object, "pattern")?
+                .map(|value| self.recurse(|this| this.pattern(value)).map(Box::new))
+                .transpose()?;
+            Ok(ast::Pattern::MatchAs(ast::PatternMatchAs {
+                node_index: Default::default(),
+                range: Default::default(),
+                pattern,
+                name: self.opt_identifier(object, "name")?,
+            }))
+        } else if self.is_node(object, "MatchOr")? {
+            Ok(ast::Pattern::MatchOr(ast::PatternMatchOr {
+                node_index: Default::default(),
+                range: Default::default(),
+                patterns: self.patterns(object, "patterns", "MatchOr")?,
+                runtime_patterns: None,
+            }))
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "expected some sort of pattern, but got {}",
+                unsafe { pyre_object::type_name_of(object) }
+            )))
+        }
+    }
+
+    /// `_validate_stmts` / `_validate_exprs` (validate.py:132, :151) reject a
+    /// missing element of a statement or expression list.  The compiler AST
+    /// has nowhere to hold one, so unlike the rest of the validation this runs
+    /// during the conversion, where it is still visible.  Lists of the other
+    /// ASDL nodes carry no such check.
+    fn require_node(&self, value: PyObjectRef, kind: &str) -> AstResult<()> {
+        if unsafe { pyre_object::is_none(value) } {
+            return Err(crate::PyError::value_error(format!(
+                "None disallowed in {kind} list"
+            )));
+        }
+        Ok(())
+    }
+
+    fn body(&mut self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<ast::Stmt>> {
+        self.list(object, field, node)?
+            .into_iter()
+            .map(|value| {
+                self.require_node(value, "statement")?;
+                self.recurse(|this| this.stmt(value))
+            })
+            .collect()
+    }
+
+    fn exprs(&mut self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<ast::Expr>> {
+        self.list(object, field, node)?
+            .into_iter()
+            .map(|value| {
+                self.require_node(value, "expression")?;
+                self.recurse(|this| this.expr(value))
+            })
+            .collect()
+    }
+
+    fn req_expr(
+        &mut self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+    ) -> AstResult<Box<ast::Expr>> {
+        let value = self.field(object, field, node)?;
+        Ok(Box::new(self.recurse(|this| this.expr(value))?))
+    }
+
+    fn opt_expr(&mut self, object: PyObjectRef, field: &str) -> AstResult<Option<Box<ast::Expr>>> {
+        self.optional_field(object, field)?
+            .map(|value| self.recurse(|this| this.expr(value)).map(Box::new))
+            .transpose()
+    }
+
+    fn identifier(
+        &self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+    ) -> AstResult<ast::Identifier> {
+        Ok(ast::Identifier::new(
+            self.string(object, field, node)?,
+            Default::default(),
+        ))
+    }
+
+    fn opt_identifier(
+        &self,
+        object: PyObjectRef,
+        field: &str,
+    ) -> AstResult<Option<ast::Identifier>> {
+        let Some(value) = self.optional_field(object, field)? else {
+            return Ok(None);
+        };
+        if !unsafe { pyre_object::is_str(value) } {
+            return Err(crate::PyError::type_error(
+                "AST identifier must be of type str",
+            ));
+        }
+        Ok(Some(ast::Identifier::new(
+            unsafe { pyre_object::w_str_get_value(value).to_string() },
+            Default::default(),
+        )))
+    }
+
+    fn identifiers(
+        &self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+    ) -> AstResult<Vec<ast::Identifier>> {
+        self.list(object, field, node)?
+            .into_iter()
+            .map(|value| {
+                if !unsafe { pyre_object::is_str(value) } {
+                    return Err(crate::PyError::type_error(
+                        "AST identifier must be of type str",
+                    ));
+                }
+                Ok(ast::Identifier::new(
+                    unsafe { pyre_object::w_str_get_value(value).to_string() },
+                    Default::default(),
+                ))
+            })
+            .collect()
+    }
+
+    fn int_field(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<i64> {
+        let value = self.field(object, field, node)?;
+        crate::builtins::space_index_w(value)
     }
 
     fn expr(&mut self, object: PyObjectRef) -> AstResult<ast::Expr> {
@@ -275,7 +1015,10 @@ impl ObjectConverter {
             let args = self
                 .list(object, "args", "Call")?
                 .into_iter()
-                .map(|arg| self.recurse(|this| this.expr(arg)))
+                .map(|arg| {
+                    self.require_node(arg, "expression")?;
+                    self.recurse(|this| this.expr(arg))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let keywords = self
                 .list(object, "keywords", "Call")?
@@ -313,7 +1056,10 @@ impl ObjectConverter {
             let elements = self
                 .list(object, "elts", if is_tuple { "Tuple" } else { "List" })?
                 .into_iter()
-                .map(|element| self.recurse(|this| this.expr(element)))
+                .map(|element| {
+                    self.require_node(element, "expression")?;
+                    self.recurse(|this| this.expr(element))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let ctx = self.context(self.field(object, "ctx", "sequence")?)?;
             if is_tuple {
@@ -351,12 +1097,264 @@ impl ObjectConverter {
                 kind: None,
                 invalid_type: None,
             }))
+        } else if self.is_node(object, "BoolOp")? {
+            let op = self.field(object, "op", "BoolOp")?;
+            Ok(ast::Expr::BoolOp(ast::ExprBoolOp {
+                node_index: Default::default(),
+                range: Default::default(),
+                op: self.boolop(op)?,
+                values: self.exprs(object, "values", "BoolOp")?,
+                runtime_values: None,
+            }))
+        } else if self.is_node(object, "NamedExpr")? {
+            let target = self.req_expr(object, "target", "NamedExpr")?;
+            let value = self.req_expr(object, "value", "NamedExpr")?;
+            Ok(ast::Expr::Named(ast::ExprNamed {
+                node_index: Default::default(),
+                range: Default::default(),
+                target,
+                value,
+            }))
+        } else if self.is_node(object, "Lambda")? {
+            let args = self.field(object, "args", "Lambda")?;
+            let parameters = self.recurse(|this| this.parameters(args))?;
+            let body = self.req_expr(object, "body", "Lambda")?;
+            Ok(ast::Expr::Lambda(ast::ExprLambda {
+                node_index: Default::default(),
+                range: Default::default(),
+                parameters: Some(Box::new(parameters)),
+                body,
+            }))
+        } else if self.is_node(object, "IfExp")? {
+            let test = self.req_expr(object, "test", "IfExp")?;
+            let body = self.req_expr(object, "body", "IfExp")?;
+            let orelse = self.req_expr(object, "orelse", "IfExp")?;
+            Ok(ast::Expr::If(ast::ExprIf {
+                node_index: Default::default(),
+                range: Default::default(),
+                test,
+                body,
+                orelse,
+            }))
+        } else if self.is_node(object, "Dict")? {
+            let keys = self.list(object, "keys", "Dict")?;
+            let values = self.list(object, "values", "Dict")?;
+            if keys.len() != values.len() {
+                return Err(crate::PyError::value_error(
+                    "Dict doesn't have the same number of keys as values",
+                ));
+            }
+            // A `None` key is the `**mapping` spread, which has no key node.
+            let items = keys
+                .into_iter()
+                .zip(values)
+                .map(|(key, value)| {
+                    let key = if unsafe { pyre_object::is_none(key) } {
+                        None
+                    } else {
+                        Some(self.recurse(|this| this.expr(key))?)
+                    };
+                    self.require_node(value, "expression")?;
+                    Ok(ast::DictItem {
+                        key,
+                        value: self.recurse(|this| this.expr(value))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, crate::PyError>>()?;
+            Ok(ast::Expr::Dict(ast::ExprDict {
+                node_index: Default::default(),
+                range: Default::default(),
+                items,
+                runtime_values: None,
+            }))
+        } else if self.is_node(object, "Set")? {
+            Ok(ast::Expr::Set(ast::ExprSet {
+                node_index: Default::default(),
+                range: Default::default(),
+                elts: self.exprs(object, "elts", "Set")?,
+                runtime_elts: None,
+            }))
+        } else if self.is_node(object, "ListComp")? {
+            let elt = self.req_expr(object, "elt", "ListComp")?;
+            let generators = self.comprehensions(object, "ListComp")?;
+            Ok(ast::Expr::ListComp(ast::ExprListComp {
+                node_index: Default::default(),
+                range: Default::default(),
+                elt,
+                generators,
+            }))
+        } else if self.is_node(object, "SetComp")? {
+            let elt = self.req_expr(object, "elt", "SetComp")?;
+            let generators = self.comprehensions(object, "SetComp")?;
+            Ok(ast::Expr::SetComp(ast::ExprSetComp {
+                node_index: Default::default(),
+                range: Default::default(),
+                elt,
+                generators,
+            }))
+        } else if self.is_node(object, "DictComp")? {
+            let key = self.req_expr(object, "key", "DictComp")?;
+            let value = self.req_expr(object, "value", "DictComp")?;
+            let generators = self.comprehensions(object, "DictComp")?;
+            Ok(ast::Expr::DictComp(ast::ExprDictComp {
+                node_index: Default::default(),
+                range: Default::default(),
+                key,
+                value,
+                generators,
+            }))
+        } else if self.is_node(object, "GeneratorExp")? {
+            let elt = self.req_expr(object, "elt", "GeneratorExp")?;
+            let generators = self.comprehensions(object, "GeneratorExp")?;
+            Ok(ast::Expr::Generator(ast::ExprGenerator {
+                node_index: Default::default(),
+                range: Default::default(),
+                elt,
+                generators,
+                parenthesized: true,
+            }))
+        } else if self.is_node(object, "Await")? {
+            Ok(ast::Expr::Await(ast::ExprAwait {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: self.req_expr(object, "value", "Await")?,
+            }))
+        } else if self.is_node(object, "Yield")? {
+            Ok(ast::Expr::Yield(ast::ExprYield {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: self.opt_expr(object, "value")?,
+            }))
+        } else if self.is_node(object, "YieldFrom")? {
+            Ok(ast::Expr::YieldFrom(ast::ExprYieldFrom {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: self.req_expr(object, "value", "YieldFrom")?,
+            }))
+        } else if self.is_node(object, "Compare")? {
+            let left = self.req_expr(object, "left", "Compare")?;
+            let ops = self
+                .list(object, "ops", "Compare")?
+                .into_iter()
+                .map(|op| self.cmpop(op))
+                .collect::<Result<Vec<_>, _>>()?;
+            let comparators = self.exprs(object, "comparators", "Compare")?;
+            Ok(ast::Expr::Compare(ast::ExprCompare {
+                node_index: Default::default(),
+                range: Default::default(),
+                left,
+                ops: ops.into_boxed_slice(),
+                comparators: comparators.into_boxed_slice(),
+                runtime_comparators: None,
+            }))
+        } else if self.is_node(object, "Subscript")? {
+            let value = self.req_expr(object, "value", "Subscript")?;
+            let slice = self.req_expr(object, "slice", "Subscript")?;
+            let ctx = self.context(self.field(object, "ctx", "Subscript")?)?;
+            Ok(ast::Expr::Subscript(ast::ExprSubscript {
+                node_index: Default::default(),
+                range: Default::default(),
+                value,
+                slice,
+                ctx,
+            }))
+        } else if self.is_node(object, "Starred")? {
+            let value = self.req_expr(object, "value", "Starred")?;
+            let ctx = self.context(self.field(object, "ctx", "Starred")?)?;
+            Ok(ast::Expr::Starred(ast::ExprStarred {
+                node_index: Default::default(),
+                range: Default::default(),
+                value,
+                ctx,
+            }))
+        } else if self.is_node(object, "Slice")? {
+            Ok(ast::Expr::Slice(ast::ExprSlice {
+                node_index: Default::default(),
+                range: Default::default(),
+                lower: self.opt_expr(object, "lower")?,
+                upper: self.opt_expr(object, "upper")?,
+                step: self.opt_expr(object, "step")?,
+            }))
+        } else if self.is_node(object, "JoinedStr")? {
+            let values = self.exprs(object, "values", "JoinedStr")?;
+            Ok(fstring(Vec::new(), Some(values)))
+        } else if self.is_node(object, "FormattedValue")? {
+            let element = self.interpolation(object)?;
+            Ok(fstring(vec![element], None))
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected some sort of expr, but got {}",
                 unsafe { pyre_object::type_name_of(object) }
             )))
         }
+    }
+
+    fn interpolation(&mut self, object: PyObjectRef) -> AstResult<ast::InterpolatedStringElement> {
+        let expression = self.req_expr(object, "value", "FormattedValue")?;
+        let conversion = self.conversion(object)?;
+        let format_spec = self.opt_expr(object, "format_spec")?;
+        Ok(ast::InterpolatedStringElement::Interpolation(
+            ast::InterpolatedElement {
+                node_index: Default::default(),
+                range: Default::default(),
+                expression,
+                debug_text: None,
+                conversion,
+                // A spec is an expression that gets compiled like any other
+                // (`visit_FormattedValue`, codegen.py:2371). The compiler AST
+                // instead keeps the elements the parser found between the
+                // braces, which an object does not carry, so the spec rides
+                // the field below and the parsed shape stays empty.
+                format_spec: None,
+                runtime_str: None,
+                runtime_interpolation_format_spec: None,
+                runtime_formatted_value_format_spec: format_spec,
+            },
+        ))
+    }
+
+    /// `visit_FormattedValue` (codegen.py:2364) matches `s`, `r` and `a` and
+    /// leaves anything else at no conversion at all; 3.14 stops instead, so a
+    /// character it does not know is an error here.
+    fn conversion(&self, object: PyObjectRef) -> AstResult<ast::ConversionFlag> {
+        match self.int_field(object, "conversion", "FormattedValue")? {
+            -1 => Ok(ast::ConversionFlag::None),
+            value if value == i64::from(b's') => Ok(ast::ConversionFlag::Str),
+            value if value == i64::from(b'r') => Ok(ast::ConversionFlag::Repr),
+            value if value == i64::from(b'a') => Ok(ast::ConversionFlag::Ascii),
+            value => Err(crate::PyError::system_error(format!(
+                "Unrecognized conversion character {value}"
+            ))),
+        }
+    }
+
+    fn boolop(&self, object: PyObjectRef) -> AstResult<ast::BoolOp> {
+        for (name, op) in [("And", ast::BoolOp::And), ("Or", ast::BoolOp::Or)] {
+            if self.is_node(object, name)? {
+                return Ok(op);
+            }
+        }
+        Err(crate::PyError::type_error("expected some sort of boolop"))
+    }
+
+    fn cmpop(&self, object: PyObjectRef) -> AstResult<ast::CmpOp> {
+        for (name, op) in [
+            ("Eq", ast::CmpOp::Eq),
+            ("NotEq", ast::CmpOp::NotEq),
+            ("Lt", ast::CmpOp::Lt),
+            ("LtE", ast::CmpOp::LtE),
+            ("Gt", ast::CmpOp::Gt),
+            ("GtE", ast::CmpOp::GtE),
+            ("Is", ast::CmpOp::Is),
+            ("IsNot", ast::CmpOp::IsNot),
+            ("In", ast::CmpOp::In),
+            ("NotIn", ast::CmpOp::NotIn),
+        ] {
+            if self.is_node(object, name)? {
+                return Ok(op);
+            }
+        }
+        Err(crate::PyError::type_error("expected some sort of cmpop"))
     }
 
     fn keyword(&mut self, object: PyObjectRef) -> AstResult<ast::Keyword> {
@@ -419,8 +1417,31 @@ impl ObjectConverter {
                         .to_vec()
                         .into_boxed_slice(),
                 ))
+            } else if pyre_object::is_complex(object) {
+                Ok(ast::ConstantValue::Complex {
+                    real: pyre_object::w_complex_get_real(object),
+                    imag: pyre_object::w_complex_get_imag(object),
+                })
             } else if pyre_object::is_ellipsis(object) {
                 Ok(ast::ConstantValue::Ellipsis)
+            } else if pyre_object::is_tuple(object) {
+                // A container constant never comes out of the parser; it reaches
+                // here from a tree an optimizer folded, and it nests. The node
+                // depth guard does not apply: it counts AST nodes, and a
+                // constant nested past it still compiles where 3.14 compiles.
+                Ok(ast::ConstantValue::Tuple(
+                    pyre_object::w_tuple_items_copy_as_vec(object)
+                        .into_iter()
+                        .map(|item| self.constant_value(item))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            } else if pyre_object::is_frozenset(object) {
+                Ok(ast::ConstantValue::Frozenset(
+                    pyre_object::w_set_items(object)
+                        .into_iter()
+                        .map(|item| self.constant_value(item))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
             } else {
                 Err(crate::PyError::type_error(format!(
                     "got an invalid type in Constant: {}",
@@ -482,6 +1503,31 @@ impl ObjectConverter {
         }
         Err(crate::PyError::type_error("expected some sort of operator"))
     }
+}
+
+/// An f-string expression built from `_ast` objects.  `visit_JoinedStr`
+/// (codegen.py:2357) compiles the values one after another and joins them,
+/// which is the shape an object carries; the compiler AST instead holds the
+/// literal and interpolated parts the parser split, so the values are handed
+/// over as the parts to join and that part list stays empty.  A
+/// `FormattedValue` on its own is a single interpolated part, which does fit
+/// the part list.
+fn fstring(
+    elements: Vec<ast::InterpolatedStringElement>,
+    runtime_joined_str: Option<Vec<ast::Expr>>,
+) -> ast::Expr {
+    ast::Expr::FString(ast::ExprFString {
+        node_index: Default::default(),
+        range: Default::default(),
+        value: ast::FStringValue::single(ast::FString {
+            node_index: Default::default(),
+            range: Default::default(),
+            elements: elements.into(),
+            flags: ast::FStringFlags::empty(),
+        }),
+        runtime_joined_str,
+        runtime_values: None,
+    })
 }
 
 pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyResult {
@@ -1220,19 +2266,18 @@ impl Converter<'_> {
             );
         }
 
-        let mut values = Vec::new();
+        let mut parts = Vec::new();
         for part in node.value.iter() {
             match part {
-                ast::FStringPart::Literal(literal) => values.push(self.constant(
-                    range(literal.range),
-                    self.string(&literal.value),
-                    pyre_object::w_none(),
-                )?),
+                ast::FStringPart::Literal(literal) => {
+                    push_literal(&mut parts, range(literal.range), &literal.value)
+                }
                 ast::FStringPart::FString(fstring) => {
-                    values.extend(self.interpolated_elements(&fstring.elements)?);
+                    self.interpolated_elements(&fstring.elements, &mut parts)?
                 }
             }
         }
+        let values = self.joined_values(parts)?;
         self.node(
             "JoinedStr",
             Some(range(node.range)),
@@ -1240,24 +2285,49 @@ impl Converter<'_> {
         )
     }
 
+    fn joined_values(&self, parts: Vec<JoinedPart>) -> Result<Vec<PyObjectRef>, crate::PyError> {
+        parts
+            .into_iter()
+            .map(|part| match part {
+                JoinedPart::Literal { start, end, value } => {
+                    self.constant((start, end), self.string(&value), pyre_object::w_none())
+                }
+                JoinedPart::Value(value) => Ok(value),
+            })
+            .collect()
+    }
+
     fn interpolated_elements(
         &self,
         elements: &[ast::InterpolatedStringElement],
-    ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-        let mut values = Vec::new();
+        parts: &mut Vec<JoinedPart>,
+    ) -> Result<(), crate::PyError> {
         for element in elements {
             match element {
-                ast::InterpolatedStringElement::Literal(literal) => values.push(self.constant(
-                    range(literal.range),
-                    self.string(&literal.value),
-                    pyre_object::w_none(),
-                )?),
+                ast::InterpolatedStringElement::Literal(literal) => {
+                    push_literal(parts, range(literal.range), &literal.value)
+                }
                 ast::InterpolatedStringElement::Interpolation(interpolation) => {
+                    let mut conversion = interpolation.conversion;
+                    if let Some(debug_text) = interpolation.debug_text.as_ref() {
+                        self.push_debug_text(parts, interpolation, debug_text);
+                        // fstring.py:315 — a debugging expression defaults to
+                        // `!r` when neither a conversion nor a format spec
+                        // says how to render the value.
+                        if matches!(
+                            (conversion, &interpolation.format_spec),
+                            (ast::ConversionFlag::None, None)
+                        ) {
+                            conversion = ast::ConversionFlag::Repr;
+                        }
+                    }
                     let format_spec = interpolation
                         .format_spec
                         .as_deref()
                         .map(|spec| {
-                            let values = self.interpolated_elements(&spec.elements)?;
+                            let mut spec_parts = Vec::new();
+                            self.interpolated_elements(&spec.elements, &mut spec_parts)?;
+                            let values = self.joined_values(spec_parts)?;
                             self.node(
                                 "JoinedStr",
                                 Some(range(spec.range)),
@@ -1265,22 +2335,48 @@ impl Converter<'_> {
                             )
                         })
                         .transpose()?;
-                    values.push(self.node(
+                    parts.push(JoinedPart::Value(self.node(
                         "FormattedValue",
                         Some(range(interpolation.range)),
                         &[
                             ("value", self.expr(&interpolation.expression)?),
                             (
                                 "conversion",
-                                pyre_object::w_int_new(interpolation.conversion as i8 as i64),
+                                pyre_object::w_int_new(conversion as i8 as i64),
                             ),
                             ("format_spec", self.optional(format_spec)),
                         ],
-                    )?);
+                    )?));
                 }
             }
         }
-        Ok(values)
+        Ok(())
+    }
+
+    /// The literal an `=` conversion echoes.  `fstring_find_expr`
+    /// (fstring.py:279) takes it as one slice of the source, from the start of
+    /// the expression through the `=` and the whitespace after it; the parser
+    /// here hands over that frame as the text on either side of the
+    /// expression, so the slice is put back together from the two.
+    fn push_debug_text(
+        &self,
+        parts: &mut Vec<JoinedPart>,
+        interpolation: &ast::InterpolatedElement,
+        debug_text: &ast::DebugText,
+    ) {
+        use ruff_text_size::Ranged;
+        let (start, end) = range(interpolation.expression.range());
+        let leading = strip_debug_comments(&debug_text.leading);
+        let trailing = strip_debug_comments(&debug_text.trailing);
+        let expression = &self.source[start as usize..end as usize];
+        push_literal(
+            parts,
+            (
+                start.saturating_sub(leading.len() as u32),
+                end + trailing.len() as u32,
+            ),
+            &[leading.as_str(), expression, trailing.as_str()].concat(),
+        );
     }
 
     fn match_case(&self, case: &ast::MatchCase) -> crate::PyResult {
@@ -1753,6 +2849,68 @@ impl Converter<'_> {
             .collect::<Result<Vec<_>, _>>()
             .map(|items| self.list(items))
     }
+}
+
+/// `%T`-style class name of an AST object.  The `_ast` node types are heap
+/// types, so the name sits on the class the instance points at rather than on
+/// the layout its `ob_type` names.
+fn class_name(object: PyObjectRef) -> &'static str {
+    match crate::typedef::r#type(object) {
+        Some(w_type) => unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) },
+        None => unsafe { pyre_object::type_name_of(object) },
+    }
+}
+
+/// A value of a `JoinedStr` under construction.  `add_constant_string`
+/// (fstring.py:23) folds a piece into the `Constant` before it, keeping that
+/// node's start and taking the new end, and an empty piece is dropped
+/// (`f_string_to_ast_node`, fstring.py:449); what the parser kept apart -- an
+/// implicit concatenation, the text an `=` conversion echoes -- therefore
+/// reaches the tree as one node, not one per piece.
+enum JoinedPart {
+    Literal { start: u32, end: u32, value: String },
+    Value(PyObjectRef),
+}
+
+fn push_literal(parts: &mut Vec<JoinedPart>, (start, end): (u32, u32), value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if let Some(JoinedPart::Literal {
+        end: last_end,
+        value: last,
+        ..
+    }) = parts.last_mut()
+    {
+        *last_end = end;
+        last.push_str(value);
+        return;
+    }
+    parts.push(JoinedPart::Literal {
+        start,
+        end,
+        value: value.to_string(),
+    });
+}
+
+/// A comment inside the braces runs to the end of the line and is no part of
+/// the text an `=` conversion echoes.
+fn strip_debug_comments(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_comment = false;
+    for ch in text.chars() {
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+                result.push(ch);
+            }
+        } else if ch == '#' {
+            in_comment = true;
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 fn range(range: impl RangeParts) -> (u32, u32) {
