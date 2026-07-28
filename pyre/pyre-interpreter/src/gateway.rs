@@ -715,11 +715,14 @@ pub unsafe fn builtin_code_call(
     // fixed arity indexes its slice directly, so a call that supplies a
     // different number of arguments is rejected before the body runs.  The
     // slice length is the positional count on every call but a keyword one, so
-    // the trailing marker dict is only looked for once a length already
-    // mismatched.
+    // fixed-count bodies reject a trailing keyword marker before it can be read
+    // as an ordinary argument.
     let arity = unsafe { (*code).fast_natural_arity } as usize;
-    if arity <= 4 && args.len() != arity {
-        let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+    if arity <= 4 {
+        let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        if crate::builtins::has_real_kwargs(kwargs) {
+            return Err(no_keyword_arguments(unsafe { &*code }));
+        }
         if positional.len() != arity {
             return Err(arity_mismatch(unsafe { &*code }, arity, positional.len()));
         }
@@ -748,13 +751,11 @@ pub unsafe fn builtin_code_call(
 fn arity_mismatch(code: &BuiltinCode, expected: usize, given: usize) -> crate::PyError {
     let name = code.name;
     let owner = unsafe { code.owner.as_ref() };
-    let (qualname, wanted, got) = match owner {
-        Some(owner) => (
-            format!("{}.{}", owner.type_name, name),
-            expected.saturating_sub(1),
-            given.saturating_sub(1),
-        ),
-        None => (name.to_string(), expected, given),
+    let qualname = builtin_code_qualname(code);
+    // A descriptor's receiver is not part of the reported count.
+    let (wanted, got) = match owner {
+        Some(_) => (expected.saturating_sub(1), given.saturating_sub(1)),
+        None => (expected, given),
     };
     let message = if owner.is_some_and(|owner| is_slot_wrapper(owner.type_name, name)) {
         if wanted == 2 {
@@ -773,6 +774,32 @@ fn arity_mismatch(code: &BuiltinCode, expected: usize, given: usize) -> crate::P
         }
     };
     crate::PyError::type_error(message)
+}
+
+fn builtin_code_qualname(code: &BuiltinCode) -> String {
+    match unsafe { code.owner.as_ref() } {
+        Some(owner) => format!("{}.{}", owner.type_name, code.name),
+        None => code.name.to_string(),
+    }
+}
+
+fn no_keyword_arguments(code: &BuiltinCode) -> crate::PyError {
+    // A method carries its owning type, so it names itself `list.append`.
+    // A module-level builtin has no owner to qualify it with and reports the
+    // bare name.
+    crate::PyError::type_error(format!(
+        "{}() takes no keyword arguments",
+        builtin_code_qualname(code)
+    ))
+}
+
+/// Build the keyword-rejection error for a fixed-count BuiltinCode.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_no_keyword_arguments(obj: PyObjectRef) -> crate::PyError {
+    unsafe { no_keyword_arguments(&*(obj as *const BuiltinCode)) }
 }
 
 /// Python 3.14 fills a type's slots with `wrapper_descriptor`s and its
@@ -1002,6 +1029,40 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `gateway.py BuiltinCode.funcrun` reaches the unwrapped body through
+/// `Arguments.parse_obj`, which rejects a call whose positional count does not
+/// fit the signature.  A builtin registered with a declared count carries no
+/// `Signature` to parse against and its body indexes those slots directly, so
+/// the positional count is checked before the body runs.
+pub fn check_declared_arity(name: &str, arity: usize, given: usize) -> Result<(), crate::PyError> {
+    if given == arity {
+        return Ok(());
+    }
+    let message = match arity {
+        0 => format!("{name}() takes no arguments ({given} given)"),
+        1 => format!("{name}() takes exactly one argument ({given} given)"),
+        n => format!("{name} expected {n} arguments, got {given}"),
+    };
+    Err(crate::PyError::type_error(message))
+}
+
+/// Check the declared arity as positional-only. Keyword calls carry a trailing
+/// marker dict in the raw builtin slice; the callee still receives that raw
+/// slice after the arity guard.
+pub fn check_declared_positional_arity(
+    name: &str,
+    arity: usize,
+    args: &[PyObjectRef],
+) -> Result<(), crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes no keyword arguments"
+        )));
+    }
+    check_declared_arity(name, arity, positional.len())
+}
+
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
 pub fn make_builtin_function_with_arity(
     name: &'static str,
@@ -1175,18 +1236,18 @@ mod tests {
 // (gateway.py visit_fsencode line 365) and by posix call sites that
 // previously inlined the same extraction.
 pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
+    let data = fsencode_bytes_w(obj)?;
+    Ok(String::from_utf8_lossy(&data).into_owned())
+}
+
+pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     unsafe {
         if pyre_object::is_str(obj) {
-            // A path str may carry lone surrogates (surrogateescape decoding),
-            // so read it through the WTF-8 view and lossily fold surrogates to
-            // U+FFFD rather than panicking in the strict `&str` accessor.
-            return Ok(pyre_object::w_str_get_wtf8(obj)
-                .to_string_lossy()
-                .into_owned());
+            return fsencode_str_bytes(obj);
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
-            return Ok(String::from_utf8_lossy(data).into_owned());
+            return Ok(data.to_vec());
         }
     }
     // `type(path).__fspath__(path)` — the descriptor read off the type is
@@ -1197,17 +1258,40 @@ pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyErro
         let result = crate::call::call_function_impl_result(fspath_fn, &[obj])?;
         unsafe {
             if pyre_object::is_str(result) {
-                return Ok(pyre_object::w_str_get_wtf8(result)
-                    .to_string_lossy()
-                    .into_owned());
+                return fsencode_str_bytes(result);
             }
             if pyre_object::bytesobject::is_bytes_like(result) {
                 let data = pyre_object::bytesobject::bytes_like_data(result);
-                return Ok(String::from_utf8_lossy(data).into_owned());
+                return Ok(data.to_vec());
             }
         }
     }
     Err(crate::PyError::type_error(
         "expected str, bytes or os.PathLike",
     ))
+}
+
+fn fsencode_str_bytes(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
+    let mut out = Vec::with_capacity(wtf8.len());
+    for (pos, cp) in wtf8.code_points().enumerate() {
+        if let Some(ch) = cp.to_char() {
+            let mut buf = [0; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        let code = cp.to_u32();
+        if (0xDC80..=0xDCFF).contains(&code) {
+            out.push((code - 0xDC00) as u8);
+        } else {
+            return Err(crate::typedef::unicode_encode_error(
+                "utf-8",
+                obj,
+                pos,
+                pos + 1,
+                "surrogates not allowed",
+            ));
+        }
+    }
+    Ok(out)
 }

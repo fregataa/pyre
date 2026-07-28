@@ -95,11 +95,6 @@ struct ServentRaw {
 /// UnicodeEncodeError falls back to `.encode('idna')`.  Embedded null
 /// bytes raise TypeError (matching `:120-122`).  Other input types
 /// raise TypeError.
-///
-/// pyre's `idna` codec presently passes through as UTF-8 instead of
-/// emitting punycode, so non-ASCII hostnames still pass through this
-/// helper without raising but produce incorrect DNS queries — that is
-/// an `encodings/idna` gap, not a `_socket` parity issue.
 #[cfg(unix)]
 fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     if w_host.is_null() {
@@ -109,15 +104,23 @@ fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, cr
     }
     let bytes: Vec<u8> = unsafe {
         if pyre_object::is_str(w_host) {
-            let s = pyre_object::w_str_get_value(w_host);
-            if s.is_ascii() {
+            // The ASCII attempt reads the raw buffer, so a host that has no
+            // utf-8 view — one carrying a lone surrogate — reaches the `idna`
+            // fallback the same way any other non-ASCII host does.
+            let s = pyre_object::unicodeobject::w_str_get_wtf8(w_host);
+            if s.as_bytes().is_ascii() {
                 s.as_bytes().to_vec()
             } else {
                 let method = crate::baseobjspace::getattr_str(w_host, "encode")?;
                 let codec = pyre_object::w_str_new("idna");
                 let encoded = crate::call_function(method, &[codec]);
                 if encoded.is_null() {
-                    return Err(crate::PyError::type_error("idna encoding failed"));
+                    // The codec's own error is what the caller sees — a host
+                    // the `idna` codec rejects raises that rejection, not a
+                    // substituted one.
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::type_error("idna encoding failed")
+                    }));
                 }
                 if !pyre_object::bytesobject::is_bytes_like(encoded) {
                     return Err(crate::PyError::type_error(
@@ -561,7 +564,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "inet_aton: arg must be a string",
                             ));
                         }
-                        pyre_object::w_str_get_value(args[0]).to_string()
+                        crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                     };
                     let c = std::ffi::CString::new(s.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null in argument"))?;
@@ -633,7 +636,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "inet_pton: address must be a string",
                             ));
                         }
-                        pyre_object::w_str_get_value(args[1]).to_string()
+                        crate::baseobjspace::str_utf8_w(args[1])?.to_string()
                     };
                     let c_ip = std::ffi::CString::new(ip.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
@@ -755,7 +758,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "sethostname: name must be a string",
                             ));
                         }
-                        pyre_object::w_str_get_value(args[0]).to_string()
+                        crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                     };
                     rustpython_host_env::socket::sethostname(&name).map_err(|e| {
                         crate::PyError::os_error_with_errno(
@@ -973,13 +976,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "getservbyname: name must be a string",
                         ));
                     }
-                    pyre_object::w_str_get_value(args[0]).to_string()
+                    crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| crate::PyError::value_error("embedded null"))?;
                 let proto_c: Option<std::ffi::CString> =
                     if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
-                        let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                        let p = crate::baseobjspace::str_utf8_w(args[1])?.to_string();
                         Some(
                             std::ffi::CString::new(p.as_bytes())
                                 .map_err(|_| crate::PyError::value_error("embedded null"))?,
@@ -1021,7 +1024,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let port = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
                 let proto_c: Option<std::ffi::CString> =
                     if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
-                        let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                        let p = crate::baseobjspace::str_utf8_w(args[1])?.to_string();
                         Some(
                             std::ffi::CString::new(p.as_bytes())
                                 .map_err(|_| crate::PyError::value_error("embedded null"))?,
@@ -1191,7 +1194,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "getprotobyname: name must be a string",
                     ));
                 }
-                let name = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                let name = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
                 let pe = unsafe { libc::getprotobyname(c_name.as_ptr()) };
@@ -1251,7 +1254,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "if_nametoindex: name must be a string",
                         ));
                     }
-                    let name = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                    let name = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
                     let c_name = std::ffi::CString::new(name.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
                     let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
@@ -1610,7 +1613,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 if pyre_object::is_none(host_obj) {
                     None
                 } else if pyre_object::is_str(host_obj) {
-                    let s = pyre_object::w_str_get_value(host_obj).to_string();
+                    let s = crate::baseobjspace::str_utf8_w(host_obj)?.to_string();
                     Some(
                         std::ffi::CString::new(s.as_bytes())
                             .map_err(|_| crate::PyError::value_error("embedded null in host"))?,
@@ -1630,7 +1633,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     let v = pyre_object::w_int_get_value(port_obj);
                     Some(std::ffi::CString::new(format!("{v}")).unwrap())
                 } else if pyre_object::is_str(port_obj) {
-                    let s = pyre_object::w_str_get_value(port_obj).to_string();
+                    let s = crate::baseobjspace::str_utf8_w(port_obj)?.to_string();
                     Some(
                         std::ffi::CString::new(s.as_bytes())
                             .map_err(|_| crate::PyError::value_error("embedded null in port"))?,
@@ -1762,7 +1765,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         "getnameinfo: sockaddr[1] must be an integer",
                     ));
                 }
-                let host = unsafe { pyre_object::w_str_get_value(host_obj).to_string() };
+                let host = crate::baseobjspace::str_utf8_w(host_obj)?.to_string();
                 let port_v = unsafe { pyre_object::w_int_get_value(port_obj) };
 
                 let c_host = std::ffi::CString::new(host.as_bytes())
@@ -2086,7 +2089,7 @@ fn pack_inet_addr(
         };
         let path_bytes_vec: Vec<u8> = unsafe {
             if pyre_object::is_str(path_obj) {
-                pyre_object::w_str_get_value(path_obj)
+                crate::baseobjspace::str_utf8_w(path_obj)?
                     .to_string()
                     .into_bytes()
             } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
@@ -2131,7 +2134,7 @@ fn pack_inet_addr(
         if !pyre_object::is_str(host_obj) {
             return Err(crate::PyError::type_error("address host must be a string"));
         }
-        pyre_object::w_str_get_value(host_obj).to_string()
+        crate::baseobjspace::str_utf8_w(host_obj)?.to_string()
     };
     if !unsafe { pyre_object::is_int(port_obj) } {
         return Err(crate::PyError::type_error(

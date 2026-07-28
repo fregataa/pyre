@@ -3449,12 +3449,17 @@ impl CallControl {
 
     /// RPython `call.py:182-187 get_jitcode_calldescr` source-of-truth for
     /// `FUNC.RESULT`. Pyre derives the calldescr's result kind char from
-    /// `graph.return_type` (stamped at registration off the parsed Rust
-    /// signature, mirroring `funcptr._obj.TO.RESULT`). The mapping mirrors
+    /// `graph.return_type` (stamped at registration, mirroring
+    /// `funcptr._obj.TO.RESULT`). The mapping mirrors
     /// `return_type_string_to_kind` below. Returns `None` when the
     /// graph carries no return type — callers (`transform_graph_to_jitcode`)
     /// fall back to a CFG scan in that case (e.g. unit-test graphs without a
     /// parsed signature).
+    ///
+    /// The stamp is already a result-kind token, never a Rust type: it comes
+    /// from `front::mir dont_look_inside_return_token`, which is where a
+    /// scoped `Result<T, PyError>` is projected through `T` and where any
+    /// other `Result` keeps the ADT's own kind.
     pub fn declared_return_kind(&self, path: &CallPath) -> Option<char> {
         let s = self.function_graphs.get(path)?.return_type.as_ref()?.trim();
         Some(return_type_string_to_kind(s))
@@ -3779,6 +3784,9 @@ impl CallControl {
     pub(crate) fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
             CallTarget::FunctionPath { segments } => {
+                if crate::model::fn_const_segments(target).is_some() {
+                    return None;
+                }
                 let path = CallPath::from_segments(segments.iter().map(String::as_str));
                 // A rich-`OpKind` graph resolves via `function_graphs`; an
                 // opname-dispatch helper has no rich twin there, so it is
@@ -4058,6 +4066,14 @@ impl CallControl {
     /// `CallPath`; otherwise it falls back to the stable symbolic address
     /// shim for source-only analysis.
     pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
+        if let Some(segments) = crate::model::fn_const_segments(target) {
+            let path = CallPath::from_segments(segments.iter().map(String::as_str));
+            return self
+                .function_fnaddrs
+                .get(&path)
+                .copied()
+                .unwrap_or_else(|| symbolic_fnaddr_for_path(&path));
+        }
         if let Some(path) = self.target_to_path(target) {
             return self
                 .function_fnaddrs
@@ -5677,6 +5693,11 @@ pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
 }
 
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
+    if let Some(segments) = crate::model::fn_const_segments(target) {
+        return stable_symbolic_fnaddr(&CallPath::from_segments(
+            segments.iter().map(String::as_str),
+        ));
+    }
     stable_symbolic_fnaddr(target)
 }
 
@@ -9708,5 +9729,21 @@ mod tests {
         assert_eq!(cc.recursive_field_count("Inner"), 2);
         // Outer: a(1) + inner→{x,y}(2) + `&Inner` pointer(1) + b(1) = 5.
         assert_eq!(cc.recursive_field_count("Outer"), 5);
+    }
+
+    #[test]
+    fn fn_const_target_strips_head_for_fnaddr_only() {
+        let mut cc = CallControl::new();
+        let real_path = CallPath::from_segments(["m", "f"]);
+        cc.register_function_fnaddr(real_path, 0x1234);
+        let target = CallTarget::function_path(["__fn_const", "m", "f"]);
+
+        assert_eq!(
+            crate::model::fn_const_segments(&target)
+                .map(|s| { s.iter().map(String::as_str).collect::<Vec<_>>() }),
+            Some(vec!["m", "f"])
+        );
+        assert_eq!(cc.fnaddr_for_target(&target), 0x1234);
+        assert_eq!(cc.target_to_path(&target), None);
     }
 }

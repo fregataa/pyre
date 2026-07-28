@@ -4523,23 +4523,40 @@ impl<'a> Lowering<'a> {
                 // shape (`flowspace_adapter.rs::is_str_const_define`).
                 result_ty: ValueType::Ref(None),
             },
-            // A function item's value is its address.  Upstream materialises
-            // it as `Constant(funcptr)` of lltype `Ptr(FuncType)`
-            // (`rtyper.getcallable`, and `sub_helper_funcptr_constant` for the
-            // sub-helper twins), whose `getkind` is `r` — the same reason the
-            // `Str` arm above declares a Ref.  The synthetic define reuses the
-            // callee's real path so a value threaded into a call site still
-            // resolves, which also puts it in front of `getcalldescr`'s
-            // `RESULT == FUNC.RESULT` check (`call.py`): an `Int` here read as
-            // a 0-arg call to that function and hard-failed against any callee
-            // whose graph carries a `FUNC.RESULT` token — `w_dict_new`
-            // (`dont_look_inside`) threaded through `Option::unwrap_or_else` is
-            // the shape that surfaces it.
-            DecodedConst::FnPath(segments) => OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
-                args: vec![],
-                result_ty: ValueType::Ref(None),
-            },
+            // A function item used as a *value* rather than called; its value
+            // is the function's address.  The define takes a synthetic head
+            // for the same reason the `Str` arm above does: the path never
+            // matches a registered graph, so the define is not mistaken for a
+            // real 0-arg call to the function it names.  Both of
+            // `getcalldescr`'s checks (`call.py`) run off the resolved callee
+            // graph, and both reject this shape without the head — the
+            // argument-kind comparison against the define's empty list
+            // (`cycle_reduce_method`, one `Ref` parameter), and
+            // `RESULT == FUNC.RESULT` for a 0-parameter callee carrying a
+            // result token (`w_dict_new`, `dont_look_inside`, threaded through
+            // `Option::unwrap_or_else`).  The callee's own segments stay in
+            // the tail so the referenced function is still recoverable.
+            //
+            // Upstream materialises the address as `Constant(funcptr)` of
+            // lltype `Ptr(FuncType)` (`rtyper.getcallable`, and
+            // `sub_helper_funcptr_constant` for the sub-helper twins), whose
+            // `getkind` is `r`.  The slot here stays `Int` because majit
+            // materialises a funcptr as its integer address everywhere else
+            // (`jtransform.rs direct_funcptr_value` emits `ConstInt(fnaddr)`,
+            // which the assembler encodes through the `'i'` argcode), and the
+            // flowspace fold gives the define a `Signed` legacy slot to match.
+            DecodedConst::FnPath(segments) => {
+                let mut synthetic = Vec::with_capacity(segments.len() + 1);
+                synthetic.push(crate::model::FN_CONST_HEAD.to_string());
+                synthetic.extend(segments);
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: synthetic,
+                    },
+                    args: vec![],
+                    result_ty: ValueType::Int,
+                }
+            }
         };
         let var = self
             .graph
@@ -12804,10 +12821,20 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
     // `RESULT == FUNC.RESULT` check).  `Result<(), PyError>` reaches the
     // unit arm the same way its callee reaches `widen_unit_return_to_void`.
     //
+    // Only a `PyError` carrier is lowered that way.  Any other `Result`
+    // stays a real ADT the callee returns whole and the caller matches on
+    // (`rbigint::_AsDouble -> Result<f64, RBigIntError>`), so projecting it
+    // would name the payload's bank for a value that arrives as a
+    // reference — the same disagreement in the other direction.
+    //
     // The `OBJECTPTR` carve-out below deliberately keeps reading the
     // declared `output`: it decides the pointer's lowering, not its bank,
     // and a `Result`-typed output has never taken it.
-    let payload = crate::front::result_exc::tyref_result_ok(output, llbc);
+    let payload = if crate::front::result_exc::tyref_is_result_of_pyerror(output, llbc) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
         return None;
@@ -15401,7 +15428,7 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
 /// `None` when `var` traces to a `Const`, a function input (no producing
 /// op), a phi merge (a block with more than one incoming `Link`, so no
 /// single producer), or a producer not yet emitted into `graph`.
-fn resolve_to_producer_op(
+pub(crate) fn resolve_to_producer_op(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
 ) -> Option<(BlockId, usize)> {

@@ -1733,10 +1733,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "urandom",
             |args| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error("urandom() requires 1 argument"));
+                crate::gateway::check_declared_arity("urandom", 1, args.len())?;
+                // `__index__` conversion, so a non-integer is a TypeError
+                // instead of a raw field read that asks for an arbitrary
+                // number of bytes.
+                let n = crate::builtins::space_index_w(args[0])?;
+                if n < 0 {
+                    return Err(crate::PyError::value_error("negative argument not allowed"));
                 }
-                let n = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+                // A 32-bit target's `usize` is narrower than the `__index__`
+                // result, so a size it cannot hold is reported rather than
+                // wrapped to a smaller request.
+                let n = usize::try_from(n)
+                    .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let buf = host_os::urandom(n).unwrap_or_else(|_| vec![0u8; n]);
                 // Route host entropy through the trusted controller instead of
@@ -2599,7 +2608,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             let key = unsafe {
                 if pyre_object::is_str(args[0]) {
-                    pyre_object::w_str_get_value(args[0]).to_string()
+                    crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                 } else {
                     return Ok(pyre_object::w_none());
                 }
@@ -3627,7 +3636,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let cmd = unsafe {
                         if pyre_object::is_str(args[0]) {
-                            pyre_object::w_str_get_value(args[0]).to_string()
+                            crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                         } else {
                             return Err(crate::PyError::type_error(
                                 "system(): command must be a string",
@@ -3806,7 +3815,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map(|s| {
                         let bytes = unsafe {
                             if pyre_object::is_str(s) {
-                                pyre_object::w_str_get_value(s).as_bytes().to_vec()
+                                crate::baseobjspace::str_utf8_w(s)?.as_bytes().to_vec()
                             } else if pyre_object::is_bytes(s) {
                                 pyre_object::w_bytes_data(s).to_vec()
                             } else {
@@ -4156,7 +4165,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let user = unsafe {
                         if pyre_object::is_str(args[0]) {
-                            pyre_object::w_str_get_value(args[0]).to_string()
+                            crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                         } else {
                             return Err(crate::PyError::type_error(
                                 "initgroups(): username must be str",

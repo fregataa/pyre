@@ -115,9 +115,11 @@ pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
             return true;
         }
         unsafe {
+            // Compared as raw buffers: `**{'\ud800': 1}` puts a lone surrogate
+            // in a keyword name, which has no `&str` spelling.
             if pyre_object::is_str(w_other)
                 && pyre_object::is_str(w_key)
-                && pyre_object::w_str_get_value(w_other) == pyre_object::w_str_get_value(w_key)
+                && pyre_object::w_str_get_wtf8(w_other) == pyre_object::w_str_get_wtf8(w_key)
             {
                 return true;
             }
@@ -152,7 +154,7 @@ pub fn check_not_duplicate_kwargs(
         if contains_w_names(w_key, existingkeywords_w) {
             let key_repr = unsafe {
                 if pyre_object::is_str(w_key) {
-                    pyre_object::w_str_get_value(w_key).to_string()
+                    pyre_object::w_str_get_wtf8(w_key).to_string()
                 } else {
                     crate::display::py_str(w_key)?
                 }
@@ -1897,6 +1899,24 @@ mod tests {
         assert!(contains_w_names(pyre_object::w_str_new("a"), &names));
         assert!(contains_w_names(pyre_object::w_str_new("b"), &names));
         assert!(!contains_w_names(pyre_object::w_str_new("c"), &names));
+    }
+
+    /// `contains_w_names` compares keyword names without requiring a `&str`
+    /// view.
+    #[test]
+    fn surrogate_keyword_name_matches() {
+        let mut name = rustpython_wtf8::Wtf8Buf::new();
+        name.push(rustpython_wtf8::CodePoint::from_u32(0xD800).unwrap());
+        let w_name = pyre_object::w_str_from_wtf8(name.clone());
+        let existing = vec![pyre_object::w_str_from_wtf8(name.clone())];
+        let new = vec![w_name];
+        let values: Vec<PyObjectRef> = vec![pyre_object::w_int_new(1)];
+
+        assert!(contains_w_names(w_name, &existing));
+        let err = check_not_duplicate_kwargs(&existing, &new, &values, pyre_object::PY_NULL)
+            .expect_err("should raise TypeError on duplicate");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert!(err.message.contains("got multiple values"));
     }
 
     /// pypy/interpreter/argument.py:410-417 `_check_not_duplicate_kwargs` —

@@ -103,6 +103,12 @@ fn write_object(
     version: i32,
     depth: usize,
 ) -> Result<(), PyError> {
+    // `obj` is held as a raw local across the whole traversal, which is sound
+    // only because writing allocates nothing the GC manages: the output is a
+    // Rust `Vec<u8>`, and the one conversion here (`obj_to_bigint`) reads the
+    // int or clones a Rust `BigInt`.  A minor collection therefore cannot run
+    // between the branch test and the read, so no reload from the shadow slot
+    // is needed.  Anything added here that allocates breaks that.
     if depth == 0 {
         return Err(PyError::value_error("object too deeply nested to marshal"));
     }
@@ -522,6 +528,20 @@ pub(crate) fn loads_bytes(data: &[u8]) -> PyResult {
     let mut reader: &[u8] = data;
     let result = wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
     Ok(result.get())
+}
+
+/// `PyMarshal_WriteObjectToString` — serialize one object into a raw byte
+/// buffer at the current format version.  `_imp.find_frozen(withdata=True)`
+/// hands these bytes back as the frozen data, so they are the same stream
+/// `loads_bytes` reads.
+pub(crate) fn dumps_bytes(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    let version = wire::FORMAT_VERSION as i32;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(value);
+    let mut out = Vec::new();
+    let mut refs = (version >= 3).then(WriterRefs::new);
+    write_object(&mut out, value, &mut refs, version, MAX_DEPTH)?;
+    Ok(out)
 }
 
 fn dump_impl(args: &[PyObjectRef]) -> PyResult {

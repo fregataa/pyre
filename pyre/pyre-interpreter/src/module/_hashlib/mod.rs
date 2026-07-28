@@ -9,23 +9,53 @@
 
 use pyre_object::*;
 
-/// The 14 always-supported digests hashlib advertises.
-const ALGORITHMS: &[&str] = &[
-    "md5",
-    "sha1",
-    "sha224",
-    "sha256",
-    "sha384",
-    "sha512",
-    "sha3_224",
-    "sha3_256",
-    "sha3_384",
-    "sha3_512",
-    "shake_128",
-    "shake_256",
-    "blake2b",
-    "blake2s",
+/// The 14 always-supported digests hashlib advertises, each with the OpenSSL
+/// names that also select it.
+///
+/// `py_digest_by_name` consults two tables in turn: the Python names, matched
+/// exactly, then the OpenSSL names, matched without regard to case.  That
+/// asymmetry decides which spellings resolve — `sha3_256` does and `SHA3_256`
+/// does not, because the OpenSSL spelling is `SHA3-256`; `blake2b` does and
+/// `Blake2b` does not, because the OpenSSL spelling is `BLAKE2B512`.
+///
+/// The digest an object computes is named by the entry it resolved to, not by
+/// the spelling the caller used, so `new('sha-256').name` is `sha256`.
+const DIGEST_NAMES: &[(&str, &[&str])] = &[
+    ("md5", &["MD5", "SSL3-MD5"]),
+    ("sha1", &["SHA1", "SSL3-SHA1"]),
+    ("sha224", &["SHA224", "SHA2-224", "SHA-224"]),
+    ("sha256", &["SHA256", "SHA2-256", "SHA-256"]),
+    ("sha384", &["SHA384", "SHA2-384", "SHA-384"]),
+    ("sha512", &["SHA512", "SHA2-512", "SHA-512"]),
+    ("sha3_224", &["SHA3-224"]),
+    ("sha3_256", &["SHA3-256"]),
+    ("sha3_384", &["SHA3-384"]),
+    ("sha3_512", &["SHA3-512"]),
+    ("shake_128", &["SHAKE128", "SHAKE-128"]),
+    ("shake_256", &["SHAKE256", "SHAKE-256"]),
+    ("blake2b", &["BLAKE2B512"]),
+    ("blake2s", &["BLAKE2S256"]),
 ];
+
+/// The entry `name` selects, or `None` when it names no digest this build
+/// computes.  Numeric object identifiers are not accepted: resolving those
+/// needs the OpenSSL object database, which pyre does not carry.
+fn lookup_digest_name(name: &[u8]) -> Option<&'static str> {
+    if let Some((python_name, _)) = DIGEST_NAMES
+        .iter()
+        .find(|(python_name, _)| python_name.as_bytes() == name)
+    {
+        return Some(python_name);
+    }
+    DIGEST_NAMES
+        .iter()
+        .find(|(_, ossl_names)| {
+            ossl_names
+                .iter()
+                .any(|ossl| ossl.as_bytes().eq_ignore_ascii_case(name))
+        })
+        .map(|(python_name, _)| *python_name)
+}
 
 /// `_oneshot_digest(name, data, length=0)` — bytes of the digest.
 fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -33,7 +63,7 @@ fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(name_obj) } {
         return Err(crate::PyError::type_error("digest name must be a string"));
     }
-    let name = unsafe { w_str_get_value(name_obj) }.to_string();
+    let name = crate::baseobjspace::str_utf8_w(name_obj)?.to_string();
     let data = match args.get(1).copied() {
         Some(obj) if unsafe { bytesobject::is_bytes_like(obj) } => {
             unsafe { bytesobject::bytes_like_data(obj) }.to_vec()
@@ -49,6 +79,45 @@ fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     match pyre_native::hash::compute_digest(&name, &data, length) {
         Some(out) => Ok(w_bytes_from_bytes(&out)),
         None => Err(crate::PyError::value_error(format!(
+            "unsupported hash type {name}"
+        ))),
+    }
+}
+
+/// `HASH(name)` name resolution — the Python name of the digest `name`
+/// selects.  OpenSSL resolves the digest when the context is created, so an
+/// unknown name is reported there rather than when the digest is finally
+/// taken.
+fn resolve_digest_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name_obj = args.first().copied().unwrap_or_else(w_none);
+    if !unsafe { is_str(name_obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "new() argument 'name' must be str, not {}",
+            crate::type_methods::arg_type_name(name_obj)
+        )));
+    }
+    // Read off the buffer and report the failures the utf-8 conversion of the
+    // name would: a lone surrogate does not encode, and an embedded null ends
+    // the C string the digest is looked up by.
+    let name = unsafe { w_str_get_wtf8(name_obj) };
+    if let Some(pos) = name
+        .code_points()
+        .position(|cp| (0xD800..=0xDFFF).contains(&cp.to_u32()))
+    {
+        return Err(crate::typedef::unicode_encode_error(
+            "utf-8",
+            name_obj,
+            pos,
+            pos + 1,
+            "surrogates not allowed",
+        ));
+    }
+    if name.as_bytes().contains(&0) {
+        return Err(crate::PyError::value_error("embedded null character"));
+    }
+    match lookup_digest_name(name.as_bytes()) {
+        Some(python_name) => Ok(w_str_new(python_name)),
+        None => Err(unsupported_digestmod(&format!(
             "unsupported hash type {name}"
         ))),
     }
@@ -85,8 +154,11 @@ fn compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let read = |obj: PyObjectRef| -> Result<Vec<u8>, crate::PyError> {
         unsafe {
             if is_str(obj) {
-                let s = w_str_get_value(obj);
-                if !s.is_ascii() {
+                // The ASCII check runs on the raw buffer: a lone surrogate is
+                // non-ASCII, so it takes the same rejection as any other
+                // non-ASCII character.
+                let s = w_str_get_wtf8(obj);
+                if !s.as_bytes().is_ascii() {
                     return Err(crate::PyError::type_error(
                         "comparing strings with non-ASCII characters is not supported",
                     ));
@@ -114,7 +186,8 @@ crate::py_module! {
     "_hashlib",
     interpleveldefs: {
         "openssl_md_meth_names" => {
-            let names: Vec<PyObjectRef> = ALGORITHMS.iter().map(|n| w_str_new(n)).collect();
+            let names: Vec<PyObjectRef> =
+                DIGEST_NAMES.iter().map(|(n, _)| w_str_new(n)).collect();
             w_frozenset_from_items(&names)
         },
     },
@@ -134,6 +207,7 @@ crate::py_module! {
     },
     functions: {
         "_oneshot_digest" / * = oneshot_digest,
+        "_resolve_digest_name" / 1 = resolve_digest_name,
         "compare_digest" / 2 = compare_digest,
         "hmac_new" / * = hmac_new,
         "hmac_digest" / * = hmac_digest,

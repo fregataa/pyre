@@ -289,9 +289,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "combinations",
-        crate::make_builtin_function_with_arity(
+        crate::make_builtin_function_with_arity_and_maybe_sig(
             "combinations",
             |args| {
+                crate::gateway::check_declared_arity("combinations", 2, args.len())?;
                 let r = crate::builtins::space_index_w(args[1])?;
                 if r < 0 {
                     return Err(crate::PyError::value_error("r must be non-negative"));
@@ -327,6 +328,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_seq_iter_new(list, n))
             },
             2,
+            Some(crate::gateway::Signature::new(
+                vec!["iterable", "r"],
+                None,
+                None,
+                0,
+                0,
+            )),
         ),
     );
     // combinations_with_replacement(iterable, r) — like combinations, but an
@@ -337,7 +345,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "combinations_with_replacement",
-        crate::make_builtin_function_with_arity(
+        crate::make_builtin_function_with_arity_and_maybe_sig(
             "combinations_with_replacement",
             |args| {
                 let missing = match args.len() {
@@ -381,6 +389,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_seq_iter_new(list, n))
             },
             2,
+            Some(crate::gateway::Signature::new(
+                vec!["iterable", "r"],
+                None,
+                None,
+                0,
+                0,
+            )),
         ),
     );
     // product(*iterables, repeat=1)

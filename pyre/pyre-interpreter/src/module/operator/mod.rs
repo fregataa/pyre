@@ -3,30 +3,16 @@
 use pyre_object::*;
 
 fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "index() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
     let indexed = crate::baseobjspace::space_index(args[0])?;
     unsafe { Ok(range_bigint_to_obj(range_obj_to_bigint(indexed))) }
 }
 
-/// Shared body for the binary-arithmetic thunks (`add`/`sub`/`mul`): a
-/// wrong argument count is a `TypeError`, not a panic
-/// (`interp_operator.py` `@unwrap_spec` argument checking).  The operand
-/// error propagates, matching the `truediv`/`floordiv` thunks.
-fn op_binary<F>(args: &[PyObjectRef], name: &str, f: F) -> Result<PyObjectRef, crate::PyError>
+/// Shared body for the binary-arithmetic thunks (`add`/`sub`/`mul`).  The
+/// operand error propagates, matching the `truediv`/`floordiv` thunks.
+fn op_binary<F>(args: &[PyObjectRef], f: F) -> Result<PyObjectRef, crate::PyError>
 where
     F: Fn(PyObjectRef, PyObjectRef) -> Result<PyObjectRef, crate::PyError>,
 {
-    if args.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "{name} expected 2 arguments, got {}",
-            args.len()
-        )));
-    }
     f(args[0], args[1])
 }
 
@@ -64,8 +50,11 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let read = |obj: PyObjectRef| -> Result<Vec<u8>, crate::PyError> {
         unsafe {
             if is_str(obj) {
-                let s = w_str_get_value(obj);
-                if !s.is_ascii() {
+                // The ASCII check runs on the raw buffer: a lone surrogate is
+                // non-ASCII, so it takes the same rejection as any other
+                // non-ASCII character.
+                let s = w_str_get_wtf8(obj);
+                if !s.as_bytes().is_ascii() {
                     return Err(crate::PyError::type_error(
                         "comparing strings with non-ASCII characters is not supported",
                     ));
@@ -160,10 +149,10 @@ crate::py_module! {
     },
     functions: {
         "index"    / 1 = op_index,
-        "add"      / 2 = |args| op_binary(args, "add", add),
-        "sub"      / 2 = |args| op_binary(args, "sub", sub),
-        "mul"      / 2 = |args| op_binary(args, "mul", mul),
-        "matmul"   / 2 = |args| op_binary(args, "matmul", matmul),
+        "add"      / 2 = |args| op_binary(args, add),
+        "sub"      / 2 = |args| op_binary(args, sub),
+        "mul"      / 2 = |args| op_binary(args, mul),
+        "matmul"   / 2 = |args| op_binary(args, matmul),
         "truediv"  / 2 = |args| truediv(args[0], args[1]),
         "floordiv" / 2 = |args| floordiv(args[0], args[1]),
         "mod"      / 2 = |args| mod_(args[0], args[1]),
@@ -178,19 +167,19 @@ crate::py_module! {
         "or_"      / 2 = |args| or_(args[0], args[1]),
         "xor"      / 2 = |args| xor(args[0], args[1]),
         // interp_operator.py:150-210 — in-place operations, each `space.inplace_X`.
-        "iadd"      / 2 = |args| op_binary(args, "iadd", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAdd)),
-        "isub"      / 2 = |args| op_binary(args, "isub", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceSubtract)),
-        "imul"      / 2 = |args| op_binary(args, "imul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMultiply)),
-        "imatmul"   / 2 = |args| op_binary(args, "imatmul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMatrixMultiply)),
-        "ifloordiv" / 2 = |args| op_binary(args, "ifloordiv", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceFloorDivide)),
-        "imod"      / 2 = |args| op_binary(args, "imod", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRemainder)),
-        "itruediv"  / 2 = |args| op_binary(args, "itruediv", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceTrueDivide)),
-        "ipow"      / 2 = |args| op_binary(args, "ipow", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplacePower)),
-        "ilshift"   / 2 = |args| op_binary(args, "ilshift", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceLshift)),
-        "irshift"   / 2 = |args| op_binary(args, "irshift", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRshift)),
-        "iand"      / 2 = |args| op_binary(args, "iand", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAnd)),
-        "ior"       / 2 = |args| op_binary(args, "ior", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceOr)),
-        "ixor"      / 2 = |args| op_binary(args, "ixor", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceXor)),
+        "iadd"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAdd)),
+        "isub"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceSubtract)),
+        "imul"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMultiply)),
+        "imatmul"   / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMatrixMultiply)),
+        "ifloordiv" / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceFloorDivide)),
+        "imod"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRemainder)),
+        "itruediv"  / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceTrueDivide)),
+        "ipow"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplacePower)),
+        "ilshift"   / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceLshift)),
+        "irshift"   / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRshift)),
+        "iand"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAnd)),
+        "ior"       / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceOr)),
+        "ixor"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceXor)),
         "concat"    / 2 = op_concat,
         "iconcat"   / 2 = op_iconcat,
         "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
@@ -202,49 +191,16 @@ crate::py_module! {
         "getitem"  / 2 = |args| getitem(args[0], args[1]),
         "setitem"  / 3 = |args| { setitem(args[0], args[1], args[2])?; Ok(w_none()) },
         "delitem"  / 2 = |args| { delitem(args[0], args[1])?; Ok(w_none()) },
-        // Underscore aliases (__add__ / __sub__ / __mul__ via operator).
-        "__add__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__add__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(add(args[0], args[1]).unwrap_or(w_none())) },
-        "__sub__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__sub__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(sub(args[0], args[1]).unwrap_or(w_none())) },
-        "__mul__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__mul__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(mul(args[0], args[1]).unwrap_or(w_none())) },
-        "eq" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("eq() takes exactly 2 arguments ({} given)", args.len()))); } baseobjspace::compare(args[0], args[1], CompareOp::Eq) },
-        "lt" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("lt() takes exactly 2 arguments ({} given)", args.len()))); } baseobjspace::compare(args[0], args[1], CompareOp::Lt) },
-        "gt" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("gt() takes exactly 2 arguments ({} given)", args.len()))); } baseobjspace::compare(args[0], args[1], CompareOp::Gt) },
+        "eq" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Eq),
+        "lt" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Lt),
+        "gt" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Gt),
         "le" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Le),
         "ge" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ge),
         "ne" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ne),
         "length_hint"  / * = op_length_hint,
         "_compare_digest" / 2 = op_compare_digest,
     },
-    extra_init: |ns| {
-        // `operator.py` tail — bind each dunder name to its operator
-        // function (`__lt__ = lt`, `__add__ = add`, …) so `operator.__lt__`
-        // resolves like CPython's pure-Python wrapper does.
-        const ALIASES: &[(&str, &str)] = &[
-            ("__lt__", "lt"), ("__le__", "le"), ("__eq__", "eq"),
-            ("__ne__", "ne"), ("__ge__", "ge"), ("__gt__", "gt"),
-            ("__not__", "not_"), ("__abs__", "abs"), ("__add__", "add"),
-            ("__and__", "and_"), ("__call__", "call"),
-            ("__floordiv__", "floordiv"), ("__index__", "index"),
-            ("__inv__", "inv"), ("__invert__", "invert"),
-            ("__lshift__", "lshift"), ("__mod__", "mod"), ("__mul__", "mul"),
-            ("__matmul__", "matmul"), ("__neg__", "neg"), ("__or__", "or_"),
-            ("__pos__", "pos"), ("__pow__", "pow"), ("__rshift__", "rshift"),
-            ("__sub__", "sub"), ("__truediv__", "truediv"), ("__xor__", "xor"),
-            ("__concat__", "concat"), ("__contains__", "contains"),
-            ("__delitem__", "delitem"), ("__getitem__", "getitem"),
-            ("__setitem__", "setitem"), ("__iadd__", "iadd"),
-            ("__iand__", "iand"), ("__iconcat__", "iconcat"),
-            ("__ifloordiv__", "ifloordiv"), ("__ilshift__", "ilshift"),
-            ("__imod__", "imod"), ("__imul__", "imul"),
-            ("__imatmul__", "imatmul"), ("__ior__", "ior"),
-            ("__ipow__", "ipow"), ("__irshift__", "irshift"),
-            ("__isub__", "isub"), ("__itruediv__", "itruediv"),
-            ("__ixor__", "ixor"),
-        ];
-        for (dunder, src) in ALIASES {
-            if let Some(f) = crate::module_ns_get(ns, src) {
-                crate::module_ns_store(ns, dunder, f);
-            }
-        }
-    },
+    // The `__lt__ = lt` / `__add__ = add` dunder aliases belong to
+    // `operator.py`, which binds them after its `from _operator import *`;
+    // this module carries only the names that tail imports.
 }

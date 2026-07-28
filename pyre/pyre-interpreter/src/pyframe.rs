@@ -1104,6 +1104,23 @@ pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
     unsafe { crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject }
 }
 
+/// True when a `sys.settrace` / `sys.setprofile` hook is installed on the
+/// execution context this frame runs under.
+///
+/// `executioncontext.py:296-298` keeps the JIT on and widens `trace_limit`
+/// instead, because upstream's traces carry the per-bytecode hook calls.
+/// pyre's traces do not, so a frame that is being traced runs interpreted —
+/// `call_trace` / `bytecode_trace` are driven from the plain eval path.
+/// A frame carrying its own `f_trace` also runs interpreted.
+pub fn frame_tracing_active(frame: &PyFrame) -> bool {
+    let ec = frame.execution_context;
+    if ec.is_null() {
+        return false;
+    }
+    let ec = unsafe { &*ec };
+    !ec.gettrace().is_null() || ec.profilefunc.is_some() || !frame.get_w_f_trace().is_null()
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct FrameDebugData {

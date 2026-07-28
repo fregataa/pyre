@@ -28,7 +28,7 @@
 //! * `i64` / `i32` / `u32` / `usize` — `w_int_get_value` + cast.
 //! * `f64` — `w_float_get_value`.
 //! * `bool` — `w_bool_get_value`.
-//! * `&str` — `w_str_get_value`.
+//! * `&str` — `str_utf8_w` (a lone surrogate raises `UnicodeEncodeError`).
 //! * `pyre_object::PyObjectRef` — passthrough (`args[i]`).
 //! * `&[pyre_object::PyObjectRef]` — passthrough of the whole slice (varargs).
 //!
@@ -76,7 +76,10 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
     let mut param_names = Vec::<String>::new();
     let mut param_required = Vec::<bool>::new();
+    let mut param_positional = Vec::<bool>::new();
     let mut has_varargs = false;
+    let mut has_kw_markers = false;
+    let mut kwonly_tail = false;
     let user_name_str = user_name.to_string();
     for (idx, arg) in user_sig.inputs.iter().enumerate() {
         let pat_type = match arg {
@@ -91,10 +94,19 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if is_varargs_param(&pat_type.ty) {
             has_varargs = true;
         }
+        let is_kwonly = pat_type.attrs.iter().any(|a| a.path().is_ident("kwonly"));
+        let is_kwargs = pat_type.attrs.iter().any(|a| a.path().is_ident("kwargs"));
+        if is_kwonly {
+            kwonly_tail = true;
+        }
+        if is_kwonly || is_kwargs {
+            has_kw_markers = true;
+        }
         param_names.push(param_name(idx, pat_type));
         // Optional iff it has a `#[default(...)]` or is `Option<T>`.
         param_required
             .push(arg_default(pat_type)?.is_none() && option_inner(&pat_type.ty).is_none());
+        param_positional.push(!kwonly_tail && !is_kwargs);
         let (unwrap, ident) = unwrap_arg(idx, pat_type, Some((&user_name_str, idx + 1)))?;
         unwrap_stmts.push(unwrap);
         call_args.push(quote! { #ident });
@@ -113,6 +125,8 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let req_lits = param_required.iter().map(|b| quote! { #b });
         let fn_name_str = user_name.to_string();
         quote! {
+            let __pyre_positional_count =
+                crate::builtins::split_builtin_kwargs(args).0.len();
             const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
             const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
             let __pyre_bound_args;
@@ -128,6 +142,36 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 } else {
                     args
                 };
+        }
+    };
+
+    // `Arguments.parse_obj` rejects a positional count that does not fit the
+    // signature before `BuiltinCode.funcrun` enters the unwrapped body.  The
+    // unwrap statements below index their slots directly, so the count is
+    // checked here — a missing required slot would otherwise read past the
+    // end of `args`.  A raw whole-args slice takes any count.
+    let count_preamble = if has_varargs {
+        quote! {}
+    } else {
+        let total = param_positional
+            .iter()
+            .filter(|&&positional| positional)
+            .count();
+        let required = param_required
+            .iter()
+            .zip(param_positional.iter())
+            .filter(|(required, positional)| **required && **positional)
+            .count();
+        let fn_name = user_name.to_string();
+        let too_few = arity_message(&fn_name, required, total, false);
+        let too_many = arity_message(&fn_name, required, total, true);
+        quote! {
+            if args.len() < #required {
+                return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
+            }
+            if __pyre_positional_count > #total {
+                return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
+            }
         }
     };
 
@@ -159,6 +203,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             args: &[::pyre_object::PyObjectRef],
         ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
             #kwargs_preamble
+            #count_preamble
             #(#unwrap_stmts)*
             #body
         }
@@ -224,10 +269,36 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    // Companion `<name>_pyre_arity()` — the `fast_natural_arity` this
+    // builtin may declare.  `BuiltinCode.fast_natural_arity` names the one
+    // argument count at which the body may be entered with its slots filled
+    // directly, so it exists only when every parameter is required: an
+    // optional parameter (`#[default(...)]` or `Option<T>`), a keyword-only
+    // or `**kwargs` marker and a raw whole-args slice all admit more than one
+    // count, and get `HOPELESS`.
+    let arity_fn_name = format_ident!("{}_pyre_arity", user_name);
+    let natural_arity =
+        if has_varargs || has_kw_markers || param_required.iter().any(|required| !required) {
+            quote! { crate::HOPELESS }
+        } else {
+            let n = param_positional
+                .iter()
+                .filter(|&&positional| positional)
+                .count() as u16;
+            quote! { #n }
+        };
+    let arity_fn = quote! {
+        #[allow(dead_code)]
+        #vis fn #arity_fn_name() -> u16 {
+            #natural_arity
+        }
+    };
+
     Ok(quote! {
         #inner_fn
         #wrapper
         #sig_fn
+        #arity_fn
     })
 }
 
@@ -593,11 +664,13 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
                 }
             }
         }
-        // `&str` — borrow from `w_str_get_value`.
+        // `&str` — borrow the utf-8 view.  A lone surrogate has no such view,
+        // so it is reported as the `UnicodeEncodeError` the strict utf-8
+        // encoder raises rather than demanding one.
         if let Type::Path(p) = &*r.elem {
             if path_is_ident(&p.path, "str") {
                 return Ok(quote! {
-                    unsafe { ::pyre_object::w_str_get_value(args[#idx]) }
+                    crate::baseobjspace::str_utf8_w(args[#idx])?
                 });
             }
         }
@@ -672,6 +745,41 @@ fn param_name(idx: usize, pt: &PatType) -> String {
     match &*pt.pat {
         Pat::Ident(pi) => python_keyword_name(&pi.ident.to_string()),
         _ => format!("__pyre_positional_{idx}"),
+    }
+}
+
+/// The `TypeError` text for a positional count that does not fit a builtin
+/// taking `required`..`total` arguments, as a `format!` over `args.len()`.
+///
+/// A signature with no optional slot names one exact count; one with an
+/// optional tail names the bound the call missed, so `too_many` picks
+/// between them.
+fn arity_message(
+    name: &str,
+    required: usize,
+    total: usize,
+    too_many: bool,
+) -> proc_macro2::TokenStream {
+    if required != total {
+        let bound = if too_many { total } else { required };
+        let plural = if bound == 1 { "" } else { "s" };
+        let at = if too_many { "at most" } else { "at least" };
+        let text = format!("{name} expected {at} {bound} argument{plural}, got {{}}");
+        return quote! { format!(#text, args.len()) };
+    }
+    match total {
+        0 => {
+            let text = format!("{name}() takes no arguments ({{}} given)");
+            quote! { format!(#text, args.len()) }
+        }
+        1 => {
+            let text = format!("{name}() takes exactly one argument ({{}} given)");
+            quote! { format!(#text, args.len()) }
+        }
+        n => {
+            let text = format!("{name} expected {n} arguments, got {{}}");
+            quote! { format!(#text, args.len()) }
+        }
     }
 }
 
@@ -1692,7 +1800,9 @@ fn expand_pyre_methods(
         let mut call_args = Vec::<proc_macro2::TokenStream>::new();
         let mut param_names = Vec::<String>::new();
         let mut param_required = Vec::<bool>::new();
+        let mut param_positional = Vec::<bool>::new();
         let mut has_varargs = false;
+        let mut kwonly_tail = false;
         for (offset, arg) in inputs.enumerate() {
             let FnArg::Typed(pt) = arg else {
                 return Err(syn::Error::new(
@@ -1704,9 +1814,15 @@ fn expand_pyre_methods(
             if is_varargs_param(&pt.ty) {
                 has_varargs = true;
             }
+            let is_kwonly = pt.attrs.iter().any(|a| a.path().is_ident("kwonly"));
+            let is_kwargs = pt.attrs.iter().any(|a| a.path().is_ident("kwargs"));
+            if is_kwonly {
+                kwonly_tail = true;
+            }
             param_names.push(param_name(offset, pt));
             // Optional iff it has a `#[default(...)]` or is `Option<T>`.
             param_required.push(arg_default(pt)?.is_none() && option_inner(&pt.ty).is_none());
+            param_positional.push(!kwonly_tail && !is_kwargs);
             let (stmt, ident) = unwrap_arg(arg_idx, pt, None)?;
             unwrap_stmts.push(stmt);
             call_args.push(quote! { #ident });
@@ -1742,6 +1858,8 @@ fn expand_pyre_methods(
                 let req_lits = all_required.iter().map(|b| quote! { #b });
                 let fn_name_str = mname.to_string();
                 quote! {
+                    let __pyre_positional_count =
+                        crate::builtins::split_builtin_kwargs(args).0.len();
                     const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
                     const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
                     let __pyre_bound_args;
@@ -1775,8 +1893,15 @@ fn expand_pyre_methods(
                 quote! {}
             } else {
                 let receiver_slots = usize::from(matches!(kind, MethodKind::Instance));
-                let visible_max = param_names.len();
-                let visible_required = param_required.iter().filter(|&&required| required).count();
+                let visible_max = param_positional
+                    .iter()
+                    .filter(|&&positional| positional)
+                    .count();
+                let visible_required = param_required
+                    .iter()
+                    .zip(param_positional.iter())
+                    .filter(|(required, positional)| **required && **positional)
+                    .count();
                 let expected_total = receiver_slots + visible_max;
                 let fn_name = mname.to_string();
                 let expected = if visible_required == visible_max {
@@ -1791,8 +1916,31 @@ fn expand_pyre_methods(
                         if visible_max == 1 { "" } else { "s" }
                     )
                 };
+                // A missing required slot is rejected the same way: the
+                // unwrap statements below index their slots directly, so the
+                // body would otherwise read past the end of `args`.
+                let expected_min = receiver_slots + visible_required;
+                let too_few = if visible_required == visible_max {
+                    quote! {
+                        format!(
+                            "{}() takes {} ({} given)",
+                            #fn_name, #expected,
+                            args.len().saturating_sub(#receiver_slots),
+                        )
+                    }
+                } else {
+                    let text = format!(
+                        "{} expected at least {visible_required} argument{}, got {{}}",
+                        fn_name,
+                        if visible_required == 1 { "" } else { "s" },
+                    );
+                    quote! { format!(#text, args.len().saturating_sub(#receiver_slots)) }
+                };
                 quote! {
-                    if args.len() > #expected_total {
+                    if args.len() < #expected_min {
+                        return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
+                    }
+                    if __pyre_positional_count > #expected_total {
                         return ::std::result::Result::Err(crate::PyError::type_error(format!(
                             "{}() takes {} ({} given)",
                             #fn_name,
