@@ -129,8 +129,8 @@ pub use jitcode::{
 };
 pub use jitdriver::{
     DeclarativeJitDriver, JitDriver, JitDriverStaticData, MultiFrameBlackholeResult,
-    SingleFrameBlackholeResult, TraceContinuationSuspendGuard, drive_multi_frame_blackhole,
-    drive_single_frame_blackhole, trace_continuation_suspended,
+    SingleFrameBlackholeResult, TraceContinuationSuspendGuard, current_state_field_fvc_epoch,
+    drive_multi_frame_blackhole, drive_single_frame_blackhole, trace_continuation_suspended,
 };
 pub use majit_backend::CompiledTraceInfo;
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
@@ -163,6 +163,7 @@ pub use quasiimmut::QuasiImmut;
 pub use resume_box_reader::{
     BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
     materialize_bridge_virtual, rebuilt_value_to_opref, replay_pending_fields,
+    seed_bridge_virtualizable_boxes,
 };
 pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::GreenBox;

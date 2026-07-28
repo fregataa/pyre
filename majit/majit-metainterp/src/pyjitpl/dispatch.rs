@@ -335,6 +335,31 @@ pub trait JitCodeSym {
         None
     }
 
+    /// pyjitpl.py:2981-2989 `live_arg_boxes` — this merge point's
+    /// loop-carried boxes, in the exact order the closing JUMP emits them.
+    ///
+    /// RPython builds `live_arg_boxes` ONCE per `reached_loop_header` and
+    /// hands the same list to `current_merge_points.append` (the
+    /// registration), to `compile_loop`'s LABEL and to `compile_trace`'s
+    /// JUMP; `assert len(original_boxes) == len(live_arg_boxes)`
+    /// (pyjitpl.py:3020) is free there because there is only one list. The
+    /// dispatch loop reaches a merge point with only `JitCodeSym` in scope,
+    /// so this hook is how it gets at the construction that
+    /// `JitState::collect_jump_args_with_boxes` uses for the close — the two
+    /// MUST agree or the cut label's arity will not match the JUMP's
+    /// (`compile.py:334 jump.numargs() == label.numargs()`).
+    ///
+    /// `vable_boxes` is `TraceCtx::collect_virtualizable_typed_boxes()`,
+    /// identity last (this hook drops it, mirroring the `.pop()`).
+    /// `None` = "no state-field construction" — the caller keeps its own
+    /// fallback.
+    fn loop_carried_boxes(
+        &self,
+        _vable_boxes: &[(OpRef, majit_ir::Type)],
+    ) -> Option<Vec<(OpRef, majit_ir::Type)>> {
+        None
+    }
+
     // -- State field support (register/tape machines) -----
     //
     // When state_fields is configured, scalar and array fields on the
@@ -4957,7 +4982,98 @@ where
                             let header_pc = ctx.header_pc;
                             let inner_key =
                                 crate::green_key_from_code_ptr(ctx.green_key_raw.0, pc as usize);
-                            if ctx.has_merge_point_at(inner_key, header_pc) {
+                            // pyjitpl.py:3001-3007, which runs BEFORE the
+                            // `current_merge_points` scan:
+                            //
+                            //     ptoken = self.get_procedure_token(greenboxes)
+                            //     if has_compiled_targets(ptoken):
+                            //         self.compile_trace(live_arg_boxes, ptoken)
+                            //
+                            // `greenboxes` is the merge point just reached, so a
+                            // loop that ALREADY has compiled code is jumped into,
+                            // never re-derived by cutting this trace at it. The
+                            // cut (compile.py:269) is for the other case: an
+                            // inner loop nobody has compiled yet, which
+                            // `compile_loop` then attaches to
+                            // `original_boxes[:num_green_args]` — the INNER
+                            // greenkey (pyjitpl.py:3183-3187).
+                            //
+                            // Pyre's cut cannot do that attach: it stores under
+                            // `cut_inner_green_key`, and the only key derivable
+                            // here is `green_key_from_code_ptr(green_key_raw.0,
+                            // pc)` with `JitState::code_ptr()` defaulting to 0 —
+                            // not the driver's `GreenKey::hash_u64`. So cutting
+                            // at a merge point that already holds a compiled loop
+                            // would replace reachable code with code stored where
+                            // nothing enters. Decline the cut and keep tracing;
+                            // the trace then closes at its own header with this
+                            // loop's body inlined, which is what it does at trip
+                            // counts too low to reach the merge point twice.
+                            //
+                            // The JUMP-into-ptoken half of :3001-3007 is not
+                            // implemented here.  It is not blocked on missing
+                            // machinery — that was tried and measured:
+                            // publishing the token key plus `close_greens` and
+                            // returning `CloseLoop` reaches `close_bridge` for a
+                            // guard origin and `compile_trace_from_interp`
+                            // (through `compile_trace_entry_data`, which needs
+                            // `header_pc == 0`) for an interp origin, and both
+                            // land.  cel's `nested_list_loop_varying_trip_count`
+                            // then keeps its results and loses its 4 aborts, but
+                            // its `spread 0..32` deopts go 959 → 1763 over 4000
+                            // rows and 1275 → 2601 over 16000: the residual
+                            // per-row tail worsens ~2.6x.  Jumping in ends the
+                            // trace at the inner loop, where the ordinary close
+                            // covered the whole outer iteration, and the exit
+                            // guards that shape leaves behind do not converge.
+                            // Routing the closing JUMP's target tokens off the
+                            // token it enters instead of off the bridge origin
+                            // (`unroll.py:196-197 cell_token = jump_op.getdescr()`
+                            // — pyre's `compile_bridge` hands `optimize_bridge`
+                            // the ORIGIN loop's `front_target_tokens`) recovers
+                            // only 7% of that, so the gap is elsewhere.
+                            //
+                            // Two consequences of declining, both narrower than
+                            // upstream:
+                            //   * upstream reaches the `current_merge_points`
+                            //     scan whenever `compile_trace` does NOT raise;
+                            //     this arm returns to neither the scan nor the
+                            //     `append` (:3058-3060), so the merge point is
+                            //     never registered at all while a compiled loop
+                            //     sits at those greens.
+                            //   * upstream's is a JUMP into reachable code; ours
+                            //     re-traces that loop's body inline.
+                            //
+                            // The token lookup below is unconditional, where
+                            // upstream guards it with `if not self.partial_trace:`
+                            // (:3002).  That gate must not be spelled
+                            // `is_bridge_trace`: `partial_trace` is set only by
+                            // `retrace_needed` (pyjitpl.py:2438-2439), so it means
+                            // "this is a RETRACE", and a bridge from a guard
+                            // failure runs the consult upstream just like a
+                            // primary entry.  Its live reading is
+                            // `MetaInterp::partial_trace()`, which this loop
+                            // cannot reach while it holds the TraceCtx borrow —
+                            // harmless while the lookup only decides a log line,
+                            // and part of what the JUMP half has to carry.
+                            let mp_greens = (
+                                mp_green_ints.clone(),
+                                mp_green_refs.clone(),
+                                mp_green_floats.clone(),
+                            );
+                            let already_compiled_here = ctx
+                                .compiled_key_for_greens_fn
+                                .as_ref()
+                                .and_then(|f| f(&mp_greens));
+                            if let Some(ptoken_key) = already_compiled_here {
+                                if crate::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit] merge point pc={pc} already has compiled loop \
+                                         key={ptoken_key} — declining the cross-loop cut \
+                                         (pyjitpl.py:3005)"
+                                    );
+                                }
+                            } else if ctx.has_merge_point_at(inner_key, header_pc) {
                                 if crate::jitdriver::spdiag_enabled() {
                                     eprintln!(
                                         "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
@@ -5004,45 +5120,54 @@ where
                                 // unconditionally at the reached_loop_header entry
                                 // above (pyjitpl.py:2993).
                                 return TraceAction::CloseLoop;
-                            }
-                            // first visit → append and keep tracing
-                            // (pyjitpl.py:3058-3060). For the state-field dispatch
-                            // model the merge point's loop-carried values are the
-                            // RED state fields (the closing JUMP = collect_jump_args),
-                            // NOT the green operands captured in `live_arg_boxes`
-                            // (those are promoted constants folded inline in the cut
-                            // body). Use the red state-field oprefs in
-                            // collect_jump_args order (int scalars then ref scalars)
-                            // as the cut's `original_boxes` so the inner loop's LABEL
-                            // inputarg arity matches the JUMP (compile.py:334
-                            // jump.numargs()==label.numargs()). Falls back to the
-                            // operand-captured boxes for interpreters with no
-                            // int/ref state fields.
-                            let mut red_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
-                            let mut sfi = 0;
-                            while let Some(o) = sym.state_field_ref(sfi) {
-                                red_boxes
-                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Int));
-                                sfi += 1;
-                            }
-                            let mut sfr = 0;
-                            while let Some(o) = sym.state_ref_field_ref(sfr) {
-                                red_boxes
-                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Ref));
-                                sfr += 1;
-                            }
-                            let original_boxes = if red_boxes.is_empty() {
-                                live_arg_boxes
                             } else {
-                                red_boxes
-                            };
-                            if crate::mptrace_enabled() {
-                                eprintln!(
-                                    "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
-                                    ctx.num_ops(),
-                                );
+                                // first visit → append and keep tracing
+                                // (pyjitpl.py:3058-3060). For the state-field dispatch
+                                // model the merge point's loop-carried values are the
+                                // RED state fields (the closing JUMP = collect_jump_args),
+                                // NOT the green operands captured in `live_arg_boxes`
+                                // (those are promoted constants folded inline in the cut
+                                // body). Register the SAME construction the close uses
+                                // — `JitState::collect_jump_args_with_boxes` reached
+                                // through `JitCodeSym::loop_carried_boxes` — so the cut
+                                // label's inputarg arity matches the JUMP's
+                                // (compile.py:334 jump.numargs()==label.numargs()), the
+                                // way RPython's single `live_arg_boxes` list does by
+                                // construction (pyjitpl.py:2981-2989). Falls back to the
+                                // operand-captured boxes for interpreters with no state
+                                // fields at all.
+                                //
+                                // Building this from the scalar state fields alone (as
+                                // this site used to) silently omits the virtualizable's
+                                // element boxes, so an interpreter whose state is purely
+                                // `[int; virt]` / `[float; virt]` arrays registered just
+                                // the greens plus one unexpanded vable ref while its
+                                // close expanded to one box per element — the arity
+                                // mismatch that made every nested loop decline.
+                                let vable_boxes =
+                                    ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
+                                let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
+                                    Some(mut boxes) => {
+                                        // pyjitpl.py:2978-2987 normalizes the list
+                                        // before it becomes anything — the LABEL
+                                        // this registration turns into cannot carry
+                                        // a constant or a repeated box.
+                                        ctx.remove_consts_and_duplicates(&mut boxes);
+                                        boxes
+                                            .into_iter()
+                                            .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
+                                            .collect()
+                                    }
+                                    None => live_arg_boxes,
+                                };
+                                if crate::mptrace_enabled() {
+                                    eprintln!(
+                                        "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
+                                        ctx.num_ops(),
+                                    );
+                                }
+                                ctx.add_merge_point(inner_key, original_boxes, header_pc);
                             }
-                            ctx.add_merge_point(inner_key, original_boxes, header_pc);
                         }
                     }
                 }

@@ -983,3 +983,138 @@ pub fn replay_pending_fields(
         emit_pending_field_op(ctx, target_op, value_op, pending.item_index, descr);
     }
 }
+
+/// `pyjitpl.py:3449 rebuild_state_after_failure`:
+///
+/// ```python
+/// if vinfo is not None:
+///     self.virtualizable_boxes = virtualizable_boxes
+/// ```
+///
+/// `virtualizable_boxes` is what `resume.py:1083 consume_virtualizable_boxes`
+/// built out of the guard's vable section: the virtualizable itself comes
+/// first (`resume.py:1404 virtualizable = self.next_ref()`), then
+/// `virtualizable.py:139 load_list_of_boxes` reads one box per static field
+/// and one per array element — off the LIVE object, which is where the array
+/// lengths come from — and returns the list with the virtualizable appended,
+/// so `boxes[-1]` is the identity every consumer indexes.
+///
+/// Without this a bridge traces with no virtualizable bound at all, and the
+/// first vable-shaped op it reaches has nothing to resolve against.
+///
+/// Returns `false` (leaving the ctx untouched) when the stream cannot be
+/// turned into a complete shadow: no vable section, a null identity, a
+/// length that disagrees with the live object's layout, or an entry whose
+/// concrete value the guard did not carry.
+pub fn seed_bridge_virtualizable_boxes(
+    ctx: &mut crate::TraceCtx,
+    info: &crate::virtualizable::VirtualizableInfo,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &crate::jit_state::ResumeDataResult,
+    cache: &mut BridgeVirtualCache,
+    fail_values: &[i64],
+) -> bool {
+    use majit_ir::resumedata::RebuiltValue;
+    use majit_ir::{Const, GcRef, Type, Value};
+
+    fn concrete(v: &RebuiltValue, fail_values: &[i64]) -> Option<Value> {
+        let typed = |ty: Type, bits: i64| match ty {
+            Type::Int => Value::Int(bits),
+            Type::Float => Value::Float(f64::from_bits(bits as u64)),
+            Type::Ref => Value::Ref(GcRef(bits as usize)),
+            Type::Void => Value::Void,
+        };
+        match v {
+            RebuiltValue::Box(n, ty) => fail_values.get(*n).map(|&bits| typed(*ty, bits)),
+            RebuiltValue::Const(Const::Int(i)) => Some(Value::Int(*i)),
+            RebuiltValue::Const(Const::Float(f)) => Some(Value::Float(*f)),
+            RebuiltValue::Const(Const::Ref(r)) => Some(Value::Ref(*r)),
+            // A virtualized vable slot has no deadframe concrete; the shadow
+            // would be a guess, so decline the whole seed instead.
+            RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => None,
+        }
+    }
+
+    let Some((identity, slots)) = resume_data.virtualizable_values.split_first() else {
+        return false;
+    };
+    // `resume.py:1404 virtualizable = self.next_ref()` — the first entry is a
+    // ref box holding the virtualizable itself.  Anything else means this
+    // guard's vable section does not name the virtualizable (the box was
+    // replaced, folded, or never made it into the guard's fail args), and
+    // dereferencing whatever value sits there would be a wild read; decline
+    // the seed instead, which leaves the guard deopting through the blackhole
+    // exactly as it did before — `compile.py:27 compile.giveup()`.
+    let Some(identity_value @ Value::Ref(vable_ref)) = concrete(identity, fail_values) else {
+        return false;
+    };
+    let vable_ptr = vable_ref.as_usize() as *const u8;
+    if vable_ptr.is_null() {
+        return false;
+    }
+    // virtualizable.py:150-153 `lst = getattr(virtualizable, fieldname); for j
+    // in range(len(lst))` — the live object is the authority on how many array
+    // boxes the stream carries.
+    if !info.can_read_all_array_lengths_from_heap() {
+        return false;
+    }
+    // Upstream never validates the decoded identity here: `rebuild_state_after
+    // _failure` takes `virtualizable_boxes[-1]` and goes straight on to
+    // `reset_token_gcref` + `synchronize_virtualizable()` (pyjitpl.py:3449-3454),
+    // because the box came out of ITS OWN numbering and cannot name anything
+    // else.  Pyre's does not carry that guarantee — the state-field vable
+    // section is only as good as the numbering that produced it — and the
+    // pointer is dereferenced below, so an identity that is not the live object
+    // would be a wild read.  Check it and decline instead (`compile.giveup()`,
+    // compile.py:27), which is strictly more conservative than upstream: the
+    // guard keeps deopting through the blackhole exactly as it did before.
+    //
+    // The two writes upstream pairs with the assignment are both inert for this
+    // seed's only consumer, so neither is ported:
+    //   * `reset_token_gcref` — the state-field vinfo is built by
+    //     `VirtualizableInfo::without_vable_token()`, whose token protocol
+    //     no-ops (`codegen_state.rs` `__build_virtualizable_info`).
+    //   * `synchronize_virtualizable()` — `TraceCtx::synchronize_virtualizable`
+    //     deliberately skips the write-back for `RustVec` array storage, which
+    //     is what every `[.. ; virt]` state field is: the macro-generated
+    //     mainloop owns that struct and writes it on every opcode, so the heap
+    //     is authoritative and flushing the shadow back would clobber it.
+    match ctx.virtualizable_heap_ptr() {
+        Some(live) if live == vable_ptr => {}
+        Some(_) | None => return false,
+    }
+    let array_lengths = unsafe { info.read_array_lengths_from_heap(vable_ptr) };
+    let expected = info.num_static_extra_boxes + array_lengths.iter().sum::<usize>();
+    if slots.len() != expected {
+        return false;
+    }
+    let mut values = Vec::with_capacity(expected + 1);
+    for slot in slots {
+        match concrete(slot, fail_values) {
+            Some(value) => values.push(value),
+            None => return false,
+        }
+    }
+    let mut boxes: Vec<OpRef> = Vec::with_capacity(expected + 1);
+    for slot in slots {
+        boxes.push(rebuilt_value_to_opref(
+            ctx,
+            slot,
+            rd_virtuals,
+            resume_data,
+            cache,
+        ));
+    }
+    // virtualizable.py:143-144 "the returned list is in the format expected of
+    // virtualizable_boxes, so it ends in the virtualizable itself".
+    boxes.push(rebuilt_value_to_opref(
+        ctx,
+        identity,
+        rd_virtuals,
+        resume_data,
+        cache,
+    ));
+    values.push(identity_value);
+    ctx.set_virtualizable_boxes_with_info(boxes, values, info, &array_lengths);
+    true
+}

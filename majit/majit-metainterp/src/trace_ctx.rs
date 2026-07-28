@@ -306,13 +306,35 @@ pub struct TraceCtx {
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
     /// matches RPython's get_procedure_token(greenboxes) + has_compiled_targets.
     pub has_compiled_targets_fn: Option<Box<dyn Fn(u64) -> bool>>,
-    /// pyjitpl.py:2978 `if not self.partial_trace:` parity at
-    /// `reached_loop_header` — explicit "this trace started from a
-    /// guard failure" flag.  RPython distinguishes via
-    /// `self.resumekey` typing (`ResumeGuardDescr` vs
+    /// pyjitpl.py:3005 `ptoken = self.get_procedure_token(greenboxes)` for the
+    /// greens of the merge point just reached, in the same `(ints, refs,
+    /// floats)` slot grouping as [`Self::close_greens`]. `Some(key)` iff a
+    /// compiled loop with jumpable targets already lives at those greens
+    /// (`MetaInterp::compiled_key_for_greens`, which folds in
+    /// `has_compiled_targets`).
+    ///
+    /// [`Self::has_compiled_targets_fn`] cannot answer this: it is keyed on the
+    /// u64 green key, and the dispatch loop cannot derive a foreign merge
+    /// point's key. `green_key_from_code_ptr(green_key_raw.0, pc)` is not it —
+    /// `JitState::code_ptr()` defaults to 0, and the driver's key is
+    /// `GreenKey::hash_u64` over the declared green tuple.
+    pub compiled_key_for_greens_fn:
+        Option<Box<dyn Fn(&(Vec<i64>, Vec<i64>, Vec<i64>)) -> Option<u64>>>,
+    /// Explicit "this trace started from a guard failure" flag. RPython
+    /// distinguishes via `self.resumekey` typing (`ResumeGuardDescr` vs
     /// `ResumeFromInterpDescr`); pyre sets this to `true` at
     /// `start_bridge_tracing` and leaves the default `false` for
-    /// primary entries.  Consumers that need bridge-only behavior
+    /// primary entries.
+    ///
+    /// ⚠️This is NOT `self.partial_trace`. That flag is set only by
+    /// `retrace_needed` (pyjitpl.py:2438-2439) and means "this is a
+    /// RETRACE"; a bridge from a guard failure has `partial_trace = None`
+    /// and takes every `if not self.partial_trace:` branch. Pyre has no
+    /// retrace counterpart, so those branches are unconditional here —
+    /// gating one of them on this flag would be a new behaviour, not
+    /// parity.
+    ///
+    /// Consumers that need bridge-only behavior
     /// (e.g. `pyre-jit-trace::pyjitpl::run_to_end`'s close-loop
     /// skip when no compiled targets exist for the current
     /// greenkey) gate on this flag instead of fn presence.
@@ -1228,6 +1250,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
             bridge_target_header_pc: None,
@@ -1306,6 +1329,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
             bridge_target_header_pc: None,
@@ -1857,6 +1881,89 @@ impl TraceCtx {
     /// Returns `None` if no standard virtualizable is active.
     pub fn collect_virtualizable_boxes(&self) -> Option<Vec<OpRef>> {
         self.virtualizable_boxes.clone()
+    }
+
+    /// pyjitpl.py:2958-2964 `remove_consts_and_duplicates`:
+    ///
+    /// ```python
+    /// for i in range(endindex):
+    ///     box = boxes[i]
+    ///     if isinstance(box, Const) or box in duplicates:
+    ///         boxes[i] = self.history.record_same_as(box)
+    ///     else:
+    ///         duplicates[box] = None
+    /// ```
+    ///
+    /// `reached_loop_header` runs this over the reds and, sharing ONE
+    /// `duplicates` set, over `virtualizable_boxes[:-1]` (pyjitpl.py:2978-2987)
+    /// — i.e. over exactly what the loop-carried list is about to become — so
+    /// no entry of that list is a constant and none appears twice. Both
+    /// properties are assumed downstream and neither is checked:
+    /// `TreeLoop::cut_trace_from_with_consts` keys its remap on the `OpRef`, so
+    /// a repeat overwrites the earlier slot's mapping, and its `remap_ref`
+    /// short-circuits on `!is_runtime_opref`, so a constant is never rewritten
+    /// to the inputarg the LABEL declares for it.
+    ///
+    /// The `SameAs` variant follows the box's OWN type, never the slot's
+    /// declared one: a cross-type `SameAs` absorbed by `make_equal_to` breaks
+    /// the type invariant in the optimizer's replace path. An entry whose
+    /// `OpRef` carries no type is left alone rather than guessed at.
+    ///
+    /// Upstream normalizes per `reached_loop_header` visit, so the registration
+    /// and the closing JUMP are normalized by separate invocations; this is
+    /// called at each of those sites rather than once for both.
+    pub fn remove_consts_and_duplicates(&mut self, boxes: &mut [(OpRef, Type)]) {
+        let mut duplicates: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+        for slot in boxes.iter_mut() {
+            let (opref, declared) = *slot;
+            if !opref.is_constant() && duplicates.insert(opref) {
+                continue;
+            }
+            let Some(tp) = opref.ty() else {
+                continue;
+            };
+            debug_assert!(
+                tp == declared || opref.is_constant(),
+                "loop-carried slot declared {declared:?} but its box is {tp:?}",
+            );
+            let same_as = self.record_op(majit_ir::OpCode::same_as_for_type(tp), &[opref]);
+            *slot = (same_as, declared);
+        }
+    }
+
+    /// [`Self::remove_consts_and_duplicates`] for the JUMP side, which carries
+    /// no separate type tag — the LABEL it targets already declares the types,
+    /// so each slot's own `OpRef` is the only type source and the only one
+    /// upstream uses (`record_same_as` reads `box.type`).
+    pub fn remove_consts_and_duplicates_untyped(&mut self, boxes: &mut [OpRef]) {
+        let mut typed: Vec<(OpRef, Type)> = boxes
+            .iter()
+            .map(|&opref| (opref, opref.ty().unwrap_or(Type::Int)))
+            .collect();
+        self.remove_consts_and_duplicates(&mut typed);
+        for (slot, (opref, _)) in boxes.iter_mut().zip(typed) {
+            *slot = opref;
+        }
+    }
+
+    /// [`collect_virtualizable_boxes`] with each slot paired with its declared
+    /// [`Type`] (`virtualizable_slot_type`); identity LAST, as always.
+    ///
+    /// pyjitpl.py:2981-2989 builds ONE `live_arg_boxes` and hands it to both
+    /// the merge-point registration and the closing JUMP. The registration
+    /// side becomes a cut trace's LABEL inputargs, and those are *typed*
+    /// (`TreeLoop::cut_trace_from_with_consts` → `OpRef::input_arg_typed`), so
+    /// the type tag has to travel with the box for a registration to be able
+    /// to reproduce the close's shape.
+    pub fn collect_virtualizable_typed_boxes(&self) -> Option<Vec<(OpRef, Type)>> {
+        let boxes = self.virtualizable_boxes.as_ref()?;
+        Some(
+            boxes
+                .iter()
+                .enumerate()
+                .map(|(i, &opref)| (opref, self.virtualizable_slot_type(i).unwrap_or(Type::Int)))
+                .collect(),
+        )
     }
 
     /// The walk-final concrete values of the virtualizable's array elements, in
@@ -4398,6 +4505,57 @@ mod tests {
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
         ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
+    }
+
+    /// `test_pyjitpl.py:74-95 test_remove_consts_and_duplicates` — the upstream
+    /// vector, verbatim: `[b1, b2, b1, c3]` leaves the first sighting of each
+    /// box alone and replaces the repeat AND the constant with fresh `SAME_AS`
+    /// results, recording one `SAME_AS` op per replacement.
+    #[test]
+    fn remove_consts_and_duplicates_matches_the_upstream_vector() {
+        let mut recorder = Trace::new();
+        let b1 = recorder.record_input_arg(Type::Int);
+        let b2 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let c3 = ctx.const_int(3);
+        let ops_before = ctx.num_ops();
+
+        let mut boxes = [
+            (b1, Type::Int),
+            (b2, Type::Int),
+            (b1, Type::Int),
+            (c3, Type::Int),
+        ];
+        ctx.remove_consts_and_duplicates(&mut boxes);
+
+        assert_eq!(boxes[0].0, b1, "first sighting is left alone");
+        assert_eq!(boxes[1].0, b2, "first sighting is left alone");
+        assert_ne!(boxes[2].0, b1, "the repeat must become a fresh SAME_AS");
+        assert_ne!(boxes[3].0, c3, "the constant must become a fresh SAME_AS");
+        assert_ne!(boxes[2].0, boxes[3].0, "each replacement is its own op");
+        assert!(
+            !boxes[3].0.is_constant(),
+            "a SAME_AS result is a runtime box, which is the point: \
+             `TreeLoop::cut_trace_from_with_consts`'s `remap_ref` skips \
+             non-runtime oprefs, so a constant would never be rewritten to \
+             the inputarg the LABEL declares for it"
+        );
+        assert_eq!(
+            ctx.num_ops(),
+            ops_before + 2,
+            "exactly one SAME_AS recorded per replaced slot"
+        );
+
+        // Idempotent: a normalized list has no constant and no repeat left.
+        let ops_after = ctx.num_ops();
+        let mut again = boxes;
+        ctx.remove_consts_and_duplicates(&mut again);
+        assert_eq!(again, boxes, "a normalized list is unchanged");
+        assert_eq!(ctx.num_ops(), ops_after, "and records nothing");
     }
 
     /// vable_getfield_ref cache-hit (pyjitpl.py:939
