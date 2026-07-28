@@ -2184,6 +2184,24 @@ impl MiniMarkGC {
         }
     }
 
+    /// Whether the collector traverses references out of this object — the
+    /// property CPython's `gc.is_tracked` reports.
+    ///
+    /// Heap ownership alone is the wrong test: an atomic object such as an int
+    /// or a float is collector-allocated on some paths (`PYRE_GC_INTERP`, the
+    /// JIT, wasm) and immortal on others, so ownership would make the same
+    /// Python value answer differently per backend. Its registered type has no
+    /// reference to traverse either way, which is the stable property.
+    pub fn object_is_tracked(&self, obj_addr: usize) -> bool {
+        if !self.is_managed_heap_object(obj_addr) {
+            return false;
+        }
+        let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        self.validate_type_id(type_id, obj_addr, "object_is_tracked");
+        let type_info = self.types.get(type_id);
+        type_info.has_gc_ptrs || (type_info.items_have_gc_ptrs && type_info.item_size > 0)
+    }
+
     /// `inspector.py:get_rpy_referents`: trace one object's direct GC
     /// referents without changing collection state.
     fn visit_referents(&self, obj_addr: usize, visitor: &mut dyn FnMut(GcRef)) {
@@ -2272,6 +2290,66 @@ impl MiniMarkGC {
             }
             unsafe { (*hdr).clear_flag(flags::EXTRA) };
             self.visit_referents(gcref.0, &mut |child| pending.push(child));
+        }
+        for gcref in result {
+            visitor(gcref);
+        }
+    }
+
+    /// `pypy/module/gc/referents.py:53-78 _list_w_obj_referents`: visit the
+    /// app-level objects `obj` refers to directly, looking through the
+    /// interpreter-internal structs in between. A visited app-level object
+    /// terminates that branch of the walk; anything else is expanded, so a
+    /// list reports its items rather than its item array. GCFLAG_EXTRA keeps
+    /// each node out of the walk twice and is restored before returning.
+    pub fn do_get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        let mut pending: Vec<GcRef> = Vec::new();
+        let mut result: Vec<GcRef> = Vec::new();
+        let mut i = 0usize;
+        let mut parent = obj;
+        loop {
+            let mut children: Vec<GcRef> = Vec::new();
+            self.visit_referents(parent.0, &mut |child| children.push(child));
+            for child in children {
+                if child.is_null() || !self.is_managed_heap_object(child.0) {
+                    continue;
+                }
+                let hdr = unsafe { header_of(child.0) };
+                if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+                    continue;
+                }
+                unsafe { (*hdr).set_flag(flags::EXTRA) };
+                pending.push(child);
+            }
+            // Walk the queue until a non-app-level node needs expanding; on
+            // reaching the end without one, every branch has terminated.
+            let mut expand = false;
+            while i < pending.len() {
+                parent = pending[i];
+                i += 1;
+                let hdr = unsafe { header_of(parent.0) };
+                let type_id = unsafe { (*hdr).type_id() };
+                if !unsafe { (*hdr).has_flag(flags::DUMMY) } && self.types.get(type_id).is_object {
+                    result.push(parent);
+                } else {
+                    expand = true;
+                    break;
+                }
+            }
+            if !expand {
+                break;
+            }
+        }
+        for gcref in &pending {
+            unsafe { (*header_of(gcref.0)).clear_flag(flags::EXTRA) };
         }
         for gcref in result {
             visitor(gcref);
@@ -3792,6 +3870,14 @@ impl GcAllocator for MiniMarkGC {
         self.do_get_objects(generation, visitor)
     }
 
+    fn get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
+        self.do_get_referents(obj, visitor)
+    }
+
+    fn is_tracked(&mut self, obj: GcRef) -> bool {
+        self.object_is_tracked(obj.0)
+    }
+
     fn collect_oldgen_nonmoving(&mut self) {
         self.do_collect_oldgen_nonmoving();
     }
@@ -4195,6 +4281,81 @@ mod tests {
         for object in [holder, raw, leaf] {
             assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
         }
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn get_referents_looks_through_rpython_structs_and_stops_at_objects() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let pair_info = || TypeInfo::with_gc_ptrs(2 * ptr_size, vec![0, ptr_size]);
+        let raw_tid = gc.register_type(pair_info());
+        let mut object_info = pair_info();
+        object_info.is_object = true;
+        let object_tid = gc.register_type(object_info);
+
+        // holder -> raw -> {near, far}; `far` in turn points back at `holder`,
+        // which must not be reported: the walk stops at the first object.
+        let near = gc.alloc_with_type(object_tid, 2 * ptr_size);
+        let far = gc.alloc_with_type(object_tid, 2 * ptr_size);
+        let raw = gc.alloc_with_type(raw_tid, 2 * ptr_size);
+        let mut holder = gc.alloc_with_type(object_tid, 2 * ptr_size);
+        unsafe {
+            *(raw.0 as *mut GcRef) = near;
+            *((raw.0 + ptr_size) as *mut GcRef) = far;
+            *(far.0 as *mut GcRef) = holder;
+            *(holder.0 as *mut GcRef) = raw;
+            gc.roots.add(&mut holder);
+        }
+
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents.len(), 2);
+        assert!(referents.contains(&near));
+        assert!(referents.contains(&far));
+        assert!(!referents.contains(&raw));
+        assert!(!referents.contains(&holder));
+        for object in [holder, raw, near, far] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+        }
+
+        // A self-referential object terminates instead of looping forever.
+        let mut referents = Vec::new();
+        gc.do_get_referents(far, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![holder]);
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn is_tracked_follows_the_type_not_the_heap_the_instance_landed_in() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let atomic_tid = gc.register_type(TypeInfo::object(ptr_size));
+        let holder_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            ptr_size,
+            atomic_tid,
+            vec![0],
+        ));
+
+        let atomic = gc.alloc_with_type(atomic_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(holder_tid, ptr_size);
+        unsafe {
+            *(holder.0 as *mut GcRef) = atomic;
+            gc.roots.add(&mut holder);
+        }
+        assert!(!gc.object_is_tracked(atomic.0));
+        assert!(gc.object_is_tracked(holder.0));
+
+        // The same two types answer the same way once promoted out of the
+        // nursery — the heap the instance landed in must not matter.
+        gc.do_collect_nursery();
+        let atomic = unsafe { *(holder.0 as *const GcRef) };
+        assert!(!gc.object_is_tracked(atomic.0));
+        assert!(gc.object_is_tracked(holder.0));
+
+        // An address the collector does not own is never tracked.
+        let mut off_heap = 0usize;
+        assert!(!gc.object_is_tracked(&mut off_heap as *mut usize as usize));
         gc.roots.clear();
     }
 

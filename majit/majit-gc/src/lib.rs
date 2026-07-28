@@ -337,6 +337,19 @@ pub trait GcAllocator: Send {
     /// without an inspector visit no objects.
     fn get_objects(&mut self, _generation: i8, _visitor: &mut dyn FnMut(GcRef)) {}
 
+    /// `pypy/module/gc/referents.py:53-78 _list_w_obj_referents`: visit the
+    /// app-level objects `obj` refers to directly, expanding the
+    /// interpreter-internal structs in between. Same rooting contract as
+    /// [`GcAllocator::get_objects`]. Collectors without an inspector visit no
+    /// objects.
+    fn get_referents(&mut self, _obj: GcRef, _visitor: &mut dyn FnMut(GcRef)) {}
+
+    /// Whether the collector traverses references out of `obj` — what
+    /// `gc.is_tracked` reports. Collectors without an inspector track nothing.
+    fn is_tracked(&mut self, _obj: GcRef) -> bool {
+        false
+    }
+
     /// Trigger a non-moving old-gen-only major collection (sweep dead old-gen
     /// objects without moving the nursery). The default no-ops so a backend
     /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
@@ -808,6 +821,12 @@ impl GcAllocator for GcHandle {
     }
     fn get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
         gc_sync::gc_op(|gc| gc.get_objects(generation, visitor))
+    }
+    fn get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
+        gc_sync::gc_op(|gc| gc.get_referents(obj, visitor))
+    }
+    fn is_tracked(&mut self, obj: GcRef) -> bool {
+        gc_sync::gc_op(|gc| gc.is_tracked(obj))
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
@@ -1516,6 +1535,40 @@ pub fn set_active_get_objects(hook: Option<GetObjectsFn>) {
 pub fn get_objects(generation: i8, visitor: GetObjectsVisitorFn) {
     if let Some(f) = ACTIVE_GET_OBJECTS.get() {
         f(generation, visitor);
+    }
+}
+
+/// Active-backend trampoline for `pypy/module/gc/referents.py:53-78
+/// _list_w_obj_referents`. Same rooting contract as [`get_objects`]: the
+/// backend invokes the visitor while its inspection pause is still held.
+pub type GetReferentsFn = fn(GcRef, GetObjectsVisitorFn);
+
+global_hook!(static ACTIVE_GET_REFERENTS: GetReferentsFn);
+
+pub fn set_active_get_referents(hook: Option<GetReferentsFn>) {
+    ACTIVE_GET_REFERENTS.set(hook);
+}
+
+pub fn get_referents(obj: GcRef, visitor: GetObjectsVisitorFn) {
+    if let Some(f) = ACTIVE_GET_REFERENTS.get() {
+        f(obj, visitor);
+    }
+}
+
+/// Active-backend trampoline for `gc.is_tracked`: whether the collector
+/// traverses references out of the object.
+pub type IsTrackedFn = fn(GcRef) -> bool;
+
+global_hook!(static ACTIVE_IS_TRACKED: IsTrackedFn);
+
+pub fn set_active_is_tracked(hook: Option<IsTrackedFn>) {
+    ACTIVE_IS_TRACKED.set(hook);
+}
+
+pub fn is_tracked(obj: GcRef) -> bool {
+    match ACTIVE_IS_TRACKED.get() {
+        Some(f) => f(obj),
+        None => false,
     }
 }
 
