@@ -3297,9 +3297,9 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     if exc == 0 {
         return;
     }
-    // A GC-managed exception (post-#18) marked here has its registered child
-    // offsets traced by the collector; the exception is oldgen-stable so a
-    // bare mark suffices.
+    // A GC-managed exception marked here has its registered child offsets
+    // traced by the collector; the exception is oldgen-stable so a bare mark
+    // suffices.
     let mut gcref = majit_ir::GcRef(exc as usize);
     visitor(&mut gcref);
     // The carrier is non-moving (oldgen-stable / malloc_typed), so a minor
@@ -3308,6 +3308,38 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // tracebacks appended by the raise in flight, args — would be left
     // dangling inside the exception across the minor. Forward the raw child
     // slots explicitly, as the EC root walk does for `sys_exc_value`.
+    //
+    // For an off-GC exception — the `malloc_typed` immortals such as the
+    // MemoryError singleton, and the fallback taken when the GC allocation
+    // fails — this walk is the sole traversal of the children: both the write
+    // barrier and major seeding ignore a non-managed holder.
+    //
+    // For a GC-managed exception the picture is narrower but not empty. A
+    // major reaches the children on its own, through the type's registered
+    // pointer offsets. A minor reaches them only through the remembered set,
+    // which is exactly as complete as the barrier discipline over the twenty
+    // reference slots. That discipline has been audited and is not yet
+    // complete: the interpreter's slot writers all barrier
+    // (`exception_write_barrier` on every one), and a compiled SETFIELD_GC
+    // into a pointer field picks up a `COND_CALL_GC_WB` from the rewrite pass
+    // (`rewrite.py:930-931`, `:948-953`), but the blackhole's
+    // `bh_setfield_gc_r` / `bh_setinteriorfield_gc_r` store a reference with
+    // no barrier at all, where upstream's `write_ref_at_mem`
+    // (`llmodel.py:495-497`) gets one implicitly from the GC transform. A
+    // `w_context` or `w_traceback` written during a blackhole resume is
+    // therefore exactly the old-to-young edge the remembered set misses, so
+    // the walk stays load-bearing for both populations. Even once that gap
+    // closes, the coverage is a maintained invariant rather than a structural
+    // one — narrowing this walk to the off-GC family would make every future
+    // unbarriered exception-slot store a use-after-free instead of a leak.
+    //
+    // Either way the carrier cannot be demoted to a plain shadow-stack entry
+    // (the direct analogue of the GC transform's rooted local,
+    // `shadowstack.py:31-39`): a generic root reaches an off-GC exception's
+    // fields through neither collection, and pushing the children
+    // individually does not substitute — forwarding would rewrite the pushed
+    // copies, not the slots inside the exception. A walker with mutable
+    // access to the real slots is the only shape that works.
     unsafe {
         pyre_interpreter::eval::walk_raw_exception_roots(
             gcref.0 as pyre_object::PyObjectRef,
@@ -3341,6 +3373,12 @@ fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// handle on it, and the bridge / blackhole handoff reconstructs resume state
 /// through the blackhole allocator before re-rooting the value. Same
 /// carrier/children split as [`walk_jit_exc_value`].
+///
+/// This slot reaches only the *collecting* thread's cell; every other mutator's
+/// cell is reached through the per-mutator `PyFrameRootArea`, which carries the
+/// same TLS address alongside `BH_LAST_EXC_VALUE`. `rthread.py:429-437
+/// _trace_tlref` enumerates every thread's block rather than resolving the
+/// thread local on whichever thread started the collection.
 fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
     if exc == 0 {
@@ -3354,6 +3392,33 @@ fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             visitor,
         )
     };
+}
+
+/// Forward the GC-managed children of the immortal exception singletons.
+///
+/// `memory_error_singleton` and the per-kind `standard_exc_instance` reusable
+/// instances are `malloc_typed`, so `is_managed_heap_object` is false for them:
+/// a store into one of their reference slots takes no write barrier, and major
+/// seeding skips them, leaving the collector no path to the `args_w` /
+/// `w_traceback` a raise attaches. Upstream has no such hole — its
+/// `memory_error` (`compile.py:1090`) and the reusable prebuilt instances
+/// (`exceptiondata.py:34-38`) are ordinary prebuilt GC objects, which
+/// incminimark keeps in `prebuilt_root_objects` (`incminimark.py:355`) and
+/// traces on every major.
+///
+/// Forwarding per object rather than per carrier means the children stay live
+/// even when no raw carrier happens to be parked on the singleton.
+///
+/// This is presently latent rather than a live fix: the per-kind instances are
+/// materialized lazily by the `_ovf` direct-raise resolver, which the current
+/// walker-driven pipeline never reaches, and the MemoryError singleton is
+/// created only on an allocation failure. The enumeration reports only
+/// initialized slots, so with none created the walk costs a handful of
+/// `OnceLock` reads and visits nothing.
+fn walk_immortal_exception_singleton_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_object::interp_exceptions::for_each_immortal_exception_singleton(|exc| unsafe {
+        pyre_interpreter::eval::walk_raw_exception_roots(exc, visitor)
+    });
 }
 
 /// Root PyPy's process-global `rbigint._parts_cache`. The object crate exposes
@@ -3376,6 +3441,9 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_extra_root_walker(walk_bh_last_exc_value);
     majit_gc::shadow_stack::register_extra_root_walker(walk_guard_exc_value);
     majit_gc::shadow_stack::register_extra_root_walker(walk_rbigint_parts_cache);
+    // Children of the off-GC exception singletons, which no carrier and no
+    // collection phase reaches on its own.
+    majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_exception_singleton_roots);
     // Stored `PyError` carriers whose GC refs the precise collector cannot
     // reach through their raw TLS cells: the call-assembler FFI stash and the
     // no-handler trace→portal stash. Mirrors `walk_pending_call_error`.

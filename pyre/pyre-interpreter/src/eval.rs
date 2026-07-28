@@ -51,6 +51,8 @@ thread_local! {
         in_flight_exception: IN_FLIGHT_EXCEPTION.with(|cell| cell as *const _),
         bh_last_exception: majit_metainterp::blackhole::BH_LAST_EXC_VALUE
             .with(|cell| cell as *const _),
+        guard_exception: majit_metainterp::blackhole::GUARD_EXC_VALUE
+            .with(|cell| cell as *const _),
         jit_pending_exception: crate::stack_check::capture_jit_pending_exception_area(),
         pending_call_error: crate::call::capture_pending_call_error_area(),
         pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
@@ -64,6 +66,7 @@ struct PyFrameRootArea {
     mapdict_method_cache: *const (),
     in_flight_exception: *const Cell<PyObjectRef>,
     bh_last_exception: *const Cell<i64>,
+    guard_exception: *const Cell<i64>,
     jit_pending_exception: *const Cell<i64>,
     pending_call_error: *const (),
     pending_hash_error: *const (),
@@ -275,16 +278,19 @@ pub unsafe fn walk_raw_code_roots(
     }
 }
 
-/// Mark the GC-managed children of an immortal `W_BaseException`.
+/// Mark the GC-managed children of a `W_BaseException`.
 ///
-/// Exceptions are `malloc_typed`-immortal (`interp_exceptions.rs` `new_exception`
-/// / "lives forever"), so the collector never traces them — the root visitor's
-/// `is_managed_heap_object` guard short-circuits on the immortal exception, and
-/// `mark_object` is never reached for it (it is not an old-gen object). Its
+/// Exception allocation is split: an ordinary exception goes to the non-moving
+/// oldgen via `try_gc_alloc_stable_raw`, while the immortal singletons and the
+/// GC-allocation-failure fallback use `malloc_typed` (`interp_exceptions.rs`
+/// `new_exception`). For the `malloc_typed` family the collector never traces
+/// the exception at all — the root visitor's `is_managed_heap_object` guard
+/// short-circuits and `mark_object` is never reached — and for the oldgen
+/// family a minor reaches the children only through the remembered set. Its
 /// `args_w` tuple, `w_errno` / `w_strerror` / `w_filename` ints/strings,
 /// `w_traceback` / `w_context` / `w_cause`, `w_dict`, … are ordinary GC-managed
 /// objects, so when an exception is the only holder of those children (a caught
-/// `except X as e` bound to a frame local) a major collection sweeps them and a
+/// `except X as e` bound to a frame local) a collection sweeps them and a
 /// later `e.args` / `e.errno` reads freed memory. Visit every
 /// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
 /// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`
@@ -592,6 +598,7 @@ pub unsafe fn walk_pyframe_roots_area(
     unsafe {
         walk_in_flight_exception_area(area.in_flight_exception, visitor);
         walk_raw_exception_cell_area(area.bh_last_exception, visitor);
+        walk_raw_exception_cell_area(area.guard_exception, visitor);
         walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
         crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
         crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);
@@ -982,7 +989,8 @@ fn walk_bh_last_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 
 /// Forward one raw `i64` exception carrier cell and trace the exception's
 /// GC-managed children. Shared by every such carrier
-/// (`BH_LAST_EXC_VALUE`, `TL_JIT_PENDING_EXCEPTION`) so they cannot drift.
+/// (`BH_LAST_EXC_VALUE`, `GUARD_EXC_VALUE`, `TL_JIT_PENDING_EXCEPTION`) so they
+/// cannot drift.
 pub(crate) unsafe fn walk_raw_exception_cell_area(
     c: *const Cell<i64>,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
