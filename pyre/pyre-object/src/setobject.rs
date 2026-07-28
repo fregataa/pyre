@@ -575,8 +575,17 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// non-collecting stable old-generation allocator, so there is no collection
 /// point between reading `src`'s table and installing the new field value.
 ///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `w_set_new` twin: cloning `src`'s `SetItemsStorage` (`IndexMap<ObjectKey,
+/// ()>`) and boxing it into `d.items` is a foreign `IndexMap::clone` +
+/// storage-box write. Tracing into it carries that host container op into the
+/// caller and unifies the `items` field as `Instance(IndexMap)`; residualising
+/// the whole assignment keeps the box off the trace, modelling it as a void
+/// effect on two GCREFs.
+///
 /// # Safety
 /// `dst` and `src` must point to valid `W_SetObject`s.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
     let d = &mut *(dst as *mut W_SetObject);
     let copied = (*(*(src as *const W_SetObject)).items).clone();
@@ -705,46 +714,6 @@ pub unsafe fn w_set_update_from_set(
         i += 1;
     }
     Ok(())
-}
-
-/// Build the elements on exactly one of the two sides as a fresh set.
-///
-/// `_symmetric_difference_unwrapped` (`setobject.py:1062-1074`) unerases both
-/// tables once — `d_this` and `d_other` — then walks the other side first and
-/// this side second, probing each stored `(key, hash)` pair against the
-/// *captured* opposite table and placing survivors into a fresh `d_new` under
-/// the digest they already carry.  Because both captures happen up front, an
-/// `eq_w` that clears either set mid-walk orphans that table without steering
-/// the walk or the membership probes onto the replacement storage; the caller
-/// then installs the result wholesale (`w_set.sstorage = storage`, `:1114`).
-///
-/// # Safety
-/// `w_set` and `w_other` must point to valid `W_SetObject`s.
-pub unsafe fn w_set_symmetric_difference_storage(
-    w_set: PyObjectRef,
-    w_other: PyObjectRef,
-) -> Result<PyObjectRef, SetUpdateError> {
-    let _roots = crate::gc_roots::push_roots();
-    let d_new = w_set_new();
-    // The fresh set is only reachable from this frame while the probes below
-    // run user code; pin it (set bodies are non-moving, so no reload).
-    crate::gc_roots::pin_root(d_new);
-    let d_this = capture_set_items(w_set);
-    let d_other = capture_set_items(w_other);
-    for (walk, probe) in [(d_other, d_this), (d_this, d_other)] {
-        let mut i = 0;
-        loop {
-            let Some((&key, _)) = (*walk).get_index(i) else {
-                break;
-            };
-            let (found, key) = scan_set_key_reentrant(probe, key).map_err(SetUpdateError::Key)?;
-            if found.is_none() {
-                w_set_insert_key_checked(d_new, key)?;
-            }
-            i += 1;
-        }
-    }
-    Ok(d_new)
 }
 
 /// Failure modes of the PyPy `ObjectSetStrategy.update` table merge.
