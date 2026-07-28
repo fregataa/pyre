@@ -1,3 +1,4 @@
+import array
 import pickle
 import sys
 
@@ -163,8 +164,63 @@ assert bytearray.fromhex(b"B9 01EF") == b"\xb9\x01\xef"
 # fromhex with bytearray (bytes-like object)
 assert bytearray.fromhex(bytearray(b"4142")) == b"AB"
 
+# fromhex with array.array (bytes-like object)
+assert bytearray.fromhex(array.array("B", b"4142")) == b"AB"
+
 # fromhex with memoryview (bytes-like object)
 assert bytearray.fromhex(memoryview(b"4142")) == b"AB"
+
+
+class FromHexExporter:
+    def __init__(self, data):
+        self.data = bytearray(data)
+        self.flags = []
+        self.released = []
+
+    def __buffer__(self, flags):
+        self.flags.append(flags)
+        return memoryview(self.data)
+
+    def __release_buffer__(self, view):
+        self.released.append(view)
+        view.release()
+
+
+# Python 3.14 `_PyBytes_FromHex`: acquire PyBUF_SIMPLE and release the
+# temporary export after both successful and failed parses.
+exporter = FromHexExporter(b"4142")
+assert bytearray.fromhex(exporter) == b"AB"
+assert exporter.flags == [0]
+assert len(exporter.released) == 1
+exporter.data.append(0)
+
+exporter = FromHexExporter(b"4Z")
+assert_raises(ValueError, bytearray.fromhex, exporter)
+assert exporter.flags == [0]
+assert len(exporter.released) == 1
+exporter.data.append(0)
+
+
+class RaisingFromHexExporter(FromHexExporter):
+    def __release_buffer__(self, view):
+        self.released.append(view)
+        raise RuntimeError("release boom")
+
+
+unraisable = []
+old_unraisablehook = sys.unraisablehook
+sys.unraisablehook = unraisable.append
+try:
+    exporter = RaisingFromHexExporter(b"4142")
+    assert bytes.fromhex(exporter) == b"AB"
+    exporter = RaisingFromHexExporter(b"4Z")
+    assert_raises(ValueError, bytes.fromhex, exporter)
+finally:
+    sys.unraisablehook = old_unraisablehook
+assert len(unraisable) == 2
+assert all(isinstance(event.exc_value, RuntimeError) for event in unraisable)
+
+assert_raises(BufferError, bytearray.fromhex, memoryview(b"4142")[::2])
 
 # fromhex error: non-hexadecimal character
 try:
@@ -363,6 +419,89 @@ assert bytearray(b"abcdabcda").rfind(b"a", None, 6) == 4
 assert bytearray(b"abcdabcda").rfind(b"a", 2, None) == 8
 assert bytearray(b"abcdabcda").index(b"a") == 0
 assert bytearray(b"abcdabcda").rindex(b"a") == 8
+
+search_buffer = FromHexExporter(b"bc")
+assert bytearray(b"abcd").find(search_buffer) == 1
+assert bytearray(b"abcbc").count(search_buffer) == 2
+assert search_buffer in bytearray(b"abcd")
+assert len(search_buffer.released) == 3
+
+split_buffer = FromHexExporter(b",")
+assert bytearray(b"a,b").split(split_buffer) == [bytearray(b"a"), bytearray(b"b")]
+assert bytearray(b"a,b").rsplit(split_buffer) == [bytearray(b"a"), bytearray(b"b")]
+assert len(split_buffer.released) == 2
+
+
+# CPython 3.14 gh-142560: search methods acquire the bytearray receiver
+# before converting a buffer/index argument.  Re-entrant conversion therefore
+# cannot resize the receiver out from under the borrowed search window.
+class SearchResize:
+    def __init__(self, receiver):
+        self.receiver = receiver
+
+    def __buffer__(self, flags):
+        self.receiver.clear()
+        return memoryview(self.receiver)
+
+    def __release_buffer__(self, view):
+        view.release()
+
+    def __index__(self):
+        self.receiver.clear()
+        return ord("A")
+
+
+for method_name in (
+    "find",
+    "count",
+    "index",
+    "rindex",
+    "rfind",
+    "startswith",
+    "endswith",
+):
+    receiver = bytearray(b"A")
+    assert_raises(BufferError, getattr(receiver, method_name), SearchResize(receiver))
+
+receiver = bytearray(b"A")
+argument = SearchResize(receiver)
+assert_raises(BufferError, lambda: argument in receiver)
+
+for method_name in ("split", "rsplit"):
+    receiver = bytearray(b"A")
+    assert_raises(BufferError, getattr(receiver, method_name), SearchResize(receiver))
+
+
+class SearchBound:
+    def __init__(self, receiver, value):
+        self.receiver = receiver
+        self.value = value
+
+    def __index__(self):
+        self.receiver.clear()
+        return self.value
+
+
+# Argument-clinic converts slice bounds/maxsplit before the implementation
+# acquires the receiver export, so these mutations remain legal.
+for method_name, expected in (("find", -1), ("count", 0), ("rfind", -1)):
+    receiver = bytearray(b"A")
+    assert getattr(receiver, method_name)(b"A", SearchBound(receiver, 0)) == expected
+
+for method_name in ("index", "rindex"):
+    receiver = bytearray(b"A")
+    assert_raises(
+        ValueError,
+        getattr(receiver, method_name),
+        b"A",
+        SearchBound(receiver, 0),
+    )
+
+for method_name in ("split", "rsplit"):
+    receiver = bytearray(b"A,A")
+    assert getattr(receiver, method_name)(
+        b",", SearchBound(receiver, 1)
+    ) == [bytearray()]
 
 
 # make trans
@@ -882,3 +1021,24 @@ for i in range(-1, 2, 1):
     assert_raises(
         IndexError, lambda: a[-sys.maxsize - i], _msg="bytearray index out of range"
     )
+
+
+# CPython 3.14 `ByteArrayTest.test_resize` /
+# `ByteArrayTest.test_resize_forbidden`.
+a = bytearray(b"abcdef")
+assert a.resize(3) is None
+assert a == bytearray(b"abc")
+assert a.resize(10) is None
+assert a == bytearray(b"abc\0\0\0\0\0\0\0")
+assert a.resize(0) is None
+assert a == bytearray()
+
+a = bytearray(10)
+view = memoryview(a)
+# The same-size fast path is not a resize and remains legal while exported.
+assert a.resize(10) is None
+assert_raises(BufferError, a.resize, 11)
+assert_raises(BufferError, a.resize, 9)
+assert len(a) == 10
+view.release()
+assert a.resize(9) is None
