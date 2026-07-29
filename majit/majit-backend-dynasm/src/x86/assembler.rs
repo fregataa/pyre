@@ -3314,11 +3314,29 @@ impl<'a> Assembler386<'a> {
                         self.regalloc_mov(b_loc, &Loc::Reg(scratch));
                         scratch
                     };
-                    dynasm!(self.mc ; .arch x64 ; ucomisd Rx(a.value), Rx(b.value));
-                    if let Some(Loc::Reg(r)) = result_loc {
-                        let cc = Self::float_opcode_to_cc(op.opcode);
-                        self.emit_setcc(cc, r.value);
+                    // `assembler.py:1322 _cmpop_float`: UCOMISD sets
+                    // ZF = PF = CF = 1 when either operand is NaN, so only the
+                    // `A` / `AE` forms are already false on an unordered
+                    // compare.  FLOAT_LT / FLOAT_LE reach them by comparing in
+                    // the reverse order (`rev_cond`); FLOAT_EQ / FLOAT_NE have
+                    // no such form and take the parity fixup instead.
+                    let (lhs, rhs, cc, need_parity) = match op.opcode {
+                        OpCode::FloatLt => (b, a, CC_A, false),
+                        OpCode::FloatLe => (b, a, CC_AE, false),
+                        OpCode::FloatGt => (a, b, CC_A, false),
+                        OpCode::FloatGe => (a, b, CC_AE, false),
+                        OpCode::FloatEq => (a, b, CC_E, true),
+                        _ => (a, b, CC_NE, true),
+                    };
+                    dynasm!(self.mc ; .arch x64 ; ucomisd Rx(lhs.value), Rx(rhs.value));
+                    if need_parity {
+                        self.emit_if_parity_clear_zero_and_carry();
                     }
+                    // `assembler.py:1345 genop_cmp_float` ends in `flush_cc`, so
+                    // a comparison whose only consumer is the next guard keeps
+                    // its answer in the flags instead of materialising a
+                    // boolean the guard would immediately re-test.
+                    self.flush_cc(cc, result_loc);
                 }
             }
             // ── Casts ──
@@ -5069,6 +5087,22 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; movzx Rd(dst_reg), Rb(dst_reg));
     }
 
+    /// `assembler.py:1314 _if_parity_clear_zero_and_carry`.
+    ///
+    /// UCOMISD sets PF on an unordered compare, together with ZF and CF, so
+    /// `sete` / `setb` / `setbe` would report NaN as equal / less-than and
+    /// `setne` would report it as not-not-equal.  `cmp rbp, 0` on the frame
+    /// pointer — never null inside compiled code — clears ZF and CF, and is
+    /// jumped over when PF is clear.
+    fn emit_if_parity_clear_zero_and_carry(&mut self) {
+        let ordered = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64
+            ; jnp =>ordered
+            ; cmp rbp, 0
+            ; =>ordered
+        );
+    }
+
     /// x86/assembler.py:1286 `flush_cc` parity.
     ///
     /// After emitting a CMP/TEST that leaves a boolean in the
@@ -5081,18 +5115,26 @@ impl<'a> Assembler386<'a> {
     /// value for non-guard consumers (e.g. boolean stored into a
     /// frame slot).
     fn flush_cc(&mut self, cond: u8, result_loc: Option<&Loc>) {
+        // `assembler.py:1293 flush_cc` opens with
+        // `assert self.guard_success_cc == rx86.cond_none` — a condition
+        // still pending here was published by an earlier op and never
+        // consumed, which would make the following guard branch on it.
+        debug_assert!(
+            self.guard_success_cc.is_none(),
+            "flush_cc: guard_success_cc already set",
+        );
         let frame_reg_value = crate::x86::regalloc::frame_reg().value;
         if let Some(Loc::Reg(r)) = result_loc {
             if r.value == frame_reg_value {
                 // Sentinel: the next op accepts cc.
-                debug_assert!(
-                    self.guard_success_cc.is_none(),
-                    "flush_cc: guard_success_cc already set",
-                );
                 self.guard_success_cc = Some(cond);
                 return;
             }
-            dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), 0);
+            // `assembler.py:1300` clears the destination with `MOV imm0`
+            // before `SET_ir` because `SETcc` writes only the low byte.
+            // `emit_setcc` ends in `movzx r32, r8`, which zeroes bits 8..63
+            // on its own, so the same two-instruction sequence is spelled
+            // without the leading MOV.
             self.emit_setcc(cond, r.value);
         }
     }
@@ -5124,19 +5166,6 @@ impl<'a> Assembler386<'a> {
             OpCode::UintLe => CC_BE,
             OpCode::UintGt => CC_A,
             OpCode::UintGe => CC_AE,
-            _ => CC_E,
-        }
-    }
-
-    /// Map a float comparison OpCode to a condition code (after ucomisd).
-    fn float_opcode_to_cc(opcode: OpCode) -> u8 {
-        match opcode {
-            OpCode::FloatLt => CC_B,  // ucomisd: below = less than
-            OpCode::FloatLe => CC_BE, // below or equal
-            OpCode::FloatGt => CC_A,  // above
-            OpCode::FloatGe => CC_AE, // above or equal
-            OpCode::FloatEq => CC_E,  // equal
-            OpCode::FloatNe => CC_NE, // not equal
             _ => CC_E,
         }
     }

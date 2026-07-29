@@ -109,9 +109,10 @@ use super::*;
 ///     that the converged walker would route through. Production reach
 ///     today is zero — `jtransform.rs jit.force_virtual` is the only
 ///     producer and pyre's interpreter does not emit it.
-///   - `vrefs_after_residual_call` is unported; no `jit.virtual_ref`
-///     producers exist today, so the upstream loops are empty. Vable forces
-///     are detected by the residual-call execution path's heap-token bracket.
+///   - `vrefs_after_residual_call` is ported on `TraceCtx` but the walker
+///     never calls it; no `jit.virtual_ref` producers exist today, so the
+///     upstream loops are empty either way. Vable forces are detected by the
+///     residual-call execution path's heap-token bracket.
 ///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
 ///     tracer also returns `None` from this helper unless a
 ///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
@@ -5421,16 +5422,6 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     let value_concrete = ConcreteValue::Ref(value);
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
-    // Read the arm AFTER any empty-strategy promotion above, so the predicate
-    // sees the storage the sub-walk will actually append into.  An
-    // Empty->Object promotion is not the pre-existing-block in-place case:
-    // it has just installed a young `items` block into the (possibly old)
-    // list wrapper.  Keep the body's `list_write_barrier` for that transition;
-    // only an append whose Object block predated this append is covered solely
-    // by the SetarrayitemGc array barrier.
-    ctx.fbw_mode.append_inplace_wb_covered_receiver = (!promote_empty
-        && unsafe { pyre_object::w_list_append_stores_into_gc_block_in_place(inner_self) })
-    .then_some(inner_self as usize);
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,

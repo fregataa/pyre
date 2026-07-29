@@ -478,7 +478,7 @@ impl Drop for InlineConcreteFrameGuard {
     }
 }
 
-/// `executioncontext.py:85 enter` / `:91 leave` around one concretely executed
+/// `executioncontext.py enter` / `leave` around one concretely executed
 /// residual call of an inline sub-walk.
 ///
 /// Inlining a call elides the callee's real call sequence, so nothing
@@ -491,8 +491,19 @@ impl Drop for InlineConcreteFrameGuard {
 struct ResidualFrameChainGuard {
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame: *mut pyre_interpreter::PyFrame,
-    saved_topframeref: *mut pyre_interpreter::PyFrame,
+    /// Shadow-stack index of the caller `topframeref` this guard displaced,
+    /// held there rather than in the struct because the residual runs
+    /// arbitrary user code.  Frames themselves never move — `FrameBox::new`
+    /// allocates old-gen — but once the tracer stores a `JitVirtualRef` in the
+    /// chain the displaced value is a nursery object, and a minor collection
+    /// inside the residual would leave `Drop` writing back a pre-move pointer.
+    /// Rooting lets the collector forward it in place, as `CurrentFrameGuard`
+    /// already does for the same field.
+    saved_root: usize,
     previous_published: *mut pyre_interpreter::PyFrame,
+    /// Whether this guard performed the chain write, so `Drop` restores only
+    /// what it changed.  False when the chain already named `frame`.
+    entered: bool,
 }
 
 impl ResidualFrameChainGuard {
@@ -506,20 +517,33 @@ impl ResidualFrameChainGuard {
             return None;
         }
         let saved_topframeref = unsafe { (*ec).topframeref };
-        // Re-entering the same frame would make it its own caller.
-        if std::ptr::eq(saved_topframeref, frame) {
-            return None;
+        // Re-entering the same frame would make it its own caller.  `topframeref`
+        // holds a `jit.virtual_ref`, so a vref that NAMES this frame is the same
+        // re-entry as the bare pointer; resolve the referent without forcing,
+        // because forcing clears `TOKEN_TRACING_RESCALL` and
+        // `tracing_after_residual_call` reads that as a callee escape.
+        let entered = !std::ptr::eq(
+            pyre_interpreter::executioncontext::vref_referent(saved_topframeref),
+            frame,
+        );
+        if entered {
+            unsafe {
+                (*frame).f_backref = saved_topframeref;
+                (*ec).topframeref = frame;
+            }
         }
-        unsafe {
-            (*frame).f_backref = saved_topframeref;
-            (*ec).topframeref = frame;
-        }
+        let saved_root = majit_gc::shadow_stack::push(majit_ir::GcRef(saved_topframeref as usize));
+        // Published whether or not this guard wrote the chain: `frame` is the
+        // one a force inside the residual must redirect its escape onto
+        // (`flush_active_frame_escape`), and the chain already naming it makes
+        // that more true, not less.
         let previous_published = PUBLISHED_INLINE_FRAME.with(|slot| slot.replace(frame));
         Some(Self {
             ec,
             frame,
-            saved_topframeref,
+            saved_root,
             previous_published,
+            entered,
         })
     }
 }
@@ -527,14 +551,21 @@ impl ResidualFrameChainGuard {
 impl Drop for ResidualFrameChainGuard {
     fn drop(&mut self) {
         unsafe {
-            // `executioncontext.py:91-109 leave`: move the raw caller vref
-            // back without forcing it, then, when the frame escaped, force
-            // the caller and mark it escaped too.  A frame handed to
-            // application code keeps a reference to its caller, so the caller
-            // must stay materialised; dropping that propagation would leave
-            // the escape recorded only on a frame the walk owns privately.
+            // `executioncontext.py leave`: move the raw caller vref back without
+            // forcing it, then, when the frame escaped, force the caller and
+            // mark it escaped too.  A frame handed to application code keeps a
+            // reference to its caller, so the caller must stay materialised;
+            // dropping that propagation would leave the escape recorded only on
+            // a frame the walk owns privately.
+            // Read the root back before popping: a collection during the
+            // residual forwards it in place.
+            let saved_topframeref =
+                majit_gc::shadow_stack::get(self.saved_root).0 as *mut pyre_interpreter::PyFrame;
+            majit_gc::shadow_stack::pop_to(self.saved_root);
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
-            (*self.ec).topframeref = self.saved_topframeref;
+            if self.entered {
+                (*self.ec).topframeref = saved_topframeref;
+            }
             if (*self.frame).escaped() {
                 let f_back = (*self.frame).get_f_back();
                 if !f_back.is_null() {
@@ -1519,9 +1550,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // (`rpython/jit/metainterp/executor.py:446`), is neither can-raise nor a
     // call (`resoperation.py:1124-1125`), and is inserted only by the backend
     // GC rewrite pass after optimization (`backend/llsupport/rewrite.py:948`),
-    // so it never participates in the metainterp's side-effect analysis.  On
-    // the in-place Object-append arm it is not recorded at all, for the same
-    // reason — see `FbwWalkMode::append_inplace_wb_covered`.
+    // so it never participates in the metainterp's side-effect analysis.
     let is_idempotent_gc_barrier = pyre_interpreter::is_list_write_barrier(func_ptr as usize);
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
@@ -2630,14 +2659,15 @@ pub(crate) fn do_not_in_trace_call_result(
 /// `*token_ptr == 0` assertion in `tracing_before_residual_call`
 /// intact.
 ///
-/// `vrefs_before_residual_call` / `vrefs_after_residual_call`
-/// (`pyjitpl.py`) are unported.  `PyreSym` does carry
-/// `virtualref_boxes` (`state.rs`), so what is missing is the bracket
-/// itself: the pre-call `vrefinfo.tracing_before_residual_call` loop
-/// and the post-call `stop_tracking_virtualref`.  Unreachable today —
-/// the codewriter emits no `jit.virtual_ref` producers
-/// (`jit/call.rs`), leaving `virtualref_boxes` empty so both upstream
-/// loops iterate zero times.
+/// Despite the name it records no vref half.  `vrefs_before_residual_call` /
+/// `vrefs_after_residual_call` / `stop_tracking_virtualref` are ported on
+/// `TraceCtx` and wired on the metainterp leg; what is missing is the walker
+/// calling them.  Note the two `virtualref_boxes`: the bracket and the guard
+/// snapshots read `TraceCtx`'s, while `PyreSym`'s is touched only by the
+/// caller-less `opimpl_virtual_ref` and the resume-side decode.  Unreachable
+/// today — the codewriter emits no `jit.virtual_ref` producers
+/// (`jit/call.rs`), leaving both empty so every upstream loop iterates zero
+/// times.
 pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     // pyjitpl.py: vinfo = self.jitdriver_sd.virtualizable_info;
     //                       if vinfo is not None:
@@ -3536,31 +3566,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
-        // `list_write_barrier` on the Object strategy's in-place append arm:
-        // the backend GC rewrite already marks the same store's items block
-        // with `COND_CALL_GC_WB_ARRAY`, and the list's `items` pointer did not
-        // change, so a recorded barrier call is a second barrier upstream never
-        // emits. Skip the record; the executor below still runs it concretely,
-        // because the walk itself mutates the live heap. `OpRef::NONE` is safe
-        // as the result slot: the barrier is void, so the only consumer
-        // (`set_opref_concrete` on the executed result) is the `Type::Void`
-        // no-op arm.
-        let wb_covered = ctx
-            .fbw_mode
-            .append_inplace_wb_covered_receiver
-            .is_some_and(|receiver| {
-                allboxes.len() == 2
-                    && matches!(ctx.trace_ctx.box_value(allboxes[0]), Some(majit_ir::Value::Int(addr))
-                        if pyre_interpreter::is_list_write_barrier(addr as usize))
-                    && matches!(ctx.trace_ctx.box_value(allboxes[1]), Some(majit_ir::Value::Ref(r))
-                        if r.as_usize() == receiver)
-            });
-        let recorded = if wb_covered {
-            OpRef::NONE
-        } else {
-            ctx.trace_ctx
-                .record_op_with_descr(call_opcode, &allboxes, descr.clone())
-        };
+        // Always record `list_write_barrier` on the Object strategy's in-place
+        // append arm.  Dropping it in favour of the backend's
+        // `COND_CALL_GC_WB_ARRAY` on the block's `setarrayitem` is unsound: a
+        // guard-failure bridge that re-materializes the items block appends into
+        // it without that array barrier ever firing, so an `old -> young` slot
+        // store leaves the block off the remembered set.  A later minor frees
+        // the still-referenced young element and the collector then reads a
+        // freed (poison) header.  The list barrier remembers the enclosing
+        // `W_ListObject`, whose trace reaches every slot, and keeps them alive.
+        let recorded = ctx
+            .trace_ctx
+            .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
         // pyjitpl.py `_record_helper_pure` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,

@@ -183,6 +183,18 @@ const CC_LE: u8 = 12; // signed <=
 const CC_G: u8 = 13; // signed >
 
 /// Invert a condition code.
+/// Widest value `cmp Xn, #imm` encodes — `codebuilder.py:389 CMP_ri`.
+const MAX_CMP_IMM12: u32 = 4095;
+
+/// Forward reach of `b.cond`: a signed 19-bit displacement in 4-byte words.
+const BCOND_FORWARD_RANGE: usize = 1 << 20;
+
+/// Ceiling assumed for one operation's machine code when deciding whether a
+/// trace can use single-instruction guard branches.  The largest emitters are
+/// `Label`/`Jump` (one store per live register, ~120 bytes) and calls with a
+/// full argument list; 1KB leaves roughly an 8x margin.
+const MAX_BYTES_PER_OP: usize = 1024;
+
 fn invert_cc(cc: u8) -> u8 {
     match cc {
         CC_O => CC_NO,
@@ -277,6 +289,31 @@ pub struct AssemblerARM64<'a> {
     /// consumed by a following GUARD_TRUE/GUARD_FALSE.
     /// Stores an abstract condition code (CC_* constants).
     guard_success_cc: Option<u8>,
+    /// `(result location, condition code)` of the comparison emitted by the
+    /// immediately preceding `RegAllocOp`, so a `GUARD_TRUE`/`GUARD_FALSE`
+    /// that consumes exactly that result can branch on the live NZCV flags
+    /// instead of re-testing the materialized boolean.
+    /// `assembler.py:1186-1198 _walk_operations` folds the pair by handing
+    /// `prevop` to `guard_operations[...]`, which reaches
+    /// `regalloc.py:780 guard_impl` -> `dispatch_comparison(prevop)` and
+    /// returns the comparison's own `fcond`; the guard then emits only the
+    /// conditional branch.  pyre's regalloc emits the two ops separately,
+    /// so the pairing is recognised here at emit time instead.
+    /// Cleared by every non-guard `RegAllocOp`, so only an ADJACENT pair
+    /// folds — the same `operations[i + 1]` window upstream uses.
+    pending_cmp_cc: Option<(RegLoc, u8)>,
+
+    /// Whether guards must use the two-instruction long-branch form.
+    /// `b.cond` carries a signed 19-bit word displacement, so it reaches
+    /// +1MB; the failure-recovery stubs are written straight after the body,
+    /// so a guard reaches its stub whenever the trace's own code fits inside
+    /// that window.  Only a trace too large for that has to pay the extra
+    /// inversion and `b`.  Decided once per trace in `_assemble`.
+    long_guard_branch: bool,
+
+    /// Offset of the current trace's first emitted byte, for the
+    /// `long_guard_branch` range check.
+    trace_start_offset: usize,
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
     target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
@@ -473,6 +510,9 @@ impl<'a> AssemblerARM64<'a> {
             constants,
             next_slot: 0,
             guard_success_cc: None,
+            pending_cmp_cc: None,
+            long_guard_branch: false,
+            trace_start_offset: 0,
             target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
@@ -1061,6 +1101,15 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// Emit: CMP loc0, loc1
+    /// `codebuilder.py:113 ADD_ri` — `add Xd, Xn, #imm12`.  Encoded directly
+    /// because dynasm's immediate form cannot take a dynamic register (it
+    /// cannot tell whether the register is SP).
+    pub(crate) fn emit_add_ri(&mut self, rd: u8, rn: u8, imm: u32) {
+        debug_assert!(imm <= MAX_CMP_IMM12, "add immediate {imm} exceeds 12 bits");
+        let word: u32 = (0b1001000100u32 << 22) | (imm << 10) | ((rn as u32) << 5) | (rd as u32);
+        dynasm!(self.mc ; .arch aarch64 ; .u32 word);
+    }
+
     fn emit_cmp_loc_loc(&mut self, loc0: &Loc, loc1: &Loc) {
         // Load loc0 into x16 if needed, loc1 into x17 if needed
         let r0 = match loc0 {
@@ -1075,6 +1124,22 @@ impl<'a> AssemblerARM64<'a> {
             }
             _ => return,
         };
+        // `opassembler.py:129 emit_int_comp_op` takes `CMP_ri` when the
+        // right-hand side is an immediate; `codebuilder.py:389 CMP_ri` holds
+        // a 12-bit unsigned field, so anything wider still needs a register.
+        if let Loc::Immed(i) = loc1 {
+            if let Ok(imm) = u32::try_from(i.value) {
+                if imm <= MAX_CMP_IMM12 {
+                    // dynasm's `cmp Xn|SP, #uimm` form cannot take a dynamic
+                    // register operand, so encode it the way
+                    // `codebuilder.py:389 CMP_ri` does: SUBS with Rd = xzr.
+                    let word: u32 =
+                        (0b1111000100u32 << 22) | (imm << 10) | ((r0 as u32) << 5) | 0b11111;
+                    dynasm!(self.mc ; .arch aarch64 ; .u32 word);
+                    return;
+                }
+            }
+        }
         let r1 = match loc1 {
             Loc::Reg(s) => s.value,
             Loc::Frame(f) => {
@@ -1982,6 +2047,8 @@ impl<'a> AssemblerARM64<'a> {
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
         let inputargs: &'a [InputArg] = self.inputargs;
         let ops: &'a [Op] = self.operations;
+        self.trace_start_offset = self.mc.offset().0;
+        self.long_guard_branch = ops.len().saturating_mul(MAX_BYTES_PER_OP) >= BCOND_FORWARD_RANGE;
         if emit_prologue {
             self._call_header(inputargs);
         } else {
@@ -2076,6 +2143,10 @@ impl<'a> AssemblerARM64<'a> {
                         );
                     }
                     self.regalloc_mov(src, dst);
+                    // A reload/spill/register move sits between the
+                    // comparison and its guard, so they are no longer the
+                    // adjacent pair `_walk_operations` folds.
+                    self.pending_cmp_cc = None;
                     continue;
                 }
                 RegAllocOp::Perform {
@@ -2163,6 +2234,22 @@ impl<'a> AssemblerARM64<'a> {
             );
         }
 
+        // The `MAX_BYTES_PER_OP` estimate that let this trace use
+        // single-instruction guard branches has to have held: every guard's
+        // stub is written after this point, so the body plus the stubs must
+        // stay inside `b.cond`'s forward reach.  One stub is a handful of
+        // instructions per guard, so charge 64 bytes each.
+        debug_assert!(
+            self.long_guard_branch
+                || (self.mc.offset().0 - self.trace_start_offset)
+                    + self.pending_guard_tokens.len() * 64
+                    < BCOND_FORWARD_RANGE,
+            "trace emitted {} bytes with {} guards but used single-instruction \
+             guard branches; MAX_BYTES_PER_OP is too small",
+            self.mc.offset().0 - self.trace_start_offset,
+            self.pending_guard_tokens.len(),
+        );
+
         // assembler.py:1167-1171 `_assemble`: grow the frame to fit a
         // cross-loop JUMP target.  The closing `br` jumps into the target
         // loop's body, which can use deeper frame slots than this trace; for
@@ -2186,6 +2273,10 @@ impl<'a> AssemblerARM64<'a> {
         fail_index: u32,
         ops: &[Op],
     ) {
+        // Only an ADJACENT comparison/guard pair may share NZCV; anything
+        // emitted in between invalidates the record (the comparison arms
+        // below re-arm it).
+        self.pending_cmp_cc = None;
         match op.opcode {
             OpCode::IntAddOvf => {
                 // RPython aarch64/opassembler.py int_add_impl parity —
@@ -2221,8 +2312,11 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             OpCode::IntMulOvf => {
-                // aarch64/opassembler.py emit_comp_op_int_mul_ovf: smulh+mul+asr+cmp
-                // against the 64-bit sign-extended high half.
+                // `opassembler.py:94 emit_comp_op_int_mul_ovf`: the product
+                // overflowed iff the high half differs from the low half's
+                // sign extension.  `CMP_rr_shifted(ip0, res, 63)` is
+                // `cmp Xn, Xm, asr #63`, which does the shift as part of the
+                // compare rather than through a scratch register.
                 if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
                 {
@@ -2230,8 +2324,7 @@ impl<'a> AssemblerARM64<'a> {
                     dynasm!(self.mc ; .arch aarch64
                         ; smulh x15, X(lhs_reg as u8), X(src_reg as u8)
                         ; mul X(dst.value), X(lhs_reg as u8), X(src_reg as u8)
-                        ; asr x14, X(dst.value), 63
-                        ; cmp x15, x14
+                        ; cmp x15, X(dst.value), asr #63
                     );
                     self.guard_success_cc = Some(CC_E);
                 }
@@ -2311,21 +2404,19 @@ impl<'a> AssemblerARM64<'a> {
                 if arglocs.len() >= 2 {
                     self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
                 }
-                if let Some(Loc::Reg(r)) = result_loc {
-                    let cc = Self::opcode_to_cc(op.opcode);
-                    self.emit_setcc(cc, r.value);
-                }
+                let cc = Self::opcode_to_cc(op.opcode);
+                self.flush_cc(cc, result_loc);
             }
             OpCode::IntIsTrue => {
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                if let Some(src) = arglocs.first() {
                     self.emit_test_loc(src);
-                    self.emit_setcc(CC_NE, r.value);
+                    self.flush_cc(CC_NE, result_loc);
                 }
             }
             OpCode::IntIsZero => {
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                if let Some(src) = arglocs.first() {
                     self.emit_test_loc(src);
-                    self.emit_setcc(CC_E, r.value);
+                    self.flush_cc(CC_E, result_loc);
                 }
             }
             OpCode::UintMulHigh => {
@@ -2475,10 +2566,11 @@ impl<'a> AssemblerARM64<'a> {
                         scratch
                     };
                     dynasm!(self.mc ; .arch aarch64 ; fcmp D(a.value), D(b.value));
-                    if let Some(Loc::Reg(r)) = result_loc {
-                        let cc = Self::float_opcode_to_cc(op.opcode);
-                        self.emit_setcc(cc, r.value);
-                    }
+                    // `opassembler.py:138 emit_comp_op_float_*` returns the
+                    // condition instead of materialising a boolean, so an
+                    // adjacent guard branches straight off `fcmp`'s NZCV.
+                    let cc = Self::float_opcode_to_cc(op.opcode);
+                    self.flush_cc(cc, result_loc);
                 }
             }
             // ── Casts ──
@@ -2886,9 +2978,11 @@ impl<'a> AssemblerARM64<'a> {
                     // to load(ip0, ofs_loc) + ADD_rr. ip0 = x16 (reserved scratch).
                     let combined_index = if ofs != 0 {
                         if (0..4096).contains(&ofs) {
-                            dynasm!(self.mc ; .arch aarch64
-                                ; mov x16, X(index.value)
-                                ; add x16, x16, ofs as u32);
+                            // `opassembler.py:403 ADD_ri(ip0, index, ofs)` is a single
+                            // instruction; dynasm's `add Xd|SP, Xn|SP, #uimm` form rejects a
+                            // dynamic register operand, so encode the word directly
+                            // (`codebuilder.py:113 ADD_ri`).
+                            self.emit_add_ri(16, index.value, ofs as u32);
                         } else {
                             self.emit_mov_imm64(16, ofs);
                             dynasm!(self.mc ; .arch aarch64
@@ -3424,16 +3518,18 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::GuardTrue | OpCode::VecGuardTrue | OpCode::GuardNonnull => {
                 // arglocs[0] = condition location
                 if let Some(loc) = arglocs.first() {
-                    self.emit_test_loc(loc);
-                    self.guard_success_cc = Some(CC_NE);
+                    self.load_condition_into_cc(loc);
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
+            // `assembler.py:1777 genop_guard_guard_false` inverts the
+            // published cc, then implements: a folded IntLt that published
+            // CC_L becomes a CC_L failure jump here.
             OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull => {
                 if let Some(loc) = arglocs.first() {
-                    self.emit_test_loc(loc);
-                    self.guard_success_cc = Some(CC_E);
+                    self.load_condition_into_cc(loc);
                 }
+                self.guard_success_cc = self.guard_success_cc.map(invert_cc);
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardValue => {
@@ -3527,6 +3623,10 @@ impl<'a> AssemblerARM64<'a> {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
         }
+        // Every arm emits its own flag-setting code, so a comparison record
+        // that `load_condition_into_cc` did not consume cannot describe the
+        // live NZCV any more.
+        self.pending_cmp_cc = None;
     }
 
     /// Helper: guard class comparison
@@ -3787,17 +3887,88 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Map a float comparison OpCode to a condition code (after ucomisd).
+    /// Map a float comparison OpCode to a condition code (after `fcmp`).
+    ///
+    /// `fcmp` sets NZCV = 0b0011 when either operand is NaN, so C is SET and
+    /// V is SET for an unordered compare.  Only conditions that are false in
+    /// that state may be used for `<`, `<=`, `>`, `>=`; `==` must be false and
+    /// `!=` true.  `opassembler.py:310-315` picks exactly these:
+    /// `VFP_LT` = `lo` (C clear), `VFP_LE` = `ls` (C clear or Z set),
+    /// `gt` (Z clear and N == V), `ge` (N == V), `eq`, `ne`.
+    ///
+    /// `hi`/`hs` — the x86 `seta`/`setae` spelling, correct after `ucomisd`
+    /// because that sets CF on unordered — are both TRUE after an unordered
+    /// `fcmp` and must not be used here.
     fn float_opcode_to_cc(opcode: OpCode) -> u8 {
         match opcode {
-            OpCode::FloatLt => CC_B,  // ucomisd: below = less than
-            OpCode::FloatLe => CC_BE, // below or equal
-            OpCode::FloatGt => CC_A,  // above
-            OpCode::FloatGe => CC_AE, // above or equal
-            OpCode::FloatEq => CC_E,  // equal
-            OpCode::FloatNe => CC_NE, // not equal
+            OpCode::FloatLt => CC_B,  // lo: C clear
+            OpCode::FloatLe => CC_BE, // ls: C clear or Z set
+            OpCode::FloatGt => CC_G,  // gt: Z clear and N == V
+            OpCode::FloatGe => CC_GE, // ge: N == V
+            OpCode::FloatEq => CC_E,  // eq
+            OpCode::FloatNe => CC_NE, // ne
             _ => CC_E,
         }
+    }
+
+    /// `x86/regalloc.py:265 force_allocate_reg_or_cc` hands a comparison the
+    /// frame register as its result when the next op consumes the flags
+    /// directly (`RegAlloc::force_allocate_reg_or_cc`).  That is a sentinel,
+    /// not a real destination — `cset x29, cc` would destroy the frame
+    /// pointer — so publish the condition for the following guard and emit
+    /// nothing.  Otherwise materialize the boolean and remember the pair so
+    /// an adjacent guard can still branch on the live flags.
+    fn flush_cc(&mut self, cond: u8, result_loc: Option<&Loc>) {
+        // `assembler.py:1293 flush_cc` opens with
+        // `assert self.guard_success_cc == rx86.cond_none` — a condition
+        // still pending here was published by an earlier op and never
+        // consumed, which would make the following guard branch on it.
+        debug_assert!(
+            self.guard_success_cc.is_none(),
+            "flush_cc: guard_success_cc already set",
+        );
+        let frame_reg_value = crate::aarch64::regalloc::frame_reg().value;
+        if let Some(Loc::Reg(r)) = result_loc {
+            if r.value == frame_reg_value {
+                self.guard_success_cc = Some(cond);
+                return;
+            }
+            self.emit_setcc(cond, r.value);
+            self.pending_cmp_cc = Some((*r, cond));
+        }
+    }
+
+    /// The comparison NZCV flags are still live iff the immediately
+    /// preceding `RegAllocOp` was a comparison writing exactly `loc` — the
+    /// `operations[i + 1]` adjacency `assembler.py:1186 _walk_operations`
+    /// requires before folding a comparison into its guard.  Every other
+    /// `RegAllocOp` clears the record, so nothing in between can have
+    /// clobbered the flags.  Returns the condition under which the
+    /// comparison was TRUE.
+    fn take_pending_cmp_cc(&mut self, loc: &Loc) -> Option<u8> {
+        let (cmp_reg, cc) = self.pending_cmp_cc.take()?;
+        let Loc::Reg(guard_reg) = loc else {
+            return None;
+        };
+        (cmp_reg.value == guard_reg.value && cmp_reg.is_xmm == guard_reg.is_xmm).then_some(cc)
+    }
+
+    /// `x86/regalloc.py:429 load_condition_into_cc` on the emit side. The
+    /// comparison either published its condition through the frame-register
+    /// sentinel (`flush_cc`) or materialized a boolean; in the second case
+    /// an ADJACENT comparison still left its flags live, so branch on those.
+    /// Only when neither holds is the operand an unrelated boolean that has
+    /// to be re-tested.
+    fn load_condition_into_cc(&mut self, loc: &Loc) {
+        if self.guard_success_cc.is_some() {
+            return;
+        }
+        if let Some(cc) = self.take_pending_cmp_cc(loc) {
+            self.guard_success_cc = Some(cc);
+            return;
+        }
+        self.emit_test_loc(loc);
+        self.guard_success_cc = Some(CC_NE);
     }
 
     /// Guard with faillocs — emit conditional jump and store faillocs on descr.
@@ -4488,13 +4659,36 @@ impl<'a> AssemblerARM64<'a> {
         fail_label
     }
 
-    /// Emit a conditional branch to `label` using the long-branch pattern:
-    /// `b.<inv_cc> skip; b =>label; skip:` so that the displacement of the
-    /// unconditional `b` is 26-bit / ±128MB instead of the 19-bit / ±1MB
-    /// of `b.cond`. The extra inversion+skip adds one instruction per
-    /// guard, but avoids `ImpossibleRelocation` on large traces (logo's
-    /// 70000-op trace generates >1MB of machine code).
+    /// Emit a conditional branch to `label`.
+    ///
+    /// `opassembler.py:857 _emit_op_cond_call` and the guard emitters reserve
+    /// one instruction and patch it with `B_ofs_cond`, which is what the
+    /// steady-state loop should contain.  A trace whose code exceeds
+    /// `b.cond`'s +1MB reach cannot do that, and falls back to
+    /// `b.<inv_cc> skip; b =>label; skip:` — the unconditional `b` carries a
+    /// 26-bit displacement (±128MB) at the cost of one extra instruction per
+    /// guard.  logo's 70000-op trace needs it.
     fn emit_bcond_to_label(&mut self, cc: u8, label: DynamicLabel) {
+        if !self.long_guard_branch {
+            match cc {
+                CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>label),
+                CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>label),
+                CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>label),
+                CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>label),
+                CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
+                CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>label),
+                CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>label),
+                CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>label),
+                CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>label),
+                CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>label),
+                CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>label),
+                CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>label),
+                CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>label),
+                CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>label),
+                _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
+            }
+            return;
+        }
         let skip = self.mc.new_dynamic_label();
         // Invert: branch over the unconditional `b` when the guard succeeds
         match cc {
@@ -6888,12 +7082,21 @@ impl<'a> AssemblerARM64<'a> {
     /// False)` parity, inlined like the WB slowpath.
     fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc]) {
         let _ = op;
-        // Test the condition in a scratch register (ip0/x16), not an
-        // allocatable register, so the test never clobbers a live value
-        // before it is saved.
-        self.emit_load_loc_to_ip0(arglocs[0]);
         let skip_label = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch aarch64 ; cbz x16, =>skip_label);
+        // `opassembler.py:864 _emit_op_cond_call` skips the CMP when
+        // `arglocs[0] is None` — the condition is already in the flags.
+        // Here that case is signalled by `guard_success_cc`, published by
+        // `flush_cc` when the regalloc handed the comparison the
+        // frame-register sentinel.
+        if let Some(cc) = self.guard_success_cc.take() {
+            self.emit_jcc_to_label(invert_cc(cc), skip_label);
+        } else {
+            // Test the condition in a scratch register (ip0/x16), not an
+            // allocatable register, so the test never clobbers a live value
+            // before it is saved.
+            self.emit_load_loc_to_ip0(arglocs[0]);
+            dynasm!(self.mc ; .arch aarch64 ; cbz x16, =>skip_label);
+        }
 
         self.emit_push_all_volatile_regs();
         self.emit_call_from_arglocs(arglocs, 1);
