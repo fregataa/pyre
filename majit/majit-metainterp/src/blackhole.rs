@@ -1118,6 +1118,20 @@ impl BlackholeInterpreter {
     pub(crate) fn bhimpl_abort_permanent(&mut self) -> Result<(), DispatchError> {
         let exc = BH_LAST_EXC_VALUE.with(|c| c.get());
         if exc != 0 {
+            // Hand the exception to the other walked root before dropping this
+            // one.  A residual-call raise is reachable *only* through this cell
+            // (`walk_bh_last_exc_value`) until something stores it, and the
+            // `RaiseException` arm below routes it into
+            // `handle_exception_in_frame` → `route_to_catch`, which records a
+            // traceback node — an allocation — before it performs that store.
+            // Exception objects are non-moving (`w_exception_new_empty` uses
+            // the stable old gen), but old gen is mark-sweep, so an unrooted
+            // one in that window is collectable.  `route_to_catch` clears the
+            // cell only *after* the record for the same reason
+            // (blackhole.py:407 parity); `exception_last_value` is a
+            // `walk_bh_regs` root, so writing it first keeps the value covered
+            // across the handoff.
+            self.exception_last_value = exc;
             BH_LAST_EXC_VALUE.with(|c| c.set(0));
             return Err(DispatchError::RaiseException(exc));
         }
@@ -1190,6 +1204,16 @@ impl BlackholeInterpreter {
             return false;
         }
         let target = (code[catch_pos + 1] as usize) | ((code[catch_pos + 2] as usize) << 8);
+        // Take the exception into this frame's walked slot before anything
+        // below can allocate.  `record` builds a traceback node, and on the
+        // inline-callee path this slot is the exception's ONLY root at that
+        // moment: `handler_inline_call_pyre_nested` reads
+        // `callee.exception_last_value` after `callee.run()` returned, which
+        // popped the callee's `push_bh_regs` entry, and a callee-local `raise`
+        // never went through `BH_LAST_EXC_VALUE`.  Exception objects do not
+        // move (`w_exception_new_empty` allocates in the stable old gen), but
+        // old gen is mark-sweep, so an unrooted one is collectable.
+        self.exception_last_value = exc_value;
         // pyopcode.py raise_varargs records the raising instruction before
         // handler lookup; RaiseWithExplicitTraceback skips it for bare
         // reraise.
@@ -1203,7 +1227,6 @@ impl BlackholeInterpreter {
                 self.last_opcode_position as i64,
             );
         }
-        self.exception_last_value = exc_value;
         self.position = target;
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // A residual `bh_call` that raised published the exception into BOTH
@@ -1313,11 +1336,18 @@ impl BlackholeInterpreter {
         // slot NULL) and a vable opcode dereferences it.  Rooting the full
         // pending chain here mirrors the RPython invariant.
         let bh_depth = unsafe {
-            let depth =
-                majit_gc::shadow_stack::push_bh_regs(&mut self.registers_r, &mut self.tmpreg_r);
+            let depth = majit_gc::shadow_stack::push_bh_regs(
+                &mut self.registers_r,
+                &mut self.tmpreg_r,
+                &mut self.exception_last_value,
+            );
             let mut caller = self.nextblackholeinterp.as_deref_mut();
             while let Some(frame) = caller {
-                majit_gc::shadow_stack::push_bh_regs(&mut frame.registers_r, &mut frame.tmpreg_r);
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut frame.registers_r,
+                    &mut frame.tmpreg_r,
+                    &mut frame.exception_last_value,
+                );
                 caller = frame.nextblackholeinterp.as_deref_mut();
             }
             depth
@@ -3651,7 +3681,11 @@ mod tests {
             assert_eq!(reused.tmpreg_r, 0);
 
             let depth = unsafe {
-                majit_gc::shadow_stack::push_bh_regs(&mut reused.registers_r, &mut reused.tmpreg_r)
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut reused.registers_r,
+                    &mut reused.tmpreg_r,
+                    &mut reused.exception_last_value,
+                )
             };
             let mut roots: Vec<usize> = Vec::new();
             majit_gc::shadow_stack::walk_bh_regs(|slot| roots.push(slot.0));
@@ -3659,6 +3693,43 @@ mod tests {
             assert!(
                 roots.iter().all(|&word| word == 0),
                 "pooled interp handed the root walker stale references: {roots:x?}",
+            );
+        }
+
+        /// The caught exception is reachable from the root walker while the
+        /// frame's handler runs.
+        ///
+        /// `route_to_catch` stores it in `exception_last_value` and jumps to
+        /// the handler (`blackhole.py:396-411`); the handler recovers it much
+        /// later through `last_exc_value` / `last_exception`, and the latter
+        /// dereferences it via `bh_classof`.  Every allocation the handler
+        /// performs in between can trigger a minor collection, so the slot has
+        /// to be a root — a moved object would leave the read on a from-space
+        /// address, and an otherwise-unreferenced one would simply be
+        /// reclaimed.  Upstream gets this for free: the field lives on a
+        /// GC-managed interpreter object, exactly like `tmpreg_r`.
+        #[test]
+        fn the_caught_exception_slot_is_a_gc_root_for_the_handler_window() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            const EXC: i64 = 0x7f00_0000_abc0;
+            bh.exception_last_value = EXC;
+            bh.tmpreg_r = 0;
+
+            let depth = unsafe {
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut bh.registers_r,
+                    &mut bh.tmpreg_r,
+                    &mut bh.exception_last_value,
+                )
+            };
+            let mut roots: Vec<usize> = Vec::new();
+            majit_gc::shadow_stack::walk_bh_regs(|slot| roots.push(slot.0));
+            majit_gc::shadow_stack::pop_bh_regs_to(depth);
+            assert!(
+                roots.contains(&(EXC as usize)),
+                "the caught exception is invisible to the collector while the \
+                 handler runs; roots were {roots:x?}",
             );
         }
 
@@ -4058,6 +4129,78 @@ mod tests {
             assert_eq!(bh.return_type, BhReturnType::Int);
         }
 
+        thread_local! {
+            /// Address of the interpreter's `exception_last_value` slot, read
+            /// back by [`probe_exception_slot_at_record_time`].
+            static PROBE_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            /// What that slot held when the recorder ran.
+            static PROBE_SEEN: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+        }
+
+        /// Stand-in for pyre's `record_caught_blackhole_traceback`.  The real
+        /// one allocates a `PyTraceback`, i.e. it is a GC safepoint; this one
+        /// just samples the slot that has to be covering the exception by then.
+        extern "C" fn probe_exception_slot_at_record_time(
+            _exc: i64,
+            _frame: i64,
+            _jitcode_index: i64,
+            _opcode_position: i64,
+        ) {
+            let slot = PROBE_SLOT.with(|c| c.get()) as *const i64;
+            let seen = if slot.is_null() { -1 } else { unsafe { *slot } };
+            PROBE_SEEN.with(|c| c.set(seen));
+        }
+
+        /// `route_to_catch` must publish the exception into the walked
+        /// `exception_last_value` slot BEFORE it invokes the traceback
+        /// recorder.
+        ///
+        /// The recorder allocates, and on this path — a `raise` inside an
+        /// inlined callee, caught by the caller — that slot is the exception's
+        /// only root: `handler_inline_call_pyre_nested` reads
+        /// `callee.exception_last_value` after `callee.run()` popped the
+        /// callee's `push_bh_regs` entry, and a callee-local raise never went
+        /// through `BH_LAST_EXC_VALUE`.  Exceptions do not move but old gen is
+        /// mark-sweep, so an unrooted one there is collectable.
+        #[test]
+        fn test_bh_route_to_catch_roots_the_exception_before_recording() {
+            const EXC_VAL: i64 = 0xCAFE_F00D;
+
+            let mut sub = JitCodeBuilder::default();
+            sub.load_const_r_value(0, EXC_VAL);
+            sub.emit_raise(0);
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_v(sub_idx, &[], &[], None);
+            let handler_lbl = b.new_label();
+            b.catch_exception(handler_lbl);
+            b.load_const_i_value(2, 999);
+            b.int_return(2);
+            b.mark_label(handler_lbl);
+            b.load_const_i_value(2, 42);
+            b.int_return(2);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            bh.record_caught_exception = Some(probe_exception_slot_at_record_time);
+
+            PROBE_SEEN.with(|c| c.set(-1));
+            PROBE_SLOT.with(|c| c.set(std::ptr::addr_of!(bh.exception_last_value) as usize));
+            let _ = bh.run();
+            PROBE_SLOT.with(|c| c.set(0));
+
+            assert_eq!(
+                PROBE_SEEN.with(|c| c.get()),
+                EXC_VAL,
+                "the recorder is a GC safepoint, so `exception_last_value` must \
+                 already carry the exception when it runs"
+            );
+        }
+
         /// Tier 2.2: exception raised inside the callee
         /// without a caller-side `catch_exception/L` propagates as
         /// `LeaveFrame` with `bh.got_exception` and
@@ -4133,6 +4276,43 @@ mod tests {
                 !bh.got_exception,
                 "abort_permanent without pending TLS exception must not set got_exception"
             );
+        }
+
+        /// `bhimpl_abort_permanent` must re-home the exception into a walked
+        /// root before it clears `BH_LAST_EXC_VALUE`.
+        ///
+        /// The cell is the only root over a residual-call raise
+        /// (`walk_bh_last_exc_value`), and the `RaiseException` handoff runs
+        /// `handle_exception_in_frame` → `route_to_catch`, which records a
+        /// traceback node — an allocation — before it stores the value itself.
+        /// Exceptions are non-moving but old gen is mark-sweep, so clearing the
+        /// cell first leaves the exception collectable across that allocation.
+        /// `exception_last_value` is a `walk_bh_regs` root, so it must already
+        /// carry the exception at the moment the cell goes to zero.
+        #[test]
+        fn test_bh_abort_permanent_rehomes_exception_into_walked_root() {
+            const EXC: i64 = 0x5eed_0001;
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            super::BH_LAST_EXC_VALUE.with(|c| c.set(EXC));
+
+            let outcome = bh.bhimpl_abort_permanent();
+
+            assert!(
+                matches!(outcome, Err(super::DispatchError::RaiseException(e)) if e == EXC),
+                "a pending TLS exception must route through RaiseException"
+            );
+            assert_eq!(
+                bh.exception_last_value, EXC,
+                "the cell is cleared here, so the walked `exception_last_value` \
+                 slot must already carry the exception"
+            );
+            assert_eq!(
+                super::BH_LAST_EXC_VALUE.with(|c| c.get()),
+                0,
+                "the cell is drained once the value has another root"
+            );
+            super::BH_LAST_EXC_VALUE.with(|c| c.set(0));
         }
 
         /// Tier 2.3: callee `abort/` propagates aborted=true.
