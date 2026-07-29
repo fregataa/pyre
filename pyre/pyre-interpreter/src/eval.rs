@@ -357,15 +357,20 @@ pub unsafe fn walk_raw_exception_roots(
 const IMMORTAL_WALK_MAX_DEPTH: u32 = 8;
 
 /// Force-forward the managed children of any `malloc_typed`-immortal REGISTERED
-/// pyre object reachable from a value-stack slot.  Such objects are outside the
-/// GC arenas, so the marker skips them and their registered `gc_ptr_offsets`
-/// trace never fires; a managed child held solely through one is freed by a
-/// collection (a bare `for x in <expr>:` whose iterator sits on the value
-/// stack, a `d.keys()` view, an immortal iterator's source list).  Drive off
-/// the per-type offset registry so every present and future immortal type is
-/// covered.  Runs on both minor and major collections via the
-/// collection-kind-agnostic `visitor`.
-unsafe fn walk_raw_immortal_roots(
+/// pyre object reachable from a root slot (a frame value-stack/locals slot, or
+/// an explicit `gc_roots::pin_root` shadow-stack slot).  Such objects are
+/// outside the GC arenas, so the marker skips them and their registered
+/// `gc_ptr_offsets` trace never fires; a managed child held solely through one
+/// is freed by a collection (a bare `for x in <expr>:` whose iterator sits on
+/// the value stack, a `d.keys()` view, an immortal iterator's source list, an
+/// `_pickle.Unpickler` pinned across `load`).  Drive off the per-type offset
+/// registry so every present and future immortal type is covered.  Runs on both
+/// minor and major collections via the collection-kind-agnostic `visitor`.
+///
+/// # Safety
+/// `value` must be a valid `PyObjectRef` or null, and `visitor` must accept the
+/// forwarded child slots for the duration of the walk.
+pub unsafe fn walk_raw_immortal_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
@@ -1049,6 +1054,18 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     crate::reduce_protocol::walk_handle_roots(visitor);
     // The aiter/anext app-level handles are the same off-GC-slot case.
     crate::async_operation::walk_handle_roots(visitor);
+    // `_compat_pickle`'s fix_imports tables are `space.fromcache(State)` off-GC
+    // slots; forward them on every collection so a minor move updates the cached
+    // mapping pointers. Placed with the ungated handle roots (not the gated
+    // prebuilt block) because the state is published lazily without
+    // `mark_prebuilt_roots_dirty`, so its possibly-young dicts must be forwarded
+    // on the first collection regardless of the prebuilt-remember bit.
+    {
+        let mut fwd = |slot: &mut PyObjectRef| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        };
+        crate::module::_pickle::walk_pickle_state_gc(&mut fwd);
+    }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor

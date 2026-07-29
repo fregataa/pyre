@@ -16,6 +16,8 @@
 //! `PicklingError`, `UnpicklingError` — so `from _pickle import (...)`
 //! resolves and the accelerated path engages.
 
+use std::sync::atomic::{AtomicPtr, Ordering};
+
 use pyre_object::PyObjectRef;
 use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
 
@@ -225,47 +227,180 @@ pub(crate) fn lookup_builtin(name: &str) -> Option<PyObjectRef> {
     current_ec().and_then(|ec| unsafe { (*ec).lookup_builtin(name) })
 }
 
+// ── `_compat_pickle` fix_imports tables (space.fromcache(State)) ──────
+
+/// `pypy/module/_pickle/state.py State` — the four `_compat_pickle` mapping
+/// dicts, imported once and cached for the process instead of re-`getattr`'d on
+/// every `compat_map` call. Held off the GC object graph; the collector reaches
+/// the dicts through [`walk_pickle_state_gc`].
+struct PickleState {
+    w_name_mapping: PyObjectRef,
+    w_import_mapping: PyObjectRef,
+    w_reverse_name_mapping: PyObjectRef,
+    w_reverse_import_mapping: PyObjectRef,
+}
+
+/// Published once and never replaced (the `space.fromcache` singleton), so the
+/// collector reads the slot without coordinating with a mutator inside
+/// `compat_map`.
+static PICKLE_STATE: AtomicPtr<PickleState> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The cached `_compat_pickle` tables, built on first use. Returns `None` when
+/// `_compat_pickle` or one of its four tables is unavailable, so `compat_map`
+/// falls back to the identity mapping. Yields a raw `*const PickleState` (not a
+/// shared reference): a reader may hold it across a collection that rewrites the
+/// slots through `walk_pickle_state_gc`'s raw pointers, which a `&PickleState`
+/// spanning that write would make undefined under Rust's aliasing model.
+///
+/// `State.startup` (state.py) imports `_compat_pickle` eagerly at space startup
+/// and lets a failure propagate. This builds the same tables lazily on the first
+/// `compat_map` and degrades to the identity mapping when the module is absent
+/// rather than propagating: the eager-startup hook has no pyre counterpart, and
+/// the fallback keeps protocol-<3 pickling usable on a minimal stdlib that omits
+/// `_compat_pickle` (proto>=3 never reaches `compat_map`).
+fn pickle_state() -> Option<*const PickleState> {
+    let ptr = PICKLE_STATE.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        return Some(ptr as *const PickleState);
+    }
+    // Pin the module and each table across the reads: a plain module `getattr`
+    // stays native, but the defensive pin keeps the four dicts rooted even if a
+    // lookup ever runs Python and relocates them before publication.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let compat = import_module("_compat_pickle").ok()?;
+    pyre_object::gc_roots::pin_root(compat);
+    for attr in [
+        "NAME_MAPPING",
+        "IMPORT_MAPPING",
+        "REVERSE_NAME_MAPPING",
+        "REVERSE_IMPORT_MAPPING",
+    ] {
+        let compat = pyre_object::gc_roots::shadow_stack_get(base);
+        let table = crate::baseobjspace::getattr_str(compat, attr).ok()?;
+        pyre_object::gc_roots::pin_root(table);
+    }
+    // Slots base+1..=base+4 hold the four tables (updated by any relocation
+    // during the reads). No GC-allocating step runs between here and publication.
+    let created = Box::into_raw(Box::new(PickleState {
+        w_name_mapping: pyre_object::gc_roots::shadow_stack_get(base + 1),
+        w_import_mapping: pyre_object::gc_roots::shadow_stack_get(base + 2),
+        w_reverse_name_mapping: pyre_object::gc_roots::shadow_stack_get(base + 3),
+        w_reverse_import_mapping: pyre_object::gc_roots::shadow_stack_get(base + 4),
+    }));
+    let published = match PICKLE_STATE.compare_exchange(
+        std::ptr::null_mut(),
+        created,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => created,
+        Err(existing) => {
+            drop(unsafe { Box::from_raw(created) });
+            existing
+        }
+    };
+    Some(published as *const PickleState)
+}
+
+/// Forward the four cached `_compat_pickle` mapping dicts. Called on every
+/// collection from `walk_global_prebuilt_roots`, so a minor move updates the
+/// off-GC cached pointers. Upstream reaches the same dicts through the space's
+/// object graph; pyre holds them off-heap and hands them to the collector.
+pub(crate) fn walk_pickle_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let ptr = PICKLE_STATE.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    // A collection can run mid-`compat_map`, which reads these same slots through
+    // raw pointers (never a live `&PickleState`); write them through raw pointers
+    // too so no `&`/`&mut` to the shared state is outstanding across the update.
+    unsafe {
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_name_mapping));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_import_mapping));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_reverse_name_mapping));
+        visitor(&mut *std::ptr::addr_of_mut!(
+            (*ptr).w_reverse_import_mapping
+        ));
+    }
+}
+
 /// `_compat_pickle` import/name compatibility mapping applied at protocol
 /// < 3. `reverse` picks the py3 → py2 direction used when dumping (the
 /// REVERSE_* tables); the forward direction (py2 → py3) is used when
 /// loading. Returns the mapped `(module, name)`, unchanged when no entry
 /// matches.
-pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, String) {
-    let (name_map_attr, import_map_attr) = if reverse {
-        ("REVERSE_NAME_MAPPING", "REVERSE_IMPORT_MAPPING")
-    } else {
-        ("NAME_MAPPING", "IMPORT_MAPPING")
+pub(crate) fn compat_map(
+    module: &str,
+    name: &str,
+    reverse: bool,
+) -> Result<(String, String), crate::PyError> {
+    // `pickle_state()` yields a raw `*const PickleState`, not a shared reference:
+    // the generic `finditem` below can run Python on a user-replaced mapping and
+    // drive a collection, and `walk_pickle_state_gc` then rewrites the cached
+    // slots through raw pointers. A `&PickleState` spanning that write would be
+    // invalidated under Rust's aliasing model, so each slot is read through a raw
+    // pointer here — the same discipline the collection walker uses.
+    let Some(state) = pickle_state() else {
+        return Ok((module.to_string(), name.to_string()));
     };
-    let compat = match import_module("_compat_pickle") {
-        Ok(m) => m,
-        Err(_) => return (module.to_string(), name.to_string()),
+    // Build the (module, name) key before touching the cached slots, then read
+    // each mapping slot immediately before its probe.
+    let key = pyre_object::tupleobject::w_tuple_new(vec![
+        pyre_object::w_str_new(module),
+        pyre_object::w_str_new(name),
+    ]);
+    // `finditem` below is generic: a replaced or non-dict `*_MAPPING` routes
+    // through `getitem`, which can run Python and drive a collection. Pin the
+    // freshly built key so a collection there cannot sweep it mid-lookup — the
+    // Rust counterpart of the RPython GC transform auto-rooting `w_key` across
+    // `space.finditem`. The key is a born-old-stable (non-moving) tuple over
+    // immortal element strings, so keeping it alive is sufficient (no re-read).
+    // The cached real-dict tables take the native `w_dict_lookup_checked` path
+    // and never collect, so this only guards a user-replaced mapping.
+    let _key_root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(key);
+    // (module, name) entry takes precedence over a bare module remap. Probe
+    // through the generic `space.finditem` so a replaced or non-dict `*_MAPPING`
+    // and a raising key comparison behave like PyPy's `space.finditem`.
+    let w_name_map = unsafe {
+        if reverse {
+            std::ptr::addr_of!((*state).w_reverse_name_mapping).read()
+        } else {
+            std::ptr::addr_of!((*state).w_name_mapping).read()
+        }
     };
-    // (module, name) entry takes precedence over a bare module remap.
-    if let Ok(w_name_map) = crate::baseobjspace::getattr_str(compat, name_map_attr) {
-        let key = pyre_object::tupleobject::w_tuple_new(vec![
-            pyre_object::w_str_new(module),
-            pyre_object::w_str_new(name),
-        ]);
-        if let Some(v) = unsafe { pyre_object::w_dict_lookup(w_name_map, key) } {
-            let m = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 0) };
-            let n = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 1) };
-            if let (Some(m), Some(n)) = (m, n) {
-                return (
-                    unsafe { pyre_object::unicodeobject::w_str_get_value(m) }.to_string(),
-                    unsafe { pyre_object::unicodeobject::w_str_get_value(n) }.to_string(),
-                );
-            }
-        }
+    // `if w_1:` (find_class, interp_pickle.py:2612) is an interp-level presence
+    // test: `space.finditem` returns None when absent, and RPython `if w_1:` on a
+    // possibly-None `W_Root` checks `is not None`, not Python truthiness. A
+    // present entry commits to `w_module_name, w_name = space.listview(w_1)`,
+    // which requires exactly two elements (ValueError otherwise) and whose
+    // `text_w` conversions raise TypeError on a non-str element — the guards a
+    // malformed value would otherwise hit in the downstream `__import__` /
+    // `getattr`.
+    if let Some(v) = crate::baseobjspace::finditem(w_name_map, key)? {
+        let pair = crate::baseobjspace::fixedview(v, 2)?;
+        return Ok((
+            crate::baseobjspace::text_w(pair[0])?.to_string(),
+            crate::baseobjspace::text_w(pair[1])?.to_string(),
+        ));
     }
-    if let Ok(w_import_map) = crate::baseobjspace::getattr_str(compat, import_map_attr) {
-        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_import_map, module) } {
-            return (
-                unsafe { pyre_object::unicodeobject::w_str_get_value(v) }.to_string(),
-                name.to_string(),
-            );
+    let w_import_map = unsafe {
+        if reverse {
+            std::ptr::addr_of!((*state).w_reverse_import_mapping).read()
+        } else {
+            std::ptr::addr_of!((*state).w_import_mapping).read()
         }
+    };
+    // `elif w_2:` — presence of a bare-module remap, then `w_module_name = w_2`
+    // with `name` unchanged; `text_w` raises TypeError on a non-str remap value.
+    if let Some(v) = crate::baseobjspace::finditem_str(w_import_map, module)? {
+        return Ok((
+            crate::baseobjspace::text_w(v)?.to_string(),
+            name.to_string(),
+        ));
     }
-    (module.to_string(), name.to_string())
+    Ok((module.to_string(), name.to_string()))
 }
 
 /// `interp_pickle.py _getattribute` — walk a dotted `qualname` from `obj`,
