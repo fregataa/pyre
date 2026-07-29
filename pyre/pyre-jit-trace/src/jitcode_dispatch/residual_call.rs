@@ -1886,6 +1886,23 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `vable_and_vrefs_before_residual_call` (pyjitpl.py) runs only past
     // the OS_NOT_IN_TRACE / force-virtual short-circuits. RPython mirror:
     // `pyjitpl.py`.
+    // `vrefinfo.tracing_before_residual_call(vref)` for every live vref
+    // (`pyjitpl.py:3341-3348`), which upstream runs first inside the same
+    // `vable_and_vrefs_before_residual_call` the vable half below mirrors.
+    // Stamps TOKEN_TRACING_RESCALL so the post-call check can tell "forced by
+    // this callee" from "untouched".  Armed here, past every decline gate, for
+    // the same reason the vable half is: a declined residual must not strand a
+    // token.
+    //
+    // Gated on `is_may_force` — the walker's `check_forces_virtual_or_
+    // virtualizable()` — because `do_residual_call` runs the whole preparation
+    // block only for `assembler_call or effectinfo.check_forces_...`
+    // (`pyjitpl.py:2007`).  A call that cannot force needs no stamp, and
+    // stamping one would leave `tracing_after_residual_call` reading a token
+    // nobody will clear.
+    if is_may_force {
+        ctx.trace_ctx.vrefs_before_residual_call();
+    }
     let live_frame = if ctx.fbw_mode.snapshot_sym.is_null() {
         0
     } else {
@@ -2089,6 +2106,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         .unwrap_or(std::ptr::null());
     ctx.trace_ctx
         .set_virtualizable_heap_ptr(restored_vable_heap_ptr);
+    // `pyjitpl.py:2049` step 3, "after this call, check the vrefs.  If any
+    // have been forced by the call, then we record in the trace a
+    // VIRTUAL_REF_FINISH---before we record any CALL".  Runs before the
+    // virtualizable check below, matching the upstream order, and before the
+    // CALL op is recorded further down.  A vref the callee handed to Python
+    // stops being tracked and its box becomes ConstPtr(NULL), so the resume
+    // snapshot no longer claims the frame is still virtual.  Paired with the
+    // pre-call stamp, so it carries the same `is_may_force` gate.
+    if is_may_force {
+        ctx.trace_ctx.vrefs_after_residual_call();
+    }
     // `vinfo.tracing_after_residual_call(virtualizable)`
     // heap half: a cleared token means the callee forced the virtualizable —
     // the frame escaped, the trace must abort (pyjitpl.py
@@ -2394,24 +2422,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
             // value. An executed void helper has nothing to stamp.
-            match call_descr.result_type() {
-                majit_ir::Type::Int => {
-                    ctx.trace_ctx
-                        .set_opref_concrete(recorded, majit_ir::Value::Int(result_i64));
+            // `pyjitpl.py:2049-2068` checks forced virtual refs before
+            // recording the selected CALL operation.  The assembler-call
+            // walker uses `OpRef::NONE` while concrete-executing so
+            // `vrefs_after_residual_call` can emit VIRTUAL_REF_FINISH before
+            // CALL_ASSEMBLER, then stamps the newly recorded call itself.
+            if !recorded.is_none() {
+                match call_descr.result_type() {
+                    majit_ir::Type::Int => {
+                        ctx.trace_ctx
+                            .set_opref_concrete(recorded, majit_ir::Value::Int(result_i64));
+                    }
+                    majit_ir::Type::Ref => {
+                        ctx.trace_ctx.set_opref_concrete(
+                            recorded,
+                            majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
+                        );
+                    }
+                    majit_ir::Type::Float => {
+                        ctx.trace_ctx.set_opref_concrete(
+                            recorded,
+                            majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
+                        );
+                    }
+                    majit_ir::Type::Void => {}
                 }
-                majit_ir::Type::Ref => {
-                    ctx.trace_ctx.set_opref_concrete(
-                        recorded,
-                        majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
-                    );
-                }
-                majit_ir::Type::Float => {
-                    ctx.trace_ctx.set_opref_concrete(
-                        recorded,
-                        majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
-                    );
-                }
-                majit_ir::Type::Void => {}
             }
             // #57 Option C (capture): this residual is the FOR_ITER advance
             // (`for_iter_next`) — it just advanced the real shared heap
@@ -2659,15 +2694,13 @@ pub(crate) fn do_not_in_trace_call_result(
 /// `*token_ptr == 0` assertion in `tracing_before_residual_call`
 /// intact.
 ///
-/// Despite the name it records no vref half.  `vrefs_before_residual_call` /
-/// `vrefs_after_residual_call` / `stop_tracking_virtualref` are ported on
-/// `TraceCtx` and wired on the metainterp leg; what is missing is the walker
-/// calling them.  Note the two `virtualref_boxes`: the bracket and the guard
-/// snapshots read `TraceCtx`'s, while `PyreSym`'s is touched only by the
-/// caller-less `opimpl_virtual_ref` and the resume-side decode.  Unreachable
-/// today — the codewriter emits no `jit.virtual_ref` producers
-/// (`jit/call.rs`), leaving both empty so every upstream loop iterates zero
-/// times.
+/// The vref halves are bracketed by that same executor:
+/// `TraceCtx::vrefs_before_residual_call` stamps every live vref before the
+/// call and `vrefs_after_residual_call` turns any the callee forced into a
+/// `VIRTUAL_REF_FINISH` + ConstPtr(NULL) box before the CALL op is recorded.
+/// They iterate over the vrefs an inlined call's `enter` pushed
+/// (`inline_call.rs::walker_ec_enter`), so a residual that hands an inlined
+/// callee's frame to Python stops the trace from claiming it is still virtual.
 pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     // pyjitpl.py: vinfo = self.jitdriver_sd.virtualizable_info;
     //                       if vinfo is not None:

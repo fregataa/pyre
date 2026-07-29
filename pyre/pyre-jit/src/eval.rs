@@ -248,6 +248,41 @@ impl Drop for FrameLocalsRoot {
     }
 }
 
+/// Restores `ExecutionContext.topframeref` after compiled execution, including
+/// panic unwinds.  The saved pointer lives on the shadow stack so a moving
+/// collection can forward it in place, matching `CurrentFrameGuard`.
+struct TopFrameRefGuard {
+    ec: *mut PyExecutionContext,
+    saved_root: Option<usize>,
+}
+
+impl TopFrameRefGuard {
+    fn new(ec: *mut PyExecutionContext) -> Self {
+        let saved_root = if ec.is_null() {
+            None
+        } else {
+            let saved = unsafe { (*ec).topframeref };
+            Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
+                saved as usize,
+            )))
+        };
+        Self { ec, saved_root }
+    }
+}
+
+impl Drop for TopFrameRefGuard {
+    fn drop(&mut self) {
+        let Some(saved_root) = self.saved_root else {
+            return;
+        };
+        let saved = majit_gc::shadow_stack::get(saved_root);
+        majit_gc::shadow_stack::pop_to(saved_root);
+        unsafe {
+            (*self.ec).topframeref = saved.0 as *mut PyFrame;
+        }
+    }
+}
+
 /// Bridge pyre-object's `is_managed_heap_object` query to
 /// `majit_gc::gc_owns_object`. Used by host-side allocators
 /// (`pyre_object::dealloc_items_block`) to discriminate
@@ -1233,19 +1268,20 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // collections triggered by CallMallocNursery slow paths.
     majit_gc::shadow_stack::register_libc_jitframe_tracer(pyre_libc_jitframe_tracer);
     // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
-    // Layout: super_.typeptr(u64, offset 0) | virtual_token(*mut u8, offset 8) | forced(*mut u8, offset 16)
+    // Layout: three pointer-sized words — super_.typeptr | virtual_token |
+    // forced — so the size and the traced offset below are both derived from
+    // the struct rather than spelled out for one word width.
     //
     // Note (GC trace divergence).  Upstream
     // `virtualref.py:17-20` declares both `virtual_token` and
     // `forced` as GC slots (`llmemory.GCREF` / `OBJECTPTR`); pyre
-    // registers only `forced` (offset 16) in `gc_ptr_offsets`.
+    // registers only `forced` in `gc_ptr_offsets`.
     // The `virtual_token` slot is intentionally outside the GC's
     // view because every runtime value it can hold lives outside
     // any GC heap: TOKEN_NONE (null), `token_tracing_rescall()`
     // (program-lifetime leaked `Box<ObjectHeader>` dummy lazily
     // allocated by `allocate_tracing_rescall_dummy` and cached in
-    // `TRACING_RESCALL_DUMMY_PTR`, see `majit-metainterp/src/
-    // virtualref.rs:140-180`), and active JITFRAME addresses
+    // `TRACING_RESCALL_DUMMY_PTR`), and active JITFRAME addresses
     // (libc::calloc'd, see `register_libc_jitframe_tracer` above).
     // The optimizer-side descriptor at
     // `majit-metainterp/src/optimizeopt/virtualize.rs:make_vref_field_descr`
@@ -3825,7 +3861,7 @@ unsafe extern "C" fn force_pyframe_vref(
             // the vref names, then run the guard's async forcing, which is
             // what writes `virtual_token = TOKEN_NONE` and `forced` back.
             let token = (*v).virtual_token as usize as u64;
-            driver.meta_interp_mut().force_virtualizable_token(token);
+            driver.force_virtualizable_token(token);
         })
     };
     // `virtualref.py:174-176` — `token == TOKEN_NONE` with no `forced` means
@@ -3834,10 +3870,18 @@ unsafe extern "C" fn force_pyframe_vref(
     // returns into RPython; this hook is a `extern "C"` pointer read from the
     // frame chain with no exception channel, so the unreachable state is
     // asserted instead.  Unreachable holds because a vref reaches the chain
-    // only between `virtual_ref` and `virtual_ref_finish`, and `finish` writes
-    // `forced` before the frame is dropped.  Whoever teaches the tracer to
-    // emit `VIRTUAL_REF` owns re-checking that: a trace aborted between the
-    // two leaves a vref naming a JIT frame that is already gone.
+    // only between `virtual_ref` and `virtual_ref_finish`, and every path that
+    // can outlive the finish writes `forced` first.
+    //
+    // Re-checked now that the walker emits `VIRTUAL_REF` at the inlined-call
+    // push (`inline_call.rs::walker_ec_enter`).  A leaving frame that escaped
+    // takes `ExecutionContext.leave`'s escape branch, which records
+    // `VIRTUAL_REF_FINISH(vrefbox, virtualbox)` — the form that stores the
+    // virtual into `forced` — and marks the caller escaped so its own leave
+    // does the same.  A frame that did not escape has no reader left once
+    // `leave` restores `topframeref`.  The state that would reach here is a
+    // vref finished with the NULL form and still read afterwards, which
+    // requires that propagation to have been skipped.
     forced.expect("InvalidVirtualRef: frame-chain vref forced after its frame died")
         as *mut pyre_interpreter::PyFrame
 }
@@ -3860,12 +3904,22 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 majit_metainterp::virtualizable::VableToken::TracingRescall
             )
         });
-        let live_frame_armed = match info.read_token(frame.cast()) {
-            majit_metainterp::virtualizable::VableToken::Active(token) => {
-                driver.meta_interp_mut().is_force_token_armed(token)
-            }
-            _ => false,
-        };
+        // `pyjitpl.py:3326-3334` reads the token only from
+        // `virtualizable_boxes[-1]`.  An inlined callee materialized through
+        // a virtual reference is an ordinary frame, not that one standard
+        // virtualizable, and its token slot is not part of its resume image.
+        let standard_frame = driver
+            .meta_interp()
+            .standard_virtualizable_heap_ptr()
+            .cast_mut()
+            .cast::<pyre_interpreter::PyFrame>();
+        let live_frame_armed = std::ptr::eq(frame, standard_frame)
+            && match info.read_token(frame.cast()) {
+                majit_metainterp::virtualizable::VableToken::Active(token) => {
+                    driver.meta_interp_mut().is_force_token_armed(token)
+                }
+                _ => false,
+            };
         let mut force = |ptr: *mut u8| {
             info.force_virtualizable_if_necessary(ptr, |token| {
                 driver.meta_interp_mut().force_virtualizable_token(token);
@@ -7507,8 +7561,22 @@ fn execute_assembler(
         }
     }
 
+    // `executioncontext.py:91-107 leave` runs from a `finally`, so upstream's
+    // `topframeref` is balanced no matter how a frame is left: a guard failure
+    // inside an inlined callee resumes into that callee's own `MIFrame` level
+    // and its `leave` still executes.  Pyre's compiled trace carries `enter` /
+    // `leave` as walker-recorded field ops rather than as jitcode, so the ops
+    // after a failing guard never run and every `enter` this run performed
+    // without its matching `leave` would leave a `JitVirtualRef` published in
+    // the live slot — read as a `PyFrame` by the interpreter that resumes, and
+    // still carrying an active FORCE_TOKEN naming the JIT frame that has just
+    // died.  Bracket the assembler run the way `install_current_frame` /
+    // `CurrentFrameGuard` bracket a frame: a balanced run restores the same
+    // value it saved, an unbalanced exit restores the caller.
+    let ec_for_topframeref = frame_root.frame().execution_context as *mut PyExecutionContext;
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
     let outcome = {
+        let _topframeref_guard = TopFrameRefGuard::new(ec_for_topframeref);
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         driver.run_compiled_detailed_with_bridge_keyed(
             green_key,

@@ -15,10 +15,15 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// The value [`VREF_GC_TYPE_ID`] holds before `set_vref_gc_type_id` runs.  Zero
+/// is a legitimate id, so the sentinel has to be a value the registry never
+/// hands out.
+const VREF_GC_TYPE_ID_UNSET: u32 = u32::MAX;
+
 /// GC type id for JitVirtualRef, set by `set_vref_gc_type_id()` at startup.
 /// RPython registers JIT_VIRTUAL_REF as a real GC type; pyre does the same
 /// via `gc.register_type(TypeInfo::with_gc_ptrs(...))` in eval.rs.
-static VREF_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+static VREF_GC_TYPE_ID: AtomicU32 = AtomicU32::new(VREF_GC_TYPE_ID_UNSET);
 
 /// Set the GC type id for JitVirtualRef. Called once at startup after
 /// `gc.register_type()` returns the assigned id.
@@ -34,16 +39,14 @@ pub(crate) fn vref_gc_type_id() -> u32 {
 /// `rpython/rtyper/rclass.py:OBJECT` — RPython's GC
 /// object header.  Every `rclass.OBJECT` subclass starts with a
 /// `typeptr` field (a vtable pointer) used for runtime type identity
-/// checks (`inst.typeptr == some_vtable`).  Pyre's analogue: a u64
-/// `typeptr` slot at offset 0 carrying the type-id constant for
-/// each registered GC type.
+/// checks (`inst.typeptr == some_vtable`).  Pyre's analogue is the
+/// pointer-sized identity word at offset 0.
 #[repr(C)]
 pub struct ObjectHeader {
     /// `rclass.OBJECT.typeptr` — runtime type identity.  RPython
     /// stores a pointer to the per-class `OBJECT_VTABLE` instance;
-    /// pyre stores the type-id constant directly (e.g.
-    /// `JIT_VIRTUAL_REF_VTABLE` for `JitVirtualRef`).
-    pub typeptr: u64,
+    /// pyre stores a pointer-sized identity constant directly.
+    pub typeptr: usize,
 }
 
 /// `rpython/rlib/jit.py JitVirtualRef`: heap-allocated virtual
@@ -66,17 +69,18 @@ pub struct ObjectHeader {
 /// `optimizeopt/virtualize.rs`) agree on the slot type.
 ///
 /// TODO (GC trace).  Upstream traces both fields as
-/// real GC pointers; pyre traces only `forced`.  `eval.rs:241-247`
-/// registers JIT_VIRTUAL_REF with `gc_ptr_offsets = [16]` (forced
-/// only).  The reason is that every value `virtual_token` ever holds
-/// at runtime falls outside the GC heap:
+/// real GC pointers; pyre traces only `forced` — the type registration
+/// in `eval.rs` derives that one entry from `offset_of!(JitVirtualRef,
+/// forced)`, so it follows the target's pointer width.  The reason
+/// `virtual_token` is left out is that every value it ever holds at
+/// runtime falls outside the GC heap:
 ///   - `TOKEN_NONE` — null, safe to walk.
 ///   - `token_tracing_rescall()` — program-lifetime leaked
 ///     `Box<ObjectHeader>` (see `allocate_tracing_rescall_dummy` /
 ///     `TRACING_RESCALL_DUMMY_PTR` below), host-heap allocated and
 ///     never freed; not a GC-allocated `_dummy` GcStruct.
 ///   - an active JITFRAME address — `libc::calloc`'d on a host-side
-///     pool (eval.rs:232-240), not nursery/oldgen.
+///     pool, not nursery/oldgen.
 /// Routing it through `trace_and_update_object` would either be a
 /// no-op or trip a poison-address check.  The optimizer-side
 /// `Type::Ref` is intentionally retained so that
@@ -100,7 +104,9 @@ pub struct JitVirtualRef {
 /// real OBJECT_VTABLE pointer; the comparison `header.typeptr ==
 /// JIT_VIRTUAL_REF_VTABLE` is the structural equivalent of
 /// upstream's `inst.typeptr == self.jit_virtual_ref_vtable`.
-pub const JIT_VIRTUAL_REF_VTABLE: u64 = 0x4A49_5456_5245_4621; // "JITVREF!"
+// `virtualref.py:21-23` allocates an OBJECT_VTABLE pointer, so its translated
+// identity occupies one target word rather than an unconditional u64.
+pub const JIT_VIRTUAL_REF_VTABLE: usize = 0x4A56_5221; // "JVR!"
 
 /// Free-function form of [`VirtualRefInfo::is_virtual_ref`] for callers that
 /// don't hold a `VirtualRefInfo` — e.g. the interpreter's frame-chain force
@@ -109,8 +115,8 @@ pub const JIT_VIRTUAL_REF_VTABLE: u64 = 0x4A49_5456_5245_4621; // "JITVREF!"
 /// `virtualref.py:94-98 is_virtual_ref(gcref)`.
 ///
 /// # Safety
-/// `ptr` must be null or point to a valid object whose first 8 bytes are the
-/// `('super', rclass.OBJECT)` typeptr word.
+/// `ptr` must be null or point to a valid object whose leading
+/// pointer-sized word is the `('super', rclass.OBJECT)` typeptr.
 #[inline]
 pub unsafe fn ptr_is_virtual_ref(ptr: *const u8) -> bool {
     unsafe {
@@ -150,15 +156,44 @@ pub use crate::jit::InvalidVirtualRef;
 /// `virtualref.py:85-91 virtual_ref_during_tracing(real_object)`.
 /// Initializes virtual_token = TOKEN_NONE, forced = real_object.
 /// Returns raw pointer; caller owns the allocation.
+///
+/// `lltype.malloc(self.JIT_VIRTUAL_REF)` is a GC allocation, and it has to be
+/// one here too: `forced` is the sole traced slot of the type registered with
+/// [`set_vref_gc_type_id`], so once `ExecutionContext.topframeref` holds
+/// the vref instead of the frame, this object is the only edge keeping the
+/// frame it wraps reachable.  A host-heap allocation is invisible to the
+/// collector — the root walker's `gc_current_object_address` early-out returns
+/// an unowned address unchanged — which drops that edge and lets a live frame
+/// be collected out from under the walk.
+///
+/// Old-gen, not nursery: `virtualref_boxes`, the recorded ops' concrete stamps
+/// and the interpreter's `f_backref` chain all hold this address as a raw
+/// pointer that no root walker forwards, and MiniMark's old-gen is mark-sweep,
+/// so the address is stable across a minor collection.  The `forced` frame may
+/// be young, hence the creation write barrier.
+///
+/// The `Box` fallback covers the window before `set_vref_gc_type_id` has run
+/// (the id still reads its unset sentinel) and an old-gen allocation failure;
+/// it is leaked, and reclamation is what it gives up.
 fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
-    let vref = Box::new(JitVirtualRef {
+    let vref = JitVirtualRef {
         super_: ObjectHeader {
             typeptr: JIT_VIRTUAL_REF_VTABLE,
         },
         virtual_token: TOKEN_NONE,
         forced: real_object,
-    });
-    Box::into_raw(vref) as *mut u8
+    };
+    let type_id = vref_gc_type_id();
+    if type_id != VREF_GC_TYPE_ID_UNSET {
+        let gcref = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<JitVirtualRef>());
+        if gcref.0 != 0 {
+            unsafe { std::ptr::write(gcref.0 as *mut JitVirtualRef, vref) };
+            // Creation write barrier: an old-gen vref may point at a young frame.
+            majit_gc::gc_write_barrier(gcref);
+            return gcref.0 as *mut u8;
+        }
+    }
+    Box::into_raw(Box::new(vref)) as *mut u8
 }
 
 /// Token value indicating no JIT frame is active.
@@ -169,10 +204,9 @@ pub const TOKEN_NONE: *mut u8 = std::ptr::null_mut();
 /// ```python
 /// _DUMMY = lltype.GcStruct('JITFRAME_DUMMY')
 /// ```
-/// Pyre stores the corresponding type-id as a u64 magic constant —
-/// the typeptr written into the `super_.typeptr` slot of the
-/// allocated `_dummy` instance below.
-pub const JITFRAME_DUMMY_VTABLE: u64 = 0x4A46_4D44_554D_4D59; // "JFMDUMMY"
+/// `virtualizable.py:326-330` uses a real pointer to the `_dummy` object, so
+/// the translated identity word is pointer-sized too.
+pub const JITFRAME_DUMMY_VTABLE: usize = 0x4A46_444D; // "JFDM"
 
 /// Lazy initialisation of the `_dummy` address.  `OnceLock<usize>`
 /// (instead of `OnceLock<*mut u8>`) so the cell is `Sync` —
@@ -394,7 +428,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
-    /// whose first 8 bytes are the type-tag word.
+    /// whose leading pointer-sized word is the type-tag.
     pub unsafe fn tracing_before_residual_call(&self, vref_ptr: *mut u8) {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
@@ -415,7 +449,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
-    /// whose first 8 bytes are the type-tag word.
+    /// whose leading pointer-sized word is the type-tag.
     pub unsafe fn tracing_after_residual_call(&self, vref_ptr: *mut u8) -> bool {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
@@ -448,7 +482,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
-    /// whose first 8 bytes are the type-tag word.
+    /// whose leading pointer-sized word is the type-tag.
     pub unsafe fn continue_tracing(&self, vref_ptr: *mut u8, real_object: *mut u8) {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
@@ -461,6 +495,15 @@ impl VirtualRefInfo {
             // `virtualref.py:127 assert vref.virtual_token != TOKEN_TRACING_RESCALL`
             debug_assert_ne!(vref.virtual_token, token_tracing_rescall());
             vref.virtual_token = TOKEN_NONE;
+            // The vref is an old-gen allocation and `real_object` can be young,
+            // so the `forced` store needs the generational barrier its creation
+            // counterpart in `alloc_virtual_ref` already carries.  That
+            // counterpart barriers only inside its GC-allocated arm, so skip
+            // an address the collector does not own (the `Box` arm taken
+            // before the vref type id is registered).
+            if majit_gc::gc_owns_object(vref_ptr as usize) {
+                majit_gc::gc_write_barrier(majit_ir::GcRef(vref_ptr as usize));
+            }
             vref.forced = real_object;
         }
     }
@@ -495,8 +538,8 @@ impl VirtualRefInfo {
     /// `JIT_VIRTUAL_REF_VTABLE`.
     ///
     /// # Safety
-    /// `ptr` must point to a valid GCREF object whose first 8 bytes
-    /// are the typeptr word, or be null.
+    /// `ptr` must point to a valid GCREF object whose leading
+    /// pointer-sized word is the typeptr, or be null.
     pub unsafe fn is_virtual_ref(&self, ptr: *const u8) -> bool {
         unsafe { ptr_is_virtual_ref(ptr) }
     }
@@ -629,7 +672,7 @@ mod tests {
     /// `virtualref.py:101-102`: `tracing_before_residual_call`
     /// returns silently when the gcref is not a JitVirtualRef.
     /// pyre's `is_virtual_ref` guard mirrors the shape — a
-    /// non-vref pointer (here a `u64` whose first 8 bytes are NOT
+    /// non-vref pointer (here a word whose leading bytes are NOT
     /// `JIT_VIRTUAL_REF_VTABLE`) must be left untouched.
     #[test]
     fn tracing_before_residual_call_skips_non_vref() {

@@ -2954,17 +2954,55 @@ impl GcRewriter for GcRewriterImpl {
         let ops = Self::remove_bridge_exception(ops);
 
         // Result positions are consumed only by result-producing ops; a
-        // Void-result op never occupies a position slot. Skip Void ops here
-        // for the same reason `emit` assigns no position id when
-        // `rt == Type::Void` — otherwise a Void op carrying the `VoidOp(
-        // u32::MAX)` sentinel (op_typed(NONE.raw(), Void)) would saturate
-        // the max and overflow the first `next_pos += 1` in `emit`.
-        let next_pos = ops
+        // Void-result op never occupies a position slot. Skip sentinels and
+        // constants below for the same reason `emit` assigns no position id
+        // when `rt == Type::Void`.
+        //
+        // rewrite.py:106-116 replaces a ConstPtr argument with a fresh
+        // LOAD_FROM_GC_TABLE box. RPython boxes retain distinct identity when
+        // their producer was optimized away, so pyre's numeric namespace must
+        // reserve argument and guard-fail positions too. Forced virtuals can
+        // carry producerless constant boxes as allocation lengths; reusing
+        // such a raw position would alias an Int box with the new Ref box in
+        // backend SSA.
+        // The `VoidOp(u32::MAX)` sentinel is the one raw payload that must not
+        // enter the high-water mark: it would pin `next_pos` at `u32::MAX`,
+        // which the first `+= 1` in `emit` overflows — a panic where overflow
+        // checks are on, and a silent wrap to 0 in release, handing every
+        // rewritten op a position that aliases a live operand. Every other
+        // non-constant payload still counts, `TempVar` included: its sentinel
+        // range sits above the body positions, and lowering the mark past it
+        // lets a new box collide with a position that reaches the backend
+        // through resume data rather than through `pos`/args/failargs.
+        let counts_toward_high_water =
+            |pos: OpRef| !pos.is_none() && !pos.is_constant() && pos.ty() != Some(Type::Void);
+        let max_result_pos = ops
             .iter()
-            .filter(|op| op.result_type() != Type::Void)
-            .filter_map(|op| (!op.pos.get().is_none()).then_some(op.pos.get().raw()))
-            .max()
-            .map_or(0, |max_pos| max_pos.saturating_add(1));
+            .filter_map(|op| {
+                let pos = op.pos.get();
+                counts_toward_high_water(pos).then(|| pos.raw())
+            })
+            .max();
+        let mut max_raw_pos = max_result_pos;
+        if let Some(result_high_water) = max_result_pos {
+            let mut reserve_later_box = |pos: OpRef| {
+                if counts_toward_high_water(pos) && pos.raw() > result_high_water {
+                    max_raw_pos =
+                        Some(max_raw_pos.map_or(pos.raw(), |old: u32| old.max(pos.raw())));
+                }
+            };
+            for op in &ops {
+                for arg in op.getarglist() {
+                    reserve_later_box(arg.to_opref());
+                }
+                if let Some(fail_args) = op.getfailargs() {
+                    for arg in fail_args {
+                        reserve_later_box(arg.to_opref());
+                    }
+                }
+            }
+        }
+        let next_pos = max_raw_pos.map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py:366-367 — if `remove_tested_failarg` rewrote this

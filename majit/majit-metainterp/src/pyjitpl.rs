@@ -3027,6 +3027,13 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `pyjitpl.py:3326-3334` keeps exactly one standard virtualizable
+    /// identity in `virtualizable_boxes[-1]`; `vable_ptr` is its concrete
+    /// heap counterpart.
+    pub fn standard_virtualizable_heap_ptr(&self) -> *const u8 {
+        self.vable_ptr
+    }
+
     /// Cache fallback virtualizable array lengths for trace-entry box setup.
     pub(crate) fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
         self.vable_array_lengths = lengths;
@@ -4923,25 +4930,9 @@ impl<M: Clone> MetaInterp<M> {
         let Some(ctx) = self.tracing.as_mut() else {
             return OpRef::NONE;
         };
-        // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
-        // `vrefinfo = self.staticdata.virtualref_info` (pyjitpl.py:1314).
-        let vref_ptr = self
-            .staticdata
-            .virtualref_info
-            .virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
-        // pyjitpl.py:1805: cindex = ConstInt(len(virtualref_boxes) // 2)
-        let cindex = ctx.const_int((ctx.virtualref_boxes.len() / 2) as i64);
-        // pyjitpl.py:1806-1807:
-        //   resbox = metainterp.history.record2(rop.VIRTUAL_REF, box, cindex, vref)
-        //   self.metainterp.heapcache.new(resbox)
-        // `TraceCtx::virtual_ref` bundles both so the heapcache `new`
-        // is not skipped (the inline `ctx.record_op(VirtualRefR, ...)`
-        // form bypassed `heap_cache.new_object` — pyjitpl.py:1807 parity).
-        let vref = ctx.virtual_ref(virtual_obj, cindex);
-        // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
-        ctx.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
-        ctx.virtualref_boxes.push((vref, vref_ptr as usize));
-        vref
+        // `@arguments("box", returns="box")` — the jitcode opimpl yields only
+        // the box; the concrete vref has no register to land in.
+        ctx.opimpl_virtual_ref(virtual_obj, virtual_obj_ptr).0
     }
 
     /// pyjitpl.py:1819-1832 `opimpl_virtual_ref_finish(box)` parity —
@@ -4952,54 +4943,10 @@ impl<M: Clone> MetaInterp<M> {
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
-        // `pyjitpl.py:1820-1822`:
-        //     vrefbox = metainterp.virtualref_boxes.pop()
-        //     lastbox = metainterp.virtualref_boxes.pop()
-        let (vrefbox, vref_ptr) = ctx
-            .virtualref_boxes
-            .pop()
-            .expect("opimpl_virtual_ref_finish: missing vrefbox");
-        let (lastbox, lastbox_ptr) = ctx
-            .virtualref_boxes
-            .pop()
-            .expect("opimpl_virtual_ref_finish: missing virtualbox");
-        // `pyjitpl.py:1823 assert box.getref_base() == lastbox.getref_base()`
-        // — compare the concrete ref base, not the SSA OpRef.  PyPy permits
-        // alias boxes that share `getref_base()` but differ in box identity;
-        // an `OpRef`-identity assert would reject those.  Read
-        // `virtual_obj`'s ref value off its variant tag when it is a
-        // ConstPtr, falling back to the pre-pop side-table pointer that the
-        // matching `opimpl_virtual_ref(virtual_obj, virtual_obj_ptr)`
-        // recorded as `lastbox_ptr`.
-        let virtual_obj_ptr = match virtual_obj.inline_const_to_value() {
-            Some(Value::Ref(r)) => r.as_usize(),
-            _ => lastbox_ptr,
-        };
-        // pyjitpl.py:1825 `assert box.getref_base() == lastbox.getref_base()`
-        // — RPython's plain `assert` fires in both untranslated and
-        // translated builds (the latter via the same fail-fast on
-        // invariant break); the Rust port mirrors that with `assert_eq!`
-        // so release builds also fail at the divergence point rather
-        // than silently corrupting the vref stack.
-        assert_eq!(
-            virtual_obj_ptr, lastbox_ptr,
-            "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
-             (virtual_obj={:?}, lastbox={:?})",
-            virtual_obj, lastbox
+        assert!(
+            ctx.opimpl_virtual_ref_finish(virtual_obj),
+            "opimpl_virtual_ref_finish: missing vrefbox"
         );
-        // pyjitpl.py:1826-1832 `vrefinfo = ...; vref = vrefbox.getref_base();
-        //   if vrefinfo.is_virtual_ref(vref): record VIRTUAL_REF_FINISH`.
-        let is_vref = vref_ptr != 0
-            && unsafe {
-                self.staticdata
-                    .virtualref_info
-                    .is_virtual_ref(vref_ptr as *const u8)
-            };
-        if is_vref {
-            // pyjitpl.py:1831-1832 `VIRTUAL_REF_FINISH(vrefbox, nullbox)`.
-            let null = ctx.const_ref(0);
-            let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, null]);
-        }
     }
 
     /// Whether the engine is currently tracing.
@@ -11625,6 +11572,23 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         fail_values: &[i64],
     ) -> Option<(Vec<i64>, Vec<i64>)> {
+        self.handle_async_forcing_with_allocator(
+            green_key,
+            trace_id,
+            fail_index,
+            fail_values,
+            &crate::resume::NullAllocator,
+        )
+    }
+
+    fn handle_async_forcing_with_allocator(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+        allocator: &dyn crate::resume::BlackholeAllocator,
+    ) -> Option<(Vec<i64>, Vec<i64>)> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] key={} trace={} fail={} nvals={}",
@@ -11686,7 +11650,6 @@ impl<M: Clone> MetaInterp<M> {
         let deadframe_types = self.get_recovery_slot_types(green_key, norm_tid, fail_index);
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
-        let allocator = crate::resume::NullAllocator;
         let all_liveness = self.staticdata.liveness_info.as_slice();
         let (all_virtuals_ptr, all_virtuals_int) = crate::resume::force_from_resumedata(
             rd_numb,
@@ -11699,7 +11662,7 @@ impl<M: Clone> MetaInterp<M> {
             Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
             vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
-            &allocator,
+            allocator,
         );
         drop(_cc_guard);
         // compile.py:999-1000: obj = AllVirtuals(all_virtuals)
@@ -11717,6 +11680,14 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Force a running virtualizable identified by its backend force token.
     pub fn force_virtualizable_token(&mut self, token: u64) {
+        self.force_virtualizable_token_with_allocator(token, &crate::resume::NullAllocator);
+    }
+
+    pub fn force_virtualizable_token_with_allocator(
+        &mut self,
+        token: u64,
+        allocator: &dyn crate::resume::BlackholeAllocator,
+    ) {
         let deadframe = self
             .backend
             .force(GcRef(token as usize))
@@ -11741,7 +11712,13 @@ impl<M: Clone> MetaInterp<M> {
                 Type::Void => 0,
             })
             .collect::<Vec<_>>();
-        let _ = self.handle_async_forcing(green_key, trace_id, fail_index, &fail_values);
+        let _ = self.handle_async_forcing_with_allocator(
+            green_key,
+            trace_id,
+            fail_index,
+            &fail_values,
+            allocator,
+        );
     }
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {

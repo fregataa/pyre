@@ -2455,11 +2455,6 @@ pub struct PyreSym {
     /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
     pub(crate) current_exc_value: pyre_object::PyObjectRef,
     pub(crate) current_exc_box: OpRef,
-    /// pyjitpl.py:2597 virtualref_boxes: pairs of (jit_virtual, real_vref).
-    /// Each pair: (symbolic OpRef, concrete pointer).
-    /// resume.py:1093 restores virtual references on guard failure.
-    /// Pairs stored flat: [virt_sym, virt_ptr, real_sym, real_ptr, ...].
-    pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
     // ── RPython MIFrame.registers_{i,r,f} port (pyjitpl.py:74-90) ──
     //
     // RPython reference (target shape):
@@ -5260,7 +5255,6 @@ impl PyreSym {
             trace_built_exc: indexmap::IndexMap::new(),
             current_exc_value: pyre_interpreter::eval::get_current_exception(),
             current_exc_box: OpRef::NONE,
-            virtualref_boxes: Vec::new(),
             // RPython pyjitpl.py:74-78 init: registers_X[i] = CONST_NULL for
             // i in num_regs. Sized lazily here — `setup_kind_register_banks`
             // resizes `registers_i` / `registers_f` once the owning JitCode is
@@ -5813,66 +5807,6 @@ impl PyreSym {
         } else {
             Some(cv.to_pyobj())
         }
-    }
-}
-
-/// pyjitpl.py:1789-1814 opimpl_virtual_ref parity.
-/// Creates a concrete JitVirtualRef via virtual_ref_during_tracing(),
-/// records VIRTUAL_REF(box, cindex), and pushes
-/// [virtualbox, vrefbox] onto virtualref_boxes.
-///
-/// Upstream's caller is `executioncontext.py:89 enter`, which the tracer
-/// reaches by tracing through the interpreter's own frame-entry code.  The
-/// pyre walker builds its inline levels itself and never traces `enter`, so
-/// this has no caller yet and `virtualref_boxes` stays empty in every live
-/// trace.  Wiring it is a prerequisite for the multi-frame blackhole adopt
-/// (`try_adopt_multi_frame_blackhole`, `trace.rs`).
-pub(crate) fn opimpl_virtual_ref(
-    ctx: &mut TraceCtx,
-    sym: &mut PyreSym,
-    virtual_obj: OpRef,
-    virtual_obj_ptr: usize,
-) -> OpRef {
-    // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
-    let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
-    let vref_ptr = vref_info.virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
-    // pyjitpl.py:1805: cindex = ConstInt(len(virtualref_boxes) // 2)
-    let cindex = ctx.const_int((sym.virtualref_boxes.len() / 2) as i64);
-    // pyjitpl.py:1806: record VIRTUAL_REF(box, cindex)
-    let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, cindex]);
-    // pyjitpl.py:1807: heapcache.new(resbox)
-    ctx.heap_cache_mut().new_box(vref);
-    // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
-    sym.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
-    sym.virtualref_boxes.push((vref, vref_ptr as usize));
-    vref
-}
-
-/// pyjitpl.py:1819-1831 opimpl_virtual_ref_finish parity.
-/// Pops vrefbox and lastbox from virtualref_boxes (LIFO),
-/// asserts `box == lastbox`, records VIRTUAL_REF_FINISH if still virtual.
-///
-/// Called from metainterp finishframe_inline/exception (executioncontext.leave parity).
-pub(crate) fn opimpl_virtual_ref_finish(ctx: &mut TraceCtx, sym: &mut PyreSym, virtual_obj: OpRef) {
-    if sym.virtualref_boxes.len() < 2 {
-        return;
-    }
-    // pyjitpl.py:1821: vrefbox = virtualref_boxes.pop()
-    let (vref_opref, vref_ptr) = sym.virtualref_boxes.pop().unwrap();
-    // pyjitpl.py:1822: lastbox = virtualref_boxes.pop()
-    let (lastbox_opref, _lastbox_ptr) = sym.virtualref_boxes.pop().unwrap();
-    // pyjitpl.py:1823: assert box.getref_base() == lastbox.getref_base()
-    debug_assert_eq!(
-        virtual_obj, lastbox_opref,
-        "opimpl_virtual_ref_finish: leaving frame box != top virtualref box"
-    );
-    // pyjitpl.py:1831: if is_virtual_ref(vref) → record VIRTUAL_REF_FINISH
-    let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
-    let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
-    if is_vref {
-        // pyjitpl.py:1832: VIRTUAL_REF_FINISH(vrefbox, nullbox)
-        let null = ctx.const_ref(0);
-        let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, null]);
     }
 }
 
@@ -7644,14 +7578,18 @@ fn materialize_concrete_virtual_ptr(
             }
             // Pyre adaptation: bh_new_with_vtable writes vtable at
             // vtable_offset but PyObject.w_class needs separate init
-            // (pyobject.rs:51). Matches materialize_virtual_object at
-            // state.rs:7220.
-            if vtable != 0 {
+            // (pyobject.rs:51). Matches materialize_virtual_object.
+            //
+            // `w_class_obj()` — not `get_instantiate(vtable)` — is the source:
+            // a vtable word is only a `PyType` pointer for a pyre object
+            // descr.  `JitVirtualRef` carries the `jit_virtual_ref_vtable`
+            // type-id constant there (`virtualref.py:21-23`) and its offset-8
+            // slot is `virtual_token`, not `w_class`, so it returns None and
+            // this seeding is skipped.
+            if let Some(w_class) = size_descr.w_class_obj() {
                 unsafe {
                     let pyobj = ptr as *mut pyre_object::PyObject;
-                    (*pyobj).w_class = pyre_object::pyobject::get_instantiate(
-                        &*(vtable as *const pyre_object::pyobject::PyType),
-                    );
+                    (*pyobj).w_class = w_class as pyre_object::pyobject::PyObjectRef;
                 }
             }
             let gcref = majit_ir::GcRef(ptr as usize);
@@ -9374,10 +9312,11 @@ impl JitState for PyreJitState {
         // (majit/majit-ir/src/resumedata.rs:402-416) decoded it into
         // `resume_data.virtualref_values`. Materialize the OpRef + concrete
         // pointer for each pair through the same `resolve` / `decode_concrete`
-        // callbacks used for `frames[0].values`, then push the pairs into
-        // `sym.virtualref_boxes` so `opimpl_virtual_ref` /
-        // `opimpl_virtual_ref_finish` handlers (state.rs:3475-3500) observe
-        // the parent's still-open virtualref scope at bridge entry.
+        // callbacks used for `frames[0].values`, then hand the pairs to the
+        // trace's own `virtualref_boxes` — the single store, matching
+        // upstream's one `MetaInterp.virtualref_boxes` — so an inlined call's
+        // `virtual_ref_finish` and the residual-call bracket both observe the
+        // parent's still-open virtualref scope at bridge entry.
         //
         // For traces with no active `virtual_ref`, `virtualref_values` is
         // empty and this loop is a no-op.
@@ -9398,6 +9337,8 @@ impl JitState for PyreJitState {
             "virtualref_values must contain an even number of entries (got {})",
             vref_values.len(),
         );
+        let mut restored_virtualref_boxes: Vec<(OpRef, usize)> =
+            Vec::with_capacity(vref_values.len());
         for pair in vref_values.chunks_exact(2) {
             let (virt_opref, virt_val) = bridge_decode_box(
                 ctx,
@@ -9423,8 +9364,8 @@ impl JitState for PyreJitState {
             );
             let virt_ptr = value_to_usize(&virt_val);
             let vref_ptr = value_to_usize(&vref_val);
-            sym.virtualref_boxes.push((virt_opref, virt_ptr));
-            sym.virtualref_boxes.push((vref_opref, vref_ptr));
+            restored_virtualref_boxes.push((virt_opref, virt_ptr));
+            restored_virtualref_boxes.push((vref_opref, vref_ptr));
             // pyjitpl.py:3438 / resume.py:1397: continue_tracing is called
             // unconditionally for every (vref, real_object) pair. The
             // is_virtual_ref(vref) guard (virtualref.py:123) and the
@@ -9436,6 +9377,52 @@ impl JitState for PyreJitState {
                 vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
             }
         }
+        // `ExecutionContext.topframeref` is a live heap field, so unlike the
+        // RPython locals `rebuild_state_after_failure` reconstructs, whatever
+        // the dead trace last stored there is still in it.  A trace that
+        // abandoned an inlined callee level at this guard left that level's
+        // vref published — and a compiled-trace vref carries a live FORCE_TOKEN
+        // with a null `forced` (`virtualize.py optimize_VIRTUAL_REF`), naming a
+        // JIT frame that has now exited.  Forcing it reaches `cpu.force` with
+        // no armed `jf_force_descr`.
+        //
+        // The resume data says what the slot should hold: the innermost scope
+        // the guard still had open, whose vref the `continue_tracing` loop
+        // above has just repaired, or — with no scope open — the resumed frame
+        // itself.  Rewrite only when the slot holds some *other* vref; an
+        // already-correct slot (every non-abandoning exit) is left alone.
+        let restored_top = restored_virtualref_boxes
+            .last()
+            .map(|&(_, vref_ptr)| vref_ptr)
+            .unwrap_or(sym.concrete_vable_ptr as usize);
+        let live_ec = if sym.concrete_vable_ptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            let frame = sym.concrete_vable_ptr as *const pyre_interpreter::PyFrame;
+            unsafe { (*frame).execution_context as *mut pyre_interpreter::PyExecutionContext }
+        };
+        if !live_ec.is_null() && restored_top != 0 {
+            let published = unsafe { (*live_ec).topframeref };
+            // A scope the guard still had open must be republished whatever the
+            // slot currently holds: `execute_assembler` restores `topframeref`
+            // to the frame it saved before the run, so after an inlined-callee
+            // guard the slot names the portal frame — not a vref — and leaving
+            // it there would expose the portal to a residual `sys._getframe()`
+            // and close the wrong concrete chain on leave.  With no scope open
+            // `restored_top` is the resumed frame itself, and only a stale vref
+            // in the slot is worth overwriting.
+            let stale_scope = !restored_virtualref_boxes.is_empty()
+                || unsafe {
+                    majit_metainterp::virtualref::ptr_is_virtual_ref(published as *const u8)
+                };
+            if published as usize != restored_top && stale_scope {
+                unsafe {
+                    (*live_ec).topframeref = restored_top as *mut pyre_interpreter::PyFrame;
+                }
+            }
+        }
+        // `pyjitpl.py:3433 self.virtualref_boxes = virtualref_boxes`.
+        ctx.restore_virtualref_boxes(restored_virtualref_boxes);
 
         // `sync_virtualizable_after_guard_failure` runs before bridge setup,
         // but on the multi-frame inlined-callee path its resume-decoded array
@@ -10036,9 +10023,7 @@ fn materialize_virtual_object(
     fields: &[(u32, majit_metainterp::resume::MaterializedValue)],
     materialized_refs: &[Option<majit_ir::GcRef>],
 ) -> Option<majit_ir::GcRef> {
-    use pyre_object::pyobject::{
-        OB_TYPE_OFFSET, PyObject, PyType, W_CLASS_OFFSET, get_instantiate,
-    };
+    use pyre_object::pyobject::{OB_TYPE_OFFSET, PyObject, PyType, W_CLASS_OFFSET};
 
     let size_descr = descr.as_size_descr()?;
     let vtable = size_descr.vtable();
@@ -10057,24 +10042,21 @@ fn materialize_virtual_object(
         return None;
     }
 
-    if vtable as u64 == majit_metainterp::virtualref::JIT_VIRTUAL_REF_VTABLE {
-        // `JitVirtualRef` is a `GcStruct` whose `('super', rclass.OBJECT)` slot
-        // holds the type-id constant itself, not a `PyType *`.  It has no
-        // `w_class`, and running the arm below would dereference the
-        // `JIT_VIRTUAL_REF_VTABLE` magic as a type object.  The field replay
-        // then fills `virtual_token` and `forced` from the traced values, the
-        // same two the optimizer seeds when it lowers `VIRTUAL_REF`.
-        unsafe { (raw as *mut u64).write(vtable as u64) };
-    } else {
-        unsafe {
-            let ptr = raw as *mut PyObject;
-            (*ptr).ob_type = vtable as *const PyType;
-            // rclass.py:739-743 set `w_class` from the cached instantiate
-            // pointer on the PyType. Tracing may later overwrite this via
-            // an explicit `SetfieldGc(w_class)`; the field replay below
-            // takes precedence for that case (heaptracker.py:66-style
-            // "typeptr" filter does NOT apply to w_class in pyre).
-            (*ptr).w_class = get_instantiate(&*(vtable as *const PyType));
+    unsafe {
+        let ptr = raw as *mut PyObject;
+        (*ptr).ob_type = vtable as *const PyType;
+        // rclass.py:739-743 set `w_class` from the cached instantiate
+        // pointer on the PyType. Tracing may later overwrite this via
+        // an explicit `SetfieldGc(w_class)`; the field replay below
+        // takes precedence for that case (heaptracker.py:66-style
+        // "typeptr" filter does NOT apply to w_class in pyre).
+        //
+        // `w_class_obj()` is None when the vtable word is not a `PyType`
+        // pointer — `JitVirtualRef` stores the `jit_virtual_ref_vtable`
+        // type-id constant at offset 0 (`virtualref.py:21-23`) and keeps
+        // `virtual_token` where `w_class` would sit.
+        if let Some(w_class) = size_descr.w_class_obj() {
+            (*ptr).w_class = w_class as *mut PyObject;
         }
     }
 

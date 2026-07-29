@@ -78,7 +78,7 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
 /// jit_virtual_ref_vtable: return inst` (the pointer already *is* the frame)
 /// else materialize via `force_virtual`.
 #[inline]
-pub(crate) fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
+pub fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
         // Only the tracer stores a `JitVirtualRef` here, and it registers the
         // hook when the driver comes up, so an unset hook means the slot was
@@ -306,6 +306,13 @@ pub fn execution_context_builtin_cache_get(ec: &ExecutionContext) -> PyObjectRef
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
 pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);
 
+/// Byte offset of `topframeref` within `ExecutionContext`, for the JIT's
+/// GETFIELD_GC/SETFIELD_GC lowering of [`ExecutionContext::enter`] /
+/// [`ExecutionContext::leave`] at an inlined call.  The traced sequence is
+/// `executioncontext.py:88-89` — read the slot into the callee's `f_backref`,
+/// then store the callee's `jit.virtual_ref` back into it.
+pub const EC_TOPFRAMEREF_OFFSET: usize = std::mem::offset_of!(ExecutionContext, topframeref);
+
 /// Size of `ExecutionContext`, for the JIT's StructPtrInfo SizeDescr
 /// describing the (non-GC) EC struct.  The EC is never JIT-allocated;
 /// this size only backs the field-tracking SizeDescr.
@@ -422,9 +429,16 @@ impl ExecutionContext {
         frame
     }
 
+    /// `self.topframeref()` without the virtualizable force that
+    /// [`Self::gettopframe`] adds — "raw" is about `force_frame`, not about the
+    /// vref.  The vref force is not optional: `executioncontext.py:68/72/446/451`
+    /// all read the slot *with* the parens, and the only unforced reads upstream
+    /// are `:88`/`:96`, which move the vref along rather than dereference it.
+    /// A `JitVirtualRef` handed out here would be dereferenced at `PyFrame`
+    /// field offsets by every caller.
     #[inline]
     pub fn gettopframe_raw(&self) -> *mut PyFrame {
-        self.topframeref
+        force_vref(self.topframeref)
     }
 
     /// `executioncontext.py gettopframe_nohidden` — follow `f_backref` past every

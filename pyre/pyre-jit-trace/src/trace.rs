@@ -1524,6 +1524,30 @@ fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<
     candidate.filter(|&t| crate::jitcode_dispatch::exc_handler_rejoins_loop(code, t))
 }
 
+fn discard_bridge_carrier_walk<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    sym: &mut Sym,
+    entry_depth: usize,
+    pre_pos: majit_metainterp::recorder::TracePosition,
+    pre_virtualref_boxes: &[(majit_ir::OpRef, usize)],
+) {
+    // `pyframe.py:316-358 execute_frame` closes exactly the frame entered by
+    // that invocation in its `finally: executioncontext.leave(...)`.  Close
+    // only scopes this carrier walk opened, while their recorder positions
+    // are still live.  If the walk already closed a parent scope, preserve
+    // only the snapshot prefix that still survives instead of reopening it.
+    let restore_depth = ctx.virtualref_boxes_len().min(entry_depth);
+    while ctx.virtualref_boxes_len() > entry_depth {
+        let before = ctx.virtualref_boxes_len();
+        crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
+        if ctx.virtualref_boxes_len() == before {
+            break;
+        }
+    }
+    ctx.cut_trace(pre_pos);
+    ctx.restore_virtualref_boxes(pre_virtualref_boxes[..restore_depth].to_vec());
+}
+
 fn drive_bridge_carrier_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -1532,6 +1556,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
 ) -> TraceAction {
+    let entry_depth = ctx.virtualref_boxes_len();
+    let pre_virtualref_boxes = ctx.snapshot_virtualref_boxes();
+    let pre_pos = ctx.get_trace_position();
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
@@ -1558,10 +1585,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
         // this measured P2 class permanently declined.
         fbw_bridge_decline(ctx);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
         return p2_drain_abort();
     };
 
-    let pre_pos = ctx.get_trace_position();
     // `setup_reconstructed_callee_frame` emits the callee frame vable into the
     // trace and returns `argboxes_r` seeding the portal reds + in-flight
     // operand-stack temps; the `_pending` callee sym is unused on the sub-walk
@@ -1570,12 +1597,12 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let Some((_pending, argboxes_r)) =
         crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())
     else {
-        ctx.cut_trace(pre_pos);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
         crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
         return p2_drain_abort();
     };
     let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
-        ctx.cut_trace(pre_pos);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
         return p2_drain_abort();
     };
@@ -1585,7 +1612,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         recipe.jitcode_pc,
     );
     let Some(entry) = entry else {
-        ctx.cut_trace(pre_pos);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
         return p2_drain_abort();
     };
@@ -1623,6 +1650,14 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             &[]
         },
     );
+    let deepest_got_exception = matches!(
+        &walk,
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubRaise { .. },
+            _
+        )))
+    );
+    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
     // compile the bridge (the recorded callee continuation + the root
@@ -1762,7 +1797,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
     }
 
-    ctx.cut_trace(pre_pos);
+    discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
@@ -1833,6 +1868,14 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         paused_parents,
         child_result,
     );
+    let got_exception = matches!(
+        &middle_walk,
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubRaise { .. },
+            _
+        )))
+    );
+    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, got_exception);
     match middle_walk {
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
