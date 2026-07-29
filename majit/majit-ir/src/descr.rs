@@ -1226,6 +1226,37 @@ impl GcCache {
         // descr.py:108-118 caches the SizeDescr. Multiple pyre producers may
         // report partial layouts, so the cached owner is upgraded when the
         // incoming frozen list has more fields.
+        //
+        // Field count alone is not authority, and "more fields" is not
+        // "closer to upstream". Where the two producers collide today, the
+        // analyzer-side one (`majit-translate`
+        // `bh_size_spec_from_callcontrol`) is longer by exactly the header
+        // words at offsets 0 and 8 — and `heaptracker.py:60-71
+        // all_fielddescrs`, the list `descr.py:125-126` assigns onto the
+        // cached descr, skips `typeptr` and `c__pad*` outright while the GC
+        // header is not part of the lltype STRUCT at all. Upstream's
+        // positional list is therefore the header-free one, which is what the
+        // runtime groups build.
+        //
+        // The vtable is the reliable discriminator between the two: only the
+        // runtime publish has one, because a build-time spec has no runtime
+        // type object to point at. It decides in both directions, so the
+        // surviving descr is the same whichever producer registers first —
+        // the closest this can get to upstream's single owner per STRUCT.
+        // Losing the vtable is separately fatal —
+        // `new_with_vtable` skips its typeptr store (`majit-gc/src/rewrite.rs`
+        // gates `gen_initialize_vtable` on `vtable != 0`) over zeroed nursery
+        // memory, so the fresh object reads back with a null `ob_type`.
+        //
+        // Upstream has no upgrade rule to arbitrate at all: `descr.py:105-127
+        // get_size_descr` takes the vtable as a parameter, mints once per
+        // STRUCT, and assigns `all_fielddescrs` onto that one owner;
+        // `gc.py:536-542 init_size_descr` stamps the tid on it. Two producers
+        // for one key is pyre's own condition. Where their specs describe
+        // genuinely different layouts — disagreeing on field offsets and
+        // sizes rather than one being a subset of the other — neither side is
+        // right and the key itself is the defect; that is the struct-identity
+        // spelling collision, tracked separately.
         let should_insert = match self._cache_size.get(&key) {
             None => true,
             Some(existing) => {
@@ -1237,7 +1268,20 @@ impl GcCache {
                     .as_size_descr()
                     .map(|sd| sd.all_fielddescrs().len())
                     .unwrap_or(0);
-                new_count > existing_count
+                let existing_vtable = existing.as_size_descr().map_or(0, |sd| sd.vtable());
+                let new_vtable = descr.as_size_descr().map_or(0, |sd| sd.vtable());
+                // Both directions, so the surviving descr does not depend on
+                // which producer happened to register first. The 18
+                // module-scope groups are published before the build-time
+                // specs, but the per-exception-class groups behind
+                // `W_BASE_EXCEPTION_DESCR_CACHE` are not — they arrive after,
+                // and a one-sided rule would reject their vtable exactly the
+                // way the other order loses it.
+                match (existing_vtable != 0, new_vtable != 0) {
+                    (true, false) => false,
+                    (false, true) => true,
+                    _ => new_count > existing_count,
+                }
             }
         };
         if should_insert {
@@ -5349,6 +5393,119 @@ impl FailDescr for SimpleFailDescr {
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
+    }
+}
+
+#[cfg(test)]
+mod register_keyed_size_authority_tests {
+    use super::*;
+
+    fn size_descr_at(type_id: u32, vtable: usize, offsets: &[usize]) -> DescrRef {
+        let mut sd = SimpleSizeDescr::with_vtable(u32::MAX, 32, type_id, vtable);
+        let fields: Vec<Arc<dyn FieldDescr>> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &offset)| {
+                Arc::new(SimpleFieldDescr::new_with_name(
+                    i as u32,
+                    offset,
+                    8,
+                    Type::Int,
+                    false,
+                    ArrayFlag::Signed,
+                    format!("f{offset}"),
+                    format!("f{offset}"),
+                )) as Arc<dyn FieldDescr>
+            })
+            .collect();
+        sd = sd.with_all_fielddescrs(fields);
+        Arc::new(sd) as DescrRef
+    }
+
+    fn size_descr(type_id: u32, vtable: usize, nfields: usize) -> DescrRef {
+        let offsets: Vec<usize> = (0..nfields).map(|i| i * 8).collect();
+        size_descr_at(type_id, vtable, &offsets)
+    }
+
+    /// The analyzer-side producer reports MORE fields and NO vtable, and the
+    /// extra entries are the two header words at offsets 0 and 8 — exactly
+    /// what `heaptracker.py:64-67 all_fielddescrs` skips. Field count alone
+    /// would let that list evict the runtime publish, which holds both the
+    /// header-free positional list upstream builds and the only copy of the
+    /// vtable `new_with_vtable`'s typeptr store needs.
+    #[test]
+    fn a_vtable_less_header_bearing_producer_never_displaces_the_runtime_publish() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x8463ec159694d229);
+        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x1000, &[16, 24, 32]));
+        gc.register_keyed_size(
+            key.clone(),
+            size_descr_at(0x9694d229, 0, &[0, 8, 16, 24, 32]),
+        );
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.type_id(), 7, "the real gc tid must survive");
+        assert_ne!(cached.vtable(), 0, "the vtable must survive");
+        assert_eq!(
+            cached
+                .all_fielddescrs()
+                .iter()
+                .map(|f| f.offset())
+                .collect::<Vec<_>>(),
+            vec![16, 24, 32],
+            "the header words must not enter the positional list",
+        );
+    }
+
+    /// The mirror order. The 18 module-scope groups publish before the
+    /// build-time specs, but the per-exception-class groups do not — they
+    /// arrive after a `vtable: 0` spec is already cached, and a one-sided rule
+    /// would reject their vtable, losing it exactly the way the other order
+    /// does.
+    #[test]
+    fn a_vtable_bearing_publish_still_wins_when_it_arrives_second() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x8463ec159694d229);
+        gc.register_keyed_size(
+            key.clone(),
+            size_descr_at(0x9694d229, 0, &[0, 8, 16, 24, 32]),
+        );
+        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x1000, &[16, 24, 32]));
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.type_id(), 7);
+        assert_ne!(cached.vtable(), 0, "the vtable must win from either side");
+    }
+
+    /// The two orders above must agree; upstream has one owner per `STRUCT`
+    /// and never arbitrates, so an order-dependent answer is a defect by
+    /// itself.
+    #[test]
+    fn the_surviving_descr_does_not_depend_on_registration_order() {
+        let runtime = || size_descr_at(7, 0x1000, &[16, 24, 32]);
+        let analyzer = || size_descr_at(0x9694d229, 0, &[0, 8, 16, 24, 32]);
+        let survivor = |first: DescrRef, second: DescrRef| {
+            let mut gc = GcCache::new();
+            let key = LLType::Struct(3);
+            gc.register_keyed_size(key.clone(), first);
+            gc.register_keyed_size(key.clone(), second);
+            let sd = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+            (sd.type_id(), sd.vtable(), sd.all_fielddescrs().len())
+        };
+        assert_eq!(
+            survivor(runtime(), analyzer()),
+            survivor(analyzer(), runtime())
+        );
+    }
+
+    /// The upgrade rule itself is unchanged when both sides carry a vtable.
+    #[test]
+    fn a_fuller_layout_still_upgrades_when_both_carry_a_vtable() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(11);
+        gc.register_keyed_size(key.clone(), size_descr(7, 0x1000, 1));
+        gc.register_keyed_size(key.clone(), size_descr(9, 0x2000, 3));
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.type_id(), 9);
+        assert_eq!(cached.all_fielddescrs().len(), 3);
     }
 }
 
