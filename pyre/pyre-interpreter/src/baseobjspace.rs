@@ -1171,10 +1171,13 @@ pub(crate) unsafe fn get_and_call_function(
     args_w: &[PyObjectRef],
 ) -> PyResult {
     if !w_descr.is_null()
-        && std::ptr::eq(
+        && (std::ptr::eq(
             unsafe { (*w_descr).ob_type },
             &crate::FUNCTION_TYPE as *const _,
-        )
+        ) || std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+        ))
     {
         let mut full = Vec::with_capacity(args_w.len() + 1);
         full.push(w_obj);
@@ -4265,6 +4268,50 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
             return Ok(w_dict);
         }
     }
+    if unsafe { pyre_object::is_float(obj) } {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return Ok(PY_NULL);
+        };
+        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
+            let existing = unsafe { pyre_object::floatobject::w_float_getdict(obj) };
+            if !existing.is_null() {
+                return Ok(existing);
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let w_dict = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::floatobject::w_float_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
+            return Ok(w_dict);
+        }
+    }
+    if unsafe { pyre_object::is_complex(obj) } {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return Ok(PY_NULL);
+        };
+        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
+            let existing = unsafe { pyre_object::complexobject::w_complex_getdict(obj) };
+            if !existing.is_null() {
+                return Ok(existing);
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let w_dict = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::complexobject::w_complex_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
+            return Ok(w_dict);
+        }
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return Ok(pyre_object::PY_NULL),
@@ -4302,6 +4349,12 @@ pub(crate) fn native_slot_get(
     if unsafe { pyre_object::is_str(obj) } {
         return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_get(obj, index as usize) });
     }
+    if unsafe { pyre_object::is_float(obj) } {
+        return Ok(unsafe { pyre_object::floatobject::w_float_slot_get(obj, index as usize) });
+    }
+    if unsafe { pyre_object::is_complex(obj) } {
+        return Ok(unsafe { pyre_object::complexobject::w_complex_slot_get(obj, index as usize) });
+    }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
         return Ok(None);
@@ -4327,6 +4380,14 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::unicodeobject::w_str_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
+    if unsafe { pyre_object::is_float(obj) } {
+        unsafe { pyre_object::floatobject::w_float_slot_set(obj, index as usize, value) };
+        return Ok(true);
+    }
+    if unsafe { pyre_object::is_complex(obj) } {
+        unsafe { pyre_object::complexobject::w_complex_slot_set(obj, index as usize, value) };
+        return Ok(true);
+    }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
         return Ok(false);
@@ -4347,11 +4408,31 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     if unsafe { pyre_object::is_str(obj) } {
         return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_del(obj, index as usize) });
     }
+    if unsafe { pyre_object::is_float(obj) } {
+        return Ok(unsafe { pyre_object::floatobject::w_float_slot_del(obj, index as usize) });
+    }
+    if unsafe { pyre_object::is_complex(obj) } {
+        return Ok(unsafe { pyre_object::complexobject::w_complex_slot_del(obj, index as usize) });
+    }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
         return Ok(false);
     }
     Ok(unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(w_dict, name) })
+}
+
+/// `space.isinstance_w(w_dict, space.w_dict)` — the dict-or-dict-subclass
+/// gate every typed-field `setdict` arm shares, raising the standard
+/// `__dict__` TypeError otherwise.
+fn require_dict_for_setdict(w_dict: PyObjectRef) -> Result<(), PyError> {
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if unsafe { isinstance_w(w_dict, w_dict_type) } {
+        return Ok(());
+    }
+    Err(PyError::type_error(format!(
+        "__dict__ must be set to a dictionary, not a '{}'",
+        object_functionstr_type_name(w_dict),
+    )))
 }
 
 /// interpreter/baseobjspace.py:70-73 W_Root.setdict(space, w_dict).
@@ -4374,25 +4455,13 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     }
     // function.py:683-688 StaticMethod.setdict.
     if unsafe { pyre_object::function::is_staticmethod(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::function::w_staticmethod_setdict(obj, w_dict) };
         return Ok(());
     }
     // function.py:731-736 ClassMethod.setdict.
     if unsafe { pyre_object::function::is_classmethod(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::function::w_classmethod_setdict(obj, w_dict) };
         return Ok(());
     }
@@ -4410,25 +4479,23 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         return Ok(());
     }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::bytesobject::w_bytes_setdict(obj, w_dict) };
         return Ok(());
     }
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::bytearrayobject::w_bytearray_setdict(obj, w_dict) };
+        return Ok(());
+    }
+    if unsafe { pyre_object::is_float(obj) } {
+        require_dict_for_setdict(w_dict)?;
+        unsafe { pyre_object::floatobject::w_float_setdict(obj, w_dict) };
+        return Ok(());
+    }
+    if unsafe { pyre_object::is_complex(obj) } {
+        require_dict_for_setdict(w_dict)?;
+        unsafe { pyre_object::complexobject::w_complex_setdict(obj, w_dict) };
         return Ok(());
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -4692,6 +4759,32 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // non-proxy operand, costing only one ptr-equality check on the hot
     // path.
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+
+    if name == "__dict__" {
+        if let Some(obj_type) = crate::typedef::r#type(obj) {
+            let module_type = crate::typedef::gettypeobject(&pyre_object::MODULE_TYPE);
+            let shadows_with_foreign_instance_dict = unsafe {
+                lookup_where(obj_type.as_ptr(), "__dict__").is_some_and(|(owner, _)| {
+                    let layout = pyre_object::w_type_get_layout_ptr(owner);
+                    !layout.is_null()
+                        && std::ptr::eq((*layout).typedef, &pyre_object::pyobject::INSTANCE_TYPE)
+                })
+            };
+            if !module_type.is_null()
+                && unsafe { issubtype_w(obj_type.as_ptr(), module_type) }
+                && shadows_with_foreign_instance_dict
+            {
+                let dict = if unsafe { is_module(obj) } {
+                    unsafe { pyre_object::w_module_get_w_dict(obj) }
+                } else {
+                    getdict(obj)?
+                };
+                if !dict.is_null() {
+                    return Ok(dict);
+                }
+            }
+        }
+    }
 
     // GenericAlias.__getattribute__ (`_pypy_generic_alias.py:52`) — every
     // attribute outside `_ATTR_EXCEPTIONS` delegates to `__origin__`.
@@ -5304,22 +5397,44 @@ unsafe fn super_getattribute_wtf8(
         }
         let super_type = pyre_object::descriptor::w_super_get_type(obj);
         let bound_obj = pyre_object::descriptor::w_super_get_obj(obj);
-        // descriptor.py:127-149 _super_check: `su_obj` is itself a subtype of
-        // `su_type` only in the classmethod / class-level case.  A class whose
-        // metaclass is `su_type` is an *instance* of `su_type`, not a subtype,
-        // so it must resolve through `type(su_obj)` — otherwise its MRO never
-        // reaches `su_type` and the lookup fails.  The `type()` fallback also
-        // lets non-INSTANCE builtin subclasses (W_BaseException and friends)
-        // resolve their class through the path that powers `type(obj)`
-        // (`pypy/objspace/std/typeobject.py:1083 type_get_mro`).
-        let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
-            bound_obj
-        } else if is_instance(bound_obj) {
+        // descriptor.py:127-149 _super_check.  `type(su_obj)` — read from the
+        // instance `w_class` for a heap instance, otherwise the `space.type`
+        // path that also serves non-INSTANCE builtin subclasses (W_BaseException
+        // and friends, `pypy/objspace/std/typeobject.py:1083 type_get_mro`).
+        let w_raw_type = if is_instance(bound_obj) {
             w_instance_get_type(bound_obj)
         } else if let Some(cls) = crate::typedef::r#type(bound_obj) {
             cls.as_ptr()
         } else {
-            return Err(PyError::type_error("super: bad obj type"));
+            std::ptr::null_mut()
+        };
+        let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
+            // classmethod / class-level case: `su_obj` is itself a subtype of
+            // `su_type`.
+            bound_obj
+        } else if !w_raw_type.is_null() && issubtype_w(w_raw_type, super_type) {
+            // normal case: `isinstance(su_obj, su_type)`.  A class whose
+            // metaclass is `su_type` also lands here — it is an instance of
+            // `su_type`, resolved through `type(su_obj)`.
+            w_raw_type
+        } else {
+            // slow path: `su_obj.__class__` honouring `__getattribute__`, so a
+            // proxy that forwards `__class__` to a wrapped object is still a
+            // valid target when that class is a subtype of `su_type`.  A
+            // missing `__class__` falls back to `type(su_obj)`; any other error
+            // propagates.
+            let w_type = match getattr_str(bound_obj, "__class__") {
+                Ok(w) => w,
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => w_raw_type,
+                Err(e) => return Err(e),
+            };
+            if !w_type.is_null() && issubtype_w(w_type, super_type) {
+                w_type
+            } else {
+                return Err(PyError::type_error(
+                    "super(type, obj): obj must be an instance or subtype of type",
+                ));
+            }
         };
         let mro_ptr = w_type_get_mro(w_obj_type);
         if mro_ptr.is_null() {
@@ -6174,6 +6289,17 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
 }
 
 fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
+    if name == "__dict__" && unsafe { is_module(obj) } {
+        let dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
+        if !dict.is_null() {
+            return Ok(dict);
+        }
+    }
+    if name == "__doc__" && unsafe { pyre_object::is_member(obj) } {
+        if let Some(doc) = unsafe { pyre_object::w_member_get_doc(obj) } {
+            return Ok(w_str_new(doc));
+        }
+    }
     // Type objects: look up in type's own dict → base dicts
     // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap
     unsafe {
@@ -6192,6 +6318,72 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 w_metaclass,
                 crate::typedef::gettypefor((*obj).ob_type).map(|p| p.as_ptr()),
             ];
+            // A class always exposes its canonical namespace through the
+            // metatype's `__dict__` descriptor.  A Python base mixed into the
+            // metaclass can also contribute an instance-`__dict__` getset,
+            // but that descriptor's mapdict layout does not apply to the
+            // class object and must not shadow `type.__dict__`.
+            if name == "__dict__" {
+                // typeobject.py:811-819 — the metatype MRO is consulted first,
+                // so a metaclass that overrides `__dict__`
+                // (`Meta.__dict__ = property(...)`) supersedes the class's
+                // canonical namespace.  The canonical entry is `type`'s own
+                // `__dict__` getset (owner `type`), whose getter already returns
+                // the class proxy handled by the fallback below; every other
+                // metatype defining `__dict__` is a genuine override to invoke.
+                // (Owner layout typedef cannot narrow this: every class,
+                // including `type` and user metaclasses, chains its layout
+                // typedef to `object`'s `INSTANCE_TYPE`, so `type`'s canonical
+                // getset is told apart by owner identity, not by layout.)
+                for w_metaclass in w_metaclasses.iter().flatten() {
+                    let w_metaclass = *w_metaclass;
+                    if !is_type(w_metaclass) {
+                        continue;
+                    }
+                    if let Some((owner, descr)) = lookup_where(w_metaclass, name) {
+                        // A `__dict__` descriptor is a genuine metatype override
+                        // only when its owner is a proper metaclass (a subclass
+                        // of `type`).  A plain base mixed into the metaclass MRO
+                        // ahead of `type` (`class Meta(Base, type)`) contributes
+                        // an *instance* `__dict__` getset that does not apply to
+                        // a class object; fall through to the canonical proxy for
+                        // it, as for `type`'s own getset (owner `type`).
+                        if !std::ptr::eq(owner, w_type_type)
+                            && issubtype_w(owner, w_type_type)
+                            && is_data_descr(descr)
+                        {
+                            match get(descr, obj, w_metaclass) {
+                                Ok(Some(result)) => return Ok(result),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    return type_getattr_hook_or_err(
+                                        obj,
+                                        &w_metaclasses,
+                                        name,
+                                        e,
+                                        call_getattr,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // No metatype descriptor overrides `__dict__`; a real type
+                // always exposes its canonical namespace, so a null pointer is
+                // an unfinished bootstrap layout rather than a user-visible
+                // mapping — surface it instead of a throwaway writable proxy.
+                let dict_ptr = w_type_get_dict_ptr(obj);
+                debug_assert!(
+                    !dict_ptr.is_null(),
+                    "type object is missing its canonical __dict__"
+                );
+                if dict_ptr.is_null() {
+                    return Err(PyError::runtime_error(
+                        "type object has no canonical __dict__",
+                    ));
+                }
+                return Ok(pyre_object::w_dict_proxy_new(dict_ptr as PyObjectRef));
+            }
             // typeobject.py:811-819 — `space.lookup(self, name)` searches the
             // complete metaclass MRO, and any data descriptor found there is
             // consulted before the class's own MRO.  This includes getsets
@@ -6262,19 +6454,6 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // path below would bind it with `obj=None` and yield the raw
                 // descriptor instead of the bitmask.
                 return Ok(w_int_new(w_type_get_flags(obj)));
-            }
-            if name == "__dict__" {
-                // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
-                // returns `W_DictProxyObject(w_dict)` — a read-only
-                // **live** view of the type's namespace.  The proxy's
-                // identity is fresh per call (a new wrapper) but its
-                // `w_mapping` is the type's canonical W_DictObject.
-                let dict_ptr = w_type_get_dict_ptr(obj);
-                if dict_ptr.is_null() {
-                    return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
-                }
-                let canonical = dict_ptr as PyObjectRef;
-                return Ok(pyre_object::w_dict_proxy_new(canonical));
             }
             if name == "__bases__" {
                 // typeobject.py:1027 descr_get__bases__ — `object` (the root
@@ -6358,29 +6537,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // CPython likewise keeps `tp_doc` beside a member descriptor under
             // the same dict key.  Pyre has no separate type-doc slot, so serve
             // that exact builtin split here without affecting subclasses.
-            if name == "__doc__"
-                && std::ptr::eq(
-                    obj,
-                    crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
-                )
-            {
-                return Ok(w_str_new(crate::typedef::PROPERTY_DOC));
-            }
-            if name == "__doc__"
-                && std::ptr::eq(
-                    obj,
-                    crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
-                )
-            {
-                return Ok(w_str_new(crate::typedef::FUNCTION_DOC));
-            }
-            if name == "__doc__"
-                && std::ptr::eq(
-                    obj,
-                    crate::typedef::gettypeobject(&pyre_object::function::METHOD_TYPE),
-                )
-            {
-                return Ok(w_str_new(crate::typedef::METHOD_DOC));
+            if name == "__doc__" {
+                if let Some(doc) = crate::typedef::type_builtin_own_doc(obj) {
+                    return Ok(doc);
+                }
             }
             // typeobject.py:1166-1179 descr__doc — a heap type reads only its
             // own dict and returns None when absent; class docs are never
@@ -8509,6 +8669,30 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
     }
 }
 
+/// LOAD_SPECIAL attribute resolution, shared by the interpreter
+/// (`eval::load_special`) and the JIT residual (`call_jit::bh_load_special_fn`).
+/// `_PyObject_LookupSpecial` resolves a special method on the type only,
+/// bypassing the instance dict and any `__getattribute__` override, so a pure
+/// `lookup_in_type` followed by the descriptor's `__get__` keeps both engines
+/// calling the same method even when the receiver overrides `__getattribute__`.
+pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    let w_type = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+    let descr = if w_type.is_null() {
+        None
+    } else {
+        unsafe { lookup_in_type(w_type, name) }
+    }
+    .ok_or_else(|| {
+        crate::PyError::attribute_error(format!(
+            "'{}' object has no attribute '{}'",
+            object_functionstr_type_name(obj),
+            name,
+        ))
+    })?;
+    let bound = unsafe { get(descr, obj, w_type) }?.unwrap_or(descr);
+    Ok(bound)
+}
+
 /// `callmethod.py:25-85 LOAD_METHOD` fast-path decision, shared by the
 /// interpreter (`eval::load_method`) and the JIT tracer
 /// (`jitcode_dispatch::try_walker_specialize_load_method_attr`) so both produce the
@@ -8923,6 +9107,11 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
                             pyre_object::gc_roots::shadow_stack_get(mro_root_start + index)
                         })
                         .collect();
+                    if !mro_w.iter().any(|&entry| std::ptr::eq(entry, w_self)) {
+                        return Err(PyError::type_error(
+                            "mro() returned a result without the new class",
+                        ));
+                    }
                     pyre_object::w_type_set_mro(w_self, mro_w.clone());
 
                     // typeobject.py `_add_mro_classes_as_subclasses`: custom
@@ -9322,7 +9511,8 @@ pub(crate) unsafe fn get(
         if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
             return Ok(Some(descr));
         }
-        if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
+        if (std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
+            || std::ptr::eq(ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _))
             && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
         {
             if obj.is_null() {
@@ -9396,7 +9586,11 @@ pub(crate) unsafe fn get(
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
             let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(raiseattrerror(obj, slot_name, None));
+            return Err(PyError::attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                getfulltypename(obj),
+                slot_name,
+            )));
         }
         return Ok(found);
     }
@@ -9629,6 +9823,13 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
                 ));
             }
         };
+        if !w_type_is_heaptype(w_oldcls.as_ptr()) && !std::ptr::eq(w_oldcls.as_ptr(), w_module_type)
+        {
+            return Err(crate::PyError::type_error(
+                "__class__ assignment only supported for mutable types or ModuleType subclasses"
+                    .to_string(),
+            ));
+        }
         // objectobject.py:148-154 — get_full_instance_layout() must match.
         // typeobject.py:125-129 Layout.expand() compares 5-tuple:
         //   (typedef, newslotnames, base_layout, hasdict, weakrefable)
@@ -9763,6 +9964,18 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
 /// `object.__setattr__` and as the default path in `setattr`.
 pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    // `W_BaseException` carries its instance dict on the typed `w_dict` slot but
+    // installs no `__dict__` getset in its namespace, so the descriptor walk
+    // below finds no exception `__dict__` setter.  A plain base mixed into an
+    // exception (`class E(Exception, Base)`) does contribute an *instance*
+    // `__dict__` getset (`Base`'s), whose mapdict layout is incompatible with
+    // the exception layout and rejects the receiver — so the walk must not reach
+    // it.  Route exception `__dict__` assignment straight to `setdict`, ahead of
+    // that walk (`interp_exceptions.py:227-231 W_BaseException.setdict`).
+    if name == "__dict__" && unsafe { pyre_object::is_exception(obj) } {
+        setdict(obj, value)?;
+        return Ok(w_none());
+    }
     // Data descriptor __set__ takes priority (PyPy: descroperation.py
     // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
     // whether `obj` is a Python-level instance, so the lookup must run for
@@ -11377,24 +11590,23 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
     } else {
         unsafe { lookup_in_type_where(w_type, "__length_hint__") }
     };
-    let self_args = [w_obj];
     // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` — a
     // type-MRO descriptor is called with the object as self; the builtin
     // method-table result is already bound and called with no extra args.
-    let (callable, args): (PyObjectRef, &[PyObjectRef]) = match w_descr {
-        Some(descr) => (descr, &self_args),
+    let w_hint_result = match w_descr {
+        Some(descr) => unsafe { get_and_call_function(descr, w_obj, w_type, &[]) },
         None => {
             if unsafe { is_instance(w_obj) } {
                 return Ok(default);
             }
             match getattr_str_impl(w_obj, "__length_hint__", false) {
-                Ok(m) => (m, &[]),
+                Ok(m) => crate::call::call_function_impl_result(m, &[]),
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
-                Err(e) => return Err(e),
+                Err(e) => Err(e),
             }
         }
     };
-    let w_hint = match crate::call::call_function_impl_result(callable, args) {
+    let w_hint = match w_hint_result {
         Ok(v) => v,
         Err(err) => {
             if err.kind == crate::PyErrorKind::TypeError

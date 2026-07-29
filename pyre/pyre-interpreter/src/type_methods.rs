@@ -472,7 +472,6 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // hint before `_do_extend_from_iterable` obtains and consumes the
             // iterator.  Hint failures other than TypeError/AttributeError are
             // observable and propagate without appending a prefix.
-            let _ = crate::baseobjspace::length_hint(other, 0)?;
             // Append each yielded value before asking for the next one.  An
             // exception from a later `next()` does not roll back the prefix.
             let _roots = pyre_object::gc_roots::push_roots();
@@ -5485,6 +5484,54 @@ pub unsafe fn has_dict_backing(obj: PyObjectRef) -> bool {
     !resolve_dict_backing(obj).is_null()
 }
 
+/// Write pyre's object-resident stand-in for a dict subclass's intrinsic
+/// `W_DictMultiObject` payload.  This is a layout-slot operation, not Python
+/// attribute assignment: a subclass may override `__setattr__` with a dict
+/// method before its mapping payload exists.
+/// Absolute layout-slot index of the reserved `__dict_data__` payload for
+/// `obj`, walking the layout chain from the object's type toward its base.
+/// `None` when no layout in the chain reserves the slot.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+unsafe fn dict_data_slot(obj: PyObjectRef) -> Option<u32> {
+    unsafe {
+        let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
+        if w_type.is_null() {
+            return None;
+        }
+        let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
+        while !layout.is_null() {
+            let current = &*layout;
+            let first_slot = current
+                .nslots
+                .saturating_sub(current.newslotnames.len() as u32);
+            if let Some(offset) = current
+                .newslotnames
+                .iter()
+                .position(|name| name == "__dict_data__")
+            {
+                return Some(first_slot + offset as u32);
+            }
+            layout = current.base_layout;
+        }
+        None
+    }
+}
+
+pub fn set_dict_backing(obj: PyObjectRef, backing: PyObjectRef) -> bool {
+    unsafe {
+        if !is_instance(obj) || !is_dict(backing) {
+            return false;
+        }
+        if let Some(slot) = dict_data_slot(obj) {
+            crate::objspace::std::mapdict::setslotvalue(obj, slot, backing);
+            return true;
+        }
+    }
+    false
+}
+
 pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         if is_dict(obj) {
@@ -5515,33 +5562,11 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
             // Read that reserved layout slot directly: going through
             // `getattr_str` would incorrectly expose internal dict operations
             // to a subclass's Python-level `__getattribute__` hook.
-            let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
-            if !w_type.is_null() {
-                let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
-                while !layout.is_null() {
-                    let current = &*layout;
-                    let newslots = current.newslotnames.len() as u32;
-                    let first_slot = if current.nslots > newslots {
-                        current.nslots - newslots
-                    } else {
-                        0
-                    };
-                    if let Some(offset) = current
-                        .newslotnames
-                        .iter()
-                        .position(|name| name == "__dict_data__")
-                    {
-                        if let Some(backing) = crate::objspace::std::mapdict::getslotvalue(
-                            obj,
-                            first_slot + offset as u32,
-                        ) {
-                            if is_dict(backing) {
-                                return backing;
-                            }
-                        }
-                        break;
+            if let Some(slot) = dict_data_slot(obj) {
+                if let Some(backing) = crate::objspace::std::mapdict::getslotvalue(obj, slot) {
+                    if is_dict(backing) {
+                        return backing;
                     }
-                    layout = current.base_layout;
                 }
             }
         }

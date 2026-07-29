@@ -10,10 +10,16 @@ use crate::pyobject::*;
 pub struct W_FloatObject {
     pub ob_header: PyObject,
     pub floatval: f64,
+    /// Native-subclass mapdict owner. Exact floats keep this null.
+    pub w_dict: PyObjectRef,
+    /// Native-subclass `__slots__` storage indexed by `Member.index`.
+    pub w_slots: PyObjectRef,
 }
 
 /// Field offset of `floatval` within `W_FloatObject`, for JIT field access.
 pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, floatval);
+pub const FLOAT_W_DICT_OFFSET: usize = std::mem::offset_of!(W_FloatObject, w_dict);
+pub const FLOAT_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_FloatObject, w_slots);
 
 /// GC type id assigned to `W_FloatObject` at JitDriver init time.
 /// Held as a constant here (rather than runtime-queried) so the
@@ -57,6 +63,8 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
     };
     if crate::gc_interp::enabled() {
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
@@ -86,6 +94,8 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
     if raw.is_null() {
@@ -110,6 +120,37 @@ pub fn box_float_constant(value: f64) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_float_get_value(obj: PyObjectRef) -> f64 {
     unsafe { (*(obj as *const W_FloatObject)).floatval }
+}
+
+#[inline]
+pub unsafe fn w_float_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_FloatObject)).w_dict }
+}
+
+#[inline]
+pub unsafe fn w_float_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe { (*(obj as *mut W_FloatObject)).w_dict = w_dict };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// Address of `W_FloatObject::w_slots` for the shared slot helpers.
+///
+/// # Safety
+/// `obj` must point to a valid `W_FloatObject`.
+unsafe fn float_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
+    unsafe { &mut (*(obj as *mut W_FloatObject)).w_slots }
+}
+
+pub unsafe fn w_float_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    unsafe { crate::slots::slot_get(obj, index, float_slots_field) }
+}
+
+pub unsafe fn w_float_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    unsafe { crate::slots::slot_set(obj, index, value, float_slots_field) }
+}
+
+pub unsafe fn w_float_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    unsafe { crate::slots::slot_del(obj, index, float_slots_field) }
 }
 
 #[majit_macros::dont_look_inside]

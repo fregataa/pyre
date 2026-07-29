@@ -4171,6 +4171,14 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    fn load_special(&mut self, name: &str) -> Result<(), PyError> {
+        let obj = self.pop();
+        let bound = crate::baseobjspace::load_special_resolve(obj, name)?;
+        self.push(bound);
+        self.push(PY_NULL);
+        Ok(())
+    }
+
     /// pyopcode.py:1024-1027 `LOAD_ATTR` — the interpreter consults the mapdict
     /// attribute cache only off-trace; under the JIT it does the plain
     /// `space.getattr`, which the trace folds via the type's `version_tag`.
