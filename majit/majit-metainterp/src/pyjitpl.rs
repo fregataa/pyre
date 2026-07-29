@@ -5229,15 +5229,17 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ptr) = from_consts {
             return ptr;
         }
-        // Bridge traces start from rebuilt resume state, not a fresh portal
-        // entry, so `initial_inputarg_consts` is not seeded with the
-        // virtualizable inputarg's ConstPtr. The live virtualizable pointer
-        // cached by `set_vable_ptr` during JitState setup is the same heap
-        // object (`orig_inpargs[idx].getref_base()`), so fall back to it.
-        if !self.vable_ptr.is_null() {
-            return self.vable_ptr;
+        // Bridge traces have no ConstPtr seeded in `initial_inputarg_consts`.
+        // Prefer the trace-local pointer (RPython's `orig_inpargs` is the
+        // trace's own history): `TraceCtx::virtualizable_heap_ptr` is restored
+        // by the residual-call epilogue after a re-entrant callee deopts,
+        // while `MetaInterp::vable_ptr` may still point at a nested frame
+        // whose shorter `locals_cells_stack_w` would break the virtualizable
+        // field-load preamble's inputargs accounting.
+        if let Some(ptr) = ctx.virtualizable_heap_ptr().filter(|p| !p.is_null()) {
+            return ptr;
         }
-        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null())
+        self.vable_ptr
     }
 
     /// compile.py:168 / pyjitpl.py:3605 parity: every real loop token must
