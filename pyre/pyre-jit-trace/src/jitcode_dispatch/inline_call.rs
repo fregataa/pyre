@@ -1414,6 +1414,43 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     Some((args, concretes))
 }
 
+thread_local! {
+    /// Memo for [`callee_body_has_abort_permanent`], keyed by the stable
+    /// `CodeObject` pointer.  The answer is a static property of the callee's
+    /// assembled body, so it is computed once per code object instead of once
+    /// per inline attempt — the scan is O(body) and the callsite is reached on
+    /// every retrace of every caller.
+    ///
+    /// The raw address is a sound permanent key only because `w_code_new`
+    /// (`pycode.rs`) allocates every `PyCode` with `Box::into_raw` and nothing
+    /// frees it, so the address is unique for the process and never moves.
+    /// `eval.rs`'s `PyCode` registration names the change that would end that —
+    /// switching `w_code_new` to `try_gc_alloc_stable` — after which a
+    /// reclaimed address could return another code object's answer, and here
+    /// a stale `false` would admit an inline whose body does carry
+    /// `abort_permanent`.  Same invariant as `FBW_HAZARDOUS_INLINE_DENY`
+    /// (`fbw_state.rs`).
+    static CALLEE_ABORT_PERMANENT_SEEN: std::cell::RefCell<std::collections::BTreeMap<usize, bool>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Whether the callee's assembled body contains an `abort_permanent` marker.
+///
+/// Same scan `loop_inlines_abort_permanent_callee` runs over a `SubJitCodeBody`
+/// (`trace.rs`), memoized here because this is the per-callsite path.
+fn callee_body_has_abort_permanent(w_code: *const (), body: &SubJitCodeBody) -> bool {
+    let key = w_code as usize;
+    if let Some(hit) = CALLEE_ABORT_PERMANENT_SEEN.with(|m| m.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let hit =
+        crate::jitcode_runtime::decoded_ops(body.code).any(|op| op.opname == "abort_permanent");
+    CALLEE_ABORT_PERMANENT_SEEN.with(|m| {
+        m.borrow_mut().insert(key, hit);
+    });
+    hit
+}
+
 pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -1619,6 +1656,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if nparams > body.num_regs_r {
         return Ok(None);
     }
+    // Inlining a callee whose body carries an `abort_permanent` marker walks
+    // the sub-walk straight into it.  That surfaces as
+    // `TraceAction::AbortPermanent`, which stamps `DONT_TRACE_HERE` on the
+    // CALLER loop's green key — so one unported opcode anywhere in a callee
+    // permanently un-JITs the loop that calls it.  Upstream keeps this
+    // decision static and on the callee: `codewriter/policy.py:48-84`
+    // `look_inside_graph` reads whole-graph properties before tracing, and its
+    // own comment (:78-79) spells out the consequence of a "no" — "the call
+    // will be turned into a residual call".  Answer the same way.
+    //
+    // `loop_inlines_abort_permanent_callee` (`trace.rs`) already screens this
+    // up front, but only for callees it can resolve statically out of globals
+    // and frame slots; a bound method, a container element or a call result
+    // reaches here unscreened.  At this point the callee is concrete, so the
+    // screen is exact.
+    //
+    // Whole-body, like upstream's whole-graph test: a marker on a path this
+    // trace happens not to take still costs only the inline if we decline,
+    // where walking into it costs the whole loop, permanently.
+    if callee_body_has_abort_permanent(w_code, &body) {
+        return Ok(None);
+    }
     // The callee body resolves its `d`/`j` descr operands through its OWN
     // per-fn pool, not the caller's.  Without this the sub-walk reads the
     // wrong descr at the first `getfield_vable_r` / `residual_call`
@@ -1729,6 +1788,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     as *const pyre_interpreter::CodeObject;
                 !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
             };
+    }
+    // A callee `fbw_abort_nested_unjournaled_residual` already named on its
+    // hazard arm residualizes from here on.  The hazard is a static property of
+    // the callee's `CodeObject` (loop-bearing / self-recursive), so re-inlining
+    // it rebuilds the identical framestack and reaches the identical abort —
+    // the enclosing loop is retired for a decline that belongs to the callee.
+    // `warmstate.py:331` `disable_noninlinable_function` is the same answer:
+    // the flag it sets means "do not inline calls to this function", and the
+    // enclosing loop is left free to retrace.
+    //
+    // `bridge_rec_root_selfrec` is exempt: that admission carries its own
+    // `SELFREC_CA_FOLD_ACTIVE` exemption from the hazard arm (:2696), so its
+    // recursive residual is not what named the callee here.
+    if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
+        return Ok(None);
     }
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
@@ -2113,6 +2187,35 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // the callee's residuals for real, and a residual that reads the chain
     // (`sys._getframe`, a traceback) must see the callee it is running in.
     let mut concrete_callee_frame = std::ptr::null_mut::<pyre_interpreter::PyFrame>();
+    // Each precondition below answers "can the multiframe seed serve this
+    // callee".  A "no" declines the INLINE — `Ok(None)`, this function's own
+    // did-not-inline answer, which every caller follows to the ordinary
+    // residual call.  It must not be `Err`: that is
+    // `LoopBearingCalleeInlineUnsupported`, which `trace.rs` maps to
+    // `TraceAction::Abort`, discarding the whole enclosing loop trace.  And
+    // because the arm does not call `fbw_decline`, the same static, callee-shaped
+    // precondition failed identically on every retrace, so the loop kept
+    // re-tracing and re-aborting instead of settling.
+    //
+    // The strict path already declines gracefully here (`break 'seed`); only
+    // the `try_multiframe` path aborted.  Upstream never has this state:
+    // `pyjitpl.py` `do_residual_or_indirect_call` residualizes the callee it
+    // cannot follow, and the recursion-budget path calls `dont_trace_here` and
+    // then still falls through to `do_residual_call` — the enclosing trace
+    // survives either way.  `rlib/jit.py`'s `ABORT_*` set (TOO_LONG, BRIDGE,
+    // BAD_LOOP, ESCAPE, FORCE_QUASIIMMUT, SEGMENTED_TRACE) has no
+    // cannot-inline-this-callee reason at all.
+    //
+    // The variant's own doc justifies abort-over-residual for a callee whose
+    // short inner loops would compile and deopt-storm — but
+    // `callee_fast_path_inlinable_allowing_forward_branch` already rejects every
+    // backward `goto_if_not` and every `switch`, so a `try_multiframe` callee
+    // provably has no inner loop and that rationale does not reach here.
+    //
+    // All of these sit before the first recorded op (the `GETFIELD_GC_R`
+    // below), so returning costs nothing but the inline.  The
+    // POP_JUMP_IF_NONE scan is the one exception and still aborts — see the
+    // note at that site.
     if try_multiframe || strict_seed {
         'seed: {
             // Branch-A frame shape only (mirror REC_CA): no cells.
@@ -2122,14 +2225,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             };
             if raw.is_null() {
                 if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    return Ok(None);
                 }
                 break 'seed;
             }
             let callee_code = unsafe { &*raw };
             if pyre_interpreter::ncells(callee_code) != 0 {
                 if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    return Ok(None);
                 }
                 break 'seed;
             }
@@ -2146,6 +2249,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
             // int bank, so no Ref rebox is needed.  A strict straight-line callee
             // has no branch at all, so this scan never fires for it.
+            //
+            // This is the one precondition here that still aborts instead of
+            // returning `Ok(None)`, and deliberately so.  Residualizing it does
+            // work — `bench/synth/_pending/gc_bug_bridge_flavor_traceback_names`
+            // goes from 98 aborts to 2 and
+            // `_pending/exception_nested_exc_info_restore` from 5 aborts to 0,
+            // both compiling loops they never compiled before — but the loops it
+            // newly compiles then print traceback tuples missing their outermost
+            // frame, diverging from the interpreter (that fixture pins its
+            // expected output in its header).  The abort was masking a lost
+            // `PyTraceback` node on the compiled exception path, not preventing
+            // one.  Restore `Ok(None)` here once that node is recorded; it is the
+            // largest single win left in this function.
             if (0..callee_code.instructions.len()).any(|pc| {
                 matches!(
                     pyre_interpreter::decode_instruction_at(callee_code, pc),
@@ -2168,7 +2284,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 crate::state::ensure_jitcode_index(callee_code_key as *const ())
             else {
                 if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    return Ok(None);
                 }
                 break 'seed;
             };
@@ -2179,7 +2295,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 || ec_reg as usize >= callee_regs_r.len()
             {
                 if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    return Ok(None);
                 }
                 break 'seed;
             }
@@ -2194,7 +2310,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
                 if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    return Ok(None);
                 }
                 break 'seed;
             }
@@ -2362,6 +2478,15 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // the caller frame past its matching handler.  Decline the inline so
         // the call stays residual, where the post-call catch resume
         // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
+        //
+        // FIXME: this `Err` discards the whole enclosing loop trace, where the
+        // comment above describes only declining the inline.  It cannot become
+        // `Ok(None)` in place like the seed preconditions below: by here the
+        // seed block has already recorded `GETFIELD_GC_R` +
+        // `emit_new_pyframe_inline_with_params` and stamped a concrete
+        // `FrameBox` onto that op, so returning would leave dead IR behind.
+        // Closing it means hoisting `decline_inline_caller_frame_for_catch_marker`
+        // ahead of the seed block.
         match compute_inline_caller_frame(ctx, op.pc) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {

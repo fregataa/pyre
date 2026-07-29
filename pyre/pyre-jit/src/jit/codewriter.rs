@@ -6470,7 +6470,22 @@ impl CodeWriter {
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
+            // Straight-line form: the arm has modelled this opcode's stack
+            // effect and the walk falls through to the next PC.  The block is
+            // closed only when nothing follows to close it.
             ($py_pc:expr) => {{
+                emit_abort_permanent!(@emit $py_pc, ($py_pc) + 1 >= code.instructions.len())
+            }};
+            // Terminal form: the marker ends this graph block.  Used by the
+            // arms that `continue` out of the dispatch instead of completing
+            // their stack model — the `Call` nargs > 14 arm (which skips its
+            // `push_and_bump!`) and the `LoadFastCheck` unbound arm (which
+            // switches into a dedicated dead-end block that has no successor
+            // by construction).
+            ($py_pc:expr, closes_block) => {{
+                emit_abort_permanent!(@emit $py_pc, true)
+            }};
+            (@emit $py_pc:expr, $closes_block:expr) => {{
                 // Publish `last_instr` to the vable before the bail so the
                 // blackhole hands the interpreter the right resume
                 // coordinate.  The blackhole replays codewriter jitcode that
@@ -6518,23 +6533,45 @@ impl CodeWriter {
                     None,
                     ($py_pc) as i64,
                 );
-                // `abort_permanent` is a runtime terminator, but RPython's
-                // flow graph has no third terminal block beside returnblock
-                // and exceptblock (`model.py:18-19`).  Keep the orthodox
-                // graph shape by linking the unreachable continuation to
-                // returnblock.  Canonical flattening serializes
-                // `abort_permanent` first; its runtime dispatch never reaches
-                // the synthetic null return.  Leaving this block with no exit
-                // would instead make `flatten.py:107-109` mistake its full
-                // FrameState input tuple for return arguments.
-                let abort_return = super::flow::Link::new(
-                    vec![super::flow::Constant::none().into()],
-                    Some(graph.returnblock.clone()),
-                    None,
-                )
-                .into_ref();
-                append_exit(&current_block.block(), abort_return);
-                needs_fallthrough = false;
+                // `abort_permanent` terminates the *run*, not the *graph*.
+                // Closing the block here would set `exits`, and the
+                // `block_closed_by_terminator` gate below then skips op
+                // dispatch for every later PC — so nothing behind this opcode
+                // is lowered, `merge_entry_by_green` loses every loop header
+                // that follows, and `compile_and_run_once` silently refuses
+                // (`n(target_pc).is_none()`) with no abort recorded.  One
+                // `class` statement, `del`, or annotated assignment in a
+                // module prologue therefore made every loop in that module
+                // permanently un-JITtable.
+                //
+                // RPython has no counterpart to compare against because it
+                // has no unsupported opcodes: `pyopcode.py:865-870
+                // LOAD_BUILD_CLASS` and `:777-778 LOAD_LOCALS` are plain
+                // value pushes and the tracer walks straight through them,
+                // and nothing in `flowcontext.py` blacklists the graph a
+                // hard-to-trace operation appears in.  The parity-preserving
+                // shape is therefore to keep the graph connected: the arms
+                // above already leave a well-typed FrameState (the
+                // `push_fresh_ref` / depth adjustments), so the fall-through
+                // continues to be lowered and a real terminator closes the
+                // block.  Runtime never reaches it — `abort_permanent` hands
+                // control back to the interpreter first.
+                //
+                // A block with no successor to close it must still be closed:
+                // an exit-less block makes `flatten.py:107-109` mistake its
+                // full FrameState input tuple for return arguments.  Link it
+                // to returnblock, the orthodox second terminal block
+                // (`model.py:18-19`).
+                if $closes_block {
+                    let abort_return = super::flow::Link::new(
+                        vec![super::flow::Constant::none().into()],
+                        Some(graph.returnblock.clone()),
+                        None,
+                    )
+                    .into_ref();
+                    append_exit(&current_block.block(), abort_return);
+                    needs_fallthrough = false;
+                }
             }};
         }
 
@@ -6698,6 +6735,54 @@ impl CodeWriter {
                     &current_state,
                     &site,
                 );
+            }};
+        }
+
+        // `flowcontext.py:130-156 BlockRecorder.guessexception` closes the
+        // recording block AT the can-raise operation and resumes normal flow
+        // in a fresh `EggBlock`, so an opcode whose can-raise op is followed
+        // by its own exit wiring (`guessbool` setting the Bool exitswitch,
+        // FOR_ITER's exhaustion split) records the exception edge on the
+        // FIRST block and the branch on the SECOND.  Pyre's arms build both
+        // in one pass, and the generic per-PC catch emission at the bottom of
+        // the dispatch runs too late — it finds the block already closed and
+        // skips the edge.  This macro performs the `guessexception` cut in the
+        // middle of such an arm: attach the exception edge here, then hand the
+        // walker a fresh successor to wire the branch into.
+        //
+        // `$threaded` carries the Variables the successor consumes that the
+        // FrameState does not list — the can-raise op's own result feeding the
+        // branch.  `unsimplify.py:59-76 split_block` threads exactly those
+        // through the link so `regalloc.py:26-77 make_dependencies`, which
+        // computes liveness per block from `inputargs`, sees them live.
+        macro_rules! emit_catch_exception_and_split {
+            ($catch_label:expr, $py_pc:expr, $threaded:expr) => {{
+                let py_pc = $py_pc;
+                emit_catch_exception!($catch_label);
+                let mut next_state = current_state.clone();
+                next_state.next_offset = py_pc;
+                next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                let next_block =
+                    SpamBlockRef::new(graph.new_block(Vec::new()), Some(next_state.clone()));
+                all_walker_blocks.push(next_block.clone());
+                // Identity split: every surviving Variable passes through
+                // unchanged, so `link_args` mirrors `inputargs`.
+                let mut inputargs: Vec<super::flow::FlowValue> = next_state.getvariables();
+                for value in $threaded {
+                    let value: super::flow::FlowValue = value.into();
+                    if let Some(variable) = value.as_variable()
+                        && !inputargs.iter().any(|arg| arg == &value)
+                    {
+                        inputargs.push(variable.into());
+                    }
+                }
+                next_block.block().borrow_mut().inputargs = inputargs.clone();
+                append_exit(
+                    &current_block.block(),
+                    super::flow::Link::new(inputargs, Some(next_block.block()), None).into_ref(),
+                );
+                restore_canraise_exit_order(&current_block.block());
+                current_block = next_block;
             }};
         }
 
@@ -7791,13 +7876,12 @@ impl CodeWriter {
                     // is expected to continue processing the canraise op's
                     // normal-flow result and subsequent ops.
                     //
-                    // `emit_abort_permanent!` is NOT excluded: it appends a
-                    // returnblock link, so `exits` is non-empty and every
-                    // later PC lands here and skips dispatch.  A body that
-                    // aborts therefore stops emitting at that opcode — which
-                    // is why `merge_entry_by_green` drops the loop headers
-                    // behind it instead of taking every header a bytecode
-                    // scan finds.
+                    // `emit_abort_permanent!` does NOT reach this gate: it
+                    // leaves the block open so the rest of the code object
+                    // keeps lowering, and only appends a returnblock link when
+                    // the abort is the last instruction (nothing follows to
+                    // dispatch).  `merge_entry_by_green` therefore keeps the
+                    // loop headers behind an unsupported opcode.
                     //
                     // Reuses `block_closed_by_terminator` computed above the
                     // loop-header `jit_merge_point` gate: the merge emission
@@ -8213,6 +8297,14 @@ impl CodeWriter {
                                 cond_value,
                                 py_pc as i64,
                             );
+                            // `bool` runs the operand's `__bool__`, so inside a
+                            // `try` range it needs its own exception edge before
+                            // `guessbool` closes the block with the two Bool
+                            // exits.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception_and_split!(catch_label, py_pc, [bool_value]);
+                                exception_edge_handled = true;
+                            }
                             // flowcontext.py:756-763 `block.exitswitch = w_cond`.
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
@@ -8293,6 +8385,13 @@ impl CodeWriter {
                                 cond_value,
                                 py_pc as i64,
                             );
+                            // See PopJumpIfFalse — the `bool` can raise out of
+                            // `__bool__`, so cut the block here when the PC is
+                            // covered by a `try` range.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception_and_split!(catch_label, py_pc, [bool_value]);
+                                exception_edge_handled = true;
+                            }
                             // flowcontext.py:756-763 `block.exitswitch = w_cond`.
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
@@ -8817,10 +8916,12 @@ impl CodeWriter {
                                 result.into()
                             };
                             if nargs > 14 {
-                                emit_abort_permanent!(py_pc);
-                                // `abort_permanent` closes this graph block.
-                                // Do not record the synthetic call result or
-                                // any later operation on the closed block.
+                                // `closes_block`: this arm skips the
+                                // `push_and_bump!` below, so its stack model is
+                                // incomplete and the fall-through must not be
+                                // walked.  Do not record the synthetic call
+                                // result or any later operation on the block.
+                                emit_abort_permanent!(py_pc, closes_block);
                                 continue;
                             }
                             push_and_bump!(call_result_value, py_pc);
@@ -10030,22 +10131,11 @@ impl CodeWriter {
                             // — the catch fires only on a non-null backend
                             // exception.
                             if let Some(catch_label) = catch_for_pc[py_pc] {
-                                emit_catch_exception!(catch_label);
-                                let mut b_state = current_state.clone();
-                                b_state.next_offset = py_pc;
-                                b_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                                let block_b = SpamBlockRef::new(
-                                    graph.new_block(Vec::new()),
-                                    Some(b_state.clone()),
+                                emit_catch_exception_and_split!(
+                                    catch_label,
+                                    py_pc,
+                                    [next_value.clone()]
                                 );
-                                all_walker_blocks.push(block_b.clone());
-                                block_b.block().borrow_mut().inputargs = b_state.getvariables();
-                                append_exit(
-                                    &current_block.block(),
-                                    output_link(&current_state, &b_state, block_b.block()),
-                                );
-                                restore_canraise_exit_order(&current_block.block());
-                                current_block = block_b;
                             }
                             // Emit the exhaustion branch: ptr_nonzero(next)
                             // selects between the continue arm (non-null →
@@ -11624,7 +11714,11 @@ impl CodeWriter {
 
                                 current_block = unbound_block;
                                 current_state = unbound_state;
-                                emit_abort_permanent!(py_pc);
+                                // `closes_block`: the null arm's block is a
+                                // dead end by construction — the bound arm
+                                // already merged the fall-through PC above, so
+                                // nothing follows to close this one.
+                                emit_abort_permanent!(py_pc, closes_block);
                                 continue;
                             }
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
