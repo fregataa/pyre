@@ -2227,7 +2227,7 @@ impl RPythonAnnotator {
         // reaching here means a call-site interface (recursivecall /
         // addpendinggraph) leaked an unannotated arg through —
         // fail-loud matches the upstream AttributeError.
-        let unions: Result<Vec<SomeValue>, UnionError> = oldcells
+        let unions: Result<Vec<SomeValue>, (usize, UnionError)> = oldcells
             .iter()
             .zip(inputcells.iter())
             .enumerate()
@@ -2239,23 +2239,59 @@ impl RPythonAnnotator {
                          raised AttributeError)"
                     )
                 });
-                unionof([c1, s2])
+                unionof([c1, s2]).map_err(|e| (i, e))
             })
             .collect();
 
         let unions = match unions {
             Ok(u) => u,
-            Err(e) => {
+            Err((slot, e)) => {
+                // `annrpython.py:437-438` attaches the offending source to the
+                // UnionError before it is recorded or re-raised. `UnionError`
+                // renders only the two annotations, which on its own does not
+                // say which merge produced them — and the merging block is
+                // routinely an inlined callee, so the graph the caller was
+                // annotating is not the graph that failed. Carry the same
+                // `source_lines` context here, plus the input slot the two
+                // annotations belong to.
+                let source = crate::tool::error::source_lines(
+                    graph,
+                    Some(block),
+                    None,
+                    None,
+                    true,
+                    crate::tool::error::SHOW_DEFAULT_LINES_OF_CODE,
+                )
+                .join("\n");
+                // `source_lines1` answers `no source!` for every graph lowered
+                // from LLBC rather than from Python (`graph.source` is absent),
+                // which is all of them here. Quote the block's operations
+                // instead — the same "show the offending block" role upstream's
+                // source-line range plays, rendered the way `gather_error`
+                // already renders an operation (`tool/error.rs:498`).
+                let ops = {
+                    let b = block.borrow();
+                    if b.operations.is_empty() {
+                        "    <no operations>".to_string()
+                    } else {
+                        b.operations
+                            .iter()
+                            .map(|op| format!("    {op}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+                let e = format!("{e}\n\n[mergeinputargs slot={slot}]\n{source}\n{ops}");
                 // Upstream keeps going when `self.keepgoing` is set;
                 // otherwise re-raises.
                 if self.keepgoing {
-                    self.errors.borrow_mut().push(format!("{e}"));
+                    self.errors.borrow_mut().push(e);
                     self.failed_blocks
                         .borrow_mut()
                         .insert(BlockKey::of(block), Rc::clone(block));
                     return;
                 }
-                panic!("UnionError in mergeinputargs: {}", e);
+                panic!("UnionError in mergeinputargs: {e}");
             }
         };
 

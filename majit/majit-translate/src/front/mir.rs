@@ -8697,10 +8697,15 @@ impl<'a> Lowering<'a> {
 
     /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
     /// `String::as_str(&self) -> &str`, `Wtf8::as_str(&self) -> &str`, and
-    /// `<String as Borrow<str>>::borrow(&self) -> &str` — every one
+    /// `<String as Borrow<str>>::borrow(&self) -> &str`, and pyre's
+    /// `as_str_unchecked(&Wtf8) -> &str` — every one
     /// returns a `&str` view of the same string, an identity in the
     /// lifted value model (Rust `String`/`&str`/`str`/`Wtf8`/`Wtf8Buf`
-    /// all lower to the immutable rpy_string).  Without the intercept the
+    /// all lower to the immutable rpy_string).  `as_str_unchecked` names
+    /// the view `Wtf8::as_str` gives once its validity arm has been taken
+    /// separately: `as_str` itself returns `Result<&str, Utf8Error>`,
+    /// whose destination does not strip to `str`, so it fails the gate
+    /// below and stays a wall.  Without the intercept the
     /// call keeps a `CallTarget::Method` `as_ref` getattr the rtyper
     /// cannot route on the classdef-less string receiver (the `Cannot
     /// find attribute "as_ref" on UnicodeString` wall).  Bind the
@@ -8727,7 +8732,7 @@ impl<'a> Lowering<'a> {
         let Some(leaf) = np.rsplit("::").next() else {
             return false;
         };
-        if !matches!(leaf, "as_ref" | "as_str" | "borrow") {
+        if !matches!(leaf, "as_ref" | "as_str" | "as_str_unchecked" | "borrow") {
             return false;
         }
         if !first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc)) {
@@ -10147,14 +10152,31 @@ impl<'a> Lowering<'a> {
     /// and keeps the generic `Call` form (none arise today; the live
     /// callers are `neg`'s `int_value` and `functional`'s `step`,
     /// both `i64`).
-    /// Lower `i64::wrapping_{add,sub,mul}` (`core::num::<Impl>::wrapping_*`,
-    /// Opaque in the LLBC like every core fn) to the native
-    /// `BinOp("add"/"sub"/"mul")`.  `Signed` arithmetic is modular
-    /// machine arithmetic — `rint.py rtype_add` emits `int_add` with no
-    /// overflow check, and `int_add` wraps (`rarithmetic.py intmask`
-    /// semantics) — so the wrapping method IS the plain llop.  Restricted
-    /// to word-sized signed receivers; a narrower `wrapping_add` (which
-    /// wraps at its own width) keeps the `Call` form.
+    /// Lower `{i64,u64}::wrapping_{add,sub,mul}`
+    /// (`core::num::<Impl>::wrapping_*`, Opaque in the LLBC like every
+    /// core fn) to the native `BinOp("add"/"sub"/"mul")`.  `Signed`
+    /// arithmetic is modular machine arithmetic — `rint.py:217
+    /// rtype_add` emits `int_add` with no overflow check, and `int_add`
+    /// wraps (`rarithmetic.py intmask` semantics) — so the wrapping
+    /// method IS the plain llop.  Restricted to word-sized receivers; a
+    /// narrower `wrapping_add` (which wraps at its own width) keeps the
+    /// `Call` form.
+    ///
+    /// Both integer banks count, the lesson [`vec_index_type_is_scalar`]
+    /// already carries: `usize` serializes as `{"UInt": "Usize"}`, which
+    /// `tyref_literal_int_atom` does not see at all, so an `Int`-only
+    /// test silently declined every unsigned counter (`keys_version`,
+    /// `clear_gen`) and left the enclosing graph blocked on the call.
+    /// Unsigned is the same machine op under a different rtyper
+    /// dispatch: `rint.py`'s `opprefix` makes it `uint_add`, and
+    /// `jtransform.py:1608-1610` renames `uint_{add,sub,mul}` straight
+    /// back to `int_{add,sub,mul}` for the JIT.
+    ///
+    /// The result carries the receiver's signedness rather than a flat
+    /// `Int`.  `union_type` widens `Int ∪ Unsigned` to `Unknown`
+    /// (`binaryop.py:191` UnionError), so annotating a `usize` sum as
+    /// `Int` would poison the merge where it meets the unsigned field
+    /// read it came from.
     fn try_lower_wrapping_binop(
         &mut self,
         mir_bb: usize,
@@ -10190,7 +10212,9 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+        let signed_word = matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"));
+        let unsigned_word = matches!(self.tyref_literal_uint_atom(src), Some("U64" | "Usize"));
+        if !signed_word && !unsigned_word {
             return Ok(false);
         }
         let bb_id = self.block_id[mir_bb];
@@ -10203,7 +10227,11 @@ impl<'a> Lowering<'a> {
                 op: op.to_string(),
                 lhs: lhs.clone(),
                 rhs: rhs.clone(),
-                result_ty: ValueType::Int,
+                result_ty: if unsigned_word {
+                    ValueType::Unsigned
+                } else {
+                    ValueType::Int
+                },
             },
         });
         self.local_var[dest_local] = Some(res);
@@ -11600,10 +11628,11 @@ fn constants_call_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
 /// so the index type must be an integer.  Charon runs `monomorphize:false`,
 /// so the signature keeps the generic index param `I` (a `TypeVar` typing
 /// as `Ref`); the concrete index type is the callsite substitution
-/// `types[1]` of the impl generics `[T, I, A]`.  `Index<usize>` types as
-/// `Unsigned` and signed integer indices as `Int`; both occupy RPython's
-/// integer register bank. `Index<Range<…>>` resolves to a `Range*` Adt
-/// (`Ref`) and returns `None`. Owner/leaf are derived the same way
+/// `types[1]` of the impl generics `[T, I, A]`, which
+/// [`vec_index_type_is_scalar`] classifies: `Index<usize>` types as
+/// `Unsigned` and signed integer indices as `Int`, and both occupy RPython's
+/// integer register bank, while `Index<Range<…>>` resolves to a `Range*` Adt
+/// (`Ref`) and returns `None`.  Owner/leaf are derived the same way
 /// [`call_target_segments`]
 /// derives the call key (`impl_method_owner_for_fundecl`).  Free so the
 /// same gate is shared by the call-lowering intercept and the deferred-write
@@ -11630,13 +11659,25 @@ fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-        .is_some_and(|t| {
-            matches!(
-                tyref_to_value_type(&t, llbc),
-                ValueType::Int | ValueType::Unsigned
-            )
-        });
+        .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
     int_indexed.then_some(leaf)
+}
+
+/// Whether `ty` is an index type [`vec_index_regular_leaf`] may lower to a
+/// scalar `ArrayRead` / `ArrayWrite`.
+///
+/// Both integer banks count. `usize` — what essentially every real callsite
+/// indexes with — serializes as `{"UInt": "Usize"}` and types as
+/// [`ValueType::Unsigned`], so an `Int`-only test silently rejects it and
+/// leaves the whole fold dead: the `#[ignore]`d real-LLBC anchor
+/// `vec_index_mut_fill_user_function_args_real` failed with two residual
+/// `index_mut` calls.  A `Range` index types as `Ref` and is still rejected,
+/// which is what the gate exists for.
+fn vec_index_type_is_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    matches!(
+        tyref_to_value_type(ty, llbc),
+        ValueType::Int | ValueType::Unsigned
+    )
 }
 
 /// Whether a [`RegularCall`] is a `Vec<T>` `index` **or** `index_mut` on an
@@ -14591,12 +14632,25 @@ fn tuple_per_shape_enabled() -> bool {
 /// Route inline-Field `dyn Trait` virtual calls through the faithful
 /// `CallTarget::Indirect` vtable pipeline instead of the synthetic
 /// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
-/// Default-OFF — `PYRE_DYN_INDIRECT=1` opts in; every other value (unset
-/// included) keeps the inert `__dyn_call` emit.
+///
+/// `__dyn_call` is not a lowering, it is a placeholder: an unregistered
+/// synthetic path that stops whatever graph reaches it.  Routing through
+/// `Indirect` is what `jtransform.py`'s `indirect_call` does, so this is the
+/// faithful side.  It was gated while the widening it forces — the annotator
+/// now annotates every family member's body — outweighed what it bought;
+/// census at the flip point, both states, same corpus:
+///
+/// | gate | records | biggest wall |
+/// |---|---:|---|
+/// | off | 243 | `__dyn_call` 48 |
+/// | on  | **224** | `Wtf8::as_str` 37 |
+///
+/// On by default; `PYRE_DYN_INDIRECT=0` is the kill switch that restores the
+/// inert `__dyn_call` emit.
 pub(crate) fn dyn_indirect_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("PYRE_DYN_INDIRECT").as_deref(),
-        Ok("1") | Ok("true")
+        Ok("0") | Ok("false")
     )
 }
 
@@ -20354,6 +20408,48 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    /// The `Vec` index fold must accept a `usize` index.
+    ///
+    /// `usize` types as `Unsigned`, not `Int`, so gating on `Int` alone left
+    /// both the read and write lifts dead for every real callsite — caught
+    /// only by the `#[ignore]`d real-LLBC anchor
+    /// (`vec_index_mut_fill_user_function_args_real`), which does not run in
+    /// CI.  This pins the acceptance set without the 440MB corpus.
+    #[test]
+    fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let ty = |v: serde_json::Value| {
+            serde_json::from_value::<super::TyRef>(serde_json::json!({
+                "HashConsedValue": [0, v]
+            }))
+            .expect("fixture TyRef parses")
+        };
+        let usize_ty = ty(serde_json::json!({ "Literal": { "UInt": "Usize" } }));
+        assert_eq!(
+            super::tyref_to_value_type(&usize_ty, &llbc),
+            crate::model::ValueType::Unsigned,
+            "usize must type as Unsigned — the trap this gate fell into"
+        );
+        assert!(
+            super::vec_index_type_is_scalar(&usize_ty, &llbc),
+            "Vec index fold must accept a usize index"
+        );
+        assert!(
+            super::vec_index_type_is_scalar(
+                &ty(serde_json::json!({ "Literal": { "Int": "I64" } })),
+                &llbc
+            ),
+            "Vec index fold must accept a signed index"
+        );
+        assert!(
+            !super::vec_index_type_is_scalar(
+                &ty(serde_json::json!({ "Adt": { "id": { "Adt": 7 } } })),
+                &llbc
+            ),
+            "a Range index types as Ref and must stay rejected"
+        );
     }
 
     #[test]

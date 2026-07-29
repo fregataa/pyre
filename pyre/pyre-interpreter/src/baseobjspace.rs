@@ -1662,19 +1662,12 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        let mut result = Wtf8Buf::new();
-        let mut i = start;
-        for n in 0..slicelength {
-            if i >= 0 {
-                if let Some(cp) = at(i as usize) {
-                    result.push(cp);
-                }
-            }
-            if n + 1 < slicelength {
-                i += step;
-            }
-        }
-        return Ok(w_str_from_wtf8(result));
+        return Ok(pyre_object::unicodeobject::w_str_slice_codepoints(
+            obj,
+            start,
+            step,
+            slicelength,
+        ));
     }
     // `descr_getitem`: getindex_w(index, IndexError, "string") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
@@ -1707,9 +1700,9 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let actual_idx = if idx < 0 { len as i64 + idx } else { idx };
     if actual_idx >= 0 {
         if let Some(cp) = at(actual_idx as usize) {
-            let mut one = Wtf8Buf::new();
-            one.push(cp);
-            return Ok(w_str_from_wtf8(one));
+            return Ok(pyre_object::unicodeobject::w_str_from_codepoint(
+                cp.to_u32(),
+            ));
         }
     }
     Err(PyError::new(
@@ -2018,7 +2011,7 @@ pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "range.count() takes exactly one argument ({} given)",
-            args.len().saturating_sub(1)
+            crate::type_methods::args_given(args)
         )));
     }
     let obj = args[0];
@@ -2057,7 +2050,7 @@ pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "range.index() takes exactly one argument ({} given)",
-            args.len().saturating_sub(1)
+            crate::type_methods::args_given(args)
         )));
     }
     let obj = args[0];
@@ -3503,7 +3496,13 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
             ),
         ));
     }
-    for (k, &idx) in indices.iter().enumerate() {
+    // Walked by index rather than `.iter().enumerate()`: `Enumerate::next` is
+    // an unregistered foreign leaf that stops this graph, and the position is
+    // already needed as `k`.  `listobject.py setitem__List_ANY_ANY`'s extended
+    // arm spells the same walk as a plain `range` loop.
+    let mut k = 0usize;
+    while k < indices.len() {
+        let idx = indices[k];
         let item =
             pyre_object::w_list_getitem(w_other, k as i64).expect("k < other_len by construction");
         if !pyre_object::w_list_setitem(obj, idx, item) {
@@ -3512,6 +3511,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
                 "list assignment index out of range",
             ));
         }
+        k += 1;
     }
     Ok(w_none())
 }
@@ -3775,10 +3775,17 @@ unsafe fn setitem_bytearray_slice(
             ),
         ));
     }
-    for (k, &idx) in indices.iter().enumerate() {
-        if let Some(slot) = vec.get_mut(idx) {
-            *slot = sequence2[k];
+    // Index walk rather than `.iter().enumerate()` / `slice::get_mut`, both of
+    // which are unregistered foreign leaves that stop this graph;
+    // `bytearrayobject.py setitem__Bytearray_ANY_ANY`'s extended arm is the
+    // same plain `range` loop.
+    let mut k = 0usize;
+    while k < indices.len() {
+        let idx = indices[k];
+        if idx < vec.len() {
+            vec[idx] = sequence2[k];
         }
+        k += 1;
     }
     Ok(w_none())
 }
@@ -7628,15 +7635,14 @@ pub fn str_utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
             crate::type_methods::arg_type_name(obj)
         )));
     }
-    // The raw buffer read below is only valid for a `str`.
-    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
-    match wtf8.as_str() {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            let pos = wtf8
-                .code_points()
-                .position(|cp| cp.to_char().is_none())
-                .unwrap_or(0);
+    // The buffer read below is only valid for a `str`.
+    match unsafe { pyre_object::w_str_get_value_opt(obj) } {
+        Some(s) => Ok(s),
+        None => {
+            // `w_str_first_surrogate` already located the offending code
+            // point while deciding there was no `&str` view; re-reading it
+            // costs a second scan only on the raising path.
+            let pos = unsafe { pyre_object::w_str_first_surrogate(obj) }.max(0) as usize;
             Err(crate::typedef::unicode_encode_error(
                 "utf-8",
                 obj,
@@ -12717,11 +12723,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // Box the idx-th code point as a one-character str,
                 // reading the WTF-8 view so a lone surrogate is yielded
                 // instead of panicking.
-                pyre_object::w_str_codepoint_at(seq, idx as usize).map(|cp| {
-                    let mut one = Wtf8Buf::new();
-                    one.push(cp);
-                    w_str_from_wtf8(one)
-                })
+                pyre_object::w_str_codepoint_at(seq, idx as usize)
+                    .map(|cp| pyre_object::unicodeobject::w_str_from_codepoint(cp.to_u32()))
             } else if pyre_object::bytesobject::is_bytes_like(seq) {
                 // Each item is the byte's ordinal, read from the live buffer.
                 if (idx as usize) < pyre_object::bytesobject::bytes_like_len(seq) {
@@ -12996,9 +12999,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             for &arg in &call_args {
                 pyre_object::gc_roots::pin_root(arg);
             }
-            let rooted_args: Vec<_> = (0..call_args.len())
-                .map(|index| pyre_object::gc_roots::shadow_stack_get(first_arg_slot + index))
-                .collect();
+            let mut rooted_args = Vec::with_capacity(call_args.len());
+            for index in 0..call_args.len() {
+                rooted_args.push(pyre_object::gc_roots::shadow_stack_get(
+                    first_arg_slot + index,
+                ));
+            }
             let w_fun = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
                 as *const pyre_object::interp_itertools::W_StarMap))
                 .w_fun;
@@ -13116,9 +13122,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             // Rebuild from roots because any preceding `next` may have moved
             // the yielded objects after their raw addresses entered `objects`.
             let objects_base = pyre_object::gc_roots::shadow_stack_len() - objects.len();
-            let rooted_objects = (0..objects.len())
-                .map(|index| pyre_object::gc_roots::shadow_stack_get(objects_base + index))
-                .collect();
+            let mut rooted_objects = Vec::with_capacity(objects.len());
+            for index in 0..objects.len() {
+                rooted_objects.push(pyre_object::gc_roots::shadow_stack_get(
+                    objects_base + index,
+                ));
+            }
             return Ok(pyre_object::w_tuple_new(rooted_objects));
         }
         // `pypy/module/__builtin__/functional.py:930-942 W_Filter.next_w`
@@ -13203,9 +13212,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         mo::w_map_get_fun(pyre_object::gc_roots::shadow_stack_get(obj_slot));
                     pyre_object::gc_roots::pin_root(w_fun);
                     let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                    let rooted_items: Vec<_> = (0..items.len())
-                        .map(|index| pyre_object::gc_roots::shadow_stack_get(items_base + index))
-                        .collect();
+                    let mut rooted_items = Vec::with_capacity(items.len());
+                    for index in 0..items.len() {
+                        rooted_items
+                            .push(pyre_object::gc_roots::shadow_stack_get(items_base + index));
+                    }
                     crate::call::call_function_impl_result(
                         pyre_object::gc_roots::shadow_stack_get(fun_slot),
                         &rooted_items,
@@ -13874,7 +13885,7 @@ pub(crate) fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     if positional.len() != 3 {
         return Err(crate::PyError::type_error(format!(
             "__set_name__() takes 2 positional arguments but {} were given",
-            positional.len().saturating_sub(1),
+            crate::type_methods::args_given(positional),
         )));
     }
     let prop = property_require_obj(
@@ -14495,7 +14506,7 @@ pub(crate) fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> PyResult {
-    let given = args.len().saturating_sub(1);
+    let given = crate::type_methods::args_given(args);
     if given == 0 {
         return Err(PyError::type_error(
             "throw expected at least 1 argument, got 0",
@@ -14508,8 +14519,8 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
     }
     let gen_obj = args[0];
     let w_type = args[1];
-    let w_val = args.get(2).copied().unwrap_or_else(w_none);
-    let w_tb = args.get(3).copied().unwrap_or_else(w_none);
+    let w_val = crate::type_methods::arg_or_none(args, 2);
+    let w_tb = crate::type_methods::arg_or_none(args, 3);
     let argc = given;
 
     // Python 3.14 deprecates only the legacy three-argument spelling; the
@@ -14632,7 +14643,7 @@ pub(crate) fn coroutine_wrapper_next_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn coroutine_wrapper_send_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
-    let value = args.get(1).copied().unwrap_or_else(w_none);
+    let value = crate::type_methods::arg_or_none(args, 1);
     generator_send_ex(coroutine, value, None, None)
 }
 
@@ -14687,7 +14698,7 @@ pub(crate) fn async_generator_anext_method(args: &[PyObjectRef]) -> PyResult {
 
 pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
-    let value = args.get(1).copied().unwrap_or_else(w_none);
+    let value = crate::type_methods::arg_or_none(args, 1);
     async_generator_init_hooks(async_gen)?;
     Ok(pyre_object::generator::w_async_gen_asend_new(
         async_gen, value,
@@ -14695,7 +14706,7 @@ pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
-    let given = args.len().saturating_sub(1);
+    let given = crate::type_methods::args_given(args);
     if given == 0 {
         return Err(PyError::type_error(
             "athrow expected at least 1 argument, got 0",
@@ -14720,8 +14731,8 @@ pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::generator::w_async_gen_athrow_new(
         async_gen,
         args[1],
-        args.get(2).copied().unwrap_or_else(w_none),
-        args.get(3).copied().unwrap_or_else(w_none),
+        crate::type_methods::arg_or_none(args, 2),
+        crate::type_methods::arg_or_none(args, 3),
     ))
 }
 
@@ -14795,7 +14806,7 @@ pub(crate) fn async_gen_asend_next_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn async_gen_asend_send_method(args: &[PyObjectRef]) -> PyResult {
     async_gen_asend_do_send(
         args.first().copied().unwrap_or(PY_NULL),
-        args.get(1).copied().unwrap_or_else(w_none),
+        crate::type_methods::arg_or_none(args, 1),
     )
 }
 
@@ -14974,7 +14985,7 @@ pub(crate) fn async_gen_athrow_next_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn async_gen_athrow_send_method(args: &[PyObjectRef]) -> PyResult {
     async_gen_athrow_do_send(
         args.first().copied().unwrap_or(PY_NULL),
-        args.get(1).copied().unwrap_or_else(w_none),
+        crate::type_methods::arg_or_none(args, 1),
     )
 }
 

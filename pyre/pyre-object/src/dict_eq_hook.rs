@@ -216,6 +216,24 @@ pub fn clear_hash_w_hook() {
     HASH_W_HOOK.with(|cell| cell.set(None));
 }
 
+/// True when an `eq_w` hook is installed on this thread.
+/// `dont_look_inside`: thread-local read, residualizes via the registered
+/// fnaddr (same pattern as [`has_hash_w_hook`]).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn has_eq_w_hook() -> bool {
+    EQ_W_HOOK.with(|cell| cell.get().is_some())
+}
+
+/// Invoke the installed `eq_w` hook; returns `false` when no hook is
+/// installed — gate with [`has_eq_w_hook`] (the [`try_eq_w`] wrapper does).
+/// Not `unsafe` for ABI-surface reasons (residual calls dispatch through a
+/// plain fnaddr); `a` / `b` must nonetheless be valid PyObjectRefs (null
+/// tolerated as per PyPy's `is_w` shortcut at `baseobjspace.py:818-822`).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn eq_w_hooked(a: PyObjectRef, b: PyObjectRef) -> bool {
+    EQ_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(a, b) }).unwrap_or(false))
+}
+
 /// Invoke the installed `eq_w` hook.  Returns `None` when no hook is
 /// installed (pyre-object lib tests, pre-init snapshot tools); the
 /// caller falls back to the limited-type builtin equality so existing
@@ -226,7 +244,11 @@ pub fn clear_hash_w_hook() {
 /// PyPy's `is_w` shortcut at `baseobjspace.py:818-822`).
 #[inline]
 pub unsafe fn try_eq_w(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
-    EQ_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(a, b) }))
+    if has_eq_w_hook() {
+        Some(eq_w_hooked(a, b))
+    } else {
+        None
+    }
 }
 
 /// Invoke the installed `hash_w` hook.  Returns `None` when no hook
@@ -300,6 +322,19 @@ pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
     HASH_STR_HOOK.with(|cell| cell.get().map(|f| unsafe { f(ptr, len) }).unwrap_or(0))
 }
 
+/// [`hash_str_hooked`] over a byte slice.
+///
+/// Marked so the `as_ptr` decomposition runs *inside* the boundary that is
+/// already opaque (`rlib/jit.py:139`): `core::slice::<Impl>::as_ptr` is an
+/// unregistered foreign leaf, and spelling it in [`try_hash_str`]'s traced body
+/// stopped that graph and every caller above it.  A `&[u8]` argument crosses a
+/// residual call unchanged — the same shape `host_seam::emit_stdout` uses — and
+/// the `i64` result is a single word, so nothing here widens the residual ABI.
+#[majit_macros::dont_look_inside]
+pub fn hash_str_hooked_bytes(bytes: &[u8]) -> i64 {
+    hash_str_hooked(bytes.as_ptr(), bytes.len())
+}
+
 /// Invoke the installed `hash_str` hook over `bytes`.  Returns `None` when no
 /// hook is installed (pyre-object lib tests without the str hook, pre-init
 /// snapshot tools); the str-keyed GET helpers then fall back to the
@@ -307,7 +342,7 @@ pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
 #[inline]
 pub fn try_hash_str(bytes: &[u8]) -> Option<i64> {
     if has_hash_str_hook() {
-        Some(hash_str_hooked(bytes.as_ptr(), bytes.len()))
+        Some(hash_str_hooked_bytes(bytes))
     } else {
         None
     }

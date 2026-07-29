@@ -74,6 +74,79 @@ unsafe fn identity_storage<'a>(
     &*(dict.dstorage as *const indexmap::IndexMap<IdentityKey, PyObjectRef>)
 }
 
+/// Internal helper: `IdentityDictStrategy::getitem` body.  Caller must have
+/// already verified `is_correct_type(w_key)`.
+///
+/// Residualise the identity-storage getitem leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the twin of `dictmultiobject::w_dict_lookup_int_strategy`:
+/// the `IndexMap::get` it wraps is an external-crate heap-lookup the tracer
+/// cannot model — the oopspec'd residual arm of
+/// `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
+/// [`IdentityKey`] hashes and compares by address, so the probe runs no user
+/// Python code at all.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on
+/// [`IDENTITY_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_lookup_identity_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    identity_storage(obj).get(&IdentityKey(key)).copied()
+}
+
+/// `dictmultiobject.py:1081-1087 delitem`'s identity-keyed remove — drop the
+/// entry for `key` and report whether one was there.
+///
+/// Residualise the storage remove alone (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the delete twin of [`w_dict_lookup_identity_strategy`]:
+/// upstream's `_ll_dict_del` (`rordereddict.py:884`) carries
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and an
+/// `IndexMap` can never be virtual to this front end, so the predicate is
+/// permanently false and the residual arm is the only one reachable.  The
+/// keys-version bump stays traced.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_delete_identity_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    identity_storage_mut(obj)
+        .shift_remove(&IdentityKey(key))
+        .is_some()
+}
+
+/// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
+/// instantiation for IdentityDictStrategy — `wrap` is identity (`:26-27`), so
+/// the migration ports each `IdentityKey(obj)` into
+/// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
+///
+/// Residualised (`@dont_look_inside`, `rlib/jit.py:139`) for the reason
+/// `dictmultiobject::w_dict_switch_int_to_object_strategy` is: the body is
+/// `IndexMap` construction and refill end to end, and the front end has no
+/// lowering for it, so there is no modellable point inside to put the boundary
+/// at.
+///
+/// # Safety
+/// `w_dict` must be a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    // Borrow the old typed box (its field stays live, so it is traced
+    // while the migration builds the object map); after the store the
+    // box is unreachable and the sweep reclaims it.
+    let old = &*(dict.dstorage as *const IdentityDictStorage);
+    let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
+    for (k, &v) in old.iter() {
+        new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
+    }
+    dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
+        new_map,
+        crate::dictmultiobject::object_dict_storage_gc_type_id(),
+    ) as *mut u8;
+    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+}
+
 #[inline]
 unsafe fn identity_storage_mut<'a>(
     obj: PyObjectRef,
@@ -148,20 +221,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// (`:26-27`), so the migration ports each `IdentityKey(obj)` into
     /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // Borrow the old typed box (its field stays live, so it is traced
-        // while the migration builds the object map); after the store the
-        // box is unreachable and the sweep reclaims it.
-        let old = &*(dict.dstorage as *const IdentityDictStorage);
-        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
-        for (k, &v) in old.iter() {
-            new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
-        }
-        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
-            new_map,
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as *mut u8;
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+        w_dict_switch_identity_to_object_strategy(w_dict);
     }
 
     /// `identitydict.py:67-70 get_empty_storage` — erased `{}` with
@@ -180,7 +240,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// O(1) identity-keyed lookup.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if Self::is_correct_type(w_key) {
-            return identity_storage(w_dict).get(&IdentityKey(w_key)).copied();
+            return w_dict_lookup_identity_strategy(w_dict, w_key);
         }
         // `identitydict.py:40-41 _never_equal_to` → always False, so
         // mismatched keys always promote and retry.
@@ -215,8 +275,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// on mismatch, promote to Object.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if Self::is_correct_type(w_key) {
-            let entries = identity_storage_mut(w_dict);
-            let removed = entries.shift_remove(&IdentityKey(w_key)).is_some();
+            let removed = w_dict_delete_identity_strategy(w_dict, w_key);
             if removed {
                 crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             }
