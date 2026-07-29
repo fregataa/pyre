@@ -981,9 +981,6 @@ fn try_commit_midbody_abort_inner(
     }
 }
 
-/// True when `start_pc` is the target of a `JumpBackward` in `code` — i.e. a
-/// loop header, the origin of a loop-header trace rather than a function-entry
-/// trace.
 fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -1868,111 +1865,102 @@ fn seed_loop_entry_ref_slots(
     }
 }
 
-/// Materialize a blackhole `ContinueRunningNormally` handoff into the live
-/// interpreter frame: write every live local / operand-stack slot from the
-/// terminal register banks, then move the frame to the resume coordinate.
+/// Hand a blackhole `ContinueRunningNormally` back the way upstream does:
+/// resume on the frame the blackhole has been writing, not on one rebuilt from
+/// the terminal register banks.
 ///
-/// Shared by the single-frame and multi-frame adopt paths — the multi-frame
-/// chain's terminal frame is the portal level, so it needs the exact same
-/// treatment (a chain whose inner levels committed through their own
-/// virtualizable still leaves the portal's `valuestackdepth` at the aborted
-/// mid-expression value).
-fn apply_blackhole_crn(
-    frame: usize,
-    jitcode_index: i32,
-    position: usize,
-    last_opcode_position: usize,
-    registers_i: &[i64],
-    registers_r: &mut [i64],
-    registers_f: &[i64],
-    resume_py_pc: usize,
-) -> bool {
-    if frame == 0 {
-        return false;
-    }
-    let Some(stack_base) = crate::state::concrete_nlocals(frame) else {
-        return false;
-    };
-    let pf = unsafe { &mut *(frame as *mut pyre_interpreter::PyFrame) };
-    let w_code = pf.pycode;
-    if w_code.is_null() {
-        return false;
-    }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    let Some(stack_depth) = crate::liveness::liveness_for(raw_code)
-        .depth_at_py_pc()
-        .get(resume_py_pc)
-        .copied()
-    else {
-        return false;
-    };
-    let live_end = stack_base + stack_depth as usize;
-    if pf.locals_w().as_slice().len() < live_end {
-        return false;
-    }
-    let pcdep = crate::state::pcdep_trivia_at(jitcode_index, last_opcode_position as i32)
-        .or_else(|| crate::state::pcdep_trivia_at(jitcode_index, position as i32));
-    let Some(pcdep) = pcdep else {
-        return false;
-    };
-
-    // Validate every mapped color and every live operand-stack slot before
-    // writing anything.  Dead locals may retain their old heap value; each
-    // stack slot at the merge point must have an authoritative color.
-    let mut writes: Vec<(usize, u8, usize)> = Vec::new();
-    for &(bank, color, slot) in &pcdep {
-        let slot = slot as usize;
-        if slot >= live_end {
-            continue;
-        }
-        let color = color as usize;
-        let present = match bank {
-            0 => color < registers_i.len(),
-            1 => color < registers_r.len(),
-            2 => color < registers_f.len(),
-            _ => false,
-        };
-        if !present {
-            return false;
-        }
-        if !writes.iter().any(|(existing, _, _)| *existing == slot) {
-            writes.push((slot, bank, color));
-        }
-    }
-    if (stack_base..live_end).any(|slot| !writes.iter().any(|(s, _, _)| *s == slot)) {
-        return false;
-    }
-
-    let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+/// `handle_jitexception` (`warmspot.py:970-982`) re-enters the portal with the
+/// greens and reds the exception carries; the frame is among the reds, and
+/// nothing reconstructs its contents.  It can afford that because the
+/// blackhole's virtualizable ops are write-through —
+/// `bhimpl_setarrayitem_vable_r` and `bhimpl_setfield_vable_i`
+/// (`blackhole.py:1390-1490`) fetch the array out of the virtualizable and
+/// store into it — so by the time `bhimpl_jit_merge_point` raises
+/// (`blackhole.py:1068-1069`) the frame already holds the driven region's
+/// result.  That raise only fires at the bottommost level, which is the portal
+/// frame: `convert_and_run_from_pyjitpl` links `framestack[0]` last, so
+/// `nextblackholeinterp is None` names the root and no other.
+///
+/// pyre's walked frame has two representations, so "the frame the blackhole was
+/// writing" has to be named.  The drive's vable ops address the frame held in
+/// the jitcode's own frame register, which the caller gates to be the LIVE
+/// root; the portal epilogue then publishes the SNAPSHOT
+/// (`eval.rs` `restore_resume_state_from(&executed_frame)`).  Mirroring live
+/// into the snapshot is what makes that epilogue hand over the drive's result
+/// instead of the walk's stale copy — the same move, for the same reason, that
+/// the escape leg makes.
+///
+/// `last_instr` is the one coordinate the drive does not leave resume-ready: it
+/// stops at the merge point having recorded the pc it is AT, and resuming there
+/// needs the pc before it.  Mirroring without this normalization resumes one
+/// opcode past the loop header — measured on
+/// `getframe_root_loop_force_blackhole_crn` and
+/// `getframe_root_loop_force_while_merge`, which then produce no output at all.
+///
+/// ⭐Infallible, and that is the whole point.  The register-image rebuild this
+/// replaces had to validate pcdep coverage, register-bank bounds and NULL Refs,
+/// and every one of those checks could only fail AFTER the drive had already
+/// executed the region — a decline that hands an executed region back to a
+/// replay that runs it again.  Upstream has no such path, and neither does
+/// this.
+///
+/// Both adopt arms come here.  The multi-frame one has already folded its live
+/// root into the snapshot by the time it does, so the mirror is a no-op there
+/// and only the coordinate lands; routing it through anyway keeps one
+/// definition of what adopting a CRN means.
+fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
     unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(registers_r);
+        let live = &*(live_root as *const pyre_interpreter::PyFrame);
+        let snap = &mut *(snapshot as *mut pyre_interpreter::PyFrame);
+        snap.restore_resume_state_from(live);
+        snap.last_instr = resume_py_pc as isize - 1;
     }
-    for (slot, bank, color) in writes {
-        let value = match bank {
-            0 => majit_ir::Value::Int(registers_i[color]),
-            1 => majit_ir::Value::Ref(majit_ir::GcRef(registers_r[color] as usize)),
-            2 => majit_ir::Value::Float(f64::from_bits(registers_f[color] as u64)),
-            _ => unreachable!("validated blackhole register bank"),
-        };
-        pf.locals_w_mut()[slot] = crate::state::boxed_slot_value_for_type(value.get_type(), &value);
-        // Per store, not once after the loop: boxing the next slot can collect,
-        // which re-arms the array's write barrier.
-        pyre_interpreter::remember_frame_locals_array(pf.locals_cells_stack_w);
-    }
-    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
-    pf.valuestackdepth = live_end;
-    pf.last_instr = resume_py_pc as isize - 1;
-    true
 }
 
+/// ⚠️`drive_single_frame_blackhole` **executes** — `bh.resume_mainloop()`
+/// (`jitdriver.rs`) runs the region, allocating and calling.  So every decline
+/// AFTER the drive discards work that already happened and returns to a caller
+/// that replays it: `try_adopt_force_blackhole` reports `false`, and
+/// `run_perfn_walk`'s epilogue then takes the committed escape pc or the legacy
+/// replay, both of which re-enter the region.  The locals publish below carries
+/// its own undo for exactly that reason; the `mfdbg!` sibling names the same
+/// hazard at the multi-frame `resume_py_pc` check as the reason not to add a
+/// check there.
+///
+/// Declines therefore split at the drive:
+/// - BEFORE it are free — nothing has run.
+/// - AFTER it are the double-apply class, and worse than "a lost
+///   optimization": the undo the publish below carries restores the frame, but
+///   the region's residual calls already mutated the heap and no undo reaches
+///   that.  Measured with the CRN arm forced to decline on
+///   `getframe_root_loop_force_blackhole_crn_nonidempotent`: the accumulator
+///   comes back right at 199990000 and the list holds 20005 entries for 20000
+///   iterations, one extra per declined drive.
+///
+/// ⭐So this path now has NO post-drive decline, which is what makes it safe to
+/// drive loop-bearing bodies at all.  Every arm adopts: `DoneWithThisFrame*`
+/// and `ExitFrameWithExceptionRef` record a concrete frame result, and
+/// `ContinueRunningNormally` hands the frame over through
+/// [`adopt_blackhole_crn`], which validates nothing because it rebuilds
+/// nothing.  The one `false` left in the match is an empty green list, a
+/// codewriter contract violation with no upstream counterpart.
+///
+/// Over `pyre/bench/synth` that is 50 frame-terminal adoptions plus 15 CRN
+/// adoptions (five each from the three `getframe_root_loop_force_*` fixtures),
+/// zero declines, and no corpus file's output differing from the
+/// interpreter's.
 fn try_adopt_single_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
 ) -> bool {
+    macro_rules! sfdbg {
+        ($($a:tt)*) => {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!("[s1-adopt] {}", format!($($a)*));
+            }
+        };
+    }
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         return false;
     };
@@ -1990,17 +1978,42 @@ fn try_adopt_single_frame_blackhole(
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         return false;
     };
+    // Two gates used to sit here, and both were scaffolding around a decline
+    // that no longer exists.
+    //
+    // One refused to drive any body containing a loop header, so that no drive
+    // could reach a `jit_merge_point` and hence the `ContinueRunningNormally`
+    // arm — the only arm that could reject the image.  The other pre-checked
+    // pcdep trivia purely to pre-empt the pcdep lookup the register-image
+    // rebuild did, deciding before the drive what would otherwise have been
+    // decided after the region had already run.  The CRN arm rejects nothing now
+    // ([`adopt_blackhole_crn`]) and reads no pcdep, so all either gate could do
+    // is refuse an adopt that would have succeeded.
+    //
+    // Worth recording why gating was never the answer: a post-drive decline is
+    // unsound in a way no undo can repair.  The publish below carries an undo,
+    // and it restores the frame exactly — but the drive also ran the region's
+    // residual calls, and their heap effects are not frame state.  Measured
+    // with the CRN arm forced to decline on
+    // `getframe_root_loop_force_blackhole_crn_nonidempotent`: `total` comes
+    // back correct at 199990000 while the list holds 20005 entries for 20000
+    // iterations, one extra per declined drive.  The undo makes that failure
+    // QUIETER, not smaller — before it the accumulator was visibly wrong too.
+    // So the decline had to go, not be gated around.
+    //
     // The escape flush that ran ahead of the forcing residual is
     // all-or-nothing, and its decline is what this latch is gated on
     // (`committed_frame_escape_pc().is_none()`).  What it declines on is the
     // operand-stack half — the shadow's stack region reads NULL away from a
-    // merge point — and the register image below carries that half anyway.
+    // merge point — and the drive reconstructs that half itself, through the
+    // vable stores its own execution makes.
     // The LOCALS half is not optional: every LOAD_FAST lowers to
-    // `getarrayitem_vable_r` on the frame the register image names, so without
-    // it the replay reads whatever that frame held before the walk began, and
-    // a local the walk assigned comes back null.  Publish that half here and
-    // withdraw it if it cannot complete, so a decline still leaves the legacy
-    // replay pristine pre-walk state.
+    // `getarrayitem_vable_r` on the frame the latched image's register names,
+    // so without it the drive reads whatever that frame held before the walk
+    // began, and a local the walk assigned comes back null.  Publish that half
+    // here, and withdraw it if it cannot complete — the withdrawal is honest
+    // only because nothing has run at that point.
+    //
     // Which frame gets it is an identity question, and the walked frame has two
     // representations: `cf_addr` is the `snapshot_for_tracing` copy the walk
     // steps concretely, `live_root_addr` the frame the compiled loop runs on.
@@ -2046,7 +2059,7 @@ fn try_adopt_single_frame_blackhole(
     // slots it was taken from, so these words are the only remaining reference
     // to the pre-walk locals, and a collection inside the drive would both free
     // them and leave the withdrawal below writing back pre-move addresses.
-    let mut terminal = majit_metainterp::drive_single_frame_blackhole(
+    let terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         majit_metainterp::blackhole::StateFieldLayout::default(),
         virtualizable_info,
@@ -2057,29 +2070,49 @@ fn try_adopt_single_frame_blackhole(
         latched.raising_exception,
     );
 
+    // Its own prefix: this is not a decline, and reading it as one is exactly
+    // the confusion that made the CRN arm look unreachable.
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!(
+            "[s1-drive-outcome] {}",
+            match terminal.outcome {
+                majit_metainterp::jitexc::JitException::ContinueRunningNormally { .. } =>
+                    "ContinueRunningNormally",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid =>
+                    "DoneWithThisFrameVoid",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(_) =>
+                    "DoneWithThisFrameInt",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(_) =>
+                    "DoneWithThisFrameRef",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(_) =>
+                    "DoneWithThisFrameFloat",
+                majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(_) =>
+                    "ExitFrameWithExceptionRef",
+            }
+        );
+    }
     let adopted = match terminal.outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
             ref green_int, ..
         } => match green_int.first() {
             Some(&resume_py_pc) => {
                 let resume_py_pc = resume_py_pc as usize;
-                if apply_blackhole_crn(
-                    cf_addr,
-                    jitcode_index,
-                    terminal.position,
-                    terminal.last_opcode_position,
-                    &terminal.registers_i,
-                    terminal.registers_r.as_mut_slice(),
-                    &terminal.registers_f,
-                    resume_py_pc,
-                ) {
-                    WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
-                    true
-                } else {
-                    false
-                }
+                adopt_blackhole_crn(cf_addr, vable_frame, resume_py_pc);
+                sfdbg!("adopted with green resume_py_pc={resume_py_pc}");
+                WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
+                true
             }
-            None => false,
+            None => {
+                // The last post-drive decline in this arm, and a codewriter
+                // contract violation rather than a runtime condition: the
+                // portal's `jit_merge_point` carries `py_pc` as its first int
+                // green, so an empty list means the op was emitted without its
+                // greens.  Upstream indexes the greens unconditionally
+                // (`warmspot.py:973-976` `getattr(e, attrname)[count]`), so it
+                // has no decline for this to correspond to.
+                sfdbg!("ContinueRunningNormally with no green int");
+                false
+            }
         },
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
@@ -2125,15 +2158,21 @@ fn try_adopt_single_frame_blackhole(
             );
         }
     } else {
-        // The terminal was not adoptable, so this returns to the legacy
-        // escape/replay path, which resumes the frame from its pre-walk state —
-        // the state `restore_escape_flush_undo` puts back for the flush half.
-        // The publish above and the replay's own vable stores both landed here,
-        // so both have to come off.  The drive reached the frame's scalars
-        // through `setfield_vable_i`, for which no undo image exists anywhere
-        // else: the store journal covers heap effects and
+        // Only the empty-green-list arm gets here, and that is a codewriter
+        // contract violation rather than a runtime outcome.  This returns to the
+        // legacy escape/replay path, which resumes the frame from its pre-walk
+        // state — the state `restore_escape_flush_undo` puts back for the flush
+        // half.  The publish above and the drive's own vable stores both landed
+        // on this frame, so both have to come off.  The drive reached the
+        // frame's scalars through `setfield_vable_i`, for which no undo image
+        // exists anywhere else: the store journal covers heap effects and
         // `fbw_exit_last_instr_rollback` only arms on a return or void-return
         // exit, which an unadoptable terminal is not.
+        //
+        // ⚠️Putting the FRAME back is all this can do.  The drive already ran,
+        // so any heap effect in the region it executed stays, and the replay
+        // performs it a second time.  That is why no new post-drive decline may
+        // be added here: the withdrawal looks total and is not.
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
         if let Some(scalars) = scalars_undo {
             crate::state::restore_frame_scalars(vable_frame, scalars);
@@ -2152,6 +2191,26 @@ fn try_adopt_multi_frame_blackhole(
     // under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_miframe`'s
     // `s2dbg!` names its own: a silent decline is indistinguishable from the
     // adopt never being reached, and the two want different fixes.
+    //
+    // ⚠️The declines are NOT interchangeable — see
+    // [`try_adopt_single_frame_blackhole`].  Those before
+    // `drive_multi_frame_blackhole` are free; those after it discard a chain
+    // that already ran and hand back to a caller that replays it, and no undo
+    // reaches the heap effects that chain committed.
+    //
+    // Exactly one post-drive decline survives here, the empty `green_int`, and
+    // it is a codewriter contract violation rather than a runtime outcome.  The
+    // three that used to sit beside it — no terminal image, terminal jitcode
+    // index out of i32 range, and the register-image rebuild's own rejection —
+    // all existed only to serve that rebuild, and went with it when the CRN
+    // handoff became [`adopt_blackhole_crn`].
+    //
+    // Note that they could not have been hoisted instead.  The rebuild's index
+    // here is `terminal.jitcode_index` = `bh.jitcode.index()` of whichever
+    // interpreter the chain ended in (`BlackholeTerminalImage::take_from`), and
+    // the run can enter jitcodes that are not levels of `latched.framestack`,
+    // so pre-checking the levels would have added a decline without discharging
+    // the post-drive one.  Retiring the rebuild is what discharged them.
     macro_rules! mfdbg {
         ($($a:tt)*) => {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -2350,8 +2409,8 @@ fn try_adopt_multi_frame_blackhole(
     // that stores `e.__traceback__` and then reads an attribute off it faults
     // in `object_getattr_miss`, where the same shape through the single-frame
     // arm is correct.  Publishing them needs a per-level slot→value map — what
-    // `apply_blackhole_crn` builds from `pcdep_trivia_at` — run before the
-    // drive rather than after it.
+    // the retired register-image rebuild built from `pcdep_trivia_at` — run
+    // before the drive rather than after it.
     let Some(mut locals_undo) = crate::state::capture_frame_locals(root_addr) else {
         mfdbg!("frame 0: {root_addr:#x} locals not capturable");
         restore_links(&saved_links);
@@ -2387,7 +2446,7 @@ fn try_adopt_multi_frame_blackhole(
     mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
-        terminal: mut mf_terminal,
+        terminal: _mf_terminal,
     } = majit_metainterp::drive_multi_frame_blackhole(
         &mut mf_builder,
         &mut latched.framestack,
@@ -2441,49 +2500,41 @@ fn try_adopt_multi_frame_blackhole(
                 break 'crn false;
             };
             let resume_py_pc = resume_py_pc as usize;
-            // Only the frame address is checked.  `resume_py_pc` is a
+            // `resume_py_pc` is deliberately NOT checked.  It is a
             // `depth_at_py_pc` index written through to
             // `frame.last_instr = resume_py_pc - 1`, so 0 is an ordinary
-            // coordinate — the single-frame arm hands it to
-            // `apply_blackhole_crn` unfiltered.  Rejecting it here would also
-            // decline *after* the chain has been driven, returning to a legacy
-            // replay that re-executes what the chain already committed.
-            if cf_addr == 0 {
-                mfdbg!("cf_addr {cf_addr:#x} is zero");
-                break 'crn false;
-            }
-            // The terminal frame's own `setfield_vable` operations committed
-            // the frame fields they wrote, but the aborted mid-expression
-            // operand stack is still in place, so the resume coordinate needs
-            // the same live-slot materialization the single-frame path
-            // performs.
-            let Some(terminal) = mf_terminal.as_mut() else {
-                mfdbg!("no terminal image for the ContinueRunningNormally handoff");
-                break 'crn false;
-            };
-            let Ok(terminal_jitcode_index) = i32::try_from(terminal.jitcode_index) else {
-                mfdbg!(
-                    "terminal jitcode index {} out of range",
-                    terminal.jitcode_index
-                );
-                break 'crn false;
-            };
-            // Snapshot, not `root_addr`: with the fold above the match the
-            // snapshot is the committed image the epilogue propagates,
-            // matching the single-frame arm.
-            if !apply_blackhole_crn(
-                cf_addr,
-                terminal_jitcode_index,
-                terminal.position,
-                terminal.last_opcode_position,
-                &terminal.registers_i,
-                terminal.registers_r.as_mut_slice(),
-                &terminal.registers_f,
-                resume_py_pc,
-            ) {
-                mfdbg!("apply_blackhole_crn rejected the terminal image");
-                break 'crn false;
-            }
+            // coordinate — the single-frame arm hands it to the CRN handoff
+            // unfiltered.  Rejecting it here would also decline *after* the
+            // chain has been driven, returning to a legacy replay that
+            // re-executes what the chain already committed.
+            //
+            // `cf_addr` needs no check either: the pre-drive
+            // `concrete_nlocals(cf_addr)` above already returns `None` for a
+            // zero frame (`state.rs` `(frame != 0).then_some(..)?`).  The
+            // decline that used to sit here was unreachable AND post-drive,
+            // i.e. it could only ever have been an instance of the hazard the
+            // comment above names.
+            debug_assert_ne!(
+                cf_addr, 0,
+                "pre-drive concrete_nlocals admitted a zero frame"
+            );
+            // Same handoff as the single-frame arm, for the same reason: the
+            // chain's levels wrote their frames through the blackhole's
+            // write-through vable ops, and a CRN is raised only at the
+            // bottommost level, which `convert_and_run_from_pyjitpl` makes the
+            // portal frame.  So the frame already holds the driven result and
+            // nothing has to be rebuilt from the terminal register banks.
+            //
+            // The fold above the match has already made the snapshot the
+            // committed image, so the mirror inside is a no-op here and only
+            // the resume coordinate is left to set.  Taking the same path
+            // anyway keeps one definition of what adopting a CRN means.
+            //
+            // This retires three post-drive declines at once — the absent
+            // terminal image, the out-of-range terminal jitcode index, and the
+            // register-image rebuild's own rejection — each of which handed a
+            // chain that had already run back to a replay.
+            adopt_blackhole_crn(cf_addr, root_addr, resume_py_pc);
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
             true
         }

@@ -278,6 +278,15 @@ pub struct BlackholeInterpreter {
     /// Replaces the prior single-driver flat fields
     /// (`portal_runner_ptr`/`mainjitcode_calldescr`) so multi-driver
     /// dispatch matches upstream line-by-line.
+    ///
+    /// Upstream reads the table through `self.builder.metainterp_sd`
+    /// (blackhole.py:60 `self.metainterp_sd = metainterp_sd`), so it is
+    /// builder-shared and every interpreter in a chain sees it by
+    /// construction.  A pool-owned Rust interpreter cannot hold a `&builder`
+    /// back-reference, so this is the builder's snapshot, copied in by
+    /// `acquire_interp` the same way `descrs` is (blackhole.py:288).  Set it
+    /// via [`BlackholeInterpBuilder::setup_jitdrivers_sd`] before acquiring,
+    /// not on individual frames.
     pub jitdrivers_sd: Vec<BhJitDriverSd>,
     /// Pyre: absolute start index of the operand stack in
     /// PyFrame.locals_cells_stack_w. RPython does not need this because
@@ -716,6 +725,17 @@ impl BlackholeInterpreter {
                 self.registers_r[i] = 0;
             }
         }
+        // `tmpreg_r` is a reference slot on the same footing as `registers_r`:
+        // `run()` hands both to `push_bh_regs`, and `walk_bh_regs` visits the
+        // tmpreg word as a `GcRef` root.  Its live window is one opcode — the
+        // gap between a call helper returning and the `registers_r[dst]` store
+        // — but nothing resets it, so a released interp carries the last ref
+        // return value into the pool.  Nothing roots it there, so the object
+        // can be collected; the next `run()` on that pooled interp then pushes
+        // the dead address as a root and the collector reads a header off it.
+        // Upstream's `cleanup_registers` (`blackhole.py:385`) has no such slot
+        // to clear: RPython's tmpreg is a traced field of a GC object.
+        self.tmpreg_r = 0;
         self.exception_last_value = 0;
     }
 
@@ -1844,6 +1864,12 @@ pub struct BlackholeInterpBuilder {
     /// wiring is done before the first `acquire_interp`, the inner Vec
     /// is uniquely owned and `make_mut` is cheap.
     pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
+    /// RPython `blackhole.py:60` `self.metainterp_sd = metainterp_sd`.
+    /// Every interpreter resolves `jitdrivers_sd[jdindex]` through its
+    /// builder (blackhole.py:1079 `sd = self.builder.metainterp_sd`,
+    /// :1096 `self.builder.metainterp_sd.jitdrivers_sd[jdindex]`), so the
+    /// table belongs here and `acquire_interp` hands each frame a copy.
+    pub jitdrivers_sd: Vec<BhJitDriverSd>,
 }
 
 impl Default for BlackholeInterpBuilder {
@@ -1863,6 +1889,7 @@ impl BlackholeInterpBuilder {
             op_rvmprof_code: u8::MAX,
             descrs: Vec::new(),
             dispatch_table: std::sync::Arc::new(Vec::new()),
+            jitdrivers_sd: Vec::new(),
         }
     }
 
@@ -2004,6 +2031,17 @@ impl BlackholeInterpBuilder {
     /// RPython `blackhole.py:102-103` `setup_descrs(descrs)`.
     pub fn setup_descrs(&mut self, descrs: Vec<BhDescr>) {
         self.descrs = descrs;
+    }
+
+    /// Publish the jitdriver table every interpreter this builder hands out
+    /// will resolve `jdindex` against — the builder-side half of
+    /// `blackhole.py:60` `self.metainterp_sd = metainterp_sd` (read back at
+    /// :1079 / :1096).  Call before `acquire_interp`: a chain built from a
+    /// builder whose table is still empty gives every frame an empty table,
+    /// and `bhimpl_jit_merge_point`'s recursive-portal branch indexes it
+    /// directly.
+    pub fn setup_jitdrivers_sd(&mut self, jitdrivers_sd: Vec<BhJitDriverSd>) {
+        self.jitdrivers_sd = jitdrivers_sd;
     }
 
     /// Resolve JitCode fnaddr values from a mapping function.
@@ -2211,6 +2249,11 @@ impl BlackholeInterpBuilder {
         bh.op_live = self.op_live;
         // RPython blackhole.py:287: self.dispatch_loop = builder.dispatch_loop
         bh.dispatch_table = std::sync::Arc::clone(&self.dispatch_table);
+        // blackhole.py:250 `self.builder = builder` — upstream keeps the
+        // back-reference and reads `self.builder.metainterp_sd.jitdrivers_sd`
+        // on demand (:1079, :1096).  The pool owns the interpreters here, so
+        // hand each one the builder's snapshot instead.
+        bh.jitdrivers_sd = self.jitdrivers_sd.clone();
         bh
     }
 
@@ -2222,7 +2265,27 @@ impl BlackholeInterpBuilder {
         interp.nextblackholeinterp = None;
         interp.aborted = false;
         interp.got_exception = false;
+        // The virtualizable handle is frame identity, not builder state, and
+        // `acquire_interp` refreshes only the six builder-shared fields.  A
+        // pooled interp that kept `virtualizable_ptr` would hand the next user
+        // a pointer to the frame this run just finished with:
+        // `blackhole_from_resumedata` never assigns either field, so
+        // `call_jit.rs`'s "a novable resume runs no vable opcodes, so leave
+        // both the pointer and the vinfo handle unset (null)" only holds for
+        // an interp that comes back from the pool clean.  `run()` dereferences
+        // `virtualizable_ptr` for every chain frame whose `virtualizable_info`
+        // is non-null (`push_resume_ref_roots`), so a stale pair reads a dead
+        // frame and roots its slots.  Reset with `virtualizable_stack_base`,
+        // which is the same frame-scoped triple.
+        interp.virtualizable_ptr = 0;
+        interp.virtualizable_info = std::ptr::null();
         interp.virtualizable_stack_base = 0;
+        // Same footing: the layout describes the register file of the machine
+        // this run resumed, so it must not outlive it.  A stale one does not
+        // fail loudly — `StateFieldLayout::default()` is all-zero and the
+        // `scalar_slot`/`array_elem_slot` range checks are `debug_assert!`, so
+        // a release build reads whatever slot the arithmetic lands on.
+        interp.state_field_layout = StateFieldLayout::default();
         self.pool.push(interp);
     }
 
@@ -2454,10 +2517,19 @@ pub fn run_forever_with_portal(
                     terminal_out.as_deref_mut(),
                 ) {
                     Ok((new_bh, exc)) => {
-                        // Handled at recursive portal level — continue
+                        // Handled at a recursive portal level.  `new_bh` is
+                        // that portal frame (blackhole.py:1780 returns
+                        // `blackholeinterp`), and its caller already holds the
+                        // re-entered portal's result
+                        // (`_handle_jitexception_in_portal` →
+                        // warmspot.py:1041-1050), so the frame is finished.
+                        // Fall through to the shared release + step below —
+                        // blackhole.py:1759-1760 sit outside the `try`, so
+                        // they run on this arm too.  Re-entering `new_bh`
+                        // instead would execute its tail a second time and
+                        // overwrite the installed result.
                         bh = new_bh;
                         current_exc = exc;
-                        continue;
                     }
                     Err(propagated_exc) => {
                         // Bottommost or unhandled — propagate out
@@ -2489,7 +2561,6 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
     pub virtualizable_ptr: i64,
     pub virtualizable_stack_base: usize,
-    pub jitdrivers_sd: &'a [BhJitDriverSd],
     /// Per-frame concrete frame ptr + its own stack_base, aligned to
     /// `framestack.frames` (outermost-first).  When present, each blackhole
     /// level uses ITS OWN frame as the virtualizable instead of sharing the
@@ -2528,7 +2599,6 @@ pub fn convert_and_run_from_pyjitpl(
                 cur_bh.virtualizable_ptr = frame_ptr;
                 cur_bh.virtualizable_stack_base = frame_stack_base;
             }
-            cur_bh.jitdrivers_sd = config.jitdrivers_sd.to_vec();
         }
         // Keep every completed interpreter bank rooted while later frames are
         // acquired and throughout `run_forever`.  The chain is consumed and
@@ -3530,6 +3600,68 @@ mod tests {
             assert!(bh2.registers_i.is_empty());
         }
 
+        /// A pooled interp must not carry the previous run's frame identity.
+        ///
+        /// `acquire_interp` refreshes only the six builder-shared fields
+        /// (`blackhole.py:284-289`), and `blackhole_from_resumedata` assigns
+        /// neither `virtualizable_ptr` nor `virtualizable_info` — the guard
+        /// path sets them afterwards, and deliberately does not for a
+        /// `novable` resume ("leave both the pointer and the vinfo handle
+        /// unset (null)", `pyre-jit/src/call_jit.rs`).  That contract is only
+        /// true if the pool hands back a cleared interp: `run()` dereferences
+        /// `virtualizable_ptr` for every chain frame with a non-null
+        /// `virtualizable_info` to push its GC roots, so a leaked pair reads
+        /// the frame the previous blackhole finished with.
+        ///
+        /// The handle here is never dereferenced — the assertion is on the
+        /// pointer word, so a dangling non-null stand-in is enough.
+        #[test]
+        fn released_interp_does_not_leak_its_virtualizable_handle_to_the_next_user() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            bh.virtualizable_ptr = 0x7f00_0000_1234;
+            bh.virtualizable_info =
+                std::ptr::NonNull::<crate::virtualizable::VirtualizableInfo>::dangling().as_ptr();
+            bh.virtualizable_stack_base = 9;
+
+            builder.release_interp(bh);
+            let reused = builder.acquire_interp();
+
+            assert_eq!(reused.virtualizable_ptr, 0);
+            assert!(reused.virtualizable_info.is_null());
+            assert_eq!(reused.virtualizable_stack_base, 0);
+        }
+
+        /// A pooled interp must expose no reference word as a GC root.
+        ///
+        /// `run()` roots `registers_r` AND `tmpreg_r` through
+        /// `push_bh_regs`, and `walk_bh_regs` visits the tmpreg word as a
+        /// `GcRef`.  `cleanup_registers` cleared the bank but not the tmpreg,
+        /// so a released interp carried the last ref return value into the
+        /// pool, where nothing roots it — and the next `run()` on that interp
+        /// pushed the by-then-collectable address back as a root.
+        #[test]
+        fn released_interp_exposes_no_reference_word_to_the_root_walker() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            bh.tmpreg_r = 0x7f00_0000_5678;
+
+            builder.release_interp(bh);
+            let mut reused = builder.acquire_interp();
+            assert_eq!(reused.tmpreg_r, 0);
+
+            let depth = unsafe {
+                majit_gc::shadow_stack::push_bh_regs(&mut reused.registers_r, &mut reused.tmpreg_r)
+            };
+            let mut roots: Vec<usize> = Vec::new();
+            majit_gc::shadow_stack::walk_bh_regs(|slot| roots.push(slot.0));
+            majit_gc::shadow_stack::pop_bh_regs_to(depth);
+            assert!(
+                roots.iter().all(|&word| word == 0),
+                "pooled interp handed the root walker stale references: {roots:x?}",
+            );
+        }
+
         #[test]
         fn test_builder_new_leaves_control_opcodes_unset_until_explicit_setup() {
             let mut builder = BlackholeInterpBuilder::new();
@@ -3635,6 +3767,165 @@ mod tests {
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);
+        }
+
+        /// `_run_forever` steps to `nextblackholeinterp` after the
+        /// iteration whose `JitException` was resolved at a recursive
+        /// portal level, not only after a plain return.
+        ///
+        /// `blackhole.py:1752-1760`:
+        ///
+        /// ```python
+        /// while True:
+        ///     try:
+        ///         current_exc = blackholeinterp._resume_mainloop(current_exc)
+        ///     except jitexc.JitException as e:
+        ///         blackholeinterp, current_exc = _handle_jitexception(
+        ///             blackholeinterp, e)
+        ///     blackholeinterp.builder.release_interp(blackholeinterp)
+        ///     blackholeinterp = blackholeinterp.nextblackholeinterp
+        /// ```
+        ///
+        /// The release + step sit BELOW the `try`, so they run on both
+        /// arms.  `_handle_jitexception` returns the portal frame
+        /// (`blackhole.py:1780`) after
+        /// `_handle_jitexception_in_portal` has already installed the
+        /// re-entered portal's result as the CALLER's return value
+        /// (`blackhole.py:1772` → `warmspot.py:1039-1050`), so that
+        /// frame is finished and the loop must continue in its caller.
+        ///
+        /// The chain here is `inner -> caller`.  `inner` carries the
+        /// portal `jitdriver_sd` and inline-calls a sub-jitcode whose
+        /// `jit_merge_point` is bottommost (the callee interpreter
+        /// `for_inline_callee` builds has no `nextblackholeinterp`), so
+        /// the `ContinueRunningNormally` reaches `_run_forever` from a
+        /// frame that DOES have a caller — the recursive-portal arm.
+        /// Re-entering `inner` instead would run its tail a second time
+        /// and overwrite the portal runner's result with `inner`'s own.
+        #[test]
+        fn run_forever_steps_past_the_portal_frame_after_handle_jitexception() {
+            let mut sub = JitCodeBuilder::default();
+            sub.jit_merge_point(0, &[], &[], &[], &[], &[], &[]);
+            let sub_jitcode = sub.finish();
+
+            let mut inner_b = JitCodeBuilder::default();
+            let sub_idx = inner_b.add_sub_jitcode(sub_jitcode);
+            inner_b.inline_call_ir_v(sub_idx, &[], &[], None);
+            // The tail the bug re-executes: it would hand the caller `7`.
+            inner_b.load_const_i_value(1, 7);
+            inner_b.int_return(1);
+            let inner_jitcode = inner_b.finish();
+            inner_jitcode.set_jitdriver_sd(0);
+
+            // `_setup_return_value_i` writes `registers_i[code[position-1]]`
+            // (`blackhole.py:1655`), so the caller resumes at an
+            // `int_return` whose preceding byte is the `int_copy`
+            // destination register 0.
+            let mut caller_b = JitCodeBuilder::default();
+            caller_b.load_const_i_value(0, 42);
+            let caller_resume = caller_b.current_pos();
+            caller_b.int_return(0);
+            let caller_jitcode = caller_b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut caller = builder.acquire_interp();
+            caller.setposition(std::sync::Arc::new(caller_jitcode), caller_resume);
+            let mut inner = builder.acquire_interp();
+            inner.setposition(std::sync::Arc::new(inner_jitcode), 0);
+            inner.nextblackholeinterp = Some(Box::new(caller));
+
+            let portal_runner =
+                |_exc: &crate::jitexc::JitException| Ok((super::BhReturnType::Int, 999));
+            let outcome = super::run_forever_with_portal(
+                &mut builder,
+                inner,
+                0,
+                Some(&portal_runner),
+                None,
+                None,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    crate::jitexc::JitException::DoneWithThisFrameInt(999)
+                ),
+                "the caller must return the portal runner's result, got {outcome:?}",
+            );
+        }
+
+        /// `bhimpl_jit_merge_point`'s recursive-portal branch
+        /// (`blackhole.py:1079-1093`) and `get_portal_runner`
+        /// (`blackhole.py:1096`) both index `jitdrivers_sd[jdindex]`
+        /// unchecked.  Upstream can, because the table hangs off
+        /// `self.builder.metainterp_sd`: one table, reached by every frame of
+        /// a chain through its builder back-reference.  A pool-owned Rust
+        /// interpreter holds a snapshot instead, so the guarantee has to come
+        /// from `acquire_interp` — `blackhole_from_resumedata` builds a chain
+        /// by acquiring one interpreter per resumed frame and never touches
+        /// the table, and every frame above the bottom one takes the
+        /// recursive-portal branch.
+        #[test]
+        fn every_interp_a_builder_hands_out_carries_the_jitdriver_table() {
+            let mut builder = super::build_inline_call_only_bh_builder();
+            builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
+                result_type: super::BhReturnType::Int,
+                ..Default::default()
+            }]);
+
+            // The shape `blackhole_from_resumedata` produces: one acquire per
+            // resumed frame, linked caller-ward through `nextblackholeinterp`.
+            let caller = builder.acquire_interp();
+            let mut inner = builder.acquire_interp();
+            inner.nextblackholeinterp = Some(Box::new(caller));
+
+            let mut frame = Some(&inner);
+            let mut depth = 0;
+            while let Some(f) = frame {
+                assert_eq!(
+                    f.jitdrivers_sd.len(),
+                    1,
+                    "chain frame {depth} cannot resolve jdindex 0",
+                );
+                assert_eq!(f.get_portal_runner(0).0, 0);
+                depth += 1;
+                frame = f.nextblackholeinterp.as_deref();
+            }
+            assert_eq!(depth, 2, "expected a two-frame chain");
+
+            // `release_interp` leaves the table on the pooled interpreter, so
+            // the refresh must overwrite it.  Otherwise a builder whose table
+            // is empty still hands out the previous run's entries, which is
+            // what let an unseeded resume path look like it worked.
+            builder.release_interp(inner);
+            builder.setup_jitdrivers_sd(Vec::new());
+            assert!(
+                builder.acquire_interp().jitdrivers_sd.is_empty(),
+                "a pooled interp must not carry the previous run's table",
+            );
+        }
+
+        /// `state_field_layout` describes the register file of the machine one
+        /// resume belongs to, so it must not survive into the pool.  The
+        /// range checks in `scalar_slot`/`ref_scalar_slot`/`array_elem_slot`
+        /// are `debug_assert!`, so a release build given the all-zero default
+        /// silently returns `0 + field_idx` — aliasing the dispatch JitCode's
+        /// own argument registers rather than the identity slots
+        /// `ref_scalar_base` exists to keep clear of them.
+        #[test]
+        fn released_interp_does_not_leak_its_state_field_layout_to_the_next_user() {
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.state_field_layout =
+                super::StateFieldLayout::with_ref_scalars(1, vec![4], 0, 2, 8, 0);
+            assert_eq!(bh.state_field_layout.ref_scalar_slot(0), 8);
+
+            builder.release_interp(bh);
+            let reused = builder.acquire_interp();
+            assert_eq!(
+                reused.state_field_layout,
+                super::StateFieldLayout::default(),
+                "a pooled interp must not carry the previous resume's layout",
+            );
         }
 
         /// Tier 2.1: ref-typed return propagation through

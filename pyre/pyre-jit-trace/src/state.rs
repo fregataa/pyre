@@ -4805,8 +4805,18 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
 /// Take a copy of `frame`'s locals so a caller that publishes over them can put
 /// the frame back exactly as it found it.  Returned as raw words: boxing a slot
 /// during the publish can collect, so the copy has to be registered as resume
-/// roots (`push_resume_ref_roots`) for the duration, like the register image
-/// `apply_blackhole_crn` holds.
+/// roots (`push_resume_ref_roots`) for the duration.
+///
+/// ⚠️Restoring the FRAME is not the same as undoing the drive.  This and
+/// [`capture_frame_scalars`] together cover the whole mutable virtualizable
+/// surface — the only vable fields with a production emit site are `last_instr`
+/// (index 0) and `valuestackdepth` (2), plus this array; `setfield_vable_r`/`_f`
+/// have dispatch arms and no emitter.  A decline taken after
+/// `drive_single_frame_blackhole` still leaves every heap effect the region's
+/// residual calls made, and the replay repeats them — measured on
+/// `getframe_root_loop_force_blackhole_crn_nonidempotent` as one extra list
+/// entry per declined drive while the locals came back correct.  So this is an
+/// undo for PRE-drive failures; it does not license a post-drive one.
 ///
 /// Upstream needs no counterpart. `resume.py`'s virtualizable write-back
 /// (`VirtualizableInfo.write_from_resume_data`) runs on a per-call `MIFrame`

@@ -243,6 +243,45 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         *miframe.float_values.get_mut(color)? = Some(value.to_bits() as i64);
     }
 
+    // Seed every REMAINING color the walk has a concrete value for, not just the
+    // ones live at `resume_pc`.
+    //
+    // `_copy_data_from_miframe` (blackhole.py:1711-1730) copies
+    // `range(num_regs_i/r/f())` — the WHOLE bank, filtering only on "the MIFrame
+    // has a box here", never on liveness.  Seeding a liveness-selected subset is
+    // the deviation, and it is unsound the moment the drive leaves the straight
+    // line: the blackhole runs on to a `jit_merge_point`, whose own live set is
+    // generally LARGER (a loop-carried value defined in the prologue and not
+    // rewritten in the body is dead at a mid-body pc but live at the header).
+    // Those colors then read back NULL, and a NULL written into a live
+    // operand-stack slot faults the interpreter.
+    //
+    // Measured on the `getframe_root_loop_force_*` fixtures: live at the build
+    // pc was ref [0, 1, 6] while the merge wanted [0, 1, 2, 3, 4], and 2/3/4 all
+    // had concrete values in the walk's own bank the whole time.
+    //
+    // Seeding cannot introduce a stale value: a color the drive rewrites is
+    // overwritten before any read, and a color it does not rewrite still holds
+    // what the walk observed at the force point, which is what a merge reached
+    // without an intervening definition expects.  Colors with no concrete value
+    // stay unset, exactly as an absent upstream box does.
+    for (color, slot) in miframe.int_values.iter_mut().enumerate() {
+        if slot.is_none()
+            && let Some(ConcreteValue::Int(value)) = ctx.concrete_registers_i.get(color).copied()
+        {
+            *slot = Some(value);
+        }
+    }
+    for (color, slot) in miframe.ref_values.iter_mut().enumerate() {
+        // `ConcreteValue::Null` is the walker's "unknown" sentinel, not a proven
+        // Python null, so it seeds nothing.
+        if slot.is_none()
+            && let Some(ConcreteValue::Ref(value)) = ctx.concrete_registers_r.get(color).copied()
+        {
+            *slot = Some(value as i64);
+        }
+    }
+
     Some(miframe)
 }
 
@@ -1958,6 +1997,27 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // gates is attribute/item READS of frame-family objects, which are
         // idempotently re-executable (re-execution reads the same flushed
         // values the first execution saw; a token re-force is a no-op).
+        //
+        // Why the licence is `!writes_live_heap` and not the effect class the
+        // rewound residual declares: BOTH upstream-shaped static licences are
+        // empty on this path.  `check_is_elidable()`/`EF_LOOPINVARIANT` is
+        // disjoint from forcing by construction — `pyjitpl.py:2007` takes the
+        // forcing arm iff `check_forces_virtual_or_virtualizable()`
+        // (`extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, effectinfo.py:250)
+        // and routes elidable/loop-invariant down the `else` arm at `:2084`.
+        // An empty declared write set is unavailable too: every residual that
+        // reaches this gate carries `EF_RANDOM_EFFECTS`, whose write-descr sets
+        // are `None` — top, not bottom — by upstream's own assertion
+        // (effectinfo.py:149-155).  So no `EffectInfo` predicate can license
+        // this rewind, and the licence has to come from the shape gates above.
+        // Measured over `pyre/bench/synth` (312 files, 115 forces): the only
+        // shape that commits an `EscapeResumeKind::Exact` is a `LoadAttr`/`Ref`
+        // frame-family read, 10 of them, from `getframe_stored_fback_walk` and
+        // `getframe_force_cancel_journal`; 5 enter a user frame and have the
+        // commit withdrawn below, 5 do not and are re-executed.  Every other
+        // force either commits nothing or takes the merge-point fallback, whose
+        // `RerunsOpcode` kind `commit_walk_end` refuses outright.
+        //
         // A sub-walk's mirror describes the callee frame, not the escape
         // frame, so it is never latched (the nested unjournaled-residual
         // decline above already aborts before this).
@@ -2015,6 +2075,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
         if forced {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[force-shape] helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
+                     reentrant={reentrant_residual} commit={} entered_frame={} bh={} \
+                     fs={} subwalk={} bridge={} wf={:?} wa={:?} wi={:?} rnd={} fn=0x{:x} \
+                     pc={op_pc}",
+                    call_descr.result_type(),
+                    match committed_frame_escape_pc() {
+                        None => "none",
+                        Some((_, EscapeResumeKind::Exact)) => "exact",
+                        Some((_, EscapeResumeKind::RerunsOpcode)) => "reruns",
+                    },
+                    heap_write_odometer_before
+                        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
+                    blackhole_result.is_some(),
+                    ctx.session.borrow().framestack.len(),
+                    ctx.fbw_mode.inline_subwalk,
+                    ctx.trace_ctx.is_bridge_trace,
+                    ei._write_descrs_fields.as_ref().map(Vec::len),
+                    ei._write_descrs_arrays.as_ref().map(Vec::len),
+                    ei._write_descrs_interiorfields.as_ref().map(Vec::len),
+                    ei.has_random_effects(),
+                    func_ptr as usize,
+                );
+            }
             // The escaping residual also entered a user Python frame whose
             // body may have committed irreversible effects; a committed
             // escape resume would re-execute this opcode and re-run that
@@ -2037,6 +2122,59 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // failure leaves the pre-existing escape/replay path untouched.
             let odometer_unchanged = heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() == before);
+            // Feasibility probe for retiring the rewind latch in favour of the
+            // orthodox resume-PAST-the-residual path (`blackhole.py:1653-1662`
+            // splices the callee result into the caller past its call, so no
+            // re-runnability licence is needed at all).  The latch shape is the
+            // exact complement of the C3 S1 gate: it is `!writes_live_heap` and
+            // has already committed an escape pc, so it can never reach the
+            // build below.  Measure whether it COULD: build the image and throw
+            // it away.  `build_single_frame_miframe` only reads liveness and the
+            // concrete register banks, so discarding it is free.
+            if fbw_debug_abort_enabled()
+                && !writes_live_heap
+                && odometer_unchanged
+                && matches!(
+                    committed_frame_escape_pc(),
+                    Some((_, EscapeResumeKind::Exact))
+                )
+                && !ctx.trace_ctx.is_bridge_trace
+                && !ctx.fbw_mode.inline_subwalk
+                && ctx.session.borrow().framestack.is_empty()
+                && !ctx.fbw_mode.snapshot_sym.is_null()
+            {
+                let built = blackhole_result.and_then(|(resume_pc, result_bank, result_color)| {
+                    let lastop_result = match exec_result {
+                        Ok(value) => {
+                            (result_bank != 'v').then_some((result_bank, result_color, value))
+                        }
+                        Err(_) => None,
+                    };
+                    let jitcode = unsafe {
+                        let sym = &*ctx.fbw_mode.snapshot_sym;
+                        (!sym.jitcode().is_null())
+                            .then(|| (&(*sym.jitcode()).payload).jitcode.clone())
+                    };
+                    jitcode.map(|jitcode| {
+                        (
+                            resume_pc,
+                            build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
+                                .is_some(),
+                        )
+                    })
+                });
+                match built {
+                    Some((resume_pc, true)) => eprintln!(
+                        "[latch-vs-bh] latch shape COULD build a resume-past image at \
+                         resume_pc={resume_pc}"
+                    ),
+                    Some((resume_pc, false)) => eprintln!(
+                        "[latch-vs-bh] latch shape could NOT build an image at \
+                         resume_pc={resume_pc}"
+                    ),
+                    None => eprintln!("[latch-vs-bh] latch shape has no blackhole_result/jitcode"),
+                }
+            }
             if fbw_debug_abort_enabled() && ctx.fbw_mode.inline_subwalk {
                 eprintln!(
                     "[s2-gate] inline_subwalk fs={} flag={} writes_live={} odo_unchanged={} \
