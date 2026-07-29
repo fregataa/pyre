@@ -257,8 +257,8 @@ unsafe fn walk_raw_function_roots(
     }
 }
 
-/// Forward a Box-immortal `PyCode`'s cached globals dict object
-/// (`pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-immortal,
+/// Forward a Box-immortal `PyCode`'s cached globals dict object and realized
+/// `co_consts_w` entries. Module globals are `malloc_typed`-immortal,
 /// but `exec`/`eval` with a plain dict (or a function built with custom
 /// globals) caches a `try_gc_alloc` movable dict here, which a minor collection
 /// relocates.  The code object itself is Box-immortal, so the standard tracer
@@ -269,12 +269,48 @@ pub unsafe fn walk_raw_code_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
+    unsafe fn walk(
+        value: PyObjectRef,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+        visited: &mut Vec<usize>,
+    ) {
+        unsafe {
+            if value.is_null() || !crate::pycode::is_code(value) {
+                return;
+            }
+            let identity = value as usize;
+            // PyPy's GC traces the PyCode constant list transitively and its
+            // mark state prevents revisiting shared/cyclic nodes. PyCode
+            // wrappers are outside pyre's collector, so mirror that small
+            // identity set directly while walking their constant graph.
+            if visited.contains(&identity) {
+                return;
+            }
+            visited.push(identity);
+            let code = &mut *(value as *mut crate::pycode::PyCode);
+            visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
+            if !code.co_consts_w.is_null() {
+                for slot in (&*code.co_consts_w).iter() {
+                    let mut child = slot.load(std::sync::atomic::Ordering::Acquire);
+                    if child.is_null() {
+                        continue;
+                    }
+                    visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
+                    slot.store(child, std::sync::atomic::Ordering::Release);
+                    // A code wrapper is Box-immortal and therefore not traced
+                    // by the collector. Recurse through nested co_consts_w,
+                    // matching PyPy's transitively traced PyCode list.
+                    walk(child, visitor, visited);
+                }
+            }
+        }
+    }
+
     unsafe {
         if value.is_null() || !crate::pycode::is_code(value) {
             return;
         }
-        let code = &mut *(value as *mut crate::pycode::PyCode);
-        visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
+        walk(value, visitor, &mut Vec::new());
     }
 }
 
@@ -1021,6 +1057,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     if !scan_prebuilt {
         return;
     }
+    // PyPy's GC reaches standalone code objects through the ordinary object
+    // graph. Pyre's Box-immortal wrappers need the equivalent process-global
+    // owner before walking module/type caches below.
+    crate::pycode::walk_prebuilt_code_roots(visitor);
     unsafe {
         let mut forward = |slot: &mut PyObjectRef| {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -2717,19 +2757,19 @@ impl ConstantOpcodeHandler for PyFrame {
         // Reached only for a code constant nested inside a container constant
         // (e.g. a tuple element), which has no top-level `co_consts_w` slot;
         // realize a wrapper directly.  Top-level `LOAD_CONST` of a code constant
-        // goes through `code_constant_at` below.
+        // goes through `constant_at` below.
         Ok(crate::pycode::box_code_constant(code))
     }
 
-    fn code_constant_at(
+    fn constant_at(
         &mut self,
-        index: usize,
+        index: crate::bytecode::oparg::ConstIdx,
         _enclosing: &crate::bytecode::CodeObject,
     ) -> Result<Self::Value, PyError> {
         // `pyopcode.py:498-499 getconstant_w(index) -> co_consts_w[index]`:
-        // return the one wrapper `self.pycode` holds at `index`.
+        // return the one object `self.pycode` holds at `index`.
         Ok(unsafe {
-            crate::pycode::w_code_co_const(self.pycode as pyre_object::PyObjectRef, index)
+            crate::pycode::w_code_const(self.pycode as pyre_object::PyObjectRef, usize::from(index))
         })
     }
 

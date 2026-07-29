@@ -637,6 +637,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::longobject::w_long_new_fresh_rbigint_handle",
+        "pyre_object::w_long_new_fresh_rbigint_handle",
+        pyre_object::longobject::w_long_new_fresh_rbigint_handle as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::gc_hook::try_gc_add_root",
         "pyre_object::try_gc_add_root",
         pyre_object::gc_hook::try_gc_add_root as *const (),
@@ -1072,6 +1078,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::jit_compiler_bigint_to_rbigint",
         crate::jit_compiler_bigint_to_rbigint as *const (),
     );
+    // PyPy's getconstant_w is a pre-wrapped list read. Pyre's compiler stores
+    // ConstantData, so the first read realizes and atomically publishes that
+    // wrapped object. Keep this temporary compiler-boundary machinery opaque
+    // to source translation; all later reads return the same co_consts_w slot.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_const",
+        crate::pycode::w_code_const as *const (),
+    );
     // Truncated `_divrem` projections used by Rust operator shims.
     push_fnaddr(
         &mut entries,
@@ -1083,6 +1098,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_rem",
         crate::objspace::descroperation::jit_bigint_rem as *const (),
     );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder",
+        crate::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder as *const (),
+    );
     // Floored `divmod` projections used by the zero-checked interpreter seams.
     push_fnaddr(
         &mut entries,
@@ -1093,6 +1113,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
         crate::objspace::descroperation::jit_bigint_mod_floor as *const (),
+    );
+    // Machine-int-divisor legs of the same seams (`_int_floordiv` / `_int_mod`).
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_div_floor",
+        crate::objspace::descroperation::jit_bigint_int_div_floor as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_mod_int_result",
+        crate::objspace::descroperation::jit_bigint_int_mod_int_result as *const (),
     );
     // `jit_bigint_{and,or,xor,sub,mul}` residualize the Rust RBigInt binary
     // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
@@ -1194,6 +1225,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_pow_nomod",
         crate::objspace::descroperation::jit_bigint_pow_nomod as *const (),
     );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_pow_nomod",
+        crate::objspace::descroperation::jit_bigint_int_pow_nomod as *const (),
+    );
     // `bigint_lshift_count(...)?` carries the same implicit MemoryError shape
     // for RPython's lshift allocation.
     push_fnaddr(
@@ -1201,12 +1237,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_lshift_count",
         crate::objspace::descroperation::jit_bigint_lshift_count as *const (),
     );
-    // `jit_bigint_neg` residualizes the unary `<BigInt as Neg>::neg` operator;
-    // a single operand pointer.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result",
+        crate::objspace::descroperation::jit_bigint_lshift_int_int_result as *const (),
+    );
+    // Unary rbigint operations each take one payload pointer.
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_neg",
         crate::objspace::descroperation::jit_bigint_neg as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_invert",
+        crate::objspace::descroperation::jit_bigint_invert as *const (),
     );
     // `jit_bigint_{shl,shr}` residualize the BigInt shift-by-`usize` operators
     // (`<BigInt as Shl<usize>>::shl`, …); `b` is the machine shift count.
@@ -2971,6 +3016,29 @@ mod tests {
             tuple2
         );
         assert_eq!(bindings["pyre_interpreter::jit_build_tuple_2"], tuple2);
+    }
+
+    /// `front::rbigint_call::lshift_count_residual_path` retargets both the
+    /// long-count and Signed×Signed-overflow forms.  Keep both exact paths
+    /// resolvable: otherwise the latter silently falls back to a symbolic
+    /// fnaddr when an overflowing machine-int left shift promotes to rbigint.
+    #[test]
+    fn jit_trace_fnaddrs_covers_both_rbigint_lshift_residuals() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let count =
+            crate::objspace::descroperation::jit_bigint_lshift_count as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::objspace::descroperation::jit_bigint_lshift_count"],
+            count
+        );
+
+        let int_int = crate::objspace::descroperation::jit_bigint_lshift_int_int_result as *const ()
+            as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result"],
+            int_int
+        );
     }
 
     #[test]

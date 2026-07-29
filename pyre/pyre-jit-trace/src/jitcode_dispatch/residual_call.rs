@@ -3221,6 +3221,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `divmod(a, b)` on two exact ints: inline the guarded
+    // `OS_INT_PY_DIV` / `OS_INT_PY_MOD` pair into a virtual `Cls_ii`
+    // specialised tuple (intobject.py `_divmod` → `newtuple2`) instead of the
+    // opaque `bh_call_fn(divmod_builtin, NULL, a, b)` residual.  Pure like the
+    // `len` fold, so no sub-walk restriction; any non-matching shape falls
+    // through to the generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_divmod(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // B3: a `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
     // constructs the exception, and a `RaiseVarargs`
@@ -3777,24 +3791,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 ctx.trace_ctx.box_value(idx_opref),
                 ctx.trace_ctx.box_value(code_opref),
             ) {
-                // Materialize the constant identically to the runtime
-                // `bh_load_const_fn` helper (call_jit.rs): a code constant reads
-                // the one shared wrapper off the virtualizable `pycode`'s
-                // `co_consts_w[index]`, other constants realize directly.
+                // Read the constant identically to the runtime
+                // `bh_load_const_fn`: every constant is the shared
+                // `pycode.co_consts_w[index]` object.
                 let w_const = unsafe {
-                    let w_code = pyre_interpreter::pycode::w_code_co_const(
+                    pyre_interpreter::pycode::w_code_const(
                         w_code_ptr as pyre_object::PyObjectRef,
                         consti as usize,
-                    );
-                    if !w_code.is_null() {
-                        w_code
-                    } else {
-                        let code = &*(pyre_interpreter::w_code_get_ptr(
-                            w_code_ptr as pyre_object::PyObjectRef,
-                        )
-                            as *const pyre_interpreter::CodeObject);
-                        pyre_interpreter::pyframe::load_const_from_code(code, consti as usize)
-                    }
+                    )
                 };
                 let const_box = ctx.trace_ctx.const_ref(w_const as i64);
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, const_box)?;
@@ -4138,6 +4142,23 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             // count their own `_int_lshift` / `_int_rshift`
                             // path before Long/Long.
                             specialized = try_walker_specialize_binary_op_long_int_shift(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        if specialized.is_none() {
+                            // `_int_floordiv` / `_int_mod` are the same family:
+                            // an Int divisor keeps its machine word instead of
+                            // being widened to a bigint, and `_int_mod`'s
+                            // result is a machine int rather than a long.
+                            specialized = try_walker_specialize_binary_op_long_int_div(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        if specialized.is_none() {
+                            // `descr_pow` keeps a `W_IntObject` exponent
+                            // unwrapped and calls `rbigint.int_pow`; only a
+                            // long exponent reaches `rbigint.pow`.
+                            specialized = try_walker_specialize_binary_op_long_int_pow(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )?;
                         }

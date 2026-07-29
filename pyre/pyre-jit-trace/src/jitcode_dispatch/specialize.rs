@@ -563,53 +563,15 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     }
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
-            // rint.py _ovf_zer guards: int_eq(rhs,0)→guard_false +
-            // (lhs==INT_MIN)&(rhs==-1)→guard_false ahead of the elidable
-            // helper call (so a re-used trace bails before the helper's
-            // wrapping_div / wrapping_rem returns a wrap value).
-            let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, (rb == 0) as i64);
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
-            let lhs_is_min = walker_int_eq_const(ctx, lhs_raw, i64::MIN, (la == i64::MIN) as i64);
-            let rhs_is_neg_one = walker_int_eq_const(ctx, rhs_raw, -1, (rb == -1) as i64);
-            let ovf_both = ctx
-                .trace_ctx
-                .record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
-            ctx.trace_ctx.set_opref_concrete(
-                ovf_both,
-                majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
-            );
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both])?;
-            // jtransform.py OS_INT_PY_DIV / OS_INT_PY_MOD elidable
-            // residual call (call_typed_with_effect_pure → CallI patched via
-            // record_result_of_call_pure).
-            let (func_ptr, effect_info, concrete_result) = if op_code == OpCode::IntFloorDiv {
-                (
-                    majit_metainterp::blackhole::ll_int_py_div as *const (),
-                    majit_metainterp::INT_PY_DIV_EFFECT_INFO,
-                    majit_metainterp::blackhole::ll_int_py_div(la, rb),
-                )
-            } else {
-                (
-                    majit_metainterp::blackhole::ll_int_py_mod as *const (),
-                    majit_metainterp::INT_PY_MOD_EFFECT_INFO,
-                    majit_metainterp::blackhole::ll_int_py_mod(la, rb),
-                )
-            };
-            let r = ctx.trace_ctx.call_typed_with_effect_pure(
-                OpCode::CallI,
-                func_ptr,
-                &[lhs_raw, rhs_raw],
-                &[majit_ir::Type::Int, majit_ir::Type::Int],
-                majit_ir::Type::Int,
-                effect_info,
-                &[
-                    majit_ir::Value::Int(func_ptr as usize as i64),
-                    majit_ir::Value::Int(la),
-                    majit_ir::Value::Int(rb),
-                ],
-                majit_ir::Value::Int(concrete_result),
-            );
-            (r, concrete_result)
+            walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)?;
+            walker_emit_int_py_div_or_mod(
+                ctx,
+                lhs_raw,
+                rhs_raw,
+                la,
+                rb,
+                op_code == OpCode::IntFloorDiv,
+            )
         }
         OpCode::IntRshift => {
             // The machine SAR masks the count mod 64, so guard the count into
@@ -650,6 +612,78 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
+}
+
+/// rint.py `_ovf_zer` guards for a machine-int division: `int_eq(rhs,0)` →
+/// `guard_false` plus `(lhs==INT_MIN)&(rhs==-1)` → `guard_false`.  Both must
+/// precede the elidable `ll_int_py_div` / `ll_int_py_mod` call so a re-used
+/// trace bails before the helper's `wrapping_div` / `wrapping_rem` returns a
+/// wrap value.  A `divmod` site shares one guard pair across both halves.
+fn walker_emit_int_div_domain_guards<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    lhs_raw: OpRef,
+    rhs_raw: OpRef,
+    la: i64,
+    rb: i64,
+) -> Result<(), DispatchError> {
+    let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, (rb == 0) as i64);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
+    let lhs_is_min = walker_int_eq_const(ctx, lhs_raw, i64::MIN, (la == i64::MIN) as i64);
+    let rhs_is_neg_one = walker_int_eq_const(ctx, rhs_raw, -1, (rb == -1) as i64);
+    let ovf_both = ctx
+        .trace_ctx
+        .record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
+    ctx.trace_ctx.set_opref_concrete(
+        ovf_both,
+        majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both])
+}
+
+/// jtransform.py `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable residual call
+/// (`call_typed_with_effect_pure` → `CallI` patched via
+/// `record_result_of_call_pure`), returning the result op and its recorded
+/// value.  The caller must have emitted
+/// [`walker_emit_int_div_domain_guards`] over the same operand pair first.
+fn walker_emit_int_py_div_or_mod<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    lhs_raw: OpRef,
+    rhs_raw: OpRef,
+    la: i64,
+    rb: i64,
+    is_div: bool,
+) -> (OpRef, i64) {
+    let (func_ptr, effect_info, concrete_result) = if is_div {
+        (
+            majit_metainterp::blackhole::ll_int_py_div as *const (),
+            majit_metainterp::INT_PY_DIV_EFFECT_INFO,
+            majit_metainterp::blackhole::ll_int_py_div(la, rb),
+        )
+    } else {
+        (
+            majit_metainterp::blackhole::ll_int_py_mod as *const (),
+            majit_metainterp::INT_PY_MOD_EFFECT_INFO,
+            majit_metainterp::blackhole::ll_int_py_mod(la, rb),
+        )
+    };
+    let r = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
+        func_ptr,
+        &[lhs_raw, rhs_raw],
+        &[majit_ir::Type::Int, majit_ir::Type::Int],
+        majit_ir::Type::Int,
+        effect_info,
+        &[
+            majit_ir::Value::Int(func_ptr as usize as i64),
+            majit_ir::Value::Int(la),
+            majit_ir::Value::Int(rb),
+        ],
+        majit_ir::Value::Int(concrete_result),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(r, majit_ir::Value::Int(concrete_result));
+    (r, concrete_result)
 }
 
 /// Walker-native mixed `W_LongObject` / `W_IntObject` arithmetic
@@ -706,6 +740,12 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
         (Some(lhs), Some(rhs)) => (lhs, rhs),
         _ => return Ok(None),
     };
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
+            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
+    {
+        return Ok(None);
+    }
     let (long, int, long_obj, int_obj) = unsafe {
         if pyre_object::is_long(lhs_obj) && pyre_object::is_int(rhs_obj) {
             (r_args[0], r_args[1], lhs_obj, rhs_obj)
@@ -715,12 +755,14 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
             return Ok(None);
         }
     };
-    if unsafe {
-        !pyre_object::is_exact_builtin_instance(long_obj)
-            || !pyre_object::is_exact_builtin_instance(int_obj)
-    } {
+    let (Some(long_class), Some(int_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        )
+    }) else {
         return Ok(None);
-    }
+    };
     let int_value = unsafe { pyre_object::w_int_get_value(int_obj) };
 
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -745,8 +787,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
     let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
     let long_pl = ctx.trace_ctx.record_op_with_descr(
@@ -808,6 +852,397 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Walker-native `W_LongObject // W_IntObject` / `%` specialization for the
+/// `BINARY_OP` helper residual_call.
+///
+/// `pypy/objspace/std/longobject.py:424,441 _make_descr_binop` selects
+/// `_int_floordiv` / `_int_mod` when the right operand is a `W_IntObject`.
+/// The two legs differ in their *result* representation, and that difference
+/// is the whole point of specialising them apart:
+///   * `_int_floordiv` (`longobject.py:417-423`) → `rbigint.int_floordiv` →
+///     a bigint quotient, boxed as a `W_LongObject` — the same shape
+///     [`try_walker_specialize_binary_op_long_int_shift`] emits.
+///   * `_int_mod` (`longobject.py:434-440`) → `rbigint.int_mod_int_result` →
+///     `space.newint`: the remainder of a long by a machine int always fits a
+///     machine int, so this leg allocates **no** result bigint and boxes a
+///     plain `W_IntObject`.
+///
+/// `long_floordiv` / `long_mod` (`descroperation.rs`) raise
+/// `ZeroDivisionError` before reaching the `_nonzero` rbigint seam, so the
+/// divisor test is traced as a `GUARD_TRUE(int_ne(divisor, 0))` — the guard a
+/// meta-tracer records for that interpreter branch. A replay with a zero
+/// divisor therefore bails to the interpreter, which raises the authentic
+/// error rather than re-deriving its wording here.
+///
+/// `int // long` and `int % long` are `descr_rfloordiv` / `descr_rmod`, which
+/// coerce the left operand to a long and take the bigint/bigint path; they are
+/// deliberately left to [`try_walker_specialize_binary_op_long`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    let is_floordiv = match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
+        Some(BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide) => true,
+        Some(BinaryOperator::Remainder | BinaryOperator::InplaceRemainder) => false,
+        _ => return Ok(None),
+    };
+    let long = r_args[0];
+    let int = r_args[1];
+    let (Some(long_obj), Some(int_obj)) = (
+        walker_concrete_ref_object(ctx, long),
+        walker_concrete_ref_object(ctx, int),
+    ) else {
+        return Ok(None);
+    };
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(long_obj)
+            || pyre_object::tagged_int::is_tagged_int(int_obj))
+    {
+        return Ok(None);
+    }
+    let (long_class, int_class, int_value) = unsafe {
+        if !pyre_object::is_long(long_obj) || !pyre_object::is_int(int_obj) {
+            return Ok(None);
+        }
+        let (Some(long_class), Some(int_class)) = (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        ) else {
+            return Ok(None);
+        };
+        (long_class, int_class, pyre_object::w_int_get_value(int_obj))
+    };
+    // The zero-divisor arm raises before calling rbigint. Record it through the
+    // generic helper so no partial specialization is emitted.
+    if int_value == 0 {
+        return Ok(None);
+    }
+
+    // Execute the authentic Python operation first: it supplies both the
+    // observable result and the concrete payload for the pure call, without
+    // running an allocating rbigint helper twice at record time.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+    if boxed_result_obj == pyre_object::PY_NULL {
+        return Ok(None);
+    }
+    // Everything that can decline must do so before the first guard is
+    // recorded — a later bail-out would leave the operand's class pinned in
+    // the heap cache with no matching guard in the trace.
+    let quotient_concrete = if is_floordiv {
+        if unsafe {
+            pyre_object::is_int(boxed_result_obj) || !pyre_object::is_long(boxed_result_obj)
+        } {
+            return Ok(None);
+        }
+        let raw_concrete = unsafe {
+            *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+                as *const i64)
+        };
+        if pyre_object::longobject::jit_bigint_fits_int(raw_concrete) != 0 {
+            return Ok(None);
+        }
+        Some(raw_concrete)
+    } else {
+        if unsafe { !pyre_object::is_int(boxed_result_obj) } {
+            return Ok(None);
+        }
+        None
+    };
+
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
+    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
+    let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonzero = ctx.trace_ctx.record_op(OpCode::IntNe, &[int_raw, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonzero, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonzero])?;
+
+    let off = pyre_object::longobject::LONG_VALUE_OFFSET;
+    let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
+    let long_pl = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[long],
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        long_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+    );
+
+    let result = match quotient_concrete {
+        Some(raw_concrete) => {
+            let helper =
+                pyre_interpreter::objspace::descroperation::jit_bigint_int_div_floor as *const ();
+            let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+                OpCode::CallR,
+                helper,
+                &[long_pl, int_raw],
+                &[majit_ir::Type::Ref, majit_ir::Type::Int],
+                majit_ir::Type::Ref,
+                majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+                &[
+                    majit_ir::Value::Int(helper as usize as i64),
+                    majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+                    majit_ir::Value::Int(int_value),
+                ],
+                majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                raw,
+                majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+            );
+            if raw.inline_const_to_value().is_none() {
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+            }
+            // `w_long_new` keeps the quotient a `W_LongObject`, so this guard is
+            // not a demotion test: it pins the trace to the payload shape the
+            // inline box was recorded for, exactly as the shift leg does.
+            let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+            let fits = ctx.trace_ctx.call_typed_with_effect(
+                OpCode::CallI,
+                fits_fn,
+                &[raw],
+                &[majit_ir::Type::Ref],
+                majit_ir::Type::Int,
+                majit_metainterp::cannot_raise_effect_info(),
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(fits, majit_ir::Value::Int(0));
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
+
+            let boxed = crate::helpers::emit_box_long_inline(
+                ctx.trace_ctx,
+                raw,
+                crate::descr::w_long_size_descr(),
+                crate::descr::long_value_descr(),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+            );
+            boxed
+        }
+        None => {
+            let mod_concrete = unsafe { pyre_object::w_int_get_value(boxed_result_obj) };
+            let helper = pyre_interpreter::objspace::descroperation::jit_bigint_int_mod_int_result
+                as *const ();
+            let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+                OpCode::CallI,
+                helper,
+                &[long_pl, int_raw],
+                &[majit_ir::Type::Ref, majit_ir::Type::Int],
+                majit_ir::Type::Int,
+                majit_metainterp::ELIDABLE_EFFECT_INFO,
+                &[
+                    majit_ir::Value::Int(helper as usize as i64),
+                    majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+                    majit_ir::Value::Int(int_value),
+                ],
+                majit_ir::Value::Int(mod_concrete),
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(mod_concrete));
+            if raw.inline_const_to_value().is_none() {
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+            }
+            let boxed = walker_box_int(ctx, op_pc, raw, mod_concrete)?;
+            ctx.trace_ctx
+                .set_opref_concrete(boxed, box_int_concrete(mod_concrete, boxed_result_i64));
+            boxed
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
+/// Walker-native `W_LongObject ** W_IntObject` specialization for the
+/// `BINARY_OP` helper residual_call.
+///
+/// `longobject.py:206-231 descr_pow` keeps a `W_IntObject` exponent unwrapped
+/// (`exp_bigint` stays `None`) and calls `rbigint.int_pow`; only a long
+/// exponent reaches `rbigint.pow`. `long_pow` (`descroperation.rs`) reaches
+/// that call past four short-circuits — a negative exponent goes to the float
+/// path, a zero exponent returns 1, and a base of 0 / 1 / -1 returns a
+/// constant. The exponent tests unbox to a machine word, so they record as a
+/// single `GUARD_TRUE(int_gt(exp, 0))`.
+///
+/// The three base tests collapse into one guard: a base whose payload does not
+/// fit a machine word has magnitude at least `2**63`, so it can be none of
+/// 0 / 1 / -1. That is strictly stronger than the interpreter's three
+/// comparisons — it can only bail more often, never take a different path —
+/// and it costs one `jit_bigint_fits_int` call instead of three bigint
+/// comparisons against baked constants. It also makes the usual trailing
+/// result-fits guard redundant: `|base| >= 2**63` with `exp >= 1` cannot
+/// produce a result that fits a machine word, so unlike the floordiv and shift
+/// legs this one emits no guard on the result payload.
+///
+/// `descr_pow` wraps every branch as `W_LongObject` (no `newlong` demotion),
+/// so the result boxes inline exactly like the other long legs.
+/// The three-argument `pow(a, b, m)` is not a `BINARY_OP` and never reaches
+/// here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_binary_op_long_int_pow<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    if !matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+        Some(BinaryOperator::Power | BinaryOperator::InplacePower)
+    ) {
+        return Ok(None);
+    }
+    let long = r_args[0];
+    let int = r_args[1];
+    let (Some(long_obj), Some(int_obj)) = (
+        walker_concrete_ref_object(ctx, long),
+        walker_concrete_ref_object(ctx, int),
+    ) else {
+        return Ok(None);
+    };
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(long_obj)
+            || pyre_object::tagged_int::is_tagged_int(int_obj))
+    {
+        return Ok(None);
+    }
+    let (long_class, int_class, exp_value) = unsafe {
+        if !pyre_object::is_long(long_obj) || !pyre_object::is_int(int_obj) {
+            return Ok(None);
+        }
+        let (Some(long_class), Some(int_class)) = (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        ) else {
+            return Ok(None);
+        };
+        (long_class, int_class, pyre_object::w_int_get_value(int_obj))
+    };
+    // A non-positive exponent leaves through one of the short-circuits above
+    // the `rbigint.int_pow` call; record those through the generic helper.
+    if exp_value <= 0 {
+        return Ok(None);
+    }
+    let off = pyre_object::longobject::LONG_VALUE_OFFSET;
+    let base_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
+    if pyre_object::longobject::jit_bigint_fits_int(base_payload) != 0 {
+        return Ok(None);
+    }
+
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+    if boxed_result_obj == pyre_object::PY_NULL
+        || unsafe {
+            pyre_object::is_int(boxed_result_obj) || !pyre_object::is_long(boxed_result_obj)
+        }
+    {
+        return Ok(None);
+    }
+    let raw_concrete = unsafe {
+        *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+            as *const i64)
+    };
+
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
+    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
+    let exp_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let positive = ctx.trace_ctx.record_op(OpCode::IntGt, &[exp_raw, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(positive, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[positive])?;
+
+    let base_pl = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[long],
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        base_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(base_payload as usize)),
+    );
+    let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+    let base_fits = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        fits_fn,
+        &[base_pl],
+        &[majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::cannot_raise_effect_info(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(base_fits, majit_ir::Value::Int(0));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[base_fits])?;
+
+    let helper = pyre_interpreter::objspace::descroperation::jit_bigint_int_pow_nomod as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+        OpCode::CallR,
+        helper,
+        &[base_pl, exp_raw],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as usize as i64),
+            majit_ir::Value::Ref(majit_ir::GcRef(base_payload as usize)),
+            majit_ir::Value::Int(exp_value),
+        ],
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
+
+    let result = crate::helpers::emit_box_long_inline(
+        ctx.trace_ctx,
+        raw,
+        crate::descr::w_long_size_descr(),
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
 /// Walker-native `W_LongObject << W_IntObject` / `>>` specialization for the
 /// `BINARY_OP` helper residual_call.
 ///
@@ -852,15 +1287,17 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    let rhs_value = unsafe {
-        if !pyre_object::is_long(lhs_obj)
-            || !pyre_object::is_int(rhs_obj)
-            || !pyre_object::is_exact_builtin_instance(lhs_obj)
-            || !pyre_object::is_exact_builtin_instance(rhs_obj)
-        {
+    let (lhs_class, rhs_class, rhs_value) = unsafe {
+        if !pyre_object::is_long(lhs_obj) || !pyre_object::is_int(rhs_obj) {
             return Ok(None);
         }
-        pyre_object::w_int_get_value(rhs_obj)
+        let (Some(lhs_class), Some(rhs_class)) = (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        ) else {
+            return Ok(None);
+        };
+        (lhs_class, rhs_class, pyre_object::w_int_get_value(rhs_obj))
     };
     // The negative-count arm raises before calling rbigint.  Record it through
     // the generic helper so no partial specialization is emitted.
@@ -893,8 +1330,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[rhs_raw, zero]);
     ctx.trace_ctx
@@ -1017,6 +1456,14 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
         return Ok(None);
     }
+    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        )
+    }) else {
+        return Ok(None);
+    };
     // Authentic boxed result via the same execute path the int leg uses; a
     // NULL / raised result defers to the generic record.
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -1045,6 +1492,8 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     // Read each operand's immutable `value` payload, then call the
     // elidable `rbigint` op on the bare `*const BigInt` payloads. Passing
     // the payloads (not the wrappers) keeps the call pure on the immutable
@@ -1185,6 +1634,14 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
         return Ok(None);
     }
+    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        )
+    }) else {
+        return Ok(None);
+    };
     // Authentic boxed float via the generic execute path; a NULL / raised result
     // (zero divisor, float overflow) defers to the generic record.
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -1193,6 +1650,8 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     // Pure `rbigint.truediv` → correctly-rounded f64 (CallPureF). The op already
     // ran authentically above, so the divisor is nonzero / non-overflowing here;
     // the trailing GuardNoException covers a divide-by-zero / overflow on replay.
@@ -1236,14 +1695,28 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
 
 /// FBW fold of the UNPACK_SEQUENCE two-residual lowering (`unpack_sequence_fn`
 /// validator + per-index `unpack_item_fn` reader emitted by the codewriter
-/// UNPACK_SEQUENCE arm) for an arity-2 specialised int tuple: guard the
-/// `spec_ii` class once, then read `value0` / `value1` directly
-/// (`getfield_gc_pure_i` + `wrapint`) so the unpacked items stay unboxed ints
-/// through the downstream BINARY_OP int fold — the walker analogue of the
-/// retired MIFrame `W_SpecialisedTupleObject_ii` value0/value1 reads. Returns
-/// `Ok(Some(()))` when folded (the caller returns `Continue`); `Ok(None)` to
-/// fall through to the opaque residual record, which stays correct for any
-/// other shape — so a non-foldable sequence is not declined.
+/// UNPACK_SEQUENCE arm) for an arity-2 specialised tuple: guard the
+/// specialisation's class once, then read `value0` / `value1` directly instead
+/// of leaving three opaque `CALL_MAY_FORCE` residuals in the loop.
+///
+/// `objspace.py:519-523 fixedview` reaches `tolist()` for every
+/// `W_AbstractTupleObject`, and `specialisedtupleobject.py:32,58-64 tolist`
+/// unrolls over `_immutable_fields_` value slots, so upstream traces the whole
+/// unpack inline and the optimizer virtualizes the pair away. Both arity-2
+/// layouts are covered here because `makespecialisedtuple2`
+/// (`specialisedtupleobject.py:169-179`) never falls back to a plain tuple:
+///   * `ii` — `value0`/`value1` are inline machine ints, so the read is
+///     `getfield_gc_pure_i` + `wrapint` and the items stay unboxed through the
+///     downstream BINARY_OP int fold (the walker analogue of the retired
+///     MIFrame `W_SpecialisedTupleObject_ii` reads);
+///   * `oo` — `wraps[i]` for an object slot is the identity
+///     (`specialisedtupleobject.py:26-27`), so the `getfield_gc_r` result is
+///     already the item. This is the layout a `divmod(long, long)` result pair
+///     takes, since neither half satisfies `is_plain_int1`.
+///
+/// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
+/// `Ok(None)` to fall through to the opaque residual record, which stays
+/// correct for any other shape — so a non-foldable sequence is not declined.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -1268,29 +1741,27 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     let Some(concrete_seq) = walker_concrete_ref_object(ctx, seq) else {
         return Ok(None);
     };
-    // Only the arity-2 int specialised tuple is folded today; any other shape
-    // falls through to the opaque residual (correct, slower).
+    // Both arity-2 specialisations fold; any other shape (a plain tuple, a
+    // longer unpack, a list) falls through to the opaque residual (correct,
+    // slower).
     let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE
         as *const pyre_object::pyobject::PyType;
-    if !std::ptr::eq(unsafe { (*concrete_seq).ob_type }, spec_ii) {
+    let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
+        as *const pyre_object::pyobject::PyType;
+    let seq_type = unsafe { (*concrete_seq).ob_type };
+    let is_oo = std::ptr::eq(seq_type, spec_oo);
+    if !is_oo && !std::ptr::eq(seq_type, spec_ii) {
         return Ok(None);
     }
+    let spec_type = if is_oo { spec_oo } else { spec_ii };
     match helper {
         majit_ir::PyreHelperKind::UnpackSequence => {
-            // `spec_ii` is always arity 2, so the class guard subsumes the
-            // exact-length check `unpack_sequence_fn` performs.
+            // Either specialisation is always arity 2, so the class guard
+            // subsumes the exact-length check `unpack_sequence_fn` performs.
             if int_val != 2 {
                 return Ok(None);
             }
-            if !ctx.trace_ctx.heap_cache().is_class_known(seq) {
-                let type_const = ctx.trace_ctx.const_int(spec_ii as i64);
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardClass, &[seq, type_const], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(seq, spec_ii as i64);
-            }
+            walker_guard_specialised_pair_class(ctx, op_pc, seq, spec_type)?;
             // Pass `seq` through as the validated tuple; the per-index
             // `unpack_item_fn` reads below fold off it.
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, seq)?;
@@ -1300,13 +1771,29 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
             if !(0..2).contains(&int_val) {
                 return Ok(None);
             }
+            // Normally the partner `unpack_sequence_fn` fold already guarded
+            // the class (its validated-tuple passthrough reg == `seq`), in
+            // which case this is a no-op; guard here too so a fold that only
+            // catches the item reads still proves the layout it loads from.
+            walker_guard_specialised_pair_class(ctx, op_pc, seq, spec_type)?;
+            if is_oo {
+                let descr = if int_val == 0 {
+                    crate::descr::specialised_tuple_oo_value0_descr()
+                } else {
+                    crate::descr::specialised_tuple_oo_value1_descr()
+                };
+                // `wraps[i]` is the identity for an object slot, so the field
+                // read is the whole item — no re-boxing, and no `may_force`
+                // execution needed to recover a box identity.
+                let item = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, seq, descr);
+                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
+                return Ok(Some(()));
+            }
             // Authentic boxed element (small-int caching / identity); fall
             // through to the opaque residual if it cannot be executed.
             let Some(elem_ptr) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
                 return Ok(None);
             };
-            // The class was already guarded by the partner `unpack_sequence_fn`
-            // fold (its validated-tuple passthrough reg == `seq`).
             let descr = if int_val == 0 {
                 crate::descr::specialised_tuple_ii_value0_descr()
             } else {
@@ -1337,6 +1824,29 @@ unsafe fn args_tuple_shape_probe(stored: pyre_object::PyObjectRef) -> pyre_objec
         })
         .collect();
     pyre_object::w_tuple_new(items)
+}
+
+/// `guard_class(seq, spec)` for one of the arity-2 tuple specialisations,
+/// emitted once per traced `seq` — the heap cache turns every later fold on the
+/// same register into a no-op, the way upstream's optimizer keeps a single
+/// class guard for a value it already proved.
+fn walker_guard_specialised_pair_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq: OpRef,
+    spec_type: *const pyre_object::pyobject::PyType,
+) -> Result<(), DispatchError> {
+    if ctx.trace_ctx.heap_cache().is_class_known(seq) {
+        return Ok(());
+    }
+    let type_const = ctx.trace_ctx.const_int(spec_type as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardClass, &[seq, type_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(seq, spec_type as i64);
+    Ok(())
 }
 
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
@@ -2715,6 +3225,30 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         )?
     };
 
+    let tuple = walker_emit_specialised_tuple_ii(ctx, op_pc, raw0, raw1, v0, v1)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
+    Ok(Some(()))
+}
+
+/// Emit the virtual `Cls_ii` arity-2 int tuple (`makespecialisedtuple2`,
+/// specialisedtupleobject.py) walker-native: `new_with_vtable` + the `w_class`
+/// / `value0` / `value1` `setfield_gc`s over the two raw int payloads.
+///
+/// `v0` / `v1` are the recorded payloads; they build the concrete shadow the
+/// partner unpack fold reads back (`walker_concrete_ref_object` +
+/// `unpack_item_fn`).  The shadow is constructed LAST so the construct→root
+/// window holds no intervening runtime allocation: stamping `tuple`'s concrete
+/// roots the fresh spec_ii via the trace's concrete-shadow set. A concrete
+/// allocation failure aborts the whole walk because the virtual allocation
+/// and stores have already been recorded.
+fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw0: OpRef,
+    raw1: OpRef,
+    v0: i64,
+    v1: i64,
+) -> Result<OpRef, DispatchError> {
     let tuple = ctx.trace_ctx.record_op_with_descr(
         OpCode::NewWithVtable,
         &[],
@@ -2738,43 +3272,25 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
             wc,
         );
     }
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[tuple, raw0],
-        crate::descr::specialised_tuple_ii_value0_descr(),
-    );
-    ctx.trace_ctx.heapcache_setfield_cached(
-        tuple,
-        crate::descr::specialised_tuple_ii_value0_descr().index(),
-        raw0,
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[tuple, raw1],
-        crate::descr::specialised_tuple_ii_value1_descr(),
-    );
-    ctx.trace_ctx.heapcache_setfield_cached(
-        tuple,
-        crate::descr::specialised_tuple_ii_value1_descr().index(),
-        raw1,
-    );
-    // Concrete spec_ii shadow for the dst (read by the partner unpack fold's
-    // `walker_concrete_ref_object` + `unpack_item_fn` execution).  Built
-    // directly from the element payloads — `newtuple_from_array(arr)` cannot
-    // be executed concretely (the virtual array `arr` has no concrete
-    // shadow).  Constructed last so the construct→root window holds no
-    // intervening runtime allocation: stamping `tuple`'s concrete roots the
-    // fresh spec_ii via the trace's concrete-shadow set.
+    for (raw, descr) in [
+        (raw0, crate::descr::specialised_tuple_ii_value0_descr()),
+        (raw1, crate::descr::specialised_tuple_ii_value1_descr()),
+    ] {
+        let descr_index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[tuple, raw], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(tuple, descr_index, raw);
+    }
     let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
     if tuple_ptr.is_null() {
-        return Ok(None);
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
     }
     ctx.trace_ctx.set_opref_concrete(
         tuple,
         majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
     );
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
-    Ok(Some(()))
+    Ok(tuple)
 }
 
 /// #57 SLICE 3b: walker-native speculative int specialization for the
@@ -3139,12 +3655,14 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
-    if unsafe {
-        !pyre_object::is_exact_builtin_instance(long_obj)
-            || !pyre_object::is_exact_builtin_instance(int_obj)
-    } {
+    let (Some(long_class), Some(int_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        )
+    }) else {
         return Ok(None);
-    }
+    };
     let effective_cmp = if reflected {
         match cmp_op {
             ComparisonOperator::Less => ComparisonOperator::Greater,
@@ -3180,8 +3698,10 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
     let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
     let long_pl = ctx.trace_ctx.record_op_with_descr(
@@ -3271,6 +3791,14 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
     if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
         return Ok(None);
     }
+    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        )
+    }) else {
+        return Ok(None);
+    };
     // Authentic boxed W_Bool via the same execute path the int leg uses; also
     // advances the concrete VM state the downstream ops read.
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -3279,6 +3807,8 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     // Pure `rbigint` comparison → sign in {-1,0,1}. Dead after the `int_<cmp>`
     // below and never spans a guard, so it needs no blackhole reconstruction.
     let cmp_fn = pyre_object::longobject::jit_w_long_cmp as *const ();
@@ -4245,6 +4775,140 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
+/// shape the meta-tracer produces upstream (intobject.py `_divmod` →
+/// `space.newtuple2(space.newint(z), space.newint(m))`) instead of the opaque
+/// `bh_call_fn(divmod_builtin, NULL, a, b)` residual.
+///
+/// The divmod row rejects a zero divisor before dispatching, so the trace
+/// carries the same domain guards the `//` / `%` specialization emits, then
+/// runs the two `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable calls over one
+/// guarded operand pair.  The result is the virtual `Cls_ii` specialised
+/// tuple, so a `q, r = divmod(...)` site pairs with
+/// [`try_walker_specialize_unpack`] and the tuple never materializes.
+///
+/// The exact `w_class` guard is required because an `int` SUBCLASS shares
+/// `ob_type == &INT_TYPE` but may override `__divmod__`; it side-exits to the
+/// generic residual.
+///
+/// Returns `None` (fall through to the generic residual, SAFE) for any other
+/// shape: wrong arity, a bound receiver, a non-`divmod` callable, an operand
+/// that is not an exact `int` (long / float / bool / subclass), a tagged
+/// immediate, a zero divisor, or the `INT_MIN // -1` pair that escapes to a
+/// bigint result.
+pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, a, b)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(lhs_obj),
+        ConcreteValue::Ref(rhs_obj),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0 — not a plain `divmod(a, b)` call.
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || lhs_obj.is_null()
+        || rhs_obj.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_divmod_function(concrete_callable) {
+        return Ok(None);
+    }
+    // A tagged immediate has no real header for the `w_class` / unbox guards
+    // and this emit is not tag-aware, so decline it to the residual.
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
+            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
+    {
+        return Ok(None);
+    }
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let (la, rb) = unsafe {
+        let is_exact_int = |o: pyre_object::PyObjectRef| {
+            std::ptr::eq((*o).ob_type, &pyre_object::pyobject::INT_TYPE)
+                && std::ptr::eq((*o).w_class, int_typeobj)
+        };
+        if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
+            return Ok(None);
+        }
+        (
+            pyre_object::w_int_get_value(lhs_obj),
+            pyre_object::w_int_get_value(rhs_obj),
+        )
+    };
+    // A zero divisor raises ZeroDivisionError and `INT_MIN // -1` escapes to
+    // the bigint pair; both are outside the guarded domain the emit below
+    // covers, so decline rather than record a guard the recorded operands
+    // already fail.
+    if rb == 0 || (la == i64::MIN && rb == -1) {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    // Pin the callable identity (LOAD_GLOBAL `divmod` is usually already a
+    // constant via the namespace cell fold).
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let (lhs_op, rhs_op) = (r_args[2], r_args[3]);
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    // `GuardClass` before the `w_class` read: it is the guard that proves the
+    // operand is a real heap header rather than a tagged immediate, so it has
+    // to precede any `getfield` off that header.
+    walker_guard_class(ctx, op.pc, lhs_op, int_type_addr)?;
+    walker_guard_class(ctx, op.pc, rhs_op, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, lhs_op, int_typeobj)?;
+    walker_guard_exact_w_class(ctx, op.pc, rhs_op, int_typeobj)?;
+    let lhs_raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        lhs_op,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    let rhs_raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        rhs_op,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    walker_emit_int_div_domain_guards(ctx, op.pc, lhs_raw, rhs_raw, la, rb)?;
+    let (div_raw, div_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, true);
+    let (mod_raw, mod_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, false);
+    let tuple =
+        walker_emit_specialised_tuple_ii(ctx, op.pc, div_raw, mod_raw, div_value, mod_value)?;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
+    Ok(Some(()))
+}
+
 /// #171 ORTHODOX descent of the real `w_list_append` charon body (WIP).
 ///
 /// Instead of hand-rolling the int-storage append IR (the fold below), walk
@@ -4758,10 +5422,15 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
     // Read the arm AFTER any empty-strategy promotion above, so the predicate
-    // sees the storage the sub-walk will actually append into.
-    ctx.fbw_mode.append_inplace_wb_covered_receiver =
-        unsafe { pyre_object::w_list_append_stores_into_gc_block_in_place(inner_self) }
-            .then_some(inner_self as usize);
+    // sees the storage the sub-walk will actually append into.  An
+    // Empty->Object promotion is not the pre-existing-block in-place case:
+    // it has just installed a young `items` block into the (possibly old)
+    // list wrapper.  Keep the body's `list_write_barrier` for that transition;
+    // only an append whose Object block predated this append is covered solely
+    // by the SetarrayitemGc array barrier.
+    ctx.fbw_mode.append_inplace_wb_covered_receiver = (!promote_empty
+        && unsafe { pyre_object::w_list_append_stores_into_gc_block_in_place(inner_self) })
+    .then_some(inner_self as usize);
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,

@@ -890,8 +890,9 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// jitcode in `walker_capture_snapshot_for_last_guard`.
     pub inline_subwalk: bool,
     /// The enclosing `w_list_append` fold took the Object strategy's in-place
-    /// arm, so the appended ref lands in a `SetarrayitemGc` the backend GC
-    /// rewrite already covers with `COND_CALL_GC_WB_ARRAY`
+    /// arm on a block that existed before this append, so the appended ref
+    /// lands in a `SetarrayitemGc` the backend GC rewrite already covers with
+    /// `COND_CALL_GC_WB_ARRAY`
     /// (`rewrite.py:936-944` `handle_write_barrier_setarrayitem`). The list's
     /// own `items` pointer is unchanged on that arm, so remembering the
     /// `W_ListObject` adds nothing the array barrier does not already do.
@@ -906,6 +907,10 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// Carries the receiver address rather than a flag so only that list's
     /// barrier is dropped — a barrier reached for any other list inside the
     /// sub-walk is recorded normally.
+    ///
+    /// Never set for Empty->Object promotion: that transition also installs
+    /// the new block in `W_ListObject.items`, so the owner barrier is
+    /// load-bearing even though the subsequent element store is in-place.
     ///
     /// Only set while the items block is GC-managed. With
     /// `PYRE_GC_ITEMSBLOCK=0` the block is `std::alloc` memory with no GC
@@ -1760,6 +1765,10 @@ pub enum DispatchError {
     /// walker surfaces it as a typed abort that the production driver
     /// maps to `TraceAction::Abort` (recoverable — may retry later).
     AbortMarkerReached { pc: usize },
+    /// Record-time construction of a concrete shadow object failed after the
+    /// specialization had emitted IR. Falling through to the generic residual
+    /// would retain that partial prologue, so abort the whole walk.
+    ConcreteShadowAllocationFailed { pc: usize },
     /// `abort_permanent/` (BC_ABORT_PERMANENT) reached. pyre's codegen
     /// emits this for fail-paths that must always terminate the frame
     /// (e.g. BigInt-overflow / unported-op fallbacks). Blackhole
@@ -1970,6 +1979,7 @@ impl DispatchError {
             Self::VableArrayIndexOutOfRange { .. } => "VableArrayIndexOutOfRange",
             Self::VableArrayIndexNotConcrete { .. } => "VableArrayIndexNotConcrete",
             Self::AbortMarkerReached { .. } => "AbortMarkerReached",
+            Self::ConcreteShadowAllocationFailed { .. } => "ConcreteShadowAllocationFailed",
             Self::AbortPermanentMarkerReached { .. } => "AbortPermanentMarkerReached",
             Self::MayForceNullRefArgUnsupported { .. } => "MayForceNullRefArgUnsupported",
             Self::VableEscapedDuringResidualCall { .. } => "VableEscapedDuringResidualCall",
@@ -7133,6 +7143,37 @@ fn next_op_is_load_method_self_for_attr<Sym: WalkSym>(
 enum WalkerStoreAttrSpecialization {
     Residual(DescrRef, Vec<OpRef>),
     Direct,
+}
+
+/// The canonical Python class of an exact builtin operand, or `None` when it
+/// is a subclass instance or carries no `w_class` to pin.
+///
+/// A specialization that bypasses special-method lookup needs this at RECORD
+/// time to pick the class object its replay guard compares against.  PyPy has
+/// no equivalent step: `space.allocate_instance` gives an `int` subclass its
+/// own RPython class, so one `guard_class` already separates it from
+/// `W_IntObject`.  pyre shares the `ob_type` layout between the two and carries
+/// the Python-visible class in `w_class`, so `GuardClass` alone leaves a
+/// subclass free to reuse the trace and skip its `__floordiv__` / `__pow__` /
+/// `__lt__` override.
+///
+/// `is_exact_builtin_instance` also accepts a NULL `w_class`; that operand
+/// cannot be pinned by [`walker_guard_exact_w_class`], so it declines here
+/// rather than emitting a guard that would fail on its own recorded operand.
+///
+/// # Safety
+/// `obj` must be a non-null, untagged heap object.
+unsafe fn walker_exact_builtin_class(
+    obj: pyre_object::PyObjectRef,
+) -> Option<pyre_object::PyObjectRef> {
+    unsafe {
+        let w_class = (*obj).w_class;
+        if w_class.is_null() {
+            return None;
+        }
+        let canonical = pyre_object::pyobject::get_instantiate(&*(*obj).ob_type);
+        std::ptr::eq(w_class, canonical).then_some(canonical)
+    }
 }
 
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`

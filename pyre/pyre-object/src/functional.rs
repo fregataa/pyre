@@ -1,7 +1,7 @@
 //! `pypy/module/__builtin__/functional.py` line-by-line ports for built-in iterator functionals.
 
 use crate::pyobject::*;
-use crate::rbigint::RBigInt as BigInt;
+use crate::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use pyre_macros::pyre_class;
 
 // ── functional.rs ─────────────────────────────────────────────
@@ -771,7 +771,10 @@ pub unsafe fn range_obj_to_bigint(obj: PyObjectRef) -> BigInt {
         } else if is_int(obj) {
             BigInt::from(crate::intobject::w_int_get_value(obj))
         } else {
-            crate::longobject::w_long_get_value(obj).clone()
+            // `space.bigint_w(W_LongObject)` returns the stored rbigint
+            // reference. The host ownership adapter is a shallow clone, but
+            // source translation aliases the existing GC payload.
+            crate::longobject::w_long_get_value(obj).translated_alias()
         }
     }
 }
@@ -927,7 +930,7 @@ pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<P
     unsafe {
         let (start, _stop, step) = w_range_fields(obj);
         let len_b = range_obj_to_bigint(w_range_length(obj));
-        let mut idx = index.clone();
+        let mut idx = index.translated_alias();
         if idx < BigInt::zero() {
             idx = &idx + &len_b;
         }
@@ -1156,7 +1159,10 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         let step = range_obj_to_bigint((*it).step);
         // `w_result = self.w_index * self.w_step + self.w_start`, then
         // `self.w_index = self.w_index + 1` (wrapped, arbitrary precision).
-        let value = start + index.clone() * step;
+        // `next_index` is wrapped before `value`; that first allocation may
+        // collect while the computed item exists only as an unboxed rbigint.
+        // RPython's GC transform roots this local automatically.
+        let value = RBigIntGcRoot::new(start + index.translated_alias() * step);
         let _roots = crate::gc_roots::push_roots();
         crate::gc_roots::pin_root(obj);
         let iter_slot = crate::gc_roots::shadow_stack_len() - 1;
@@ -1165,7 +1171,7 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;
         (*it).index = next_index;
         crate::gc_hook::try_gc_write_barrier(it as *mut u8);
-        Some(range_bigint_to_obj(value))
+        Some(range_bigint_to_obj(value.translated_alias()))
     }
 }
 

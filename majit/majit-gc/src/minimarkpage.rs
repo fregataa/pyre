@@ -9,6 +9,11 @@ use std::alloc::{self, Layout};
 use std::ptr;
 
 const WORD: usize = std::mem::size_of::<usize>();
+const ARENA_ALIGN: usize = if crate::header::GcHeader::ALIGN > WORD {
+    crate::header::GcHeader::ALIGN
+} else {
+    WORD
+};
 
 #[repr(C)]
 struct ArenaReference {
@@ -67,9 +72,19 @@ impl ArenaCollection {
     pub fn new(arena_size: usize, page_size: usize, small_request_threshold: usize) -> Self {
         assert_eq!(arena_size % WORD, 0);
         assert_eq!(page_size % WORD, 0);
+        assert_eq!(
+            page_size % ARENA_ALIGN,
+            0,
+            "page size must preserve the GC object alignment"
+        );
         assert_eq!(small_request_threshold % WORD, 0);
         let length = small_request_threshold / WORD + 1;
         let hdrsize = std::mem::size_of::<PageHeader>();
+        assert_eq!(
+            hdrsize % ARENA_ALIGN,
+            0,
+            "PageHeader must preserve the GC object alignment"
+        );
         assert!(page_size > hdrsize);
         let mut nblocks_for_size = vec![0; length];
         for (i, nblocks) in nblocks_for_size.iter_mut().enumerate().skip(1) {
@@ -209,7 +224,11 @@ impl ArenaCollection {
         if self._pick_next_arena() {
             return;
         }
-        let layout = Layout::from_size_align(self.arena_size, WORD).expect("invalid arena layout");
+        // The arena stores GcHeader at the beginning of each old-generation
+        // block. On wasm32 the header remains u64-aligned even though WORD is
+        // four bytes, so pointer-width alignment is insufficient.
+        let layout =
+            Layout::from_size_align(self.arena_size, ARENA_ALIGN).expect("invalid arena layout");
         let arena_base = unsafe { alloc::alloc(layout) };
         if arena_base.is_null() {
             alloc::handle_alloc_error(layout);
