@@ -337,6 +337,40 @@ pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
     Ok(Some(truth))
 }
 
+/// Truth specialization for a concrete `W_BoolObject` operand — the sibling
+/// [`try_walker_specialize_truth_int`] declines it, because it emits
+/// `GUARD_CLASS INT` and a bool carries `BOOL_TYPE`.  Same `intval: i64`
+/// layout, so only the guarded class constant differs; `is_true` on the
+/// unboxed field is `W_BoolObject.is_true`'s `self.intval != 0`.
+///
+/// This is the shape every `if a == b:` reaches: `COMPARE_OP` leaves a boxed
+/// bool the following `TO_BOOL` / `POP_JUMP_IF_*` tests, so without this arm a
+/// comparison costs two `CALL_MAY_FORCE`s and two force/exception guard pairs
+/// instead of one call and a field read.  When the comparison itself already
+/// specialized, [`bool_box_truth_lookup`] folds the test first and this never
+/// runs; it covers the case where the comparison stayed a residual.
+pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
+        return Ok(None);
+    };
+    let val = unsafe {
+        if !pyre_object::is_bool(obj) {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(obj)
+    };
+    let bool_type_addr = &pyre_object::pyobject::BOOL_TYPE as *const _ as i64;
+    let raw = walker_unbox_int(ctx, op_pc, operand, bool_type_addr)?;
+    let truth = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[raw]);
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int((val != 0) as i64));
+    Ok(Some(truth))
+}
+
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// the former int fast path's structure (`guard_class` + `getfield_gc_i` per
@@ -1850,6 +1884,159 @@ fn walker_guard_specialised_pair_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// One hop of a `while tb is not None: names.append(tb.tb_frame.f_code.co_name);
+/// tb = tb.tb_next` traceback walk.
+///
+/// Each of these is a `GetSetProperty` whose getter body is a single slot read
+/// on a receiver [`walker_specialize_traceback_walk_field`] pins by class:
+/// `pytraceback.py descr_get_next` / `descr_get_tb_frame` and `pyframe.py`
+/// `fget_code`.  None of them dispatches anywhere or can raise.  Left residual,
+/// every hop of the walk costs a forcing call, which is what makes each
+/// traceback fixture dominated by the walk rather than by the raise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TracebackWalkField {
+    /// `tb.tb_next` — the chain link; a null slot is the terminator and
+    /// surfaces as `None`.
+    TbNext,
+    /// `tb.tb_frame` — the node's frame.  Unlike its two siblings the getter
+    /// ALSO runs `mark_as_escaped()`; see the escape emit.
+    TbFrame,
+    /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
+    FCode,
+}
+
+/// Which walk hop, if any, this `(receiver, attribute)` pair is.
+fn traceback_walk_field(
+    concrete_obj: pyre_object::PyObjectRef,
+    name: &str,
+) -> Option<TracebackWalkField> {
+    let ob_type = unsafe { (*concrete_obj).ob_type };
+    if std::ptr::eq(ob_type, &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE) {
+        return match name {
+            "tb_next" => Some(TracebackWalkField::TbNext),
+            "tb_frame" => Some(TracebackWalkField::TbFrame),
+            _ => None,
+        };
+    }
+    if std::ptr::eq(ob_type, &pyre_interpreter::pyframe::FRAME_TYPE) && name == "f_code" {
+        return Some(TracebackWalkField::FCode);
+    }
+    None
+}
+
+/// Emit one traceback-walk hop as a guarded inline field read instead of the
+/// opaque `getattr_fn` residual.
+///
+/// Returns `None` (fall through to the residual) BEFORE recording any guard for
+/// every shape it cannot settle — an uncacheable `version_tag`, or a null slot
+/// on a hop whose null is not a documented value.  A bail-out after a guard
+/// would leave the caller reading the attribute as already pinned.
+fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    field: TracebackWalkField,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::pyframe::PyFrame;
+
+    let (receiver_type, descr, stored) = match field {
+        TracebackWalkField::TbNext => (
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+            crate::descr::pytraceback_w_next_descr(),
+            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(concrete_obj) },
+        ),
+        TracebackWalkField::TbFrame => (
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+            crate::descr::pytraceback_frame_descr(),
+            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) }
+                as pyre_object::PyObjectRef,
+        ),
+        TracebackWalkField::FCode => (
+            &pyre_interpreter::pyframe::FRAME_TYPE,
+            crate::descr::pyframe_code_descr(),
+            unsafe { (*(concrete_obj as *const PyFrame)).pycode } as pyre_object::PyObjectRef,
+        ),
+    };
+    // Only `tb_next` has a null with a defined meaning.  A null frame is a
+    // torn-down traceback and a null `pycode` a half-built frame; both are
+    // answered by a `sys.namespace` stub or `None` the residual owns.
+    if stored.is_null() && field != TracebackWalkField::TbNext {
+        return Ok(None);
+    }
+    let w_type = pyre_interpreter::typedef::gettypeobject(receiver_type);
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+    // The slot guard pins the receiver's `w_class` against `w_type`.  A frame
+    // built before `init_typeobjects` carries a null `w_class`, which would
+    // make that guard fail on its first execution, so decline instead of
+    // recording a doomed trace.
+    if unsafe { (*concrete_obj).w_class } != w_type {
+        return Ok(None);
+    }
+
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
+    let value = if stored.is_null() {
+        // End of the chain.  There is no is-null guard opcode, so pin the
+        // slot against the null constant the way the exception `w_dict`
+        // shadow guard does, then produce the None the getter returns.
+        let null_const = ctx.trace_ctx.const_ref(0);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[raw_value, null_const],
+        )?;
+        ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+    } else {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
+        ctx.trace_ctx.set_opref_concrete(
+            raw_value,
+            majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
+        );
+        raw_value
+    };
+
+    if field == TracebackWalkField::TbFrame {
+        // `descr_get_tb_frame` also runs `frame.mark_as_escaped()`
+        // (`pyframe.py:176 mark_as_escaped`): the reference it hands out has to
+        // keep the frame materialised.  `set_escaped` ORs `FLAG_ESCAPED` into
+        // the `flags` byte, so the trace reads that byte, sets the bit, and
+        // stores it back.
+        //
+        // The bit has to be set BY THE TRACE, not only stamped now: the trace
+        // is reused, and each replay walks a different traceback naming a
+        // different frame, so a trace-time-only mark would leave every later
+        // frame unmarked.  The concrete write below is the one the
+        // authoritative walk's residual executor would have performed, applied
+        // here for the same reason `try_walker_lower_exc_info_residual` applies
+        // its own.
+        let flags_descr = crate::descr::pyframe_flags_descr();
+        let live_flags =
+            crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, raw_value, flags_descr.clone());
+        let escaped_bit = ctx.trace_ctx.const_int(i64::from(PyFrame::FLAG_ESCAPED));
+        let new_flags = ctx
+            .trace_ctx
+            .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[raw_value, new_flags],
+            flags_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(raw_value, flags_descr.index(), new_flags);
+        unsafe { (*(stored as *mut PyFrame)).mark_as_escaped() };
+    }
+
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+    Ok(Some(()))
+}
+
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
@@ -1922,6 +2109,20 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let value = crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
+    }
+
+    if let Some(walk_field) = traceback_walk_field(concrete_obj, &name) {
+        if let Some(()) = walker_specialize_traceback_walk_field(
+            ctx,
+            op_pc,
+            obj,
+            concrete_obj,
+            walk_field,
+            dst,
+            dst_bank,
+        )? {
+            return Ok(Some(()));
+        }
     }
 
     if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
@@ -2208,11 +2409,28 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// The receiver-layout-specific half of the LOAD_METHOD fold: which field the
+/// walker guards to keep "no instance attribute shadows this method" true for
+/// the life of the trace.
+///
+/// `load_method_fast_path` proved the property once, at record time; this is
+/// what re-proves it on every execution.  One variant per layout whose
+/// non-allocating dictionary peek that predicate covers.
+enum ShadowGuard {
+    /// A `W_ObjectObject` receiver: pin the mapdict map, so adding
+    /// `obj.<name>` grows the map chain and side-exits.
+    InstanceMap(*const u8),
+    /// A `W_BaseException` receiver: pin `w_dict` at null, so the lazy
+    /// allocation `e.<name> = ...` performs side-exits.  Carries the kind
+    /// because the field descrs are grouped per `ExcKind` vtable.
+    ExceptionDictIsNull(pyre_object::interp_exceptions::ExcKind),
+}
+
 /// `callmethod.py LOAD_METHOD` method-cache fold for the
 /// codewriter's method-form `LOAD_ATTR` residual.  The safety oracle is the
 /// interpreter's `load_method_fast_path`: it declines custom
-/// `__getattribute__`, uncacheable types, non-function descriptors,
-/// shadowing instance attributes, and non-instance receivers.  On success the
+/// `__getattribute__`, uncacheable types, non-function descriptors, and
+/// shadowing instance attributes.  On success the
 /// walker emits the guards that keep that decision stable, then writes
 /// `w_descr` as a green constant so the following `CALL` can use the existing
 /// constant-callee inline path.
@@ -2235,9 +2453,6 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    if name.contains("__") {
-        return Ok(None);
-    }
     let Some((w_type, version_tag, w_descr)) =
         (unsafe { pyre_interpreter::load_method_fast_path(concrete_obj, &name) })
     else {
@@ -2246,23 +2461,46 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     if unsafe { resolve_inlinable_callee(w_descr) }.is_none() {
         return Ok(None);
     }
-    let map = unsafe {
-        let inst = &*(concrete_obj as *const pyre_object::W_ObjectObject);
-        inst.map
-    };
-    if map.is_null() {
+    // `space.type` reaches an exception's class through the kind registry when
+    // the generic stub is still installed, and the `w_class` guard below can
+    // only pin a class the slot actually holds.
+    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
         return Ok(None);
     }
+    let shadow = unsafe {
+        if pyre_object::is_instance(concrete_obj) {
+            let map = (*(concrete_obj as *const pyre_object::W_ObjectObject)).map;
+            if map.is_null() {
+                return Ok(None);
+            }
+            // A devolved instance holds its attributes in a dictionary and
+            // keeps the same map across a later `e.<name> = ...`, so pinning
+            // the map would not observe the shadow the assignment installs.
+            // `W_ObjectObject.map` is stored untyped; the map layer owns the
+            // node type.
+            if pyre_interpreter::objspace::std::mapdict::map_is_devolved(map.cast()) {
+                return Ok(None);
+            }
+            ShadowGuard::InstanceMap(map)
+        } else if pyre_object::is_exception(concrete_obj) {
+            ShadowGuard::ExceptionDictIsNull(pyre_object::w_exception_get_kind(concrete_obj))
+        } else {
+            // `load_method_fast_path` admits only the layouts above; keep the
+            // two in step so a new layout there cannot reach an emit that has
+            // no shadowing guard for it.
+            return Ok(None);
+        }
+    };
 
-    // guard_class(obj, &INSTANCE_TYPE): receiver is a user instance, so the
-    // `w_class` and map fields read below are valid.
-    let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
+    // guard_class(obj, ob_type): pins the payload layout, so the `w_class` and
+    // shadowing-slot reads below name the fields they were recorded against.
+    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(instance_type_addr);
+        let type_const = ctx.trace_ctx.const_int(physical_type);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(obj, instance_type_addr);
+            .class_now_known(obj, physical_type);
     }
 
     // Pin the Python-level receiver class (`w_class`) exactly.  This is the
@@ -2291,15 +2529,28 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
     ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
 
-    // mapdict.py LOAD_ATTR caching: guard the instance map so adding a
-    // shadowing `obj.method` attribute changes shape and side-exits before the
-    // constant descriptor is reused.
-    let map_op = walker_record_getfield_gc_i_uncached(ctx, obj, crate::descr::object_map_descr());
-    let map_const = ctx.trace_ctx.const_int(map as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
+    // Re-prove the shadowing precondition: growing an instance attribute named
+    // like the method must side-exit before the constant descriptor is reused.
+    // mapdict.py LOAD_ATTR caching does this by pinning the map; an exception
+    // has no map, and pins the still-unallocated `w_dict` slot instead.
+    let (slot_op, slot_const) = match shadow {
+        ShadowGuard::InstanceMap(map) => (
+            walker_record_getfield_gc_i_uncached(ctx, obj, crate::descr::object_map_descr()),
+            ctx.trace_ctx.const_int(map as i64),
+        ),
+        ShadowGuard::ExceptionDictIsNull(kind) => (
+            walker_record_getfield_gc_r_uncached(
+                ctx,
+                obj,
+                crate::descr::w_exception_dict_descr(kind),
+            ),
+            ctx.trace_ctx.const_ref(0),
+        ),
+    };
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[slot_op, slot_const])?;
     ctx.trace_ctx
         .heap_cache_mut()
-        .replace_box(map_op, map_const);
+        .replace_box(slot_op, slot_const);
 
     let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_const)?;

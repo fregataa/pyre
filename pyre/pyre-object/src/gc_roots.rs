@@ -146,8 +146,16 @@ pub fn pin_root(root: PyObjectRef) {
     // bracket.  RPython's `_trace_drag_out` always rewrites a root that names
     // an already-forwarded nursery object; normalize the host-side copy at
     // the same boundary so the shadow stack never gains a forwarding stub.
-    let root = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-    SHADOW_STACK.with(|s| s.borrow_mut()[index] = root);
+    let normalized = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+    // The slot already holds `root`, so a query that found no forwarding stub
+    // has nothing to write back.  That is the steady state — nothing collected
+    // between the push above and the query — and the write-back is not free:
+    // this thread-local resolves through `_tlv_get_addr` on every `with`, and
+    // pinning sits on the interpreter's allocation and call paths, so the
+    // second resolve plus its `RefCell` borrow is paid once per pinned livevar.
+    if normalized != root {
+        SHADOW_STACK.with(|s| s.borrow_mut()[index] = normalized);
+    }
 }
 
 /// Current length of the thread-local shadow stack. Used by
@@ -172,11 +180,28 @@ pub fn shadow_stack_len() -> usize {
 /// The initial [`pin_root`] still normalizes a copied pointer that may have
 /// become stale before it was published.
 ///
+/// This is the `pop_roots` half of the bracket — the read back of a pinned
+/// livevar after a call that may have collected — so it sits on the ordinary
+/// call path (`call_function_impl_result`, the inline-call and specialize
+/// resume paths, `#[pyre_class]` method bodies), not just in tests.
+///
 /// Reads the thread-local `SHADOW_STACK` the tracer cannot type; the JIT
 /// residualises the read instead of tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the [`shadow_stack_len`] twin.
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_get(index: usize) -> PyObjectRef {
+    // A plain slot read: the slot is already a registered root, so whatever
+    // moved it has rewritten it here.  `init_gc_subsystem` registers this
+    // thread's stack as a mutator root area (`capture_shadow_stack_area`)
+    // together with `register_mutator`, before the thread runs any user code,
+    // and [`walk_shadow_stack`] hands the collector `&mut` slots — so a
+    // relocation between the pin and this read updates the slot in place and
+    // no forwarding stub can be observed here.
+    //
+    // Only [`pin_root`] normalizes, and it must: the value it receives is
+    // copied from outside the bracket, so a foreign mutator can have collected
+    // after that copy and before the pin.  That is also the pin's safepoint;
+    // a read allocates nothing and has no reason to park.
     SHADOW_STACK.with(|s| s.borrow()[index])
 }
 

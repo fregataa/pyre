@@ -841,6 +841,35 @@ unsafe fn w_set_insert_key_into(
     items: *mut SetItemsStorage,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    // Single insert probe (matches `r_dict.setitem`'s one bucket scan), run
+    // callback-free so no user `__eq__` mutates the set while the `IndexMap`
+    // borrow is live.  When every same-hash comparison stays inside the
+    // builtin ladder the probe appends in place; a pair it cannot decide
+    // breaks the probe, withholds the store, and re-runs the operation over
+    // `scan_set_key_reentrant` below.  Without this the membership half of
+    // every `add` walks the table entry by entry, which is quadratic in the
+    // set's size.
+    if let Some(result) = callback_free_set_op(|| {
+        let entries = &mut *items;
+        let index = entries.get_index_of(&key);
+        if crate::dict_eq_hook::callback_free_probe_broken() {
+            return;
+        }
+        if index.is_some() {
+            return;
+        }
+        // The probe above proved no bucket entry compares equal without
+        // leaving the ladder, so this placement probe repeats those same
+        // comparisons and cannot break either.
+        entries.insert(key, ());
+        let set = &mut *(dst as *mut W_SetObject);
+        set.len = (*set.items).len();
+        set.hash = -1;
+        set_write_barrier(dst);
+    }) {
+        return result.map_err(SetUpdateError::Key);
+    }
+
     let (found, key) = scan_set_key_reentrant(items, key).map_err(SetUpdateError::Key)?;
     if found.is_some() {
         return Ok(());
@@ -867,6 +896,15 @@ unsafe fn w_set_contains_key_for_update(
     probe: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, SetUpdateError> {
+    // Bucket probe first, as in `w_set_contains_key_checked`.  The walk below
+    // is the reentrant fallback and visits every entry, so without this a
+    // whole-set difference probes linearly per element and runs quadratic.
+    if let Some(result) = callback_free_set_op(|| {
+        let s = &*(probe as *const W_SetObject);
+        (*s.items).contains_key(&key)
+    }) {
+        return result.map_err(SetUpdateError::Key);
+    }
     'restart: loop {
         let items = (*(probe as *const W_SetObject)).items;
         let len = (*items).len();
@@ -913,6 +951,26 @@ unsafe fn w_set_remove_key_for_update(
     dst: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    // Locate the bucket callback-free before falling back to the entry walk,
+    // which is linear in the set's size.  The index is resolved inside the
+    // probe and the removal withheld when a comparison leaves the builtin
+    // ladder, so the walk below can redo the whole operation.  The removal
+    // itself still shifts the tail, as in the fallback.
+    if let Some(result) = callback_free_set_op(|| {
+        let items = (*(dst as *const W_SetObject)).items;
+        let index = (*items).get_index_of(&key);
+        if crate::dict_eq_hook::callback_free_probe_broken() {
+            return;
+        }
+        if let Some(index) = index {
+            (*items).shift_remove_index(index);
+            let set = &mut *(dst as *mut W_SetObject);
+            set.len -= 1;
+            set.hash = -1;
+        }
+    }) {
+        return result.map_err(SetUpdateError::Key);
+    }
     'restart: loop {
         let items = (*(dst as *const W_SetObject)).items;
         let len = (*items).len();

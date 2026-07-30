@@ -3057,13 +3057,20 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 ///   unconditional, but *int-only*: the float table falls through to
 ///   `_ => return Ok(None)` for them.  Hence the separate
 ///   `args_all_exact_plain_int`.
+/// - `FloorDivide` / `Remainder` (+ in-place) — `IntFloorDiv` / `IntMod`,
+///   int-only for the same reason (neither has a `FLOAT_*` opcode).  These two
+///   are the one accepted pair whose lowering *can* decline — on a zero divisor
+///   or on `i64::MIN` by `-1` — but a surviving residual is still replay-safe
+///   on its own merits: `int.__floordiv__` / `int.__mod__` read two immutable
+///   boxes and either allocate a fresh result or raise `ZeroDivisionError`,
+///   which commits nothing a replay would double.  The `plain_int` proof is
+///   what rules out a user `__mod__`.  `i % k` in an `if` is the common shape
+///   that would otherwise residualize the whole callee
+///   (`bench/synth/gc_bug_bridge_flavor_traceback_names`).
 ///
 /// Every other tag is excluded because its lowering can still decline and
-/// leave the residual in place:
+/// leave a residual that is NOT replay-safe on its own:
 ///
-/// - `FloorDivide` / `Remainder` (+ in-place) — int-table `needs_concrete_check`
-///   declines a zero or `i64::MIN / -1` divisor; the float table has no
-///   `FLOAT_*` opcode for either.
 /// - `TrueDivide` (+ in-place) — float-table only, and it declines a zero
 ///   divisor so the raising `descr_truediv` stays recorded.
 /// - `Lshift` (+ in-place) — the int table declines it outright (the reused
@@ -3078,7 +3085,7 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 /// The two provenance sets describe the actual operands of each binop.  This
 /// admits `def f(self, x): return x + 1` when only `x` is numeric, while still
 /// rejecting `self + x` and global numeric subclasses with user dunders.
-pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
+pub(crate) fn residual_call_is_specialized_plain_numeric_op(
     body_code: &[u8],
     numeric_ref_regs: &[bool; u8::MAX as usize + 1],
     plain_int_ref_regs: &[bool; u8::MAX as usize + 1],
@@ -3087,12 +3094,14 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
 ) -> bool {
+    let helper = residual_call_helper_kind_in_body(body_code, d, callee_descr_refs);
     if !matches!(
         d.key,
         "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
-    ) || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
-        != Some(majit_ir::PyreHelperKind::BinaryOp)
-    {
+    ) || !matches!(
+        helper,
+        Some(majit_ir::PyreHelperKind::BinaryOp | majit_ir::PyreHelperKind::CompareOp)
+    ) {
         return false;
     }
     // `iIR`: the R-list follows the I-list.  `walker_int_specialization_operands`
@@ -3129,6 +3138,16 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
     else {
         return false;
     };
+    // Both compare tables map all six `ComparisonOperator`s unconditionally
+    // (`IntLt/Le/Gt/Ge/Eq/Ne` in `try_walker_specialize_compare_op_int`,
+    // `FloatLt/Le/Gt/Ge/Eq/Ne` in `try_walker_specialize_compare_op_float`), so
+    // no tag leaves the residual in place and there is no int-only carve-out
+    // like the bitwise binops need.  `CHECK_EXC_MATCH` reuses the `CompareOp`
+    // shape with `ISINSTANCE_OP` (tag 10), which is not one of the six and so
+    // stays excluded.
+    if helper == Some(majit_ir::PyreHelperKind::CompareOp) {
+        return pyre_interpreter::runtime_ops::compare_op_from_tag(tag).is_some();
+    }
     use pyre_interpreter::bytecode::BinaryOperator;
     match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
         Some(
@@ -3145,10 +3164,91 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
             | BinaryOperator::Xor
             | BinaryOperator::InplaceAnd
             | BinaryOperator::InplaceOr
-            | BinaryOperator::InplaceXor,
+            | BinaryOperator::InplaceXor
+            | BinaryOperator::FloorDivide
+            | BinaryOperator::Remainder
+            | BinaryOperator::InplaceFloorDivide
+            | BinaryOperator::InplaceRemainder,
         ) => plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize],
         _ => false,
     }
+}
+
+/// Is this body op the `CHECK_EXC_MATCH` residual — `compare_fn(exc,
+/// match_type, ISINSTANCE_OP)`?
+///
+/// Unlike the arithmetic tags, this one needs no operand proof.  The helper
+/// validates the match target and then walks the exception class MRO
+/// (`validate_check_exc_match_class` + `check_exc_match_against` →
+/// `exception_match`), reading `is_tuple` / `is_type` / the MRO array and
+/// nothing else: it reaches no user code for any operand, mutates nothing, and
+/// returns one of the two immortal `bool` singletons.  Its single failure mode
+/// — `TypeError` for a target that is not an exception class — allocates a
+/// fresh exception exactly the way the `CanRaise`-tagged members of the
+/// `replay_safe_read` set can, so a replay commits nothing new.
+///
+/// `iIRd>r`: the tag is the first I-list entry, and it must live in the
+/// callee's immutable constant window — a runtime tag could select one of the
+/// six ordinary comparisons, which do dispatch to user `__eq__`.
+pub(crate) fn residual_call_is_exception_match(
+    body_code: &[u8],
+    d: &DecodedOp,
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    if d.key != "residual_call_ir_r/iIRd>r"
+        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+            != Some(majit_ir::PyreHelperKind::CompareOp)
+    {
+        return false;
+    }
+    if body_code.get(d.pc + 2).is_none_or(|i_len| *i_len == 0) {
+        return false;
+    }
+    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
+        return false;
+    };
+    (tag_reg as usize)
+        .checked_sub(num_regs_i)
+        .and_then(|constant_index| constants_i.get(constant_index))
+        .is_some_and(|tag| *tag == pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG)
+}
+
+/// Is this body op a `TO_BOOL` / `POP_JUMP_IF_*` truth residual whose single
+/// Ref operand is a proven immutable builtin — an exact numeric, or the `bool`
+/// an accepted `COMPARE_OP` in the same body produced?
+///
+/// Such an operand's `__bool__` is `int`'s or `bool`'s, so the call reads a
+/// field and returns an int: it commits nothing a replay could double.  That is
+/// the same argument the `replay_safe_read` set is built on, and it holds
+/// whether or not the walk-time folds
+/// (`bool_box_truth_lookup`, `try_walker_specialize_truth_int`,
+/// `try_walker_specialize_truth_bool`) erase the residual.
+///
+/// `iRd>i`: the funcbox int operand, then the R-list (length byte, then one
+/// register per entry), then the descr.  Only the one-operand arity is the
+/// truth shape.
+pub(crate) fn residual_call_is_proven_truth(
+    body_code: &[u8],
+    numeric_ref_regs: &[bool; u8::MAX as usize + 1],
+    bool_ref_regs: &[bool; u8::MAX as usize + 1],
+    d: &DecodedOp,
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    if d.key != "residual_call_r_i/iRd>i"
+        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+            != Some(majit_ir::PyreHelperKind::Truth)
+    {
+        return false;
+    }
+    if body_code.get(d.pc + 2) != Some(&1) {
+        return false;
+    }
+    let Some(&arg_reg) = body_code.get(d.pc + 3) else {
+        return false;
+    };
+    numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
 }
 
 pub(crate) fn residual_call_is_specialized_plain_int_binop(
@@ -3466,6 +3566,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // mis-resume the kept short-circuit stack.
         if ei.pyre_helper == majit_ir::PyreHelperKind::Truth {
             if let Some(truth) = try_walker_specialize_truth_int(ctx, op.pc, r_args[0])? {
+                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            // The boxed bool a residual `COMPARE_OP` leaves behind — the int
+            // arm above guards `INT_TYPE` and declines it, so without this the
+            // test on every `if a == b:` stays a second may-force call.
+            if let Some(truth) = try_walker_specialize_truth_bool(ctx, op.pc, r_args[0])? {
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
                 return Ok((DispatchOutcome::Continue, op.next_pc));
             }

@@ -302,6 +302,7 @@ impl MetaInterpStaticData {
     /// This preserves RPython's stable `metainterp_sd.jitcodes` invariant
     /// for already-captured resume data.
     fn set_jitcodes_from_make_result(&mut self, payloads: Vec<std::sync::Arc<crate::PyJitCode>>) {
+        self.reserve_build_time_index_space();
         for payload in payloads {
             assert!(
                 !payload.code_ptr.is_null(),
@@ -366,6 +367,7 @@ impl MetaInterpStaticData {
         code: *const (),
         supplied: Option<std::sync::Arc<crate::PyJitCode>>,
     ) -> *const JitCode {
+        self.reserve_build_time_index_space();
         let raw_key = Self::canonical_code_key_opt(code).unwrap_or(0);
         if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
             match supplied {
@@ -402,6 +404,29 @@ impl MetaInterpStaticData {
         let ptr = &*jitcode as *const JitCode;
         self.jitcodes.push(jitcode);
         ptr
+    }
+
+    /// Keep the leading `jitcodes` slots that a build-time jitcode's baked
+    /// `JitCode::index` can name out of the runtime append space.
+    ///
+    /// The build-time table is dense (`all_jitcodes()[i].index == i`), so its
+    /// length is exactly that range, and
+    /// [`install_build_time_jitcode_at`] writes into it verbatim — a resume
+    /// frame records the baked index and resolves it as `sd.jitcodes[index]`.
+    /// Runtime PyCode entries append at `len()`, so without the reservation
+    /// the first one takes slot 0, the build-time install overwrites it, and
+    /// [`Self::compiled_jitcode_lookup`] answers `None` for a code the
+    /// codewriter still reports as drained.
+    ///
+    /// Idempotent: a no-op once the leading slots exist.
+    fn reserve_build_time_index_space(&mut self) {
+        let reserved = crate::jitcode_runtime::all_jitcodes().len();
+        while self.jitcodes.len() < reserved {
+            let index = self.jitcodes.len() as i32;
+            let payload = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
+            Self::stamp_payload_index(index, &payload);
+            self.jitcodes.push(Box::new(JitCode { index, payload }));
+        }
     }
 
     /// Return the installed SD entry for a `PyCode`.
@@ -549,7 +574,8 @@ pub fn setup_indirectcalltargets(targets: Vec<std::sync::Arc<majit_metainterp::j
     // assembler objects standing in for one RPython CodeWriter assembler.
     // Keep the frozen source-translation PBC family when runtime targets are
     // published instead of replacing it with the latest runtime-only batch.
-    let mut merged = crate::jitcode_runtime::build_indirectcalltargets();
+    let frozen = crate::jitcode_runtime::indirectcalltargets();
+    let mut merged = frozen.to_vec();
     for target in targets {
         if !merged
             .iter()
@@ -692,13 +718,11 @@ pub fn install_jitcode_for(
 /// resume decoders to resolve `sd.jitcodes[index]` to the portal, it must sit
 /// at exactly that slot.
 ///
-/// The build-time absolute index space and the runtime-grown user-PyCode slot
-/// space collide here (both start at 0): overwriting `index` clobbers whatever
-/// user jitcode last took that slot.  This is sound only while the jd1
-/// experiment's overwritten slot holds a jitcode with no live resume data (the
-/// import-time `_get_exports_list` at slot 0 is dead by the time user code
-/// drives jd1).  Reconciling the two index spaces into one absolute table is
-/// the standing follow-up.
+/// The two index spaces no longer overlap: the leading
+/// `all_jitcodes().len()` slots are reserved for build-time indices
+/// (`MetaInterpStaticData::reserve_build_time_index_space`) and runtime
+/// PyCode entries append above them, so the write below can only replace a
+/// reserved skeleton or an earlier install of the same portal.
 ///
 /// Dropping the install is NOT an available shortcut, measured: without it the
 /// jd1 live-enter blackhole resume resolves slot 0 to the user jitcode that
@@ -712,15 +736,7 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let mut sd = r.borrow_mut();
-        while sd.jitcodes.len() < index {
-            let i = sd.jitcodes.len() as i32;
-            let skeleton = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
-            skeleton.jitcode.set_index(i as usize);
-            sd.jitcodes.push(Box::new(JitCode {
-                index: i,
-                payload: skeleton,
-            }));
-        }
+        sd.reserve_build_time_index_space();
         // Idempotent same-value stamp: the portal core already carries `index`.
         payload.jitcode.set_index(index);
         let slot = Box::new(JitCode {
@@ -728,6 +744,11 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
             payload,
         });
         if index < sd.jitcodes.len() {
+            debug_assert!(
+                sd.jitcodes[index].payload.is_skeleton()
+                    || unsafe { sd.jitcodes[index].raw_code() }.is_null(),
+                "build-time slot {index} is occupied by a runtime PyCode entry",
+            );
             sd.jitcodes[index] = slot;
         } else {
             sd.jitcodes.push(slot);
@@ -6753,24 +6774,35 @@ fn reconstruct_inline_recipe(
     cache: &mut BridgeVirtualCache,
     in_a_call: bool,
 ) -> Option<ReconstructRecipe> {
+    // Each decline below ends the whole multi-frame path (`recipes.clear()` in
+    // the caller), so name every class: an uncensused decline is invisible in
+    // the corpus and shows up only as the caller's NoRecipes abort.
+    macro_rules! decline {
+        ($class:literal) => {{
+            crate::jitcode_dispatch::census_record(concat!("P2Recipe::", $class));
+            return None;
+        }};
+    }
     if frame.pc < 0 {
-        return None;
+        decline!("NoSnapshotPc");
     }
     let py_pc = forward_py_pc_or_backxlat(frame.jitcode_index, frame.pc) as usize;
-    let w_code = code_for_jitcode_index(frame.jitcode_index)?;
+    let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
+        decline!("NoCodeForJitcodeIndex");
+    };
     if w_code.is_null() {
-        return None;
+        decline!("NullWCode");
     }
     let raw_code = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
     if raw_code.is_null() {
-        return None;
+        decline!("NullRawCode");
     }
     let code_ref = unsafe { &*raw_code };
     if !code_ref.freevars.is_empty() || pyre_interpreter::pyframe::ncells(code_ref) != 0 {
-        return None;
+        decline!("CellsOrFreevars");
     }
     // pyframe.py:128-132 get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
@@ -6779,14 +6811,14 @@ fn reconstruct_inline_recipe(
     // namespace), there is nothing to restore, so abort to the single-frame
     // bridge — the forward inline path declines the same way.
     if recover_inline_callee_globals(raw_code as *const ()).is_null() {
-        return None;
+        decline!("NoCalleeGlobals");
     }
     let nlocals = code_ref.varnames.len();
 
     let liveness = crate::liveness::liveness_for(raw_code);
     let stack_only = match liveness.stack_depth_at(py_pc) {
         Some(d) => d,
-        None => return None,
+        None => decline!("NoStackDepthAtPc"),
     };
     let pending_result_abs_slot = if in_a_call && stack_only > 0 {
         Some(nlocals + stack_only - 1)
@@ -6813,13 +6845,14 @@ fn reconstruct_inline_recipe(
         None
     };
     let pending_result_color = if in_a_call {
-        Some(
-            pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
-                p.result_color_trivia_for_jitcode_pc(frame.pc as usize)
-                    .map(|c| c as usize)
-                    .filter(|&c| c != u16::MAX as usize)
-            })?,
-        )
+        let Some(color) = pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
+            p.result_color_trivia_for_jitcode_pc(frame.pc as usize)
+                .map(|c| c as usize)
+                .filter(|&c| c != u16::MAX as usize)
+        }) else {
+            decline!("NoPendingResultColor");
+        };
+        Some(color)
     } else {
         None
     };
@@ -6836,7 +6869,7 @@ fn reconstruct_inline_recipe(
         if reg_indices.int.iter().any(|&c| c as usize == color)
             || reg_indices.float.iter().any(|&c| c as usize == color)
         {
-            return None;
+            decline!("PendingResultNotRef");
         }
         if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
             pending_value_index = Some(reg_indices.int.len() + ref_pos);
@@ -6855,7 +6888,7 @@ fn reconstruct_inline_recipe(
     // resume.py:1054 consume_boxes: the liveness enumeration count must match
     // the (pending-excluded) encoded frame section exactly.
     if reg_indices.total_len() != values.len() {
-        return None;
+        decline!("LivenessValueCountMismatch");
     }
     // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
     // the frame's locals_cells_stack_w is a W_Root array — all live slots are
@@ -6866,7 +6899,7 @@ fn reconstruct_inline_recipe(
     // always reads `registers_r[k]`, trace_opcode.rs). Fall back to
     // the single-frame bridge rather than synthesize an unboxed local.
     if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
-        return None;
+        decline!("UnboxedLiveRegister");
     }
 
     // Virtualizable-callee shape (pyre's "every function is its own portal"
@@ -6931,7 +6964,9 @@ fn reconstruct_inline_recipe(
             crate::jitcode_dispatch::census_record("P2Recipe::PortalSiblingAdmit");
         }
         use majit_ir::resumedata::{RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
-        let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
+        let Some(frame_pos) = reg_indices.ref_.iter().position(|&c| c == pframe_reg) else {
+            decline!("NoFrameRedPosition");
+        };
         // resume.py:1042-1057 rebuild_from_resumedata consumes the saved boxes
         // for every frame without requiring the frame object itself to remain
         // virtual.  A Pyre callee frame can be forced before the guard (for
@@ -6984,25 +7019,34 @@ fn reconstruct_inline_recipe(
             });
         }
         let RebuiltValue::Virtual(frame_vidx) = values[frame_pos] else {
-            return None;
+            decline!("FrameRedNotVirtual");
         };
         // The `frame` red virtual is a PyFrame VirtualInfo; its
         // `locals_cells_stack_w` array field is at PYFRAME_LOCALS_CELLS_STACK_OFFSET.
         let array_vidx = {
+            let Some(frame_virtual) = rd_virtual_at(rd_virtuals, *frame_vidx) else {
+                decline!("FrameVirtualMissing");
+            };
             let majit_ir::RdVirtualInfo::VirtualInfo {
                 fieldnums,
                 fielddescrs,
                 ..
-            } = rd_virtual_at(rd_virtuals, *frame_vidx)?
+            } = frame_virtual
             else {
-                return None;
+                decline!("FrameVirtualNotStruct");
             };
-            let arr_field_idx = fielddescrs.iter().position(|fd| {
-                fd.offset == crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET
-            })?;
-            let (av, tb) = untag(*fieldnums.get(arr_field_idx)?);
+            let Some(arr_field_idx) = fielddescrs
+                .iter()
+                .position(|fd| fd.offset == crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            else {
+                decline!("NoLocalsArrayField");
+            };
+            let Some(&arr_fieldnum) = fieldnums.get(arr_field_idx) else {
+                decline!("LocalsArrayFieldnumMissing");
+            };
+            let (av, tb) = untag(arr_fieldnum);
             if tb != TAGVIRTUAL {
-                return None;
+                decline!("LocalsArrayNotVirtual");
             }
             if av < 0 {
                 (rd_virtuals.map_or(0, |v| v.len()) as i32 + av) as usize
@@ -7010,14 +7054,17 @@ fn reconstruct_inline_recipe(
                 av as usize
             }
         };
-        let arr: Vec<i16> = match rd_virtual_at(rd_virtuals, array_vidx)? {
+        let Some(array_virtual) = rd_virtual_at(rd_virtuals, array_vidx) else {
+            decline!("LocalsArrayVirtualMissing");
+        };
+        let arr: Vec<i16> = match array_virtual {
             majit_ir::RdVirtualInfo::VArrayInfoClear { fieldnums, .. }
             | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => fieldnums.clone(),
-            _ => return None,
+            _ => decline!("LocalsArrayNotArrayInfo"),
         };
         let valuestackdepth = nlocals + stack_only;
         if valuestackdepth > arr.len() {
-            return None;
+            decline!("LocalsArrayTooShort");
         }
         let callinfocollection = ctx.callinfocollection.clone();
         let mut registers_r = vec![OpRef::NONE; valuestackdepth];
@@ -7261,7 +7308,7 @@ fn reconstruct_inline_recipe(
             continue;
         }
         if registers_r[s] == OpRef::NONE {
-            return None;
+            decline!("MandatoryOperandMissing");
         }
     }
 
@@ -12819,6 +12866,21 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// live wrapper is registered or it carries no globals yet — the callers
 /// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
 /// null result as "decline the multi-frame path".
+/// Recover the callee's `W_Code` OBJECT for a reconstructed inline frame.
+///
+/// Sibling of [`recover_inline_callee_globals`], reading the same
+/// `code_ptr → live wrapper` registry.  A reconstructed frame's `pycode` red
+/// has to be this object, not the raw code pointer the recipe carries: every
+/// consumer treats it as a `W_Code` (constant pool reads, `PyTraceback` node
+/// construction).  Returns `PY_NULL` when no live wrapper is registered.
+pub(crate) fn recover_inline_callee_code(code_ptr: *const ()) -> pyre_object::PyObjectRef {
+    let live = pyre_interpreter::live_code_wrapper(code_ptr);
+    if live.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    live
+}
+
 pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object::PyObjectRef {
     let live = pyre_interpreter::live_code_wrapper(code_ptr);
     if !live.is_null() {
@@ -13282,7 +13344,10 @@ mod indirectcalltargets_tests {
         let hit = sd
             .compiled_jitcode_lookup(code)
             .expect("populated payload should be installed by make_jitcodes");
-        assert!(std::ptr::eq(sd.jitcodes[0].as_ref(), hit));
+        // Runtime entries append above the reserved build-time index space, so
+        // read the slot back through the entry's own index.
+        let index = unsafe { (*hit).index } as usize;
+        assert!(std::ptr::eq(sd.jitcodes[index].as_ref(), hit));
     }
 
     #[test]
@@ -13302,9 +13367,11 @@ mod indirectcalltargets_tests {
         let mut sd = MetaInterpStaticData::new();
         let (_code, expected_raw) = make_code("x = 1\n");
         sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw)]);
+        // The install appends above the reserved build-time index space.
+        let index = sd.jitcodes.len() as i32 - 1;
         let _sd_guard = MetainterpSdGuard::swap(sd);
 
-        let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
+        let hit = raw_code_for_jitcode_index(index).expect("installed jitcode index must resolve");
         assert_eq!(hit, expected_raw);
     }
 }

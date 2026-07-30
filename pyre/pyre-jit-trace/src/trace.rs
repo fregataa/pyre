@@ -1545,7 +1545,11 @@ fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<
     // `catch_exception/L` for the enclosing try sits BEHIND it (between the
     // CALL's post-call `-live-` and the next op), so scan backward — the same
     // lookup the single-frame exception-edge router uses.
-    let candidate = crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc);
+    // `root_pc` is the CALL's OWN trailing `-live-`, one op short of the
+    // block-entry `-live-` the backward scan keys off, so read forward first
+    // and keep the backward scan for callers already at that coordinate.
+    let candidate = crate::jitcode_dispatch::catch_target_after_resume_live(code, root_pc)
+        .or_else(|| crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc));
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         eprintln!("[p2-raise] root_pc={root_pc} catch_before={candidate:?}");
     }
@@ -1761,6 +1765,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // SubRaise routing performs, threaded across the carrier the sub-walk
     // crossed on its own).  Without this the raise is dropped and re-interpreted
     // every iteration (deopt-storm).
+    //
+    // A root frame with no covering handler is the framestack-exhausted arm of
+    // the same walk: `finishframe_exception` runs out of frames to scan and
+    // reaches `compile_exit_frame_with_exception`.  Seeding `catch_target: None`
+    // routes the root walk to that exit instead of declining — the decline
+    // records the bridge guard as permanently undecidable, so every later
+    // failure of that guard short-circuits into a full blackhole resume.
     let subwalk_raise = match &walk {
         Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubRaise { exc, exc_concrete }, _))) => {
             Some((*exc, *exc_concrete))
@@ -1769,28 +1780,29 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     };
     if let Some((exc, exc_concrete)) = subwalk_raise {
         if carrier.recipes.len() == 1 {
-            if let Some(catch_target) = carrier_root_catch_target(sym, root_pc) {
-                crate::jitcode_dispatch::set_carrier_raise_seed(
-                    crate::jitcode_dispatch::CarrierRaiseSeed {
-                        exc,
-                        exc_concrete,
-                        catch_target,
-                    },
-                );
-                crate::jitcode_dispatch::census_record("P2Drain::CompileRootRaise");
-                let root_py_pc =
-                    crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
-                        as usize;
-                let action =
-                    full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
-                // Defensive: `dispatch_via_miframe` consumes the seed, but a
-                // walk that early-declines before reaching it would leave the
-                // seed standing and leak it into a later unrelated walk. Clear
-                // any residual seed so exactly this walk can observe it.
-                let _ = crate::jitcode_dispatch::take_carrier_raise_seed();
-                return action;
-            }
-            crate::jitcode_dispatch::census_record("P2Drain::RaiseNoRootCatch");
+            let catch_target = carrier_root_catch_target(sym, root_pc);
+            crate::jitcode_dispatch::set_carrier_raise_seed(
+                crate::jitcode_dispatch::CarrierRaiseSeed {
+                    exc,
+                    exc_concrete,
+                    catch_target,
+                },
+            );
+            crate::jitcode_dispatch::census_record(if catch_target.is_some() {
+                "P2Drain::CompileRootRaise"
+            } else {
+                "P2Drain::CompileRootRaiseEscape"
+            });
+            let root_py_pc =
+                crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32) as usize;
+            let action =
+                full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
+            // Defensive: `dispatch_via_miframe` consumes the seed, but a
+            // walk that early-declines before reaching it would leave the
+            // seed standing and leak it into a later unrelated walk. Clear
+            // any residual seed so exactly this walk can observe it.
+            let _ = crate::jitcode_dispatch::take_carrier_raise_seed();
+            return action;
         }
     }
 
@@ -4900,8 +4912,17 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // re-walk executes the body's residual calls before failing) —
                 // an unbounded slowdown. Decline it so the location interprets
                 // instead.
+                // A bridge entry is keyed on the guard descr, which the
+                // green-key cell never gates, so the green-key decline alone
+                // leaves `must_compile_with_values` re-firing this
+                // structurally-undecidable bridge every
+                // `DEFAULT_TRACE_EAGERNESS` failures forever — each retry
+                // re-walking the whole body and executing its residual calls
+                // concretely. Record the bridge-guard decline too, the way
+                // `ExcEdgeNoInFrameCatch` below does.
                 DE::GotoIfNotValueNotConcrete { .. } => {
                     fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+                    fbw_bridge_decline(ctx);
                     TraceAction::Abort
                 }
                 // The exc-edge routing decision is `find_catch_for_exc_resume`

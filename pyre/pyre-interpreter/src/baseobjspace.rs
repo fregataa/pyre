@@ -114,7 +114,7 @@ pub(crate) unsafe fn walk_pending_hash_error_area(
 pub fn clear_method_cache() {
     let mut cache = METHOD_CACHE.lock();
     cache.versions.fill(0);
-    cache.names.fill(None);
+    cache.names.fill(std::ptr::null_mut());
     cache
         .lookup_where
         .fill((std::ptr::null_mut(), std::ptr::null_mut()));
@@ -8338,9 +8338,18 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
 /// `(null, null)` pair on a valid `(version, name)` entry is the cached
 /// negative result (`_lookup_where_all_typeobjects` returned
 /// `(None, None)`).
+///
+/// `names[h]` holds the interned name *object* and is validated by identity
+/// (`typeobject.py:541` `cache.names[method_hash] is name`), so a probe costs
+/// one pointer compare rather than a digest plus a `memcmp` over the bytes,
+/// and a fill stores the pointer rather than allocating a copy of the name.
+/// Every name reaching the cache comes from `box_str_constant`, which
+/// allocates through `malloc_typed`: the object is immortal and never
+/// relocated, so the slot needs no GC forwarding and its address is never
+/// reused by a later, different name (`null` = empty).
 struct MethodCache {
     versions: Vec<u64>,
-    names: Vec<Option<String>>,
+    names: Vec<PyObjectRef>,
     lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
 }
 
@@ -8357,7 +8366,7 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
     std::sync::LazyLock::new(|| {
         parking_lot::Mutex::new(MethodCache {
             versions: vec![0u64; METHOD_CACHE_SIZE],
-            names: vec![None; METHOD_CACHE_SIZE],
+            names: vec![std::ptr::null_mut(); METHOD_CACHE_SIZE],
             lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
         })
     });
@@ -8366,12 +8375,16 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
 /// version token directly (PyPy hashes `current_object_addr_as_int(
 /// version_tag)`; the u64 is its own address-stable surrogate).
 /// `name_hash` only needs to be deterministic — the slot's validity is
-/// the exact `(version, name)` match, not the hash — so an FNV-1a over
-/// the bytes stands in for `compute_hash(name)`.
-fn method_hash(version_tag: u64, name: &str) -> usize {
+/// the exact `(version, name)` match, not the hash.  Upstream's
+/// `hash(name)` is the interned string's memoized digest, i.e. a
+/// per-name-object constant; the interned pointer is the same constant
+/// without the byte walk, so an FNV-1a over its bytes stands in.  Two
+/// threads that interned the same name into different objects then land
+/// in different slots instead of evicting each other from a shared one.
+fn method_hash(version_tag: u64, w_name: PyObjectRef) -> usize {
     let mut name_hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.as_bytes() {
-        name_hash ^= *b as u64;
+    for b in (w_name as usize as u64).to_le_bytes() {
+        name_hash ^= b as u64;
         name_hash = name_hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     const SHIFT2: u32 = 64 - METHOD_CACHE_SIZE_EXP;
@@ -8439,14 +8452,13 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> PyObjectRef {
-    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
     // PyPy's elidable returns the cached `(w_class, w_value)` tuple
     // object; the residual-call ABI here carries one raw register, so
     // the elidable surface projects the `w_value` half.  Callers that
     // need the defining class go through the interpreter front door
     // `lookup_where_with_method_cache`, which reads the same cache
     // entry.
-    _cached_lookup_where(w_type, name, version_tag).1
+    _cached_lookup_where(w_type, w_name, version_tag).1
 }
 
 /// `lookup_where` *class* projection — the `@elidable` companion of
@@ -8470,8 +8482,7 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> PyObjectRef {
-    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
-    _cached_lookup_where(w_type, name, version_tag).0
+    _cached_lookup_where(w_type, w_name, version_tag).0
 }
 
 /// The `MethodCache` probe/fill shared by the `@elidable` JIT surface
@@ -8479,16 +8490,21 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
 /// slot; on a miss runs the raw MRO walk (`typeobject.py:478-489
 /// _lookup_where_all_typeobjects`) and fills the slot with the
 /// `(w_class, w_value)` pair (`typeobject.py:545-549`).
+///
+/// `w_name` must be an interned name object (`box_str_constant`): the slot
+/// is keyed by its address, so a collectable or non-interned string would
+/// let a later allocation at the same address answer a hit for a different
+/// name.
 unsafe fn _cached_lookup_where(
     w_type: PyObjectRef,
-    name: &str,
+    w_name: PyObjectRef,
     version_tag: u64,
 ) -> (PyObjectRef, PyObjectRef) {
-    let h = method_hash(version_tag, name);
+    let h = method_hash(version_tag, w_name);
     // Probe without holding the borrow across the MRO walk below.
     let hit = {
         let cache = METHOD_CACHE.lock();
-        if cache.versions[h] == version_tag && cache.names[h].as_deref() == Some(name) {
+        if cache.versions[h] == version_tag && cache.names[h] == w_name {
             // A valid entry with null pointers is the cached negative result.
             Some(cache.lookup_where[h])
         } else {
@@ -8498,6 +8514,7 @@ unsafe fn _cached_lookup_where(
     if let Some(tup) = hit {
         return tup;
     }
+    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
     let tup =
         lookup_where_pair(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
     // Prebuilt-family store: the cache slot is reached only by
@@ -8505,7 +8522,7 @@ unsafe fn _cached_lookup_where(
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     let mut cache = METHOD_CACHE.lock();
     cache.versions[h] = version_tag;
-    cache.names[h] = Some(name.to_string());
+    cache.names[h] = w_name;
     cache.lookup_where[h] = tup;
     tup
 }
@@ -8702,13 +8719,18 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
 /// `CALL`.
 ///
 /// Returns `Some((w_type, version_tag, w_descr))` for the
-/// plain-instance-method case the fast path binds `self` for
-/// (callmethod.py:55-68); `None` (fall back to `getattr`) for every other
-/// receiver / descriptor shape.  Mirror of `callmethod.py`:
-/// `has_object_getattribute()` (line 33), `version_tag()` (line 56),
-/// `_pure_lookup_where_with_method_cache` (line 59),
-/// `flag_method_descriptor` (line 66), and the instance-dict shadowing
-/// check (line 66).
+/// plain-instance-method case the fast path binds `self` for; `None` (fall
+/// back to `getattr`) for every other receiver / descriptor shape.  Mirror of
+/// `callmethod.py`: `has_object_getattribute()`, `version_tag()`,
+/// `_pure_lookup_where_with_method_cache`, `flag_method_descriptor`, and the
+/// instance-dict shadowing check.
+///
+/// The gate is the receiver's Python class, never its payload layout —
+/// `LOAD_METHOD` opens with `w_type = space.type(w_obj)` and asks nothing else
+/// about `w_obj`.  An exception subclass instance is a `W_BaseException`
+/// rather than a `W_ObjectObject`, so a layout gate here would leave every
+/// `e.method()` on it resolving through `getattr` into a fresh bound `Method`,
+/// which the tracer cannot inline.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
@@ -8716,13 +8738,11 @@ pub unsafe fn load_method_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, PyObjectRef)> {
-    if w_obj.is_null() || !is_instance(w_obj) {
+    if w_obj.is_null() {
         return None;
     }
-    let w_type = w_instance_get_type(w_obj);
-    if w_type.is_null() {
-        return None;
-    }
+    // callmethod.py `w_type = space.type(w_obj)`.
+    let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
     // typeobject.py:56-58 `version_tag = self.version_tag()`; `None`
     // (uncacheable) is `0` here.
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -8747,11 +8767,9 @@ pub unsafe fn load_method_fast_path(
     if !pyre_object::typeobject::w_type_get_flag_method_descriptor(w_descr_type.as_ptr()) {
         return None;
     }
-    // callmethod.py:66-67 `w_value = w_obj.getdictvalue(space, name)`: a
-    // shadowing instance attribute means the method is not bound.
-    if crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, Wtf8::new(name)).is_some() {
-        return None;
-    }
+    // callmethod.py `w_value = w_obj.getdictvalue(space, name)`: a shadowing
+    // instance attribute means the method is not bound.
+    instance_dict_does_not_shadow(w_obj, name)?;
     Some((w_type, version_tag, w_descr))
 }
 
@@ -8800,6 +8818,47 @@ pub unsafe fn classmethod_on_type_fast_path(
         return None;
     }
     Some((w_type, version_tag, w_func))
+}
+
+/// `callmethod.py`'s `w_obj.getdictvalue(space, name)` shadowing check,
+/// restricted to a probe that neither allocates nor runs Python.
+///
+/// [`getdict`] installs a fresh instance dictionary on several layouts
+/// (exceptions, bytes, bytearray), and a `LOAD_METHOD` that materialises one
+/// has changed the receiver just by looking at it.  The tracer shares this
+/// predicate, so it must also stay free of anything that could run a user
+/// `__eq__`.
+///
+/// `Some(())` = no instance attribute of this name shadows the type lookup,
+/// proven without touching the receiver.  `None` = either a shadowing entry,
+/// or a layout this cannot answer for — both decline the fast path.
+///
+/// # Safety
+/// `w_obj` must be a valid, non-null object pointer.
+unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Option<()> {
+    if is_instance(w_obj) {
+        // Mapdict side storage: the entry lookup reads the map chain and
+        // allocates nothing.
+        return crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, Wtf8::new(name))
+            .is_none()
+            .then_some(());
+    }
+    if pyre_object::is_exception(w_obj) {
+        // The `descr_reduce` peek: the raw `w_dict` slot, `PY_NULL` until the
+        // instance grows a dictionary.  A receiver that already carries one is
+        // declined rather than probed, since `finditem_str` on it can run a
+        // user `__eq__` against a colliding non-string key.  This is stricter
+        // than `callmethod.py`, and it is also what lets the tracer express
+        // the shadowing precondition as a single "slot is null" guard.
+        return pyre_object::interp_exceptions::w_exception_peek_dict(w_obj)
+            .is_null()
+            .then_some(());
+    }
+    // Every other layout (list / str / tuple / native-payload subclasses)
+    // keeps its instance attributes somewhere this probe does not read yet.
+    // Adding a layout means adding its non-allocating dictionary peek here and
+    // the matching shadowing guard on the tracer side.
+    None
 }
 
 /// The `getattr(w_obj, name)` shape that reduces, purely, to
@@ -11310,6 +11369,20 @@ pub fn unpackiterable(
         // `return items`); read it back into the `Vec<PyObjectRef>` the Rust
         // signature promises here, outside the traced/blackholed drain body.
         let w_list = _unpackiterable_unknown_length(w_iterator, w_iterable)?;
+        // `warmspot.py:998-1005` re-raises `ExitFrameWithExceptionRef` out of
+        // `ll_portal_runner`.  jd1 is entered from a merge-point hook that
+        // returns unit, so a recording walk that ran the raising `next()` for
+        // real parks the error instead; surface it here, at the first host-side
+        // point after the drain.  It cannot be surfaced inside the drain loop:
+        // that body is the jitcode the jd1 walker records, and a `Result` shell
+        // of its own there is a discriminant switch over niladic constructors
+        // with no host symbol — `try_fuse_drain_match`
+        // (majit-translate front/result_exc.rs) rewrites only the one such
+        // shell it recognises, the `match next(w_iterator)` at the loop's core,
+        // and the walker faults executing any other.  The walk leaves a
+        // truncated list when it parked; raising discards it, which is what the
+        // raise means.
+        crate::stack_check::drain_jit_pending_exception()?;
         Ok(drain_collect_items(w_list))
     } else {
         // baseobjspace.py:996-998 — known-length path with shape validation.

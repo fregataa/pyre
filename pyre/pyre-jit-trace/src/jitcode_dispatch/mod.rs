@@ -740,6 +740,25 @@ fn emit_traceback_node<Sym: WalkSym>(
             .heapcache_setfield_cached(traceback, descr.index(), value);
     }
 
+    // `f_lineno` resolves through `offset2lineno(pycode, last_instr)` on every
+    // read, so the frame itself has to carry the coordinate — the node's own
+    // `tb_lasti` answers a different question and is frozen. The interpreter
+    // gets this for free from `pyopcode.py`'s per-opcode `last_instr` store;
+    // compiled code does not run it, and `fbw_publish_exit_last_instr` only
+    // reaches the virtualizable, so an inlined callee frame would keep the `-1`
+    // initialization sentinel and report its `def` line. A frame that goes on
+    // running has this overwritten by its own later publish, exactly as the
+    // per-opcode store would.
+    let last_instr_value = ctx.trace_ctx.const_int(i64::from(site.last_instruction));
+    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[site.frame, last_instr_value],
+        last_instr_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(site.frame, last_instr_descr.index(), last_instr_value);
+
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -2081,17 +2100,21 @@ pub(crate) fn census_dump() {
 
 /// Carrier-boundary raise seed (`finishframe_exception` at the bridge carrier):
 /// set by [`crate::trace::drive_bridge_carrier_walk`] when a depth-2 inlined
-/// callee's sub-walk ended in `SubRaise` and the ROOT frame's `except` handler
-/// covers the CALL.  [`crate::jitcode_dispatch::dispatch_via_miframe`] reads it
-/// once when it sets up the root walk and enters at `catch_target` with the
-/// caught exception seeded — the same handler-entry reconstruction the
-/// walk-level SubRaise routing performs, but at the carrier boundary the
-/// sub-walk crossed on its own.
+/// callee's sub-walk ended in `SubRaise`.
+/// [`crate::jitcode_dispatch::dispatch_via_miframe`] reads it once when it sets
+/// up the root walk.  With `catch_target` set the root frame's `except` handler
+/// covers the CALL and the walk enters at that handler with the caught
+/// exception seeded — the same handler-entry reconstruction the walk-level
+/// SubRaise routing performs, but at the carrier boundary the sub-walk crossed
+/// on its own.  `None` means the root frame has no covering handler: the
+/// framestack this trace models is exhausted, so the walk ends immediately with
+/// `compile_exit_frame_with_exception` and the interpreter unwinds the
+/// remaining Python frames.
 #[derive(Clone, Copy)]
 pub(crate) struct CarrierRaiseSeed {
     pub exc: OpRef,
     pub exc_concrete: crate::state::ConcreteValue,
-    pub catch_target: usize,
+    pub catch_target: Option<usize>,
 }
 
 thread_local! {
@@ -2655,6 +2678,30 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
 /// outside any in-frame try.
 /// Returns the handler target (2-byte LE label after `catch_exception/L`), or
 /// `None` when the raising op sits outside any in-frame try (propagate).
+/// The `catch_exception/L` target of the can-raise op whose OWN trailing
+/// `-live-` sits at `resume_live_pos`.
+///
+/// A caught can-raise op expands to `[op, -live-, catch_exception,
+/// -live-(block entry), vable stores…]`.  [`find_catch_before_resume_live`]
+/// keys off the SUCCESSOR block-entry `-live-` and reads backward from it; a
+/// caller holding the op's own trailing `-live-` instead is one op short of
+/// that coordinate, so the same scan walks straight past the catch. Read
+/// forward for those callers: when `resume_live_pos` is a `-live-` whose very
+/// next op is a `catch_exception`, that catch is the one guarding the op.
+pub(crate) fn catch_target_after_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
+    let live = decode_op_at(code, resume_live_pos)?;
+    if live.key != "live/" {
+        return None;
+    }
+    let catch = decode_op_at(code, live.next_pc)?;
+    if catch.key != "catch_exception/L" {
+        return None;
+    }
+    let lo = *code.get(catch.pc + 1)? as usize;
+    let hi = *code.get(catch.pc + 2)? as usize;
+    Some(lo | (hi << 8))
+}
+
 pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
     let mut pcs: Vec<usize> = crate::jitcode_runtime::decoded_ops(code)
         .map(|op| op.pc)
@@ -2716,11 +2763,12 @@ fn label_operand_offset(key: &str) -> Option<usize> {
 /// (`pyjitpl.py:2530-2546`) does, and a handler that returns out of the frame is
 /// `finishframe`'s ordinary case (`pyjitpl.py:2503-2525`).
 ///
-/// What the predicate still gates is INLINING a caller whose in-try CALL would
-/// deliver a raise across the inline boundary: with a non-rejoining handler that
-/// delivery drops the catching frame's traceback node, so
-/// `exception_traceback_frame_lineno` reports the raising frame twice and at the
-/// wrong lineno (both backends).
+/// What the predicate still gates is INLINING a CLOSURE callee at a caller's
+/// in-try CALL.  A non-rejoining handler is an `except E as e` body, and the
+/// callee's free variables resolve through cells that body's implicit cleanup
+/// stores `None` into and then clears; the inlined read answers `None`
+/// (`synth/exception_as_cell_cleanup`, dynasm).  A callee with no free
+/// variables cannot reach a caller cell and is inlined either way.
 ///
 /// Bounded forward reachability from `catch_target`, following `goto`/
 /// `goto_if_not` successors: `true` as soon as any path reaches a
@@ -4653,6 +4701,40 @@ struct InlineParentBlackhole {
     /// Float values have no concrete shadow bank; retain their OpRefs and
     /// resolve them at force time while the trace context is still live.
     float_values: Vec<(usize, OpRef)>,
+}
+
+/// Whether any frame the trace already models would catch an exception raised
+/// below it — i.e. whether a raise escaping the callee about to be inlined has
+/// to be routed back INTO the traced region.
+///
+/// Each paused caller on the framestack is asked whether its own pending CALL
+/// sits inside a try-block, the same `after_residual_call_resume` →
+/// `catch_exception/L` lookup [`decline_inline_caller_frame_for_catch_marker`]
+/// uses. Level 0's parent is the snapshot root, so the scan covers the root
+/// frame and every intermediate one; the innermost CALL needs no test here
+/// because a nested try-block CALL already declines multiframe on its own.
+///
+/// Unknown answers count as catching: a parent with no snapshot, an
+/// unresolvable jitcode, or a CALL with no recorded pc could all be hiding a
+/// handler, and admitting one wrongly costs a guard storm.
+pub(crate) fn inline_chain_catches_a_raise(session: &std::cell::RefCell<WalkSession>) -> bool {
+    session.borrow().framestack.iter().any(|frame| {
+        let Some(parent) = frame.parent.as_ref() else {
+            return true;
+        };
+        let Some(call_pc) = parent.call_jitcode_pc else {
+            return true;
+        };
+        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+        else {
+            return true;
+        };
+        match pjc.after_residual_call_resume_for_jitcode_pc(call_pc) {
+            // No after-call resume marker: the CALL is not in a try-block.
+            None => false,
+            Some(resume) => try_catch_exception_at(pjc.jitcode.code.as_slice(), resume).is_some(),
+        }
+    })
 }
 
 /// The derivation flavor of a paused caller frame's Python resume pc.

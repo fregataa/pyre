@@ -974,7 +974,11 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 /// `FrameDebugData` fields. Both require a custom trace.
 ///
 /// Forwarded (mirrors `walk_pyframe_roots` eval.rs:496-556):
-///   - `f_backref` — the parent frame pointer.
+///   - `f_backref` — the parent frame pointer, or the `JitVirtualRef` standing
+///     in for it once the JIT virtualizes an inlined callee. The vref is a GC
+///     object registered with `forced` as its one traced slot, so forwarding
+///     this slot greys the vref and the collector reaches the parent frame
+///     through it; no hop is needed here.
 ///   - `pycode` — visited to match the walker; inert while code objects
 ///     are Box-immortal (`is_nursery_object_start` short-circuits).
 ///   - `locals_cells_stack_w` — the array pointer.  A GC-managed nursery
@@ -5653,14 +5657,49 @@ fn drive_unpack_iterable_trace(
         if exit_with_exception {
             crate::call_jit::drain_backend_jit_exc();
         }
+        // This reaches the session-absent no-op arm, so no finish trace is
+        // compiled here today: the finish-compile drains the frontend meta
+        // envelope that pairs with `MetaInterp.tracing`, and jd1 opens the
+        // tracer through `MetaInterp::force_start_tracing`, which installs no
+        // envelope (only `JitDriver::force_start_tracing` calls
+        // `begin_trace_session`).
+        //
+        // Opening the session here (the meta is fully static for the novable
+        // driver, so it is the value the back-edge arm above builds) is what
+        // would compile the trace; the defect that used to block it — the
+        // parked error resurfacing at an unrelated later unpack, which
+        // `synth/unpack_drain_star_raise` case 4 catches — was the backend
+        // `_store_exception` leak drained just above, not the park itself.
         match meta.compile_finish_from_active_session(
             &finish_args,
             finish_arg_types,
             exit_with_exception,
         ) {
             Ok(()) => {
+                // The no-op arm answers `Ok(())` without draining the tracer,
+                // and `tracing` is one slot shared by every driver: left
+                // installed it makes `is_tracing()` answer true for the rest of
+                // the process, so every later trace attempt in any driver bails
+                // at the guard above and nothing is ever compiled again. Any
+                // module defining a class with `__slots__` reaches this — the
+                // slots tuple is drained during type creation and the drain
+                // ends by raising — which costs an unrelated loop in the same
+                // module ~150x.
+                //
+                // A finish that could not be compiled is an abort, so treat it
+                // as the `else` arm below does: drop the trace non-permanently
+                // and let the cell's abort budget self-limit retrace storms.
+                // `abort_trace` also closes the profiler/debug scope
+                // `force_start_tracing` opened, via `clear_trace_session`.
+                if meta.is_tracing() {
+                    meta.abort_trace(false);
+                }
                 if dbg {
-                    eprintln!("[jd1] compile_finish ok exit_with_exception={exit_with_exception}");
+                    eprintln!(
+                        "[jd1] compile_finish ok exit_with_exception={exit_with_exception} \
+                         still_tracing={}",
+                        meta.is_tracing(),
+                    );
                 }
             }
             Err(stb) => {
@@ -6275,7 +6314,32 @@ fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
     }
 }
 
+/// Memoized wrapper over [`unsupported_jit_shape_uncached`], which runs on
+/// every frame entry but is a pure function of the code object: it flattens the
+/// whole constant table and walks the instruction stream up to four times.
+///
+/// The `CodeObject` allocation is owned for the process lifetime by
+/// `PyCode.code_ptr` (`Box::into_raw`, never freed), so its address is a stable
+/// key that is never reused — the same property the frame-shape decline census
+/// already relies on.
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+    thread_local! {
+        static SHAPE_CACHE: std::cell::RefCell<
+            std::collections::HashMap<usize, UnsupportedJitShape>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = code as *const _ as usize;
+    if let Some(cached) = SHAPE_CACHE.with(|c| c.borrow().get(&key).copied()) {
+        return cached;
+    }
+    let shape = unsupported_jit_shape_uncached(code);
+    SHAPE_CACHE.with(|c| {
+        c.borrow_mut().insert(key, shape);
+    });
+    shape
+}
+
+fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
     // RPython/PyPy has no counterpart to this function at all: `jit_merge_point`
     // and `can_enter_jit` are unconditional (`pypy/module/pypyjit/interp_jit.py`),
     // and `JitPolicy.look_inside_graph` (`rpython/jit/codewriter/policy.py:48`)
@@ -9774,7 +9838,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-) -> Option<(Vec<Value>, usize, usize)> {
+) -> Option<(Vec<Value>, usize, usize, Vec<(usize, usize)>)> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
@@ -9937,7 +10001,16 @@ pub(crate) fn decode_and_restore_guard_failure(
                 }
             }
         }
-        Some((typed, resume_pc, resumed_frames.len()))
+        // Outermost-first `(w_code, py_pc)` per resumed section. The caller
+        // needs them to ask each frame's own exception table whether it
+        // catches at its own resume pc — `resume_pc` alone only addresses the
+        // innermost section, so it cannot answer that question for a
+        // multi-frame resume.
+        let coords: Vec<(usize, usize)> = resumed_frames
+            .iter()
+            .map(|f| (f.code as usize, f.py_pc))
+            .collect();
+        Some((typed, resume_pc, resumed_frames.len(), coords))
     } else {
         None
     }

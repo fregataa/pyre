@@ -1551,6 +1551,19 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pyframe.py:80 escaped` and its neighbours live in one `u8`, so
+            // the traced `mark_as_escaped` is a byte-wide read-or-write, not a
+            // word store.  Appended last: the accessors above address this
+            // group by index.
+            (
+                "PyFrame.flags",
+                crate::frame_layout::PYFRAME_FLAGS_OFFSET,
+                std::mem::size_of::<u8>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
         ],
         "PyFrame",
         "pyframe::PyFrame",
@@ -1850,6 +1863,12 @@ pub fn w_class_descr() -> DescrRef {
 /// virtual instead.
 pub fn w_class_obj_for_vtable(vtable: usize) -> Option<i64> {
     if vtable == 0 {
+        return None;
+    }
+    // A `JitVirtualRef` names itself with a type tag, not a `PyType` address,
+    // and has no `w_class` to answer with — reading the tag as a type would
+    // dereference a constant.
+    if vtable == majit_metainterp::virtualref::JIT_VIRTUAL_REF_VTABLE as usize {
         return None;
     }
     let tp = vtable as *const pyre_object::pyobject::PyType;
@@ -2596,6 +2615,32 @@ pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
     field_descr_from_group(group, 3)
 }
 
+/// Field descr for `W_BaseException.w_dict` (the lazily allocated instance
+/// dictionary), the last slot of the per-kind exception descr group.  The
+/// LOAD_METHOD method-cache fold reads it to pin the receiver at "carries no
+/// instance dictionary", which is what makes the folded descriptor safe: a
+/// later `e.<name> = ...` allocates the dictionary and side-exits.
+pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    // Located by offset rather than by a hand-counted position.  The field
+    // list is edited by hand, and naming the wrong index does not fail to
+    // compile: it silently reads a neighbouring slot that stays null for an
+    // ordinary subclass, which turns the shadowing guard below into a no-op
+    // and lets compiled code keep calling a method an instance attribute has
+    // already shadowed.
+    let field = group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == pyre_object::interp_exceptions::EXC_W_DICT_OFFSET)
+        .expect("exception descr group has no w_dict field");
+    field_descr_from_group(group, field)
+}
+
 /// Field descriptor for `W_BaseException.w_traceback`, sharing the
 /// per-kind exception allocation descriptor with the other exception slots.
 pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
@@ -2684,6 +2729,30 @@ pub fn pytraceback_size_descr() -> DescrRef {
 }
 
 pub fn pytraceback_field_descr(index: usize) -> DescrRef {
+    field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
+}
+
+/// Field descriptor for `PyTraceback.frame`, the node's own frame slot read by
+/// `descr_get_tb_frame`.
+pub fn pytraceback_frame_descr() -> DescrRef {
+    let index = PYTRACEBACK_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == pyre_interpreter::pytraceback::PYTRACEBACK_FRAME_OFFSET)
+        .expect("PyTraceback descr group has no frame field");
+    field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
+}
+
+/// Field descriptor for `PyTraceback.w_next`, the chain link `descr_get_next`
+/// reads.  Located by offset rather than by a hand-counted position, so a
+/// later edit to the field list above cannot silently repoint this at a
+/// neighbouring slot.
+pub fn pytraceback_w_next_descr() -> DescrRef {
+    let index = PYTRACEBACK_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == pyre_interpreter::pytraceback::PYTRACEBACK_W_NEXT_OFFSET)
+        .expect("PyTraceback descr group has no w_next field");
     field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
 }
 
@@ -2881,6 +2950,18 @@ pub fn pyframe_w_yielding_from_descr() -> DescrRef {
 
 pub fn pyframe_f_backref_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 10)
+}
+
+/// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
+/// traced `tb_frame` fold to reproduce the getter's `mark_as_escaped()`.
+/// Located by offset, so appending another field cannot repoint it.
+pub fn pyframe_flags_descr() -> DescrRef {
+    let index = PYFRAME_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == crate::frame_layout::PYFRAME_FLAGS_OFFSET)
+        .expect("PyFrame descr group has no flags field");
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
 }
 
 #[cfg(test)]

@@ -1574,12 +1574,24 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             ctx.fbw_mode.inline_subwalk,
         );
     }
+    // Name every bail between the entry print and callee resolution.  An
+    // `[inline-entry]` with no follow-up line otherwise leaves the reason
+    // unobservable, which is the whole distance between "this call did not
+    // inline" and knowing why.
+    macro_rules! decline {
+        ($why:expr) => {{
+            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+                eprintln!("[inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
     if r_args.is_empty() {
-        return Ok(None);
+        decline!("no ref args");
     }
     let mut arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
     if r_args.len() < 2 {
-        return Ok(None);
+        decline!("fewer than two ref args");
     }
     for i in 0..2 {
         if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
@@ -1591,10 +1603,10 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         }
     }
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
-        return Ok(None);
+        decline!("callable slot carries no concrete ref");
     };
     if callable.is_null() {
-        return Ok(None);
+        decline!("callable is null");
     }
     // The receiver slot is a checked `PY_NULL` sentinel for a plain no-receiver
     // call; its concrete shadow arrives as `Null` (`call_kw`) or `Ref(PY_NULL)`
@@ -1602,7 +1614,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let null_or_self = match arg_concretes[1] {
         ConcreteValue::Ref(r) => r,
         ConcreteValue::Null => pyre_object::PY_NULL,
-        _ => return Ok(None),
+        _ => decline!("receiver slot carries no concrete ref"),
     };
     let mut method_form = !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL;
     // baseobjspace.py:1254-1259 unwraps `_Method` before the Function
@@ -1629,14 +1641,28 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let Some((w_code, nparams, has_closure)) =
         (unsafe { resolve_inlinable_callee(resolved_callable) })
     else {
-        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
-            eprintln!("[inline-decline] pc={} callee not inlinable", op.pc);
-        }
-        return Ok(None);
+        // The callable's type is the whole answer here: `resolve_inlinable_callee`
+        // takes plain `function` only, so a `builtin_function_or_method` or a
+        // `method` reads as "not inlinable" for a reason no pc can convey.
+        decline!(format_args!(
+            "callee not inlinable (callable type {})",
+            unsafe { pyre_object::type_name_of(callable) }
+        ));
     };
     if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        // Name the callee: a pc alone does not say which function a decline
+        // cost, and one trace reaches several.
+        let name = unsafe {
+            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject;
+            if raw.is_null() {
+                String::new()
+            } else {
+                (*raw).qualname.clone()
+            }
+        };
         eprintln!(
-            "[inline-resolved] pc={} nparams={nparams} has_closure={has_closure} method_form={method_form}",
+            "[inline-resolved] pc={} callee={name} nparams={nparams} has_closure={has_closure} method_form={method_form}",
             op.pc,
         );
     }
@@ -2303,6 +2329,32 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     }
 }
 
+/// Whether any level already on the inline stack is a recursion unroll — the
+/// snapshot root's own code re-entered, or one code appearing twice in the
+/// chain (a mutual cycle).
+///
+/// Such a chain's levels are suspended copies of the same frame, so an unwind
+/// through it is the shape `fbw_max_rec_unroll_depth` bounds rather than the
+/// straight-line chain `fbw_max_multiframe_depth` covers.
+fn inline_chain_unrolls_recursion<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    let root_code = if sym_ptr.is_null() {
+        0
+    } else {
+        unsafe {
+            pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode()).raw_code() as *const ())
+                as *const () as usize
+        }
+    };
+    let session = ctx.session.borrow();
+    session.framestack.iter().enumerate().any(|(i, frame)| {
+        frame.w_code == root_code
+            || session.framestack[..i]
+                .iter()
+                .any(|outer| outer.w_code == frame.w_code)
+    })
+}
+
 /// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
 /// resolve their callee from the CALL operand; builtin-dispatch specializers
 /// resolve an app-level descriptor first and enter here with that function as
@@ -2732,12 +2784,30 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         u16::MAX
     };
     let inline_depth = ctx.session.borrow().framestack.len();
-    // A callee that raises inline is inlinable only at the top level: below an
-    // intermediate frame its unwind needs the cross-frame bridge (gh#343 /
-    // gh#467) the drain cannot yet build (`callee_body_contains_raise`).  A
-    // value-returning chain (no raise) inlines to the full depth.
+    // A callee that raises inline needs the cross-frame bridge (gh#343 /
+    // gh#467) the drain cannot yet build, but only when the raise has to come
+    // back INTO the traced region — i.e. when some frame already on the
+    // framestack catches it.  Measured: admitting such a callee below an
+    // intermediate frame takes `guard_failures` from 1203 to 19654 and drops
+    // `bridges_compiled` from 6 to 2 on a caught-in-loop shape, because the
+    // guards it emits keep failing with no bridge to land on.
+    //
+    // When no modelled frame catches, the raise leaves the traced region
+    // entirely and takes the guard-exception exit, which needs no such bridge —
+    // `bench/synth/exception_escape_caller_frame_tb_node`'s `d_no_try` shape.
+    // A value-returning chain (no raise) inlines to the full depth either way.
+    //
+    // The lift is one level, not the full chain depth: the shape it unlocks is
+    // a single intermediate frame between the loop and the raise, and a chain
+    // whose levels are self-recursive unrolls keeps the recursion bound
+    // instead. The unwind out of such a chain crosses suspended copies of the
+    // same frame, which is what `fbw_max_rec_unroll_depth` bounds above;
+    // letting the raising leaf inline below one costs 1.9x on
+    // `bench/synth/selfrec_tail_exception_unwind`.
     let effective_multiframe_depth = if callee_body_contains_raise(body.code) {
-        1
+        let bounded = crate::jitcode_dispatch::inline_chain_catches_a_raise(ctx.session)
+            || inline_chain_unrolls_recursion(ctx);
+        if bounded { 1 } else { 2 }
     } else {
         fbw_max_multiframe_depth()
     };
@@ -3045,9 +3115,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // provably has no inner loop and that rationale does not reach here.
     //
     // All of these sit before the first recorded op (the `GETFIELD_GC_R`
-    // below), so returning costs nothing but the inline.  The
-    // POP_JUMP_IF_NONE scan is the one exception and still aborts — see the
-    // note at that site.
+    // below), so returning costs nothing but the inline.
     if try_multiframe || strict_seed {
         'seed: {
             // Branch-A frame shape only (mirror REC_CA): existing freevar
@@ -3055,49 +3123,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             if !callee_code.cellvars.is_empty() {
                 if try_multiframe {
                     return Ok(None);
-                }
-                break 'seed;
-            }
-            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
-            // identity residual call whose operands must be Ref (the codewriter
-            // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
-            // int-specializes the tested local, the mid-body guard resume cannot
-            // source that operand's Ref form from the callee register banks
-            // (`collect_callee_active_boxes` would read a stale/mismatched box), so
-            // the encoded liveness stream disagrees with the decoder
-            // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
-            // corrupted. Decline to the ordinary residual call until
-            // the multi-frame resume reboxes int-specialized identity operands.
-            // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
-            // int bank, so no Ref rebox is needed.  A strict straight-line callee
-            // has no branch at all, so this scan never fires for it.
-            //
-            // This is the one precondition here that still aborts instead of
-            // returning `Ok(None)`, and deliberately so.  Residualizing it does
-            // work — `bench/synth/_pending/gc_bug_bridge_flavor_traceback_names`
-            // goes from 98 aborts to 2 and
-            // `_pending/exception_nested_exc_info_restore` from 5 aborts to 0,
-            // both compiling loops they never compiled before — but the loops it
-            // newly compiles then print traceback tuples missing their outermost
-            // frame, diverging from the interpreter (that fixture pins its
-            // expected output in its header).  The abort was masking a lost
-            // `PyTraceback` node on the compiled exception path, not preventing
-            // one.  Restore `Ok(None)` here once that node is recorded; it is the
-            // largest single win left in this function.
-            if (bound_method.is_none() || method_form)
-                && (0..callee_code.instructions.len()).any(|pc| {
-                    matches!(
-                        pyre_interpreter::decode_instruction_at(callee_code, pc),
-                        Some((
-                            pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
-                                | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
-                            _
-                        ))
-                    )
-                })
-            {
-                if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
@@ -3253,7 +3278,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // walk context is the callee's. A caller frame that is not snapshot-able
     // (try-block catch marker / missing liveness) declines to interpretation.
     let parent_frame = if try_multiframe {
-        match compute_inline_caller_frame(ctx, op.pc) {
+        match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
                 // An un-entered multiframe-inline CALL declined at its
@@ -3300,25 +3325,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // served correctly today), so this never removes a working inline.
         //
         // A `TryBlockCatchMarker` decline is different: the CALL is covered by
-        // the caller's exception table.  The collapse resumes at the CALL's
-        // pre-call `-live-`, which precedes the CALL's own `catch_exception`,
-        // so an in-callee `GUARD_NO_EXCEPTION` failing there hands the
-        // blackhole a pending exception at a coordinate from which neither the
-        // forward check nor the bounded backward startpoint scan
-        // (`handle_exception_in_frame`) can reach that catch — the raise exits
-        // the caller frame past its matching handler.  Decline the inline so
-        // the call stays residual, where the post-call catch resume
+        // the caller's exception table AND the callee has free variables, so it
+        // reads cells the caller frame owns — one of which, inside a handler, is
+        // the `except E as e` binding the implicit cleanup stores `None` into
+        // and then clears.  Inlining reads that cell as `None`
+        // (`synth/exception_as_cell_cleanup`).  Decline so the call stays
+        // residual, where the post-call catch resume
         // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
         //
-        // FIXME: this `Err` discards the whole enclosing loop trace, where the
-        // comment above describes only declining the inline.  It cannot become
+        // This `Err` discards the whole enclosing loop trace, where the comment
+        // above describes only declining the inline.  It cannot become
         // `Ok(None)` in place like the seed preconditions below: by here the
         // seed block has already recorded `GETFIELD_GC_R` +
         // `emit_new_pyframe_inline_with_params` and stamped a concrete
         // `FrameBox` onto that op, so returning would leave dead IR behind.
-        // Closing it means hoisting `decline_inline_caller_frame_for_catch_marker`
-        // ahead of the seed block.
-        match compute_inline_caller_frame(ctx, op.pc) {
+        match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -4047,18 +4068,14 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     if !exception_string_override_straight_line(body.code) {
         return Ok(None);
     }
-    // A nested Python call in the override body (e.g. `return repr(self.args)`)
-    // cannot be inlined on this bounded route: recording the callee's own
-    // residual and its guard-resume snapshot aborts mid-trace, discarding the
-    // whole loop instead of declining.  Keep such a body on the residual
-    // dispatch path where the interpreter owns the nested frame.
-    let Some((override_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    // A nested call in the override body (e.g. `return repr(self.args)`) is
+    // inlined like any other: the nested callee records its own residual and
+    // guard-resume snapshot on this route without aborting, and a raise from it
+    // reaches the enclosing handler unchanged.
+    let Some((_override_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
     else {
         return Ok(None);
     };
-    if exception_string_override_has_nested_call(body.code, override_descr_refs) {
-        return Ok(None);
-    }
 
     // A straight-line, effect-free override can be sampled before any IR is
     // emitted. If its observed result is not a string, decline to the original
