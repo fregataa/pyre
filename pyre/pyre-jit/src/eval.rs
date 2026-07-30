@@ -5501,6 +5501,11 @@ fn drive_unpack_iterable_trace(
         {
             pending_err.get_or_insert(err);
         }
+        // The backend `_store_exception` cells are a compiled-side slot too:
+        // a guard exit that carried the drain's exception leaves them set even
+        // after the two clears above. See the walk's finish arm for what a
+        // survivor does to the next compiled trace.
+        crate::call_jit::drain_backend_jit_exc();
         // Parked last, so the clears above cannot swallow it.
         if let Some(err) = pending_err {
             pyre_interpreter::stack_check::park_jit_pending_error(err);
@@ -5632,6 +5637,21 @@ fn drive_unpack_iterable_trace(
         // (`walk_jit_pending_exception`).
         if exit_with_exception && let Some(err) = drain_error_from_exc_ref(exc_value) {
             pyre_interpreter::stack_check::park_jit_pending_error(err);
+        }
+        // The `next()` that ended the drain raised for real, and the shared
+        // `bh_*` residual helper published its exception into the backend
+        // `_store_exception` cells as well as `BH_LAST_EXC_VALUE`
+        // (`publish_residual_call_exception`). The trace exit consumed it just
+        // above — the loop-exit `StopIteration` is dropped so `ln` re-derives
+        // its own, anything else is parked — but the cells still hold it, and
+        // tracing must leave them pristine (`drain_backend_jit_exc`). A
+        // survivor is read by the next compiled trace's `must_save_exception`
+        // guard, whose recovery stub stages it into `jf_guard_exc`: the
+        // blackhole then unwinds an exception no one raised and the call
+        // returns NULL, surfacing much later as a `StopIteration` out of an
+        // unrelated operator.
+        if exit_with_exception {
+            crate::call_jit::drain_backend_jit_exc();
         }
         match meta.compile_finish_from_active_session(
             &finish_args,
@@ -8575,6 +8595,17 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if stack_almost_full() {
         return None;
     }
+    // `compile_and_run_once` traces, runs the backend compiler, and then enters
+    // the code it just produced, all in native frames no `stack_check()` ever
+    // saw.  Upstream's backend is a few RPython frames and stays well inside the
+    // budget, so it marks only the sub-regions where an interruption would leave
+    // dangling state (`compile.py:976`, `pyjitpl.py:3305`, `resume.py:1318`);
+    // Cranelift's is an optimizing compiler measuring ~1.2 MB against a 768 KB
+    // budget, so the prologue probe of the code being entered reports an
+    // overflow at a Python call depth of 2.  `report_error = 0` for the region
+    // is what `stack.h:42-43` is for — a real overflow still surfaces from the
+    // interpreter once the region exits.
+    let _cc_guard = majit_metainterp::CriticalCodeGuard::enter();
     let env = PyreEnv;
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
