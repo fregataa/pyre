@@ -238,42 +238,6 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
     }
 }
 
-/// `PYRE_FBW_BLACKHOLE_RESUME` (default ON) — a top-level one-frame walk whose
-/// residual forced the vable and writes live heap resumes PAST the escaping
-/// opcode through the blackhole instead of falling back to escape/replay.  Both
-/// the latch (`writes_live_heap`, odometer unchanged, non-bridge, empty
-/// framestack, no committed escape pc, resolvable snapshot sym) and the adopt
-/// (`try_adopt_single_frame_blackhole` → `apply_single_frame_blackhole_crn`,
-/// which validates every mapped color and every live operand-stack slot before
-/// writing anything) decline to the pre-existing path on any unmet condition,
-/// so the flip only ever replaces a replay that would have produced the same
-/// state.  `=0`/`false` opts back out.
-fn single_frame_blackhole_resume_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_BLACKHOLE_RESUME") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// Opt-in for adopting the MULTI-frame (inlined sub-walk) blackhole image.
-/// The build side (`build_multi_frame_miframe`, the input-arg `_resref` seed,
-/// and the getfield-chain `recover_ref_value`) reconstructs the frame stack
-/// correctly, but the resume side (`drive_multi_frame_blackhole` →
-/// `convert_and_run_from_pyjitpl`) does not yet materialize an OUTER frame's
-/// locals into its live frame before the innermost frame re-reads them (an
-/// inner `sys._getframe(1).f_locals[...]` runs first in the blackhole chain and
-/// sees the not-yet-restored caller frame).  Until that materialization lands,
-/// keep the multi-frame image from being latched so an inline-sub-walk force
-/// declines to the legacy escape/replay path (correct output) instead of
-/// resuming into an incomplete caller frame.
-fn multi_frame_blackhole_resume_enabled() -> bool {
-    std::env::var_os("PYRE_FBW_MULTIFRAME").as_deref() == Some(std::ffi::OsStr::new("1"))
-}
-
 fn build_single_frame_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
@@ -2460,10 +2424,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             }
             if fbw_debug_abort_enabled() && ctx.fbw_mode.inline_subwalk {
                 eprintln!(
-                    "[s2-gate] inline_subwalk fs={} flag={} writes_live={} odo_unchanged={} \
+                    "[s2-gate] inline_subwalk fs={} writes_live={} odo_unchanged={} \
                      committed_none={} not_bridge={} bh_result_some={} sym_nonnull={}",
                     ctx.session.borrow().framestack.len(),
-                    single_frame_blackhole_resume_enabled(),
                     writes_live_heap,
                     odometer_unchanged,
                     committed_frame_escape_pc().is_none(),
@@ -2472,8 +2435,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     !ctx.fbw_mode.snapshot_sym.is_null(),
                 );
             }
-            if single_frame_blackhole_resume_enabled()
-                && writes_live_heap
+            // A top-level one-frame walk whose residual forced the vable and
+            // writes live heap resumes PAST the escaping opcode through the
+            // blackhole instead of falling back to escape/replay. Both the
+            // latch (`writes_live_heap`, odometer unchanged, non-bridge, empty
+            // framestack, no committed escape pc, resolvable snapshot sym) and
+            // the adopt (`try_adopt_single_frame_blackhole` →
+            // `apply_single_frame_blackhole_crn`, which validates every mapped
+            // color and every live operand-stack slot before writing anything)
+            // decline to the pre-existing path on any unmet condition, so this
+            // only ever replaces a replay that would have produced the same
+            // state.
+            if writes_live_heap
                 && odometer_unchanged
                 && !ctx.trace_ctx.is_bridge_trace
                 && let Some((resume_pc, result_bank, result_color)) = blackhole_result
@@ -2507,8 +2480,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             });
                         });
                     }
+                // An inlined sub-walk adopts the multi-frame blackhole image.
+                // The build side (`build_multi_frame_miframe`, the input-arg
+                // `_resref` seed, and the getfield-chain `recover_ref_value`)
+                // reconstructs the frame stack; the resume side
+                // (`drive_multi_frame_blackhole` →
+                // `convert_and_run_from_pyjitpl`) publishes each level as the
+                // chain reaches it. The blast radius is exactly
+                // `inline_subwalk` at a vable escape: this is an `if`/`else
+                // if`, and the single-frame arm requires
+                // `framestack.is_empty() && !inline_subwalk`.
+                //
+                // This path was once gated because the walker executes
+                // residuals concretely while an inline push does not run the
+                // interpreter's call sequence. `ec.topframeref` therefore
+                // named the CALLER while an inlined callee body ran, so a
+                // `sys._getframe` that was itself the escaping residual read
+                // the wrong frame at walk time. Adopting committed that answer
+                // where legacy escape/replay discarded it. A `sys._getframe`
+                // executed later, inside the blackhole, was always correct.
+                // `walker_ec_enter` / `walker_ec_leave` (the port of
+                // `executioncontext.py:85-107`) publish the callee frame at
+                // the inlined-call push, which closed the gap.
+                // `synth/getframe_while_escaping_read_frame_identity` is the
+                // regression guard.
                 } else if ctx.fbw_mode.inline_subwalk
-                    && multi_frame_blackhole_resume_enabled()
                     && let Some(framestack) = build_multi_frame_miframe(
                         ctx,
                         resume_pc,
