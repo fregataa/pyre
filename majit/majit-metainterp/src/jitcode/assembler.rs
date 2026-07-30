@@ -368,7 +368,24 @@ impl JitCodeBuilder {
         self.constants_f.len() as u16
     }
 
+    /// Materialise an integer constant into `dst`.
+    ///
+    /// `assembler.py:163` sets `allow_short = (insn[0] in USE_C_FORM)` and
+    /// `int_copy` is in `USE_C_FORM` (`assembler.py:312`), so a value that
+    /// fits a signed byte is written inline as `int_copy/c>i`
+    /// (`assembler.py:99-107`) and costs no `constants_i` slot.  Registers
+    /// and constants of one kind share a single 256-wide index space, so
+    /// pooling every small constant instead pushes `try_finish` over the
+    /// `total_i > 256` ceiling and declines JitCodes the build-time
+    /// assembler — which does emit the short form — would have accepted.
     pub fn load_const_i_value(&mut self, dst: u16, value: i64) {
+        if let Ok(short) = i8::try_from(value) {
+            self.touch_reg(dst);
+            self.write_insn("int_copy/c>i");
+            self.push_u8(short as u8);
+            self.push_reg_u8(dst, "int_copy/c>i dst");
+            return;
+        }
         let const_idx = self.add_const_i(value);
         self.load_const_i(dst, const_idx);
     }
@@ -4554,13 +4571,30 @@ impl JitCodeBuilder {
         self.add_sub_jitcode_arc(std::sync::Arc::new(jitcode))
     }
 
+    /// Append a descr-pool entry and return the two-byte operand index that
+    /// refers to it.
+    ///
+    /// `assembler.py:204 assert 0 <= num <= 0xFFFF, "too many AbstractDescrs!"`
+    /// bounds the same index; upstream aborts translation, and the
+    /// build-time builder does too.  This builder runs at runtime and cannot
+    /// panic, so an index past the operand width latches the overflow flag
+    /// and `try_finish` declines the JitCode, the same way `push_reg_u8`
+    /// handles a register index that outgrows its byte.
+    fn push_descr_entry(&mut self, entry: RuntimeBhDescr) -> u16 {
+        let idx = self.descrs.len();
+        self.descrs.push(entry);
+        if idx > u16::MAX as usize {
+            self.encoding_overflow = true;
+            return 0;
+        }
+        idx as u16
+    }
+
     /// Variant accepting an already-shared `Arc<JitCode>` for callers
     /// that already hold a shared handle (e.g. a re-export from
     /// `MetaInterpStaticData::indirectcalltargets`).
     pub fn add_sub_jitcode_arc(&mut self, jitcode: std::sync::Arc<JitCode>) -> u16 {
-        let idx = self.descrs.len() as u16;
-        self.descrs.push(RuntimeBhDescr::JitCode(jitcode));
-        idx
+        self.push_descr_entry(RuntimeBhDescr::JitCode(jitcode))
     }
 
     pub fn add_fn_ptr(&mut self, ptr: *const ()) -> u16 {
@@ -4639,9 +4673,7 @@ impl JitCodeBuilder {
                 }
             }
         }
-        let idx = self.descrs.len() as u16;
-        self.descrs.push(RuntimeBhDescr::Call(target));
-        idx
+        self.push_descr_entry(RuntimeBhDescr::Call(target))
     }
 
     pub fn add_call_assembler_target_number(
@@ -4657,9 +4689,7 @@ impl JitCodeBuilder {
                 }
             }
         }
-        let idx = self.descrs.len() as u16;
-        self.descrs.push(RuntimeBhDescr::AssemblerToken(target));
-        idx
+        self.push_descr_entry(RuntimeBhDescr::AssemblerToken(target))
     }
 
     pub fn add_call_assembler_target(
@@ -4759,22 +4789,17 @@ impl JitCodeBuilder {
                 }
             }
         }
-        let idx = self.descrs.len() as u16;
-        self.descrs.push(RuntimeBhDescr::Descr(descr));
-        idx
+        self.push_descr_entry(RuntimeBhDescr::Descr(descr))
     }
 
     fn add_switch_descr(&mut self, mut const_keys_in_order: Vec<i64>) -> u16 {
         const_keys_in_order.sort();
-        let idx = self.descrs.len() as u16;
         // RPython creates one SwitchDictDescr object per switch site
         // (`flatten.py:282-285`), so do not deduplicate.
-        self.descrs
-            .push(RuntimeBhDescr::Descr(CanonicalBhDescr::Switch {
-                dict: std::collections::HashMap::new(),
-                const_keys_in_order,
-            }));
-        idx
+        self.push_descr_entry(RuntimeBhDescr::Descr(CanonicalBhDescr::Switch {
+            dict: std::collections::HashMap::new(),
+            const_keys_in_order,
+        }))
     }
 
     pub fn try_finish(mut self) -> Option<JitCode> {
@@ -5787,6 +5812,9 @@ mod tests {
         let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
         entries.insert("switch/id".to_string(), jitcode::insns::BC_SWITCH);
         entries.insert("int_copy/i>i".to_string(), jitcode::insns::BC_MOVE_I);
+        // `load_const_i_value` emits the `USE_C_FORM` short encoding for
+        // byte-sized constants, so wire both `int_copy` variants.
+        entries.insert("int_copy/c>i".to_string(), jitcode::insns::BC_MOVE_I_C);
         entries.insert("int_return/i".to_string(), jitcode::insns::BC_INT_RETURN);
         let mut builder = BlackholeInterpBuilder::new();
         builder.setup_insns(&entries);
@@ -6427,6 +6455,81 @@ mod tests {
         for value in 0..256 {
             builder.add_const_i(value);
         }
+        assert!(builder.try_finish().is_none());
+    }
+
+    /// `int_copy` is in `USE_C_FORM` (`assembler.py:312`), so a byte-sized
+    /// constant is written inline rather than into `constants_i`.
+    #[test]
+    fn load_const_i_value_uses_the_short_form_for_byte_sized_values() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(1);
+        builder.load_const_i_value(0, -5);
+        let jitcode = builder.try_finish().expect("short form must assemble");
+        assert_eq!(
+            jitcode.code,
+            vec![
+                majit_translate::codewriter::insns::insn_byte("int_copy/c>i"),
+                (-5i8) as u8,
+                0
+            ]
+        );
+    }
+
+    /// A value that does not fit a signed byte still goes through the pool
+    /// as `int_copy/i>i`.
+    #[test]
+    fn load_const_i_value_pools_values_wider_than_a_byte() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(1);
+        builder.load_const_i_value(0, 1000);
+        let jitcode = builder.try_finish().expect("pooled form must assemble");
+        assert_eq!(
+            jitcode.code[0],
+            majit_translate::codewriter::insns::insn_byte("int_copy/i>i")
+        );
+    }
+
+    /// Registers and constants of one kind share a single 256-wide index
+    /// space.  Pooling every small constant pushes `total_i` past it and
+    /// declines the JitCode; the short form keeps them out of the pool
+    /// entirely, so a full byte range of distinct constants still assembles.
+    #[test]
+    fn a_full_byte_range_of_small_constants_still_assembles() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(1);
+        for value in -128..=127i64 {
+            builder.load_const_i_value(0, value);
+        }
+        assert!(builder.try_finish().is_some());
+    }
+
+    fn fill_descr_pool(entries: usize) -> JitCodeBuilder {
+        let mut builder = JitCodeBuilder::new();
+        for _ in 0..entries {
+            builder.push_descr_entry(RuntimeBhDescr::Call(JitCallTarget::new(
+                std::ptr::null(),
+                std::ptr::null(),
+            )));
+        }
+        builder
+    }
+
+    /// A descr operand is two bytes wide, so `0xFFFF` is the last index a
+    /// bytecode can name (`assembler.py:204`).
+    #[test]
+    fn try_finish_accepts_last_two_byte_descr_slot() {
+        let builder = fill_descr_pool(u16::MAX as usize + 1);
+        assert!(builder.try_finish().is_some());
+    }
+
+    /// One entry past the operand width. Upstream aborts translation with
+    /// `assert 0 <= num <= 0xFFFF, "too many AbstractDescrs!"`; this builder
+    /// runs at runtime, so it latches the overflow flag and declines the
+    /// JitCode instead of wrapping the index with `as u16`.
+    #[test]
+    fn try_finish_declines_descr_pool_overflow() {
+        let builder = fill_descr_pool(u16::MAX as usize + 2);
         assert!(builder.try_finish().is_none());
     }
 }
