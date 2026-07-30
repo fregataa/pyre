@@ -80,6 +80,16 @@ thread_local! {
     /// from `ContinueRunningNormally` mirrors `_exit_frame_with_exception`.
     static WALK_END_PROPAGATED_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::PyError>> =
         const { std::cell::RefCell::new(None) };
+    /// Stable address for the in-flight walk-end exception carrier above.
+    ///
+    /// RPython keeps this value in the translated MIFrame / exception object
+    /// graph, which its root walker visits for every mutator. Pyre's
+    /// trace→portal seam is genuinely per-thread, but its raw TLS is outside
+    /// that graph, so the owning mutator publishes its address to the
+    /// collector's STW root-area registry.
+    static WALK_END_ROOT_AREA: WalkEndRootArea = WalkEndRootArea {
+        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|value| value as *const _),
+    };
     /// True at portal trace sites that can consume
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
@@ -89,6 +99,10 @@ thread_local! {
     /// merge point's green pc, but the interpreter fallback must resume at
     /// the opcode whose entry stack matches the restored live boxes.
     static WALK_END_RESTART_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct WalkEndRootArea {
+    propagated_exception: *const std::cell::RefCell<Option<pyre_interpreter::PyError>>,
 }
 
 /// Take-and-reset the walk-end flush flag for the trace that just
@@ -128,6 +142,10 @@ pub(crate) enum WalkEndCommitLeg {
     /// otherwise reports these walks as `committed=true leg=0`, which reads as
     /// "no leg" when it means "a commit path outside the leg contract".
     TerminateNoReplay = 8,
+    /// `SwitchToBlackhole(ABORT_TOO_LONG)`: the post-step MIFrame image was
+    /// converted to blackhole frames and run forward, never replayed from the
+    /// trace entry.
+    TraceTooLong = 9,
 }
 
 /// Where a committing leg puts the interpreter, relative to the effects the
@@ -259,21 +277,34 @@ pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError>
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
-/// Root the no-handler exception parked in `WALK_END_PROPAGATED_EXCEPTION`
-/// across the trace→portal boundary until `take_walk_end_propagated_exception`
-/// consumes it. The parked `PyError`'s GC refs are unreachable through the raw
-/// `RefCell`; forward them in place via `PyError::walk_gc_refs`. Never
-/// materialises the lazy-null `exc_object`.
+/// Capture this mutator's raw walk-end carrier address for STW root walking.
+pub fn capture_walk_end_root_area() -> *const () {
+    WALK_END_ROOT_AREA.with(|area| area as *const _ as *const ())
+}
+
+/// Root the no-handler exception parked across the trace→portal boundary until
+/// `take_walk_end_propagated_exception` consumes it. Forward its GC refs in
+/// place without materialising the lazy-null `exc_object`.
 pub fn walk_walk_end_propagated_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    WALK_END_PROPAGATED_EXCEPTION.with(|c| {
-        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
-        // holds the only reference for its duration and does not re-borrow the
-        // cell, so no borrow-flag conflict with a walker-triggered path.
-        let opt = unsafe { &mut *c.as_ptr() };
-        if let Some(err) = opt.as_mut() {
-            err.walk_gc_refs(visitor);
-        }
-    });
+    let data = capture_walk_end_root_area();
+    unsafe { walk_walk_end_roots_area(data, visitor) };
+}
+
+/// # Safety
+/// `data` must come from [`capture_walk_end_root_area`], and the owning
+/// mutator must be quiesced when a foreign collector thread calls this.
+pub unsafe fn walk_walk_end_roots_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let area = unsafe { &*(data as *const WalkEndRootArea) };
+    let exception_cell = unsafe { &*area.propagated_exception };
+    // SAFETY: the owner is either synchronously collecting or STW-quiesced;
+    // no Rust borrow is live while the collector forwards these raw slots.
+    let opt = unsafe { &mut *exception_cell.as_ptr() };
+    if let Some(err) = opt.as_mut() {
+        err.walk_gc_refs(visitor);
+    }
 }
 
 thread_local! {
@@ -1982,8 +2013,9 @@ fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
 /// and `ExitFrameWithExceptionRef` record a concrete frame result, and
 /// `ContinueRunningNormally` hands the frame over through
 /// [`adopt_blackhole_crn`], which validates nothing because it rebuilds
-/// nothing.  The one `false` left in the match is an empty green list, a
-/// codewriter contract violation with no upstream counterpart.
+/// nothing. An empty green list is a codewriter contract violation with no
+/// upstream counterpart, so it fails loudly instead of returning to replay
+/// after the drive has executed.
 ///
 /// Over `pyre/bench/synth` that is 50 frame-terminal adoptions plus 15 CRN
 /// adoptions (five each from the three `getframe_root_loop_force_*` fixtures),
@@ -1993,6 +2025,7 @@ fn try_adopt_single_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
+    commit_leg: WalkEndCommitLeg,
 ) -> bool {
     macro_rules! sfdbg {
         ($($a:tt)*) => {
@@ -2001,21 +2034,44 @@ fn try_adopt_single_frame_blackhole(
             }
         };
     }
+    // A zero-effect overlong walk deliberately permits entry replay even when
+    // no blackhole image was representable. Only an effectful TraceTooLong
+    // carries the irrevocable, fully preflighted adoption contract.
+    let trace_too_long = commit_leg == WalkEndCommitLeg::TraceTooLong
+        && crate::jitcode_dispatch::fbw_executed_effect_count() != 0;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long blackhole image disappeared before adoption"
+        );
         return false;
     };
     let jitcode_index = match i32::try_from(latched.miframe.jitcode.index()) {
         Ok(index) => index,
-        Err(_) => return false,
+        Err(_) => {
+            assert!(
+                !trace_too_long,
+                "preflighted trace-too-long jitcode index no longer fits i32"
+            );
+            return false;
+        }
     };
     let virtualizable_info = ctx
         .virtualizable_info()
         .map(std::sync::Arc::as_ptr)
         .unwrap_or(std::ptr::null());
     if virtualizable_info.is_null() {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long virtualizable info disappeared"
+        );
         return false;
     }
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long frame lost its concrete locals base"
+        );
         return false;
     };
     // Two gates used to sit here, and both were scaffolding around a decline
@@ -2041,18 +2097,23 @@ fn try_adopt_single_frame_blackhole(
     // QUIETER, not smaller — before it the accumulator was visibly wrong too.
     // So the decline had to go, not be gated around.
     //
-    // The escape flush that ran ahead of the forcing residual is
-    // all-or-nothing, and its decline is what this latch is gated on
-    // (`committed_frame_escape_pc().is_none()`).  What it declines on is the
-    // operand-stack half — the shadow's stack region reads NULL away from a
-    // merge point — and the drive reconstructs that half itself, through the
-    // vable stores its own execution makes.
-    // The LOCALS half is not optional: every LOAD_FAST lowers to
+    // The escape flush that ran ahead of the forcing residual is all-or-
+    // nothing, and its decline is what the vable-escape latch is gated on
+    // (`committed_frame_escape_pc().is_none()`).  The LOCALS half is not
+    // optional: every LOAD_FAST lowers to
     // `getarrayitem_vable_r` on the frame the latched image's register names,
     // so without it the drive reads whatever that frame held before the walk
     // began, and a local the walk assigned comes back null.  Publish that half
     // here, and withdraw it if it cannot complete — the withdrawal is honest
     // only because nothing has run at that point.
+    //
+    // Trace-too-long is also post-step: its MIFrame `resume_pc` and concrete
+    // banks already describe the next jitcode instruction.  The detached
+    // `snapshot_for_tracing` therefore owns the matching active operand stack
+    // and Python-frame coordinate.  RPython's MIFrame and red frame are one
+    // coherent per-call state at this boundary; publish the snapshot stack to
+    // the same live red frame before driving instead of leaving only
+    // `valuestackdepth` to advance over null slots.
     //
     // Which frame gets it is an identity question, and the walked frame has two
     // representations: `cf_addr` is the `snapshot_for_tracing` copy the walk
@@ -2077,38 +2138,144 @@ fn try_adopt_single_frame_blackhole(
         .flatten()
         .unwrap_or(0) as usize;
     if vable_frame == 0 || vable_frame != root_addr {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long frame identity changed before adoption"
+        );
         return false;
     }
     let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long frame locals became uncapturable"
+        );
         return false;
     };
-    let scalars_undo = crate::state::capture_frame_scalars(vable_frame);
+    let mut captured_stack = if commit_leg == WalkEndCommitLeg::TraceTooLong {
+        match crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame) {
+            Some(stack) => Some(stack),
+            None => {
+                assert!(
+                    !trace_too_long,
+                    "preflighted trace-too-long operand stack became uncapturable"
+                );
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    // `take_single_frame_blackhole` removed the image from the TLS root
+    // walker. `write_back_outer_locals` may box Int/Float locals and collect
+    // before the blackhole driver installs its own packed roots. Bridge that
+    // interval explicitly, including the detached snapshot's active operand
+    // stack, and copy forwarding updates into the MIFrame.
+    let image_ref_locations: Vec<usize> = latched
+        .miframe
+        .ref_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.map(|_| index))
+        .collect();
+    let mut image_ref_roots: Vec<i64> = image_ref_locations
+        .iter()
+        .map(|&index| latched.miframe.ref_values[index].expect("location came from Some"))
+        .collect();
+    let image_exception_root = (latched.last_exc_value != 0).then(|| {
+        let index = image_ref_roots.len();
+        image_ref_roots.push(latched.last_exc_value);
+        index
+    });
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(image_ref_roots.as_mut_slice());
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
+        if let Some(stack) = captured_stack.as_mut() {
+            majit_gc::shadow_stack::push_resume_ref_roots(stack.roots_mut());
+        }
     }
     if !crate::state::write_back_outer_locals(ctx, vable_frame) {
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long locals publication declined"
+        );
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] single-frame locals publish declined — legacy replay kept");
         }
         return false;
     }
-    // The undo image stays rooted across the drive.  The publish overwrote the
-    // slots it was taken from, so these words are the only remaining reference
-    // to the pre-walk locals, and a collection inside the drive would both free
-    // them and leave the withdrawal below writing back pre-move addresses.
+    for (&index, &forwarded) in image_ref_locations.iter().zip(&image_ref_roots) {
+        latched.miframe.ref_values[index] = Some(forwarded);
+    }
+    if let Some(index) = image_exception_root {
+        latched.last_exc_value = image_ref_roots[index];
+    }
+    let committed_root_addr = latched
+        .miframe
+        .ref_values
+        .get(frame_reg as usize)
+        .copied()
+        .flatten()
+        .expect("preflighted frame register disappeared after forwarding")
+        as usize;
+    if let Some(stack) = captured_stack.as_ref() {
+        if !crate::state::publish_captured_frame_stack(committed_root_addr, stack) {
+            crate::state::restore_frame_locals(committed_root_addr, &locals_undo);
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+            assert!(
+                !trace_too_long,
+                "preflighted trace-too-long operand-stack publication declined"
+            );
+            return false;
+        }
+    }
+    // Locals plus the no-allocation stack publication are the last recoverable
+    // adoption gates. Their undo image only needs rooting through this point;
+    // after it the blackhole may execute irreversible effects and the handoff
+    // must commit or fail loudly, never return to trace-entry replay.
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+    drop(locals_undo);
+    drop(image_ref_roots);
+    drop(captured_stack);
     let terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         majit_metainterp::blackhole::StateFieldLayout::default(),
         virtualizable_info,
-        cf_addr as i64,
+        // RPython threads the current MIFrame's own red virtualizable through
+        // blackhole execution. Keep the explicit driver field aligned with
+        // the same live frame carried in the MIFrame register; the tracing
+        // snapshot is only the epilogue's committed copy.
+        committed_root_addr as i64,
         stack_base,
         ctx.metainterp_sd().as_ref(),
         latched.last_exc_value,
         latched.raising_exception,
     );
+    // The blackhole roots and forwards its Ref bank in place. A collection
+    // during the drive can therefore move the live frame away from the
+    // pre-drive `committed_root_addr`; recover the authoritative post-drive
+    // identity from the same per-frame red register before dereferencing it.
+    let forwarded_root_addr = terminal
+        .registers_r
+        .get(frame_reg as usize)
+        .copied()
+        .filter(|&addr| addr != 0)
+        .expect("post-blackhole frame register lost the live frame identity")
+        as usize;
+    // Vable opcodes address the frame carried in the MIFrame's red register,
+    // i.e. the live frame whose locals were published above. Fold every
+    // blackhole write back into the tracing snapshot before the portal
+    // epilogue propagates that snapshot. This matters for terminal exceptions:
+    // their traceback keeps `tb_frame.f_locals` observable after the walk.
+    if forwarded_root_addr != cf_addr {
+        unsafe {
+            (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
+                &*(forwarded_root_addr as *const pyre_interpreter::PyFrame),
+            );
+        }
+    }
 
     // Its own prefix: this is not a decline, and reading it as one is exactly
     // the confusion that made the CRN arm look unreachable.
@@ -2131,101 +2298,68 @@ fn try_adopt_single_frame_blackhole(
             }
         );
     }
-    let adopted = match terminal.outcome {
+    match terminal.outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
             ref green_int, ..
-        } => match green_int.first() {
-            Some(&resume_py_pc) => {
-                let resume_py_pc = resume_py_pc as usize;
-                adopt_blackhole_crn(cf_addr, vable_frame, resume_py_pc);
-                sfdbg!("adopted with green resume_py_pc={resume_py_pc}");
-                WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
-                true
-            }
-            None => {
-                // The last post-drive decline in this arm, and a codewriter
-                // contract violation rather than a runtime condition: the
-                // portal's `jit_merge_point` carries `py_pc` as its first int
-                // green, so an empty list means the op was emitted without its
-                // greens.  Upstream indexes the greens unconditionally
-                // (`warmspot.py:973-976` `getattr(e, attrname)[count]`), so it
-                // has no decline for this to correspond to.
-                sfdbg!("ContinueRunningNormally with no green int");
-                false
-            }
-        },
+        } => {
+            // The portal's `jit_merge_point` carries `py_pc` as its first int
+            // green. Upstream indexes that green unconditionally
+            // (`warmspot.py:973-976`); a missing one is a codewriter invariant
+            // failure, never a licence to replay an already-driven region.
+            let &resume_py_pc = green_int.first().expect(
+                "post-blackhole ContinueRunningNormally has no resume pc; \
+                 replay is forbidden after blackhole effects",
+            );
+            let resume_py_pc = resume_py_pc as usize;
+            adopt_blackhole_crn(cf_addr, forwarded_root_addr, resume_py_pc);
+            sfdbg!("adopted with green resume_py_pc={resume_py_pc}");
+            WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
+        }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
-            true
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(value) => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Int(
                 value,
             ));
-            true
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(value) => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
-            true
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(value) => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Float(
                 value,
             ));
-            true
         }
         majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(value) => {
             crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
-            true
-        }
-    };
-    if adopted {
-        let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
-        crate::jitcode_dispatch::discard_escape_flush_undo();
-        crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-        // The blackhole ran the region to a frame terminal, so the resume is
-        // the frame's RESULT, not a pc that re-runs anything.
-        let _ = commit_walk_end(WalkEndCommitLeg::VableEscape, WalkEndResume::Terminal);
-        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-            eprintln!(
-                "[fbw-blackhole] adopted single-frame terminal at jitcode_index={} \
-                 position={} last_opcode_position={}",
-                jitcode_index, terminal.position, terminal.last_opcode_position,
-            );
-        }
-    } else {
-        // Only the empty-green-list arm gets here, and that is a codewriter
-        // contract violation rather than a runtime outcome.  This returns to the
-        // legacy escape/replay path, which resumes the frame from its pre-walk
-        // state — the state `restore_escape_flush_undo` puts back for the flush
-        // half.  The publish above and the drive's own vable stores both landed
-        // on this frame, so both have to come off.  The drive reached the
-        // frame's scalars through `setfield_vable_i`, for which no undo image
-        // exists anywhere else: the store journal covers heap effects and
-        // `fbw_exit_last_instr_rollback` only arms on a return or void-return
-        // exit, which an unadoptable terminal is not.
-        //
-        // ⚠️Putting the FRAME back is all this can do.  The drive already ran,
-        // so any heap effect in the region it executed stays, and the replay
-        // performs it a second time.  That is why no new post-drive decline may
-        // be added here: the withdrawal looks total and is not.
-        crate::state::restore_frame_locals(vable_frame, &locals_undo);
-        if let Some(scalars) = scalars_undo {
-            crate::state::restore_frame_scalars(vable_frame, scalars);
         }
     }
-    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
-    adopted
+    let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
+    crate::jitcode_dispatch::discard_escape_flush_undo();
+    crate::jitcode_dispatch::fbw_foriter_inflight_clear();
+    // The blackhole ran the region to a frame terminal, so the resume is
+    // the frame's RESULT, not a pc that re-runs anything.
+    let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-blackhole] adopted single-frame terminal at jitcode_index={} \
+             position={} last_opcode_position={}",
+            jitcode_index, terminal.position, terminal.last_opcode_position,
+        );
+    }
+    true
 }
 
 fn try_adopt_multi_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
+    commit_leg: WalkEndCommitLeg,
 ) -> bool {
     // Every arm below returns to the legacy escape/replay path.  Name each one
     // under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_miframe`'s
@@ -2238,12 +2372,10 @@ fn try_adopt_multi_frame_blackhole(
     // that already ran and hand back to a caller that replays it, and no undo
     // reaches the heap effects that chain committed.
     //
-    // Exactly one post-drive decline survives here, the empty `green_int`, and
-    // it is a codewriter contract violation rather than a runtime outcome.  The
-    // three that used to sit beside it — no terminal image, terminal jitcode
-    // index out of i32 range, and the register-image rebuild's own rejection —
-    // all existed only to serve that rebuild, and went with it when the CRN
-    // handoff became [`adopt_blackhole_crn`].
+    // No post-drive decline survives here. An empty `green_int` is a codewriter
+    // invariant failure rather than a runtime outcome; the three checks that
+    // used to sit beside it existed only for the retired register-image
+    // rebuild.
     //
     // Note that they could not have been hoisted instead.  The rebuild's index
     // here is `terminal.jitcode_index` = `bh.jitcode.index()` of whichever
@@ -2456,7 +2588,6 @@ fn try_adopt_multi_frame_blackhole(
         restore_links(&saved_links);
         return false;
     };
-    let scalars_undo = crate::state::capture_frame_scalars(root_addr);
     let undo_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
@@ -2468,8 +2599,11 @@ fn try_adopt_multi_frame_blackhole(
         mfdbg!("frame 0: {root_addr:#x} locals publish declined");
         return false;
     }
-    // Rooted across the drive for the same reason as the single-frame arm: the
-    // publish overwrote the slots these words came from.
+    // As in the single-frame path, locals publication is the final recoverable
+    // gate. Once the roots are released and the chain starts running, adoption
+    // is irrevocable.
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
+    drop(locals_undo);
     let ec = unsafe {
         (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
             as *mut pyre_interpreter::PyExecutionContext
@@ -2539,15 +2673,14 @@ fn try_adopt_multi_frame_blackhole(
                 .restore_resume_state_from(&*(root_addr as *const pyre_interpreter::PyFrame));
         }
     }
-    let adopted = match outcome {
+    match outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
-            ref green_int,
-            ..
-        } => 'crn: {
-            let Some(&resume_py_pc) = green_int.first() else {
-                mfdbg!("ContinueRunningNormally with no green int");
-                break 'crn false;
-            };
+            ref green_int, ..
+        } => {
+            let &resume_py_pc = green_int.first().expect(
+                "post-blackhole ContinueRunningNormally has no resume pc; \
+                 replay is forbidden after blackhole effects",
+            );
             let resume_py_pc = resume_py_pc as usize;
             // `resume_py_pc` is deliberately NOT checked.  It is a
             // `depth_at_py_pc` index written through to
@@ -2585,64 +2718,50 @@ fn try_adopt_multi_frame_blackhole(
             // chain that had already run back to a replay.
             adopt_blackhole_crn(cf_addr, root_addr, resume_py_pc);
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
-            true
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
-            true
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(value) => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Int(
                 value,
             ));
-            true
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(value) => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
-            true
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(value) => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Float(
                 value,
             ));
-            true
         }
         majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(value) => {
             crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
-            true
         }
-    };
-    if adopted {
-        let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
-        crate::jitcode_dispatch::discard_escape_flush_undo();
-        crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-        // Same as the single-frame adoption: a frame terminal, not a resume pc.
-        let _ = commit_walk_end(WalkEndCommitLeg::VableEscape, WalkEndResume::Terminal);
-        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-            eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
-        }
-    } else {
-        // Same withdrawal as the single-frame arm: an unadoptable terminal
-        // returns to legacy escape/replay, which resumes the walked frame from
-        // its pre-walk state.  The chain the drive was given comes down with it,
-        // and so do the frame scalars the drive moved.
-        crate::state::restore_frame_locals(root_addr, &locals_undo);
-        if let Some(scalars) = scalars_undo {
-            crate::state::restore_frame_scalars(root_addr, scalars);
-        }
-        restore_links(&saved_links);
     }
-    majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
-    adopted
+    let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
+    crate::jitcode_dispatch::discard_escape_flush_undo();
+    crate::jitcode_dispatch::fbw_foriter_inflight_clear();
+    // Same as the single-frame adoption: a frame terminal, not a resume pc.
+    let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
+    }
+    true
 }
 
-fn try_adopt_force_blackhole(ctx: &mut TraceCtx, cf_addr: usize, live_root_addr: usize) -> bool {
-    try_adopt_multi_frame_blackhole(ctx, cf_addr, live_root_addr)
-        || try_adopt_single_frame_blackhole(ctx, cf_addr, live_root_addr)
+fn try_adopt_blackhole(
+    ctx: &mut TraceCtx,
+    cf_addr: usize,
+    live_root_addr: usize,
+    commit_leg: WalkEndCommitLeg,
+) -> bool {
+    try_adopt_multi_frame_blackhole(ctx, cf_addr, live_root_addr, commit_leg)
+        || try_adopt_single_frame_blackhole(ctx, cf_addr, live_root_addr, commit_leg)
 }
 
 fn run_perfn_walk<Sym: WalkSym>(
@@ -3359,10 +3478,19 @@ fn run_perfn_walk<Sym: WalkSym>(
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.
         let live_root_addr = sym.live_vable_frame_addr();
-        let force_blackhole_adopted = matches!(
-            &walk_result,
-            Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-        ) && try_adopt_force_blackhole(ctx, cf_addr, live_root_addr);
+        let trace_too_long_adopted =
+            matches!(
+                &walk_result,
+                Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
+            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
+        let force_blackhole_adopted =
+            matches!(
+                &walk_result,
+                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
+        }
         if !force_blackhole_adopted
             && matches!(
                 &walk_result,
@@ -3861,6 +3989,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     let blackhole_terminal_no_replay = matches!(
         &walk_result,
         Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+            | Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
     ) && WALK_END_FLUSH_COMMITTED.with(|slot| slot.get())
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some();
     if !terminate_no_replay && !blackhole_terminal_no_replay {
@@ -4894,6 +5023,46 @@ mod tests {
     use pyre_interpreter::bytecode::Instruction;
     use pyre_interpreter::compile_exec;
     use pyre_interpreter::decode_instruction_at;
+
+    #[test]
+    fn walk_end_root_area_forwards_a_quiesced_foreign_mutator() {
+        let (area_tx, area_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (roots_tx, roots_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let mut err = pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::RuntimeError,
+                "foreign mutator root",
+            );
+            err.w_name_context = 0x3000 as pyre_object::PyObjectRef;
+            err.w_obj_context = 0x4000 as pyre_object::PyObjectRef;
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                *slot.borrow_mut() = Some(err);
+            });
+            area_tx
+                .send(super::capture_walk_end_root_area() as usize)
+                .unwrap();
+            resume_rx.recv().unwrap();
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                let err = slot.borrow_mut().take().unwrap();
+                roots_tx
+                    .send((err.w_name_context as usize, err.w_obj_context as usize))
+                    .unwrap();
+            });
+        });
+
+        let area = area_rx.recv().unwrap() as *const ();
+        // The owner is blocked after publishing its stable TLS addresses,
+        // matching the mutator quiescence required by the STW registry.
+        unsafe {
+            super::walk_walk_end_roots_area(area, &mut |root| {
+                *root = majit_ir::GcRef(root.as_usize() + 0x20);
+            });
+        }
+        resume_tx.send(()).unwrap();
+        assert_eq!(roots_rx.recv().unwrap(), (0x3020, 0x4020));
+        owner.join().unwrap();
+    }
 
     /// The walk-end commit contract: only a resume pc that does not precede
     /// something the walk already applied may keep the store journal.

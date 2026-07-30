@@ -149,6 +149,38 @@ fn switch_descr_pool(entries: &[(i64, usize)]) -> Vec<DescrRef> {
     vec![std::sync::Arc::new(crate::descr::PyreSwitchDescr::new(dict)) as DescrRef]
 }
 
+#[test]
+fn trace_too_long_snapshot_waits_for_frame_transition_outcomes() {
+    assert!(trace_too_long_abort_safe(
+        &DispatchOutcome::Continue,
+        false,
+        0,
+    ));
+    assert!(!trace_too_long_abort_safe(
+        &DispatchOutcome::SubReturn { result: None },
+        false,
+        0,
+    ));
+    assert!(!trace_too_long_abort_safe(
+        &DispatchOutcome::SubRaise {
+            exc: OpRef::input_arg_ref(0),
+            exc_concrete: ConcreteValue::Ref(0xCAFEusize as _),
+        },
+        false,
+        0,
+    ));
+    assert!(!trace_too_long_abort_safe(
+        &DispatchOutcome::Continue,
+        false,
+        1,
+    ));
+    assert!(trace_too_long_abort_safe(
+        &DispatchOutcome::Continue,
+        true,
+        1,
+    ));
+}
+
 /// Concrete-shadow round-trip: a `WalkContext` built with
 /// `concrete_registers_r` exposes each slot's `ConcreteValue` via
 /// `read_ref_reg_concrete` indexed by the same byte the symbolic
@@ -159,13 +191,22 @@ fn switch_descr_pool(entries: &[(i64, usize)]) -> Vec<DescrRef> {
 fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     let exc_obj_ptr: pyre_object::PyObjectRef = 0xDEAD_BEEFusize as _;
     let descr_pool: Vec<DescrRef> = Vec::new();
-    let mut tc = fresh_trace_ctx();
-    let oprefs = distinct_const_refs(&mut tc, 3);
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref, Type::Ref]);
+    let mut oprefs = distinct_const_refs(&mut tc, 3);
+    // A non-constant input box has no intrinsic `TraceCtx` concrete payload;
+    // only the parallel MIFrame-style register shadow knows its value.
+    oprefs[1] = OpRef::input_arg_ref(1);
+    // Model a collection that forwarded the recorder Box while the raw
+    // concrete-register shadow retained its old address.
+    oprefs[2] = OpRef::input_arg_ref(2);
+    let forwarded_obj_ptr = 0xF0A0_0000usize;
+    let stale_obj_ptr = 0xDEAD_0000usize;
+    tc.set_opref_concrete(oprefs[2], Value::Ref(majit_ir::GcRef(forwarded_obj_ptr)));
     let mut regs_r = oprefs.clone();
     let mut concrete = vec![
         ConcreteValue::Null,
         ConcreteValue::Ref(exc_obj_ptr),
-        ConcreteValue::Int(42),
+        ConcreteValue::Ref(stale_obj_ptr as pyre_object::PyObjectRef),
     ];
     // Snapshot expected values before `&mut concrete` enters wc —
     // the assertion below cannot read `concrete[reg_idx]` while wc
@@ -227,6 +268,71 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
             reg_idx,
         );
     }
+    let code = [0u8, 1u8];
+    let op = DecodedOp {
+        key: "fixture/r",
+        opname: "fixture",
+        argcodes: "r",
+        pc: 0,
+        next_pc: 2,
+    };
+    assert_eq!(wc.trace_ctx.concrete_of_opref(wc.registers_r[1]), None);
+    assert_eq!(
+        super::vable_ops::vable_value_concrete(&code, &op, 0, &wc, 'r', wc.registers_r[1]),
+        Some(Value::Ref(majit_ir::GcRef(exc_obj_ptr as usize))),
+        "vable writes must preserve the concrete half of a non-constant register Box",
+    );
+    assert_eq!(
+        super::vable_ops::vable_effective_value_concrete(
+            &code,
+            &op,
+            0,
+            &wc,
+            'r',
+            wc.registers_r[1],
+            wc.registers_r[0],
+        ),
+        Some(Value::Ref(majit_ir::GcRef(0xC0DE_0000))),
+        "a TOS override must resolve its own box instead of the stale encoded register shadow",
+    );
+    let forwarded_code = [0u8, 2u8];
+    assert_eq!(
+        super::vable_ops::vable_value_concrete(
+            &forwarded_code,
+            &op,
+            0,
+            &wc,
+            'r',
+            wc.registers_r[2],
+        ),
+        Some(Value::Ref(majit_ir::GcRef(forwarded_obj_ptr))),
+        "a forwarded recorder Box must win over the stale raw Ref shadow",
+    );
+
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("trace_too_long_arbitrary_pc");
+    runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+        code: vec![0, 0],
+        c_num_regs_r: 3,
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let miframe = super::residual_call::build_trace_too_long_single_frame_miframe(
+        &wc,
+        std::sync::Arc::new(runtime_jc),
+        1,
+    )
+    .expect("an arbitrary post-step pc must not require a -live- marker");
+    assert_eq!(miframe.pc, 1);
+    assert_eq!(
+        miframe.ref_values[1],
+        Some(exc_obj_ptr as i64),
+        "the complete-bank image must retain non-constant register concrete values",
+    );
+    assert_eq!(
+        miframe.ref_values[2],
+        Some(forwarded_obj_ptr as i64),
+        "the complete-bank image must prefer the GC-forwarded Box payload",
+    );
 }
 
 /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the

@@ -1462,6 +1462,18 @@ impl PartialEq for DispatchOutcome {
     }
 }
 
+fn trace_too_long_blackhole_snapshot_safe(outcome: &DispatchOutcome) -> bool {
+    matches!(outcome, DispatchOutcome::Continue)
+}
+
+fn trace_too_long_abort_safe(
+    outcome: &DispatchOutcome,
+    blackhole_latched: bool,
+    executed_effects: usize,
+) -> bool {
+    trace_too_long_blackhole_snapshot_safe(outcome) && (blackhole_latched || executed_effects == 0)
+}
+
 /// Errors surfaced by the trace-side walker.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DispatchError {
@@ -2191,24 +2203,32 @@ pub fn walk<Sym: WalkSym>(
         // `disable_noninlinable_function` half (pyjitpl.py:2817) still only
         // runs on the per-opcode path.
         //
-        // DEVIATION from `SwitchToBlackhole(ABORT_TOO_LONG)`, which resumes in
-        // the blackhole from the traced state: a `DispatchError` resumes by
-        // re-interpreting the iteration from the trace entry, so an effect the
-        // walk already executed and cannot roll back would be applied twice.
-        // Every other walker abort upholds that invariant by declining BEFORE
-        // it executes such an effect (see `InplaceContainerMutationUnsupported`
-        // and the `FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS` effect-free check); a
-        // length check fires at an arbitrary opcode instead, so it must consult
-        // the odometer itself. `fbw_executed_effect_count` is reset per walk, so
-        // zero means nothing the replay would redo has run yet. A walk that is
-        // already past that point keeps recording — the pre-existing unbounded
-        // behaviour — rather than corrupt the heap. That overshoot is otherwise
-        // silent, so it is tallied: it is what turns a walk which never reaches
-        // a close into unbounded recording.
+        // `blackhole_if_trace_too_long` raises AFTER `run_one_step`, so the
+        // forward image must carry `pc`, the already-advanced `next_pc`, rather
+        // than `opcode_position`.  `latch_trace_too_long_blackhole` copies the
+        // live MIFrame registers while this WalkContext still owns them; the
+        // run-per-fn epilogue drives that image forward exactly like RPython's
+        // `run_blackhole_interp_to_cancel_tracing`.
+        //
+        // A complete image makes the abort safe regardless of effects.  If the
+        // image cannot be built, a zero-effect walk may still take the legacy
+        // replay; an effectful walk must retain the former keep-recording
+        // fallback because replay would apply an irreversible effect twice.
+        // The remaining overshoot is tallied so an unsupported multi-frame
+        // shape cannot silently become unbounded.
         if ctx.trace_ctx.is_too_long() {
-            if fbw_executed_effect_count() != 0 {
-                majit_metainterp::mc_diag_bump(26);
-            } else {
+            // `step` has advanced the register banks for `Continue`. The
+            // other outcomes still need the match below to perform their
+            // frame transition: in particular, `SubRaise` may enter this
+            // frame's handler and `SubReturn` is delivered to its caller by
+            // the inline-call boundary. RPython checks the length only after
+            // those transitions have happened, so never abort from the
+            // pre-transition callee image here — even a zero-effect entry
+            // replay would resume the caller without delivering the return or
+            // raise that this step produced.
+            let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
+            let blackhole_latched = snapshot_safe && latch_trace_too_long_blackhole(ctx, pc);
+            if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
                     ctx.trace_ctx.current_merge_points_first_greenkey(),
@@ -2218,6 +2238,8 @@ pub fn walk<Sym: WalkSym>(
                     pc: opcode_position,
                     ops,
                 });
+            } else {
+                majit_metainterp::mc_diag_bump(26);
             }
         }
         match outcome {
@@ -5388,9 +5410,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
         }
     }
-    // C3 S1: the force-time MIFrame survives the dispatch unwind in TLS.
-    // Its Option<i64> Ref bank is not visible to the collector, so forward
-    // every populated color until the walk-end handler takes the latch.
+    // The vable-force and trace-too-long MIFrame images survive the dispatch
+    // unwind in TLS. Their Option<i64> Ref banks are not otherwise visible to
+    // the collector, so forward every populated color until the walk-end
+    // handler takes the latch. The adopters bridge the pre-drive publication
+    // window and the blackhole drivers then install their own packed roots.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
         for value in latched.miframe.ref_values.iter_mut().flatten() {

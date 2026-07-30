@@ -10,6 +10,70 @@
 
 use super::*;
 
+/// Resolve the concrete half of a JitCode register operand.
+///
+/// RPython's MIFrame banks hold Box objects, so assigning a valuebox to
+/// `virtualizable_boxes` preserves its concrete value. Pyre splits that Box
+/// between an OpRef bank and a parallel concrete bank. Ref values prefer the
+/// recorder Box payload because the active-trace root walker forwards it in
+/// place across a collection; the raw concrete shadow is not a GC root and can
+/// retain the pre-forwarding address. Residual results do not necessarily have
+/// such a payload, so they fall back to the authoritative walker's shadow.
+/// Int/Float values are not GC addresses and keep the shadow-first order.
+pub(super) fn vable_value_concrete<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+    bank: char,
+    value: OpRef,
+) -> Option<Value> {
+    let concrete = match bank {
+        'i' => read_int_reg_concrete(code, op, operand_offset, ctx),
+        'r' => read_ref_reg_concrete(code, op, operand_offset, ctx),
+        'f' => read_float_reg_concrete(code, op, operand_offset, ctx),
+        _ => unreachable!("value bank must be 'i', 'r' or 'f'"),
+    };
+    let from_register = match (bank, concrete) {
+        ('i', ConcreteValue::Int(value)) => Some(Value::Int(value)),
+        ('i', ConcreteValue::Bool(value)) => Some(Value::Int(i64::from(value))),
+        ('r', ConcreteValue::Ref(value)) => Some(Value::Ref(majit_ir::GcRef(value as usize))),
+        ('f', ConcreteValue::Float(value)) => Some(Value::Float(value)),
+        _ => None,
+    };
+    if bank == 'r' {
+        ctx.trace_ctx
+            .lookup_opref_concrete(value)
+            .or_else(|| ctx.trace_ctx.recover_ref_value(value, 8))
+            .or(from_register)
+    } else {
+        from_register.or_else(|| ctx.trace_ctx.concrete_of_opref(value))
+    }
+}
+
+/// Resolve the concrete value after an operand-stack recovery may have
+/// replaced the bytecode register's box.
+///
+/// The register shadow is authoritative only while `effective_value` is the
+/// box encoded by the instruction. Once TOS recovery substitutes another box,
+/// re-reading that original color can return a stale concrete value from a
+/// prior loop iteration.
+pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+    bank: char,
+    encoded_value: OpRef,
+    effective_value: OpRef,
+) -> Option<Value> {
+    if effective_value == encoded_value {
+        vable_value_concrete(code, op, operand_offset, ctx, bank, effective_value)
+    } else {
+        ctx.trace_ctx.concrete_of_opref(effective_value)
+    }
+}
+
 /// `getfield_vable_<i|r|f>/rd>X` handler. Operand layout `rd>X`:
 /// 1B r-reg(vable_box) + 2B descr(field) + 1B X-dst.
 ///
@@ -170,8 +234,8 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 /// (`majit-metainterp/src/trace_ctx.rs`) which implements the
 /// full `_nonstandard_virtualizable` -> SETFIELD_GC fallback +
 /// `virtualizable_boxes[index] = valuebox` write + `synchronize_virtualizable`
-/// mirror.  The concrete `Value` is reconstructed via
-/// `TraceCtx::concrete_of_opref` (matching the
+/// mirror.  The concrete `Value` is read from the same register's parallel
+/// concrete bank (matching the
 /// `pyjitpl/dispatch.rs` shape `let (value, concrete) =
 /// self.read_<bank>_reg(src); ctx.vable_setfield(...)`).
 ///
@@ -205,7 +269,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
     let descr = read_descr(code, op, 2, ctx)?;
-    let concrete = ctx.trace_ctx.concrete_of_opref(value);
+    let concrete = vable_value_concrete(code, op, 1, ctx, value_bank, value);
     // R7 parity: pyjitpl.py `_opimpl_setfield_vable(box,
     // valuebox, fielddescr, pc)` threads orgpc through
     // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
@@ -512,9 +576,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                 'f' => read_float_reg(code, op, 2, ctx)?,
                 _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
             };
-            let concrete = ctx
-                .trace_ctx
-                .concrete_of_opref(value)
+            let concrete = vable_value_concrete(code, op, 2, ctx, value_bank, value)
                 .unwrap_or(majit_ir::Value::Void);
             if let Some(shadow) = ctx.callee_shadow.as_mut() {
                 shadow.set_opref(slot, value);
@@ -539,12 +601,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
         }
     };
-    let mut value = match value_bank {
+    let encoded_value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
         'r' => read_ref_reg(code, op, 2, ctx)?,
         'f' => read_float_reg(code, op, 2, ctx)?,
         _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
+    let mut value = encoded_value;
     // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
     // it into a local slot.  When the popped value lives in an operand-stack
     // temp that spans a nested loop, the loop-header merge-point seeds no
@@ -573,10 +636,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
     }
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
-    let concrete = ctx
-        .trace_ctx
-        .concrete_of_opref(value)
-        .unwrap_or(Value::Void);
+    let concrete =
+        vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
+            .unwrap_or(Value::Void);
     let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx.vable_setarrayitem_indexed(
         op.pc,

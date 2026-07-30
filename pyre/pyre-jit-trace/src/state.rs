@@ -2497,6 +2497,8 @@ pub trait WalkSym {
     fn valuestackdepth(&self) -> usize;
     fn jitcode(&self) -> *const JitCode;
     fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext;
+    /// Interpreter-frame snapshot the authoritative walker steps concretely.
+    fn tracing_vable_frame_addr(&self) -> usize;
     fn live_vable_frame_addr(&self) -> usize;
     fn set_live_vable_frame_addr(&mut self, value: usize);
     fn bridge_walk_entry_pc(&self) -> Option<usize>;
@@ -2605,6 +2607,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
         self.concrete_execution_context
+    }
+
+    #[inline]
+    fn tracing_vable_frame_addr(&self) -> usize {
+        self.concrete_vable_ptr as usize
     }
 
     #[inline]
@@ -4859,6 +4866,129 @@ pub(crate) fn restore_frame_locals(frame: usize, saved: &[i64]) {
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
 }
 
+/// The active operand-stack half of a tracer snapshot that must be published
+/// to its live virtualizable before an overlong trace is continued in the
+/// blackhole.
+///
+/// RPython has no separate copy step here: `convert_and_run_from_pyjitpl`
+/// copies the already-advanced MIFrame, whose red virtualizable is the one
+/// frame object carrying that call's locals and stack.  Pyre concretely steps
+/// a detached `snapshot_for_tracing`, so the corresponding state has to cross
+/// back to that same live frame explicitly.  The raw Ref words are exposed as
+/// a mutable slice because publishing locals can allocate; callers root the
+/// slice so nursery forwarding is reflected before the stack is stored.
+pub(crate) struct CapturedFrameStack {
+    stack_base: usize,
+    scalars: FrameScalars,
+    roots: Vec<i64>,
+}
+
+impl CapturedFrameStack {
+    pub(crate) fn roots_mut(&mut self) -> &mut [i64] {
+        self.roots.as_mut_slice()
+    }
+}
+
+fn frame_stack_transfer_shape(
+    snapshot: usize,
+    live_frame: usize,
+) -> Option<(
+    usize,
+    usize,
+    *const pyre_object::FixedObjectArray,
+    *mut pyre_object::FixedObjectArray,
+)> {
+    if snapshot == 0 || live_frame == 0 {
+        return None;
+    }
+    let snapshot_base = concrete_nlocals(snapshot)?;
+    let live_base = concrete_nlocals(live_frame)?;
+    if snapshot_base != live_base {
+        return None;
+    }
+    let snapshot_depth = concrete_stack_depth(snapshot)?;
+    if snapshot_depth < snapshot_base {
+        return None;
+    }
+    let snapshot_arr = unsafe {
+        *((snapshot as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
+    };
+    let live_arr = unsafe {
+        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if snapshot_arr.is_null()
+        || live_arr.is_null()
+        || unsafe { &*snapshot_arr }.as_slice().len() < snapshot_depth
+        || unsafe { &*live_arr }.as_slice().len() < snapshot_depth
+    {
+        return None;
+    }
+    Some((snapshot_base, snapshot_depth, snapshot_arr, live_arr))
+}
+
+/// Allocation-free preflight for [`capture_frame_stack_for_publish`].
+pub(crate) fn can_publish_frame_stack(snapshot: usize, live_frame: usize) -> bool {
+    frame_stack_transfer_shape(snapshot, live_frame).is_some()
+}
+
+/// Copy the tracer snapshot's active operand stack into a rootable carrier.
+/// The destination is checked at capture time and checked again at commit, so
+/// no partial stack is ever published if frame identity or layout changes.
+pub(crate) fn capture_frame_stack_for_publish(
+    snapshot: usize,
+    live_frame: usize,
+) -> Option<CapturedFrameStack> {
+    let (stack_base, stack_depth, snapshot_arr, _) =
+        frame_stack_transfer_shape(snapshot, live_frame)?;
+    let slots = unsafe { &*snapshot_arr }.as_slice();
+    Some(CapturedFrameStack {
+        stack_base,
+        scalars: capture_frame_scalars(snapshot)?,
+        roots: slots[stack_base..stack_depth]
+            .iter()
+            .map(|&value| value as i64)
+            .collect(),
+    })
+}
+
+/// Commit a captured post-step operand stack and its Python-frame coordinate
+/// to the live red frame.  This performs no allocation: once the caller has
+/// published locals and reached this point, the blackhole handoff is
+/// irrevocable.
+pub(crate) fn publish_captured_frame_stack(
+    live_frame: usize,
+    captured: &CapturedFrameStack,
+) -> bool {
+    let Some(live_base) = concrete_nlocals(live_frame) else {
+        return false;
+    };
+    if live_base != captured.stack_base
+        || captured.scalars.valuestackdepth != live_base + captured.roots.len()
+    {
+        return false;
+    }
+    let live_arr = unsafe {
+        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if live_arr.is_null()
+        || unsafe { &*live_arr }.as_slice().len() < captured.scalars.valuestackdepth
+    {
+        return false;
+    }
+    unsafe {
+        let slots = (*live_arr).as_mut_slice();
+        for (offset, &value) in captured.roots.iter().enumerate() {
+            slots[live_base + offset] = value as usize as PyObjectRef;
+        }
+    }
+    restore_frame_scalars(live_frame, captured.scalars);
+    frame_array_write_barrier(live_frame as *mut u8, live_arr);
+    true
+}
+
 /// The scalar half of the frame image [`capture_frame_locals`] covers.
 #[derive(Clone, Copy)]
 pub(crate) struct FrameScalars {
@@ -4899,15 +5029,18 @@ pub(crate) fn restore_frame_scalars(frame: usize, saved: FrameScalars) {
 /// Materialize the outer frame's locals from the virtualizable shadow.
 /// Callers must run their complete preflight before executing a rebuilt
 /// callee; after that point a failure would make replay unsafe.
-pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
+fn outer_locals_publish_target(
+    ctx: &TraceCtx,
+    frame: usize,
+) -> Option<(usize, *mut pyre_object::FixedObjectArray, usize)> {
     if frame == 0 {
-        return false;
+        return None;
     }
     let Some(nlocals) = concrete_nlocals(frame) else {
-        return false;
+        return None;
     };
     let Some(info) = ctx.virtualizable_info() else {
-        return false;
+        return None;
     };
     let frame_ptr = frame as *mut u8;
     let arr_ptr = unsafe {
@@ -4915,7 +5048,7 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
             as *const *mut pyre_object::FixedObjectArray)
     };
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
-        return false;
+        return None;
     }
     let base = info.num_static_extra_boxes;
     // Every slot has to resolve before the first store, the way the merge-point
@@ -4923,15 +5056,31 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
     // the frame carrying a mix of walk-current and pre-walk locals, which is
     // neither of the two states a caller can recover from.
     if (0..nlocals).any(|abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
-        return false;
+        return None;
     }
+    Some((nlocals, arr_ptr, base))
+}
+
+/// Read-only half of [`write_back_outer_locals`].
+///
+/// `ABORT_TOO_LONG` has already executed the current opcode when it decides to
+/// stop tracing. It uses this census before publishing a blackhole image so a
+/// later adoption cannot decline into trace-entry replay after those effects.
+pub(crate) fn can_write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
+    outer_locals_publish_target(ctx, frame).is_some()
+}
+
+pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
+    let Some((nlocals, arr_ptr, base)) = outer_locals_publish_target(ctx, frame) else {
+        return false;
+    };
     // Boxing an Int/Float slot allocates; the detached frame array is
     // forwarded only while it is in the remembered set, and each minor
     // consumes that entry, so re-arm the barrier after every store.
     for abs in 0..nlocals {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            return false;
-        };
+        let (_opref, value) = ctx
+            .virtualizable_entry_at(base + abs)
+            .expect("outer-locals target was completely preflighted");
         let boxed = boxed_slot_value_for_type(Type::Ref, &value);
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
