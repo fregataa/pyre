@@ -192,6 +192,22 @@ pub fn enabled() -> bool {
     }
 }
 
+/// Whether a collection reaching this safepoint right now would be performed.
+///
+/// The allocator asks it too, before arming a deferred major request, so the
+/// two cannot drift: a request armed past a safepoint that will refuse is
+/// re-armed by every following born-old allocation, because the threshold
+/// stays reached until a major completes
+/// (`majit_gc::collector::set_deferred_major_request_probe`).
+///
+/// Plain rather than `@dont_look_inside`: both callers are already outside
+/// traced code — [`safepoint`] is itself a residual, and the allocator reaches
+/// this through an installed `fn` pointer — and each of the three questions it
+/// asks carries the attribute in its own right.
+pub fn would_collect() -> bool {
+    enabled() && collect_enabled() && at_outermost_activation()
+}
+
 /// Dispatch-loop safepoint: when the collector says it has reached the
 /// threshold it set for its next major, run a non-moving old-gen-only major.
 /// A no-op when the flag is off or no collection hook is installed.
@@ -211,6 +227,17 @@ pub fn enabled() -> bool {
 /// kept beside the collector could only ever see the subset of allocations
 /// that remembered to report, and would answer for a heap that is not the one
 /// being collected.
+///
+/// Born-old allocations ask it in the allocator too, as `external_malloc`
+/// (incminimark.py:987-994) does, and hand the answer here through the
+/// eval-breaker word (`majit_gc::collector::take_deferred_major_request`).
+/// That path is what reaches compiled code: a trace runs its loop without
+/// returning to this dispatch loop, so a poll placed here alone is never
+/// executed while one is hot, and old-gen allocations made from inside it
+/// would go unanswered until the loop exited. The armed bit fails the trace's
+/// back-edge poll instead, which deopts to this loop and lands on the taker
+/// above. The allocator arms it only when [`would_collect`] holds, so the
+/// request cannot outlive the conditions that let this safepoint answer it.
 ///
 /// The collection is `try_gc_collect_oldgen` — it seeds roots, marks, and
 /// sweeps ONLY the old generation, never touching the nursery (not moved, not
@@ -241,11 +268,19 @@ pub fn safepoint() {
     if !enabled() {
         return;
     }
-    if collect_enabled()
-        && at_outermost_activation()
-        && poll_due()
-        && crate::gc_hook::try_gc_major_threshold_reached()
-    {
+    // Take any request the old-gen allocator armed, and take it before the
+    // decision below: the bit is a compiled loop's deopt trigger, so one left
+    // armed by a safepoint that declined to collect fires again on the next
+    // back edge, and the next.
+    let requested = majit_gc::collector::take_deferred_major_request();
+    if !would_collect() {
+        return;
+    }
+    // The request already carries the collector's answer — it was armed by
+    // `threshold_reached` in the allocator — so it does not wait for the poll
+    // interval. The poll remains for the allocations that reach the collector
+    // without passing the born-old path.
+    if requested || (poll_due() && crate::gc_hook::try_gc_major_threshold_reached()) {
         crate::gc_hook::try_gc_collect_oldgen();
     }
 }
