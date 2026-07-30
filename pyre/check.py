@@ -289,10 +289,18 @@ def pyre_env():
     falling back to the interpreter, so a JIT bug surfaces as a crash here
     rather than as correct-but-uncompiled output. MAJIT_STATS=1 prints the
     `[jit-stats]` line that `_jit_panic_reason` inspects.
+
+    PYRE_DESCR_SPELLING_GATE=1 makes the descr-universe counters in that line
+    name their members. The counters are gated at zero
+    (JITSTATS_BADNESS_FIELDS), and a bare `descr_set_ambiguous 0 -> 1` says
+    nothing about which container disagreed — on a platform the developer
+    cannot reproduce, the name is the whole diagnosis. Naming costs one stderr
+    line per member and only ever prints when a member fails to resolve.
     """
     env = dict(os.environ)
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
+    env["PYRE_DESCR_SPELLING_GATE"] = "1"
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.
@@ -397,33 +405,60 @@ def _jit_panic_reason(stderr):
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _jit_stats_snapshot(stderr):
-    """Return the last structural jit-stats line as normalized key/value text.
+    """Return every jit-stats line merged into normalized key/value text.
 
-    The diagnostic lines (mc_diag, heap_buckets, bridge_diag, fbw_diag,
-    exec_hist) share the `[jit-stats]` prefix but name themselves in a bare
-    first token; only the structural summary starts straight into key=value.
-    Reading one of those instead leaves loops_aborted and
-    internal_compile_panics missing, which the regression floor below reads as
-    0 — the gate would then never fire again, silently."""
-    stats_line = None
+    The interpreter emits more than one `[jit-stats]` line — the counters, the
+    mc_diag tallies, the descr-set universe. Keeping only the last one dropped
+    `loops_aborted` and `internal_compile_panics` from the snapshot, which
+    silently disarmed `_jit_stats_regression_floor`: it read both counters as
+    absent on the current side, so `cur > base` could never hold no matter how
+    far they rose. Later lines still win on a repeated key.
+
+    Merging is what keeps that true as lines are added. Selecting one line
+    instead — the last whose first token is not a bare diagnostic name like
+    `mc_diag` / `heap_buckets` / `bridge_diag` / `fbw_diag` / `exec_hist` —
+    re-disarms the floor the moment a second key=value line joins the first,
+    because the newcomer displaces the counters. The bare-name lines need no
+    special case here: their name token carries no `=` and is skipped with
+    every other non-assignment token.
+
+    The merged set is then narrowed to `JITSTATS_SNAPSHOT_FIELDS`, because what
+    a run may read and what a committed baseline may contain are two different
+    questions: merging arms the floor, the filter keeps the recorded surface
+    host-stable.
+    """
+    fields = {}
+    seen = False
     for line in stderr.splitlines():
         if not line.startswith("[jit-stats]"):
             continue
-        head = line[len("[jit-stats]") :].split()
-        if head and "=" not in head[0]:
-            continue
-        stats_line = line
-    if stats_line is None:
+        seen = True
+        for token in line[len("[jit-stats]") :].split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+    if not seen:
         return None
-
-    fields = {}
-    for token in stats_line[len("[jit-stats]") :].split():
-        if "=" in token:
-            key, value = token.split("=", 1)
-            fields[key] = value
+    fields = {k: v for k, v in fields.items() if k in JITSTATS_SNAPSHOT_FIELDS}
     # This watches what the JIT compiles, never how well. A regression that
     # changes no structure (for example, an extra spill) is invisible here.
     return "".join(f"{key}={fields[key]}\n" for key in sorted(fields))
+
+
+def _jit_stats_fields_equal(saved, current):
+    """Whether two snapshots agree on every `JITSTATS_SNAPSHOT_FIELDS` key,
+    reading a field missing from either side as "0"."""
+    def parse(snapshot):
+        if snapshot is None:
+            return {}
+        return dict(line.split("=", 1) for line in snapshot.splitlines())
+
+    old_fields = parse(saved)
+    new_fields = parse(current)
+    return all(
+        old_fields.get(field, "0") == new_fields.get(field, "0")
+        for field in JITSTATS_SNAPSHOT_FIELDS
+    )
 
 
 def _jit_stats_diff(saved, current, limit=6):
@@ -461,7 +496,50 @@ def _jit_stats_diff(saved, current, limit=6):
 # (guard_failures, loops_compiled, bridges_compiled) are deliberately excluded:
 # they move in both directions under ordinary tuning and their absolute value is
 # not yet confirmed stable across runners, so they stay informational.
-JITSTATS_BADNESS_FIELDS = ("loops_aborted", "internal_compile_panics")
+#
+# `descr_set_absent`, `descr_set_ambiguous` and `descr_set_stale_absent` are the
+# descr-universe invariants. Upstream cannot reach any of the three —
+# `effectinfo.py:492-494` builds its sets out of the descr objects `cpu.*descrof`
+# just created in the same process, so no member of a raw set can fail to
+# resolve — and it expresses this class of condition with a plain `assert`
+# (`descr.py:47`, `effectinfo.py:486,525`). Pyre resolves the sets across a
+# build-time/runtime split where all three are reachable in principle and the
+# runtime answer is a sound degradation rather than a crash, so the assertion is
+# expressed as a counter that must not rise off zero. A field absent from a
+# baseline reads as 0, so these gate from the first run without re-recording
+# anything.
+JITSTATS_BADNESS_FIELDS = (
+    "loops_aborted",
+    "internal_compile_panics",
+    "descr_set_absent",
+    "descr_set_ambiguous",
+    "descr_set_stale_absent",
+)
+
+# What a committed `.jitstats` baseline is allowed to contain. `_jit_stats_snapshot`
+# merges every `[jit-stats]` line so the floor above cannot be disarmed by
+# reshuffling them, but the merged set also carries keys that are not comparable
+# against a file checked into the repo:
+#
+# * `all_descrs` and `descr_set_resolved` are HOST-DEPENDENT — the Charon/LLBC
+#   extraction runs per host, so the same commit reads `all_descrs` 1168 on
+#   macOS, 1396 on ubuntu and 1365 on windows. Committing either makes every
+#   host but one disagree.
+# * the `mc_diag` tallies include contention counters (`busy_skip`,
+#   `stfe_cell_busy`, `stfe_tick`) that move with machine load.
+# * `PYRE_WASM_JIT_STATS=1` adds wall-clock (`compile_ms`) and repeated
+#   `exec_hist` lines whose keys collide across lines; check.py never sets it,
+#   but a developer who has it exported would otherwise poison a `--snapshot`
+#   re-record.
+#
+# The badness fields are all zero in a healthy run and the three structural
+# counts are host-stable, so this surface needs no re-record when a new
+# diagnostic line is added.
+JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
+    "loops_compiled",
+    "bridges_compiled",
+    "guard_failures",
+)
 
 
 def _jit_stats_regression_floor(saved, current):
@@ -841,7 +919,12 @@ class Check:
                 self.jitstats_missing.append(f"{backend}/{name}")
             else:
                 saved_jitstats = jitstats_path.read_text(encoding="utf-8")
-                if jitstats != saved_jitstats:
+                # Compare key-wise with a missing field read as "0", the same
+                # semantics `_jit_stats_regression_floor` documents. A baseline
+                # recorded before a counter existed is then still equal to a
+                # run that reports it as 0, so adding an invariant counter
+                # costs no re-record — only a real change diffs.
+                if not _jit_stats_fields_equal(saved_jitstats, jitstats):
                     self.jitstats_diffs.append(f"{backend}/{name}")
                     delta = _jit_stats_diff(saved_jitstats, jitstats)
                     return "fail", f"jit-stats diff: {delta}"
