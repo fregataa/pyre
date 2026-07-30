@@ -611,14 +611,68 @@ fn report_descr_spelling_gate() {
 /// as it stands now, so it must be read at process exit, after the run has
 /// published everything it is going to.
 pub fn descr_set_jit_stats() -> String {
-    let ledger = crate::descr::set_member_ledger();
+    let DescrSetCounts {
+        resolved,
+        absent,
+        ambiguous,
+        stale_absent,
+    } = descr_set_counts();
     format!(
-        "descr_set_resolved={} descr_set_absent={} descr_set_ambiguous={} descr_set_stale_absent={}",
-        ledger.resolved,
-        ledger.absent.len(),
-        ledger.ambiguous.len(),
-        crate::descr::stale_absent_containers().len(),
+        "descr_set_resolved={resolved} descr_set_absent={absent} \
+         descr_set_ambiguous={ambiguous} descr_set_stale_absent={stale_absent}"
     )
+}
+
+/// The same four numbers [`descr_set_jit_stats`] formats, as numbers.
+///
+/// Backends that cannot print a line reach the counters through here rather than
+/// re-deriving them, so the gated values cannot drift from the printed ones. The
+/// wasm guest has no stderr and exports these individually
+/// (`pyre_jit_descr_set_*` in `pyre-wasm`), which the runner prints on its
+/// behalf.
+/// The field-position census, as `[jit-stats]` key/value tokens.
+///
+/// This sits next to `descr_set_*` because it answers the question those
+/// counters only appear to answer. `descr_set_absent` asks whether a raw-set
+/// member resolved to SOME descr; it reads 0 while a field is bound under a
+/// parent that numbers its `all_fielddescrs` by a different convention, because
+/// resolving and resolving CORRECTLY are different questions. Upstream cannot
+/// tell them apart either — but it does not have to, since `heaptracker.py:60-72
+/// get_fielddescr_index_in` and `:96-112 all_fielddescrs` are one walker sharing
+/// one skip set, so `all_fielddescrs(S)[i].get_index() == i` holds by
+/// construction and there is nothing to count.
+///
+/// `rederived` is the one to watch: it counts fields whose caller-supplied index
+/// disagreed with the parent that will actually be indexed at
+/// `optimizeopt/info.rs force_box`. Every one of those was, before this was
+/// derived rather than transported, either an out-of-range panic or a store
+/// emitted against a DIFFERENT field.
+pub fn field_position_jit_stats() -> String {
+    let [parent_absent, parent_empty, rederived, unresolved] =
+        majit_ir::descr::GcCache::field_position_census();
+    format!(
+        "field_pos_parent_absent={parent_absent} field_pos_parent_empty={parent_empty} \
+         field_pos_rederived={rederived} field_pos_unresolved={unresolved}"
+    )
+}
+
+pub fn descr_set_counts() -> DescrSetCounts {
+    let ledger = crate::descr::set_member_ledger();
+    DescrSetCounts {
+        resolved: ledger.resolved as u64,
+        absent: ledger.absent.len() as u64,
+        ambiguous: ledger.ambiguous.len() as u64,
+        stale_absent: crate::descr::stale_absent_containers().len() as u64,
+    }
+}
+
+/// The descr-universe invariants as counts. `resolved` is the denominator; the
+/// other three are `JITSTATS_BADNESS_FIELDS` members and healthy only at zero.
+pub struct DescrSetCounts {
+    pub resolved: u64,
+    pub absent: u64,
+    pub ambiguous: u64,
+    pub stale_absent: u64,
 }
 
 /// Name every member whose container has been registered since its raw set was
