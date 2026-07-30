@@ -1792,6 +1792,12 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     // a nested `eval_loop_jit` running under this one observes depth > 1 and
     // skips collection. No-op when the flag is off.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
+    if _eval_activation.armed() {
+        // Publish the process-stable configuration in the breaker word once
+        // per activation, before the first dispatch. Compiled back-edges mask
+        // this bit out.
+        majit_ir::eval_breaker_word::set_gc_interp();
+    }
     let _current_frame_guard = if frame.execution_context.is_null() {
         install_current_frame(frame)
     } else {
@@ -1801,7 +1807,14 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let mut next_instr = frame.next_instr();
 
     loop {
-        crate::module::thread::park_if_finalizing();
+        // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
+        // finalization and STW extensions on the same already-established
+        // breaker word, so the ordinary dispatch pays one relaxed load rather
+        // than polling two process-global atomics independently.
+        let dispatch_breaker = majit_ir::eval_breaker_word::load();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
+            crate::module::thread::park_if_finalizing();
+        }
         // Interpreter-path GC safepoint (PYRE_GC_INTERP), mirroring the JIT
         // eval loop. Between opcodes the only live refs are in the frame,
         // reachable through the installed `current_frame` root walker; no
@@ -1809,13 +1822,17 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // the flag is on and enough interpreter objects have accumulated.
         // Without it, a JIT-off run reclaims interpreter-routed old-gen
         // allocations only at explicit `gc.collect`, so RSS grows unbounded.
-        pyre_object::gc_interp::safepoint();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 {
+            pyre_object::gc_interp::safepoint();
+        }
         // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
         // execute this plain evaluator (their JitDriver state is thread-owned),
         // so they must poll the same process breaker as compiled/JIT-warm
         // loops; otherwise a non-allocating Python loop can prevent collection
         // and fork/finalization STW forever.
-        majit_gc::gc_sync::safepoint_poll();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
+            majit_gc::gc_sync::safepoint_poll();
+        }
 
         if next_instr >= code.instructions.len() {
             return Ok(w_none());
@@ -4239,7 +4256,12 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.12+ CALL: stack is [callable, null_or_self, arg0..argN-1].
     // null_or_self is NULL for plain calls, `self` for method calls.
     fn call(&mut self, nargs: usize) -> Result<(), PyError> {
-        // baseobjspace.py:1240-1261 fast path: Function + no method binding
+        // baseobjspace.py:1243-1266 fast path: Function, including the
+        // CALL_METHOD form.  callmethod.py:85-94 counts a non-null `self` as
+        // one extra argument while `dropvalues` remains the physical
+        // `[callable, null_or_self, explicit args...]` width.  This is what
+        // lets the translated interpreter expose an ordinary `_flat_pycall`
+        // to the meta-tracer for `obj.method(...)`, just like PyPy.
         //
         // baseobjspace.py:1243 — skip fast path when profiling is active
         // and the function wraps a builtin code (c_call/c_return events).
@@ -4250,15 +4272,41 @@ impl OpcodeStepExecutor for PyFrame {
         // items above stack_base (callable + null_or_self + args).
         let stack_items = self.valuestackdepth.saturating_sub(self.stack_base());
         if stack_items >= nargs + 2 && !self.get_is_being_profiled() {
-            let null_or_self = self.peekvalue_maybe_none(nargs);
-            let callable = self.peekvalue_maybe_none(nargs + 1);
-            if null_or_self.is_null()
-                && !callable.is_null()
-                && unsafe { crate::is_function(callable) }
+            let mut null_or_self = self.peekvalue_maybe_none(nargs);
+            let mut callable = self.peekvalue_maybe_none(nargs + 1);
+            // baseobjspace.py:1254-1259: `_Method` is not a generic callable
+            // here.  Reuse its null/self stack slot for `w_instance`, unwrap
+            // `w_function`, and continue through the identical Function
+            // valuestack path.  Module aliases such as `random.gauss =
+            // _inst.gauss` depend on this just as direct `obj.method()` calls
+            // do; allocating an Arguments Vec for every alias call diverges
+            // from PyPy's meta-traced interpreter shape.
+            if !callable.is_null()
+                && null_or_self.is_null()
+                && unsafe { pyre_object::is_method(callable) }
             {
+                let receiver = unsafe { pyre_object::w_method_get_self(callable) };
+                let function = unsafe { pyre_object::w_method_get_func(callable) };
+                if !receiver.is_null()
+                    && !function.is_null()
+                    && unsafe { crate::is_function(function) }
+                {
+                    self.settopvalue(receiver, nargs);
+                    null_or_self = receiver;
+                    callable = function;
+                }
+            }
+            if !callable.is_null() && unsafe { crate::is_function(callable) } {
+                let methodcall = !null_or_self.is_null();
+                let call_nargs = nargs + usize::from(methodcall);
                 let anchor = FrameAnchor::new(self);
-                let result =
-                    crate::function::funccall_valuestack(callable, nargs, self, nargs + 2, false);
+                let result = crate::function::funccall_valuestack(
+                    callable,
+                    call_nargs,
+                    self,
+                    nargs + 2,
+                    methodcall,
+                );
                 if result.is_null() {
                     return Err(crate::call::take_call_error()
                         .unwrap_or_else(|| crate::PyError::type_error("call failed"))

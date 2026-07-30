@@ -5080,8 +5080,14 @@ fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
 
 /// Gate for jd1 (`unpackiterable_driver`): the merge-point hook drives a
 /// `JitCodeMachine` trace of `_unpackiterable_unknown_length` on hot unpack
-/// sites, closing and compiling the drain loop. ON by default, alongside the
-/// main JIT. Opt out with `PYRE_NO_JD1` (or `PYRE_JD1=0`); it also follows the
+/// sites, closing and compiling the drain loop. This remains opt-in with
+/// `PYRE_JD1=1`: unlike RPython, pyre currently drives jd1 through the same
+/// `MetaInterp.tracing` slot as the bytecode portal. A residual `next()` on a
+/// generator can run an arbitrarily large Python computation before yielding;
+/// while that happens the jd1 trace consists only of the opaque `next()` call,
+/// but the shared tracing flag suppresses every jd0 merge point reached by the
+/// generator body. Keep the incomplete second-driver experiment dormant until
+/// it has RPython's independent recursive-portal behavior. It also follows the
 /// master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) so "no JIT" means no
 /// jd1.
 ///
@@ -5105,7 +5111,7 @@ fn jd1_experiment_enabled() -> bool {
         {
             return false;
         }
-        true
+        std::env::var("PYRE_JD1").as_deref() == Ok("1")
     })
 }
 
@@ -5650,6 +5656,7 @@ pub fn init_jit_hooks() {
     );
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnsupportedJitShape {
     None,
@@ -5665,6 +5672,27 @@ enum UnsupportedJitShape {
     /// module body with thousands of literal constants) genuinely exceeds
     /// it. Such a frame cannot be encoded and must run in the interpreter.
     ConstEncodingOverflow,
+}
+
+/// Return the immutable frame-shape classification for an immortal user-code
+/// graph.  RPython decides the analogous graph facts once while populating
+/// `CallControl.jitcodes`; pyre's temporary runtime gate must have the same
+/// computed-once lifetime rather than scanning on every Python call.
+fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+    let key = code as *const _ as usize;
+    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
+    if let Some(&raw) = callcontrol.graph_jit_shapes.get(&key) {
+        return match raw {
+            0 => UnsupportedJitShape::None,
+            1 => UnsupportedJitShape::CurrentFrameOnly,
+            2 => UnsupportedJitShape::NestedBreakBridgeResume,
+            3 => UnsupportedJitShape::ConstEncodingOverflow,
+            _ => unreachable!("invalid cached UnsupportedJitShape discriminant"),
+        };
+    }
+    let shape = unsupported_jit_shape(code);
+    callcontrol.graph_jit_shapes.insert(key, shape as u8);
+    shape
 }
 
 /// True for opcodes that may appear in a `FOR_ITER` loop body without ever
@@ -6043,6 +6071,26 @@ fn nested_break_bridge_resume_hazard(code: &pyre_interpreter::CodeObject) -> boo
         let Some(inner_header) = inner_header else {
             continue;
         };
+        let Some((pyre_interpreter::Instruction::ForIter { delta }, op_arg)) =
+            pyre_interpreter::decode_instruction_at(code, inner_header)
+        else {
+            continue;
+        };
+        let inner_exit = pyre_interpreter::jump_target_forward(
+            &code.instructions,
+            inner_header + 1,
+            delta.get(op_arg).as_usize(),
+        );
+        // A real inner-loop break pops the inner iterator while control is
+        // still inside that FOR_ITER's body. If the POP_TOP lies at or beyond
+        // the inner loop's exhaustion target, the nested loop has already
+        // ended; a later statement-result POP_TOP followed by the enclosing
+        // loop's backedge is not a break. This is the shape in testDist:
+        // an inlined list comprehension ends, then assertTrue() pops its
+        // result and continues the surrounding product loop.
+        if pop_pc >= inner_exit {
+            continue;
+        }
         for guard_pc in (inner_header + 1)..pop_pc {
             match pyre_interpreter::decode_instruction_at(code, guard_pc) {
                 Some((pyre_interpreter::Instruction::PopJumpIfTrue { .. }, _)) => {
@@ -6294,7 +6342,8 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     majit_backend_cranelift::register_recovery_layout(
         crate::call_jit::cranelift_recovery_layout_for_descr,
     );
-    match unsupported_jit_shape(code) {
+    let jit_shape = cached_unsupported_jit_shape(code);
+    match jit_shape {
         UnsupportedJitShape::None => {}
         UnsupportedJitShape::CurrentFrameOnly => {
             // Run frames with unsupported current-frame bytecode shapes in the
@@ -6629,6 +6678,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // handler, etc., where the outer opcode handler holds a PyObjectRef
     // on the Rust stack that walk_pyframe_roots cannot reach).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
+    if _eval_activation.armed() {
+        // Share the interpreter-path GC configuration through the dispatch
+        // breaker load; the compiled back-edge mask deliberately excludes it.
+        majit_ir::eval_breaker_word::set_gc_interp();
+    }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
     // back-edge event).  Loopless frames — the overwhelming majority during
@@ -6643,19 +6697,30 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
-        pyre_interpreter::module::thread::park_if_finalizing();
+        // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
+        // finalization and STW extensions on the same already-established
+        // breaker word, so the ordinary dispatch pays one relaxed load rather
+        // than polling two process-global atomics independently.
+        let dispatch_breaker = majit_ir::eval_breaker_word::load();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
+            pyre_interpreter::module::thread::park_if_finalizing();
+        }
         // Interpreter-path GC safepoint (PYRE_GC_INTERP). Between opcodes the
         // only live refs are in the frame, reachable through the registered
         // pyframe root walker; no bytecode handler holds a Rust-stack temporary
         // here. A no-op unless the flag is on and enough interpreter objects
         // have accumulated to warrant a collection.
-        pyre_object::gc_interp::safepoint();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 {
+            pyre_object::gc_interp::safepoint();
+        }
 
         // Stop-the-world safepoint: a compiled loop's back-edge poll deopts
         // here when a collector has requested STW; park until it completes.
         // Between opcodes no bytecode handler holds a Rust-stack ref (see the
         // note above), so this is a walkable safepoint.
-        majit_gc::gc_sync::safepoint_poll();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
+            majit_gc::gc_sync::safepoint_poll();
+        }
 
         // Seed the frame pointer once after the two top-of-loop safepoints.
         // The frame is GC-managed and can move only at a collection point; this
@@ -7037,10 +7102,13 @@ fn maybe_compile_and_run(
     if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
-        return None;
-    }
+    // `eval_with_jit_inner` classifies the frame once, before entering
+    // `eval_loop_jit`.  Consequently every back-edge reaching this helper is
+    // already known traceable.  Do not repeat `unsupported_jit_shape` here:
+    // that pyre-only safety gate walks the constant tree and the complete
+    // bytecode, while RPython's `can_enter_jit` is unconditional.  Re-running
+    // it at every back-edge made the classification scan itself one of
+    // test_math's hottest native functions.
     if let Some(expected_vsd) =
         pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
     {
@@ -8121,6 +8189,16 @@ fn bound_reached(
 ///
 /// Called at every portal entry (function call). Must be fast for the
 /// common case (no compiled code, not tracing, threshold not reached).
+#[inline]
+fn dump_bytecode_enabled() -> bool {
+    // Debug configuration is process-startup state.  Reading getenv at every
+    // Python function entry showed up in test_math's call-heavy Fraction and
+    // unittest paths; RPython's warmstate entry has no corresponding per-call
+    // environment lookup.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_DUMP_BYTECODE").is_some())
+}
+
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let mut frame_root = FrameRoot::new(frame);
     // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
@@ -8129,10 +8207,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
-        return None;
-    }
-    if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+    // The ordinary caller is `eval_with_jit_inner`, immediately after its
+    // one authoritative `unsupported_jit_shape` check.  The other caller,
+    // `portal_runner_dispatch`, is recursive re-entry for a portal that could
+    // only have obtained compiled code after passing that same check.  Keep
+    // this warmstate entry shaped like RPython's unconditional
+    // `maybe_compile_and_run`; repeating the whole-frame scan here charged
+    // every Python call even before a warm counter could take the fast path.
+    if dump_bytecode_enabled() {
         if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();
@@ -11184,6 +11266,30 @@ mod tests {
     }
 
     #[test]
+    fn nested_break_hazard_ignores_completed_comprehension_before_outer_backedge() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(rows, pred, sink):\n    for p in rows:\n        for q in rows:\n            diffs = [x for x in q]\n            if pred(diffs):\n                sink(diffs)\n            elif pred(q):\n                sink(q)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        assert!(!nested_break_bridge_resume_hazard(&code));
+    }
+
+    #[test]
+    fn nested_break_hazard_keeps_secondary_edge_inner_break() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(n):\n    total = 0\n    for i in range(n):\n        for j in range(2, 4):\n            if not i % 3 != 0:\n                break\n            total += j\n    return total\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        assert!(nested_break_bridge_resume_hazard(&code));
+    }
+
+    #[test]
     fn for_iter_straight_line_store_subscr_body_is_jit_safe() {
         // The direct STORE_SUBSCR is admitted; a later mid-body abort resumes
         // exactly, so the store commits once and the iteration tail is preserved.
@@ -12575,7 +12681,7 @@ r = acc",
             }),
             "expected an instruction with an ExtendedArg prefix"
         );
-        if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+        if dump_bytecode_enabled() {
             let mut state = pyre_interpreter::OpArgState::default();
             for (pc, unit) in code.instructions.iter().copied().enumerate() {
                 let (instr, oparg) = state.get(unit);
@@ -12600,7 +12706,7 @@ r = acc",
         }
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
-        if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+        if dump_bytecode_enabled() {
             let mut keys: Vec<String> =
                 unsafe { pyre_object::w_dict_str_entries(frame.get_w_globals()) }
                     .into_iter()

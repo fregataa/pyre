@@ -335,6 +335,34 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     push_alias_pair(
         &mut entries,
+        "pyre_interpreter::gateway::method_arity_failure",
+        "gateway::method_arity_failure",
+        crate::gateway::method_arity_failure as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::gateway::method_noarg_failure",
+        "gateway::method_noarg_failure",
+        crate::gateway::method_noarg_failure as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::builtin_kwargs_marker_dict",
+        "builtins::builtin_kwargs_marker_dict",
+        crate::builtins::builtin_kwargs_marker_dict as *const (),
+    );
+
+    // RPython annotator PBC parity for `BuiltinCode.func`: every generated
+    // interp2app wrapper is a possible value of the indirect function-pointer
+    // field.  `#[pyre_methods]` contributes these process-global descriptors
+    // through the same link-time census used for pyre class descriptors.
+    #[cfg(not(target_arch = "wasm32"))]
+    for wrapper in crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS {
+        push_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
+    }
+
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::runtime_ops::jit_make_function_from_globals",
         "pyre_interpreter::jit_make_function_from_globals",
         crate::runtime_ops::jit_make_function_from_globals as *const (),
@@ -356,6 +384,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::runtime_ops::jit_sequence_getitem",
         "pyre_interpreter::jit_sequence_getitem",
         crate::runtime_ops::jit_sequence_getitem as *const (),
+    );
+    // `rpython/rlib/rrandom.py Random.genrand32` contains the Mersenne
+    // Twister refill loops.  `JitPolicy.look_inside_graph` deliberately
+    // rejects the loopy graph (it is not `@jit.unroll_safe`), so
+    // `Random.random` keeps two ordinary residual calls to the translated
+    // native helper.  Publish that helper's address just as RPython's source
+    // translation/link step does; otherwise the codewriter can only emit a
+    // `symbolic_fnaddr_for_path` hash and an inline sub-walk must abort before
+    // reaching the native residual.
+    let random_genrand32: fn(&mut crate::module::_random::Random) -> u32 =
+        crate::module::_random::Random::genrand32;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_random::Random::genrand32",
+        "module::_random::Random::genrand32",
+        random_genrand32 as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -3246,6 +3290,20 @@ mod tests {
             list_append
         );
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_random_genrand32_residual() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let genrand32: fn(&mut crate::module::_random::Random) -> u32 =
+            crate::module::_random::Random::genrand32;
+        let expected = genrand32 as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::module::_random::Random::genrand32"],
+            expected
+        );
+        assert_eq!(bindings["module::_random::Random::genrand32"], expected);
     }
 
     #[test]
