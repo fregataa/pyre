@@ -2805,7 +2805,7 @@ pub fn w_exception_slot_descr(
 /// dead-store-eliminates a balanced save/restore (and the stored
 /// exception, if it never otherwise escapes, stays virtual and DCEs).
 pub fn ec_sys_exc_value_descr() -> DescrRef {
-    EC_DESCR_GROUP.field_descrs[0].clone() as DescrRef
+    ec_field_descr(pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET)
 }
 
 /// Field descr for `ExecutionContext::topframeref`, used by the JIT lowering
@@ -2817,7 +2817,16 @@ pub fn ec_sys_exc_value_descr() -> DescrRef {
 /// heap optimizer can forward an `enter` store to the matching `leave` read
 /// and dead-store-eliminate a balanced pair whose frame never escaped.
 pub fn ec_topframeref_descr() -> DescrRef {
-    EC_DESCR_GROUP.field_descrs[1].clone() as DescrRef
+    ec_field_descr(pyre_interpreter::EC_TOPFRAMEREF_OFFSET)
+}
+
+/// Resolve one `EC_DESCR_GROUP` field by byte offset.  The group stamps
+/// `index_in_parent` as the field's rank by offset, so the positional order of
+/// `field_descrs` follows the offsets rather than the declaration order; look
+/// the field up by offset so the two accessors above cannot swap.
+fn ec_field_descr(offset: usize) -> DescrRef {
+    let parent = EC_DESCR_GROUP.size_descr.clone() as DescrRef;
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
 }
 
 /// The `ExecutionContext` field group.  `type_id 0 + vtable 0` →
@@ -2842,22 +2851,32 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         is_quasi_immutable: false,
         flag: ArrayFlag::Unsigned,
         virtualizable: false,
+        // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
     };
-    majit_ir::descr::make_simple_descr_group(
-        u32::MAX,
-        pyre_interpreter::EC_SIZE,
-        0,
-        0,
-        &[
-            field(
-                0,
-                "sys_exc_value",
-                pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
-            ),
-            field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
-        ],
-    )
+    let mut specs = vec![
+        field(
+            0,
+            "sys_exc_value",
+            pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
+        ),
+        field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
+    ];
+    // `index_in_parent` is the field's rank by byte offset
+    // (`jitcode/assembler.rs:625`), and once a parent SizeDescr is bound it is
+    // also the `PtrInfo._fields` slot key the heap optimizer reads
+    // (`optimizeopt/heap.rs` `field_slot_index`), so the two fields must not
+    // share a rank — a shared rank makes a read of one field resolve to the
+    // cached value of the other.  `ExecutionContext` is `repr(Rust)`, so rank by
+    // the actual offsets instead of the declaration order; sorting the specs
+    // first keeps the rank, the spec order and the `all_fielddescrs` positional
+    // order one numbering, as `.enumerate()` gives
+    // `build_object_descr_group_with_def_path`.
+    specs.sort_by_key(|spec| spec.offset);
+    for (index_in_parent, spec) in specs.iter_mut().enumerate() {
+        spec.index_in_parent = index_in_parent;
+    }
+    majit_ir::descr::make_simple_descr_group(u32::MAX, pyre_interpreter::EC_SIZE, 0, 0, &specs)
 });
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
@@ -3195,6 +3214,54 @@ mod tests {
         assert_eq!(size.type_id(), 7);
         assert_eq!(size.all_fielddescrs().len(), 2);
         assert_eq!(size.all_fielddescrs()[1].field_name(), "Cell.value");
+    }
+
+    #[test]
+    fn make_descr_from_bh_items_block_capacity_with_parent_is_canonical() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
+
+        let capacity = BhFieldSpec {
+            index: 0,
+            field_key: "capacity".into(),
+            name: "ItemsBlock.capacity".into(),
+            offset: 0,
+            field_size: std::mem::size_of::<usize>(),
+            field_type: Type::Int,
+            field_flag: ArrayFlag::Unsigned,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+        };
+        let parent = BhSizeSpec {
+            size: std::mem::size_of::<usize>(),
+            type_id: 3938139489201595032,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![capacity.clone()],
+        };
+        let descr = make_descr_from_bh(&BhDescr::Field {
+            offset: capacity.offset,
+            field_size: capacity.field_size,
+            field_type: capacity.field_type,
+            field_flag: capacity.field_flag,
+            is_field_signed: capacity.is_field_signed,
+            is_immutable: capacity.is_immutable,
+            is_quasi_immutable: capacity.is_quasi_immutable,
+            index_in_parent: capacity.index_in_parent,
+            parent: Some(parent),
+            name: "capacity".into(),
+            owner: "ItemsBlock".into(),
+        });
+        let canonical = items_block_capacity_descr();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "the build-time parent must not mint a second capacity FieldDescr",
+        );
+        assert_eq!(descr.index(), canonical.index());
     }
 
     #[test]
@@ -4070,6 +4137,20 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     _ => {}
                 }
             }
+            // #171 object-strategy capacity read: `list.obj_capacity` lowers
+            // to getfield_gc_r(items) + getfield_gc_i(block.capacity). The
+            // block's offset-0 GcArray length header IS the allocated
+            // capacity (immutable for the block's lifetime).
+            //
+            // This must precede the generic parent-group lookup. Charon gives
+            // `ItemsBlock.capacity` a real parent, whose local field index is
+            // zero; rebuilding that group would therefore return a distinct
+            // index-0 descriptor. Walker-native list promotion seeds the
+            // capacity under the canonical descriptor's stable index, and
+            // RPython has only one FieldDescr identity for this field.
+            if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
+                return items_block_capacity_descr();
+            }
             if let Some(parent) = parent {
                 if parent.type_id != 0 {
                     let key = majit_ir::descr::LLType::Struct(parent.type_id);
@@ -4093,13 +4174,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                         }
                     }
                 }
-            }
-            // #171 object-strategy capacity read: `list.obj_capacity` lowers
-            // to getfield_gc_r(items) + getfield_gc_i(block.capacity). The
-            // block's offset-0 GcArray length header IS the allocated
-            // capacity (immutable for the block's lifetime).
-            if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
-                return items_block_capacity_descr();
             }
             // #171 codewriter descr-bridge: a codewriter-lowered body reads a
             // box payload (`W_IntObject.intval` / `W_BoolObject.intval` /

@@ -1692,12 +1692,11 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         // built: its element boxes are still in the heap cache, so the callee
         // seeds from them and the tuple keeps no consumer.
         //
-        // The seeding fills `registers_r[0..nparams]` and nothing else, so a
-        // callee owning a local the arity check cannot see must stay residual:
-        // `co_argcount` counts neither `*args` nor `**kwargs` nor keyword-only
-        // params, so `def f(a, *, b=5)` accepts a 1-tuple here while `b` is
-        // never bound.  Same decline the keyword fold applies.
-        if method_form || !fbw_callee_scope_is_positional_only(w_code) {
+        // The unpacked arguments come from the star tuple alone, so a
+        // method-form call — whose receiver is an implicit leading argument the
+        // unpack never sees — stays residual.  The callee-scope decline this
+        // seeding also needs is applied once in the resolved half.
+        if method_form {
             return Ok(None);
         }
         let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
@@ -1939,17 +1938,18 @@ pub(crate) fn walker_ec_leave(
 /// descriptor. The first instruction's arraylen descriptor is deliberately
 /// not interchangeable with the later getarrayitem descriptor.
 pub(super) fn wrapper_args_item_descr_index(code: &[u8]) -> Option<u32> {
-    let mut wrapper_ops = crate::jitcode_runtime::decoded_ops(code);
-    let wrapper_abi_matches = wrapper_ops.next().is_some_and(|first| {
-        first.key == "arraylen_gc/rd>i" && code.get(first.pc + 1).copied() == Some(0)
-    });
-    if !wrapper_abi_matches {
-        return None;
-    }
+    // Keyword-capable generated wrappers first call
+    // `split_builtin_kwargs(args)` before their arity/unwrap code.  Its
+    // positional-slice result can therefore occupy a register other than the
+    // wrapper input r0, and register colouring can move it again between the
+    // arity check and unwrap.  Generated gateways perform their argument
+    // extraction before entering the typed body, so the first Ref item read
+    // after the first slice-length read is the wrapper-argument descriptor.
+    let arraylen_pc = crate::jitcode_runtime::decoded_ops(code)
+        .find(|decoded| decoded.key == "arraylen_gc/rd>i")
+        .map(|decoded| decoded.pc)?;
     crate::jitcode_runtime::decoded_ops(code)
-        .find(|decoded| {
-            decoded.key == "getarrayitem_gc_r/rid>r" && code.get(decoded.pc + 1).copied() == Some(0)
-        })
+        .find(|decoded| decoded.pc > arraylen_pc && decoded.key == "getarrayitem_gc_r/rid>r")
         .and_then(|decoded| {
             let lo = *code.get(decoded.pc + 3)? as usize;
             let hi = *code.get(decoded.pc + 4)? as usize;
@@ -1984,11 +1984,12 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor
-        || ctx.fbw_mode.inline_subwalk
-        || !matches!(
-            pyre_helper,
-            majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallKw
-        )
+        // A `call_kw` residual carries its kwnames tuple in arg index 2, and
+        // keywords reach a builtin as the trailing `__pyre_kw__` marker dict
+        // that `split_builtin_kwargs` strips — a shape the flat
+        // `&[PyObjectRef]` array built below does not construct, so leave those
+        // calls to `bh_call_kw_<n>`.
+        || pyre_helper != majit_ir::PyreHelperKind::CallFn
         || r_args.len() < 2
         || dst_bank != 'r'
     {
@@ -2046,6 +2047,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if body.num_regs_r < 1 {
         return Ok(None);
     }
+    let nested_helper_entry = if ctx.fbw_mode.inline_subwalk {
+        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
+            Ok(frame) => Some(frame),
+            Err(_) => return Ok(None),
+        }
+    } else {
+        None
+    };
     // Guards inside the generated wrapper must resume at the outer Python
     // CALL, because helper JitCodes have no blackhole entry point of their
     // own.  The full-body symbol is the authority for that caller frame's
@@ -2062,30 +2071,40 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if sym.jitcode().is_null() {
         return Ok(None);
     }
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
-        let jc = &*sym.jitcode();
-        let jc_index = jc.index as u32;
-        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-        if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth() as i64, jc_index, marker)
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) =
+        if nested_helper_entry.is_some() {
+            (
+                ctx.entry_py_pc(),
+                0,
+                ctx.outer_jitcode_index,
+                ctx.outer_resume_marker_jit_pc,
+            )
         } else {
-            let codeobj = &*jc.payload.code_ptr;
-            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-            let depth = if jc.payload.depth_trivia_populated() {
-                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-            } else {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(py as usize)
-                    .copied()
-            };
-            let vsd = depth
-                .map(|d| (sym.nlocals() + d as usize) as i64)
-                .unwrap_or(sym.valuestackdepth() as i64);
-            (py, vsd, jc_index, marker)
-        }
-    };
+            unsafe {
+                let jc = &*sym.jitcode();
+                let jc_index = jc.index as u32;
+                let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+                let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                if jc.payload.code_ptr.is_null() {
+                    (py, sym.valuestackdepth() as i64, jc_index, marker)
+                } else {
+                    let codeobj = &*jc.payload.code_ptr;
+                    py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                    let depth = if jc.payload.depth_trivia_populated() {
+                        jc.payload.depth_trivia_for_jitcode_pc(op.pc)
+                    } else {
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(py as usize)
+                            .copied()
+                    };
+                    let vsd = depth
+                        .map(|d| (sym.nlocals() + d as usize) as i64)
+                        .unwrap_or(sym.valuestackdepth() as i64);
+                    (py, vsd, jc_index, marker)
+                }
+            }
+        };
     let call_site_word = call_site_marker
         .map(|marker| marker as i32)
         .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
@@ -2093,21 +2112,25 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // this line records IR or touches the heap cache, so cutting back to it
     // leaves the caller's trace exactly as the ordinary residual call found it.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let call_site_active = collect_outer_active_boxes(
-        sym,
-        ctx.trace_ctx,
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        outer_jitcode_index,
-        false,
-        call_site_word,
-        op.pc as i32,
-        OuterActiveBoxesEntryTwin::Plain,
-        "builtin_wrapper_call_site",
-        None,
-        &[],
-    );
+    let call_site_active = if nested_helper_entry.is_some() {
+        ctx.outer_active_boxes.clone()
+    } else {
+        collect_outer_active_boxes(
+            sym,
+            ctx.trace_ctx,
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            outer_jitcode_index,
+            false,
+            call_site_word,
+            op.pc as i32,
+            OuterActiveBoxesEntryTwin::Plain,
+            "builtin_wrapper_call_site",
+            None,
+            &[],
+        )
+    };
 
     // The generated builtin-wrapper ABI takes its `&[PyObjectRef]` argument
     // in r0 and begins by checking its length.  Resolve that instruction's
@@ -2199,7 +2222,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             .heapcache_setarrayitem(args_array, index, wrapper_args_descr_index, item);
     }
 
-    if sym.owns_virtualizable_shadow() {
+    if nested_helper_entry.is_none() && sym.owns_virtualizable_shadow() {
         let last_instr = call_site_py_pc as i64 - 1;
         let last_instr_op = ctx.trace_ctx.const_int(last_instr);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -2239,6 +2262,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.transparent_helper_subwalk = nested_helper_entry.is_some();
+    let _helper_frame =
+        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, Some(frame)));
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -2385,6 +2411,15 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     allow_method_load_attr: bool,
     require_str_result: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
+    // HOPELESS for a `*args` / `**kwargs` / keyword-only callee, so
+    // `funccall_valuestack` is never entered for one.  Same boundary here: the
+    // seeding fills `locals[0..nparams]` and `co_argcount` counts none of the
+    // three, so a callee owning a local the arity check cannot see must stay
+    // residual.
+    if !fbw_callee_scope_is_positional_only(w_code) {
+        return Ok(None);
+    }
     // `Function.funccall_valuestack` fills a missing positional tail from
     // `defs_w` before entering the frame (`function.py:188-193,217-231`).
     // Mirror that frame shape here.  Placeholder boxes are replaced by live
@@ -2655,7 +2690,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // recursive callees residual: either requires another loop
                 // header rather than one bounded callee walk.
                 foriter_dirty_bound = bound_method.is_some()
-                    && !method_form
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
                 foriter_dirty_bound
@@ -2669,16 +2703,18 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 exact_numeric_args.iter().filter(|arg| arg.numeric).count(),
             );
         }
-        // A `Dirty` body is not admitted by seeding its frame.  Its residual
-        // can raise, and the local `except` that catches it is a callee-owned
-        // catch edge the inline path does not compile, so the exception
-        // escapes the caller instead of being handled where the source
-        // handles it.  Keep the ordinary residual call until that edge exists.
+        // An unbound `Dirty` body is not admitted by seeding its frame.  Its
+        // residual can raise, and the local `except` that catches it is a
+        // callee-owned catch edge the inline path does not compile, so the
+        // exception escapes the caller instead of being handled where the
+        // source handles it.  Stored bound methods instead take the explicit
+        // multi-frame red-frame path above.
         if !legacy_admit {
             return Ok(None);
         }
     }
     if method_form
+        && bound_method.is_none()
         && !allow_method_load_attr
         && !method_form_callee_body_supported(body.code, callee_descr_refs)
     {
@@ -3123,6 +3159,51 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             if !callee_code.cellvars.is_empty() {
                 if try_multiframe {
                     return Ok(None);
+                }
+                break 'seed;
+            }
+            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
+            // identity residual call whose operands must be Ref (the codewriter
+            // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
+            // int-specializes the tested local, the mid-body guard resume cannot
+            // source that operand's Ref form from the callee register banks
+            // (`collect_callee_active_boxes` would read a stale/mismatched box), so
+            // the encoded liveness stream disagrees with the decoder
+            // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
+            // corrupted. Decline to the ordinary residual call until
+            // the multi-frame resume reboxes int-specialized identity operands.
+            // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
+            // int bank, so no Ref rebox is needed.  A strict straight-line callee
+            // has no branch at all, so this scan never fires for it.
+            // Stored bound methods carry their explicit receiver and callee frame,
+            // so their Ref operands remain available to the resume path.
+            //
+            // This is the one precondition here that still aborts instead of
+            // returning `Ok(None)`, and deliberately so.  Residualizing it does
+            // work — `bench/synth/_pending/gc_bug_bridge_flavor_traceback_names`
+            // goes from 98 aborts to 2 and
+            // `_pending/exception_nested_exc_info_restore` from 5 aborts to 0,
+            // both compiling loops they never compiled before — but the loops it
+            // newly compiles then print traceback tuples missing their outermost
+            // frame, diverging from the interpreter (that fixture pins its
+            // expected output in its header).  The abort was masking a lost
+            // `PyTraceback` node on the compiled exception path, not preventing
+            // one.  Restore `Ok(None)` here once that node is recorded; it is the
+            // largest single win left in this function.
+            if bound_method.is_none()
+                && (0..callee_code.instructions.len()).any(|pc| {
+                    matches!(
+                        pyre_interpreter::decode_instruction_at(callee_code, pc),
+                        Some((
+                            pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
+                                | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
+                            _
+                        ))
+                    )
+                })
+            {
+                if try_multiframe {
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }

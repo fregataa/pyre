@@ -2403,7 +2403,7 @@ struct Lowering<'a> {
     /// lowering completes.  The paired `Option<String>` is the callee's
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
-    result_exc_call_results: Vec<(Variable, Option<String>)>,
+    result_exc_call_results: Vec<(Variable, Option<String>, ValueType)>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.
@@ -6643,6 +6643,32 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `f64::from_bits(bits)` is RPython's
+                // `longlong2float.longlong2float(bits)`: reinterpret the integer
+                // bit pattern as an f64 instead of following the opaque core body.
+                if args.len() == 1 && self.is_f64_from_bits(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "longlong2float".to_string(),
+                                    "longlong2float".to_string(),
+                                ],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Float,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `f64::is_sign_negative(x)` is `float2longlong(x) < 0` — reinterpret
                 // the f64 bits as i64 (sign bit = MSB) instead of an unresolved call.
                 if args.len() == 1 && self.is_f64_is_sign_negative(&reg) {
@@ -7915,8 +7941,11 @@ impl<'a> Lowering<'a> {
                 &call.dest.ty,
                 self.llbc,
             );
+            let payload_ty = crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
+                .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                .unwrap_or(ValueType::Ref(None));
             self.result_exc_call_results
-                .push((result_var.clone(), suffix));
+                .push((result_var.clone(), suffix, payload_ty));
         }
         // Capture `Iterator::next()` results (`Option<T>`-typed) for the
         // `next`-diamond rewiring pass (`front::iter_next`).  Recognition
@@ -9226,6 +9255,19 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_finite")
+    }
+
+    /// `f64::from_bits(bits)` — `core` has no graph body (Opaque), so map the
+    /// callsite to RPython's `longlong2float.longlong2float` external operation.
+    /// Its rtyper specialization emits `convert_longlong_bytes_to_float`, the
+    /// exact inverse of `float2longlong`.
+    fn is_f64_from_bits(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::from_bits")
     }
 
     /// `f64::is_sign_negative(self)` — `core` has no graph body (Opaque), so the

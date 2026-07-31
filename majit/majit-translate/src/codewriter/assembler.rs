@@ -1585,6 +1585,34 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // RPython `jtransform.py:1040-1045 rewrite_op_malloc`: a fixed-size
+            // GC struct without a vtable lowers to `new(descr)`.
+            OpKind::New { owner } => {
+                let spec = bh_size_spec_from_callcontrol(
+                    callcontrol.expect("new assembly requires a CallControl"),
+                    owner,
+                )
+                .unwrap_or_else(|| panic!("new: no struct layout registered for owner {owner:?}"));
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
+                    size: spec.size,
+                    type_id: spec.type_id,
+                    vtable: 0,
+                    owner: String::new(),
+                    all_fielddescrs: spec.all_fielddescrs,
+                    is_gc_managed: spec.is_gc_managed,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let result = op.result.as_ref().expect("new must produce a result");
+                let (reg, kind) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert_eq!(kind, 'r', "new result must use the ref register bank");
+                state.code.push(reg);
+                argcodes.push('>');
+                argcodes.push('r');
+                let key = format!("new/{argcodes}");
+                state.code[startposition] = self.get_opnum(&key);
+            }
             // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
             // tracer oracle (`box_trace.rs trace_box_float`): a `new_with_vtable`
             // carrying ONLY a size descriptor and a fresh ref-kind result, no
@@ -2608,6 +2636,7 @@ impl Assembler {
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
                 OpKind::NewList { .. } => "NewList",
+                OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
@@ -3214,10 +3243,17 @@ fn bh_size_spec_from_callcontrol(
     if owner.is_empty() {
         return None;
     }
+    // RPython keys SizeDescrs on the low-level STRUCT object, not on an
+    // annotation-side generic instantiation.  Charon registers one physical
+    // layout for the generic TypeDecl, so `Result<T>::Ok` and
+    // `Result<U>::Ok` must converge on the template variant here while their
+    // ClassDefs remain distinct in the annotator.
+    let layout_owner = majit_ir::descr::strip_generic_args(owner);
+    let layout_owner = layout_owner.as_ref();
     let size = cc
-        .struct_layout_for(owner)
+        .struct_layout_for(layout_owner)
         .map(|layout| layout.size)
-        .or_else(|| heuristic_struct_size_for_bh(cc, owner))?;
+        .or_else(|| heuristic_struct_size_for_bh(cc, layout_owner))?;
     Some(crate::jitcode::BhSizeSpec {
         size,
         // Analyzer-side structs keep the guard (unchanged); the raw
@@ -3239,9 +3275,9 @@ fn bh_size_spec_from_callcontrol(
         // structs (birthday paradox), whereas PyPy's `id(STRUCT)` never
         // aliases.  The rare hash-to-zero case (1 in 2^64) is handled
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
-        type_id: majit_ir::descr::path_hash(owner),
+        type_id: majit_ir::descr::path_hash(layout_owner),
         vtable: 0,
-        all_fielddescrs: bh_all_field_specs_for_struct(cc, owner),
+        all_fielddescrs: bh_all_field_specs_for_struct(cc, layout_owner),
     })
 }
 
@@ -3445,6 +3481,22 @@ fn fielddescrof(
 
     if let (Some(cc), Some(owner)) = (callcontrol, field.owner_root.as_deref()) {
         parent = bh_size_spec_from_callcontrol(cc, owner);
+        // RPython `descr.py:108-118,218-239` keys both the SizeDescr and
+        // FieldDescr caches on the low-level STRUCT object, never on the
+        // spelling used to reach that object.  The Rust front end can carry
+        // the same external type as `core::result::Result<T, E>` at a
+        // synthetic constructor and `result::Result<T, E>` at a MIR
+        // discriminant read (the crate prefix is stripped from the latter).
+        // Preserve the source-attached StructId across that spelling split so
+        // both operations resolve through one parent SizeDescr and therefore
+        // one `__discriminant` FieldDescr.
+        if let Some(parent_spec) = parent.as_mut()
+            && let Some(owner_id) = field
+                .owner_id
+                .or_else(|| majit_ir::descr::struct_id_for_name(owner))
+        {
+            parent_spec.type_id = owner_id.as_u64();
+        }
         if let Some(parent_spec) = parent.as_ref() {
             let full_name = bh_field_name(owner, &field.name);
             if let Some(spec) = parent_spec
@@ -3956,6 +4008,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             opname
         }
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
+        OpKind::New { .. } => "new".into(),
         OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {
@@ -4551,6 +4604,44 @@ mod tests {
         // base; the mint must fail the build rather than pick a base.
         let word = crate::layout::target_word_size();
         let _ = vable_arraydescrof(&crate::model::ValueType::Int, word * 2, true);
+    }
+
+    #[test]
+    fn fielddescrof_uses_struct_id_across_owner_spellings() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        for owner in ["core::result::Result", "result::Result"] {
+            struct_fields.fields.insert(
+                owner.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        cc.set_struct_fields(struct_fields);
+        let owner_id = majit_ir::descr::StructId::from_canonical("result::Result");
+        let parent_type_id = |owner: &str| {
+            let field = FieldDescriptor::new("__discriminant", Some(owner.to_string()))
+                .with_owner_id(Some(owner_id));
+            let crate::jitcode::BhDescr::Field {
+                parent: Some(parent),
+                ..
+            } = fielddescrof(&field, &crate::model::ValueType::Int, Some(&cc))
+            else {
+                panic!("Result discriminant must carry a parent descriptor");
+            };
+            parent.type_id
+        };
+
+        assert_eq!(
+            parent_type_id("core::result::Result<i64,PyError>"),
+            parent_type_id("result::Result<i64,PyError>"),
+        );
+        assert_eq!(
+            parent_type_id("core::result::Result<i64,PyError>"),
+            owner_id.as_u64(),
+        );
     }
 
     #[test]
