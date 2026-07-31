@@ -5,8 +5,8 @@ use pyre_object::PyObjectRef;
 use crate::PyError;
 
 use super::{
-    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, import_module, op, parse_int_text,
-    read_int_le, str_from_utf8, unpickling_error,
+    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, eof_error, import_module, op,
+    parse_int_text, read_int_le, str_from_utf8, unpickling_error,
 };
 
 #[crate::pyre_class("_pickle.Unpickler")]
@@ -173,7 +173,21 @@ impl W_Unpickler {
         me.proto = 0;
 
         loop {
-            let opcode = read1(slot)?;
+            // `interp_pickle.py:2048-2053`: an UnpicklingError while fetching
+            // the next opcode means the stream ended between pickle objects.
+            // Errors raised while dispatching a fetched opcode remain
+            // UnpicklingError and propagate unchanged.
+            let opcode = match read1(slot) {
+                Ok(opcode) => opcode,
+                Err(error) => {
+                    if let Some(cls) = crate::builtins::lookup_exc_class("_pickle.UnpicklingError")
+                        && crate::eval::check_exc_match_against(error.exc_object, cls)
+                    {
+                        return Err(eof_error("Ran out of input"));
+                    }
+                    return Err(error);
+                }
+            };
             if opcode == op::STOP {
                 let me = cur(slot);
                 return unsafe { pyre_object::listobject::w_list_pop_end(me.w_stack) }
@@ -203,8 +217,27 @@ impl W_Unpickler {
                 crate::baseobjspace::object_functionstr_type_name(w_name)
             )));
         }
-        let module = unsafe { pyre_object::unicodeobject::w_str_get_value(w_module) }.to_string();
-        let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) }.to_string();
+        let module = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_module) };
+        let name = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) };
+        let (Some(module), Some(name)) = (module, name) else {
+            audit_find_class_objects(w_module, w_name)?;
+            let module_obj = if let Some(module) = module {
+                import_module(module)?
+            } else {
+                let modules = crate::importing::sys_modules_dict();
+                unsafe { pyre_object::w_dict_lookup(modules, w_module) }.ok_or_else(|| {
+                    PyError::new(
+                        crate::PyErrorKind::ModuleNotFoundError,
+                        "No module named by surrogate identifier",
+                    )
+                })?
+            };
+            let (resolved, _) =
+                crate::module::_pickle::getattribute_dotted_obj(module_obj, w_name)?;
+            return Ok(resolved);
+        };
+        let module = module.to_string();
+        let name = name.to_string();
         audit_find_class(&module, &name)?;
         // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
         // forward map before resolution; otherwise the name resolves literally.
@@ -1011,6 +1044,9 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::REDUCE => {
             let w_args = pop(slot)?;
             let w_func = pop(slot)?;
+            if !unsafe { pyre_object::is_tuple(w_args) } {
+                return Err(PyError::type_error("argument list must be a tuple"));
+            }
             let args = tuple_items(w_args);
             let w_obj = call_fn(w_func, &args)?;
             push(slot, w_obj);
@@ -1018,20 +1054,14 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::NEWOBJ => {
             let w_args = pop(slot)?;
             let w_cls = pop(slot)?;
-            let w_obj = new_instance(w_cls, &tuple_items(w_args))?;
+            let w_obj = load_newobj(w_cls, w_args, None)?;
             push(slot, w_obj);
         }
         x if x == op::NEWOBJ_EX => {
             let w_kwargs = pop(slot)?;
             let w_args = pop(slot)?;
             let w_cls = pop(slot)?;
-            let kw_items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) };
-            let args = tuple_items(w_args);
-            let w_obj = if kw_items.is_empty() {
-                new_instance(w_cls, &args)?
-            } else {
-                new_instance_kw(w_cls, &args, &kw_items)?
-            };
+            let w_obj = load_newobj(w_cls, w_args, Some(w_kwargs))?;
             push(slot, w_obj);
         }
         x if x == op::BUILD => {
@@ -1256,6 +1286,27 @@ fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
     Ok(())
 }
 
+fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_module);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_name);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if let Ok(sys) = import_module("sys") {
+        if let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit") {
+            call_fn(
+                audit,
+                &[
+                    pyre_object::w_str_new("pickle.find_class"),
+                    pyre_object::gc_roots::shadow_stack_get(module_slot),
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// `get_extension` (EXT1 / EXT2 / EXT4) — resolve a `copyreg` extension code
 /// to its registered global via `_extension_cache` / `_inverted_registry`.
 fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
@@ -1353,9 +1404,7 @@ fn escape_decode(data: &[u8]) -> Result<Vec<u8>, PyError> {
         }
         i += 1;
         if i >= data.len() {
-            // Trailing backslash — kept verbatim.
-            out.push(b'\\');
-            break;
+            return Err(PyError::value_error("Trailing \\ in string"));
         }
         let e = data[i];
         i += 1;
@@ -1441,8 +1490,59 @@ fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, P
     }
 }
 
+/// CPython 3.14 `load_newobj` — validate the three wire operands before
+/// interpreting their concrete layouts, then call `cls.__new__`.
+fn load_newobj(
+    w_cls: PyObjectRef,
+    w_args: PyObjectRef,
+    w_kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, PyError> {
+    let opname = if w_kwargs.is_some() {
+        "NEWOBJ_EX"
+    } else {
+        "NEWOBJ"
+    };
+    if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
+        let message = format!(
+            "{opname} class argument must be a type, not {}",
+            crate::type_methods::arg_type_name(w_cls),
+        );
+        return Err(unpickling_error(&message));
+    }
+    if !unsafe { pyre_object::is_tuple(w_args) } {
+        let message = format!(
+            "{opname} args argument must be a tuple, not {}",
+            crate::type_methods::arg_type_name(w_args),
+        );
+        return Err(unpickling_error(&message));
+    }
+    if let Some(w_kwargs) = w_kwargs {
+        if !unsafe { pyre_object::is_dict(w_kwargs) } {
+            let message = format!(
+                "{opname} kwargs argument must be a dict, not {}",
+                crate::type_methods::arg_type_name(w_kwargs),
+            );
+            return Err(unpickling_error(&message));
+        }
+        let args = tuple_items(w_args);
+        let kw_items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) };
+        if !kw_items.is_empty() {
+            return new_instance_kw(w_cls, &args, &kw_items);
+        }
+        return new_instance(w_cls, &args);
+    }
+    new_instance(w_cls, &tuple_items(w_args))
+}
+
 /// `cls.__new__(cls, *args)`.
 fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
+        let message = format!(
+            "NEWOBJ class argument must be a type, not {}",
+            crate::type_methods::arg_type_name(w_cls),
+        );
+        return Err(unpickling_error(&message));
+    }
     let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
     let mut call_args = vec![w_cls];
     call_args.extend_from_slice(args);
@@ -1458,6 +1558,13 @@ fn new_instance_kw(
     args: &[PyObjectRef],
     kw_items: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, PyError> {
+    if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
+        let message = format!(
+            "NEWOBJ_EX class argument must be a type, not {}",
+            crate::type_methods::arg_type_name(w_cls),
+        );
+        return Err(unpickling_error(&message));
+    }
     let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
     let mut call_args = Vec::with_capacity(1 + args.len());
     call_args.push(w_cls);
@@ -1505,10 +1612,32 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
 
     if !unsafe { pyre_object::is_none(w_dict_state) } {
         let w_inst_dict = crate::baseobjspace::getattr_str(w_inst, "__dict__")?;
-        call_meth(w_inst_dict, "update", &[w_dict_state])?;
+        if !unsafe { pyre_object::is_dict(w_dict_state) } {
+            return Err(unpickling_error("state is not a dictionary"));
+        }
+        for (key, value) in unsafe { pyre_object::dictmultiobject::w_dict_items(w_dict_state) } {
+            // CPython 3.14 Modules/_pickle.c:6837-6843: exact `str`
+            // instance-attribute keys pass through the interpreter intern
+            // table before PyObject_SetItem.
+            let key = if unsafe { pyre_object::is_exact_type(key, &pyre_object::STR_TYPE) } {
+                unsafe { pyre_object::unicodeobject::intern_exact_str(key) }
+            } else {
+                key
+            };
+            crate::baseobjspace::setitem(w_inst_dict, key, value)?;
+        }
     }
     if !unsafe { pyre_object::is_none(w_slot_state) } {
+        if !unsafe { pyre_object::is_dict(w_slot_state) } {
+            return Err(unpickling_error("slot state is not a dictionary"));
+        }
         for (k, v) in unsafe { pyre_object::dictmultiobject::w_dict_items(w_slot_state) } {
+            if !unsafe { pyre_object::is_str(k) } {
+                return Err(PyError::type_error(format!(
+                    "attribute name must be string, not '{}'",
+                    crate::type_methods::arg_type_name(k),
+                )));
+            }
             crate::baseobjspace::setattr(w_inst, k, v)?;
         }
     }

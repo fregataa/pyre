@@ -997,20 +997,23 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// `Method` field layout — `w_function`, `w_self`, `w_class` per
-/// `function.rs:9-15`. All three are Ref slots; the JIT only consumes
-/// `w_function` (for guarding which method) and `w_self` (for recovering
-/// the receiver `OpRef` discarded by `LOAD_METHOD`). `w_class` is included
-/// for layout completeness so the descrs match the struct order.
+/// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`.
+/// All four are Ref slots; the JIT only consumes `w_function` (for guarding
+/// which method) and `w_self` (for recovering the receiver `OpRef` discarded
+/// by `LOAD_METHOD`). `w_class` and `w_module` are included for layout
+/// completeness so the descrs match the struct order — a field the struct
+/// declares but this census omits has no `index_in_parent` to rederive, so
+/// the two sides that mint its descr disagree on the number.
 ///
 /// `w_function` and `w_self` are marked immutable per
 /// `pypy/interpreter/function.py:567`
 /// `_Method._immutable_fields_ = ['w_function', 'w_instance']`. `w_class`
-/// is not listed there and stays mutable.
+/// is not listed there and stays mutable; `w_module` is written after
+/// construction by `w_method_set_module` and is mutable for that reason.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::function::{
-        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID,
-        W_METHOD_OBJECT_SIZE,
+        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_MODULE_OFFSET,
+        METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
     };
     build_object_descr_group_with_def_path(
         W_METHOD_OBJECT_SIZE,
@@ -1038,6 +1041,15 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_class",
                 METHOD_W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_module",
+                METHOD_W_MODULE_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -1231,6 +1243,8 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // the field descr (`immutable: true`) AND the GcArray contents
     // (read via `getfield_gc_pure_r`). Length comes from the GcArray
     // header via `arraylen_gc(items_block)` — no inline length cache.
+    // Python 3.14's mutable-once `hash` cache is the intentional version
+    // delta from that PyPy layout.
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_TupleObject>(),
         W_TUPLE_GC_TYPE_ID,
@@ -1252,6 +1266,15 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 8,
                 Type::Ref,
                 false,
+                false,
+                false,
+            ),
+            (
+                "hash",
+                std::mem::offset_of!(W_TupleObject, hash),
+                8,
+                Type::Int,
+                true,
                 false,
                 false,
             ),
@@ -1298,6 +1321,15 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
                 false,
             ),
+            (
+                "hash",
+                std::mem::offset_of!(W_SpecialisedTupleObject_ii, hash),
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
         ],
         "W_SpecialisedTupleObject_ii",
         "specialisedtupleobject::W_SpecialisedTupleObject_ii",
@@ -1338,6 +1370,15 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
                 false,
             ),
+            (
+                "hash",
+                std::mem::offset_of!(W_SpecialisedTupleObject_ff, hash),
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
         ],
         "W_SpecialisedTupleObject_ff",
         "specialisedtupleobject::W_SpecialisedTupleObject_ff",
@@ -1375,6 +1416,15 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 8,
                 Type::Ref,
                 false,
+                false,
+                false,
+            ),
+            (
+                "hash",
+                std::mem::offset_of!(W_SpecialisedTupleObject_oo, hash),
+                8,
+                Type::Int,
+                true,
                 false,
                 false,
             ),
@@ -2004,12 +2054,19 @@ pub fn method_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 2)
 }
 
+/// `Method.w_module` — `__module__` storage for a bound builtin method,
+/// written after construction by `w_method_set_module`. The JIT does not
+/// read it; the census entry exists so the struct's field order is complete.
+pub fn method_w_module_descr() -> DescrRef {
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 3)
+}
+
 /// Inherited `PyObject.w_class` on a `Method` — the Python-level `method`
 /// class stamped by `w_method_new`'s header. Kept in the Method group (not
 /// the standalone `w_class_descr`) so an inline emit's store is a virtual
 /// field of the same size descr and materialization reproduces the header.
 pub fn method_header_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_METHOD_DESCR_GROUP, 3)
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 4)
 }
 
 /// Size descriptor for `Method` allocation via `NewWithVtable`
@@ -2231,13 +2288,17 @@ pub fn list_w_class_descr() -> DescrRef {
 /// Immutable. Length comes from `arraylen_gc(items_block,
 /// pyobject_gcarray_descr)` against the GcArray header — no
 /// `tuple_length_descr` exists per upstream tupleobject.py:376-390
-/// (`W_TupleObject` carries `wrappeditems` only).
+/// (`W_TupleObject` carries no separate length field).
 pub fn tuple_wrappeditems_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 0)
 }
 
 pub fn tuple_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 1)
+}
+
+pub fn tuple_hash_descr() -> DescrRef {
+    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 2)
 }
 
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
@@ -2255,6 +2316,10 @@ pub fn specialised_tuple_ii_w_class_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 2)
 }
 
+pub fn specialised_tuple_ii_hash_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 3)
+}
+
 /// `W_SpecialisedTupleObject_ff.value0` — inline `f64`. Immutable.
 pub fn specialised_tuple_ff_value0_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 0)
@@ -2269,6 +2334,10 @@ pub fn specialised_tuple_ff_w_class_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 2)
 }
 
+pub fn specialised_tuple_ff_hash_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 3)
+}
+
 /// `W_SpecialisedTupleObject_oo.value0` — inline `PyObjectRef`. Immutable.
 pub fn specialised_tuple_oo_value0_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 0)
@@ -2281,6 +2350,10 @@ pub fn specialised_tuple_oo_value1_descr() -> DescrRef {
 
 pub fn specialised_tuple_oo_w_class_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 2)
+}
+
+pub fn specialised_tuple_oo_hash_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 3)
 }
 
 /// `ItemsBlock.capacity` — the GcArray length header at offset 0 of

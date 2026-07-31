@@ -16,8 +16,6 @@ use pyre_object::*;
 pub(crate) const ATTR_EXCEPTIONS: &[&str] = &[
     "__args__",
     "__class__",
-    "__copy__",
-    "__deepcopy__",
     "__mro_entries__",
     "__origin__",
     "__parameters__",
@@ -37,8 +35,6 @@ pub(crate) fn is_attr_exception(name: &str) -> bool {
         name,
         "__args__"
             | "__class__"
-            | "__copy__"
-            | "__deepcopy__"
             | "__mro_entries__"
             | "__origin__"
             | "__parameters__"
@@ -47,6 +43,12 @@ pub(crate) fn is_attr_exception(name: &str) -> bool {
             | "__typing_unpacked_tuple_args__"
             | "__unpacked__"
     )
+}
+
+/// CPython 3.14 `attr_blocked` (`Objects/genericaliasobject.c`) — these
+/// attributes are neither proxied to the origin nor exposed by the alias.
+pub(crate) fn is_attr_blocked(name: &str) -> bool {
+    matches!(name, "__bases__" | "__copy__" | "__deepcopy__")
 }
 
 /// `generic_alias_class_getitem(space, w_cls, w_item)` (util.py:99).
@@ -105,10 +107,19 @@ fn collect_parameters_one(
             // A bare class exposes no `__parameters__` descriptor of its own.
             return Ok(());
         }
-        if is_tuple(t) {
-            let n = w_tuple_len(t);
+        if is_tuple(t) || is_list(t) {
+            let n = if is_tuple(t) {
+                w_tuple_len(t)
+            } else {
+                w_list_len(t)
+            };
             for i in 0..n {
-                if let Some(x) = w_tuple_getitem(t, i as i64) {
+                let x = if is_tuple(t) {
+                    w_tuple_getitem(t, i as i64)
+                } else {
+                    w_list_getitem(t, i as i64)
+                };
+                if let Some(x) = x {
                     collect_parameters_one(x, params)?;
                 }
             }
@@ -399,13 +410,34 @@ pub(crate) fn subs_parameters(
         w_tuple_new(vec![items])
     };
     let mut newargs: Vec<PyObjectRef> = Vec::new();
-    let nargs = unsafe { w_tuple_len(args) };
+    let args_are_tuple = unsafe { is_tuple(args) };
+    let nargs = if args_are_tuple {
+        unsafe { w_tuple_len(args) }
+    } else {
+        unsafe { w_list_len(args) }
+    };
     for i in 0..nargs {
-        let Some(old_arg) = (unsafe { w_tuple_getitem(args, i as i64) }) else {
+        let old_arg = if args_are_tuple {
+            unsafe { w_tuple_getitem(args, i as i64) }
+        } else {
+            unsafe { w_list_getitem(args, i as i64) }
+        };
+        let Some(old_arg) = old_arg else {
             continue;
         };
         if unsafe { is_type(old_arg) } {
             newargs.push(old_arg);
+            continue;
+        }
+        // CPython 3.14 `_Py_subs_parameters`: lists and tuples containing
+        // parameters are recursively substituted, preserving their shape.
+        if unsafe { is_tuple(old_arg) || is_list(old_arg) } {
+            let subargs = subs_parameters(self_, old_arg, params, items)?;
+            newargs.push(if unsafe { is_tuple(old_arg) } {
+                w_tuple_new(subargs)
+            } else {
+                w_list_new(subargs)
+            });
             continue;
         }
         // `unpack = _is_unpacked_typevartuple(old_arg)` decides whether the
@@ -499,46 +531,22 @@ pub(crate) fn make_starred(ga: PyObjectRef) -> crate::PyResult {
     Ok(res)
 }
 
-/// The `_make_starred` callable referenced by an unpacked alias's
-/// `__reduce__`.
-fn ga_make_starred(args: &[PyObjectRef]) -> crate::PyResult {
-    let ga = args.first().copied().unwrap_or_else(w_none);
-    if !unsafe { is_generic_alias(ga) } {
-        return Err(crate::PyError::type_error(
-            "_make_starred() argument must be a types.GenericAlias",
-        ));
-    }
-    make_starred(ga)
-}
-
-/// The shared `_make_starred` callable, lazily built then cached.
-///
-/// The single `_make_starred` callable (`_pypy_generic_alias.py:118`),
-/// kept reachable by the GenericAlias type namespace it is also stored in
-/// (`init_generic_alias_type`) and never reallocated, so an unpacked
-/// alias's `__reduce__` returns the same object every time — PyPy returns
-/// the module-level function.  pyre houses it on the type as the stand-in
-/// for PyPy's `_pypy_generic_alias._make_starred` module global; the
-/// stable-address (old-gen) allocation makes the cached pointer safe to
-/// hold across collections.  Process-global so every thread observes the
-/// same callable identity.
-pub(crate) fn make_starred_fn() -> PyObjectRef {
-    static MAKE_STARRED_FN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAKE_STARRED_FN
-        .get_or_init(|| make_builtin_function("_make_starred", ga_make_starred) as usize)
-        as PyObjectRef
-}
-
-/// `GenericAlias.__reduce__` (`_pypy_generic_alias.py:96`).
+/// `GenericAlias.__reduce__` (CPython 3.14
+/// `Objects/genericaliasobject.c:ga_reduce`).
 fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let origin = unsafe { w_generic_alias_get_origin(self_) };
     let ga_args = unsafe { w_generic_alias_get_args(self_) };
     if unsafe { w_generic_alias_get_unpacked(self_) } {
-        // `orig = GenericAlias(origin, args); (_make_starred, (orig,))`.
+        // 3.14 reconstructs a starred alias as `next(iter(orig))`.  This
+        // replaces PyPy's app-level `_make_starred` reduce target and keeps
+        // the callable globally pickleable without a synthetic module.
         let orig = make_generic_alias(origin, ga_args)?;
-        let callable = make_starred_fn();
-        return Ok(w_tuple_new(vec![callable, w_tuple_new(vec![orig])]));
+        let iterator = crate::baseobjspace::iter(orig)?;
+        return Ok(w_tuple_new(vec![
+            crate::baseobjspace::builtin_callable("next"),
+            w_tuple_new(vec![iterator]),
+        ]));
     }
     // `(type(self), (origin, args))`.
     let ga_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
@@ -892,17 +900,6 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
             ),
         )
     };
-    // `_make_starred` (`_pypy_generic_alias.py:118`) — the module-level reduce
-    // target.  pyre has no app-level `_pypy_generic_alias` Python module, so
-    // the single shared callable lives on the type namespace; storing it here keeps it reachable
-    // for the collector and gives `__reduce__` a stable callable identity.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "_make_starred",
-            make_starred_fn(),
-        )
-    };
     // `__iter__` and `__dir__` are intercepted directly by `baseobjspace::iter`
     // and `builtins::builtin_dir`; explicit `ga.__iter__`/`ga.__dir__` access
     // delegates to `__origin__` (they are not in `_ATTR_EXCEPTIONS`).
@@ -926,7 +923,11 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         let mut parts = Vec::with_capacity(n);
         for i in 0..n {
             if let Some(item) = w_tuple_getitem(args, i as i64) {
-                parts.push(repr_item(item)?);
+                parts.push(if is_list(item) {
+                    repr_items_list(item)?
+                } else {
+                    repr_item(item)?
+                });
             }
         }
         parts.join(", ")
@@ -937,6 +938,21 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         ""
     };
     Ok(format!("{star}{}[{inner}]", repr_item(origin)?))
+}
+
+/// CPython 3.14 `ga_repr_items_list` — ParamSpec substitutions retain a
+/// list, whose type items use typing-style rendering.  Fetch each element
+/// after its predecessor's repr so mutation during a callback raises
+/// `IndexError` rather than reading stale storage.
+unsafe fn repr_items_list(list: PyObjectRef) -> Result<String, crate::PyError> {
+    let n = w_list_len(list);
+    let mut parts = Vec::with_capacity(n);
+    for i in 0..n {
+        let item = w_list_getitem(list, i as i64)
+            .ok_or_else(|| crate::PyError::index_error("list index out of range"))?;
+        parts.push(repr_item(item)?);
+    }
+    Ok(format!("[{}]", parts.join(", ")))
 }
 
 /// `_repr_item(it)` (`_pypy_generic_alias.py:124`) — a class renders as its

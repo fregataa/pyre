@@ -218,19 +218,42 @@ fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
 
 /// `array.__new__(cls, typecode, [initializer])` — `interp_array.py w_array`.
 fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
-    if args.len() < 2 {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() < 2 {
         return Err(PyError::type_error(
             "array() takes at least 1 argument (0 given)",
         ));
     }
-    if args.len() > 3 {
+    if pos.len() > 3 {
         return Err(PyError::type_error(format!(
             "array() takes at most 2 arguments ({} given)",
-            args.len() - 1
+            pos.len() - 1
         )));
     }
-    let cls = args[0];
-    let w_typecode = args[1];
+    let cls = pos[0];
+    let canonical = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
+        .map_or(PY_NULL, |ty| ty.as_ptr());
+    // PyPy's interp2app gateway leaves keywords available to a subtype's
+    // overridden __init__.  The exact array type (and a subtype inheriting
+    // array.__init__) rejects them later; __new__ itself must not mistake the
+    // flat ABI's kwargs marker for the optional initializer.
+    let init_matches = std::ptr::eq(cls, canonical)
+        || unsafe {
+            match (
+                crate::baseobjspace::lookup_in_type(cls, "__init__"),
+                crate::baseobjspace::lookup_in_type(canonical, "__init__"),
+            ) {
+                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+    if init_matches && crate::builtins::has_real_kwargs(kwargs) {
+        return Err(PyError::type_error(
+            "array.array() takes no keyword arguments",
+        ));
+    }
+    let w_typecode = pos[1];
     // typecode must be a 1-character str.
     if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
@@ -263,16 +286,13 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let obj = arr::w_array_new(typecode, itemsize);
     // Subclass: retag the fresh array with the requested class.
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
-        if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
-        {
-            if !std::ptr::eq(cls, canonical.as_ptr()) {
-                crate::typedef::tag_subclass_instance(obj, cls);
-            }
+        if !std::ptr::eq(cls, canonical) {
+            crate::typedef::tag_subclass_instance(obj, cls);
         }
     }
     // Optional initializer.
-    if args.len() >= 3 {
-        let w_init = args[2];
+    if pos.len() >= 3 {
+        let w_init = pos[2];
         if unsafe { pyre_object::is_str(w_init) } {
             if matches!(typecode, b'u' | b'w') {
                 array_fromunicode(obj, w_init)?;
@@ -372,10 +392,12 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
         let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
         let mut out: Vec<u8> = Vec::with_capacity(n as usize * isz);
         let mut i = start;
-        for _ in 0..n {
+        for k in 0..n {
             let off = i as usize * isz;
             out.extend_from_slice(&src[off..off + isz]);
-            i += step;
+            if k + 1 < n {
+                i += step;
+            }
         }
         return Ok(arr::w_array_from_bytes(tc, isz as u8, out));
     }
@@ -428,7 +450,9 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
                 let dst = i as usize * isz;
                 let s = k as usize * isz;
                 vec[dst..dst + isz].copy_from_slice(&src[s..s + isz]);
-                i += step;
+                if k + 1 < n {
+                    i += step;
+                }
             }
         }
         return Ok(pyre_object::w_none());
@@ -474,9 +498,11 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
         // Collect element indices to drop, then rebuild the buffer.
         let mut drop_set: Vec<usize> = Vec::with_capacity(n as usize);
         let mut i = start;
-        for _ in 0..n {
+        for k in 0..n {
             drop_set.push(i as usize);
-            i += step;
+            if k + 1 < n {
+                i += step;
+            }
         }
         drop_set.sort_unstable();
         let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
@@ -697,8 +723,12 @@ fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_release_buffer(args: &[PyObjectRef]) -> PyResult {
-    unsafe { arr::w_array_exports_decref(args[0]) };
-    Ok(pyre_object::w_none())
+    crate::builtins::buffer_exporter_release_view(args[0], args[1])
+}
+
+fn array_buffer(args: &[PyObjectRef]) -> PyResult {
+    let flags = crate::baseobjspace::c_int_w(args[1])?;
+    crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
@@ -1390,6 +1420,7 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "count", array_count_method, 2);
     m(ns, "clear", array_clear_method, 1);
     m(ns, "__release_buffer__", array_release_buffer, 2);
+    m(ns, "__buffer__", array_buffer, 2);
     m(ns, "reverse", array_reverse_method, 1);
     m(ns, "tolist", array_tolist_method, 1);
     m(ns, "fromlist", array_fromlist_method, 2);
@@ -1403,6 +1434,17 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "byteswap", array_byteswap_method, 1);
     m(ns, "__copy__", array_copy_method, 1);
     m(ns, "__deepcopy__", array_copy_method, 2);
+    // CPython 3.14 arraymodule.c:2471 — Py_GenericAlias with METH_CLASS.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        )
+    };
     // `pop` accepts an optional index.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1447,6 +1489,13 @@ pub fn init_array_type(ns: PyObjectRef) {
                 PY_NULL,
                 PY_NULL,
             ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__weakref__",
+            crate::typedef::make_weakref_descr(PY_NULL),
         )
     };
 }

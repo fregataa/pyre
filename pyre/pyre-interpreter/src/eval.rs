@@ -2051,6 +2051,23 @@ impl SharedOpcodeHandler for PyFrame {
         getattr_str(obj, name)
     }
 
+    fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
+        let w_type = crate::typedef::r#type(obj).ok_or_else(|| {
+            PyError::type_error(format!(
+                "'{}' object does not support the context manager protocol",
+                crate::baseobjspace::object_functionstr_type_name(obj)
+            ))
+        })?;
+        let descr = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) }
+            .ok_or_else(|| {
+                PyError::type_error(format!(
+                    "'{}' object does not support the context manager protocol",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                ))
+            })?;
+        Ok(unsafe { crate::baseobjspace::get(descr, obj, w_type.as_ptr()) }?.unwrap_or(descr))
+    }
+
     fn store_attr(
         &mut self,
         obj: Self::Value,
@@ -3976,9 +3993,27 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── load_build_class ──
-    // PyPy: BUILD_CLASS; CPython: LOAD_BUILD_CLASS
+    // PyPy pyopcode.py:866-870 LOAD_BUILD_CLASS reads
+    // `self.get_builtin().getdictvalue('__build_class__')`.  Python 3.14
+    // reports a NameError when the selected builtin mapping has no entry.
     fn load_build_class(&mut self) -> Result<(), PyError> {
-        let bc = crate::get_build_class_func();
+        let w_builtin = self.get_builtin();
+        let bc = if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            if w_dict.is_null() {
+                None
+            } else {
+                crate::baseobjspace::finditem_str(w_dict, "__build_class__")?
+            }
+        } else {
+            None
+        };
+        let Some(bc) = bc else {
+            return Err(PyError::name_error_with_name(
+                "__build_class__ not found",
+                "__build_class__",
+            ));
+        };
         self.push(bc);
         Ok(())
     }
@@ -4748,6 +4783,26 @@ mod tests {
     fn test_comparison_false() {
         let result = run_eval("5 < 3").unwrap();
         unsafe { assert!(!w_bool_get_value(result)) };
+    }
+
+    #[test]
+    fn test_equal_user_types_try_both_operands_after_not_implemented() {
+        let source = r#"calls = []
+class A:
+    def __eq__(self, other):
+        calls.append(1)
+        return NotImplemented
+result = A() == A()
+"#;
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execution failed");
+        unsafe {
+            let calls = w_dict_getitem_str(frame.w_globals, "calls").unwrap();
+            assert_eq!(pyre_object::listobject::w_list_len(calls), 2);
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(!w_bool_get_value(result));
+        }
     }
 
     #[test]
@@ -7039,6 +7094,352 @@ result = C.value";
     }
 
     #[test]
+    fn test_hot_context_manager_special_lookup_bypasses_getattribute() {
+        let _jit_guard = jit_compile_test_guard();
+        let source = "\
+seen = [0, 0]
+def enter(self):
+    return self
+def exit(self, typ, value, traceback):
+    return False
+class SpecialDescr:
+    def __init__(self, impl, index):
+        self.impl = impl
+        self.index = index
+    def __get__(self, obj, owner):
+        seen[self.index] += 1
+        return self.impl.__get__(obj, owner)
+class Manager:
+    __enter__ = SpecialDescr(enter, 0)
+    __exit__ = SpecialDescr(exit, 1)
+    def __getattribute__(self, name):
+        raise AssertionError(name)
+i = 0
+while i < 3000:
+    with Manager():
+        pass
+    i += 1";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("context-manager special lookup failed");
+        unsafe {
+            let i = w_dict_getitem_str(frame.w_globals, "i").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            let seen = w_dict_getitem_str(frame.w_globals, "seen").unwrap();
+            assert_eq!(w_int_get_value(w_list_getitem(seen, 0).unwrap()), 3000);
+            assert_eq!(w_int_get_value(w_list_getitem(seen, 1).unwrap()), 3000);
+        }
+    }
+
+    #[test]
+    fn test_inherited_dict_descriptor_preserves_native_namespace_ownership() {
+        let source = "\
+class Base:
+    pass
+class Meta(Base, type):
+    pass
+class C(metaclass=Meta):
+    pass
+type_set_rejected = False
+try:
+    Base.__dict__['__dict__'].__set__(C, {})
+except (TypeError, AttributeError):
+    type_set_rejected = True
+type_mapping_rejected = False
+try:
+    C.__dict__['x'] = 1
+except TypeError:
+    type_mapping_rejected = True
+class Exc(Base, Exception):
+    pass
+exception_delete_rejected = False
+try:
+    Base.__dict__['__dict__'].__delete__(Exc())
+except (TypeError, AttributeError):
+    exception_delete_rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("native namespace ownership regression");
+        unsafe {
+            for name in [
+                "type_set_rejected",
+                "type_mapping_rejected",
+                "exception_delete_rejected",
+            ] {
+                let value = w_dict_getitem_str(frame.w_globals, name).unwrap();
+                assert!(is_true(value).unwrap(), "{name} should be true");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_class_rejects_non_type_base_in_metaclass_calculation() {
+        let source = "\
+rejected = False
+try:
+    class C(object, None):
+        pass
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("non-type base regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_set_bases_checks_secondary_base_layout_and_acceptability() {
+        let source = "\
+class O:
+    pass
+class X:
+    pass
+rejected = False
+try:
+    X.__bases__ = (O, type(None))
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("secondary base validation regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_set_bases_rolls_back_after_mro_conflict() {
+        let source = "\
+class A:
+    pass
+class B:
+    pass
+class C(A, B):
+    pass
+class D(A, B):
+    pass
+class E(C, D):
+    pass
+old_bases = C.__bases__
+old_mro = C.__mro__
+rejected = False
+try:
+    C.__bases__ = (B, A)
+except TypeError:
+    rejected = True
+restored = C.__bases__ == old_bases and C.__mro__ == old_mro";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("MRO rollback regression");
+        unsafe {
+            for name in ["rejected", "restored"] {
+                let value = w_dict_getitem_str(frame.w_globals, name).unwrap();
+                assert!(is_true(value).unwrap(), "{name} should be true");
+            }
+        }
+    }
+
+    #[test]
+    fn test_custom_mro_observes_incomplete_mro_as_none() {
+        let source = "\
+observed_none = False
+extension_rejected = False
+class Meta(type):
+    def mro(cls):
+        global observed_none, extension_rejected
+        observed_none = cls.__mro__ is None
+        if observed_none and cls.__name__ == 'C':
+            try:
+                class Derived(cls):
+                    pass
+            except TypeError:
+                extension_rejected = True
+        return type.mro(cls)
+class C(metaclass=Meta):
+    pass";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("incomplete MRO regression");
+        unsafe {
+            for name in ["observed_none", "extension_rejected"] {
+                let value = w_dict_getitem_str(frame.w_globals, name).unwrap();
+                assert!(is_true(value).unwrap(), "{name} should be true");
+            }
+        }
+    }
+
+    #[test]
+    fn test_custom_mro_that_drops_the_new_type_is_rejected() {
+        let source = "\
+class B:
+    pass
+class Meta(type):
+    def mro(cls):
+        del Meta.mro
+        return (B,)
+rejected = False
+try:
+    class A(metaclass=Meta):
+        pass
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("disappearing custom MRO regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_super_preserves_proxy_apparent_class() {
+        let source = "\
+class Proxy:
+    def __init__(self, obj):
+        self.__obj = obj
+    def __getattribute__(self, name):
+        if name.startswith('_Proxy__'):
+            return object.__getattribute__(self, name)
+        return getattr(self.__obj, name)
+class B:
+    def f(self):
+        return 'B.f'
+class C(B):
+    def f(self):
+        return super(C, self).f() + '->C.f'
+result = C.__dict__['f'](Proxy(C()))";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("proxy super regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert_eq!(w_str_get_wtf8(value).as_str(), Ok("B.f->C.f"));
+        }
+    }
+
+    #[test]
+    fn test_empty_member_slot_error_uses_fully_qualified_type_name() {
+        let source = "\
+def make_type():
+    class X:
+        __slots__ = 'a'
+    return X
+X = make_type()
+try:
+    X().a
+except AttributeError as exc:
+    result = str(exc)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("member slot AttributeError regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert_eq!(
+                w_str_get_wtf8(value).as_str(),
+                Ok("'__main__.make_type.<locals>.X' object has no attribute 'a'")
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_metaclass_rejects_non_cell_classcell() {
+        let source = "\
+rejected = False
+try:
+    class C:
+        __classcell__ = 42
+        __slots__ = ['__classcell__']
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("default-metaclass classcell regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_type_preserves_and_warns_for_non_string_namespace_keys() {
+        let source = "\
+C = type('C', (), {1: 2})
+result = C.__dict__[1] == 2";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("non-string type namespace regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_module_and_str_layouts_conflict() {
+        let source = "\
+MT = type(__builtins__)
+try:
+    class Module(MT, str):
+        pass
+except TypeError:
+    result = True
+else:
+    result = False";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("module/str layout conflict regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_exact_immutable_rejects_layout_compatible_class_assignment() {
+        let source = "\
+class MyInt(int):
+    __slots__ = ()
+try:
+    (1).__class__ = MyInt
+except TypeError:
+    result = True
+else:
+    result = False";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("immutable exact builtin class-assignment regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_carlo_verre_hackcheck_keeps_type_setattr_distinct() {
+        let source = "\
+class Direct(type):
+    def __setattr__(cls, name, value):
+        type.__setattr__(cls, name, value)
+class Plain:
+    pass
+class DirectMeta(Plain, Direct):
+    pass
+direct = DirectMeta('DirectClass', (object,), {})
+direct.answer = 42
+class Indirect(type):
+    def __setattr__(cls, name, value):
+        object.__setattr__(cls, name, value)
+class IndirectMeta(Plain, Indirect):
+    pass
+indirect = IndirectMeta('IndirectClass', (object,), {})
+try:
+    indirect.answer = 42
+except TypeError:
+    rejected = True
+else:
+    rejected = False
+result = direct.answer == 42 and rejected";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("Carlo Verre slot-wrapper regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\
@@ -7095,6 +7496,493 @@ except TypeError:
         unsafe {
             let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
             assert_eq!(w_int_get_value(result), 1);
+        }
+    }
+
+    #[test]
+    fn test_compile_optimized_ast_folds_debug_for_source_and_ast_input() {
+        crate::importing::install_builtin_modules();
+        let source = "\
+import _ast
+raw = compile('a*__debug__', 'f.py', 'exec', flags=_ast.PyCF_ONLY_AST)
+opt_source = compile('a*__debug__', 'f.py', 'exec', flags=_ast.PyCF_OPTIMIZED_AST)
+opt_tree = compile(raw, 'f.py', 'exec', flags=_ast.PyCF_OPTIMIZED_AST)
+result = (
+    isinstance(raw.body[0].value.right, _ast.Name)
+    and isinstance(opt_source.body[0].value.right, _ast.Constant)
+    and opt_source.body[0].value.right.value is True
+    and isinstance(opt_tree.body[0].value.right, _ast.Constant)
+    and opt_tree.body[0].value.right.value is True
+)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("PyCF_OPTIMIZED_AST compile failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_like_slice_does_not_advance_past_last_item() {
+        let source = "\
+step = 2**63 - 1
+b = bytearray(b'abc')
+b[1::step] = b'x'
+assigned = b == bytearray(b'axc')
+del b[1::step]
+result = (
+    b'abc'[1::step] == b'b'
+    and bytearray(b'abc')[1::step] == bytearray(b'b')
+    and assigned
+    and b == bytearray(b'ac')
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("large-step bytes-like slice failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_constructors_validate_codec_arguments_first() {
+        let source = "\
+result = True
+for constructor in (bytes, bytearray):
+    for args, argument, received in (
+        (('', b'ascii'), 'encoding', 'bytes'),
+        (('', 'ascii', b'ignore'), 'errors', 'bytes'),
+        (('', None), 'encoding', 'None'),
+        (('', 'ascii', None), 'errors', 'None'),
+    ):
+        try:
+            constructor(*args)
+        except TypeError as exc:
+            expected = f\"{constructor.__name__}() argument '{argument}' must be str, not {received}\"
+            result = result and str(exc) == expected
+        else:
+            result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like constructor codec validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_search_methods_reject_extra_arguments() {
+        let source = "\
+result = True
+for constructor in (bytes, bytearray):
+    value = constructor(b'hello')
+    for name in ('find', 'rfind', 'index', 'rindex', 'count', 'startswith', 'endswith'):
+        try:
+            getattr(value, name)(constructor(b'x'), None, None, None)
+        except TypeError as exc:
+            result = result and name in str(exc)
+        else:
+            result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like search method arity validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_constructors_fall_back_after_index_type_error() {
+        let source = "\
+class BufferWithIndex(bytes):
+    def __index__(self):
+        raise TypeError
+
+class IterableWithIndex:
+    def __index__(self):
+        raise TypeError
+    def __iter__(self):
+        return iter((102, 111, 111))
+
+buffer = BufferWithIndex(b'foobar')
+result = (
+    bytes(buffer) == b'foobar'
+    and bytearray(buffer) == bytearray(b'foobar')
+    and bytes(IterableWithIndex()) == b'foo'
+    and bytearray(IterableWithIndex()) == bytearray(b'foo')
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like constructor index TypeError fallback failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytearray_new_defers_source_consumption_to_init() {
+        let source = "\
+class Source:
+    def __init__(self):
+        self.calls = 0
+    def __iter__(self):
+        self.calls += 1
+        return iter((1, 2, 3))
+
+source = Source()
+value = bytearray(source)
+raw = bytearray.__new__(bytearray, source, ignored=True)
+
+class Sub(bytearray):
+    pass
+
+sub_source = Source()
+sub = Sub(sub_source)
+result = (
+    value == bytearray(b'\\x01\\x02\\x03')
+    and source.calls == 1
+    and raw == bytearray()
+    and type(sub) is Sub
+    and sub == bytearray(b'\\x01\\x02\\x03')
+    and sub_source.calls == 1
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray __new__/__init__ source ownership failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytearray_hex_exports_receiver_during_separator_len() {
+        let source = "\
+value = bytearray(b'\\xaa')
+
+class Separator(bytes):
+    def __len__(self):
+        value.clear()
+        return 1
+
+try:
+    value.hex(Separator(b':'))
+except BufferError:
+    preserved = value == bytearray(b'\\xaa')
+    value.clear()
+    result = preserved and value == bytearray()
+else:
+    result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray.hex receiver export lifetime failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytearray_init_streams_into_receiver() {
+        let source = "\
+value = bytearray(b'old')
+seen = []
+
+def items():
+    for item in range(1, 5):
+        yield item
+        seen.append((list(value), value.__alloc__()))
+
+value.__init__(items())
+prefixes_visible = all(
+    prefix == list(range(1, index + 1)) and allocation > len(prefix)
+    for index, (prefix, allocation) in enumerate(seen, 1)
+)
+
+partial = bytearray(b'old')
+def broken():
+    yield 7
+    raise RuntimeError
+
+try:
+    partial.__init__(broken())
+except RuntimeError:
+    failure_preserves_prefix = partial == bytearray(b'\\x07')
+else:
+    failure_preserves_prefix = False
+
+result = (
+    value == bytearray(b'\\x01\\x02\\x03\\x04')
+    and prefixes_visible
+    and failure_preserves_prefix
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray.__init__ streaming behavior failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_percent_c_uses_fully_qualified_type_name() {
+        let source = "\
+class Qualified:
+    pass
+Qualified.__module__ = 'package.module'
+
+class Main:
+    pass
+
+messages = []
+for format_string in (b'%c', '%c'):
+    for value in (Qualified(), Main()):
+        try:
+            format_string % value
+        except TypeError as exc:
+            messages.append(str(exc))
+
+result = (
+    messages[0].endswith('not package.module.Qualified')
+    and messages[1].endswith('not Main')
+    and messages[2].endswith('not package.module.Qualified')
+    and messages[3].endswith('not Main')
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("%c fully-qualified type names failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytearray_percent_format_holds_receiver_export() {
+        let source = "\
+format_string = bytearray(b'%a end')
+
+class Value:
+    def __repr__(self):
+        format_string.clear()
+        return 'value'
+
+try:
+    format_string % Value()
+except BufferError:
+    preserved = format_string == bytearray(b'%a end')
+    format_string.clear()
+    released = format_string == bytearray()
+    result = preserved and released
+else:
+    result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray percent formatting export lifetime failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytearray_resize_reports_allocation_failure() {
+        let source = "\
+result = True
+for value in (bytearray(), bytearray(b'preserved')):
+    original = value.copy()
+    try:
+        value.resize((1 << 63) - 1)
+    except MemoryError as exc:
+        result = result and str(exc) == '' and value == original
+    else:
+        result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray.resize allocation failure handling failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_translate_validates_delete_and_arity() {
+        let source = "\
+result = True
+for value in (bytes(b'hello'), bytearray(b'hello')):
+    for args in ((), (None, None), (None, b'', b'')):
+        try:
+            value.translate(*args)
+        except TypeError:
+            pass
+        else:
+            result = False
+    try:
+        value.translate(None, unexpected=b'')
+    except TypeError:
+        pass
+    else:
+        result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like translate argument validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_prefers_dunder_bytes_without_codec() {
+        let source = "\
+class StringWithBytes(str):
+    def __new__(cls, value):
+        self = str.__new__(cls, '\\u20ac')
+        self.value = value
+        return self
+    def __bytes__(self):
+        return self.value
+
+source = StringWithBytes(b'abc')
+result = bytes(source) == b'abc'
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes str-subclass __bytes__ precedence failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_search_uses_rpython_adaptive_algorithm() {
+        let source = "\
+n = 10000
+a = b'a' * n
+b = b'b' * n
+haystack = a + a + b + a + a
+needle = a + b + b + a
+result = True
+for constructor in (bytes, bytearray):
+    value = constructor(haystack)
+    sub = constructor(needle)
+    result = (
+        result
+        and value.find(sub) == -1
+        and value.rfind(sub) == -1
+        and value.count(sub) == 0
+        and (value + sub).find(sub) == len(value)
+        and (value + sub).count(sub) == 1
+    )
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like adaptive search failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_no_arg_methods_reject_extra_arguments() {
+        let source = "\
+names = (
+    'capitalize', 'lower', 'upper', 'swapcase', 'title',
+    'isdigit', 'isalpha', 'isalnum', 'isspace', 'isascii',
+    'isupper', 'islower', 'istitle',
+)
+result = True
+for value in (b'x', bytearray(b'x')):
+    owner = type(value).__name__
+    for name in names:
+        try:
+            getattr(value, name)(42)
+        except TypeError as exc:
+            result = result and str(exc) == (
+                owner + '.' + name + '() takes no arguments (1 given)'
+            )
+        else:
+            result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like no-argument method validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_expandtabs_validates_before_reading_receiver() {
+        let source = "\
+result = True
+for value in (b'a\\tb', bytearray(b'a\\tb')):
+    for call, expected in (
+        (lambda: value.expandtabs(2, 3),
+         'expandtabs() takes at most 1 argument (2 given)'),
+        (lambda: value.expandtabs(one=1, two=2),
+         'expandtabs() takes at most 1 keyword argument (2 given)'),
+    ):
+        try:
+            call()
+        except TypeError as exc:
+            result = result and str(exc) == expected
+        else:
+            result = False
+
+value = bytearray(b'a\\tb')
+class TabSize:
+    def __index__(self):
+        value[:] = b'x\\ty'
+        return 4
+result = result and value.expandtabs(TabSize()) == bytearray(b'x   y')
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like expandtabs validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_splitlines_validates_before_reading_receiver() {
+        let source = "\
+result = True
+for value in (b'a\\nb', bytearray(b'a\\nb')):
+    for call, expected in (
+        (lambda: value.splitlines(1, 2),
+         'splitlines() takes at most 1 argument (2 given)'),
+        (lambda: value.splitlines(one=1, two=2),
+         'splitlines() takes at most 1 keyword argument (2 given)'),
+    ):
+        try:
+            call()
+        except TypeError as exc:
+            result = result and str(exc) == expected
+        else:
+            result = False
+
+value = bytearray(b'a\\nb')
+class KeepEnds:
+    def __bool__(self):
+        value[:] = b'x\\ny'
+        return True
+result = result and value.splitlines(KeepEnds()) == [
+    bytearray(b'x\\n'), bytearray(b'y')
+]
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like splitlines validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
 }

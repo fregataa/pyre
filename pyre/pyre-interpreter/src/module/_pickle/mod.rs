@@ -150,10 +150,9 @@ pub(crate) fn call_meth(
     Ok(r)
 }
 
-/// Build a `PyError` whose raised object is an instance of the named
-/// `_pickle` exception class (registered by the `exceptions:` block), with
-/// `msg` as the single argument. Falls back to a generic ValueError carrying
-/// the same text if the class is somehow unavailable.
+/// Build a `PyError` whose raised object is an instance of the named exception
+/// class, with `msg` as the single argument. Falls back to a generic ValueError
+/// carrying the same text if the class is somehow unavailable.
 fn pickle_exc(class_name: &str, msg: String) -> PyError {
     let mut err = PyError::value_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class(class_name) {
@@ -173,29 +172,25 @@ pub(crate) fn pickling_error(msg: impl Into<String>) -> PyError {
     pickle_exc("_pickle.PicklingError", msg.into())
 }
 
+pub(crate) fn eof_error(msg: &str) -> PyError {
+    pickle_exc("EOFError", msg.to_string())
+}
+
 // ── import / dotted attribute resolution (save_global / find_class) ───
 
-/// Return the named module from `sys.modules`, importing it only if absent.
-/// An already-loaded module is returned directly: re-running `importhook`
-/// for a loaded module (notably `builtins`) can rebind the canonical module
-/// object and corrupt name resolution elsewhere. The `sys.modules` entry
-/// (not the `importhook` return) is authoritative.
+/// PyPy `W_Unpickler.find_class`: call builtin `__import__(name)` first, then
+/// return the authoritative `sys.modules[name]` entry.
+///
+/// The import call is required even when the entry already exists:
+/// `dunder_import` waits on `__spec__._initializing` via the module lock, so a
+/// concurrent unpickler cannot observe a half-executed module.  Its initialized
+/// fast path does not reload or rebind modules such as `builtins`.
 pub(crate) fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
-    if let Some(m) = crate::importing::get_sys_module(name) {
-        return Ok(m);
-    }
-    // The `builtins` module lives on the execution context, not in the
-    // importable `sys.modules` cache; re-running `importhook` on it would
-    // reinitialise builtin state (and orphan the live exception classes).
-    if name == "builtins" {
-        if let Some(b) = ec_builtins_module() {
-            return Ok(b);
-        }
-    }
-    crate::importing::importhook(
+    crate::importing::dunder_import(
         name,
         pyre_object::w_none(),
-        pyre_object::listobject::w_list_new(vec![pyre_object::w_str_new("*")]),
+        pyre_object::w_none(),
+        pyre_object::w_none(),
         0,
         crate::call::getexecutioncontext(),
     )?;
@@ -212,11 +207,6 @@ fn current_ec() -> Option<*const crate::PyExecutionContext> {
     }
     let ec = unsafe { (*frame).execution_context };
     if ec.is_null() { None } else { Some(ec) }
-}
-
-/// The current execution context's `builtins` module, via the live frame.
-fn ec_builtins_module() -> Option<PyObjectRef> {
-    current_ec().map(|ec| unsafe { (*ec).get_builtin() })
 }
 
 /// Resolve a name in the `builtins` module through the execution context's
@@ -421,6 +411,61 @@ pub(crate) fn getattribute_dotted(
         cur = crate::baseobjspace::getattr_str(cur, sub)?;
     }
     Ok((cur, parent))
+}
+
+/// Wrapped-string variant of `_getattribute`, used when a qualname contains a
+/// lone surrogate and therefore has no Rust `&str` view.
+pub(crate) fn getattribute_dotted_obj(
+    obj: PyObjectRef,
+    w_qualname: PyObjectRef,
+) -> Result<(PyObjectRef, PyObjectRef), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let mut cur_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_qualname);
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_dot = pyre_object::w_str_new(".");
+    pyre_object::gc_roots::pin_root(w_dot);
+    let dot_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_parts = call_meth(
+        pyre_object::gc_roots::shadow_stack_get(qualname_slot),
+        "split",
+        &[pyre_object::gc_roots::shadow_stack_get(dot_slot)],
+    )?;
+    pyre_object::gc_roots::pin_root(w_parts);
+    let parts_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let n = unsafe {
+        pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(parts_slot))
+    };
+    let mut parent_slot = cur_slot;
+    for i in 0..n {
+        let w_part = unsafe {
+            pyre_object::listobject::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(parts_slot),
+                i as i64,
+            )
+            .unwrap()
+        };
+        if unsafe { pyre_object::w_str_get_wtf8(w_part) }.as_bytes() == b"<locals>" {
+            let qualname_repr =
+                unsafe { crate::py_repr(pyre_object::gc_roots::shadow_stack_get(qualname_slot)) }
+                    .unwrap_or_else(|_| "<qualname>".to_string());
+            return Err(PyError::attribute_error(format!(
+                "Can't get local attribute {qualname_repr}"
+            )));
+        }
+        parent_slot = cur_slot;
+        let next = crate::baseobjspace::getattr(
+            pyre_object::gc_roots::shadow_stack_get(cur_slot),
+            w_part,
+        )?;
+        pyre_object::gc_roots::pin_root(next);
+        cur_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    }
+    Ok((
+        pyre_object::gc_roots::shadow_stack_get(cur_slot),
+        pyre_object::gc_roots::shadow_stack_get(parent_slot),
+    ))
 }
 
 /// Resolve `module_name.name` to the live object, importing the module

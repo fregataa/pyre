@@ -545,6 +545,11 @@ pub unsafe fn function_retag_method_descriptor(obj: PyObjectRef) {
     }
 }
 
+/// Allocate an immutable ordinary method descriptor backed by `BuiltinCode`.
+pub fn function_new_method_descriptor(code: *const (), name: String) -> PyObjectRef {
+    function_new_impl(&METHOD_DESCRIPTOR_TYPE, code, name, PY_NULL, PY_NULL, false)
+}
+
 /// function.py:385-388 — `_check_code_mutable(attr)`:
 ///
 /// ```python
@@ -598,13 +603,36 @@ pub unsafe fn is_slot_wrapper(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SLOT_WRAPPER_TYPE) }
 }
 
+#[inline]
+pub unsafe fn is_method_descriptor(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &METHOD_DESCRIPTOR_TYPE) }
+}
+
+/// PyPy `_Method(w_function, w_instance)` binding with CPython 3.14's
+/// `builtin_function_or_method` public surface and `m_module = None`.
+pub fn builtin_bound_method_new(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_class: PyObjectRef,
+) -> PyObjectRef {
+    let method = pyre_object::w_method_new(descr, obj, w_class);
+    unsafe {
+        pyre_object::function::w_method_set_public_class(
+            method,
+            crate::typedef::gettypeobject(&BUILTIN_FUNCTION_TYPE),
+        );
+        pyre_object::function::w_method_set_module(method, pyre_object::w_none());
+    }
+    method
+}
+
 /// Function-layout carriers accepted by the interpreter call machinery.
 ///
 /// Keep this separate from [`is_function`]: wrapper descriptors must not
 /// expose Python-function metadata such as `__code__` or `__globals__`.
 #[inline]
 pub unsafe fn is_function_carrier(obj: PyObjectRef) -> bool {
-    unsafe { is_function(obj) || is_slot_wrapper(obj) }
+    unsafe { is_function(obj) || is_slot_wrapper(obj) || is_method_descriptor(obj) }
 }
 
 /// Whether this Function carrier wraps an interp-level BuiltinCode rather
@@ -914,6 +942,38 @@ pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
             return pyre_object::w_str_get_value(cached).to_string();
         }
         function_get_name(obj).to_string()
+    }
+}
+
+/// Return the application-level `__qualname__` object.
+///
+/// PyPy keeps the qualified name on the `Function` itself rather than in a
+/// side table.  CPython 3.14 additionally preserves the exact unicode object:
+/// `func_get_qualname` returns `func_qualname`, and `func_set_qualname` stores
+/// the supplied object with `Py_NewRef`.  Thus, after `f.__qualname__ = value`,
+/// `f.__qualname__ is value` must hold, including for a `str` subclass.
+///
+/// Legacy construction paths leave `w_qualname` as `PY_NULL`; materialise the
+/// `qualname or self.name` fallback once and retain it in the same owner field.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if !(*(obj as *const Function)).w_qualname.is_null() {
+            return (*(obj as *const Function)).w_qualname;
+        }
+        // `w_str_new` is a collection point that can relocate the function, so
+        // pin the receiver and reload it before storing through it.  The name
+        // itself lives in the off-GC `Box<String>` and does not move.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(obj);
+        let w_qualname = pyre_object::w_str_new(function_get_name(obj));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_qualname = w_qualname;
+        w_qualname
     }
 }
 
@@ -2901,6 +2961,22 @@ mod tests {
             assert_eq!(function_get_name(obj), "myfunc");
             assert_eq!(function_get_globals_obj(obj), w_globals);
             assert!(function_get_closure(obj).is_null());
+        }
+    }
+
+    #[test]
+    fn function_qualname_getter_preserves_the_stored_object() {
+        crate::test_hooks::install_hash_hook();
+        let raw_code = 0xDEAD_BEEF as *const ();
+        let w_code = crate::w_code_new(raw_code);
+        let w_globals = pyre_object::w_module_dict_new();
+        let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
+        let w_qualname = pyre_object::w_str_new("pkg.myfunc");
+
+        unsafe {
+            function_set_qualname(obj, w_qualname);
+            assert_eq!(function_get_qualname_obj(obj), w_qualname);
+            assert_eq!(function_get_qualname_obj(obj), w_qualname);
         }
     }
 

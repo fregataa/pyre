@@ -110,6 +110,22 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
 }
 
 pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+    // CPython 3.14 bytearray_mod_lock_held increments `ob_exports` before
+    // `_PyBytes_FormatEx` observes the receiver and decrements it after every
+    // success/error return.  Re-entrant formatting callbacks may overwrite
+    // bytes, but cannot resize and invalidate the live pointer/length pair.
+    let receiver_exported = pyre_object::bytearrayobject::is_bytearray(fmt);
+    if receiver_exported {
+        pyre_object::bytearrayobject::w_bytearray_exports_incref(fmt);
+    }
+    let formatted = bytes_format_percent_inner(fmt, args);
+    if receiver_exported {
+        pyre_object::bytearrayobject::w_bytearray_exports_decref(fmt);
+    }
+    formatted
+}
+
+unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt);
     let format = CFormatBytes::parse_from_bytes(fmt_bytes)
         .map_err(|err| PyError::value_error(err.to_string()))?;
@@ -307,7 +323,21 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> Result<String, PyError> 
     }
 }
 
+/// Reserve a spec's padding run before the formatter materialises it.
+///
+/// `min_field_width` reaches here straight from Python — `'%*s' % (n, x)`
+/// takes it from the argument tuple — and the fill run is built eagerly, so
+/// an unsatisfiable width has to unwind rather than abort the process. The
+/// fill character is always ASCII, so `width` bounds the run in bytes.
+fn check_min_field_width(spec: &CFormatSpec) -> Result<(), PyError> {
+    if let Some(CFormatQuantity::Amount(width)) = spec.min_field_width {
+        crate::builtins::try_vec_with_capacity::<u8>(width)?;
+    }
+    Ok(())
+}
+
 unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    check_min_field_width(spec)?;
     match &spec.format_type {
         CFormatType::String(conversion) => match conversion {
             CFormatConversion::Repr | CFormatConversion::Ascii => {
@@ -386,9 +416,13 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
     } else if has_dunder(obj, "__index__") {
         crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
     } else {
+        let type_name = match crate::typedef::r#type(obj) {
+            Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
+            None => crate::baseobjspace::object_functionstr_type_name(obj),
+        };
         return Err(PyError::type_error(format!(
             "%c requires an integer in range(256) or a single byte, not {}",
-            crate::baseobjspace::object_functionstr_type_name(obj)
+            type_name
         )));
     };
     let overflow = || PyError::new(PyErrorKind::OverflowError, "%c arg not in range(256)");
@@ -419,6 +453,7 @@ unsafe fn spec_format_string(
     obj: PyObjectRef,
     idx: usize,
 ) -> Result<Wtf8Buf, PyError> {
+    check_min_field_width(spec)?;
     match &spec.format_type {
         CFormatType::String(conversion) => {
             let result = match conversion {
@@ -551,7 +586,7 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
         crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
     } else {
         let tn = match crate::typedef::r#type(obj) {
-            Some(w_type) => crate::baseobjspace::type_repr_qualified_name(w_type.as_ptr()),
+            Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
             None => crate::baseobjspace::object_functionstr_type_name(obj),
         };
         return Err(PyError::type_error(format!(

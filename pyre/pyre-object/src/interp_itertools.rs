@@ -7,6 +7,57 @@
 
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
+use std::cell::UnsafeCell;
+use std::sync::LazyLock;
+
+// PyPy's GIL makes W_Count.next_w's read/add/write sequence indivisible.
+// Pyre is free-threaded, so preserve W_Count as the sole semantic owner and
+// serialize only that sequence with the same address-striped reentrant shape
+// used for PyPy's GIL-protected list/dict transitions.
+struct ForkCountLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
+unsafe impl Sync for ForkCountLock {}
+
+impl ForkCountLock {
+    fn new() -> Self {
+        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
+    }
+
+    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
+    }
+}
+
+static COUNT_LOCKS: LazyLock<Vec<ForkCountLock>> =
+    LazyLock::new(|| (0..256).map(|_| ForkCountLock::new()).collect());
+
+pub type CountGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_count_lock(obj: PyObjectRef) -> CountGuard {
+    let lock = COUNT_LOCKS[(obj as usize >> 4) & (COUNT_LOCKS.len() - 1)].get();
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = majit_gc::gc_sync::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
+}
+
+pub fn count_locks_after_fork_child() {
+    for lock in COUNT_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+}
 
 // ── W_Count — pypy/module/itertools/interp_itertools.py:class W_Count ──
 //
@@ -321,6 +372,442 @@ pub fn w_filterfalse_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> P
 #[inline]
 pub unsafe fn is_filterfalse(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FILTERFALSE_TYPE) }
+}
+
+// ── W_ISlice — pypy/module/itertools/interp_itertools.py:class W_ISlice ──
+//
+// ```python
+// class W_ISlice(W_Root):
+//     def __init__(self, space, w_iterable, w_startstop, args_w):
+//         self.iterable = space.iter(w_iterable)
+//         ...
+//         self.count = rffi.cast(rffi.UNSIGNED, 0)
+//         self.next = rffi.cast(rffi.UNSIGNED, start)
+//         self.stop = stop
+//         self.step = rffi.cast(rffi.UNSIGNED, step)
+// ```
+//
+// A null `iterable` is PyPy's `self.iterable = None` exhausted sentinel.
+// The remaining fields retain the exact unsigned/signed split used by the
+// upstream object: count/next/step are `rffi.UNSIGNED`, while -1 in `stop`
+// represents an unbounded slice.
+#[pyre_class("itertools.islice", static_name = "ISLICE")]
+pub struct W_ISlice {
+    pub iterable: PyObjectRef,
+    pub count: usize,
+    pub next: usize,
+    pub stop: i64,
+    pub step: usize,
+}
+
+/// `iterable` must already be an iterator (`W_ISlice.__init__` applies
+/// `space.iter`).  All numeric arguments have already passed `arg_int_w`.
+pub fn w_islice_new(iterable: PyObjectRef, start: i64, stop: i64, step: i64) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(iterable);
+    W_ISlice::allocate_stable(W_ISlice {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        iterable,
+        count: 0,
+        next: start as usize,
+        stop,
+        step: step as usize,
+    })
+}
+
+/// Check if an object is a `W_ISlice`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_islice(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &ISLICE_TYPE) }
+}
+
+/// Clear the live source after exhaustion, matching
+/// `W_ISlice.next_w/_ignore_items`.
+///
+/// # Safety
+/// `obj` must be a valid `W_ISlice`.
+#[inline]
+pub unsafe fn w_islice_clear_iterable(obj: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ISlice)).iterable = std::ptr::null_mut();
+    }
+}
+
+// ── W_Batched — CPython 3.14 Modules/itertoolsmodule.c:batchedobject ──
+//
+// PyPy's current itertools port predates `batched`; Python 3.14 is the
+// project's compatibility authority for this newer type.  Preserve the
+// upstream object shape: one live iterator, a signed Py_ssize_t-sized batch
+// count whose -1 value latches exhaustion, and the strict flag.
+#[pyre_class("itertools.batched", static_name = "BATCHED")]
+pub struct W_Batched {
+    pub it: PyObjectRef,
+    pub batch_size: isize,
+    pub strict: bool,
+}
+
+/// `it` must already be an iterator (`batched_new_impl` applies
+/// `PyObject_GetIter` before allocating the instance).
+pub fn w_batched_new(it: PyObjectRef, batch_size: isize, strict: bool) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(it);
+    W_Batched::allocate_stable(W_Batched {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        it,
+        batch_size,
+        strict,
+    })
+}
+
+/// Check if an object is a `W_Batched`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_batched(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &BATCHED_TYPE) }
+}
+
+/// Latch the iterator as exhausted and release its source, matching
+/// `batched_next`'s `batch_size = -1` / `Py_CLEAR(bo->it)` paths.
+///
+/// # Safety
+/// `obj` must be a valid `W_Batched`.
+#[inline]
+pub unsafe fn w_batched_set_exhausted(obj: PyObjectRef) {
+    unsafe {
+        let batched = &mut *(obj as *mut W_Batched);
+        batched.batch_size = -1;
+        batched.it = std::ptr::null_mut();
+    }
+}
+
+// ── W_Product — pypy/module/itertools/interp_itertools.py:W_Product ──
+//
+// ```python
+// class W_Product(W_Root):
+//     def __init__(self, space, args_w, w_repeat):
+//         self.gears = [...]
+//         self.indices = [0] * len(self.gears)
+//         self.lst = None
+//         self.stopped = False
+// ```
+//
+// Each translated RPython list is represented by an owned W_ListObject.  The
+// outer `gears` list owns list snapshots of the input pools; `indices` and
+// `lst` preserve the upstream mutable per-iterator state.  A null `lst`
+// represents PyPy's None sentinel before the first result and after rollover.
+#[pyre_class("itertools.product", static_name = "PRODUCT")]
+pub struct W_Product {
+    pub gears: PyObjectRef,
+    pub indices: PyObjectRef,
+    pub lst: PyObjectRef,
+    pub stopped: bool,
+}
+
+pub fn w_product_new(gears: PyObjectRef, indices: PyObjectRef, stopped: bool) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(gears);
+    crate::gc_roots::pin_root(indices);
+    W_Product::allocate_stable(W_Product {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        gears,
+        indices,
+        lst: std::ptr::null_mut(),
+        stopped,
+    })
+}
+
+/// Check if an object is a `W_Product`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_product(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &PRODUCT_TYPE) }
+}
+
+// ── W_Combinations — PyPy interp_itertools.py:W_Combinations ───────
+//
+// `pool_w`, `indices`, and `last_result_w` are the translated equivalents of
+// PyPy's three list attributes.  A null last_result_w is the initial None
+// sentinel.  The signed machine-word `r` matches RPython `int`.
+#[pyre_class("itertools.combinations", static_name = "COMBINATIONS")]
+pub struct W_Combinations {
+    pub pool_w: PyObjectRef,
+    pub indices: PyObjectRef,
+    pub r: isize,
+    pub last_result_w: PyObjectRef,
+    pub stopped: bool,
+}
+
+pub fn w_combinations_new(
+    pool_w: PyObjectRef,
+    indices: PyObjectRef,
+    r: isize,
+    stopped: bool,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(pool_w);
+    crate::gc_roots::pin_root(indices);
+    W_Combinations::allocate_stable(W_Combinations {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        pool_w,
+        indices,
+        r,
+        last_result_w: std::ptr::null_mut(),
+        stopped,
+    })
+}
+
+/// Check if an object is a `W_Combinations`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_combinations(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COMBINATIONS_TYPE) }
+}
+
+// ── W_CombinationsWithReplacement — PyPy interp_itertools.py ───────
+//
+// PyPy subclasses W_Combinations and inherits the same five attributes.
+// Rust's concrete GC layouts are flat, so repeat those fields in the same
+// order while the interpreter shares the inherited next-state algorithm.
+#[pyre_class(
+    "itertools.combinations_with_replacement",
+    static_name = "COMBINATIONS_WITH_REPLACEMENT"
+)]
+pub struct W_CombinationsWithReplacement {
+    pub pool_w: PyObjectRef,
+    pub indices: PyObjectRef,
+    pub r: isize,
+    pub last_result_w: PyObjectRef,
+    pub stopped: bool,
+}
+
+pub fn w_combinations_with_replacement_new(
+    pool_w: PyObjectRef,
+    indices: PyObjectRef,
+    r: isize,
+    stopped: bool,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(pool_w);
+    crate::gc_roots::pin_root(indices);
+    W_CombinationsWithReplacement::allocate_stable(W_CombinationsWithReplacement {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        pool_w,
+        indices,
+        r,
+        last_result_w: std::ptr::null_mut(),
+        stopped,
+    })
+}
+
+/// Check if an object is a `W_CombinationsWithReplacement`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_combinations_with_replacement(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COMBINATIONS_WITH_REPLACEMENT_TYPE) }
+}
+
+// ── W_Permutations — PyPy interp_itertools.py:W_Permutations ───────
+//
+// `pool_w`, `indices`, and `cycles` are the translated RPython list
+// attributes.  PyPy leaves indices/cycles unset when r > len(pool_w), which
+// is represented by null list pointers while `stopped` is true.
+#[pyre_class("itertools.permutations", static_name = "PERMUTATIONS")]
+pub struct W_Permutations {
+    pub pool_w: PyObjectRef,
+    pub r: isize,
+    pub stopped: bool,
+    pub raised_stop_iteration: bool,
+    pub indices: PyObjectRef,
+    pub cycles: PyObjectRef,
+    pub started: bool,
+}
+
+pub fn w_permutations_new(
+    pool_w: PyObjectRef,
+    r: isize,
+    stopped: bool,
+    indices: PyObjectRef,
+    cycles: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(pool_w);
+    if !indices.is_null() {
+        crate::gc_roots::pin_root(indices);
+    }
+    if !cycles.is_null() {
+        crate::gc_roots::pin_root(cycles);
+    }
+    W_Permutations::allocate_stable(W_Permutations {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        pool_w,
+        r,
+        stopped,
+        raised_stop_iteration: stopped,
+        indices,
+        cycles,
+        started: false,
+    })
+}
+
+/// Check if an object is a `W_Permutations`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_permutations(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &PERMUTATIONS_TYPE) }
+}
+
+// ── W_GroupBy / W_GroupByIterator — PyPy interp_itertools.py ───────
+//
+// The parent owns the live iterator and shared key/value cursor.  A strong
+// `w_currgrouper` edge mirrors PyPy's attribute and invalidates an older group
+// by identity whenever the parent advances.
+#[pyre_class("itertools.groupby", static_name = "GROUPBY")]
+pub struct W_GroupBy {
+    pub w_iterator: PyObjectRef,
+    pub w_keyfunc: PyObjectRef,
+    pub w_tgtkey: PyObjectRef,
+    pub w_currkey: PyObjectRef,
+    pub w_currvalue: PyObjectRef,
+    pub w_currgrouper: PyObjectRef,
+}
+
+pub fn w_groupby_new(w_iterator: PyObjectRef, w_keyfunc: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterator);
+    crate::gc_roots::pin_root(w_keyfunc);
+    W_GroupBy::allocate_stable(W_GroupBy {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterator,
+        w_keyfunc,
+        w_tgtkey: std::ptr::null_mut(),
+        w_currkey: std::ptr::null_mut(),
+        w_currvalue: std::ptr::null_mut(),
+        w_currgrouper: std::ptr::null_mut(),
+    })
+}
+
+#[inline]
+pub unsafe fn is_groupby(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &GROUPBY_TYPE) }
+}
+
+#[pyre_class("itertools._grouper", static_name = "GROUPBY_ITERATOR")]
+pub struct W_GroupByIterator {
+    pub groupby: PyObjectRef,
+    pub w_tgtkey: PyObjectRef,
+}
+
+pub fn w_groupby_iterator_new(groupby: PyObjectRef, w_tgtkey: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(groupby);
+    crate::gc_roots::pin_root(w_tgtkey);
+    let grouper = W_GroupByIterator::allocate_stable(W_GroupByIterator {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        groupby,
+        w_tgtkey,
+    });
+    unsafe {
+        (*(groupby as *mut W_GroupBy)).w_currgrouper = grouper;
+        crate::gc_hook::try_gc_write_barrier(groupby as *mut u8);
+    }
+    grouper
+}
+
+#[inline]
+pub unsafe fn is_groupby_iterator(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &GROUPBY_ITERATOR_TYPE) }
+}
+
+// ── W_TeeChainedListNode / W_TeeIterable — PyPy interp_itertools.py ─
+//
+// Each shared node owns one cached item and the next node.  Every tee copy
+// holds its own cursor into this same chain while sharing the source iterator.
+#[pyre_class("itertools._tee_dataobject", static_name = "TEE_DATAOBJECT")]
+pub struct W_TeeChainedListNode {
+    pub w_next: PyObjectRef,
+    pub w_obj: PyObjectRef,
+    pub running: bool,
+}
+
+pub fn w_tee_chained_list_node_new() -> PyObjectRef {
+    W_TeeChainedListNode::allocate_stable(W_TeeChainedListNode {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_next: std::ptr::null_mut(),
+        w_obj: std::ptr::null_mut(),
+        running: false,
+    })
+}
+
+#[inline]
+pub unsafe fn is_tee_dataobject(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &TEE_DATAOBJECT_TYPE) }
+}
+
+#[pyre_class("itertools._tee", static_name = "TEE_ITERABLE")]
+pub struct W_TeeIterable {
+    pub w_iterator: PyObjectRef,
+    pub w_chained_list: PyObjectRef,
+}
+
+pub fn w_tee_iterable_new(w_iterator: PyObjectRef, w_chained_list: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterator);
+    if !w_chained_list.is_null() {
+        crate::gc_roots::pin_root(w_chained_list);
+    }
+    W_TeeIterable::allocate_stable(W_TeeIterable {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterator,
+        w_chained_list,
+    })
+}
+
+#[inline]
+pub unsafe fn is_tee_iterable(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &TEE_ITERABLE_TYPE) }
 }
 
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
@@ -761,6 +1248,160 @@ mod tests {
         assert_eq!(
             <W_FilterFalse as crate::lltype::GcType>::SIZE,
             W_FILTERFALSE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_islice_gc_descriptor_traces_source_iterator() {
+        assert_eq!(W_ISLICE_GC_PTR_OFFSETS.len(), 1);
+        assert_eq!(
+            W_ISLICE_GC_PTR_OFFSETS[0],
+            std::mem::offset_of!(W_ISlice, iterable)
+        );
+        assert_eq!(
+            <W_ISlice as crate::lltype::GcType>::SIZE,
+            W_ISLICE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_batched_gc_descriptor_traces_source_iterator() {
+        assert_eq!(W_BATCHED_GC_PTR_OFFSETS.len(), 1);
+        assert_eq!(
+            W_BATCHED_GC_PTR_OFFSETS[0],
+            std::mem::offset_of!(W_Batched, it)
+        );
+        assert_eq!(
+            <W_Batched as crate::lltype::GcType>::SIZE,
+            W_BATCHED_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_product_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_PRODUCT_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Product, gears),
+                std::mem::offset_of!(W_Product, indices),
+                std::mem::offset_of!(W_Product, lst),
+            ]
+        );
+        assert_eq!(
+            <W_Product as crate::lltype::GcType>::SIZE,
+            W_PRODUCT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_combinations_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_COMBINATIONS_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Combinations, pool_w),
+                std::mem::offset_of!(W_Combinations, indices),
+                std::mem::offset_of!(W_Combinations, last_result_w),
+            ]
+        );
+        assert_eq!(
+            <W_Combinations as crate::lltype::GcType>::SIZE,
+            W_COMBINATIONS_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_combinations_with_replacement_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_COMBINATIONS_WITH_REPLACEMENT_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_CombinationsWithReplacement, pool_w),
+                std::mem::offset_of!(W_CombinationsWithReplacement, indices),
+                std::mem::offset_of!(W_CombinationsWithReplacement, last_result_w),
+            ]
+        );
+        assert_eq!(
+            <W_CombinationsWithReplacement as crate::lltype::GcType>::SIZE,
+            W_COMBINATIONS_WITH_REPLACEMENT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_permutations_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_PERMUTATIONS_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Permutations, pool_w),
+                std::mem::offset_of!(W_Permutations, indices),
+                std::mem::offset_of!(W_Permutations, cycles),
+            ]
+        );
+        assert_eq!(
+            <W_Permutations as crate::lltype::GcType>::SIZE,
+            W_PERMUTATIONS_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_groupby_gc_descriptor_traces_shared_cursor() {
+        assert_eq!(
+            W_GROUPBY_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_GroupBy, w_iterator),
+                std::mem::offset_of!(W_GroupBy, w_keyfunc),
+                std::mem::offset_of!(W_GroupBy, w_tgtkey),
+                std::mem::offset_of!(W_GroupBy, w_currkey),
+                std::mem::offset_of!(W_GroupBy, w_currvalue),
+                std::mem::offset_of!(W_GroupBy, w_currgrouper),
+            ]
+        );
+        assert_eq!(
+            <W_GroupBy as crate::lltype::GcType>::SIZE,
+            W_GROUPBY_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_groupby_iterator_gc_descriptor_traces_parent_and_key() {
+        assert_eq!(
+            W_GROUPBY_ITERATOR_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_GroupByIterator, groupby),
+                std::mem::offset_of!(W_GroupByIterator, w_tgtkey),
+            ]
+        );
+        assert_eq!(
+            <W_GroupByIterator as crate::lltype::GcType>::SIZE,
+            W_GROUPBY_ITERATOR_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_tee_dataobject_gc_descriptor_traces_item_and_next() {
+        assert_eq!(
+            W_TEE_DATAOBJECT_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_TeeChainedListNode, w_next),
+                std::mem::offset_of!(W_TeeChainedListNode, w_obj),
+            ]
+        );
+        assert_eq!(
+            <W_TeeChainedListNode as crate::lltype::GcType>::SIZE,
+            W_TEE_DATAOBJECT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_tee_iterable_gc_descriptor_traces_source_and_cursor() {
+        assert_eq!(
+            W_TEE_ITERABLE_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_TeeIterable, w_iterator),
+                std::mem::offset_of!(W_TeeIterable, w_chained_list),
+            ]
+        );
+        assert_eq!(
+            <W_TeeIterable as crate::lltype::GcType>::SIZE,
+            W_TEE_ITERABLE_OBJECT_SIZE
         );
     }
 

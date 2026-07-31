@@ -753,6 +753,18 @@ pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
     unsafe { (*func_obj).func }
 }
 
+/// Whether two builtin implementations are the same function.
+///
+/// `std::ptr::fn_addr_eq` is bound on the `core::marker::FnPtr` lang item,
+/// which Charon does not model — every call site it appears in resolves to
+/// `Error during trait resolution` and leaves a hole in the extracted body.
+/// Both operands are already the same fn-pointer type here, so their
+/// addresses answer the question without the trait.
+#[inline]
+pub fn builtin_code_fn_eq(a: BuiltinCodeFn, b: BuiltinCodeFn) -> bool {
+    a as usize == b as usize
+}
+
 /// Record the type whose namespace this code object was installed in, so its
 /// receiver is checked before the implementation runs.
 ///
@@ -1047,6 +1059,18 @@ pub fn make_builtin_function_as_builtin(name: &'static str, func: BuiltinCodeFn)
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`
+/// descriptors need the builtin-function carrier for `copyreg` parity while
+/// still routing keyword-only arguments through the gateway binder.
+pub fn make_builtin_function_as_builtin_with_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_signature(name, func, None, signature);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// `make_builtin_function` for a builtin with a declared argument
 /// `Signature`, so the call path binds keyword arguments into positional
 /// order before the function runs (see `call::bind_kwargs_to_signature`).
@@ -1159,6 +1183,22 @@ pub fn make_slot_wrapper_with_arity(
     crate::function_new_slot_wrapper(code as *const (), name.to_string())
 }
 
+/// Build a CPython-compatible variadic slot-wrapper descriptor.
+pub fn make_slot_wrapper(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
+    let code = builtin_code_new(name, func);
+    crate::function_new_slot_wrapper(code as *const (), name.to_string())
+}
+
+/// Build a CPython-compatible ordinary method descriptor with fixed arity.
+pub fn make_method_descriptor_with_arity(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_arity(name, func, arity);
+    crate::function_new_method_descriptor(code as *const (), name.to_string())
+}
+
 /// `make_builtin_function` with `fast_natural_arity = PASSTHROUGHARGS1` —
 /// PyPy `BuiltinCodePassThroughArguments1` registration shape.
 pub fn make_builtin_function_passthrough_args1(
@@ -1175,6 +1215,20 @@ pub fn make_builtin_function_passthrough_args1(
 /// must not synthesize a bound method.
 pub fn make_module_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// `make_module_builtin_function` carrying PyPy `BuiltinCode.docstring`.
+///
+/// PyPy's gateway derives this from the wrapped interpreter function's
+/// `__doc__`; Rust functions have no runtime doc attribute, so line-by-line
+/// ports pass the upstream literal at registration.
+pub fn make_module_builtin_function_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 

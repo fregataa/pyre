@@ -611,6 +611,14 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
+/// `interp_array.py W_ArrayBase.__del__`: free the raw element buffer when
+/// the managed array header is swept.
+unsafe fn array_object_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_object::interp_array::w_array_dealloc(obj_addr as pyre_object::PyObjectRef);
+    }
+}
+
 /// Reclaim the owned Rust heap (source string, token / error vectors, line
 /// table) of a swept tokenizer iterator, which `register_pyre_class` registers
 /// through the generic no-destructor path.
@@ -955,7 +963,20 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
     if !view_ptr.is_null() {
         if unsafe { (*mv).owns_export } {
-            unsafe { (&*view_ptr).backing().release_export() };
+            let owner = unsafe { (&*view_ptr).w_obj() };
+            if unsafe { pyre_object::memoryview::is_w_buffer_wrapper(owner) } {
+                // `bufferwrapper_releasebuf` without a Python execution
+                // context: end the returned memoryview's active Py_buffer
+                // export and drop the wrapper edges.  The returned view owns
+                // (and eventually releases) its own native backing export.
+                let returned = unsafe { pyre_object::memoryview::w_buffer_wrapper_mv(owner) };
+                if !returned.is_null() {
+                    unsafe { pyre_object::memoryview::w_memoryview_exports_decref(returned) };
+                }
+                unsafe { pyre_object::memoryview::w_buffer_wrapper_clear(owner) };
+            } else {
+                unsafe { (&*view_ptr).backing().release_export() };
+            }
         }
         drop(unsafe { Box::from_raw(view_ptr) });
     }
@@ -1238,11 +1259,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // other `PyObject`-layout class chains its `parent` field to
     // this id so `assign_inheritance_ids` (normalizecalls.py:373-389)
     // produces a `subclassrange_{min,max}` covering every
-    // descendant. The size is `sizeof(PyObject)` because instances
-    // tagged with `&INSTANCE_TYPE` (i.e. user `object()` calls)
-    // carry only the `ob_type` header.
-    let object_tid = gc.register_type(TypeInfo::object(
+    // descendant. The size is `sizeof(PyObject)` because instances tagged
+    // with `&INSTANCE_TYPE` (i.e. user `object()` calls) carry only this
+    // header. RPython's OBJECT has only `typeptr`; pyre's augmented header
+    // also keeps the app-level class in `w_class`. Register that managed edge
+    // on the root so every ordinary offset-traced subclass inherits it
+    // through its embedded PyObject header, matching GcStruct `super` field
+    // tracing.
+    let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(
         std::mem::size_of::<pyre_object::PyObject>(),
+        vec![std::mem::offset_of!(pyre_object::PyObject, w_class)],
     ));
     debug_assert_eq!(object_tid, OBJECT_GC_TYPE_ID);
     // W_IntObject / W_FloatObject carry `PyObject.ob_type` at offset 0,
@@ -1628,6 +1654,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     );
     pytype_to_tid.insert(
         &pyre_interpreter::function::SLOT_WRAPPER_TYPE as *const _ as usize,
+        function_tid,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_interpreter::function::METHOD_DESCRIPTOR_TYPE as *const _ as usize,
+        function_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_interpreter::function::METHOD_DESCRIPTOR_TYPE as *const _ as usize,
         function_tid,
     );
     // Cell / Method / W_SliceObject — typed payload
@@ -2678,15 +2713,37 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_Array (`array.array`) — typed payload via `#[pyre_class]`
-    // in AUTO-ID mode; its elements are unboxed scalars in an off-GC
-    // `*mut Vec<u8>` buffer (the bytearray storage model), so the
-    // descriptor reports zero traced pointer fields.  Tail of the tid
-    // chain.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_object::interp_array::W_Array as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
+    // in AUTO-ID mode. Its elements are unboxed scalars in a raw
+    // `*mut Vec<u8>` buffer, released by W_ArrayBase.__del__; the descriptor
+    // traces the object-resident mapdict, weakref, and indexed-slot fields.
+    // Tail of the tid chain.
+    {
+        let array_descr = <pyre_object::interp_array::W_Array
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let array_tid = gc.register_type(
+            TypeInfo::object_subclass_with_gc_ptrs(
+                array_descr.object_size,
+                object_tid,
+                array_descr.ptr_offsets.to_vec(),
+            )
+            .with_destructor_fn(array_object_destructor),
+        );
+        if array_descr.gc_type_id.is_unassigned() {
+            array_descr.gc_type_id.set(array_tid);
+        } else {
+            debug_assert_eq!(array_tid, array_descr.gc_type_id.get());
+        }
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            array_descr.pytype_ptr as usize,
+            array_tid,
+        );
+        pytype_to_tid.insert(array_descr.pytype_ptr as usize, array_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            array_descr.pytype_ptr as usize,
+            array_descr.ptr_offsets,
+        );
+    }
     // W_Chain (`itertools.chain`) — typed payload via `#[pyre_class]` in
     // AUTO-ID mode.  Both the `w_iterables` source iterator and the current
     // sub-iterator `w_it` are owned solely by the W_Chain (no external
@@ -3070,6 +3127,72 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::thread::W_Local
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // W_ISlice (`itertools.islice`) owns its live source iterator.  Append
+    // this new rclass.OBJECT type after every existing Python-visible type so
+    // their stable AUTO-IDs remain unchanged; its sole pointer field is then
+    // forwarded by the generated offset trace.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_ISlice
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // W_Batched is the next Python-visible AUTO-ID after W_ISlice.  Keep the
+    // append-only ordering so all previously assigned IDs remain stable.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Batched
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Product
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Combinations
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_CombinationsWithReplacement
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Permutations
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_GroupBy
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_GroupByIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_TeeChainedListNode
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_TeeIterable
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical
@@ -3083,6 +3206,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         deque_block_descr.ptr_offsets.to_vec(),
     ));
     deque_block_descr.gc_type_id.set(deque_block_tid);
+    // CPython `_buffer_wrapper`: two ordinary inline GC edges (`mv`, `obj`).
+    // Append it after every pre-existing object and the deque's internal
+    // block so no fixed payload or Python-visible AUTO-ID is renumbered.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::memoryview::W_BufferWrapper
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
@@ -8258,6 +8390,15 @@ fn compile_and_run_once(
     );
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
+    if tracing_finished
+        && std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some()
+        && let Some(trace_id) = driver.meta_interp().compiled_root_trace_id(compiled_key)
+    {
+        eprintln!(
+            "[dynasm-compile] trace={trace_id} key={compiled_key} function={} file={}",
+            code.qualname, code.source_path
+        );
+    }
     if tracing_finished {
         // warmstate.py:437-444 `finally`: the starting cell owns JC_TRACING
         // even when a cross-loop cut attaches the token to another key.

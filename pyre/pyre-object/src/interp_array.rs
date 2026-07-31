@@ -27,6 +27,12 @@ pub struct W_Array {
     /// Number of active buffer exports.  Size-changing operations are
     /// forbidden while this is non-zero (`interp_array.py::_check_resize`).
     pub exports: i64,
+    /// Mapdict `dict` / weakref SPECIAL slots and indexed `__slots__`
+    /// storage for user subclasses.  PyPy's translated `W_ArrayBase`
+    /// receives these fields from its mapdict mixins.
+    pub w_dict: PyObjectRef,
+    pub w_weakreflifeline: PyObjectRef,
+    pub w_slots: PyObjectRef,
 }
 
 /// The supported typecodes, in Python 3.14's `array.typecodes` order.
@@ -54,7 +60,7 @@ pub fn typecode_itemsize(tc: u8) -> Option<u8> {
 /// `typecode_itemsize(typecode)` (the caller validates the code).
 pub fn w_array_new(typecode: u8, itemsize: u8) -> PyObjectRef {
     let data = crate::lltype::malloc_raw(Vec::<u8>::new());
-    W_Array::allocate(W_Array {
+    W_Array::allocate_stable(W_Array {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -63,6 +69,9 @@ pub fn w_array_new(typecode: u8, itemsize: u8) -> PyObjectRef {
         itemsize,
         data,
         exports: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+        w_slots: PY_NULL,
     })
 }
 
@@ -70,7 +79,7 @@ pub fn w_array_new(typecode: u8, itemsize: u8) -> PyObjectRef {
 /// must be a multiple of `itemsize`.
 pub fn w_array_from_bytes(typecode: u8, itemsize: u8, bytes: Vec<u8>) -> PyObjectRef {
     let data = crate::lltype::malloc_raw(bytes);
-    W_Array::allocate(W_Array {
+    W_Array::allocate_stable(W_Array {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -79,7 +88,69 @@ pub fn w_array_from_bytes(typecode: u8, itemsize: u8, bytes: Vec<u8>) -> PyObjec
         itemsize,
         data,
         exports: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+        w_slots: PY_NULL,
     })
+}
+
+/// `W_ArrayBase.__del__`: release the raw element buffer when the managed
+/// array header is swept.
+///
+/// # Safety
+/// `obj` must point to a live `W_Array` and this function must run at most
+/// once for that allocation.
+pub unsafe fn w_array_dealloc(obj: PyObjectRef) {
+    let array = unsafe { &mut *(obj as *mut W_Array) };
+    if !array.data.is_null() {
+        unsafe { drop(Box::from_raw(array.data)) };
+        array.data = std::ptr::null_mut();
+    }
+}
+
+#[inline]
+pub unsafe fn w_array_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Array)).w_dict }
+}
+
+#[inline]
+pub unsafe fn w_array_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe { (*(obj as *mut W_Array)).w_dict = w_dict };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_array_getweakref(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Array)).w_weakreflifeline }
+}
+
+#[inline]
+pub unsafe fn w_array_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
+    unsafe { (*(obj as *mut W_Array)).w_weakreflifeline = lifeline };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// Address of `W_Array::w_slots` for the shared slot helpers.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Array`.
+unsafe fn array_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
+    unsafe { &mut (*(obj as *mut W_Array)).w_slots }
+}
+
+/// Read one app-level `__slots__` entry from an array subclass.
+pub unsafe fn w_array_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    unsafe { crate::slots::slot_get(obj, index, array_slots_field) }
+}
+
+/// Write one app-level `__slots__` entry on an array subclass.
+pub unsafe fn w_array_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    unsafe { crate::slots::slot_set(obj, index, value, array_slots_field) }
+}
+
+/// Clear one app-level `__slots__` entry on an array subclass.
+pub unsafe fn w_array_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    unsafe { crate::slots::slot_del(obj, index, array_slots_field) }
 }
 
 /// # Safety
@@ -219,10 +290,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn w_array_gc_descriptor_has_no_traced_pointers() {
-        // Elements are unboxed scalars in an off-GC byte buffer, so the
-        // header carries no traced edges.
-        assert_eq!(W_ARRAY_GC_PTR_OFFSETS.len(), 0);
+    fn w_array_gc_descriptor_traces_subclass_state() {
+        // Elements remain unboxed in the raw buffer; only the mapdict,
+        // weakref, and indexed-slot fields are traced.
+        assert_eq!(
+            W_ARRAY_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Array, w_dict),
+                std::mem::offset_of!(W_Array, w_weakreflifeline),
+                std::mem::offset_of!(W_Array, w_slots),
+            ]
+        );
         assert_eq!(
             <W_Array as crate::lltype::GcType>::SIZE,
             W_ARRAY_OBJECT_SIZE

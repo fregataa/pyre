@@ -593,6 +593,17 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (138, Some(0)),
     (139, Some(0)),
     (140, Some(0)),
+    (141, Some(0)),
+    (142, Some(0)),
+    (143, Some(0)),
+    (144, Some(0)),
+    (145, Some(0)),
+    (146, Some(0)),
+    (147, Some(0)),
+    (148, Some(0)),
+    (149, Some(0)),
+    (150, Some(0)),
+    (152, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
@@ -1105,6 +1116,29 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(132, typed::<crate::generator::AsyncGenValueWrapper>()),
         subclass_range_alias(133, typed::<crate::generator::AsyncGenASend>()),
         subclass_range_alias(134, typed::<crate::generator::AsyncGenAThrow>()),
+        // W_ISlice is appended after the interpreter-owned W_Local (140) in
+        // build_gc so every pre-existing Python-visible AUTO-ID stays stable.
+        subclass_range_alias(141, typed::<crate::interp_itertools::W_ISlice>()),
+        // W_Batched follows W_ISlice in the same append-only registration
+        // chain.
+        subclass_range_alias(142, typed::<crate::interp_itertools::W_Batched>()),
+        subclass_range_alias(143, typed::<crate::interp_itertools::W_Product>()),
+        subclass_range_alias(144, typed::<crate::interp_itertools::W_Combinations>()),
+        subclass_range_alias(
+            145,
+            typed::<crate::interp_itertools::W_CombinationsWithReplacement>(),
+        ),
+        subclass_range_alias(146, typed::<crate::interp_itertools::W_Permutations>()),
+        subclass_range_alias(147, typed::<crate::interp_itertools::W_GroupBy>()),
+        subclass_range_alias(148, typed::<crate::interp_itertools::W_GroupByIterator>()),
+        subclass_range_alias(
+            149,
+            typed::<crate::interp_itertools::W_TeeChainedListNode>(),
+        ),
+        subclass_range_alias(150, typed::<crate::interp_itertools::W_TeeIterable>()),
+        // `_buffer_wrapper` follows the deque's internal non-object Block
+        // (151) at the append-only GC registration tail.
+        subclass_range_alias(152, typed::<crate::memoryview::W_BufferWrapper>()),
     ]
 }
 

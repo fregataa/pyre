@@ -2666,8 +2666,11 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// `object.__ne__`; the latter deliberately calls the receiver's live
 /// `__eq__`.  Builtin layouts retain the override-only lookup because their
 /// inherited slots delegate straight back into [`compare`] and would recurse
-/// forever.  The reflected method of a proper subclass has priority, and
-/// equal types only invoke the shared `__eq__` / `__ne__` implementation once.
+/// forever.  The reflected method of a proper subclass has priority.  PyPy
+/// 3.11 suppresses the second call for equal user-defined types, but CPython
+/// 3.14 `Objects/object.c:do_richcompare` tries `tp_richcompare` in both
+/// operand directions when the first call returns `NotImplemented`; pyre's
+/// Python 3.14 compatibility rule takes precedence here.
 unsafe fn try_compare_override(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -2694,12 +2697,7 @@ unsafe fn try_compare_override(
     let a_type = crate::typedef::r#type(a);
     let b_type = crate::typedef::r#type(b);
     let a_ov = comparison_method(a, dunder);
-    let mut b_ov = comparison_method(b, rdunder);
-    if dunder == rdunder && matches!((a_type, b_type), (Some(at), Some(bt)) if at == bt) {
-        // descroperation.py: for __eq__ and __ne__, objects of the same
-        // class resolve the same method, so do not invoke it twice.
-        b_ov = None;
-    }
+    let b_ov = comparison_method(b, rdunder);
     if a_ov.is_none() && b_ov.is_none() {
         return Ok(None);
     }
@@ -3330,7 +3328,12 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if !is_long(b) && as_float(b) == 0.0 {
                 return Err(PyError::zero_division("division by zero"));
             }
-            if is_long(a) || is_long(b) {
+            // intobject.py:332 `_truediv`: machine ints wider than the
+            // binary64 mantissa deliberately overflow into the rbigint path
+            // so division is rounded once, after exact integer arithmetic.
+            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
+                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
+            if is_long(a) || is_long(b) || wide_int {
                 let a_owned;
                 let va = if is_long(a) {
                     w_long_get_value(a)
@@ -3364,40 +3367,57 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-/// Power operation dispatch (`**` operator).
-
-pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+/// `descroperation.py:425 pow_binary` — return `None` when neither numeric
+/// fast paths nor `__pow__` / `__rpow__` produce a result.
+fn pow_binary(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__pow__", "__rpow__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
-                return Ok(result);
+                return Ok(Some(result));
             }
         }
         if is_int_like(a) && is_int_like(b) {
-            return int_pow(a, b);
+            return int_pow(a, b).map(Some);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
-            return long_pow(a, b);
+            return long_pow(a, b).map(Some);
         }
         if is_float_pair(a, b) {
             reject_pow_operand_overflow(a)?;
             reject_pow_operand_overflow(b)?;
-            return float_pow_impl(as_float(a), as_float(b));
+            return float_pow_impl(as_float(a), as_float(b)).map(Some);
         }
         if is_complex_pair(a, b) {
             reject_pow_operand_overflow(a)?;
             reject_pow_operand_overflow(b)?;
-            return complex_pow(a, b);
+            return complex_pow(a, b).map(Some);
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
-            return Ok(result);
-        }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for ** or pow(): '{a_name}' and '{b_name}'"
-        )))
+        try_dispatch_binary_special(a, b, "__pow__", "__rpow__")
     }
+}
+
+/// Power operation dispatch (`**` operator).
+pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    if let Some(result) = pow_binary(a, b)? {
+        return Ok(result);
+    }
+    let a_name = crate::baseobjspace::object_functionstr_type_name(a);
+    let b_name = crate::baseobjspace::object_functionstr_type_name(b);
+    Err(PyError::type_error(format!(
+        "unsupported operand type(s) for ** or pow(): '{a_name}' and '{b_name}'"
+    )))
+}
+
+/// `descroperation.py:486-499 inplace_pow` — unlike the generated in-place
+/// binary operations, power has its own fallback error spelling.
+pub fn inplace_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    if let Some(result) = try_inplace_special(a, b, "__ipow__", None, false)? {
+        return Ok(result);
+    }
+    if let Some(result) = pow_binary(a, b)? {
+        return Ok(result);
+    }
+    Err(binary_builtin_type_error("**=", a, b))
 }
 
 // ── Numeric type-slot builtins ────────────────────────────────────────
@@ -3479,7 +3499,11 @@ pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if !is_long(b) && as_float(b) == 0.0 {
                 return Err(PyError::zero_division("division by zero"));
             }
-            if is_long(a) || is_long(b) {
+            // Match `_truediv`'s overflow-to-rbigint leg for i64 values that
+            // are not exactly representable in a binary64 mantissa.
+            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
+                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
+            if is_long(a) || is_long(b) || wide_int {
                 let a_owned;
                 let va = if is_long(a) {
                     w_long_get_value(a)
@@ -3747,6 +3771,71 @@ pub(crate) fn try_dispatch_binary_special(
     }
 }
 
+/// CPython 3.14 `typeobject.c:slot_nb_power` — the three-argument copy of
+/// `SLOT1BINFULL`.  Unlike PyPy 3.11's `space.pow`, Python 3.14 also offers
+/// the exponent's reflected method the modulus argument.  A proper subtype's
+/// distinct `__rpow__` is tried first, then the base's `__pow__`, then the
+/// reflected method when it has not already been tried.
+fn try_dispatch_ternary_pow_special(
+    base: PyObjectRef,
+    exp: PyObjectRef,
+    modulus: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    unsafe {
+        let Some(w_base_type) = crate::typedef::r#type(base) else {
+            return Ok(None);
+        };
+        let Some(w_exp_type) = crate::typedef::r#type(exp) else {
+            return Ok(None);
+        };
+        let (w_base_src, w_base_impl) =
+            match lookup_where_with_method_cache(w_base_type.as_ptr(), "__pow__") {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            };
+        let (w_exp_src, mut w_exp_impl) = if w_base_type != w_exp_type {
+            match lookup_where_with_method_cache(w_exp_type.as_ptr(), "__rpow__") {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        // slot_nb_power: a proper exponent subtype whose reflected method is
+        // distinct from the base type's definition gets the first chance.
+        if issubtype_w(w_exp_type.as_ptr(), w_base_type.as_ptr()) {
+            if let (Some(exp_src), Some(base_src), Some(exp_impl)) =
+                (w_exp_src, w_base_src, w_exp_impl)
+            {
+                if !std::ptr::eq(base_src, exp_src)
+                    && !p_abstract_issubclass_w(base_src, exp_src)?
+                    && !p_abstract_issubclass_w(w_base_type.as_ptr(), exp_src)?
+                {
+                    if let Some(result) = try_call_special(exp_impl, &[exp, base, modulus])? {
+                        return Ok(Some(result));
+                    }
+                    // CPython clears `do_other` after the subtype-first call,
+                    // including when it returns NotImplemented.
+                    w_exp_impl = None;
+                }
+            }
+        }
+
+        if let Some(method) = w_base_impl {
+            if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
+                return Ok(Some(result));
+            }
+        }
+        if let Some(method) = w_exp_impl {
+            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// descroperation.py:825 `inplace_impl` — try the in-place special
 /// (`__iadd__` etc.) on the lhs.  Returns `None` when the type has no
 /// such method or the call yields `NotImplemented`, so the caller falls
@@ -3943,45 +4032,16 @@ pub(crate) fn ternary_builtin_type_error(
     ))
 }
 
-/// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:441
-/// `def pow(space, w_obj1, w_obj2, w_obj3)`. Tries the int/long modulus
-/// fast path, then only the forward `__pow__` on the base; the reflected
-/// `__rpow__` is not consulted for three-arg power (unlike two-arg), so a
-/// forward `NotImplemented` raises the three-operand type error rather than
-/// falling through to the right operand.
+/// 3-arg `pow(a, b, c)` dispatch. PyPy 3.11's
+/// `pypy/objspace/descroperation.py:441` tries only the base's `__pow__`;
+/// Python 3.14 changed this to offer the exponent's `__rpow__` the modulus
+/// too (`Objects/typeobject.c:slot_nb_power`).
 pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResult {
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
-    // Python 3.14 extends reflected-power dispatch to the ternary form.  A
-    // strict RHS subtype gets the first opportunity, exactly as for binary
-    // power, and receives `(base, modulus)` after its bound receiver.
-    let base_type = crate::typedef::r#type(base).map(|t| t.as_ptr());
-    let exp_type = crate::typedef::r#type(exp).map(|t| t.as_ptr());
-    let rhs_first = match (base_type, exp_type) {
-        (Some(lhs), Some(rhs)) if !std::ptr::eq(lhs, rhs) => unsafe {
-            crate::baseobjspace::issubtype_w(rhs, lhs)
-        },
-        _ => false,
-    };
-    if rhs_first {
-        if let Some(method) = unsafe { lookup_type_special(exp, "__rpow__") } {
-            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
-                return Ok(result);
-            }
-        }
-    }
-    if let Some(method) = unsafe { lookup_type_special(base, "__pow__") } {
-        if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
-            return Ok(result);
-        }
-    }
-    if !rhs_first {
-        if let Some(method) = unsafe { lookup_type_special(exp, "__rpow__") } {
-            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
-                return Ok(result);
-            }
-        }
+    if let Some(result) = try_dispatch_ternary_pow_special(base, exp, modulus)? {
+        return Ok(result);
     }
     Err(ternary_builtin_type_error("pow()", base, exp, modulus))
 }
@@ -4336,7 +4396,10 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // type | type — PEP 604 union types (Python 3.10+)
         // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union,
         // which collapses identical operands (`int | int` is `int`).
-        if unionable(a) && unionable(b) {
+        // `None | type` reaches the type's reflected union descriptor, but
+        // `None | None` has no type / UnionType / GenericAlias descriptor on
+        // either side and must remain an unsupported bitwise operation.
+        if unionable(a) && unionable(b) && !(is_none(a) && is_none(b)) {
             return crate::_pypy_generic_alias::create_union(a, b);
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
@@ -5273,6 +5336,14 @@ mod tests {
         assert_eq!(bigint_truediv(&a.neg(), &b).unwrap(), -5.0);
         assert_eq!(bigint_truediv(&a, &b.neg()).unwrap(), -5.0);
         assert!(bigint_truediv(&a, &BigInt::from(0)).is_err());
+    }
+
+    #[test]
+    fn test_machine_int_truediv_uses_rbigint_rounding_past_binary64_mantissa() {
+        let result = truediv_builtin(w_int_new(63_050_394_783_186_940), w_int_new(7)).unwrap();
+        unsafe {
+            assert_eq!(w_float_get_value(result), 9_007_199_254_740_991.0);
+        }
     }
 
     #[test]

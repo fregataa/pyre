@@ -3,7 +3,7 @@ use pyre_object::rbigint::RBigInt as BigInt;
 
 use crate::{
     make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
-    make_module_builtin_function_with_arity,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_doc,
 };
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
@@ -444,17 +444,163 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
     }
 }
 
+/// Is `descr` one of pyre's native `bf_getbuffer` wrappers?
+///
+/// CPython installs `slot_bf_getbuffer` only when the descriptor selected by
+/// the concrete type's MRO is Python-defined.  Comparing the selected object
+/// with each native base descriptor preserves that slot decision for mixed
+/// inheritance: `class C(bytearray, A)` stays native, while
+/// `class C(A, bytearray)` reaches `A.__buffer__`.
+unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
+    unsafe {
+        for base in [
+            crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
+        ] {
+            if crate::baseobjspace::lookup_in_type(base, "__buffer__")
+                .is_some_and(|native| std::ptr::eq(native, descr))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The Python `__buffer__` descriptor selected for `obj`, or `None` when the
+/// type uses a native buffer slot (or has no Python-visible descriptor).
+unsafe fn memoryview_python_buffer_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let descr = crate::baseobjspace::lookup(obj, "__buffer__")?;
+        (!memoryview_is_native_buffer_descr(descr)).then_some(descr)
+    }
+}
+
+/// CPython 3.14 `slot_bf_getbuffer`: call Python `__buffer__(flags)`, acquire
+/// the returned memoryview, allocate `_buffer_wrapper(mv, obj)`, and copy its
+/// geometry while replacing only `Py_buffer.obj` with that wrapper.
+unsafe fn w_memoryview_new_python_buffer(
+    w_obj: PyObjectRef,
+    w_descr: PyObjectRef,
+    flags: i32,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        use pyre_object::memoryview::*;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        pyre_object::gc_roots::pin_root(w_descr);
+        pyre_object::gc_roots::pin_root(w_int_new(flags as i64));
+
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let w_type = crate::typedef::r#type(r_obj).map_or(r_obj, |p| p.as_ptr());
+        let w_ret = crate::baseobjspace::get_and_call_function(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            r_obj,
+            w_type,
+            &[pyre_object::gc_roots::shadow_stack_get(sp + 2)],
+        )?;
+        if !is_w_memoryview(w_ret) {
+            return Err(crate::PyError::type_error(
+                "__buffer__ returned non-memoryview object",
+            ));
+        }
+        pyre_object::gc_roots::pin_root(w_ret);
+        let ret_slot = sp + 3;
+        let r_ret = pyre_object::gc_roots::shadow_stack_get(ret_slot);
+        memoryview_check_released(r_ret)?;
+        if w_memoryview_restricted(r_ret) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
+        if flags & 0x0001 != 0 && w_memoryview_readonly(r_ret) {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::BufferError,
+                "Object is not writable.",
+            ));
+        }
+
+        // PyObject_GetBuffer(ret, buffer, flags): the returned memoryview may
+        // not be released while this copied Py_buffer is outstanding.
+        w_memoryview_exports_incref(r_ret);
+        let wrapper = w_buffer_wrapper_new(
+            pyre_object::gc_roots::shadow_stack_get(ret_slot),
+            pyre_object::gc_roots::shadow_stack_get(sp),
+        );
+        pyre_object::gc_roots::pin_root(wrapper);
+        let wrapper_slot = sp + 4;
+        let outer = w_memoryview_alloc_header(false, true);
+        let r_ret = pyre_object::gc_roots::shadow_stack_get(ret_slot);
+        let r_wrapper = pyre_object::gc_roots::shadow_stack_get(wrapper_slot);
+        let copied = w_memoryview_view(r_ret).clone_with_obj(r_wrapper);
+        w_memoryview_set_view(outer, bufferview_alloc(copied));
+        Ok(outer)
+    }
+}
+
 /// `memoryview(obj)` — acquire a 1-D byte view over a buffer-providing
 /// exporter.  Sharing another memoryview copies its view parameters (and
 /// reports the original exporter as `.obj`); a non-buffer raises TypeError.
 pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    // `PyMemoryView_FromObject` requests the full read-only buffer interface.
+    w_memoryview_new_with_flags(w_obj, 0x011c)
+}
+
+/// `memoryview._from_flags` / native `bf_getbuffer` entry with an explicit
+/// CPython `PyBUF_*` mask.
+pub(crate) fn w_memoryview_new_with_flags(
+    w_obj: PyObjectRef,
+    flags: i32,
+) -> Result<PyObjectRef, crate::PyError> {
+    w_memoryview_new_with_flags_impl(w_obj, flags, true)
+}
+
+/// Invoke a built-in exporter's native `bf_getbuffer` implementation.
+///
+/// Python `super().__buffer__(flags)` reaches the base slot directly; it must
+/// not redispatch to the concrete subclass's Python `__buffer__`, which would
+/// recurse back into the method that called `super()`.
+pub(crate) fn w_memoryview_new_native_with_flags(
+    w_obj: PyObjectRef,
+    flags: i32,
+) -> Result<PyObjectRef, crate::PyError> {
+    w_memoryview_new_with_flags_impl(w_obj, flags, false)
+}
+
+fn w_memoryview_new_with_flags_impl(
+    w_obj: PyObjectRef,
+    flags: i32,
+    allow_python_slot: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    // CPython abstract.c:PyBuffer_FillInfo — PyBUF_READ and PyBUF_WRITE are
+    // request kinds for PyMemoryView_GetContiguous, not valid standalone
+    // getbuffer flags.  (Their bits may still appear in valid composite
+    // masks such as PyBUF_FULL_RO.)
+    if flags == 0x0100 || flags == 0x0200 {
+        return Err(crate::PyError::system_error(
+            "bad argument to internal function",
+        ));
+    }
     use pyre_object::memoryview::*;
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(w_obj) {
-        return w_memoryview_new(target?);
+        return w_memoryview_new_with_flags_impl(target?, flags, allow_python_slot);
     }
     unsafe {
+        if allow_python_slot {
+            if let Some(w_descr) = memoryview_python_buffer_descr(w_obj) {
+                return w_memoryview_new_python_buffer(w_obj, w_descr, flags);
+            }
+        }
         if is_w_memoryview(w_obj) {
             memoryview_check_released(w_obj)?;
+            if w_memoryview_restricted(w_obj) {
+                return Err(crate::PyError::value_error(
+                    "cannot create a new view from a restricted memoryview",
+                ));
+            }
             // `W_MemoryView.copy` shares the source's (immutable) view; the
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
@@ -511,7 +657,7 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
             return Ok(mv);
         }
-        let (fmt, itemsize, _readonly, byte_len) = match memoryview_buffer_params(w_obj) {
+        let (fmt, itemsize, readonly, byte_len) = match memoryview_buffer_params(w_obj) {
             Some(p) => p,
             None => {
                 let tname = crate::typedef::r#type(w_obj)
@@ -522,6 +668,12 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
                 )));
             }
         };
+        if flags & 0x0001 != 0 && readonly {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::BufferError,
+                "Object is not writable.",
+            ));
+        }
         // A plain view derives its geometry: a bytes / bytearray backing builds
         // a `SimpleView`, an array.array a `RawBufferView` (readonly follows the
         // backing kind).
@@ -751,6 +903,11 @@ unsafe fn memoryview_slice_view(
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::memoryview::*;
     unsafe {
+        if w_memoryview_restricted(mv) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
         let ndim = w_memoryview_ndim(mv);
         let count = if ndim >= 1 {
             w_memoryview_native_shape(mv).first().copied().unwrap_or(0)
@@ -1356,6 +1513,11 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        if w_memoryview_restricted(mv) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
         if !pyre_object::is_str(fmt_obj) {
             return Err(crate::PyError::type_error(
                 "memoryview: format argument must be a string",
@@ -1478,6 +1640,11 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        if w_memoryview_restricted(mv) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
         // `ReadonlyWrapper(self.view)` (memoryobject.py:256).
         Ok(w_memoryview_new_derived(mv, |v| {
             pyre_object::bufferview::BufferView::Readonly {
@@ -1517,6 +1684,177 @@ unsafe fn release_external_backing(_backing: PyObjectRef) -> bool {
     false
 }
 
+/// Invoke the native `bf_releasebuffer` paired with a root memoryview's
+/// acquisition.  Python-visible `__release_buffer__` is a slot wrapper in
+/// CPython 3.14: it calls `memoryview.release()`, which in turn reaches this
+/// native slot.  Calling the Python wrapper again here would recurse.
+unsafe fn release_native_backing(backing: PyObjectRef) -> bool {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(backing) {
+            pyre_object::bytearrayobject::w_bytearray_exports_decref(backing);
+            return true;
+        }
+        if pyre_object::interp_array::is_array(backing) {
+            pyre_object::interp_array::w_array_exports_decref(backing);
+            return true;
+        }
+        if pyre_object::bytesobject::is_bytes(backing) {
+            // `bytes` has no `bf_releasebuffer`; its immutable export needs no
+            // accounting and has no Python-visible release wrapper.
+            return true;
+        }
+        release_external_backing(backing)
+    }
+}
+
+/// Is `descr` a native `bf_releasebuffer` wrapper rather than a Python slot?
+unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
+    unsafe {
+        for base in [
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
+        ] {
+            if crate::baseobjspace::lookup_in_type(base, "__release_buffer__")
+                .is_some_and(|native| std::ptr::eq(native, descr))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Python `slot_bf_releasebuffer` selected by the concrete type's MRO.
+unsafe fn memoryview_python_release_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let descr = crate::baseobjspace::lookup(obj, "__release_buffer__")?;
+        (!memoryview_is_native_release_descr(descr)).then_some(descr)
+    }
+}
+
+/// `releasebuffer_call_python`: the C slot returns `void`, so callback
+/// exceptions are reported as unraisable and never replace an active error.
+unsafe fn memoryview_call_python_release_unraisable(
+    exporter: PyObjectRef,
+    view: PyObjectRef,
+    descr: PyObjectRef,
+) {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(exporter);
+        pyre_object::gc_roots::pin_root(view);
+        pyre_object::gc_roots::pin_root(descr);
+        let r_exporter = pyre_object::gc_roots::shadow_stack_get(sp);
+        let w_type = crate::typedef::r#type(r_exporter).map_or(r_exporter, |p| p.as_ptr());
+        if let Err(mut error) = crate::baseobjspace::get_and_call_function(
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            r_exporter,
+            w_type,
+            &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
+        ) {
+            let r_exporter = pyre_object::gc_roots::shadow_stack_get(sp);
+            error.write_unraisable(
+                w_none(),
+                &format!(
+                    "Exception ignored in __release_buffer__ of {}:",
+                    crate::baseobjspace::object_functionstr_type_name(r_exporter)
+                ),
+                r_exporter,
+            );
+        }
+    }
+}
+
+/// `PyMemoryView_FromBuffer(buffer)` in `releasebuffer_call_python`, followed
+/// by `_Py_MEMORYVIEW_RESTRICTED`.  The snapshot owns no second native export:
+/// it exists only for the duration of the release callback.
+unsafe fn w_memoryview_new_restricted_snapshot(source: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(source);
+        let restricted = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+        let r_source = pyre_object::gc_roots::shadow_stack_get(sp);
+        let snapshot = pyre_object::memoryview::w_memoryview_view(r_source).clone();
+        pyre_object::memoryview::w_memoryview_set_view(
+            restricted,
+            pyre_object::memoryview::bufferview_alloc(snapshot),
+        );
+        pyre_object::memoryview::w_memoryview_set_restricted(restricted, true);
+        restricted
+    }
+}
+
+/// Run a Python release override for a native exporter with the temporary
+/// restricted view used by CPython, then make that temporary unusable even
+/// when user code retained it.
+unsafe fn memoryview_release_native_python_slot(exporter: PyObjectRef, source: PyObjectRef) {
+    unsafe {
+        let Some(descr) = memoryview_python_release_descr(exporter) else {
+            return;
+        };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(exporter);
+        pyre_object::gc_roots::pin_root(source);
+        pyre_object::gc_roots::pin_root(descr);
+        let restricted =
+            w_memoryview_new_restricted_snapshot(pyre_object::gc_roots::shadow_stack_get(sp + 1));
+        pyre_object::gc_roots::pin_root(restricted);
+        memoryview_call_python_release_unraisable(
+            pyre_object::gc_roots::shadow_stack_get(sp),
+            pyre_object::gc_roots::shadow_stack_get(sp + 3),
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+        );
+        let r_restricted = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+        if !pyre_object::memoryview::w_memoryview_released(r_restricted) {
+            pyre_object::memoryview::w_memoryview_set_released(r_restricted);
+        }
+    }
+}
+
+/// CPython `bufferwrapper_releasebuf`.
+///
+/// The returned memoryview's `bf_releasebuffer` first ends the temporary
+/// `PyObject_GetBuffer` export.  If it exposes another owner, call the
+/// original Python exporter with that exact memoryview.  If it exposes the
+/// exporter itself (the `super().__buffer__` native-subclass case), release
+/// the native view now; CPython's refcounted `Py_CLEAR(bw->mv)` performs this
+/// immediately when the wrapper held the last reference.
+unsafe fn memoryview_release_buffer_wrapper(wrapper: PyObjectRef) {
+    unsafe {
+        use pyre_object::memoryview::*;
+        let w_mv = w_buffer_wrapper_mv(wrapper);
+        let w_obj = w_buffer_wrapper_obj(wrapper);
+        if w_mv.is_null() || w_obj.is_null() {
+            return;
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(wrapper);
+        pyre_object::gc_roots::pin_root(w_mv);
+        pyre_object::gc_roots::pin_root(w_obj);
+
+        let r_mv = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        w_memoryview_exports_decref(r_mv);
+        let returned_owner = w_memoryview_obj(r_mv);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        if !std::ptr::eq(returned_owner, r_obj) {
+            if let Some(descr) = memoryview_python_release_descr(r_obj) {
+                memoryview_call_python_release_unraisable(r_obj, r_mv, descr);
+            }
+        } else if !w_memoryview_released(r_mv) {
+            memoryview_release_native_python_slot(r_obj, r_mv);
+            let backing = w_memoryview_backing(r_mv);
+            let _ = release_native_backing(backing);
+            w_memoryview_set_released(r_mv);
+        }
+        w_buffer_wrapper_clear(pyre_object::gc_roots::shadow_stack_get(sp));
+    }
+}
+
 /// `memoryview.release` — drop the view; subsequent access raises ValueError.
 /// Idempotent (a second `release` on an already-released view is a no-op),
 /// matching `descr_release`.
@@ -1543,24 +1881,31 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             // `_release_underlying`.  A slice / copy (`owns_export == false`)
             // shares the export and must not release it.
             if pyre_object::memoryview::w_memoryview_owns_export(mv) {
+                let owner = pyre_object::memoryview::w_memoryview_obj(mv);
                 let backing = pyre_object::memoryview::w_memoryview_backing(mv);
                 // Mark the view released before invoking the exporter hook so a
                 // re-entrant release is a no-op, but keep the view box until
                 // the hook returns: it is handed this memoryview and reads the
                 // backing back off it to identify the export it is undoing.
                 pyre_object::memoryview::w_memoryview_mark_released(mv);
-                // An `mmap` mapping keeps its count internally — it exposes no
-                // Python-callable release, so the drop cannot be forged from
-                // user code.  Every other exporter runs `__release_buffer__`.
-                let released = if release_external_backing(backing) {
+                let released = if pyre_object::memoryview::is_w_buffer_wrapper(owner) {
+                    memoryview_release_buffer_wrapper(owner);
                     Ok(())
                 } else {
-                    match crate::baseobjspace::lookup(backing, "__release_buffer__") {
-                        Some(release_fn) => {
-                            crate::call::call_function_impl_result(release_fn, &[backing, mv])
-                                .map(|_| ())
+                    // `slot_bf_releasebuffer`: call a Python override with a
+                    // restricted snapshot, then unconditionally invoke the
+                    // first native base release slot.
+                    memoryview_release_native_python_slot(owner, mv);
+                    if release_native_backing(backing) {
+                        Ok(())
+                    } else {
+                        match crate::baseobjspace::lookup(backing, "__release_buffer__") {
+                            Some(release_fn) => {
+                                crate::call::call_function_impl_result(release_fn, &[backing, mv])
+                                    .map(|_| ())
+                            }
+                            None => Ok(()),
                         }
-                        None => Ok(()),
                     }
                 };
                 pyre_object::memoryview::w_memoryview_drop_view(mv);
@@ -1573,13 +1918,35 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     Ok(w_none())
 }
 
-/// `memoryview.__release_buffer__` — a no-op (`descr_release_buffer`): a
-/// consumer releasing a buffer it obtained from this memoryview has nothing
-/// to undo, because acquiring a buffer from a memoryview does not increment
-/// the underlying exporter's export count.  It must NOT release the view
-/// itself.
-fn memoryview_release_buffer(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
+/// CPython 3.14 `wrap_releasebuffer`: validate that `view` belongs to the
+/// exporter, then release the memoryview itself.  The native
+/// `bf_releasebuffer` reached by [`memoryview_release`] performs the single
+/// matching export decrement.
+pub(crate) fn buffer_exporter_release_view(
+    exporter: PyObjectRef,
+    view: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        if !pyre_object::memoryview::is_w_memoryview(view) {
+            return Err(crate::PyError::type_error("expected a memoryview object"));
+        }
+        if pyre_object::memoryview::w_memoryview_released(view) {
+            return Ok(w_none());
+        }
+        if !std::ptr::eq(
+            pyre_object::memoryview::w_memoryview_backing(view),
+            exporter,
+        ) {
+            return Err(crate::PyError::value_error(
+                "memoryview's buffer is not this object",
+            ));
+        }
+    }
+    memoryview_release(&[view])
+}
+
+fn memoryview_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    buffer_exporter_release_view(args[0], args[1])
 }
 
 /// `memoryview.__enter__` — check-released, then return the view itself.
@@ -1753,20 +2120,7 @@ fn memoryview_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn memoryview_from_flags(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let object = args.get(1).copied().unwrap_or(w_none());
     let flags = crate::baseobjspace::c_int_w(args.get(2).copied().unwrap_or(w_none()))?;
-    let view = w_memoryview_new(object)?;
-    unsafe {
-        if !pyre_object::memoryview::is_w_memoryview(object)
-            && flags & 0x0001 != 0
-            && pyre_object::memoryview::w_memoryview_readonly(view)
-        {
-            memoryview_release(&[view])?;
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::BufferError,
-                "Object is not writable.",
-            ));
-        }
-    }
-    Ok(view)
+    w_memoryview_new_with_flags(object, flags)
 }
 
 /// `memoryview.hex` — the view's bytes as a hex string, reusing the
@@ -1792,7 +2146,7 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `descr_hash` (memoryobject.py:476) — a writable view is unhashable; a
 /// read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`),
-/// cached in `self._hash` with the `-1` sentinel (`_hash_str` never returns
+/// cached in `self._hash` with the `-1` sentinel (`_hash_bytes` never returns
 /// `-1`) — the release / readonly checks run only on the first call, and a
 /// view hashed before `release()` keeps hashing afterwards.
 unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> {
@@ -1816,7 +2170,7 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
             backing_hash?;
             // `compute_hash(self.view.as_str())` — the same content digest the
             // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
-            hash = hash_str_bytes(&memoryview_gather_bytes(mv));
+            hash = _hash_bytes(&memoryview_gather_bytes(mv));
             pyre_object::memoryview::w_memoryview_set_hash(mv, hash);
         }
         Ok(hash)
@@ -2095,7 +2449,14 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__buffer__",
-            make_builtin_function_with_arity("__buffer__", |args| w_memoryview_new(args[0]), 2),
+            make_builtin_function_with_arity(
+                "__buffer__",
+                |args| {
+                    let flags = crate::baseobjspace::c_int_w(args[1])?;
+                    w_memoryview_new_native_with_flags(args[0], flags)
+                },
+                2,
+            ),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -2197,10 +2558,30 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "min", || {
-        make_module_builtin_function("min", builtin_min)
+        make_module_builtin_function_with_doc(
+            "min",
+            builtin_min,
+            "min(iterable, *[, default=obj, key=func]) -> value\n\
+             min(arg1, arg2, *args, *[, key=func]) -> value\n\
+             \n\
+             With a single iterable argument, return its smallest item. The\n\
+             default keyword-only argument specifies an object to return if\n\
+             the provided iterable is empty.\n\
+             With two or more positional arguments, return the smallest argument.",
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "max", || {
-        make_module_builtin_function("max", builtin_max)
+        make_module_builtin_function_with_doc(
+            "max",
+            builtin_max,
+            "max(iterable, *[, default=obj, key=func]) -> value\n\
+             max(arg1, arg2, *args, *[, key=func]) -> value\n\
+             \n\
+             With a single iterable argument, return its biggest item. The\n\
+             default keyword-only argument specifies an object to return if\n\
+             the provided iterable is empty.\n\
+             With two or more positional arguments, return the largest argument.",
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "type", || crate::typedef::w_type());
     crate::module_ns_get_or_insert_with(ns, "isinstance", || {
@@ -2878,73 +3259,140 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
     Ok(DefaultPrintTarget::Rebound(stdout))
 }
 
-fn input_call_method(
-    object: PyObjectRef,
-    name: &str,
-    args: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
-    let result = crate::baseobjspace::call_method(object, name, args);
-    if result.is_null() {
-        Err(crate::call::take_call_error()
-            .unwrap_or_else(|| crate::PyError::runtime_error(format!("{name} failed"))))
-    } else {
-        Ok(result)
+fn input_eof_error() -> crate::PyError {
+    let mut error = crate::PyError::value_error("");
+    if let Some(cls) = lookup_exc_class("EOFError") {
+        let args = [cls];
+        if let Ok(exc) = exc_exception_new(&args) {
+            error.exc_object = exc;
+        }
     }
+    error
 }
 
-/// PyPy `pypy/module/__builtin__/app_io.py:input`.
+/// `pypy/module/__builtin__/app_io.py:24-66 input` — non-readline path.
 ///
-/// Resolve all three live sys streams, flush stderr, emit and flush the prompt
-/// through stdout, then consume one line from stdin. This preserves redirected
-/// StringIO streams as well as the interpreter-created standard streams.
+/// The tty/readline hook remains owned by `sys.__raw_input__`; when it is not
+/// installed (the normal Pyre configuration), this is the literal app-level
+/// sequence: fetch the three live `sys` streams, flush stderr, write and flush
+/// the prompt, call `stdin.readline()`, then strip one trailing newline.
 fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() > 1 {
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "input() takes no keyword arguments",
+        ));
+    }
+    if pos.len() > 1 {
         return Err(crate::PyError::type_error(format!(
             "input expected at most 1 argument, got {}",
-            args.len()
+            pos.len()
         )));
     }
-    let sys = crate::importing::get_sys_module("sys")
-        .ok_or_else(|| crate::PyError::runtime_error("input: lost sys.stdin"))?;
-    let stream = |name: &str| {
-        crate::baseobjspace::getattr_str(sys, name)
-            .map_err(|_| crate::PyError::runtime_error(format!("input: lost sys.{name}")))
-    };
-    let stdin = stream("stdin")?;
-    let stdout = stream("stdout")?;
-    let stderr = stream("stderr")?;
-    let _ = input_call_method(stderr, "flush", &[])?;
 
-    let prompt = match args.first().copied() {
-        Some(value) => builtin_str(&[value])?,
-        None => w_str_new(""),
+    let prompt = pos
+        .first()
+        .copied()
+        .unwrap_or_else(|| pyre_object::w_str_new(""));
+    let Some(sys) = crate::importing::get_sys_module("sys") else {
+        return Err(crate::PyError::runtime_error("input: lost sys.stdin"));
     };
+
     let _roots = pyre_object::gc_roots::push_roots();
+    let root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(sys);
     pyre_object::gc_roots::pin_root(prompt);
+
+    let stream = |name: &str| -> Result<PyObjectRef, crate::PyError> {
+        let sys = pyre_object::gc_roots::shadow_stack_get(root);
+        match crate::baseobjspace::getattr_str(sys, name) {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Err(
+                crate::PyError::runtime_error(format!("input: lost sys.{name}")),
+            ),
+            Err(error) => Err(error),
+        }
+    };
+
+    let stdin = stream("stdin")?;
+    pyre_object::gc_roots::pin_root(stdin);
+    let stdin_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let stdout = stream("stdout")?;
+    pyre_object::gc_roots::pin_root(stdout);
+    let stdout_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let stderr = stream("stderr")?;
+    pyre_object::gc_roots::pin_root(stderr);
+    let stderr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    // app_io.py:44 `stderr.flush()`.
+    let stderr_flush = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stderr_slot),
+        "flush",
+    )?;
+    pyre_object::gc_roots::pin_root(stderr_flush);
+    crate::call_and_check(
+        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
+        &[],
+    )?;
+
+    // app_io.py `_write_prompt`: `str(prompt)`, `stdout.write`, then an
+    // optional `stdout.flush`.
+    let prompt_text = builtin_str(&[pyre_object::gc_roots::shadow_stack_get(root + 1)])?;
+    pyre_object::gc_roots::pin_root(prompt_text);
     let prompt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = input_call_method(
-        stdout,
+    let stdout_write = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stdout_slot),
         "write",
+    )?;
+    pyre_object::gc_roots::pin_root(stdout_write);
+    let write_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::call_and_check(
+        pyre_object::gc_roots::shadow_stack_get(write_slot),
         &[pyre_object::gc_roots::shadow_stack_get(prompt_slot)],
     )?;
-    let _ = input_call_method(stdout, "flush", &[])?;
-
-    let line = input_call_method(stdin, "readline", &[])?;
-    if !unsafe { pyre_object::is_str(line) } {
-        return Err(crate::PyError::type_error("input() returned non-string"));
-    }
-    let value = crate::baseobjspace::str_utf8_w(line)?;
-    if value.is_empty() {
-        let message = "EOF when reading a line";
-        let mut error = crate::PyError::value_error(message);
-        if let Some(class) = lookup_exc_class("EOFError") {
-            if let Ok(exception) = exc_exception_new(&[class, w_str_new(message)]) {
-                error.exc_object = exception;
-            }
+    match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stdout_slot),
+        "flush",
+    ) {
+        Ok(flush) => {
+            pyre_object::gc_roots::pin_root(flush);
+            crate::call_and_check(
+                pyre_object::gc_roots::shadow_stack_get(
+                    pyre_object::gc_roots::shadow_stack_len() - 1,
+                ),
+                &[],
+            )?;
         }
-        return Err(error);
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => {}
+        Err(error) => return Err(error),
     }
-    Ok(w_str_new(value.strip_suffix('\n').unwrap_or(value)))
+
+    // app_io.py:56-65 `line = stdin.readline()` and strip one LF.
+    let readline = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stdin_slot),
+        "readline",
+    )?;
+    pyre_object::gc_roots::pin_root(readline);
+    let line = crate::call_and_check(
+        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
+        &[],
+    )?;
+    if unsafe { !pyre_object::is_str(line) } {
+        return Err(crate::PyError::type_error(
+            "input(): stdin.readline() returned non-string",
+        ));
+    }
+    let text = unsafe { pyre_object::w_str_get_wtf8(line) };
+    if text.as_bytes().is_empty() {
+        return Err(input_eof_error());
+    }
+    if text.as_bytes().last() == Some(&b'\n') {
+        let body = rustpython_wtf8::Wtf8::from_bytes(&text.as_bytes()[..text.len() - 1])
+            .expect("removing ASCII LF preserves WTF-8");
+        Ok(pyre_object::w_str_from_wtf8_managed(body.to_wtf8_buf()))
+    } else {
+        Ok(line)
+    }
 }
 
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -3210,7 +3658,7 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             return false;
         }
-        std::ptr::fn_addr_eq(
+        crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
             builtin_len as crate::gateway::BuiltinCodeFn,
         )
@@ -3229,7 +3677,7 @@ pub fn is_builtin_repr_function(callable: PyObjectRef) -> bool {
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             return false;
         }
-        std::ptr::fn_addr_eq(
+        crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
             builtin_repr as crate::gateway::BuiltinCodeFn,
         )
@@ -7574,6 +8022,36 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     Ok(w_list_new(collect_iterable(obj)?))
 }
 
+/// The message-less `MemoryError` an unsatisfiable reservation raises.
+pub fn reservation_failed() -> crate::PyError {
+    crate::PyError::memory_error("")
+}
+
+/// An empty `Vec` with room for `count` elements, reserved fallibly.
+///
+/// A builtin that sizes its storage from a Python-supplied count —
+/// `itertools.combinations([], sys.maxsize)`, `b'a'.rjust(sys.maxsize)` and
+/// their neighbours — cannot use `Vec::with_capacity`: an oversized request
+/// aborts the process instead of unwinding, so ordinary Python code
+/// terminates the interpreter. PyPy answers those calls with `MemoryError`.
+pub fn try_vec_with_capacity<T>(count: usize) -> Result<Vec<T>, crate::PyError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| reservation_failed())?;
+    Ok(out)
+}
+
+/// The `Wtf8Buf` counterpart of [`try_vec_with_capacity`], for the str
+/// methods that size their buffer from a caller-supplied `width`.
+pub fn try_wtf8_with_capacity(
+    byte_count: usize,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.try_reserve_exact(byte_count)
+        .map_err(|_| reservation_failed())?;
+    Ok(out)
+}
+
 pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     // `iter(obj)` itself can execute arbitrary allocating Python code.  Root
     // the input before that first collection point, matching the root that
@@ -7740,6 +8218,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         return Ok(pyre_object::descriptor::w_super_new(
             cls,
             pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
         ));
     }
     if args.len() == 2 {
@@ -7751,8 +8230,8 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 crate::baseobjspace::object_functionstr_type_name(cls)
             )));
         }
-        super_check(cls, obj)?;
-        return Ok(pyre_object::descriptor::w_super_new(cls, obj));
+        let obj_type = super_check(cls, obj)?;
+        return Ok(pyre_object::descriptor::w_super_new(cls, obj_type, obj));
     }
     // descriptor.py `_super_from_frame`: zero-arg super() finds the first
     // argument and the `__class__` free variable in the live caller frame.
@@ -7812,8 +8291,10 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             ));
         }
 
-        super_check(w_class, w_self)?;
-        Ok(pyre_object::descriptor::w_super_new(w_class, w_self))
+        let obj_type = super_check(w_class, w_self)?;
+        Ok(pyre_object::descriptor::w_super_new(
+            w_class, obj_type, w_self,
+        ))
     })
 }
 
@@ -7994,7 +8475,7 @@ const PYCF_IGNORE_COOKIE: i64 = 0x0800;
 const PYCF_TYPE_COMMENTS: i64 = 0x4000_0000;
 const PYCF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
 const PYCF_ALLOW_INCOMPLETE_INPUT: i64 = 0x4000;
-const PYCF_OPTIMIZED_AST: i64 = 0x8000;
+const PYCF_OPTIMIZED_AST: i64 = 0x8000 | PYCF_ONLY_AST;
 const PYCF_ACCEPT_NULL_BYTES: i64 = 0x1000_0000;
 /// `future.py` `allowed_flags` — the union of the `__future__`
 /// `compiler_flag` bits (`CO_FUTURE_DIVISION` … `CO_FUTURE_ANNOTATIONS`),
@@ -8164,10 +8645,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         crate::call::take_last_exec_ctx(),
     )?;
     let ast_type = crate::baseobjspace::getattr_str(ast_module, "AST")?;
-    let source_str = if unsafe { crate::baseobjspace::isinstance_w(source, ast_type) } {
-        if flags & PYCF_ONLY_AST != 0 {
-            return Ok(source);
-        }
+    let source_is_ast = unsafe { crate::baseobjspace::isinstance_w(source, ast_type) };
+    let source_str = if source_is_ast {
         None
     } else {
         Some(source_as_str(
@@ -8189,12 +8668,28 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         ..Default::default()
     };
     if flags & PYCF_ONLY_AST != 0 {
-        return crate::module::_ast::convert::parse_to_object(
-            source_str
-                .as_deref()
-                .expect("AST input returned above for ONLY_AST"),
-            mode,
-        );
+        // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
+        // plain ONLY_AST runs syntax-only preprocessing; OPTIMIZED_AST
+        // includes ONLY_AST and enables constant folding.
+        let syntax_check_only = flags & PYCF_OPTIMIZED_AST == PYCF_ONLY_AST;
+        return if source_is_ast {
+            crate::module::_ast::convert::preprocess_object_to_object(
+                source,
+                "",
+                mode,
+                opts,
+                syntax_check_only,
+            )
+        } else {
+            crate::module::_ast::convert::parse_to_object_with_opts(
+                source_str
+                    .as_deref()
+                    .expect("non-AST source has decoded text"),
+                mode,
+                opts,
+                syntax_check_only,
+            )
+        };
     }
     if source_str.is_none() {
         let code = crate::module::_ast::convert::compile_object(source, &filename, mode, opts)?;
@@ -8576,6 +9071,33 @@ fn exec_or_eval(
                 return Err(err);
             }
         };
+    // Python 3.14 always selects the builtin namespace supplied through an
+    // explicit exec/eval globals dict.  PyPy expresses the same selection as
+    // `space.builtin.pick_builtin(w_globals)` when
+    // `objspace.honor__builtins__` is enabled.  Keep Pyre's global PyPy
+    // configuration unchanged, but apply that exact selection to the frame
+    // constructed by this exec/eval path.
+    //
+    // `moduledef.py:95-100` has a common-case identity exit when the globals
+    // entry is already `space.builtin`.  Preserve that shape as an
+    // allocation-free exact-dict probe: imported modules overwhelmingly carry
+    // this entry, and must not enter the general mapping dispatch again.
+    let current_globals = frame.get_w_globals();
+    let keeps_existing_builtin = unsafe {
+        pyre_object::is_dict(current_globals)
+            && pyre_object::w_dict_getitem_str(current_globals, "__builtins__")
+                .is_some_and(|w_builtin| std::ptr::eq(w_builtin, frame.w_builtin))
+    };
+    if !keeps_existing_builtin {
+        // `pick_builtin_obj_checked` can invoke a dict-subclass `__getitem__`
+        // and therefore allocate or collect.  The new frame is not current
+        // yet, so expose it as a temporary GC root while selecting and storing
+        // its builtin Module.
+        let _frame_roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(frame.as_mut_ptr() as pyre_object::PyObjectRef);
+        let current_globals = frame.get_w_globals();
+        frame.w_builtin = crate::baseobjspace::pick_builtin_obj_checked(current_globals, exec_ctx)?;
+    }
     frame.fix_array_ptrs();
     // eval.py:32 frame.setdictscope(w_locals, ...) — only when locals
     // were separately supplied.  Without this call, initialize_frame_scopes'
@@ -8811,9 +9333,14 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if w_locals_dict.is_null() {
                 return Ok(w_list_new(vec![]));
             }
-            let keys_iter = crate::baseobjspace::iter(w_locals_dict)?;
-            let keys = collect_iterable(keys_iter)?;
-            builtin_sorted(&[w_list_new(keys)])
+            // PyPy app_inspect.py:50 calls
+            // `sorted(_caller_locals().keys())`, not `sorted(locals)`.
+            // This distinction is observable for a general eval locals
+            // mapping which implements `keys()` and sequence-style
+            // `__getitem__` but no `__iter__`.
+            let keys_method = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
+            let keys = crate::call_and_check(keys_method, &[])?;
+            builtin_sorted(&[keys])
         });
     }
     if args.len() > 1 {
@@ -9093,6 +9620,12 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
         }
         if is_tuple(obj) {
+            // CPython 3.14 `tuple_hash`: a successful aggregate hash is
+            // retained on the tuple.  Check before the recursive stack guard
+            // so repeated dict probes do not touch the elements at all.
+            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+                return Ok(hash);
+            }
             // The element walk is the one recursive step here, and the scalar
             // fast path above no longer reaches the call protocol's own
             // guard, so a nest deep enough to exhaust the C stack has to be
@@ -9105,7 +9638,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                     hashes.push(try_hash_value(item)?);
                 }
             }
-            return Ok(_hash_tuple_xx(&hashes));
+            let hash = _hash_tuple_xx(&hashes);
+            pyre_object::w_tuple_set_cached_hash(obj, hash);
+            return Ok(hash);
         }
         if pyre_object::is_frozenset(obj) {
             return Ok(frozenset_hash_from_storage(obj));
@@ -9313,58 +9848,119 @@ fn _hash_tuple_xx_iter(items: impl Iterator<Item = i64>) -> i64 {
         .expect("element hashes are precomputed, so the fold cannot fail")
 }
 
-/// `pypy/objspace/std/unicodeobject.py:341-345 W_UnicodeObject.hash_w`
-/// parity:
+/// CPython/PyPy's deterministic seed expansion
+/// (`Python/bootstrap_hash.c` / `rsiphash.py:lcg_urandom`).
+fn hash_secret_from_seed(mut seed: u32) -> [u8; 16] {
+    let mut secret = [0u8; 16];
+    for byte in &mut secret {
+        seed = seed.wrapping_mul(214013).wrapping_add(2531011);
+        *byte = ((seed >> 16) & 0xff) as u8;
+    }
+    secret
+}
+
+/// Process-global CPython 3.14 hash secret.  RPython's `rsiphash.seed` is
+/// likewise a single process-global owner initialized from `PYTHONHASHSEED`;
+/// it is not interpreter-thread-local state.
+static HASH_SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+
+/// How a `PYTHONHASHSEED` value that names no seed is reported.
+pub const HASH_SEED_ERROR: &str =
+    "PYTHONHASHSEED must be \"random\" or an integer in range [0; 4294967295]";
+
+/// Fix the process-global hash secret from `PYTHONHASHSEED`, leaving it unset
+/// for `"random"` or an absent value so the first digest samples a random one.
 ///
-/// ```python
-/// def hash_w(self):
-///     x = compute_hash(self._utf8)
-///     x -= (x == -1)
-///     return x
-/// ```
+/// The variable is read through the host seam, so under sandbox the value comes
+/// from the controller's environment rather than the child's cleared one.  A
+/// value that names no seed yields [`HASH_SEED_ERROR`] instead of terminating:
+/// the launcher owns the process lifetime, so reporting it is its call.
 ///
-/// `compute_hash` is `rpython.rlib.objectmodel.compute_hash` —
-/// on 64-bit hosts it delegates to `rpython.rlib.rsiphash.siphash24`
-/// with a 16-byte secret key set via `rsiphash.choose_initial_seed`
-/// (rpython/rlib/rsiphash.py:48).  The seed is read from
-/// `PYTHONHASHSEED`, defaulting to a randomised value at process
-/// start (CPython parity: `Random_Hash_Function_Seed_String`).
-///
-/// Pyre uses a fixed 16-byte key here so test runs are deterministic
-/// (matching `PYTHONHASHSEED=0`).  Switching to a randomised seed
-/// is straight-forward (`OnceLock<[u8; 16]>` seeded from
-/// `getrandom` or the env var) once tests are robust to it.
-/// Hash a string by its WTF-8 bytes — `unicodeobject.py descr_hash` hashes
-/// `self._utf8`, so a lone-surrogate string hashes by its byte sequence
-/// instead of panicking on the `&str` view.
-fn _hash_str(bytes: &[u8]) -> i64 {
+/// A digest taken before this runs pins a random secret and the variable is
+/// ignored from then on, so the launcher calls it before anything hashes.
+pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
+    let value = crate::host_seam::getenv(b"PYTHONHASHSEED")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if value.is_empty() || value.as_slice() == b"random" {
+        return Ok(());
+    }
+    let seed = std::str::from_utf8(&value)
+        .ok()
+        .and_then(|text| text.parse::<u32>().ok())
+        .ok_or(HASH_SEED_ERROR)?;
+    // `_build_key_from_seed` gives seed 0 the all-zero key rather than running
+    // the expansion over it.
+    let secret = if seed == 0 {
+        [0; 16]
+    } else {
+        hash_secret_from_seed(seed)
+    };
+    let _ = HASH_SECRET.set(secret);
+    Ok(())
+}
+
+fn hash_secret() -> &'static [u8; 16] {
+    HASH_SECRET.get_or_init(|| {
+        let mut secret = [0u8; 16];
+        getrandom::fill(&mut secret)
+            .expect("failed to get random numbers to initialize Python hash secret");
+        secret
+    })
+}
+
+/// CPython 3.14 `_Py_HashBytes`: empty input hashes to zero; every other byte
+/// sequence uses SipHash-1-3 with the process-global 128-bit secret.
+fn _hash_bytes_with_key(bytes: &[u8], secret: &[u8; 16]) -> i64 {
+    if bytes.is_empty() {
+        return 0;
+    }
     use core::hash::Hasher;
-    // `rpython/rlib/rsiphash.py _build_key_from_seed` — when
-    // `PYTHONHASHSEED=0` the key is the 16-byte all-zero buffer.
-    // Pyre runs with the deterministic seed for reproducibility,
-    // matching PyPy's `PYTHONHASHSEED=0` byte-for-byte.  Wiring a
-    // user-overridable seed is straight-forward (`OnceLock<[u8; 16]>`
-    // sampled from `getrandom` or the env var) once tests are
-    // robust to it.
-    //
-    // Not delegated to `rustpython_common::hash::hash_str`: that path
-    // needs a `HashSecret`, whose all-zero key is un-constructable at
-    // the pinned rev (private `k0`/`k1`, only a seeded `new`), and it
-    // hashes through the slice `Hash` impl (length prefix) plus a
-    // `mod_int` reduction that this raw siphash24 digest omits.
-    static SECRET: [u8; 16] = [0u8; 16];
-    let mut hasher = siphasher::sip::SipHasher24::new_with_key(&SECRET);
+    let mut hasher = siphasher::sip::SipHasher13::new_with_key(secret);
     hasher.write(bytes);
     let raw = hasher.finish() as i64;
-    let raw = raw - ((raw == -1) as i64);
-    // `rstr.py _ll_strhash` — a string caches its digest in a slot that
-    // `malloc` zeroed, so zero doubles as "not computed yet" and a digest that
-    // lands on it is replaced by this fixed substitute.  Applied here rather
-    // than at the caching str caller so every digest consumer (bytes,
-    // memoryview) agrees with the cached one on the same bytes.  Empty input
-    // is NOT special-cased: `ll_strhash`'s `return 0` arm is a null-pointer
-    // check, and upstream digests `b""` like any other value.
-    if raw == 0 { 29872897 } else { raw }
+    raw - ((raw == -1) as i64)
+}
+
+#[inline]
+fn _hash_bytes(bytes: &[u8]) -> i64 {
+    _hash_bytes_with_key(bytes, hash_secret())
+}
+
+/// CPython 3.14 `unicode_hash`: hash the PEP 393 canonical code-unit storage,
+/// selecting one-, two-, or four-byte native-endian units from the maximum
+/// code point.  Pyre stores WTF-8, so materialize only this hash input.
+fn _hash_unicode_with_key(wtf8: &rustpython_wtf8::Wtf8, secret: &[u8; 16]) -> i64 {
+    let codepoints: Vec<u32> = wtf8.code_points().map(|cp| cp.to_u32()).collect();
+    let maxchar = codepoints.iter().copied().max().unwrap_or(0);
+    let mut bytes = Vec::with_capacity(
+        codepoints.len()
+            * if maxchar <= 0xff {
+                1
+            } else if maxchar <= 0xffff {
+                2
+            } else {
+                4
+            },
+    );
+    if maxchar <= 0xff {
+        bytes.extend(codepoints.into_iter().map(|cp| cp as u8));
+    } else if maxchar <= 0xffff {
+        for cp in codepoints {
+            bytes.extend_from_slice(&(cp as u16).to_ne_bytes());
+        }
+    } else {
+        for cp in codepoints {
+            bytes.extend_from_slice(&cp.to_ne_bytes());
+        }
+    }
+    _hash_bytes_with_key(&bytes, secret)
+}
+
+#[inline]
+fn _hash_unicode(wtf8: &rustpython_wtf8::Wtf8) -> i64 {
+    _hash_unicode_with_key(wtf8, hash_secret())
 }
 
 /// `space.hash_w` digest for a `str` computed directly from its WTF-8 bytes
@@ -9373,7 +9969,8 @@ fn _hash_str(bytes: &[u8]) -> i64 {
 /// without a `W_UnicodeObject`.
 #[inline]
 pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
-    _hash_str(bytes)
+    let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes).expect("str storage is valid WTF-8");
+    _hash_unicode(wtf8)
 }
 
 /// `setobject.py W_FrozensetObject.descr_hash` — the order-independent
@@ -9420,11 +10017,9 @@ fn frozenset_hash_from_storage(obj: PyObjectRef) -> i64 {
 /// - `hash((1, 2)) == hash((1, 2))` regardless of allocation identity
 /// - `hash(frozenset(...))` is deterministic and order-independent
 ///
-/// `unicodeobject.py W_UnicodeObject.descr_hash` routes through
-/// RPython's `compute_hash(self._utf8)` which is siphash on 64-bit;
-/// pyre keeps an FNV-style multiplicative mix here (functional but
-/// not bit-identical to CPython/PyPy).  Convergence target: import
-/// siphash24 from a workspace dep.
+/// CPython 3.14's `_Py_HashBytes` uses SipHash-1-3 and returns zero for empty
+/// input. Strings hash their PEP 393 canonical code-unit representation rather
+/// than pyre's internal WTF-8 bytes, keeping all seeded values bit-identical.
 pub fn hash_value(obj: PyObjectRef) -> i64 {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
@@ -9457,24 +10052,19 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             );
         }
         if is_str(obj) {
-            // `unicodeobject.py hash_w` digests `self._utf8`, and
-            // `compute_hash` on an RPython string is `ll_strhash`, which keeps
-            // the result in the string and recomputes only while the slot
-            // still reads zero.  `_hash_str` already substitutes a zero
-            // digest, so the value cached here is never the "not computed"
-            // sentinel.
+            // CPython `unicode_hash` caches the PEP 393 content digest.
             let cached = pyre_object::w_str_get_hash(obj);
             if cached != 0 {
                 return cached;
             }
-            let hash = _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
+            let hash = _hash_unicode(pyre_object::w_str_get_wtf8(obj));
             pyre_object::w_str_set_hash(obj, hash);
             return hash;
         }
-        // `bytesobject.py descr_hash` — `compute_hash(self._value)`, the same
-        // byte-string digest str uses (bytearray is mutable / unhashable).
+        // CPython `bytes_hash` — the same `_Py_HashBytes` primitive, over the
+        // bytes payload itself (bytearray is mutable / unhashable).
         if pyre_object::is_bytes(obj) {
-            return _hash_str(pyre_object::bytesobject::w_bytes_data(obj));
+            return _hash_bytes(pyre_object::bytesobject::w_bytes_data(obj));
         }
         // `memoryobject.py descr_hash` — `compute_hash(self.view.as_str())`;
         // a released or writable view is unhashable, so this infallible
@@ -9485,7 +10075,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             if memoryview_check_released(obj).is_ok()
                 && pyre_object::memoryview::w_memoryview_readonly(obj)
             {
-                return _hash_str(&memoryview_gather_bytes(obj));
+                return _hash_bytes(&memoryview_gather_bytes(obj));
             }
         }
         if pyre_object::is_none(obj) {
@@ -9496,13 +10086,18 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return 0xFCA8_6420;
         }
         if is_tuple(obj) {
-            // `tupleobject.py:409-420 _descr_hash_unroll` folds the element
-            // digests straight into the accumulator; collecting them into a
-            // list first would allocate one per hashed tuple.
+            // CPython 3.14 `tuple_hash`: cache the successful aggregate after
+            // the first element walk. This supersedes PyPy's otherwise
+            // structurally equivalent `_descr_hash_unroll` for the requested
+            // 3.14 observable semantics.
+            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+                return hash;
+            }
             let n = w_tuple_len(obj) as i64;
-            return _hash_tuple_xx_iter(
-                (0..n).filter_map(|i| w_tuple_getitem(obj, i).map(hash_value)),
-            );
+            let hash =
+                _hash_tuple_xx_iter((0..n).filter_map(|i| w_tuple_getitem(obj, i).map(hash_value)));
+            pyre_object::w_tuple_set_cached_hash(obj, hash);
+            return hash;
         }
         if pyre_object::is_frozenset(obj) {
             return frozenset_hash_from_storage(obj);
@@ -10593,12 +11188,12 @@ pub(crate) fn init_fileio_type(ns: PyObjectRef) {
         (
             "closefd",
             fileio_get_closefd as crate::gateway::BuiltinCodeFn,
-            None,
+            Some("True if the file descriptor will be closed"),
         ),
         (
             "mode",
             fileio_get_mode as crate::gateway::BuiltinCodeFn,
-            None,
+            Some("String giving the file mode"),
         ),
         (
             "_blksize",
@@ -12565,7 +13160,7 @@ pub fn is_builtin_divmod_function(callable: PyObjectRef) -> bool {
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             return false;
         }
-        std::ptr::fn_addr_eq(
+        crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
             builtin_divmod as crate::gateway::BuiltinCodeFn,
         )
@@ -13187,15 +13782,27 @@ mod tests {
         }
     }
 
-    /// Empty input is digested like any other: SipHash-2-4 under the all-zero
-    /// key gives `0x1e924b9d737700d7`, which is what PyPy reports for
-    /// `hash("")` under `PYTHONHASHSEED=0`.  A digest never reads back as the
-    /// zero "not computed yet" sentinel.
+    /// CPython 3.14 uses SipHash-1-3, treats empty input specially as zero, and
+    /// expands numeric `PYTHONHASHSEED` values with its deterministic LCG.
     #[test]
-    fn empty_str_and_bytes_digest_like_pypy() {
-        assert_eq!(_hash_str(b""), 0x1e92_4b9d_7377_00d7);
-        assert_eq!(hash_str_bytes(b""), 0x1e92_4b9d_7377_00d7);
-        assert_ne!(_hash_str(b"a"), 0);
+    fn string_and_bytes_hash_match_cpython_seed_vectors() {
+        let zero = [0; 16];
+        assert_eq!(_hash_bytes_with_key(b"", &zero), 0);
+        assert_eq!(_hash_bytes_with_key(b"abc", &zero), -4594863902769663758);
+
+        let seed_42 = hash_secret_from_seed(42);
+        assert_eq!(_hash_bytes_with_key(b"abc", &seed_42), 3869580338025362921);
+        assert_eq!(
+            _hash_bytes_with_key(b"abcdefghijk", &seed_42),
+            7764564197781545852
+        );
+
+        let non_ascii =
+            rustpython_wtf8::Wtf8Buf::from_string("\u{e4}\u{fa}\u{2211}\u{2107}".to_owned());
+        assert_eq!(
+            _hash_unicode_with_key(&non_ascii, &zero),
+            -2810468059467891395
+        );
     }
 
     /// Tuple and frozenset hashes delegate to `rustpython_common::hash`
@@ -13223,6 +13830,24 @@ mod tests {
         assert_eq!(_hash_frozenset(&[1, 2, 3]), -272375401224217160);
         assert_eq!(_hash_frozenset(&[-2, 0, 1]), 8868930259606097796); // {-1, 0, 1}
         assert_eq!(_hash_frozenset(&[fs1, fs2]), 304806268181062474); // {fs{1}, fs{2}}
+    }
+
+    #[test]
+    fn tuple_hash_is_cached_for_general_and_specialised_layouts() {
+        crate::typedef::init_typeobjects();
+        for value in [
+            w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
+            w_tuple_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]),
+        ] {
+            unsafe {
+                assert_eq!(pyre_object::w_tuple_cached_hash(value), None);
+            }
+            let first = try_hash_value(value).unwrap();
+            unsafe {
+                assert_eq!(pyre_object::w_tuple_cached_hash(value), Some(first));
+            }
+            assert_eq!(try_hash_value(value).unwrap(), first);
+        }
     }
 
     #[test]

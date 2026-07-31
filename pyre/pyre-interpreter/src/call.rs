@@ -2037,6 +2037,11 @@ pub fn call_with_kwargs(
     }
 
     if unsafe { crate::is_function_carrier(callable) } {
+        if unsafe { crate::is_slot_wrapper(callable) }
+            && let Some(&receiver) = pos_args.first()
+        {
+            crate::typedef::slot_wrapper_check_instance(callable, receiver)?;
+        }
         let code = unsafe { crate::getcode(callable) };
         // For builtins: pack kwargs into a dict as last arg.
         //
@@ -2447,19 +2452,20 @@ pub fn call_with_kwargs(
         // keywords: FunctionType has `kwdefaults=...`, CPython 3.14 exposes
         // `memoryview(object=...)`, and the deque iterator constructors accept
         // (and ignore) `index=...`.  Route them through `__new__`.
-        let accepts_keywords_despite_nonbase = std::ptr::eq(
-            callable,
-            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
-        ) || std::ptr::eq(
-            callable,
-            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
-        ) || std::ptr::eq(
-            callable,
-            crate::module::_collections::deque_iter::public_type(),
-        ) || std::ptr::eq(
-            callable,
-            crate::module::_collections::deque_rev_iter::public_type(),
-        );
+        let accepts_keywords_despite_nonbase =
+            std::ptr::eq(
+                callable,
+                crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+            ) || std::ptr::eq(
+                callable,
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            ) || std::ptr::eq(
+                callable,
+                crate::module::_collections::deque_iter::public_type(),
+            ) || std::ptr::eq(
+                callable,
+                crate::module::_collections::deque_rev_iter::public_type(),
+            ) || std::ptr::eq(callable, crate::module::_contextvars::context_var_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(callable) }
@@ -2661,6 +2667,11 @@ pub fn call_function_impl_result(
         }
         // All callables are Function objects.
         if crate::is_function_carrier(callable) {
+            if crate::is_slot_wrapper(callable)
+                && let Some(&receiver) = args.first()
+            {
+                crate::typedef::slot_wrapper_check_instance(callable, receiver)?;
+            }
             let code = crate::getcode(callable);
             if crate::is_builtin_code(code as pyre_object::PyObjectRef) {
                 // Builtin function: direct Rust call. Errors propagate
@@ -3387,29 +3398,31 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         None
     };
 
-    // If no explicit metaclass, infer from bases (PyPy: calculate_metaclass)
+    // compiling.py:169-183 — choose the initial metaclass from the first
+    // resolved base (or `type` for an empty base list), then run
+    // `_calculate_metaclass` across *every* base.  In particular a non-type
+    // base without `__mro_entries__` still contributes `space.type(base)`:
+    // `(object, None)` therefore raises the metaclass conflict instead of
+    // slipping through the default-type fast path.
+    //
+    // `None` remains pyre's internal spelling for the exact builtin `type`
+    // winner, so `build_class_inner` can retain its raw default construction
+    // path without changing the app-level algorithm.
+    let w_type_type = crate::typedef::w_type();
     let w_metaclass = match metaclass {
-        Some(meta) if unsafe { !pyre_object::is_type(meta) } => Some(meta),
-        explicit => {
-            let initial = if let Some(explicit) = explicit {
-                explicit
-            } else if unsafe { pyre_object::w_tuple_len(bases_tuple) } > 0 {
-                unsafe {
-                    pyre_object::w_tuple_getitem(bases_tuple, 0)
-                        .and_then(|base| {
-                            if pyre_object::is_type(base) && !(*base).w_class.is_null() {
-                                Some((*base).w_class)
-                            } else {
-                                crate::typedef::r#type(base).map(|ty| ty.as_ptr())
-                            }
-                        })
-                        .unwrap_or_else(crate::typedef::w_type)
-                }
-            } else {
-                crate::typedef::w_type()
+        Some(w_meta) if unsafe { pyre_object::is_type(w_meta) } => {
+            Some(calculate_metaclass(w_meta, bases_tuple)?)
+        }
+        Some(w_meta) => Some(w_meta),
+        None => {
+            let initial = unsafe {
+                pyre_object::w_tuple_getitem(bases_tuple, 0)
+                    .and_then(crate::typedef::r#type)
+                    .map(|w_type| w_type.as_ptr())
+                    .unwrap_or(w_type_type)
             };
             let winner = calculate_metaclass(initial, bases_tuple)?;
-            if std::ptr::eq(winner, crate::typedef::w_type()) {
+            if std::ptr::eq(winner, w_type_type) {
                 None
             } else {
                 Some(winner)
@@ -3965,6 +3978,17 @@ fn build_class_inner(
         // consume the explicit class cells here (type_new_classcell leaves
         // them out of the class `__dict__`); the captured `classcell` is
         // bound to the new type below.
+        // typeobject.py `_store_type_in_classcell` validates the value before
+        // deleting it.  The default-metaclass shortcut bypasses
+        // `type.__new__`, so it must preserve that check here too.
+        if let Some(w_classcell) = classcell {
+            if !unsafe { pyre_object::is_cell(w_classcell) } {
+                return Err(PyError::type_error(format!(
+                    "__classcell__ must be a nonlocal cell, not {}",
+                    crate::baseobjspace::object_functionstr_type_name(w_classcell),
+                )));
+            }
+        }
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classcell__") };
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
@@ -4166,7 +4190,13 @@ pub(crate) fn call_init_subclass_on_bases(
     _w_effective_bases: PyObjectRef,
     init_subclass_kwargs: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
-    let w_super = pyre_object::descriptor::w_super_new(w_type, w_type);
+    // typeobject.py:1022 `space.call_function(w_super, w_type, w_type)`
+    // goes through `super.__new__` / `_super_check` before constructing the
+    // proxy.  This matters for a custom metaclass mro() that omits the
+    // nascent class: `super(w_type, w_type)` must reject that incomplete
+    // hierarchy instead of manufacturing an invalid proxy.
+    let w_objtype = crate::builtins::super_check(w_type, w_type)?;
+    let w_super = pyre_object::descriptor::w_super_new(w_type, w_objtype, w_type);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
     // `__args__.replace_arguments([])` — keywords only, no positionals.
     let kwds: Vec<(Wtf8Buf, PyObjectRef)> = init_subclass_kwargs
@@ -4663,11 +4693,13 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
     }
 }
 
-/// typeobject.py:1089-1105 find_best_base.
-unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+/// typeobject.py:1335-1353 find_best_base.
+unsafe fn find_best_base(
+    w_bases: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
         if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
-            return std::ptr::null_mut();
+            return Ok(std::ptr::null_mut());
         }
         let len = pyre_object::w_tuple_len(w_bases);
         let mut w_bestbase: pyre_object::PyObjectRef = std::ptr::null_mut();
@@ -4675,6 +4707,15 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
             if let Some(w_candidate) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
                 if !pyre_object::is_type(w_candidate) {
                     continue;
+                }
+                // typeobject.py:1343-1345 — a custom metaclass mro() may
+                // expose the nascent type before its MRO is installed, but
+                // that incomplete type cannot itself be extended.
+                if pyre_object::w_type_get_mro(w_candidate).is_null() {
+                    return Err(crate::PyError::type_error(format!(
+                        "Cannot extend an incomplete type '{}'",
+                        pyre_object::w_type_get_name(w_candidate),
+                    )));
                 }
                 if w_bestbase.is_null() {
                     w_bestbase = w_candidate;
@@ -4690,7 +4731,7 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
                 }
             }
         }
-        w_bestbase
+        Ok(w_bestbase)
     }
 }
 
@@ -4699,40 +4740,11 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
 ///   if w_bestbase is None: raise TypeError
 ///   if not w_bestbase.layout.typedef.acceptable_as_base_class: raise TypeError
 ///   for w_base in bases_w: check layout conflicts
-unsafe fn check_and_find_best_base(
+pub(crate) unsafe fn check_and_find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
-        let len = if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
-            0
-        } else {
-            pyre_object::w_tuple_len(w_bases)
-        };
-        for i in 0..len {
-            let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) else {
-                continue;
-            };
-            if !pyre_object::is_type(w_base) {
-                return Err(crate::PyError::type_error(format!(
-                    "{}() argument 2 must be tuple of types, not {}",
-                    "type",
-                    pyre_object::type_name_of(w_base),
-                )));
-            }
-            if pyre_object::w_type_get_mro(w_base).is_null() {
-                return Err(crate::PyError::type_error(format!(
-                    "cannot extend incomplete type '{}'",
-                    pyre_object::w_type_get_name(w_base),
-                )));
-            }
-            if !is_acceptable_base_class(w_base) {
-                return Err(crate::PyError::type_error(format!(
-                    "type '{}' is not an acceptable base type",
-                    pyre_object::w_type_get_name(w_base),
-                )));
-            }
-        }
-        let w_bestbase = find_best_base(w_bases);
+        let w_bestbase = find_best_base(w_bases)?;
         // typeobject.py:1113-1115
         if w_bestbase.is_null() {
             return Err(crate::PyError::type_error(
@@ -4751,6 +4763,7 @@ unsafe fn check_and_find_best_base(
         // typeobject.py:1122-1128: check layout conflicts
         let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
         if !best_layout.is_null() && !w_bases.is_null() && pyre_object::is_tuple(w_bases) {
+            let len = pyre_object::w_tuple_len(w_bases);
             for i in 0..len {
                 if let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
                     if !pyre_object::is_type(w_base) {

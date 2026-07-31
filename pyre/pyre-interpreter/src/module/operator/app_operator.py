@@ -53,7 +53,7 @@ class attrgetter(object):
     (r.name.first, r.name.last).
     """
 
-    def __init__(self, attr, *attrs):
+    def __init__(self, attr, /, *attrs):
         if (
             not isinstance(attr, str) or
             not all(isinstance(a, str) for a in attrs)
@@ -72,7 +72,7 @@ class attrgetter(object):
             self._single_attr = attr.split(".")
             self._call = self._single_attrgetter
 
-    def __call__(self, obj):
+    def __call__(self, obj, /):
         return self._call(obj)
 
     def _simple_attrgetter(self, obj):
@@ -121,14 +121,14 @@ class itemgetter(object):
     After g = itemgetter(2, 5, 3), the call g(r) returns (r[2], r[5], r[3])
     """
 
-    def __init__(self, item, *items):
+    def __init__(self, item, /, *items):
         self._single = not bool(items)
         if self._single:
             self._idx = item
         else:
             self._idx = [item] + list(items)
 
-    def __call__(self, obj):
+    def __call__(self, obj, /):
         if self._single:
             return obj[self._idx]
         else:
@@ -141,6 +141,13 @@ class itemgetter(object):
             a = ', '.join([repr(i) for i in self._idx])
         return 'operator.itemgetter(%s)' % (a,)
 
+    def __reduce__(self):
+        if self._single:
+            items = (self._idx,)
+        else:
+            items = tuple(self._idx)
+        return type(self), items
+
 
 class methodcaller(object):
     """
@@ -150,17 +157,14 @@ class methodcaller(object):
     r.name('date', foo=1).
     """
 
-    def __init__(*args, **kwargs):
-        if len(args) < 2:
-            raise TypeError("methodcaller() called with not enough arguments")
-        self, method_name = args[:2]
-        if not isinstance(method_name, str):
+    def __init__(self, name, /, *args, **kwargs):
+        if not isinstance(name, str):
             raise TypeError("method name must be a string")
-        self._method_name = method_name
-        self._args = args[2:]
+        self._method_name = name
+        self._args = args
         self._kwargs = kwargs
 
-    def __call__(self, obj):
+    def __call__(self, obj, /):
         return getattr(obj, self._method_name)(*self._args, **self._kwargs)
 
     def __repr__(self):
@@ -170,3 +174,10 @@ class methodcaller(object):
         for key, value in self._kwargs.items():
             args.append('%s=%r' % (key, value))
         return 'operator.methodcaller(%s)' % (', '.join(args),)
+
+    def __reduce__(self):
+        if not self._kwargs:
+            return type(self), (self._method_name,) + self._args
+        else:
+            from functools import partial
+            return partial(type(self), self._method_name, **self._kwargs), self._args
