@@ -100,7 +100,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::OpRef;
 use crate::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetMember};
@@ -3346,6 +3346,21 @@ pub trait SizeDescr: Descr {
         false
     }
 
+    /// Whether `NEW` for this descr must allocate in the non-moving old
+    /// generation instead of the movable nursery.
+    ///
+    /// Set it for a type whose objects the host reaches through raw
+    /// pointers it does not register as GC roots: a minor collection
+    /// inside any residual call would move such an object out from under
+    /// those pointers, and the caller would then read and write the dead
+    /// pre-move copy.  The flag exists so a JIT-emitted allocation can
+    /// match the allocator the host itself uses for that type; a type
+    /// whose host allocator is the ordinary nursery one must leave it
+    /// `false`, since the old generation is never collected as cheaply.
+    fn non_moving(&self) -> bool {
+        false
+    }
+
     /// Vtable address, if is_object().
     fn vtable(&self) -> usize {
         0
@@ -3689,6 +3704,13 @@ pub trait ArrayDescr: Descr {
     /// Whether items are structs (array-of-structs pattern).
     /// descr.py: is_array_of_structs() → self.flag == FLAG_STRUCT
     fn is_array_of_structs(&self) -> bool {
+        false
+    }
+
+    /// Whether `NEW_ARRAY` for this descr must allocate in the non-moving
+    /// old generation instead of the movable nursery.  Same contract as
+    /// [`SizeDescr::non_moving`], for the varsize path.
+    fn non_moving(&self) -> bool {
         false
     }
 
@@ -4540,6 +4562,10 @@ pub struct SimpleSizeDescr {
     /// Explicit allocation-shape bit for `NEW` rewriting.  Defaults false:
     /// normal JIT-GC structs are headered unless an emitter opts in.
     headerless: bool,
+    /// Allocation-generation bit for `NEW` rewriting; see
+    /// [`SizeDescr::non_moving`].  Atomic so a frontend can stamp it onto
+    /// an already-shared descr, the way `descr_index` is stamped.
+    non_moving: AtomicBool,
     /// descr.py:72 `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py:71 `self.gc_fielddescrs = gc_fielddescrs`.
@@ -4561,6 +4587,7 @@ impl Clone for SimpleSizeDescr {
             vtable: self.vtable,
             is_gc_managed: self.is_gc_managed,
             headerless: self.headerless,
+            non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
         }
@@ -4579,6 +4606,7 @@ impl SimpleSizeDescr {
             vtable: 0,
             is_gc_managed: true,
             headerless: false,
+            non_moving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -4595,6 +4623,7 @@ impl SimpleSizeDescr {
             vtable,
             is_gc_managed: true,
             headerless: false,
+            non_moving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -4618,6 +4647,13 @@ impl SimpleSizeDescr {
     /// Override the allocation-shape flag (default `false`).
     pub fn set_headerless(&mut self, headerless: bool) {
         self.headerless = headerless;
+    }
+
+    /// Override the allocation-generation flag (default `false`); see
+    /// [`SizeDescr::non_moving`].  Takes `&self` so a frontend can stamp
+    /// it after the descr is already behind an `Arc` and registered.
+    pub fn set_non_moving(&self, non_moving: bool) {
+        self.non_moving.store(non_moving, Ordering::Relaxed);
     }
 
     /// descr.py:123-126 — `get_size_descr` calls
@@ -4706,6 +4742,9 @@ impl SizeDescr for SimpleSizeDescr {
     }
     fn headerless(&self) -> bool {
         self.headerless
+    }
+    fn non_moving(&self) -> bool {
+        self.non_moving.load(Ordering::Relaxed)
     }
     fn vtable(&self) -> usize {
         self.vtable
@@ -4996,6 +5035,10 @@ pub struct SimpleArrayDescr {
     /// `ArrayDescr::is_gc_managed`).  `false` only for a header-less raw
     /// native pointer-array minted by `add_ptr_array_descr`.
     is_gc_managed: bool,
+    /// Allocation-generation bit for `NEW_ARRAY` rewriting; see
+    /// [`ArrayDescr::non_moving`].  Atomic so a frontend can stamp it onto
+    /// an already-shared descr, the way `type_id` is stamped.
+    non_moving: AtomicBool,
 }
 
 impl Clone for SimpleArrayDescr {
@@ -5019,6 +5062,7 @@ impl Clone for SimpleArrayDescr {
             concrete_type: self.concrete_type,
             all_interiorfielddescrs: interior,
             is_gc_managed: self.is_gc_managed,
+            non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
         }
     }
 }
@@ -5047,6 +5091,7 @@ impl SimpleArrayDescr {
             concrete_type: '\x00',
             all_interiorfielddescrs: std::sync::OnceLock::new(),
             is_gc_managed: true,
+            non_moving: AtomicBool::new(false),
         }
     }
 
@@ -5074,7 +5119,15 @@ impl SimpleArrayDescr {
             concrete_type: '\x00',
             all_interiorfielddescrs: std::sync::OnceLock::new(),
             is_gc_managed: true,
+            non_moving: AtomicBool::new(false),
         }
+    }
+
+    /// Override the allocation-generation flag (default `false`); see
+    /// [`ArrayDescr::non_moving`].  Takes `&self` so a frontend can stamp
+    /// it after the descr is already behind an `Arc` and registered.
+    pub fn set_non_moving(&self, non_moving: bool) {
+        self.non_moving.store(non_moving, Ordering::Relaxed);
     }
 
     /// Set the GC-managed flag (`false` for a header-less raw native
@@ -5143,6 +5196,9 @@ impl Descr for SimpleArrayDescr {
 impl ArrayDescr for SimpleArrayDescr {
     fn is_gc_managed(&self) -> bool {
         self.is_gc_managed
+    }
+    fn non_moving(&self) -> bool {
+        self.non_moving.load(Ordering::Relaxed)
     }
     fn base_size(&self) -> usize {
         self.base_size

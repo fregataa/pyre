@@ -589,6 +589,112 @@ pub fn emit_bound_method_inline(
     new_op
 }
 
+/// Emit inline `W_ObjectObject` creation (`NewWithVtable` + `SetfieldGc` for
+/// the inherited header `PyObject.w_class` and `map`), mirroring
+/// `objectobject.rs w_instance_new`.
+///
+/// `storage` keeps the allocation's zero — `w_instance_new` stores a null
+/// there as well (`mapdict.py:908-910 _mapdict_init_empty`, `storage = None`).
+/// `map` is the owning type's terminator, read eagerly for the same reason
+/// `w_instance_new` reads it: a deferred install leaves the promoted map guard
+/// on the next iteration's fresh instance naming a map the instance does not
+/// have yet.
+///
+/// Emitting the instantiation as New+SetField instead of the opaque
+/// `bh_call_fn` residual lets the optimizer virtualize the instance away when
+/// it never escapes the loop — the shape PyPy gets by tracing through
+/// `typeobject.py descr_call` → `space.allocate_instance`.
+pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRef) -> OpRef {
+    let new_op = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_object_object_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_op);
+    for (descr, value) in [
+        (crate::descr::object_header_w_class_descr(), header_w_class),
+        (crate::descr::object_map_descr(), map),
+    ] {
+        let index = descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+        ctx.heapcache_setfield_cached(new_op, index, value);
+    }
+    new_op
+}
+
+/// Emit `_set_mapdict_increase_storage1` (`mapdict.py:942-959`) as trace
+/// operations: allocate the one-slot-longer storage block, copy the
+/// `old_len` live slots over, append the new value, then install the block
+/// and the transition map on the instance.
+///
+/// `old_len` and `new_map` are trace-time constants, established by the map
+/// guard `store_attr_add_fast_path`'s caller emits; a fresh instance has
+/// `old_len == 0`, so the loop body disappears and only the allocation and
+/// the two field stores remain.
+///
+/// The point of emitting this rather than calling a residual is virtualization:
+/// with the store folded, an instance built and thrown away inside one loop
+/// iteration escapes nowhere and the optimizer removes it, its storage block,
+/// and the value box along with it.
+///
+/// The old block is left to the collector.  `grow_instance_items_block` frees
+/// the block it replaces, but that free is a no-op for a GC-owned block, which
+/// `store_attr_add_fast_path` requires.
+///
+/// GC: the block is a leaf, so the barrier that matters is the one on the
+/// *instance* — the collector reaches the block's slots only through
+/// `object_object_custom_trace`.  Storing `new_block` into the instance's
+/// `storage` field is a reference store, so the GC rewriter emits
+/// `CondCallGcWb(obj)` for it, and it is emitted after the item stores, so a
+/// young value already in the block is remembered with the instance.
+///
+/// Free threading: these are raw stores, so unlike the interpreter's transition
+/// they do not hold the striped `instance_lock`, and unlike the single-slot
+/// in-place write they publish two fields.  The caller is what makes that
+/// sound — it folds only an `is_unescaped` receiver, one this trace allocated
+/// and no other thread can name yet.  The two stores are still ordered
+/// `storage` before `map`, so the only intermediate a later reader can observe
+/// is the longer block under the shorter map, which over-allocates by one slot;
+/// the reverse order would publish a map claiming an index the installed block
+/// does not have.
+pub fn emit_mapdict_add_attr_inline(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    old_len: usize,
+    new_map: OpRef,
+    value: OpRef,
+) {
+    let new_len = ctx.const_int(old_len as i64 + 1);
+    let new_block = ctx.record_op_with_descr(
+        OpCode::NewArrayClear,
+        &[new_len],
+        crate::state::mapdict_storage_gcarray_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_block);
+
+    if old_len > 0 {
+        let old_block =
+            crate::state::opimpl_getfield_gc_r(ctx, obj, crate::descr::object_storage_descr());
+        for index in 0..old_len {
+            let index_op = ctx.const_int(index as i64);
+            let item = crate::state::trace_mapdict_storage_getitem(ctx, old_block, index_op);
+            crate::state::trace_mapdict_storage_setitem(ctx, new_block, index_op, item);
+        }
+    }
+
+    let value_index = ctx.const_int(old_len as i64);
+    crate::state::trace_mapdict_storage_setitem(ctx, new_block, value_index, value);
+
+    for (field_descr, stored) in [
+        (crate::descr::object_storage_descr(), new_block),
+        (crate::descr::object_map_descr(), new_map),
+    ] {
+        let index = field_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, stored], field_descr);
+        ctx.heapcache_setfield_cached(obj, index, stored);
+    }
+}
+
 /// Emit inline Object-strategy `W_ListObject` creation as traced
 /// `NewArrayClear` + `SetarrayitemGc` + `NewWithVtable` + `SetfieldGc`
 /// ops the optimizer can virtualize when the list never escapes — instead

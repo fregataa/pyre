@@ -210,6 +210,14 @@ pub struct GcRewriterImpl {
     /// gc.py:433-444 `generate_function('malloc_array_nonstandard', ...)`
     /// function addr.
     pub malloc_array_nonstandard_fn: i64,
+    /// Old-generation twin of [`Self::malloc_array_fn`], selected by
+    /// `gen_malloc_array` when the array descr is
+    /// [`majit_ir::descr::ArrayDescr::non_moving`].  Same call signature,
+    /// so it shares `malloc_array_descr`; only the allocator differs.
+    pub malloc_array_oldgen_fn: i64,
+    /// Old-generation twin of [`Self::malloc_array_nonstandard_fn`], and
+    /// shares `malloc_array_nonstandard_descr` for the same reason.
+    pub malloc_array_nonstandard_oldgen_fn: i64,
     /// gc.py:453-458 `generate_function('malloc_str', ...)` function addr.
     pub malloc_str_fn: i64,
     /// gc.py:460-465 `generate_function('malloc_unicode', ...)` function addr.
@@ -1077,7 +1085,15 @@ impl GcRewriterImpl {
         // CALL_R helper (`malloc_big_fixedsize`) does it inside the
         // helper so `gen_malloc_fixedsize` does NOT call
         // `gen_initialize_tid` after the fact.
-        let obj_ref = match self.gen_malloc_nursery(size, op.pos.get(), st) {
+        // A descr marked `non_moving` declines the nursery the same way an
+        // oversized one does, and lands on the same helper: `gen_malloc_fixedsize`
+        // allocates in the old generation, which never moves an object.
+        let nursery_ref = if descr.non_moving() {
+            None
+        } else {
+            self.gen_malloc_nursery(size, op.pos.get(), st)
+        };
+        let obj_ref = match nursery_ref {
             Some(r) => {
                 self.gen_initialize_tid(r.clone(), type_id, st);
                 r
@@ -1191,6 +1207,11 @@ impl GcRewriterImpl {
             .expect("handle_new_array descr must be ArrayDescr");
 
         let item_size = descr.item_size();
+        // A `non_moving` descr declines both nursery routes and lands on the
+        // typed malloc helpers, whose old-generation twin never moves the
+        // block.  Same opt-in as `SizeDescr::non_moving` on the fixed-size
+        // path.
+        let non_moving = descr.non_moving();
         let v_length = st.resolve(op.arg(0)); // the length operand
         let length_const = st.resolve_constant(&v_length);
 
@@ -1211,7 +1232,7 @@ impl GcRewriterImpl {
             // rewrite.py:557-558 — non-const length but zero itemsize
             // means no variable payload; fold to fixed-size basesize.
             total_size = descr.base_size() as i64;
-        } else if self.can_use_nursery(1) {
+        } else if !non_moving && self.can_use_nursery(1) {
             // rewrite.py:559-568 path #1 — varsize nursery fast path.
             // Returns None when the descr is non-standard FLAG_ARRAY,
             // in which case we fall through to path #4
@@ -1247,7 +1268,12 @@ impl GcRewriterImpl {
             // already includes the header offset.  Add HDR_SIZE here so
             // the bump-pointer alloc covers the same span.
             let s = crate::header::GcHeader::SIZE + total_size as usize;
-            if let Some(r) = self.gen_malloc_nursery(s, op.pos.get(), st) {
+            let nursery_ref = if non_moving {
+                None
+            } else {
+                self.gen_malloc_nursery(s, op.pos.get(), st)
+            };
+            if let Some(r) = nursery_ref {
                 // rewrite.py:569-572 path #2 — constant-size nursery.
                 st.record_result_mapping(op.pos.get(), r.clone());
                 self.gen_initialize_tid(r.clone(), descr.type_id(), st);
@@ -1507,8 +1533,15 @@ impl GcRewriterImpl {
         let length_ofs = len_descr.map_or(self.standard_array_length_ofs, |fd| fd.offset());
         let is_standard = ad.base_size() == self.standard_array_basesize
             && len_descr.is_some_and(|fd| fd.offset() == self.standard_array_length_ofs);
+        // The old-generation twins take the same arguments as the nursery
+        // helpers, so only the callee address changes.
+        let non_moving = ad.non_moving();
         if is_standard {
-            let fn_ref = st.const_int(self.malloc_array_fn);
+            let fn_ref = st.const_int(if non_moving {
+                self.malloc_array_oldgen_fn
+            } else {
+                self.malloc_array_fn
+            });
             let itemsize_ref = st.const_int(ad.item_size() as i64);
             let typeid_ref = st.const_int(ad.type_id() as i64);
             self.gen_call_malloc_gc(
@@ -1518,7 +1551,11 @@ impl GcRewriterImpl {
                 st,
             )
         } else {
-            let fn_ref = st.const_int(self.malloc_array_nonstandard_fn);
+            let fn_ref = st.const_int(if non_moving {
+                self.malloc_array_nonstandard_oldgen_fn
+            } else {
+                self.malloc_array_nonstandard_fn
+            });
             let basesize_ref = st.const_int(ad.base_size() as i64);
             let itemsize_ref = st.const_int(ad.item_size() as i64);
             let lengthofs_ref = st.const_int(length_ofs as i64);
@@ -1542,11 +1579,17 @@ impl GcRewriterImpl {
     /// rewrite.py:778-796 `gen_malloc_fixedsize` (framework GC arm).
     ///
     /// Emits `CALL_R(malloc_big_fixedsize_fn, size, typeid)` followed
-    /// by `CHECK_MEMORY_ERROR` (via `gen_call_malloc_gc`) and stamps
-    /// `remember_wb` on the result so the freshly-malloc'd object
-    /// skips the write barrier (rewrite.py:794-796 — fixed-size
-    /// objects are zero-initialized by `clear_gc_fields`, so any
-    /// store into a gc field needs no WB).
+    /// by `CHECK_MEMORY_ERROR` (via `gen_call_malloc_gc`).
+    ///
+    /// rewrite.py:794-796 stamps `remember_write_barrier` on the result
+    /// there, sound because upstream's `malloc_big_fixedsize` hands back a
+    /// *young* raw-malloced object: a young object needs no barrier for a
+    /// young pointer stored into it.  pyre's helper allocates in the old
+    /// generation on both backends (`dynasm_malloc_big_fixedsize` /
+    /// `gc_malloc_big_fixedsize_helper` → `alloc_oldgen_typed`), so the
+    /// same stamp would silently drop the barrier on the first `SETFIELD_GC`
+    /// of a young value into an old object and leave that value unforwarded
+    /// after the next minor collection.  The stamp is therefore not applied.
     ///
     /// pyre is framework-GC only; the Boehm `else` arm
     /// (`malloc_fixedsize_fn`) is intentionally not ported.  The
@@ -1569,14 +1612,12 @@ impl GcRewriterImpl {
         let fn_ref = st.const_int(self.malloc_big_fixedsize_fn);
         let size_ref = st.const_int(size as i64);
         let typeid_ref = st.const_int(type_id as i64);
-        let result = self.gen_call_malloc_gc(
+        self.gen_call_malloc_gc(
             &[fn_ref, size_ref, typeid_ref],
             result_pos,
             self.malloc_big_fixedsize_descr.clone(),
             st,
-        );
-        st.remember_wb(&result);
-        result
+        )
     }
 
     /// rewrite.py:836-840 `gen_malloc_str`.
@@ -3284,6 +3325,8 @@ mod tests {
     const TEST_STANDARD_ARRAY_LENGTH_OFS: usize = 0;
     const TEST_MALLOC_ARRAY_FN: i64 = 0x1111;
     const TEST_MALLOC_ARRAY_NONSTANDARD_FN: i64 = 0x2222;
+    const TEST_MALLOC_ARRAY_OLDGEN_FN: i64 = 0x1113;
+    const TEST_MALLOC_ARRAY_NONSTANDARD_OLDGEN_FN: i64 = 0x2223;
     const TEST_MALLOC_STR_FN: i64 = 0x3333;
     const TEST_MALLOC_UNICODE_FN: i64 = 0x4444;
     const TEST_MALLOC_BIG_FIXEDSIZE_FN: i64 = 0x5555;
@@ -3297,6 +3340,7 @@ mod tests {
         vtable: usize,
         w_class: Option<i64>,
         headerless: bool,
+        non_moving: bool,
         gc_fields: Vec<Arc<dyn FieldDescr>>,
     }
 
@@ -3327,6 +3371,9 @@ mod tests {
         }
         fn headerless(&self) -> bool {
             self.headerless
+        }
+        fn non_moving(&self) -> bool {
+            self.non_moving
         }
         fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
             &self.gc_fields
@@ -3391,6 +3438,7 @@ mod tests {
         type_id: u32,
         item_type: Type,
         len_descr: Option<Arc<TestFieldDescr>>,
+        non_moving: bool,
     }
 
     impl Descr for TestArrayDescr {
@@ -3416,6 +3464,9 @@ mod tests {
             self.len_descr
                 .as_ref()
                 .map(|fd| fd.as_ref() as &dyn FieldDescr)
+        }
+        fn non_moving(&self) -> bool {
+            self.non_moving
         }
     }
 
@@ -3464,6 +3515,8 @@ mod tests {
             fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
             malloc_array_fn: TEST_MALLOC_ARRAY_FN,
             malloc_array_nonstandard_fn: TEST_MALLOC_ARRAY_NONSTANDARD_FN,
+            malloc_array_oldgen_fn: TEST_MALLOC_ARRAY_OLDGEN_FN,
+            malloc_array_nonstandard_oldgen_fn: TEST_MALLOC_ARRAY_NONSTANDARD_OLDGEN_FN,
             malloc_str_fn: TEST_MALLOC_STR_FN,
             malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
             malloc_big_fixedsize_fn: TEST_MALLOC_BIG_FIXEDSIZE_FN,
@@ -3500,6 +3553,7 @@ mod tests {
             vtable: 0,
             w_class: None,
             headerless: false,
+            non_moving: false,
             gc_fields: Vec::new(),
         })
     }
@@ -3511,6 +3565,19 @@ mod tests {
             vtable: 0,
             w_class: None,
             headerless: true,
+            non_moving: false,
+            gc_fields: Vec::new(),
+        })
+    }
+
+    fn non_moving_size_descr(size: usize, type_id: u32) -> DescrRef {
+        Arc::new(TestSizeDescr {
+            size,
+            type_id,
+            vtable: 0,
+            w_class: None,
+            headerless: false,
+            non_moving: true,
             gc_fields: Vec::new(),
         })
     }
@@ -3526,6 +3593,7 @@ mod tests {
             vtable: 0,
             w_class: None,
             headerless: false,
+            non_moving: false,
             gc_fields,
         })
     }
@@ -3543,6 +3611,7 @@ mod tests {
             vtable,
             w_class,
             headerless: false,
+            non_moving: false,
             gc_fields,
         })
     }
@@ -3554,6 +3623,7 @@ mod tests {
             vtable,
             w_class: None,
             headerless: false,
+            non_moving: false,
             gc_fields: Vec::new(),
         })
     }
@@ -3589,6 +3659,18 @@ mod tests {
             type_id: 5,
             item_type: Type::Ref,
             len_descr: Some(array_len_field_descr()),
+            non_moving: false,
+        })
+    }
+
+    fn non_moving_array_descr() -> DescrRef {
+        Arc::new(TestArrayDescr {
+            base_size: TEST_STANDARD_ARRAY_BASESIZE,
+            item_size: 8,
+            type_id: 55,
+            item_type: Type::Ref,
+            len_descr: Some(array_len_field_descr()),
+            non_moving: true,
         })
     }
 
@@ -3599,6 +3681,7 @@ mod tests {
             type_id: 6,
             item_type: Type::Int,
             len_descr: Some(array_len_field_descr()),
+            non_moving: false,
         })
     }
 
@@ -3652,6 +3735,99 @@ mod tests {
                  for each constant it mints"
             );
         }
+    }
+
+    /// A `non_moving` descr takes the `malloc_big_fixedsize` helper even at a
+    /// size the nursery would happily accept, so the object is born in the
+    /// non-moving old generation. The size the helper is handed is still the
+    /// headered total, and no separate `gen_initialize_tid` follows — the
+    /// helper stamps the tid itself.
+    #[test]
+    fn test_non_moving_new_declines_nursery_at_small_size() {
+        let rw = make_rewriter();
+        let payload_size = 32;
+        let type_id = 53;
+        let ops = vec![Op::with_descr(
+            OpCode::New,
+            &[],
+            non_moving_size_descr(payload_size, type_id),
+        )];
+
+        let (result, _constants, _gcrefs) =
+            rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        assert!(
+            result
+                .iter()
+                .all(|op| op.opcode != OpCode::CallMallocNursery),
+            "a non_moving descr must never reach the nursery bump path"
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::CallR);
+        assert_eq!(result[1].opcode, OpCode::CheckMemoryError);
+        assert_eq!(
+            result[0]
+                .arg(0)
+                .to_opref()
+                .inline_const_bits()
+                .expect("malloc_big_fixedsize fn const"),
+            TEST_MALLOC_BIG_FIXEDSIZE_FN
+        );
+        assert_eq!(
+            result[0]
+                .arg(1)
+                .to_opref()
+                .inline_const_bits()
+                .expect("headered total size const"),
+            round_up(payload_size + crate::header::GcHeader::SIZE) as i64
+        );
+    }
+
+    /// The varsize twin: a `non_moving` array descr declines the nursery at a
+    /// constant length the nursery would accept, and lands on the old-generation
+    /// `malloc_array` helper rather than the nursery one.  The length still
+    /// reaches the helper as its last argument, so the block's GcArray length
+    /// header is stamped by the helper itself.
+    #[test]
+    fn test_non_moving_new_array_declines_nursery_at_small_length() {
+        let rw = make_rewriter();
+        let num_elem = 3;
+        let len_ref = OpRef::int_op(10_000);
+        let mut constants: ConstMap<Const> = ConstMap::new();
+        constants.insert(10_000, Const::Int(num_elem));
+        let new_array = Op::with_descr(
+            OpCode::NewArrayClear,
+            &[ro(len_ref)],
+            non_moving_array_descr(),
+        );
+        new_array.pos.set(OpRef::ref_op(0));
+        let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
+
+        let (result, _constants, _gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+
+        assert!(
+            result
+                .iter()
+                .all(|op| op.opcode != OpCode::CallMallocNursery
+                    && op.opcode != OpCode::CallMallocNurseryVarsize),
+            "a non_moving array descr must never reach either nursery path"
+        );
+        let call = result
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR)
+            .expect("non_moving NEW_ARRAY must emit the typed malloc CALL_R");
+        assert_eq!(
+            call.arg(0)
+                .to_opref()
+                .inline_const_bits()
+                .expect("malloc_array fn const"),
+            TEST_MALLOC_ARRAY_OLDGEN_FN
+        );
+        assert_eq!(
+            call.arg(3).to_opref(),
+            len_ref,
+            "the length operand is threaded through as the helper's num_elem"
+        );
     }
 
     #[test]
@@ -5014,6 +5190,8 @@ mod tests {
             fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
             malloc_array_fn: TEST_MALLOC_ARRAY_FN,
             malloc_array_nonstandard_fn: TEST_MALLOC_ARRAY_NONSTANDARD_FN,
+            malloc_array_oldgen_fn: TEST_MALLOC_ARRAY_OLDGEN_FN,
+            malloc_array_nonstandard_oldgen_fn: TEST_MALLOC_ARRAY_NONSTANDARD_OLDGEN_FN,
             malloc_str_fn: TEST_MALLOC_STR_FN,
             malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
             malloc_big_fixedsize_fn: TEST_MALLOC_BIG_FIXEDSIZE_FN,
@@ -5144,6 +5322,7 @@ mod tests {
                 field_size: std::mem::size_of::<usize>(),
                 field_type: Type::Int,
             })),
+            non_moving: false,
         })
     }
 
@@ -5159,6 +5338,7 @@ mod tests {
                 field_size: std::mem::size_of::<usize>(),
                 field_type: Type::Int,
             })),
+            non_moving: false,
         })
     }
 
