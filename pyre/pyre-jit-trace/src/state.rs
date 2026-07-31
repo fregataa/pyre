@@ -465,8 +465,31 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
         // inside `_encode_liveness`. The counter measures write-insn call
         // frequency, not unique-entry count.
         asm.num_liveness_ops += 1;
-        let key = (live_i.to_vec(), live_r.to_vec(), live_f.to_vec());
-        if let Some(&pos) = asm.all_liveness_positions.get(&key) {
+        // `assembler.py:238` keys on the three frozensets. `encode_liveness`
+        // sorts and dedups before writing, so two argument orderings of one
+        // set encode to identical bytes; keying on the raw slice order would
+        // miss the dedup and append a second copy of a record already in the
+        // buffer. Canonicalise to the same sorted/deduped form the writer side
+        // (`VecSet`) and `decode_liveness_records` produce.
+        let canonical = |live: &[u8]| {
+            let mut v = live.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let key = (canonical(live_i), canonical(live_r), canonical(live_f));
+        // The dict is derived from the buffer on first use after each
+        // `publish_state`, which installs bytes without one. See
+        // `assembler::liveness_positions_of`.
+        if asm.all_liveness_positions.is_none() {
+            let positions = crate::assembler::liveness_positions_of(&asm.all_liveness);
+            asm.all_liveness_positions = Some(positions);
+        }
+        let positions = asm
+            .all_liveness_positions
+            .as_ref()
+            .expect("derived just above");
+        if let Some(&pos) = positions.get(&key) {
             return Some((pos, asm.all_liveness.clone()));
         }
         let pos = asm.all_liveness_length;
@@ -481,7 +504,10 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
             return None;
         }
         let pos_u16 = pos as u16;
-        asm.all_liveness_positions.insert(key, pos_u16);
+        asm.all_liveness_positions
+            .as_mut()
+            .expect("derived above")
+            .insert(key, pos_u16);
         asm.all_liveness.push(live_i.len() as u8);
         asm.all_liveness.push(live_r.len() as u8);
         asm.all_liveness.push(live_f.len() as u8);

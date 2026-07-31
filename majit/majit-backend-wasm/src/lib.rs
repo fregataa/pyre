@@ -242,19 +242,11 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Read-only GC query for the guard hooks and codegen helpers.
-///
-/// - **Test box present** (`WASM_ACTIVE_GC` is `Some`): a test owns the
-///   GC directly — apply `f` to the boxed allocator.
-/// - **No box, `gc_sync` initialized** (production): route to the
-///   process-global singleton via `gc_query_reentrant`. Some of these
-///   callers can fire during a collection's guard evaluation / extra-root
-///   walk, so the reentrant read-only path (no second `gc_mutex`, no
-///   second `&mut`) is required.
-/// - **No box, `gc_sync` uninitialized** (no GC at all — unit tests):
-///   returns `None` so callers keep their existing `.unwrap_or(default)`
-///   / `.flatten()` behaviour.
 fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
+    if !majit_gc::gc_box_installed() {
+        return majit_gc::gc_sync::is_initialized()
+            .then(|| majit_gc::gc_sync::gc_query_reentrant(f));
+    }
     match WASM_ACTIVE_GC.with(|cell| cell.try_borrow().map(|g| g.as_deref().map(|gc| f(gc)))) {
         Ok(Some(r)) => return Some(r),
         Ok(None) => {}
@@ -279,7 +271,7 @@ fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
 /// `None` so callers keep their non-GC fallback. Top-level mutator/
 /// blackhole trampolines, never inside a collection, so `gc_op` is correct.
 fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
-    if WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
         return WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
@@ -349,6 +341,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
+    majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     WASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -825,6 +818,10 @@ fn wasm_active_gc_write_barrier(obj: GcRef) {
 ///     mutation → reach it through the raw mirror (read-only), or fall
 ///     back to `gc_sync` if there is no box at all.
 fn wasm_gc_owns_object(addr: usize) -> bool {
+    if !majit_gc::gc_box_installed() {
+        return majit_gc::gc_sync::is_initialized()
+            && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr));
+    }
     match WASM_ACTIVE_GC.with(|cell| {
         cell.try_borrow()
             .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))

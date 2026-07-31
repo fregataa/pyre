@@ -761,7 +761,17 @@ impl BlackholeInterpreter {
     /// `position` points at.  When such a sync precedes the anchor, step
     /// back over it to reach the result register; otherwise `position-1`
     /// holds it directly.
-    fn call_result_reg(&self) -> usize {
+    ///
+    /// `BC_INLINE_CALL` is the one caller shape that does NOT end in a single
+    /// result register: `JitCodeBuilder::inline_call_typed` closes every
+    /// variant with THREE return slots — `return_i`, `return_r`, `return_f`,
+    /// each a register byte or [`crate::jitcode::NO_RETURN_REG`] — because one
+    /// opcode covers all four result kinds.  At most one is a real register, so
+    /// a `NO_RETURN_REG` in the last byte identifies the three-slot tail (a
+    /// single-slot call being resumed always has a real register there, and
+    /// `push_reg_u8` never emits `NO_RETURN_REG` as one).  A float-returning
+    /// inline call needs no branch: its slot is last either way.
+    fn call_result_reg(&self, kind: BhReturnType) -> usize {
         // setfield_vable_i: op + struct_reg + value_reg + descr(2 bytes).
         const VSD_SYNC_LEN: usize = 5;
         // valuestackdepth static-field index (codewriter
@@ -782,6 +792,17 @@ impl BlackholeInterpreter {
                 }
             }
         }
+        if code[pos - 1] == crate::jitcode::NO_RETURN_REG && pos >= 3 {
+            let slot_back = match kind {
+                BhReturnType::Int => 3,
+                BhReturnType::Ref => 2,
+                // A void return sets up no value, so this arm is unreachable
+                // through `_setup_return_value_*`; keep it on the last slot,
+                // which is where the single-slot convention would land.
+                BhReturnType::Float | BhReturnType::Void => 1,
+            };
+            return code[pos - slot_back] as usize;
+        }
         code[pos - 1] as usize
     }
 
@@ -792,21 +813,21 @@ impl BlackholeInterpreter {
     /// blackhole.py:1653 _setup_return_value_i
     pub fn setup_return_value_i(&mut self, result: i64) {
         // blackhole.py:1655-1656
-        let reg_idx = self.call_result_reg();
+        let reg_idx = self.call_result_reg(BhReturnType::Int);
         self.registers_i[reg_idx] = result;
     }
 
     /// blackhole.py:1657 _setup_return_value_r
     pub fn setup_return_value_r(&mut self, result: i64) {
         // blackhole.py:1658-1659
-        let reg_idx = self.call_result_reg();
+        let reg_idx = self.call_result_reg(BhReturnType::Ref);
         self.registers_r[reg_idx] = result;
     }
 
     /// blackhole.py:1660 _setup_return_value_f
     pub fn setup_return_value_f(&mut self, result: i64) {
         // blackhole.py:1661-1662
-        let reg_idx = self.call_result_reg();
+        let reg_idx = self.call_result_reg(BhReturnType::Float);
         self.registers_f[reg_idx] = result;
     }
 
@@ -3462,6 +3483,38 @@ mod tests {
             );
         }
 
+        /// `_setup_return_value_i` must read `BC_INLINE_CALL`'s `return_i` slot,
+        /// not the byte before the resume position.
+        ///
+        /// `JitCodeBuilder::inline_call_typed` closes every inline call with
+        /// three return slots (`return_i`, `return_r`, `return_f`), so a call
+        /// whose result is an int leaves `NO_RETURN_REG` in the last two.
+        /// Reading `code[position - 1]` — RPython's single-slot
+        /// `blackhole.py:1655` convention — picks up that sentinel and indexes
+        /// `registers_i` out of bounds.  Observed as an index-out-of-bounds
+        /// panic when a tracing-abort blackhole chain returned an int into the
+        /// dispatch jitcode that had inlined it.
+        #[test]
+        fn setup_return_value_i_reads_inline_calls_int_return_slot() {
+            let mut b = JitCodeBuilder::default();
+            b.inline_call_r_i(0, &[], Some(7));
+            let jitcode = b.finish();
+            // The call is the whole body, so the position the caller resumes at
+            // is the end of the code.
+            let resume_pos = jitcode.code.len();
+            assert_eq!(
+                jitcode.code[resume_pos - 1],
+                crate::jitcode::NO_RETURN_REG,
+                "inline call should end on the unused return_f slot",
+            );
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
+            bh.setup_return_value_i(42);
+            assert_eq!(bh.registers_i[7], 42);
+        }
+
         #[test]
         fn test_bh_interp_load_const_and_binop() {
             // Build jitcode: r0 = const(10), r1 = const(20), r2 = r0 + r1
@@ -3877,6 +3930,58 @@ mod tests {
         /// frame that DOES have a caller — the recursive-portal arm.
         /// Re-entering `inner` instead would run its tail a second time
         /// and overwrite the portal runner's result with `inner`'s own.
+        /// `blackhole.py:1764-1769`: the walk up the chain stops at the frame
+        /// whose jitcode names a jitdriver, and a bottommost such frame
+        /// publishes its terminal image before the exception propagates.
+        ///
+        /// That only holds because `call.py:148` gives every portal jitcode its
+        /// `jitdriver_sd` back-pointer.  Without it the walk runs off the end of
+        /// the chain and returns through the "no portal found" arm, where the
+        /// image is never taken — which is what a `#[jit_interp]` frontend saw
+        /// before `JitDriver::register_dispatch_jitcode` set the slot.
+        #[test]
+        fn handle_jitexception_publishes_terminal_only_when_a_frame_names_its_jitdriver() {
+            let build_chain = |portal: bool| {
+                let mut b = JitCodeBuilder::default();
+                b.load_const_i_value(0, 42);
+                b.int_return(0);
+                let jitcode = b.finish();
+                jitcode.set_index(0);
+                if portal {
+                    jitcode.set_jitdriver_sd(0);
+                }
+                jitcode
+            };
+
+            for portal in [true, false] {
+                let mut builder = super::build_inline_call_only_bh_builder();
+                let mut bh = builder.acquire_interp();
+                bh.setposition(std::sync::Arc::new(build_chain(portal)), 0);
+                bh.registers_i[0] = 42;
+
+                let mut terminal = None;
+                let outcome = super::handle_jitexception(
+                    &mut builder,
+                    bh,
+                    crate::jitexc::JitException::DoneWithThisFrameInt(42),
+                    None,
+                    Some(&mut terminal),
+                );
+                assert!(
+                    outcome.is_err(),
+                    "a bottommost frame always propagates the exception",
+                );
+                assert_eq!(
+                    terminal.is_some(),
+                    portal,
+                    "terminal image published for portal={portal}",
+                );
+                if let Some(terminal) = terminal {
+                    assert_eq!(terminal.registers_i[0], 42);
+                }
+            }
+        }
+
         #[test]
         fn run_forever_steps_past_the_portal_frame_after_handle_jitexception() {
             let mut sub = JitCodeBuilder::default();
@@ -5345,6 +5450,14 @@ impl StateFieldLayout {
             self.array_lens[array_idx]
         );
         self.array_base(array_idx) + elem
+    }
+
+    /// Flat slot of the virtualizable identity, which follows every scalar and
+    /// every flattened array element — `virtualizable.py:139-144` names the
+    /// virtualizable exactly once, however many `[.. ; virt]` arrays the state
+    /// declares.  `None` when the state has no virtualizable.
+    pub fn vable_identity_slot(&self) -> Option<usize> {
+        (self.num_vable_identity_slots != 0).then(|| self.array_base(self.array_lens.len()))
     }
 }
 
@@ -8260,6 +8373,21 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     insns.insert(
         "new_array_clear/id>r".to_string(),
         majit_translate::insns::BC_NEW_ARRAY_CLEAR,
+    );
+    // Plain struct allocation (`blackhole.py:1301-1310 bhimpl_new` /
+    // `bhimpl_new_with_vtable`) — a `#[jit_interp]` frontend's declared
+    // `struct_allocs` literal lowers straight to it, so any resume that walks
+    // forward over one needs the byte dispatchable.  The handlers were already
+    // wired in `wire_bhimpl_handlers`; only the opname→byte entries were
+    // missing, which turns into a `dispatch_step: unwired opcode` panic.
+    insns.insert("new/d>r".to_string(), majit_translate::insns::BC_NEW);
+    insns.insert(
+        "new_with_vtable/d>r".to_string(),
+        majit_translate::insns::BC_NEW_WITH_VTABLE,
+    );
+    insns.insert(
+        "new_array/id>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY,
     );
     insns.insert(
         "setarrayitem_gc_r/rcrd".to_string(),

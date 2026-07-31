@@ -2195,6 +2195,9 @@ where
                             message
                         );
                     }
+                    // The unwind left `code_cursor` inside the panicking
+                    // instruction, so the frames name no resumable position.
+                    ctx.abort_after_panic = true;
                     sym.abort_portal_op();
                     return TraceAction::Abort;
                 }
@@ -2215,10 +2218,25 @@ where
                 }
                 return action;
             }
-            // pyjitpl.py:2843 blackhole_if_trace_too_long — check AFTER
-            // executing the step, matching RPython's _interpret() loop:
-            //   self.framestack[-1].run_one_step()
-            //   self.blackhole_if_trace_too_long()
+            // pyjitpl.py:2861-2867 `_interpret`:
+            //
+            //     while True:
+            //         self.framestack[-1].run_one_step()
+            //         self.blackhole_if_trace_too_long()
+            //
+            // The overflow is answered right here — `pyjitpl.py:2831 raise
+            // SwitchToBlackhole(ABORT_TOO_LONG)` — even though a source opcode
+            // may be half-executed, because its handler (pyjitpl.py:2949
+            // `run_blackhole_interp_to_cancel_tracing` → blackhole.py:1799
+            // `convert_and_run_from_pyjitpl`) finishes the current jitcode
+            // frames in the blackhole before control returns to the
+            // interpreter, so the opcode's remaining effects still run.
+            //
+            // The check sits below the action test for the same reason it sits
+            // after `run_one_step()` upstream: a step that raises its own
+            // terminal exception never reaches `blackhole_if_trace_too_long`,
+            // so a closing step commits its trace even when that step pushed
+            // the recorded op count past `trace_limit`.
             if ctx.is_too_long() {
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -2231,21 +2249,10 @@ where
             }
         }
 
-        // Post-loop overflow check: the jitcode ran to completion (all
-        // frames empty) but may have exceeded the limit on the last step.
-        if ctx.is_too_long() {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] trace_jitcode aborting: trace too long at portal pc={}",
-                    portal_pc
-                );
-            }
-            sym.abort_portal_op();
-            TraceAction::Abort
-        } else {
-            sym.commit_portal_op();
-            TraceAction::Continue
-        }
+        // The jitcode ran to completion (all frames empty).  The overflow check
+        // above ran on every step that got here, so the trace is within budget.
+        sym.commit_portal_op();
+        TraceAction::Continue
     }
 
     /// Execute a `BC_RECURSIVE_CALL_*` opcode (pyjitpl.py:1376
@@ -7946,10 +7953,15 @@ where
     // dropped so the jit_merge_point single-pass handoff can resume after the
     // committed prefix instead of replaying it from the trace header.
     //
-    // This is the portal equivalent of blackhole.py:1799
-    // convert_and_run_from_pyjitpl(): resume from the current frame position,
-    // not from the trace-start snapshot.  CloseLoop and Finish already capture
-    // their own positions; only Abort needs this recovery handoff.
+    // i0 alone only names a sound resume position when the walk stopped at a
+    // source-opcode boundary; `pyjitpl.py:2949
+    // run_blackhole_interp_to_cancel_tracing` does not depend on that, because
+    // `blackhole.py:1799 convert_and_run_from_pyjitpl` finishes the current
+    // jitcode frames in the blackhole and takes the resume position from the
+    // `jit_merge_point` they reach.  Hand the whole framestack to the abort
+    // consumer so it can do that; i0 stays as the fallback for a consumer that
+    // declines the conversion.  CloseLoop and Finish already capture their own
+    // positions; only Abort needs this recovery handoff.
     if matches!(action, TraceAction::Abort) && !standalone.frames.is_empty() {
         if let Some(pc) = standalone.frames.frames[0]
             .int_values
@@ -7959,6 +7971,22 @@ where
             .and_then(|pc| usize::try_from(pc).ok())
         {
             ctx.walk_final_pc = Some(pc);
+        }
+        // Every frame below the top already carries its own resume position:
+        // `BC_INLINE_CALL` sets `frame.pc = frame.code_cursor` on the caller
+        // before pushing the callee.  The top frame's is still the last guard's
+        // `orgpc` swap, so publish the position the walk actually stopped at —
+        // `copy_data_from_miframe` (`blackhole.py:1804`) reads `frame.pc` as
+        // each level's `setposition`.  `code_cursor` is that position: the walk
+        // decodes an instruction's operands before running its arm, so a
+        // completed step leaves the cursor just past them — where RPython's
+        // `self.pc = position` (`pyjitpl.py:3863`, in the `_get_opimpl_method`
+        // handler) leaves `MIFrame.pc`.
+        if !std::mem::replace(&mut ctx.abort_after_panic, false) {
+            if let Some(top) = standalone.frames.frames.last_mut() {
+                top.pc = top.code_cursor;
+            }
+            ctx.aborted_framestack = Some(std::mem::take(&mut standalone.frames));
         }
     }
     action

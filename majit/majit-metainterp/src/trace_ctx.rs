@@ -413,6 +413,24 @@ pub struct TraceCtx {
     /// `MetaInterp::single_pass_outcome` (set before `compile_loop` drains the
     /// ctx) to the merge-point hook.
     pub walk_final_pc: Option<usize>,
+    /// Set when the abort came out of a panic caught around `run_one_step`
+    /// rather than a decision the walk took.  The unwind can leave the frame's
+    /// `code_cursor` anywhere inside the panicking instruction, so the frames
+    /// name no position a blackhole could resume at — the abort consumer must
+    /// not convert them (`blackhole.py:1799` assumes `frame.pc` is an
+    /// instruction boundary).  RPython has no counterpart: it has no panic arm
+    /// here.
+    pub abort_after_panic: bool,
+    /// `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` needs
+    /// `metainterp.framestack` to still exist when it calls
+    /// `blackhole.py:1799 convert_and_run_from_pyjitpl(self, ...)`.  RPython
+    /// keeps the stack on the MetaInterp for the whole trace; pyre's walk owns
+    /// it locally (`trace_jitcode_with_args_and_runtime` allocates a
+    /// `StandaloneFrameStack` and drops it on return), so an aborting walk
+    /// moves it here — onto the tracing session the MetaInterp owns — for the
+    /// jitdriver's Abort arm to convert.  `None` on every non-aborting walk and
+    /// once the arm has taken it.
+    pub aborted_framestack: Option<crate::pyjitpl::MIFrameStack>,
     /// Single-pass tracing: the walk-final concrete RED values captured from
     /// the closing merge point's red operands (their live `int_values` /
     /// `ref_values` / `float_values` shadow), in operand order (slot 3 ints,
@@ -1394,6 +1412,8 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            abort_after_panic: false,
+            aborted_framestack: None,
             walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
@@ -1474,6 +1494,8 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            abort_after_panic: false,
+            aborted_framestack: None,
             walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
