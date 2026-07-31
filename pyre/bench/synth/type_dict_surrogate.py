@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=350
 N = 200000
 
 S = '\udcff'                  # lone low surrogate

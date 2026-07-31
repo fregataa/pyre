@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=280
 N = 75000
 
 
