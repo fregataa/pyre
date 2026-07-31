@@ -3522,6 +3522,9 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_ephemeron_pruner(
         pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
     );
+    // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
+    // `JIT_DRIVER` rather than a global table, so it registers per mutator
+    // instead — see `forced_virtuals_pruner_area`.
 }
 
 fn register_thread_root_areas() {
@@ -3580,6 +3583,15 @@ fn register_thread_root_areas() {
         register(partial_trace_root_walker_area, jit_driver);
         register(active_trace_root_walker_area, jit_driver);
         register(compile_snapshot_root_walker_area, jit_driver);
+        register(forced_virtuals_root_walker_area, jit_driver);
+        // The ephemeron half of the walker above, on the same `data` so the
+        // prune reaches exactly the drivers the root walk reaches.
+        unsafe {
+            majit_gc::shadow_stack::register_mutator_pruner(
+                forced_virtuals_pruner_area,
+                jit_driver,
+            );
+        }
     }
 }
 
@@ -3897,12 +3909,27 @@ unsafe extern "C" fn force_pyframe_vref(
 ) -> *mut pyre_interpreter::PyFrame {
     let (driver, _info) = driver_pair();
     let vrefinfo = majit_metainterp::virtualref::VirtualRefInfo::new();
+    // Entry, distinct from the token arm logged below: a vref built during
+    // tracing carries `forced` already set and `virtual_token = TOKEN_NONE`
+    // (`virtualref.py:85-92`), so `force_virtual` returns without running the
+    // closure. Counting only the closure conflates "never reached" with
+    // "reached and short-circuited".
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!("[jit][force-hook] vref-entry vref={vref:p}");
+    }
     let forced = unsafe {
         vrefinfo.force_virtual(vref as *mut u8, |v| {
             // `compile.py:967-971 force_now(cpu, token)` — force the JIT frame
             // the vref names, then run the guard's async forcing, which is
             // what writes `virtual_token = TOKEN_NONE` and `forced` back.
             let token = (*v).virtual_token as usize as u64;
+            // Name the entry point. The two hooks reach the same
+            // `handle_async_forcing`, and nothing downstream distinguishes
+            // them — which is how this one silently diverged from
+            // `force_pyframe` in the first place.
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[jit][force-hook] vref token=0x{token:x}");
+            }
             driver.force_virtualizable_token(token);
         })
     };
@@ -3975,15 +4002,17 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 // Decoding it through `NullAllocator` instead wrote a null over
                 // that slot, and `fast2locals` renders a null slot as an absent
                 // name — a live local vanished from `f_locals`.
-                let all_virtuals = driver.force_virtualizable_token(token);
-                // compile.py:999-1000 set_savedata_ref: hold what was
-                // materialized for the GUARD_NOT_FORCED that follows, keyed by
-                // the frame this force ran against.
-                if let Some((ptrs, ints)) = all_virtuals {
-                    driver
-                        .meta_interp_mut()
-                        .save_forced_virtuals(ptr as u64, ptrs, ints);
+                //
+                // `handle_async_forcing` keeps what it materialized for the
+                // GUARD_NOT_FORCED that follows (compile.py:999-1000), so there
+                // is nothing to attach here.
+                //
+                // See the counterpart in `force_pyframe_vref` for why the entry
+                // point is named.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[jit][force-hook] frame token=0x{token:x} frame={ptr:p}");
                 }
+                driver.force_virtualizable_token(token);
             });
         };
         // Force the traced frame only when the frame handed to Python belongs
@@ -4077,6 +4106,42 @@ unsafe fn compile_snapshot_root_walker_area(
 ) {
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
         pair.0.walk_compile_snapshot_refs(visitor);
+    }
+}
+
+/// GC walker for the virtual caches `handle_async_forcing` produced and left
+/// for the `GUARD_NOT_FORCED` that follows. Upstream traces them through the
+/// deadframe's `jf_savedata` GCREF field; pyre holds them on `MetaInterp` and
+/// needs the edge drawn explicitly.
+/// See `MetaInterp::walk_forced_virtuals_refs`.
+unsafe fn forced_virtuals_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.walk_forced_virtuals_refs(visitor);
+    }
+}
+
+/// Drop forced-virtual caches whose owner frame the major collection is about
+/// to sweep — the ephemeron half of rooting them at all.
+///
+/// The force runs inside a residual `CALL_MAY_FORCE`, and two paths leave the
+/// entry unconsumed: an escaped virtualizable raises instead of failing a
+/// guard, and `handle_fail`'s bridge-compiled arm returns without resuming.
+/// Both would otherwise pin the materialized virtuals for the process lifetime
+/// and leave a key a recycled `PyFrame` address could match.
+///
+/// Registered per mutator, next to `forced_virtuals_root_walker_area` and with
+/// the same `data`, so the prune reaches every driver the root walk reaches. The
+/// global `register_ephemeron_pruner` cannot: the table lives in this thread's
+/// `JIT_DRIVER`, and a major driven by another thread would leave it pinned.
+unsafe fn forced_virtuals_pruner_area(
+    data: *const (),
+    classify: &mut dyn FnMut(usize) -> Option<usize>,
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.prune_forced_virtuals(classify);
     }
 }
 
