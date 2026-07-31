@@ -4968,6 +4968,18 @@ thread_local! {
     static FBW_SYS_EXC_JOURNAL: std::cell::RefCell<Vec<pyre_object::PyObjectRef>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo entry for the concrete traceback-head store performed while a
+    /// bridge-entry exception arm is recorded: `(exception, attached_node)`.
+    /// The two arms are mutually exclusive and each is entered at most once
+    /// per walk session, so one slot covers the concrete attach.  It shares
+    /// the store journal's lifecycle: a committing walk keeps the node and
+    /// clears the entry, while a discarded walk removes the node only when it
+    /// is still the exception's current traceback head.  Both refs are GC
+    /// roots via [`fbw_store_journal_root_walker`].
+    static FBW_TRACEBACK_STORE_JOURNAL:
+        std::cell::RefCell<Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>> =
+        const { std::cell::RefCell::new(None) };
+
     /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
     /// body coordinate)` stashed when the FOR_ITER `for_iter_next` residual
     /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
@@ -5156,6 +5168,8 @@ struct FbwStoreJournalRootArea {
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
+    traceback_store:
+        *const std::cell::RefCell<Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     bridge_iter: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64, i64)>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
@@ -5173,6 +5187,7 @@ thread_local! {
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
         sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
+        traceback_store: FBW_TRACEBACK_STORE_JOURNAL.with(|value| value as *const _),
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
         bridge_iter: FBW_BRIDGE_ITER_JOURNAL.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
@@ -5476,6 +5491,14 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
         // borrowed area keeps the Vec storage alive for the visit.
         visitor(unsafe { &mut *(displaced as *mut pyre_object::PyObjectRef).cast() });
+    }
+    // The exception and freshly attached traceback node remain live until the
+    // walk commits or rolls back.  The entry may be their only scanned owner
+    // after later concrete execution changes the exception's head.
+    let traceback_store = unsafe { &mut *(*area.traceback_store).as_ptr() };
+    if let Some((exception, node)) = traceback_store.as_mut() {
+        visitor(unsafe { &mut *(exception as *mut pyre_object::PyObjectRef).cast() });
+        visitor(unsafe { &mut *(node as *mut pyre_object::PyObjectRef).cast() });
     }
     // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
     // across the rest of the walk (subsequent residual calls allocate and a
@@ -10220,37 +10243,17 @@ fn handle<Sym: WalkSym>(
                             op.next_pc,
                         ));
                     }
-                    // The jump did not take. Closing here anyway lands on
-                    // `compile_loop`'s own `has_compiled_targets` check
-                    // (pyjitpl.py:3185-3189), which gives the whole trace up
-                    // with SwitchToBlackhole; and the cut would store the loop
-                    // under `cut_inner_green_key`, replacing reachable code
-                    // with code stored where nothing enters. Keep tracing
-                    // instead, so the trace closes at its own header with this
-                    // loop's body inlined — the interpreter front end declines
-                    // the same case for the same reason. Only a cross-loop cut
-                    // is declined: a trace that started at these greens still
-                    // closes on its own back-edge below.
-                    // One decline is not a plain "keep tracing": compile.py:1079
-                    // `metainterp.retrace_needed` leaves `partial_trace` and
-                    // `retracing_from` pointing at this header's position. The
-                    // return below skips the merge-point registration further
-                    // down, so the later close at the root header would compare
-                    // the root merge point against a `retracing_from` no merge
-                    // point was ever recorded for, and abort instead of
-                    // retracing. `has_partial` was false above, so a partial
-                    // trace here is the one this attempt just requested.
-                    let retrace_requested = driver.meta_interp().partial_trace().is_some();
-                    if !retrace_requested && key != ctx.trace_ctx.root_green_key() {
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][walker-reached-loop-header] merge point pc={} already \
-                                 has a compiled loop key={} — declining the cross-loop cut",
-                                next_instr, key
-                            );
-                        }
-                        return Ok((DispatchOutcome::Continue, op.next_pc));
-                    }
+                    // The jump did not take (`compile.compile_trace` returns
+                    // None when none of the existing loop tokens match). Fall
+                    // through to the merge-point scan below, exactly as
+                    // `reached_loop_header` does after its own
+                    // `self.compile_trace(...)` call returns (pyjitpl.py:3003-3018):
+                    // the scan closes at the first same-greenkey merge point, and
+                    // `compile_loop` gives that trace up at its own
+                    // `has_compiled_targets` (pyjitpl.py:3185-3189); a first visit
+                    // registers a merge point (pyjitpl.py:3057-3059) and keeps
+                    // tracing.
+                    majit_metainterp::mc_diag_bump(27);
                 }
             }
 

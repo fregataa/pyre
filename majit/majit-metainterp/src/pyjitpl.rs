@@ -955,8 +955,14 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>>(inputargs: &[InputArg], ops
 pub enum BridgeCompileResult {
     /// Bridge was compiled and attached to the guard.
     Compiled,
-    /// Bridge compilation failed.
+    /// Bridge compilation gave the whole trace up.
     Failed,
+    /// `compile.compile_trace` returned None: compile.py:227 cuts the
+    /// tentative jump and returns, and `raise_if_successful`
+    /// (pyjitpl.py:3119) does not raise on None, so the trace is not given
+    /// up. The tracing context is intact and the caller falls through to
+    /// the merge-point scan, as `reached_loop_header` does.
+    Declined,
     /// Optimizer requested retrace (no matching target token).
     /// The tracing context is intact — caller should continue tracing.
     /// pyjitpl.py:3196: compile_trace returns None → MetaInterp continues.
@@ -1403,6 +1409,14 @@ pub struct MetaInterp<M: Clone> {
     /// payload the old monolithic `abort_trace` produced.
     pub(crate) pending_abort_green_key: Option<u64>,
     pub(crate) pending_abort_permanent: bool,
+
+    /// The `Counters.ABORT_*` reason a `CompileOutcome::Aborted` carries to
+    /// the caller that performs the accounting. `raise SwitchToBlackhole(reason)`
+    /// names the reason at the raise site and the single catch calls
+    /// `aborted_tracing(stb.reason)` (pyjitpl.py:2910/2930), so a compile step
+    /// that gives the trace up records its reason here rather than tallying
+    /// itself — tallying at both ends counts one aborted trace twice.
+    pub(crate) pending_abort_reason: Option<i32>,
 
     /// pyjitpl.py:2381 `MetaInterp.last_exc_box = None` (class
     /// attribute).  Set by `handle_possible_exception` to the boxed
@@ -2579,6 +2593,7 @@ impl<M: Clone> MetaInterp<M> {
             active_jitdriver_sd: None,
             aborted_tracing_greenkey: None,
             pending_abort_green_key: None,
+            pending_abort_reason: None,
             pending_abort_permanent: false,
             last_exc_box: None,
             class_of_last_exc_is_const: false,
@@ -5415,6 +5430,8 @@ impl<M: Clone> MetaInterp<M> {
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        // Only this call's own give-up decides the reason the caller accounts.
+        self.pending_abort_reason = None;
         self.single_pass_compact_label_values = None;
         let single_pass_full_live_values = self.single_pass_full_live_values.take();
         // pyjitpl.py:2995 `assert len(self.virtualref_boxes) == 0,
@@ -5501,22 +5518,6 @@ impl<M: Clone> MetaInterp<M> {
         if self.retrace_after_bridge {
             self.retrace_after_bridge = false;
         }
-        // pyjitpl.py:3162: has_compiled_targets(ptoken) →
-        // raise SwitchToBlackhole(ABORT_BAD_LOOP).
-        if let Some(ctx) = self.tracing.as_ref() {
-            let gk = ctx.green_key;
-            if self.has_compiled_targets(gk) {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] compile_loop → SwitchToBlackhole: has_compiled_targets key={}",
-                        gk
-                    );
-                }
-                self.abort_trace(false);
-                return CompileOutcome::Aborted;
-            }
-        }
-
         let vable_config = self.current_virtualizable_optimizer_config();
         // pyjitpl.py:3015-3032 parity: compile_loop uses `self.history`
         // without consuming it, so cancel paths can fall through to
@@ -5535,6 +5536,28 @@ impl<M: Clone> MetaInterp<M> {
             // jitcell_token. RPython: jitcell_token = cross_loop.jitcell_token.
             (cut_inner.unwrap_or(outer), cut_inner)
         };
+
+        // pyjitpl.py:3185-3189: has_compiled_targets(ptoken) →
+        // raise SwitchToBlackhole(ABORT_BAD_LOOP).  The key is the one the
+        // loop would be stored under — `original_boxes[:num_green_args]`,
+        // the greens of the merge point that was closed at, which for a
+        // cross-loop cut is the inner loop's key, not the trace's own.
+        if self.has_compiled_targets(green_key) {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_loop → SwitchToBlackhole: has_compiled_targets key={}",
+                    green_key
+                );
+            }
+            // The raise names the reason and the caller's catch does the
+            // accounting, so stage ABORT_BAD_LOOP and leave the teardown and
+            // the single `aborted_tracing` to the `abort_trace` that follows
+            // this `Aborted`. Tallying here as well would count one aborted
+            // trace twice, and under the `Generic` catch-all besides.
+            crate::mc_diag_bump(28); // compile_loop: has_compiled_targets giveup
+            self.pending_abort_reason = Some(counters::ABORT_BAD_LOOP);
+            return CompileOutcome::Aborted;
+        }
 
         // pyjitpl.py:3015-3032 parity: pyre caches the retrace limit per
         // green_key so guard-heavy recompilations do not loop forever.
@@ -6757,7 +6780,10 @@ impl<M: Clone> MetaInterp<M> {
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
-            None => return CompileOutcome::Cancelled,
+            None => {
+                crate::mc_diag_bump(33); // compile_trace: no tracing session
+                return CompileOutcome::Cancelled;
+            }
         };
 
         // pyjitpl.py:3187: save position before recording JUMP/FINISH
@@ -6783,6 +6809,7 @@ impl<M: Clone> MetaInterp<M> {
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
+                crate::mc_diag_bump(29); // compile_trace: no front target token
                 return CompileOutcome::Cancelled;
             };
             ctx.recorder
@@ -6893,6 +6920,7 @@ impl<M: Clone> MetaInterp<M> {
                     if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
+                    crate::mc_diag_bump(30); // compile_trace: origin loop gone
                     return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
@@ -6934,6 +6962,7 @@ impl<M: Clone> MetaInterp<M> {
                     if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
+                    crate::mc_diag_bump(32); // compile_trace: no entry-bridge data
                     return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
@@ -6955,6 +6984,7 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     }
                 } else {
+                    crate::mc_diag_bump(31); // compile_trace: entry bridge failed
                     CompileOutcome::Cancelled
                 }
             }
@@ -7521,7 +7551,15 @@ impl<M: Clone> MetaInterp<M> {
     /// is fully ported).
     pub fn abort_trace(&mut self, permanent: bool) {
         self.abort_trace_live(permanent);
-        self.aborted_tracing(AbortReason::Generic.as_int());
+        // A compile step that already decided to give the trace up staged its
+        // `Counters.ABORT_*` reason; this is the catch that turns it into the
+        // one accounting event, as `aborted_tracing(stb.reason)` does for the
+        // reason the `SwitchToBlackhole` raise carried.
+        let reason = self
+            .pending_abort_reason
+            .take()
+            .unwrap_or(AbortReason::Generic.as_int());
+        self.aborted_tracing(reason);
     }
 
     /// Live-cleanup half of `abort_trace` — no stats, no hooks.
@@ -7596,6 +7634,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn clear_pending_abort(&mut self) {
         self.pending_abort_green_key = None;
         self.pending_abort_permanent = false;
+        self.pending_abort_reason = None;
     }
 
     /// Finish the current trace with a terminal `FINISH`, then optimize and compile it.
@@ -10172,7 +10211,11 @@ impl<M: Clone> MetaInterp<M> {
                 // is before 3162 has_compiled_targets.
                 BridgeCompileResult::RetraceNeeded
             }
-            _ => BridgeCompileResult::Failed,
+            // `compile_trace_inner` also answers `Cancelled` when there is no
+            // trace at all — a state upstream cannot be in, and one the
+            // fall-through cannot serve because `compile_loop` needs the ctx.
+            CompileOutcome::Cancelled if self.tracing.is_some() => BridgeCompileResult::Declined,
+            CompileOutcome::Cancelled | CompileOutcome::Aborted => BridgeCompileResult::Failed,
         }
     }
 
