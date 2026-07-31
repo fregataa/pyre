@@ -1352,7 +1352,15 @@ pub mod unpack_iter {
             pyre_object::w_type_set_acceptable_as_base_class(iter_type, false);
             pyre_object::w_type_set_disallow_instantiation(iter_type);
         }
-        let buf = unsafe { readbuf(buffer)? };
+        // `readbuf_w` may dispatch a Python-level `__buffer__` hook.  Keep
+        // both operands rooted across that call and the stable allocation:
+        // PyPy's W_UnpackIter stores the live `self.view` lease on the
+        // iterator, never an unrooted caller-local pointer.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(format);
+        pyre_object::gc_roots::pin_root(buffer);
+        let buf = unsafe { readbuf(pyre_object::gc_roots::shadow_stack_get(sp + 1))? };
         if size <= 0 {
             return Err(struct_error(format!(
                 "cannot iteratively unpack with a struct of length {size}"
@@ -1363,14 +1371,20 @@ pub mod unpack_iter {
                 "iterative unpacking requires a buffer of a multiple of {size} bytes"
             )));
         }
-        let export_active = unsafe { crate::builtins::buffer_export_incref(buffer) };
+        let export_active = unsafe {
+            crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(sp + 1))
+        };
+        // Both slots are reread here rather than reused from a local: `readbuf`
+        // and `buffer_export_incref` above can each run Python and collect, and
+        // `allocate_stable` itself allocates, so a value captured before them
+        // would name the pre-relocation address.
         let w_iter = W_UnpackIter::allocate_stable(W_UnpackIter {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
-            format,
-            buffer,
+            format: pyre_object::gc_roots::shadow_stack_get(sp),
+            buffer: pyre_object::gc_roots::shadow_stack_get(sp + 1),
             size,
             index: 0,
             export_active,

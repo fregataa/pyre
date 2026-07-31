@@ -8760,12 +8760,27 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
             pyre_object::w_tuple_new(vec![]),
         ));
     }
-    // `curr = newargs[0]; for i in range(1, ...): curr |= newargs[i]`.
-    let mut curr = newargs[0];
-    for &next in &newargs[1..] {
-        curr = crate::objspace::descroperation::or_(curr, next)?;
+    // `curr = newargs[0]; for i in range(1, len(newargs)): curr |= newargs[i]`.
+    //
+    // `newargs` is a plain Rust `Vec` — `subs_parameters` released its root
+    // scope on the way out — while every `|` dispatches `__or__`/`__ror__` and
+    // allocates a fresh union.  PyPy's `newargs` is an app-level list the
+    // collector traces, so pin the members and reread both the accumulator and
+    // the next member from their slots after each step.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in &newargs {
+        pyre_object::gc_roots::pin_root(arg);
     }
-    Ok(curr)
+    pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(base));
+    let curr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    for i in 1..newargs.len() {
+        let next = pyre_object::gc_roots::shadow_stack_get(base + i);
+        let curr = pyre_object::gc_roots::shadow_stack_get(curr_slot);
+        let joined = crate::objspace::descroperation::or_(curr, next)?;
+        pyre_object::gc_roots::shadow_stack_set(curr_slot, joined);
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(curr_slot))
 }
 
 /// `UnionType.__class_getitem__(items)` — `typing.Union` is bound to this
@@ -8788,6 +8803,52 @@ fn union_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
         ));
     }
     crate::_pypy_generic_alias::union_from_items(&items)
+}
+
+/// `UnionType.__repr__` (`_pypy_generic_alias.py:286-287`).
+///
+/// The display slot already renders unions correctly, but the method must
+/// also be present when accessed explicitly as `union.__repr__()`.  Keeping
+/// this as the same central formatter avoids a second representation path.
+fn union_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_union(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__repr__' requires a 'types.UnionType' object",
+        ));
+    }
+    let rendered = unsafe { crate::display::py_repr(self_)? };
+    Ok(pyre_object::w_str_new(&rendered))
+}
+
+/// `UnionType.__hash__` (`_pypy_generic_alias.py:275`).
+fn union_hash_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_union(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__hash__' requires a 'types.UnionType' object",
+        ));
+    }
+    Ok(pyre_object::w_int_new(crate::builtins::try_hash_value(
+        self_,
+    )?))
+}
+
+/// `UnionType.__mro_entries__` (`_pypy_generic_alias.py` parity).
+///
+/// A union can be used in an annotation but cannot be used as a base class.
+/// CPython exposes the method and raises this error when it is called.
+fn union_mro_entries_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_union(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__mro_entries__' requires a 'types.UnionType' object",
+        ));
+    }
+    let rendered = unsafe { crate::display::py_repr(self_)? };
+    Err(crate::PyError::type_error(format!(
+        "Cannot subclass {rendered}"
+    )))
 }
 
 fn init_union_type(ns: PyObjectRef) {
@@ -8921,6 +8982,29 @@ fn init_union_type(ns: PyObjectRef) {
                 },
                 2,
             ),
+        )
+    };
+    // These are slots for ordinary operations, but CPython 3.14 and PyPy
+    // expose them as callable attributes on union instances as well.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", union_repr_method, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity("__hash__", union_hash_method, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__mro_entries__",
+            make_builtin_function_with_arity("__mro_entries__", union_mro_entries_method, 2),
         )
     };
 }
@@ -24765,7 +24849,16 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(PY_NULL);
     let inputs = positional.get(1..).unwrap_or(&[]);
+    // interp_itertools.py:1350-1360 W_Product__new__ orders the keyword census
+    // (`repeat` extraction, then the unexpected-keyword raise), the
+    // `allocate_instance` subtype check and `W_Product.__init__` — which does
+    // the `repeat` conversion and the pass over the input iterables — in that
+    // sequence, so the subtype check sits between the two.  Reaching it only
+    // through `itertools_alloc_for_class` would put it after the iterables,
+    // and an unbound `product.__new__(int, gen())` would consume `gen()`
+    // before reporting the foreign class.
     crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
+    check_user_subclass(exact, cls)?;
 
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(cls);

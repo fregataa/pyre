@@ -9280,15 +9280,30 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     // PyPy's C3 merge raises here when the bases are inconsistent; pyre's
     // low-level Vec-returning helper cannot carry that exception, so preserve
     // the same ordering through its fallible validation front door.
+    // The validation and the metaclass `mro()` below both execute Python.  A
+    // type reaching `type.__new__` has no referrer yet beyond this argument,
+    // and the MRO snapshots are untraced Rust Vecs, so root all of them and
+    // reread every use that crosses one of those calls.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pin_slot(w_self);
     let w_bases = pyre_object::typeobject::w_type_get_bases(w_self);
-    validate_c3_mro(w_bases)?;
+    validate_c3_mro(w_bases, true)?;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let default_mro = compute_default_mro(w_self);
+    let default_mro_start = pyre_object::gc_roots::shadow_stack_len();
+    let default_mro_len = default_mro.len();
+    for w_class in default_mro {
+        pyre_object::gc_roots::pin_root(w_class);
+    }
+    let default_mro =
+        |index: usize| pyre_object::gc_roots::shadow_stack_get(default_mro_start + index);
     if pyre_object::w_type_is_heaptype(w_self) {
         let w_metaclass = (*w_self).w_class;
         if !w_metaclass.is_null() {
             if let Some((w_where, w_mro_func)) = lookup_where_with_method_cache(w_metaclass, "mro")
             {
                 if !std::ptr::eq(w_where, crate::typedef::w_type()) {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
                     let w_mro = get_and_call_function(w_mro_func, w_self, w_metaclass, &[])?;
                     let mro_w = crate::builtins::collect_iterable(w_mro)?;
                     // `fixedview` keeps PyPy's items GC-visible through the
@@ -9307,27 +9322,28 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
                             return Err(PyError::type_error("mro() returned a non-class"));
                         }
                     }
-                    let mro_w: Vec<_> = (0..mro_w.len())
-                        .map(|index| {
-                            pyre_object::gc_roots::shadow_stack_get(mro_root_start + index)
-                        })
-                        .collect();
-                    if !mro_w.iter().any(|&entry| std::ptr::eq(entry, w_self)) {
+                    let mro_len = mro_w.len();
+                    let mro_at = |index: usize| {
+                        pyre_object::gc_roots::shadow_stack_get(mro_root_start + index)
+                    };
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
+                    if !(0..mro_len).any(|index| std::ptr::eq(mro_at(index), w_self)) {
                         return Err(PyError::type_error(
                             "mro() returned a result without the new class",
                         ));
                     }
-                    pyre_object::w_type_set_mro(w_self, mro_w.clone());
+                    pyre_object::w_type_set_mro(w_self, (0..mro_len).map(mro_at).collect());
 
                     // typeobject.py `_add_mro_classes_as_subclasses`: custom
                     // MRO entries outside the default hierarchy participate
                     // in invalidation just like real bases.
-                    for w_ancestor in mro_w {
-                        if !default_mro
-                            .iter()
-                            .any(|&default| std::ptr::eq(default, w_ancestor))
+                    for index in 0..mro_len {
+                        let w_ancestor = mro_at(index);
+                        if !(0..default_mro_len)
+                            .any(|default| std::ptr::eq(default_mro(default), w_ancestor))
                             && pyre_object::is_type(w_ancestor)
                         {
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
                             pyre_object::typeobject::w_type_add_subclass(w_ancestor, w_self);
                         }
                     }
@@ -9336,8 +9352,57 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
             }
         }
     }
-    pyre_object::w_type_set_mro(w_self, default_mro);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    pyre_object::w_type_set_mro(w_self, (0..default_mro_len).map(default_mro).collect());
     Ok(pyre_object::w_none())
+}
+
+/// Pin `w` into the ambient root scope and hand back its slot.
+fn pin_slot(w: PyObjectRef) -> usize {
+    pyre_object::gc_roots::pin_root(w);
+    pyre_object::gc_roots::shadow_stack_len() - 1
+}
+
+/// `typeobject.py:1665-1678 abstract_mro` — the app-level classic-class walk
+/// that `get_mro` (typeobject.py:1680-1684) applies to a base which is not a
+/// `W_TypeObject`.  Reading `__bases__` is what rejects a plain instance
+/// handed in as a base.
+///
+/// Returns shadow-stack slots rather than values: a `__bases__` read can run
+/// `__getattr__` and allocate, so the caller's scope owns the walk's roots and
+/// the entries stay addressable across the reads that follow.
+///
+/// `klass not in mro` is answered by pointer identity, matching the C3 merge
+/// this feeds instead of running an app-level `__eq__` between the reads.
+unsafe fn abstract_mro(w_klass: PyObjectRef) -> Result<Vec<usize>, crate::PyError> {
+    let mut mro_slots: Vec<usize> = Vec::new();
+    let mut stack_slots: Vec<usize> = vec![pin_slot(w_klass)];
+    while let Some(slot) = stack_slots.pop() {
+        let w_cls = pyre_object::gc_roots::shadow_stack_get(slot);
+        if mro_slots
+            .iter()
+            .any(|&seen| std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(seen), w_cls))
+        {
+            continue;
+        }
+        mro_slots.push(slot);
+        let bases_slot = pin_slot(getattr_str(w_cls, "__bases__")?);
+        if !is_tuple(pyre_object::gc_roots::shadow_stack_get(bases_slot)) {
+            return Err(crate::PyError::type_error("__bases__ must be a tuple"));
+        }
+        // `stack += klass.__bases__[::-1]` — the reversed extend leaves
+        // `__bases__[0]` on top, so the walk descends in declaration order.
+        let nbases = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(bases_slot));
+        for j in (0..nbases).rev() {
+            if let Some(w_base) = w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                j as i64,
+            ) {
+                stack_slots.push(pin_slot(w_base));
+            }
+        }
+    }
+    Ok(mro_slots)
 }
 
 /// Reject a base tuple whose C3 merge has no valid next head.
@@ -9345,14 +9410,30 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
 /// Type construction calls this before allocating the new type or running
 /// descriptor/class-subclass hooks, so an invalid hierarchy cannot escape as
 /// a later and unrelated lookup failure.
-pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> {
+///
+/// `walk_classic_bases` selects `get_mro`'s classic branch, which reads a
+/// non-type base's `__bases__` and so can run Python.  Only the call standing
+/// in for `compute_mro` (typeobject.py:1560) passes `true`: that one runs after
+/// `check_and_find_best_base` (typeobject.py:1519), so a bad type base is still
+/// reported before any classic base's `__bases__` executes.  The early
+/// pre-flight passes `false` and stays a pure C3 check.
+pub unsafe fn validate_c3_mro(
+    bases: PyObjectRef,
+    walk_classic_bases: bool,
+) -> Result<(), crate::PyError> {
     if bases.is_null() || !is_tuple(bases) {
         return Ok(());
     }
     let n = w_tuple_len(bases);
+    // `is_type_like_w` dispatches through the object space and the classic-base
+    // walk below runs Python outright, so the tuple is pinned for the whole
+    // validation and reread after anything that can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let bases_slot = pin_slot(bases);
     // CPython's typeobject.c reports duplicate direct bases before the C3
     // merge. PyPy's mro_error discovers the same case in its final list.
     for i in 0..n {
+        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
         let Some(base) = w_tuple_getitem(bases, i as i64) else {
             continue;
         };
@@ -9370,23 +9451,67 @@ pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> 
             )));
         }
     }
-    let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
-    let mut bases_list = Vec::with_capacity(n);
+    // typeobject.py:1519,1560 — `setup_user_defined_type` runs
+    // `check_and_find_best_base` before it reaches `compute_mro`, so the C3
+    // merge only ever sees a tuple that already holds at least one type.  With
+    // no type among the bases the tuple belongs to `check_and_find_best_base`
+    // and its own message, not to the classic walk.
+    let walk_classic_bases = walk_classic_bases
+        && (0..n).any(|i| {
+            w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                i as i64,
+            )
+            .is_some_and(|base| is_type_like_w(base))
+        });
+
+    // typeobject.py:1689-1690 `orderlists = [get_mro(space, base) for base in
+    // cls.bases_w]` then `orderlists.append([cls] + cls.bases_w)`.  The
+    // classic branch of `get_mro` runs Python, so the lists are accumulated as
+    // shadow-stack slots and only materialized once the build is over — the
+    // merge below allocates nothing, so reading the values there is safe.
+    let mut list_slots: Vec<Vec<usize>> = Vec::with_capacity(n + 1);
+    let mut bases_slots = Vec::with_capacity(n);
     for i in 0..n {
-        let Some(base) = w_tuple_getitem(bases, i as i64) else {
+        let Some(base) = w_tuple_getitem(
+            pyre_object::gc_roots::shadow_stack_get(bases_slot),
+            i as i64,
+        ) else {
             continue;
         };
+        // typeobject.py:1680-1684 `get_mro`: a `W_TypeObject` contributes its
+        // own linearization, anything else is walked as a classic class.
         if is_type_like_w(base) {
             let mro = w_type_get_mro(base);
-            lists.push(if mro.is_null() {
+            let entry = if mro.is_null() {
                 compute_mro(base)
             } else {
                 (*mro).to_vec()
-            });
+            };
+            list_slots.push(entry.into_iter().map(pin_slot).collect());
+        } else if walk_classic_bases {
+            list_slots.push(abstract_mro(base)?);
         }
-        bases_list.push(base);
+        bases_slots.push(pin_slot(
+            w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                i as i64,
+            )
+            .unwrap_or(base),
+        ));
     }
-    lists.push(bases_list);
+    list_slots.push(bases_slots);
+
+    let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
+    let mut lists: Vec<Vec<PyObjectRef>> = list_slots
+        .into_iter()
+        .map(|slots| {
+            slots
+                .into_iter()
+                .map(pyre_object::gc_roots::shadow_stack_get)
+                .collect()
+        })
+        .collect();
 
     loop {
         lists.retain(|list| !list.is_empty());

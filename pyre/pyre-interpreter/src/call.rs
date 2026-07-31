@@ -753,7 +753,10 @@ pub fn call_user_function_resolved(
 /// `__origin__`, set `result.__orig_class__ = self`.  This is wrapped in
 /// `try: ... except (AttributeError, TypeError): pass`, so only those two
 /// errors are swallowed; anything else propagates.
-fn set_orig_class(result: PyObjectRef, alias: PyObjectRef) -> Result<(), crate::PyError> {
+pub(crate) fn set_orig_class(
+    result: PyObjectRef,
+    alias: PyObjectRef,
+) -> Result<(), crate::PyError> {
     match crate::baseobjspace::setattr_str(result, "__orig_class__", alias) {
         Ok(_) => Ok(()),
         Err(e)
@@ -3858,10 +3861,16 @@ fn build_class_inner(
     } else {
         bases
     };
+    // The C3 validations read `__bases__` off classic bases and
+    // `create_all_slots` unpacks `__slots__`; both execute Python, so the
+    // tuple cannot stay in an untraced local across them.
+    let bases_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_effective_bases);
     // A custom metaclass owns its bases until (and unless) it invokes
     // type.__new__; do not perform type's C3 validation before dispatch.
     if w_metaclass.is_none() {
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
+        let w_effective_bases = pyre_object::gc_roots::shadow_stack_get(bases_root);
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
     }
     // Create class via metaclass or default type()
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
@@ -4024,14 +4033,36 @@ fn build_class_inner(
             }
         }
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
-        let w = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        // Slot creation, C3 validation and `__set_name__` below all allocate
+        // and can execute Python; the nascent type has no other referrer
+        // until its mro is installed, so keep it rooted and reread it after
+        // every such step.
+        let w_root = pyre_object::gc_roots::shadow_stack_len();
+        let w = pyre_object::w_type_new(
+            name,
+            pyre_object::gc_roots::shadow_stack_get(bases_root),
+            dict_obj as *mut u8,
+        );
+        pyre_object::gc_roots::pin_root(w);
         crate::builtins::type_new_take_qualname(w, dict_obj)?;
         // typeobject.py:1143-1204 create_all_slots parity.
-        unsafe { create_all_slots(w, w_effective_bases)? };
+        unsafe { create_all_slots(w, pyre_object::gc_roots::shadow_stack_get(bases_root))? };
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
+        let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         unsafe {
             (*w).w_class = crate::typedef::w_type();
         }
+        // typeobject.py:1560 `compute_mro(w_self)`, reached only once
+        // `check_and_find_best_base` inside `create_all_slots` above accepted
+        // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s
+        // classic branch runs through the fallible validation here.
+        unsafe {
+            crate::baseobjspace::validate_c3_mro(
+                pyre_object::gc_roots::shadow_stack_get(bases_root),
+                true,
+            )?
+        };
+        let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
         // typeobject.py:373-377 ready() — register self on each base's
@@ -4045,6 +4076,7 @@ fn build_class_inner(
         // provisional class-body namespace.
         if let Some(classdictcell_root) = classdictcell_root {
             let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
+            let w = pyre_object::gc_roots::shadow_stack_get(w_root);
             let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w) as PyObjectRef };
             if !type_dict.is_null() {
                 unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
@@ -4056,16 +4088,29 @@ fn build_class_inner(
         // __set_name__. The metaclass path above goes through type.__new__()
         // which handles __set_name__ in builtins.rs, so we must NOT call it
         // again there to avoid double invocation.
-        if unsafe { pyre_object::is_type(w) } {
+        if unsafe { pyre_object::is_type(pyre_object::gc_roots::shadow_stack_get(w_root)) } {
             let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
             let entries = unsafe { pyre_object::w_dict_items(dict_obj) };
+            // Every `__set_name__` runs Python, so the snapshot cannot stay in
+            // an untraced Vec across the loop.
+            let _entry_roots = pyre_object::gc_roots::push_roots();
+            let entries_root = pyre_object::gc_roots::shadow_stack_len();
+            let mut pinned = 0;
             for (w_name, value) in entries {
                 if !value.is_null() && unsafe { pyre_object::is_str(w_name) } {
-                    unsafe { crate::baseobjspace::set_name(w, w_name, value) }?;
+                    pyre_object::gc_roots::pin_root(w_name);
+                    pyre_object::gc_roots::pin_root(value);
+                    pinned += 1;
                 }
             }
+            for i in 0..pinned {
+                let w_name = pyre_object::gc_roots::shadow_stack_get(entries_root + i * 2);
+                let value = pyre_object::gc_roots::shadow_stack_get(entries_root + i * 2 + 1);
+                let w = pyre_object::gc_roots::shadow_stack_get(w_root);
+                unsafe { crate::baseobjspace::set_name(w, w_name, value) }?;
+            }
         }
-        w
+        pyre_object::gc_roots::shadow_stack_get(w_root)
     };
 
     // `_store_type_in_classcell` runs inside type.__new__, which the
@@ -4139,7 +4184,11 @@ fn build_class_inner(
             },
             _ => Vec::new(),
         };
-        call_init_subclass_on_bases(w_type, w_effective_bases, &init_subclass_kwargs)?;
+        call_init_subclass_on_bases(
+            w_type,
+            pyre_object::gc_roots::shadow_stack_get(bases_root),
+            &init_subclass_kwargs,
+        )?;
     }
 
     Ok(w_type)
@@ -4705,6 +4754,9 @@ unsafe fn find_best_base(
         let mut w_bestbase: pyre_object::PyObjectRef = std::ptr::null_mut();
         for i in 0..len {
             if let Some(w_candidate) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+                // typeobject.py:1341-1342 — a non-type base is skipped here,
+                // not rejected: it is a classic base, and `get_mro` walks it
+                // through `abstract_mro` when the C3 merge reaches it.
                 if !pyre_object::is_type(w_candidate) {
                     continue;
                 }
