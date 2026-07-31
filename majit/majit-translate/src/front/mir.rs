@@ -1951,6 +1951,19 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             crate::front::bool_then::rewire_bool_then_call_sites(&mut lo.graph, &lo.bool_then_sites)
         };
+        // The `<[T]>::first(slice)` length-checked `Option<&T>` diamond rewrite
+        // (`front::slice_first`) splits the residual `first` call block into a
+        // guarded `Some`/`None` diamond (`if len(slice) > 0`), same post-lowering
+        // shape and fail-safe contract as `bool::then`; gate the reachability
+        // sweep on an actual rewrite.
+        let slice_first_rewritten = if lo.slice_first_sites.is_empty() {
+            0
+        } else {
+            crate::front::slice_first::rewire_slice_first_call_sites(
+                &mut lo.graph,
+                &lo.slice_first_sites,
+            )
+        };
         // The `Option::unwrap_or` value-select rewrite
         // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
         // block into a `__discriminant` diamond, same post-lowering shape and
@@ -2039,6 +2052,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || checked_arith_rewritten > 0
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
+            || slice_first_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
             || map_or_rewritten > 0
@@ -2423,6 +2437,11 @@ struct Lowering<'a> {
     /// resolved ctor/method owners the arms need (see
     /// [`crate::front::bool_then::BoolThenSite`]).
     bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
+    /// `<[T]>::first(slice)` call sites recorded for the length-checked
+    /// `Option<&T>` diamond the `front::slice_first` post-pass synthesizes
+    /// after the body lowering completes (see
+    /// [`crate::front::slice_first::SliceFirstSite`]).
+    slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -2646,6 +2665,7 @@ impl<'a> Lowering<'a> {
             checked_arith_call_results: Vec::new(),
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
+            slice_first_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             range_contains_sites: Vec::new(),
@@ -4905,8 +4925,46 @@ impl<'a> Lowering<'a> {
                         // types), so read and write attrs key under one
                         // owner.
                         let owner = format!("Tuple{}", tyref_tuple_suffix(&inner.ty, self.llbc));
+                        // A tuple reached through a pointer/reference deref
+                        // (a residual call returning `&(A, B)`, a
+                        // `*mut (A, B)` field) resolves its base to a
+                        // classdef-less `SomeInstance`: pyre's pointer
+                        // erasure drops the tuple shape, so the annotator
+                        // Blocks the `__pos_<N>` read (dispatched as
+                        // `getattr`) on a classdef-less instance.  Narrow the
+                        // base to this tuple's `Tuple{suffix}` classdef first
+                        // — identity when it already carries it — the same
+                        // `__pyre_cast_instance` downcast the raw-ptr-deref
+                        // Adt field arm applies (see `narrow_root` above).  A
+                        // by-value tuple base is not deref-shaped and keeps
+                        // its concrete classdef, so it is left untouched.
+                        let base_is_deref = matches!(
+                            &inner.kind,
+                            PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
+                        );
                         let base = self.resolve_place(mir_bb, *inner)?;
                         let bb_id = self.block_id[mir_bb];
+                        let base = if base_is_deref {
+                            let narrowed = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(narrowed.clone()),
+                                kind: OpKind::Call {
+                                    target: CallTarget::FunctionPath {
+                                        segments: vec![
+                                            "__pyre_cast_instance".to_string(),
+                                            owner.clone(),
+                                        ],
+                                    },
+                                    args: vec![base],
+                                    result_ty: ValueType::Ref(Some(owner.clone())),
+                                },
+                            });
+                            narrowed
+                        } else {
+                            base
+                        };
                         let ty = tyref_to_value_type(&place_ty, self.llbc);
                         let res = self
                             .graph
@@ -5853,14 +5911,35 @@ impl<'a> Lowering<'a> {
         if !saw_return {
             return None;
         }
-        let adt = self.resolve_tyexpr_to_adt_def_id(&ty)?;
-        let layout = self.llbc.type_by_id(adt)?.layout_for_target("")?;
+        Some(OpKind::ConstInt(
+            self.size_align_const_from_tyexpr(want_align, &ty)?,
+        ))
+    }
+
+    /// The build-time byte size / alignment Charon resolved for an ADT type
+    /// expression's layout, shared by [`Self::fold_size_const_global`] (the
+    /// NamedConst-initializer form) and the inline `size_of`/`align_of` call
+    /// fold in [`Self::lower_call`].  `None` for a non-ADT type argument
+    /// (primitive / pointer / tuple, which has no `TypeDecl` layout to read)
+    /// or a layout Charon left unresolved.
+    fn size_align_const_from_tyexpr(
+        &self,
+        want_align: bool,
+        ty: &serde_json::Value,
+    ) -> Option<i64> {
+        let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
+        // Read the layout for the build's `TARGET` (empty for the host
+        // extraction target), matching the target-aware field-offset lookup
+        // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
+        // size, not the host's.
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let layout = self.llbc.type_by_id(adt)?.layout_for_target(&target)?;
         let value = if want_align {
             layout.align
         } else {
             layout.size
         }?;
-        Some(OpKind::ConstInt(value as i64))
+        Some(value as i64)
     }
 
     // -----------------------------------------------------------------------
@@ -6108,6 +6187,48 @@ impl<'a> Lowering<'a> {
         let op_kind = match (class, call.func) {
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
+                // Fold an inline `core::mem::size_of::<T>()` /
+                // `align_of::<T>()` call with a layout-resolvable ADT type
+                // argument to its build-time byte size / alignment — the same
+                // constant `fold_size_const_global` produces for the
+                // NamedConst-initializer form, applied here to the inline
+                // call shape (`gc_alloc_storage_box`'s
+                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`,
+                // `struct::__sizeof__`'s `size_of::<W_Struct>()`).  Removes the
+                // residual `<host std.mem.size_of>` call the rtyper cannot
+                // register.  Declines (falls through to the ordinary call
+                // path) for a non-ADT type argument, whose size is not read
+                // from a `TypeDecl` layout.
+                if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                {
+                    let want_align = match fd.item_meta.name_path().as_str() {
+                        "core::mem::size_of" => Some(false),
+                        "core::mem::align_of" => Some(true),
+                        _ => None,
+                    };
+                    if let Some(want_align) = want_align
+                        && let Some(ty) = reg
+                            .generics
+                            .get("types")
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|a| a.first())
+                        && let Some(size) = self.size_align_const_from_tyexpr(want_align, ty)
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::ConstInt(size),
+                        });
+                        self.local_var[dest_local] = Some(res);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
                 // Reflexive blanket `into` — the callsite selected
                 // `impl<T> From<T> for T`, a pure `T -> T` identity
                 // conversion.  Bind the destination local to the
@@ -8024,6 +8145,23 @@ impl<'a> Lowering<'a> {
         {
             self.bool_then_sites.push(site);
         }
+        // Capture `<[T]>::first(slice)` sites for the length-checked
+        // `Option<&T>` diamond `front::slice_first` synthesizes.  `first` is a
+        // foreign leaf (its `Self` is the primitive slice `[T]`, so `lower_call`
+        // keeps the raw `FunctionPath` segments), residualized as an
+        // unregistered callee the rtyper census Skips; a resolution miss leaves
+        // the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "first"])
+            && let Some(site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+        {
+            self.slice_first_sites.push(site);
+        }
         // Capture `RangeInclusive::new(lo, hi)` sites for the
         // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
         // `new` is an inherent-impl associated function whose owner
@@ -8464,6 +8602,25 @@ impl<'a> Lowering<'a> {
                     .and_then(adt_node_def_id)
                     .is_some_and(|id| id == adt_def_id);
                 if !first_is_self {
+                    return None;
+                }
+                // The first input being the owner ADT is necessary but not
+                // sufficient: an associated constructor
+                // (`W_Range::allocate(payload: Self)` /
+                // `allocate_stable(payload: Self)`) also presents the owner as
+                // its first input, yet routing it as `Method` threads the
+                // payload as the getattr receiver and blocks on
+                // `getattr(payload, "allocate")`.  Only a genuine `self`
+                // receiver may route as `Method`.  Rust forbids naming a
+                // parameter `self`, so a receiver's local is the `self` keyword
+                // (Charon names it `"self"`, or leaves it unnamed for a
+                // monomorphised trait method), whereas a constructor's
+                // `Self`-typed parameter keeps its source name (`payload`).
+                // Decline the Method hint for an explicitly-named non-`self`
+                // first input so the call routes as `FunctionPath` and the
+                // call registry resolves the constructor (its residual stub via
+                // `collect_pyre_class_ctor_stubs_from_llbc`).
+                if fd.first_arg_local_name().is_some_and(|n| n != "self") {
                     return None;
                 }
                 owner
@@ -9979,6 +10136,31 @@ impl<'a> Lowering<'a> {
         Some(crate::front::bool_then::BoolThenSite {
             result_var: result_var.clone(),
             call_once_owner: None,
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `<[T]>::first(slice)` call into a
+    /// [`crate::front::slice_first::SliceFirstSite`] — the `Option` enum root +
+    /// `Some` variant owners the length-checked diamond post-pass spells its
+    /// arms with.  Gated on [`Self::option_residual_narrow_root`] returning
+    /// `Some`: that is exactly the shape `lower_call` appends a trailing
+    /// `__pyre_cast_instance` narrowing to (the cast the post-pass absorbs and
+    /// re-applies per arm), and it declines a value-slice `Option<u8>` /
+    /// `Option<i64>` (no registered pointee root) cleanly, leaving the residual
+    /// call for the census Skip.  `None` when the destination is not a
+    /// resolvable narrow-root `Option`.
+    fn recognize_slice_first_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::slice_first::SliceFirstSite> {
+        self.option_residual_narrow_root(dest_ty)?;
+        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        Some(crate::front::slice_first::SliceFirstSite {
+            result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,
@@ -12812,6 +12994,78 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
     out
 }
 
+/// Collect residual stubs for the `#[pyre_class]`-generated allocation
+/// constructors `<Owner>::allocate(payload: Self) -> PyObjectRef` and
+/// `allocate_stable(payload: Self)`.
+///
+/// Each builds `Self { ob: <header>, ..payload }` then calls
+/// `lltype::malloc_typed[_stable]` — a non-numeric boxing allocation with no
+/// ported general `malloc->new` lowering (`fuse_boxing_alloc` rewrites only
+/// the numeric boxes `W_Float`/`W_Int`/`W_Complex`/`W_Long`; every other
+/// mallocable struct hits the fail-closed `flowspace_adapter` guard).  So the
+/// constructor body cannot be traced; the faithful treatment is the
+/// `register_external` analog — residualize the whole `allocate` call.
+/// [`Lowering::impl_method_owner`] declines the `CallTarget::Method` hint for
+/// the `payload`-named `Self` argument (routing through
+/// `CallTarget::FunctionPath`); this collection feeds the matching registry
+/// entries, keyed by the SAME [`impl_method_owner_for_fundecl`] the
+/// declined-Method `call_target_segments` arm uses, so the `FunctionPath`
+/// lookup resolves to the `*mut PyObject` return shell instead of the failing
+/// looked-inside body.  The companion skip in
+/// `populate_call_registry_from_call_graphs` keeps the constructor's own
+/// (unliftable) body out of the registry so this stub key wins.
+///
+/// Reuses the [`CallControl::unsafe_fn_stubs`] carrier + `register_unsafe_fn_stubs`
+/// registration path (both feed `(segments, Signature, return-token)` specs
+/// through the same annotator-only `residual_return_shell`).
+pub(crate) fn collect_pyre_class_ctor_stubs_from_llbc(
+    llbc: &Llbc,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    Option<String>,
+)> {
+    use crate::flowspace::argument::Signature;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        if leaf != "allocate" && leaf != "allocate_stable" {
+            continue;
+        }
+        // The macro constructor is exactly `(payload: Self) -> *mut PyObject`:
+        // one argument returning the object pointer.  A `self`-named receiver
+        // (`fn allocate(&self) -> …`) is a real method, not the constructor.
+        if fd.signature.inputs.len() != 1 {
+            continue;
+        }
+        if !output_type_is_objectptr(&fd.signature.output, llbc) {
+            continue;
+        }
+        if fd.first_arg_local_name().as_deref() == Some("self") {
+            continue;
+        }
+        let mut segments: Vec<String> = owner_qualified.split("::").map(String::from).collect();
+        segments.push(leaf);
+        let argname = fd
+            .unstructured()
+            .as_ref()
+            .and_then(|u| u.locals.locals.get(1))
+            .and_then(|l| l.name.clone())
+            .unwrap_or_else(|| "payload".to_string());
+        out.push((
+            segments,
+            Signature::new(vec![argname], None, None),
+            Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string()),
+        ));
+    }
+    out
+}
+
 /// Collect, from the lowered MIR, `(path-segments, Signature, result
 /// ValueType)` for every method whose impl-owner is a **foreign opaque**
 /// ADT and whose result type can be modeled faithfully.
@@ -13380,7 +13634,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 fn value_type_bank(ty: &ValueType) -> u8 {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) => 1,
+        ValueType::Ref(_) | ValueType::Str => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,
@@ -13526,6 +13780,19 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if tyref_is_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
+    // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
+    // rpy_string in the value model (`tyref_is_string_value`), matching
+    // upstream's one string type (`rstr.py`).  A bare string-family value
+    // (parameter, return, local) seeds `SomeString` so it stays the string
+    // lattice node at every site instead of a classdef-carrying
+    // `SomeInstance(Wtf8Buf)`: a `Wtf8Buf` value stored into a `*mut Wtf8Buf`
+    // field flows `SomeString` through `malloc_raw` (which round-trips a
+    // non-`Instance` payload unchanged), keeping the field repr
+    // `Ptr(rpy_string)` consistent with the `getattr` + deref-to-`&Wtf8`
+    // read that reports the field as a string.
+    if tyref_is_string_value(ty, llbc) {
+        return ValueType::Str;
+    }
     ValueType::Ref(None)
 }
 
@@ -13640,7 +13907,7 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
         ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
             return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
         }
-        ValueType::Ref(_) => "ref",
+        ValueType::Ref(_) | ValueType::Str => "ref",
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
@@ -13783,6 +14050,25 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // the cheap `Literal` fast-path so primitive fields never pay it.
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
+    }
+    // A fieldless (C-like) enum field is represented by-value as its
+    // discriminant integer, matching `tyref_to_value_type` which colors
+    // the same enum `Int` at every value site (construction, field read,
+    // `Discriminant`).  Seed the attr as `Int` so the forced class
+    // attribute agrees with the discriminant write; otherwise the field
+    // seeds a classdef-less `SomeInstance(None)` shell and the first typed
+    // write (`err.kind = PyErrorKind::…`) unions `Integer ∪ Instance` with
+    // no `pair(SomeInteger, SomeInstance).union()` handler and walls.
+    if tyref_is_fieldless_enum_free(ty, llbc) {
+        return ValueType::Int;
+    }
+    // A `str`/`String`/`Wtf8` field seeds a `SomeString` attr shell (via
+    // valuetype_to_someshell) instead of the classdef-less `Ref(None)`
+    // SomeInstance the fallback yields; the latter walls when the first
+    // typed string write unions `String ∪ Instance(classdef-less)` with no
+    // pair(SomeString, SomeInstance).union() handler.
+    if tyref_is_string_value(ty, llbc) {
+        return ValueType::Str;
     }
     ValueType::Ref(None)
 }

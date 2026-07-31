@@ -3437,6 +3437,24 @@ impl CallControl {
                             {
                                 continue;
                             }
+                            // `#[pyre_class]`'s `allocate`/`allocate_stable`
+                            // constructors build the object then call the
+                            // non-numeric `lltype::malloc_typed[_stable]`, which
+                            // has no ported general `malloc->new` lowering.  The
+                            // caller resolves them to the
+                            // `collect_pyre_class_ctor_stubs_from_llbc` residual
+                            // stub, so — like a builtin — the BFS must not follow
+                            // the constructor body: otherwise the two-phase census
+                            // annotates its unliftable body (and its transitive
+                            // `malloc_typed_stable`) standalone and reports a
+                            // spurious Phase-A failure for a graph no caller ever
+                            // traces into.
+                            if matches!(
+                                callee_path.last_segment(),
+                                Some("allocate") | Some("allocate_stable")
+                            ) {
+                                continue;
+                            }
                             vec![callee_path]
                         }
                         _ => continue,
@@ -6747,9 +6765,9 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unsigned
                             | crate::model::ValueType::Bool
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
-                            crate::model::ValueType::Ref(_) | crate::model::ValueType::Unknown => {
-                                majit_ir::value::Type::Ref
-                            }
+                            crate::model::ValueType::Ref(_)
+                            | crate::model::ValueType::Str
+                            | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                             crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
@@ -6799,9 +6817,9 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unsigned
                             | crate::model::ValueType::Bool
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
-                            crate::model::ValueType::Ref(_) | crate::model::ValueType::Unknown => {
-                                majit_ir::value::Type::Ref
-                            }
+                            crate::model::ValueType::Ref(_)
+                            | crate::model::ValueType::Str
+                            | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                             crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
@@ -7667,7 +7685,7 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
         // and `INT_TYPE` under the same `'int'` kind for descriptor
         // indexing (`lltypesystem/lloperation.py:108 getkind`).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) => 1,
+        ValueType::Ref(_) | ValueType::Str => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,

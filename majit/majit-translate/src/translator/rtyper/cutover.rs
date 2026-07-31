@@ -1783,6 +1783,26 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         {
             continue;
         }
+        // `#[pyre_class]`'s generated allocation constructors
+        // (`<Owner>::allocate(payload: Self)` / `allocate_stable(payload:
+        // Self)`) build the object then call the non-numeric
+        // `lltype::malloc_typed[_stable]`, which has no ported general
+        // `malloc->new` lowering — lifting the body records a poison lift-error
+        // that surfaces on the first constructing caller (`w_range_new`,
+        // the iterator/`GenericAlias` `*_new` heads).  Skip registering the
+        // constructor as a user function so its key is instead served by the
+        // residual stub from `collect_pyre_class_ctor_stubs_from_llbc` (seeded
+        // through the `unsafe_fn_stubs` carrier), whose `*mut PyObject` return
+        // shell lets the caller annotate.  The numeric boxes never reach here —
+        // they call `malloc_typed` inline (`w_float_new`/`w_int_new`), not the
+        // macro `allocate` wrapper — so this does not disturb
+        // `fuse_boxing_alloc`.
+        if matches!(
+            canonical_strip.last().map(String::as_str),
+            Some("allocate") | Some("allocate_stable")
+        ) {
+            continue;
+        }
         // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
         // intrinsic (`lltype.malloc(T, flavor='raw')` parity), recognised as
         // a host builtin (annotator `malloc_raw_alloc`, HOST_ENV
@@ -2209,11 +2229,15 @@ fn build_stub_pygraph_with_result_shell(
 ///
 /// Returns `None` for container types
 /// (`Func` / `Struct` / `Array` / `FixedSizeArray` / `Opaque` /
-/// `ForwardReference`) that `lltype_to_annotation` rejects, and for
-/// `Address` (upstream `SomeAddress`; not yet ported to the pyre
-/// `SomeValue` enum — see `model.rs:21` TODO).  The caller
+/// `ForwardReference`) that `lltype_to_annotation` rejects.  The caller
 /// treats `None` as "skip this fn"; the unported path then surfaces
 /// the original "not registered" Skip.
+///
+/// `Address` maps to the untyped `SomeAddress` shell (`llmemory.py:573
+/// SomeAddress`) — the annotation-stage projection a `*const T` / `*mut T`
+/// raw pointer carries when its element type is not modeled.  A
+/// `<[T]>::as_ptr` result is consumed here only as a residual-call argument
+/// (`hash_str_hooked(ptr, len)`), for which the untyped address is faithful.
 pub(crate) fn default_someshell_for_lltype(
     lltype: &LowLevelType,
 ) -> Option<crate::annotator::model::SomeValue> {
@@ -2221,9 +2245,9 @@ pub(crate) fn default_someshell_for_lltype(
         return None;
     }
     match lltype {
-        // SomeAddress is not yet present in the SomeValue enum
-        // (model.rs:21 TODO); skip until ported.
-        LowLevelType::Address => None,
+        LowLevelType::Address => Some(crate::annotator::model::SomeValue::Address(
+            crate::annotator::model::SomeAddress::new(),
+        )),
         _ => Some(crate::translator::rtyper::llannotation::lltype_to_annotation(lltype.clone())),
     }
 }
@@ -2392,17 +2416,53 @@ pub(crate) fn register_unsafe_fn_stubs(
 /// - `core::f64::<Impl>::to_bits` returns `u64` reinterpreted as `i64` —
 ///   `Signed` result.
 ///
-/// Paths whose faithful result is a non-scalar value the stub carrier
-/// cannot express (`alloc::fmt::format` → `String`,
+/// A raw `*const T` / `*mut T` result maps to the untyped `Address` shell
+/// (`core::slice::<Impl>::as_ptr`, `vec::Vec::as_ptr`) — faithful when the
+/// pointer is consumed only as a residual-call argument.  Paths whose
+/// faithful result is a non-scalar value the stub carrier still cannot
+/// express (`alloc::fmt::format` → `String`,
 /// `core::array::iter::<Impl>::into_iter` → an iterator with no Repr,
-/// `core::slice::<Impl>::as_ptr` → a raw `*const T`, `core::num::<Impl>::
-/// checked_*` → `Option<i64>`) are intentionally absent: registering
-/// them with a placeholder `Void`/`Signed` result mis-models the value
-/// and only migrates the failure to a deeper annotation wall (union
-/// pollution / raw-pointer modeling), so they stay residual at the
-/// "not registered" Skip until their result type can be modeled.
+/// `core::num::<Impl>::checked_*` → `Option<i64>`) stay intentionally
+/// absent: registering them with a placeholder `Void`/`Signed` result
+/// mis-models the value and only migrates the failure to a deeper
+/// annotation wall, so they stay residual at the "not registered" Skip
+/// until their result type can be modeled.
 const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (&["core", "mem", "swap"], &["x", "y"], LowLevelType::Void),
+    // `mem::drop(x)` runs `x`'s destructor and returns `()`; the trace model
+    // does not model destructors (the `Drop` terminator lowers to a
+    // pass-through `Goto`), so a Void no-op stub is faithful.
+    (&["core", "mem", "drop"], &["x"], LowLevelType::Void),
+    // `mem::size_of::<T>() -> usize`.  A concrete-type call is folded to a
+    // `ConstInt` in the front end (`Lowering::lower_call` /
+    // `size_align_const_from_tyexpr`); the residual reaching the rtyper is the
+    // generic body (`gc_alloc_storage_box<T>`), whose `T` is an abstract type
+    // parameter with no compile-time size.  Declare it opaque so the generic
+    // body annotates — the monomorphized machine code the JIT actually traces
+    // carries rustc's folded constant, so no residual call runs.  Both
+    // spellings: the FunDecl name resolves `core`, the call site may write the
+    // `std` re-export.
+    (&["core", "mem", "size_of"], &[], LowLevelType::Unsigned),
+    (&["std", "mem", "size_of"], &[], LowLevelType::Unsigned),
+    // `handle_alloc_error(layout) -> !` aborts on OOM; it never returns and
+    // its result is never consumed. The divergence is carried by the CFG, so
+    // a Void stub lets the alloc helpers lift while the residual call aborts.
+    (
+        &["alloc", "alloc", "handle_alloc_error"],
+        &["layout"],
+        LowLevelType::Void,
+    ),
+    (
+        &["core", "slice", "<Impl>", "as_ptr"],
+        &["self"],
+        LowLevelType::Address,
+    ),
+    (&["vec", "Vec", "as_ptr"], &["self"], LowLevelType::Address),
+    (
+        &["sync", "atomic", "AtomicBool", "store"],
+        &["self", "val", "order"],
+        LowLevelType::Void,
+    ),
     (
         &["cell", "Cell", "set"],
         &["self", "val"],
@@ -5138,9 +5198,14 @@ mod tests {
     }
 
     #[test]
-    fn default_someshell_for_lltype_address_yields_none() {
-        // SomeAddress not yet ported (model.rs:21 TODO).
-        assert!(default_someshell_for_lltype(&LowLevelType::Address).is_none());
+    fn default_someshell_for_lltype_address_yields_someaddress() {
+        use crate::annotator::model::SomeValue;
+        // `Address` maps to the untyped `SomeAddress` shell (llmemory.py:573
+        // `SomeAddress`) — the projection a raw `*const T` / `*mut T` result
+        // takes.
+        let s = default_someshell_for_lltype(&LowLevelType::Address)
+            .expect("Address must project to SomeAddress");
+        assert!(matches!(s, SomeValue::Address(_)), "got {s:?}");
     }
 
     #[test]

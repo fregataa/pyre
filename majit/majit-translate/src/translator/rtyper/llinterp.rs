@@ -31,7 +31,7 @@ use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _ptr, LowLevelType, LowLevelValue,
+    _address, _ptr, LowLevelType, LowLevelValue, MallocFlavor, malloc,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
@@ -203,6 +203,26 @@ fn const_to_llvalue(c: &Constant) -> LLValue {
         ConstValue::LLPtr(p) => LLValue::Ptr(p.clone()),
         ConstValue::LLAddress(a) => LLValue::Address(a.clone()),
         other => LLValue::Const(other.clone()),
+    }
+}
+
+/// Inverse of the `LowLevelValue` arm of [`any_to_llvalue`]: convert an
+/// `LLValue` into the `lltype::LowLevelValue` a heap cell stores. A Char is
+/// carried as a one-char `Str` (see the `LowLevelValue::Char` arm below).
+fn llvalue_to_lowlevel(value: &LLValue, opname: &str) -> Result<LowLevelValue, TaskError> {
+    match value {
+        LLValue::Void => Ok(LowLevelValue::Void),
+        LLValue::Int(n) => Ok(LowLevelValue::Signed(*n)),
+        LLValue::Bool(b) => Ok(LowLevelValue::Bool(*b)),
+        LLValue::Float(bits) => Ok(LowLevelValue::Float(*bits)),
+        LLValue::Ptr(p) => Ok(LowLevelValue::Ptr(p.clone())),
+        LLValue::Address(a) => Ok(LowLevelValue::Address(a.clone())),
+        LLValue::Str(s) if s.chars().count() == 1 => {
+            Ok(LowLevelValue::Char(s.chars().next().expect("one char")))
+        }
+        other => Err(TaskError {
+            message: format!("llinterp.py:405 {opname}: cannot store {other:?} into a heap cell"),
+        }),
     }
 }
 
@@ -817,6 +837,149 @@ impl LLFrame {
             )),
             "bool_not" => Ok(LLValue::Bool(!vals[0].as_bool(opname)?)),
             "cast_bool_to_int" => Ok(LLValue::Int(i64::from(vals[0].as_bool(opname)?))),
+            // `op_uint_*` (opimpl.py, generated from the `r_uint` template):
+            // the Signed carrier holds the machine word; reinterpret its
+            // bits as `u64` for the unsigned operation, then store the
+            // result word back as `i64`.
+            "uint_floordiv" => {
+                let divisor = vals[1].as_i64(opname)? as u64;
+                if divisor == 0 {
+                    return Err(TaskError {
+                        message: "opimpl.py op_uint_floordiv: unsigned division by zero"
+                            .to_string(),
+                    });
+                }
+                Ok(LLValue::Int(
+                    ((vals[0].as_i64(opname)? as u64) / divisor) as i64,
+                ))
+            }
+            "uint_mod" => {
+                let divisor = vals[1].as_i64(opname)? as u64;
+                if divisor == 0 {
+                    return Err(TaskError {
+                        message: "opimpl.py op_uint_mod: unsigned modulo by zero".to_string(),
+                    });
+                }
+                Ok(LLValue::Int(
+                    ((vals[0].as_i64(opname)? as u64) % divisor) as i64,
+                ))
+            }
+            // `op_uint_is_true` (opimpl.py, `is_true` template): the word is
+            // true iff nonzero — sign-interpretation-independent.
+            "uint_is_true" => Ok(LLValue::Bool(vals[0].truth())),
+            // `op_cast_uint_to_int(b) = intmask(b)` (opimpl.py:465-467):
+            // reinterpret the unsigned word's bits as Signed. The carrier
+            // already stores the word as `i64`, so this is the identity.
+            "cast_uint_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
+            // `op_cast_primitive` between integer types reinterprets the
+            // machine word; the Signed carrier already holds it, so the
+            // Signed<->Unsigned cast is the identity on the i64 word.
+            "cast_primitive" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
+            // `op_cast_int_to_char(b) = chr(b)` (opimpl.py:411-413): the char
+            // carrier is the one-char `Str`.
+            "cast_int_to_char" => {
+                let code = vals[0].as_i64(opname)?;
+                let ch = u8::try_from(code).map_err(|_| TaskError {
+                    message: format!("opimpl.py op_cast_int_to_char: {code} out of char range"),
+                })? as char;
+                Ok(LLValue::Str(ch.to_string()))
+            }
+            // Heap ops: `_struct`/`_array` are Arc-shared with interior
+            // mutability, so writes through the cloned `_ptr` carrier persist
+            // on the original allocation (pointer semantics).
+            "malloc_varsize" => {
+                let LLValue::Const(ConstValue::LowLevelType(t)) = &vals[0] else {
+                    return Err(TaskError {
+                        message: format!("{opname}: arg0 must be a LowLevelType constant"),
+                    });
+                };
+                // `flavor='gc'` unless the flags dict spells `'raw'`
+                // (rmodel gc_flavor_const: `Dict{"flavor": "gc"}`).
+                let flavor = match &vals[1] {
+                    LLValue::Const(ConstValue::Dict(flags))
+                        if matches!(
+                            flags.get(&ConstValue::byte_str("flavor")),
+                            Some(ConstValue::ByteStr(f)) if f.as_slice() == b"raw"
+                        ) =>
+                    {
+                        MallocFlavor::Raw
+                    }
+                    _ => MallocFlavor::Gc,
+                };
+                let n = vals[2].as_i64(opname)? as usize;
+                let ptr = malloc((**t).clone(), Some(n), flavor, false).map_err(|e| TaskError {
+                    message: format!("{opname}: {e}"),
+                })?;
+                Ok(LLValue::Ptr(Box::new(ptr)))
+            }
+            "setfield" => {
+                let LLValue::Ptr(p) = &vals[0] else {
+                    return Err(TaskError {
+                        message: format!("{opname}: arg0 must be a pointer"),
+                    });
+                };
+                let LLValue::Str(field) = &vals[1] else {
+                    return Err(TaskError {
+                        message: format!("{opname}: arg1 must be a field name"),
+                    });
+                };
+                let mut ptr = (**p).clone();
+                ptr.setattr(field, llvalue_to_lowlevel(&vals[2], opname)?)
+                    .map_err(|e| TaskError {
+                        message: format!("{opname}: {e}"),
+                    })?;
+                Ok(LLValue::Void)
+            }
+            "getsubstruct" => {
+                let LLValue::Ptr(p) = &vals[0] else {
+                    return Err(TaskError {
+                        message: format!("{opname}: arg0 must be a pointer"),
+                    });
+                };
+                let LLValue::Str(field) = &vals[1] else {
+                    return Err(TaskError {
+                        message: format!("{opname}: arg1 must be a field name"),
+                    });
+                };
+                // `op_getsubstruct` = `getattr(obj, field)` on the pointer,
+                // yielding a pointer to the inlined sub-container. `_expose`
+                // returns it as an interior pointer when the field is a Raw
+                // container inlined into a Gc parent (`rpy_string.chars`);
+                // materialise that into a plain container `_ptr` so the
+                // array op handlers can read/write through it.
+                let sub = match p.getattr(field).map_err(|e| TaskError {
+                    message: format!("{opname}: {e}"),
+                })? {
+                    LowLevelValue::Ptr(pt) => *pt,
+                    LowLevelValue::InteriorPtr(ip) => {
+                        ip._as_container_ptr(p._solid).map_err(|e| TaskError {
+                            message: format!("{opname}: {e}"),
+                        })?
+                    }
+                    other => {
+                        return Err(TaskError {
+                            message: format!(
+                                "{opname}: field {field:?} is not a container: {other:?}"
+                            ),
+                        });
+                    }
+                };
+                Ok(LLValue::Ptr(Box::new(sub)))
+            }
+            "setarrayitem" => {
+                let LLValue::Ptr(p) = &vals[0] else {
+                    return Err(TaskError {
+                        message: format!("{opname}: arg0 must be a pointer"),
+                    });
+                };
+                let index = vals[1].as_i64(opname)? as usize;
+                let mut ptr = (**p).clone();
+                ptr.setitem(index, llvalue_to_lowlevel(&vals[2], opname)?)
+                    .map_err(|e| TaskError {
+                        message: format!("{opname}: {e}"),
+                    })?;
+                Ok(LLValue::Void)
+            }
             _ => Err(TaskError {
                 message: format!(
                     "llinterp.py:273 LLFrame.getoperationhandler — op_{opname} not yet ported"
@@ -1159,6 +1322,224 @@ mod tests {
         // thread-local pointer while running. After return the local
         // mirror is restored to the prior (empty) Weak.
         assert!(LLInterpreter::current_interpreter().is_none());
+    }
+
+    #[test]
+    fn getoperationhandler_folds_uint_div_mod_and_casts() {
+        // Covers the `op_uint_floordiv` / `op_uint_mod` / `op_uint_is_true`
+        // / `op_cast_uint_to_int` folds (opimpl.py, `r_uint` templates +
+        // :465-467), chained straight-line so one eval_graph run exercises
+        // all four: 12345 //u 10 = 1234; 1234 %u 10 = 4; intmask(4) = 4;
+        // is_true(4) = True; cast_bool_to_int(True) = 1.
+        use crate::flowspace::model::Constant as FlowConstant;
+        let ten = || Hlvalue::Constant(FlowConstant::new(ConstValue::Int(10)));
+
+        let x = Variable::named("x");
+        x.set_concretetype(Some(LowLevelType::Signed));
+        let a = Variable::named("a");
+        a.set_concretetype(Some(LowLevelType::Unsigned));
+        let b = Variable::named("b");
+        b.set_concretetype(Some(LowLevelType::Unsigned));
+        let s = Variable::named("s");
+        s.set_concretetype(Some(LowLevelType::Signed));
+        let t = Variable::named("t");
+        t.set_concretetype(Some(LowLevelType::Bool));
+        let c = Variable::named("c");
+        c.set_concretetype(Some(LowLevelType::Signed));
+
+        let start = Block::shared(vec![x.clone().into()]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_floordiv",
+            vec![x.into(), ten()],
+            a.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_mod",
+            vec![a.into(), ten()],
+            b.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_uint_to_int",
+            vec![b.into()],
+            s.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_is_true",
+            vec![s.into()],
+            t.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_bool_to_int",
+            vec![t.into()],
+            c.clone().into(),
+        ));
+
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "uint_chain",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![c.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(
+                graph as Rc<dyn Any>,
+                vec![Rc::new(12345_i64) as Rc<dyn Any>],
+                false,
+            )
+            .expect("uint fold chain should run");
+        assert_eq!(*out.downcast::<i64>().expect("Signed return"), 1);
+    }
+
+    #[test]
+    fn getoperationhandler_mallocs_char_array_and_writes_through_pointer() {
+        // Covers malloc_varsize (bare GcArray path), cast_int_to_char (char =
+        // one-char Str), and setarrayitem writing through the Arc-shared
+        // `_ptr` carrier: allocate a 3-char array, write 'a'/'b'/'c', return
+        // the pointer, and confirm the writes persisted on the allocation.
+        use crate::flowspace::model::Constant as FlowConstant;
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+
+        let char_array = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Char)));
+        let type_c = || {
+            Hlvalue::Constant(FlowConstant::new(ConstValue::LowLevelType(Box::new(
+                char_array.clone(),
+            ))))
+        };
+        let flavor_c = || {
+            Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(
+                std::collections::HashMap::new(),
+            )))
+        };
+        let int_c = |n: i64| Hlvalue::Constant(FlowConstant::new(ConstValue::Int(n)));
+
+        let arr = Variable::named("arr");
+        let start = Block::shared(vec![]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![type_c(), flavor_c(), int_c(3)],
+            arr.clone().into(),
+        ));
+        for (idx, code) in [(0_i64, 97_i64), (1, 98), (2, 99)] {
+            let ch = Variable::named("ch");
+            ch.set_concretetype(Some(LowLevelType::Char));
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_int_to_char",
+                vec![int_c(code)],
+                ch.clone().into(),
+            ));
+            let set = Variable::named("set");
+            set.set_concretetype(Some(LowLevelType::Void));
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                "setarrayitem",
+                vec![arr.clone().into(), int_c(idx), ch.into()],
+                set.into(),
+            ));
+        }
+
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "malloc_write",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![arr.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(graph as Rc<dyn Any>, Vec::new(), false)
+            .expect("malloc + write-through graph should run");
+        let LowLevelValue::Ptr(ptr) = &*out.downcast::<LowLevelValue>().expect("Ptr return") else {
+            panic!("expected an array pointer return");
+        };
+        for (idx, expected) in [(0_usize, 'a'), (1, 'b'), (2, 'c')] {
+            match ptr.getitem(idx).expect("in-bounds read") {
+                LowLevelValue::Char(c) => assert_eq!(c, expected, "char at {idx}"),
+                other => panic!("expected Char at {idx}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_ll_int2dec_executes_to_decimal_strings() {
+        // Slice C: run the synthesised `ll_int2dec` helper graph
+        // (`lltypesystem/rstr.rs`) end-to-end through the interpreter and read
+        // the decimal string back out of the returned STR pointer. This is the
+        // executing correctness gate the hex builder's shape-only test lacks —
+        // it catches an off-by-one in the reversed `total_len - j - 1` slot or a
+        // swapped link argument that a BFS-of-opnames assertion cannot.
+        use crate::translator::rtyper::lltypesystem::rstr::build_ll_int2dec_helper_graph;
+
+        fn read_rpy_string(strptr: &_ptr) -> String {
+            // Read `strptr.chars` the same way `getsubstruct` does: `getattr`
+            // yields an interior pointer for the inlined array, materialised
+            // into a plain container `_ptr` to index through.
+            let chars = match strptr.getattr("chars").expect("chars field") {
+                LowLevelValue::Ptr(p) => *p,
+                LowLevelValue::InteriorPtr(ip) => {
+                    ip._as_container_ptr(true).expect("materialise chars ptr")
+                }
+                other => panic!("chars is not a container: {other:?}"),
+            };
+            let mut s = String::new();
+            let mut i = 0usize;
+            while let Ok(LowLevelValue::Char(c)) = chars.getitem(i) {
+                s.push(c);
+                i += 1;
+            }
+            s
+        }
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let run = |helper: &crate::flowspace::pygraph::PyGraph, input: i64| -> String {
+            let out = interp
+                .eval_graph(
+                    helper.graph.clone() as Rc<dyn Any>,
+                    vec![Rc::new(input) as Rc<dyn Any>],
+                    false,
+                )
+                .expect("int2dec helper graph should run");
+            let LowLevelValue::Ptr(p) = &*out.downcast::<LowLevelValue>().expect("Ptr return")
+            else {
+                panic!("expected a STR pointer return");
+            };
+            read_rpy_string(p)
+        };
+
+        // Unsigned specialisation: -1 arrives as the full u64 word.
+        let unsigned = build_ll_int2dec_helper_graph("ll_int2dec", false).expect("build unsigned");
+        for (input, expected) in [
+            (0_i64, "0"),
+            (7, "7"),
+            (12345, "12345"),
+            (-1, "18446744073709551615"),
+        ] {
+            assert_eq!(run(&unsigned, input), expected, "uint2dec({input})");
+        }
+
+        // Signed specialisation: the `val < 0` branch takes the magnitude.
+        let signed =
+            build_ll_int2dec_helper_graph("ll_int2dec_signed", true).expect("build signed");
+        for (input, expected) in [
+            (0_i64, "0"),
+            (7, "7"),
+            (-42, "-42"),
+            (12345, "12345"),
+            (-12345, "-12345"),
+        ] {
+            assert_eq!(run(&signed, input), expected, "int2dec({input})");
+        }
     }
 
     #[test]

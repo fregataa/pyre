@@ -390,6 +390,13 @@ fn dispatch_convert_from_to(
         // `NotImplemented`. The rtyper distinguishes different spec-func
         // Struct pointer types even within the same Repr subclass.
         (FunctionsPBCRepr, FunctionsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
+        // rpbc.py:1220-1224 — pairtype(MethodsPBCRepr,
+        // MethodsPBCRepr).convert_from_to: upstream identity if
+        // `r_mpbc1.lowleveltype == r_mpbc2.lowleveltype`, else
+        // `NotImplemented`. Two structurally identical method families
+        // reach this with the same receiver Ptr lowleveltype (the
+        // instance the bound method carries), so the pass-through applies.
+        (MethodsPBCRepr, MethodsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
         // rpbc.py:517-519 — pairtype(SmallFunctionSetPBCRepr,
         // FunctionRepr).convert_from_to: `return inputconst(Void, None)`.
         //   FunctionRepr is Void-typed; the Char source variable is
@@ -843,6 +850,19 @@ fn dispatch_rtype_op(
         }
         (StringRepr, StringRepr, "ge") => {
             committed(super::rstr::pair_string_string_rtype_compare(hop, "ge"))
+        }
+
+        // rstr.py:661-692 via `CharRepr(AbstractCharRepr, StringRepr)` MRO —
+        // a String compared with a Char coerces the Char operand to a 1-char
+        // string (ll_chr2str) then reuses the AbstractStringRepr compare body.
+        // Pyre's CharRepr pair_mro is [CharRepr, Repr] (explicit-arm design),
+        // so the mixed pair needs its own arm; `str_arg_idx` names the string
+        // operand both sides coerce to.
+        (StringRepr, CharRepr, "eq" | "ne" | "lt" | "le" | "gt" | "ge") => {
+            committed(super::rstr::pair_string_char_rtype_compare(hop, opname, 0))
+        }
+        (CharRepr, StringRepr, "eq" | "ne" | "lt" | "le" | "gt" | "ge") => {
+            committed(super::rstr::pair_string_char_rtype_compare(hop, opname, 1))
         }
 
         // rstr.py:651-692 inherited via AbstractUnicodeRepr(AbstractStringRepr) —
