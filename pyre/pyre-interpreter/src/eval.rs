@@ -610,15 +610,6 @@ fn gc_prebuilt_remember_enabled() -> bool {
     })
 }
 
-/// Whether the per-return diagnostic dump is enabled
-/// (`PYRE_INTERP_RETURN_LOG`). The probe sits on the RETURN_VALUE path, so an
-/// uncached read would pay a `getenv` on every Python return.
-#[cfg(not(feature = "sandbox"))]
-fn interp_return_log_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some())
-}
-
 pub fn capture_pyframe_root_area() -> *const () {
     PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
 }
@@ -1004,6 +995,10 @@ pub unsafe fn walk_pyframe_roots_area(
 pub fn register_pyframe_root_walker() {
     majit_gc::shadow_stack::register_extra_root_walker(walk_global_prebuilt_roots);
     majit_gc::shadow_stack::register_extra_root_walker(crate::module::thread::walk_thread_roots);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    majit_gc::shadow_stack::register_extra_root_walker(
+        crate::module::faulthandler::handler::walk_faulthandler_roots,
+    );
 }
 
 thread_local! {
