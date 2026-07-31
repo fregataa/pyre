@@ -2681,7 +2681,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         let legacy_admit = match safety {
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
-                foriter_deferred_admit = !fbw_foriter_deferred_call_denied(callee_code_key);
+                // The deferred promise rests on the abort REWINDING to the
+                // enclosing CALL and re-executing it from scratch.  A binop
+                // dunder dispatch (the only entry carrying an
+                // `arg_class_guard`) reaches this lever from a `BINARY_OP`
+                // instead, and that opcode is not a call boundary the rewind
+                // can name: the flush resumes one operand short and the whole
+                // iteration's contribution is dropped, silently.  A `Clean`
+                // body is still admitted from there — it has nothing that can
+                // abort.
+                foriter_deferred_admit =
+                    arg_class_guard.is_none() && !fbw_foriter_deferred_call_denied(callee_code_key);
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
@@ -3196,18 +3206,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // Stored bound methods carry their explicit receiver and callee frame,
             // so their Ref operands remain available to the resume path.
             //
-            // This is the one precondition here that still aborts instead of
-            // returning `Ok(None)`, and deliberately so.  Residualizing it does
-            // work — `bench/synth/_pending/gc_bug_bridge_flavor_traceback_names`
-            // goes from 98 aborts to 2 and
-            // `_pending/exception_nested_exc_info_restore` from 5 aborts to 0,
-            // both compiling loops they never compiled before — but the loops it
-            // newly compiles then print traceback tuples missing their outermost
-            // frame, diverging from the interpreter (that fixture pins its
-            // expected output in its header).  The abort was masking a lost
-            // `PyTraceback` node on the compiled exception path, not preventing
-            // one.  Restore `Ok(None)` here once that node is recorded; it is the
-            // largest single win left in this function.
+            // This precondition used to abort the enclosing trace rather than
+            // decline the inline, because residualizing it let loops compile that
+            // then printed traceback tuples missing their OUTERMOST frame.  That
+            // node is now recorded — the two bridge handler-entry arms attach the
+            // catching frame's own node — so the decline joins every other
+            // precondition here and returns `Ok(None)`.
+            //
+            // The abort was expensive out of all proportion to the inline it was
+            // protecting: a callee that walks a traceback (`while tb is not None`)
+            // lowers to exactly this instruction, so any handler calling such a
+            // helper aborted every retrace of the enclosing loop.  The guard whose
+            // bridge the retrace was building therefore never got one and deopted
+            // on every delivery.
             if bound_method.is_none()
                 && (0..callee_code.instructions.len()).any(|pc| {
                     matches!(
@@ -3221,7 +3232,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 })
             {
                 if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    return Ok(None);
                 }
                 break 'seed;
             }
