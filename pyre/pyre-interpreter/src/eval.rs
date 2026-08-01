@@ -610,6 +610,87 @@ fn gc_prebuilt_remember_enabled() -> bool {
     })
 }
 
+/// Whether `PYRE_RERAISE_DIAG` asks `RERAISE` to describe an operand that is
+/// not an exception before it raises the `TypeError`.
+///
+/// Read once: the check sits on the raise path, which is cold, but the flag is
+/// also consulted from a `OnceLock` for the same reason as
+/// [`interp_return_log_enabled`] — a `getenv` scans the environment array under
+/// a lock.
+#[cfg(not(feature = "sandbox"))]
+fn reraise_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_RERAISE_DIAG").is_some())
+}
+
+#[cfg(feature = "sandbox")]
+fn reraise_diag_enabled() -> bool {
+    false
+}
+
+/// Describe a `RERAISE` operand that failed the `W_BaseException` check.
+///
+/// The operand is whatever `PUSH_EXC_INFO` pushed, and the compiler emits the
+/// pair together, so a non-exception here means the frame's value-stack slot
+/// was corrupted in between — never a program error. Report enough to tell the
+/// two shapes apart: a NULL slot (a live slot that was cleared) versus a live
+/// pointer whose object is no longer an exception (a stale or swept address).
+fn reraise_bad_operand_diag(
+    w_exc: PyObjectRef,
+    oparg: u32,
+    code_name: &str,
+    depth: usize,
+    below: &[PyObjectRef],
+) {
+    let describe = |v: PyObjectRef| -> String {
+        if v.is_null() {
+            return "NULL".to_string();
+        }
+        let ob_type = unsafe { (*v).ob_type };
+        let name = if ob_type.is_null() {
+            "<null ob_type>"
+        } else {
+            unsafe { (*ob_type).name }
+        };
+        let is_exc = unsafe { pyre_object::is_exception(v) };
+        format!(
+            "0x{:x}:{name}{}",
+            v as usize,
+            if is_exc { "(EXC)" } else { "" }
+        )
+    };
+    let operand = if w_exc.is_null() {
+        "NULL".to_string()
+    } else {
+        let addr = w_exc as usize;
+        let owned = pyre_object::gc_hook::try_gc_owns_object(w_exc as *mut u8);
+        let words: Vec<String> = (0..4)
+            .map(|i| {
+                format!("0x{:x}", unsafe {
+                    *((addr + i * std::mem::size_of::<usize>()) as *const usize)
+                })
+            })
+            .collect();
+        format!(
+            "{} gc_owned={owned} words=[{}]",
+            describe(w_exc),
+            words.join(", ")
+        )
+    };
+    let stack: Vec<String> = below.iter().map(|&v| describe(v)).collect();
+    // Through the seam, not `eprintln!`: under sandbox the interpreter reaches
+    // fd 2 only via `ops::write`, and the compile-out fence rejects a direct
+    // `std::io::_eprint` here.
+    crate::host_seam::emit_stderr(
+        format!(
+            "[reraise] code={code_name} oparg={oparg} depth={depth} operand={operand} \
+             below=[{}]\n",
+            stack.join(", ")
+        )
+        .as_bytes(),
+    );
+}
+
 pub fn capture_pyframe_root_area() -> *const () {
     PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
 }
@@ -734,6 +815,8 @@ pub unsafe fn walk_pyframe_roots_area(
             let current_gen_slot =
                 unsafe { &mut (*ec).current_gen_or_coroutine as *mut PyObjectRef };
             visitor(unsafe { &mut *(current_gen_slot as *mut majit_ir::GcRef) });
+            let contextvar_slot = unsafe { &mut (*ec).contextvar_context as *mut PyObjectRef };
+            visitor(unsafe { &mut *(contextvar_slot as *mut majit_ir::GcRef) });
             for hook in unsafe {
                 [
                     &mut (*ec).w_asyncgen_firstiter_fn as *mut PyObjectRef,
@@ -917,7 +1000,11 @@ pub unsafe fn walk_pyframe_roots_area(
                     (std::ptr::null_mut::<PyObjectRef>(), 0, next_frame)
                 } else {
                     let arr = &*f.locals_cells_stack_w;
-                    (arr.items_ptr() as *mut PyObjectRef, arr.len(), next_frame)
+                    (
+                        arr.items_ptr() as *mut PyObjectRef,
+                        f.valuestackdepth.min(arr.len()),
+                        next_frame,
+                    )
                 }
             };
             if !arr_ptr.is_null() && depth > 0 {
@@ -1186,7 +1273,10 @@ pub fn walk_suspended_generator_frame(
         if !(*frame).locals_cells_stack_w.is_null() {
             let arr = &*(*frame).locals_cells_stack_w;
             let base = arr.items_ptr() as *mut PyObjectRef;
-            let len = arr.len();
+            // Locals/cells occupy the fixed prefix and
+            // `valuestackdepth` extends it through the live operand stack.
+            // Slots above it are popped capacity, not GC roots.
+            let len = (*frame).valuestackdepth.min(arr.len());
             for i in 0..len {
                 visitor(&mut *(base.add(i) as *mut majit_ir::GcRef));
             }
@@ -2099,7 +2189,7 @@ impl LocalOpcodeHandler for PyFrame {
     fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
         // STORE_FAST always writes directly to the slot.
         // Cell content updates use STORE_DEREF, not STORE_FAST.
-        self.locals_w_mut()[idx] = value;
+        self.set_locals_w(idx, value);
         Ok(())
     }
 }
@@ -2260,11 +2350,19 @@ impl NamespaceOpcodeHandler for PyFrame {
                     && pyre_object::dictmultiobject::is_module_dict(w_globals)
             }
         };
+        // `pyopcode.py:979` reads the builtins through the METHOD
+        // `self.get_builtin()`, not the `builtin` field.  Under the default
+        // `honor__builtins__=False` that method answers `space.builtin` and
+        // never consults the frame at all (`pyframe.py:199-203`), so the field
+        // being unset must not be observable here.  Reading the raw field made
+        // the builtins leg silently find nothing on any frame with a null
+        // `w_builtin`, raising `NameError` for a builtin that plainly exists.
+        let w_builtin = self.get_builtin();
         if use_cache {
             let cache_hit: Option<PyObjectRef> = unsafe {
                 load_global_via_cache(
                     w_globals,
-                    self.w_builtin,
+                    w_builtin,
                     name,
                     self.pycode as PyObjectRef,
                     nameindex,
@@ -2273,8 +2371,8 @@ impl NamespaceOpcodeHandler for PyFrame {
             if let Some(value) = cache_hit {
                 return Ok(value);
             }
-        } else if !self.w_builtin.is_null() && unsafe { pyre_object::is_module(self.w_builtin) } {
-            let w_dict = unsafe { pyre_object::w_module_get_w_dict(self.w_builtin) };
+        } else if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
             if !w_dict.is_null() {
                 if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
                     return Ok(value);
@@ -2300,10 +2398,7 @@ impl StackOpcodeHandler for PyFrame {
         // `<[T]>::swap` method call (the localsplus list carries no class row).
         let top_idx = self.valuestackdepth - 1;
         let other_idx = self.valuestackdepth - depth;
-        let w_top = self.locals_w_mut()[top_idx];
-        let w_other = self.locals_w_mut()[other_idx];
-        self.locals_w_mut()[top_idx] = w_other;
-        self.locals_w_mut()[other_idx] = w_top;
+        self.locals_w_mut().swap(top_idx, other_idx);
         Ok(())
     }
 }
@@ -2364,8 +2459,11 @@ unsafe fn load_global_via_cache(
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
     use pyre_object::celldict::unwrap_cell;
-    use pyre_object::dictmultiobject::{W_ModuleDictObject, w_dict_lock};
-    let _module_guard = w_dict_lock(w_module_dict);
+    use pyre_object::dictmultiobject::{DictOperationGuard, W_ModuleDictObject};
+    let module_guard = DictOperationGuard::new(w_module_dict, &[w_builtin, pycode]);
+    let w_module_dict = module_guard.root(0);
+    let w_builtin = module_guard.root(1);
+    let pycode = module_guard.root(2);
     // Body is a chain of unsafe-fn / raw-ptr ops on caller-supplied
     // PyObjectRefs; SAFETY contract is on the `unsafe fn` signature
     // (caller upholds w_module_dict / pycode / w_builtin validity).
@@ -2478,7 +2576,7 @@ impl IterOpcodeHandler for PyFrame {
             let iter = if pyre_object::is_dict_proxy(iter) {
                 let mapping = pyre_object::w_dict_proxy_get_mapping(iter);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = mapping;
+                self.set_locals_w(tos, mapping);
                 mapping
             } else {
                 iter
@@ -2492,7 +2590,7 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_w_range(iter) {
                 let it = pyre_object::w_range_iter(iter);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = it;
+                self.set_locals_w(tos, it);
                 return Ok(());
             }
             // Already an iterator
@@ -2536,7 +2634,7 @@ impl IterOpcodeHandler for PyFrame {
                 let w_dict = pyre_object::dictmultiobject::w_dict_view_get_dict(iter);
                 let it = pyre_object::dictmultiobject::w_dict_view_iterator_new(w_dict, kind);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = it;
+                self.set_locals_w(tos, it);
                 return Ok(());
             }
             // list → W_FastListIterObject for an exact list; a subclass may override
@@ -2545,12 +2643,12 @@ impl IterOpcodeHandler for PyFrame {
                 if pyre_object::is_exact_list(iter) {
                     let seq_iter = pyre_object::w_list_iter_new(iter);
                     let tos = self.valuestackdepth - 1;
-                    self.locals_w_mut()[tos] = seq_iter;
+                    self.set_locals_w(tos, seq_iter);
                     return Ok(());
                 }
                 let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = result;
+                self.set_locals_w(tos, result);
                 return Ok(());
             }
             // tuple → seq_iter for an exact tuple; a subclass may override
@@ -2559,12 +2657,12 @@ impl IterOpcodeHandler for PyFrame {
                 if pyre_object::is_exact_tuple(iter) {
                     let seq_iter = pyre_object::w_tuple_iter_new(iter);
                     let tos = self.valuestackdepth - 1;
-                    self.locals_w_mut()[tos] = seq_iter;
+                    self.set_locals_w(tos, seq_iter);
                     return Ok(());
                 }
                 let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = result;
+                self.set_locals_w(tos, result);
                 return Ok(());
             }
             // str → list of 1-char strings → seq_iter
@@ -2584,7 +2682,7 @@ impl IterOpcodeHandler for PyFrame {
                 let char_list = pyre_object::w_list_new(chars);
                 let seq_iter = pyre_object::w_seq_iter_new(char_list, len);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = seq_iter;
+                self.set_locals_w(tos, seq_iter);
                 return Ok(());
             }
             // bytes/bytearray → seq_iter cursor over the bytes themselves, so
@@ -2594,7 +2692,7 @@ impl IterOpcodeHandler for PyFrame {
                 let len = pyre_object::bytesobject::bytes_like_len(iter);
                 let seq_iter = pyre_object::w_seq_iter_new(iter, len);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = seq_iter;
+                self.set_locals_w(tos, seq_iter);
                 return Ok(());
             }
             // dict → iterate over keys.
@@ -2611,7 +2709,7 @@ impl IterOpcodeHandler for PyFrame {
                     pyre_object::dictmultiobject::DictViewKind::Keys,
                 );
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = it;
+                self.set_locals_w(tos, it);
                 return Ok(());
             }
             // setobject.py W_BaseSetObject.descr_iter returns a live
@@ -2621,7 +2719,7 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_set_or_frozenset(iter) {
                 let set_iter = pyre_object::w_set_iter_new(iter);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = set_iter;
+                self.set_locals_w(tos, set_iter);
                 return Ok(());
             }
             // array.array → seq_iter cursor (interp_array.py descr_iter
@@ -2630,7 +2728,7 @@ impl IterOpcodeHandler for PyFrame {
                 let len = pyre_object::interp_array::w_array_len(iter);
                 let seq_iter = pyre_object::w_seq_iter_new(iter, len);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = seq_iter;
+                self.set_locals_w(tos, seq_iter);
                 return Ok(());
             }
             // User-defined __iter__ — PyPy: space.iter → __iter__().
@@ -2647,7 +2745,7 @@ impl IterOpcodeHandler for PyFrame {
             {
                 let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = result;
+                self.set_locals_w(tos, result);
                 return Ok(());
             }
             // Type object: metaclass __iter__ (NOT the type's own MRO)
@@ -2668,7 +2766,7 @@ impl IterOpcodeHandler for PyFrame {
                     {
                         let result = crate::call_function(method, &[iter]);
                         let tos = self.valuestackdepth - 1;
-                        self.locals_w_mut()[tos] = result;
+                        self.set_locals_w(tos, result);
                         return Ok(());
                     }
                 }
@@ -3050,8 +3148,15 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn cleanup_throw(&mut self) -> Result<(), PyError> {
         let w_exc = self.pop_value()?;
-        let err = unsafe { PyError::from_exc_object(w_exc) };
+        let mut err = unsafe { PyError::from_exc_object(w_exc) };
         if err.kind != PyErrorKind::StopIteration {
+            // CPython 3.14 `CLEANUP_THROW` installs the existing exception and
+            // jumps straight to `exception_unwind`; unlike the ordinary
+            // opcode-error path it does not prepend another traceback entry.
+            // This is the same explicit-reraise shape as PyPy's
+            // `RaiseWithExplicitTraceback`, represented in pyre by
+            // `attach_tb = false`.
+            err.attach_tb = false;
             return Err(err);
         }
 
@@ -3178,7 +3283,7 @@ impl OpcodeStepExecutor for PyFrame {
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_set(slot, value) };
         } else {
-            self.locals_w_mut()[idx] = value;
+            self.set_locals_w(idx, value);
         }
         Ok(())
     }
@@ -3209,7 +3314,8 @@ impl OpcodeStepExecutor for PyFrame {
     fn make_cell(&mut self, idx: usize) -> Result<(), PyError> {
         let current = self.locals_w()[idx];
         if current.is_null() || !unsafe { pyre_object::is_cell(current) } {
-            self.locals_w_mut()[idx] = pyre_object::w_cell_new(current);
+            let cell = pyre_object::w_cell_new(current);
+            self.set_locals_w(idx, cell);
         }
         Ok(())
     }
@@ -3235,7 +3341,7 @@ impl OpcodeStepExecutor for PyFrame {
         if is_cell {
             unsafe { pyre_object::w_cell_set(slot, PY_NULL) };
         } else {
-            self.locals_w_mut()[idx] = PY_NULL;
+            self.set_locals_w(idx, PY_NULL);
         }
         Ok(())
     }
@@ -3494,7 +3600,7 @@ impl OpcodeStepExecutor for PyFrame {
                 "cannot access local variable '{name}' where it is not associated with a value"
             )));
         }
-        self.locals_w_mut()[idx] = PY_NULL;
+        self.set_locals_w(idx, PY_NULL);
         Ok(())
     }
 
@@ -3683,6 +3789,12 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── Reraise ──
     // `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
+    //
+    // `RERAISE` reads the operand `PUSH_EXC_INFO` left on the value stack, so
+    // this opcode only sees a non-exception when the frame's stack slot itself
+    // went bad between the two. That is unreachable for a correct interpreter,
+    // and the intermittent `test_asyncio` failures reach it — hence the
+    // diagnostic below rather than a bare `TypeError`.
     fn reraise(&mut self, oparg: u32) -> Result<(), PyError> {
         // pyopcode.py:1357-1363
         let reraise_lasti: i32 = if oparg != 0 {
@@ -3695,6 +3807,24 @@ impl OpcodeStepExecutor for PyFrame {
         let w_exc = self.popvalue();
         // pyopcode.py:1367 — w_value = space.interp_w(W_BaseException, w_exc)
         if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
+            if reraise_diag_enabled() {
+                // Snapshot what is left below the popped operand. If the real
+                // exception is sitting one or two slots away, the defect is a
+                // stack-depth miscount; if it is nowhere on the stack, the slot
+                // held a reference the collector reclaimed and reissued.
+                let depth = self.valuestackdepth;
+                let below: Vec<PyObjectRef> = (0..6)
+                    .take_while(|i| *i < depth)
+                    .map(|i| self.peekvalue_maybe_none(i))
+                    .collect();
+                let code_ptr = unsafe { crate::pyframe::pyframe_get_pycode(self) };
+                let code_name = if code_ptr.is_null() {
+                    "?"
+                } else {
+                    unsafe { (*code_ptr).obj_name.as_str() }
+                };
+                reraise_bad_operand_diag(w_exc, oparg, code_name, depth, &below);
+            }
             return Err(PyError::type_error(
                 "exception must derive from BaseException",
             ));
@@ -3761,10 +3891,11 @@ impl OpcodeStepExecutor for PyFrame {
                             return Ok(());
                         }
                     }
-                    if !self.w_builtin.is_null()
-                        && unsafe { pyre_object::is_module(self.w_builtin) }
-                    {
-                        let w_dict = unsafe { pyre_object::w_module_get_w_dict(self.w_builtin) };
+                    // `self.get_builtin()`, not the `builtin` field — see
+                    // `load_global_value`.
+                    let w_builtin = self.get_builtin();
+                    if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+                        let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
                         if !w_dict.is_null() {
                             if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
                                 self.push(value);
@@ -3840,7 +3971,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_fast_and_clear(&mut self, idx: usize) -> Result<(), PyError> {
         let val = self.locals_w()[idx];
         self.push(val);
-        self.locals_w_mut()[idx] = PY_NULL;
+        self.set_locals_w(idx, PY_NULL);
         Ok(())
     }
 

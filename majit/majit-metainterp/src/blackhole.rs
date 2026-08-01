@@ -252,6 +252,13 @@ pub struct BlackholeInterpreter {
     /// PC, not the next instruction PC. Public so caller-chain propagation in
     /// call_jit.rs can set it to the suspended caller's position.
     pub last_opcode_position: usize,
+    /// Position this frame was last seeded at by `setposition`.
+    ///
+    /// Diagnostic-only: an opcode that reads a register nobody wrote is
+    /// either a resume that landed here without restoring it or a forward
+    /// run whose producing opcode misbehaved, and only the seed coordinate
+    /// separates the two.
+    pub entry_position: usize,
     /// blackhole.py:391 exception_last_value: the caught exception object.
     /// Set when handle_exception_in_frame finds a handler.
     /// Read by CheckExcMatch and other exception opcodes in the handler.
@@ -404,6 +411,7 @@ impl Default for BlackholeInterpreter {
             aborted: false,
             got_exception: false,
             last_opcode_position: 0,
+            entry_position: 0,
             exception_last_value: 0,
             record_caught_exception: None,
             virtualizable_ptr: 0,
@@ -422,6 +430,7 @@ impl BlackholeInterpreter {
         self.aborted = false;
         self.got_exception = false;
         self.last_opcode_position = position;
+        self.entry_position = position;
         self.exception_last_value = 0;
     }
 
@@ -635,6 +644,44 @@ impl BlackholeInterpreter {
         }
     }
 
+    /// `blackhole.py:1102-1132` — the four `bhimpl_recursive_call_{i,r,f,v}`
+    /// share one prologue: resolve the driver's portal runner, then merge
+    /// greens and reds per kind (`greens_i + reds_i`, ...) into the
+    /// `bh_call_*` argument banks.
+    ///
+    /// A zero `fnptr` here would be an indirect call through a null address.
+    /// `get_portal_runner` reports zero for a driver slot whose
+    /// `portal_runner_adr` was never populated, and the recursive-call path is
+    /// not optional, so reaching this point with zero means `jdindex` named the
+    /// wrong slot of `jitdrivers_sd`.  Report the coordinates instead of
+    /// faulting at PC 0.
+    fn portal_runner_call_args(
+        &self,
+        jdindex: usize,
+        greens_i: Vec<i64>,
+        greens_r: Vec<i64>,
+        greens_f: Vec<i64>,
+        reds_i: Vec<i64>,
+        reds_r: Vec<i64>,
+        reds_f: Vec<i64>,
+    ) -> (i64, BhCallDescr, Vec<i64>, Vec<i64>, Vec<i64>) {
+        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
+        assert!(
+            fnptr != 0,
+            "blackhole recursive_call: jitdrivers_sd[{jdindex}] carries no portal \
+             runner ({} driver(s) registered, jitcode={}) — blackhole.py:1095-1099",
+            self.jitdrivers_sd.len(),
+            self.jitcode.name(),
+        );
+        let mut all_i = greens_i;
+        all_i.extend(&reds_i);
+        let mut all_r = greens_r;
+        all_r.extend(&reds_r);
+        let mut all_f = greens_f;
+        all_f.extend(&reds_f);
+        (fnptr, calldescr, all_i, all_r, all_f)
+    }
+
     /// blackhole.py:1109-1116 bhimpl_recursive_call_r:
     ///   fnptr, calldescr = self.get_portal_runner(jdindex)
     ///   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, greens_r+reds_r,
@@ -649,14 +696,10 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) -> majit_ir::GcRef {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
         // blackhole.py:1113-1116: greens + reds merged per kind.
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
     }
@@ -874,7 +917,9 @@ impl BlackholeInterpreter {
         // (it may be caught by a catch_operation in this frame)
         if current_exc != 0 {
             if !self.handle_exception_in_frame(current_exc) {
-                // No handler: propagate
+                // No handler: propagate.  The exception leaves this frame here,
+                // so record its node — see [`Self::record_frame_traceback`].
+                self.record_frame_traceback(current_exc);
                 if self.nextblackholeinterp.is_none() {
                     return Err(self.exit_frame_with_exception(current_exc));
                 }
@@ -900,6 +945,9 @@ impl BlackholeInterpreter {
         // Check for exception during execution
         if self.got_exception {
             let exc = self.exception_last_value;
+            // `run` reached the end of the frame with an uncaught exception, so
+            // the frame is left here — see [`Self::record_frame_traceback`].
+            self.record_frame_traceback(exc);
             if self.nextblackholeinterp.is_none() {
                 // blackhole.py:1629
                 return Err(self.exit_frame_with_exception(exc));
@@ -1105,6 +1153,27 @@ impl BlackholeInterpreter {
         //   elif result_type == 'r': bhimpl_recursive_call_r + ref_return
         //   elif result_type == 'f': bhimpl_recursive_call_f + float_return
         //   assert False
+        // The jdindex operand names a jitdriver, and only this recursive-portal
+        // level indexes the table with it — the bottommost level above raises
+        // `ContinueRunningNormally` without ever reading it.  A value out of
+        // range here is a decode fault, not a missing driver: either this frame
+        // resumed at a position that is not a merge point, or a `setarg_i` wrote
+        // past `num_regs_i` and overwrote the constant slot the operand reads.
+        // Report both coordinates instead of an anonymous bounds panic.
+        assert!(
+            jdindex < self.jitdrivers_sd.len(),
+            "blackhole jit_merge_point decoded jdindex={jdindex} but only {} jitdriver(s) exist \
+             (jitcode={} c_form={} jdindex_byte={jdindex_byte} num_regs_i={} registers_i.len={} \
+             position={} last_opcode_position={} entry_position={})",
+            self.jitdrivers_sd.len(),
+            self.jitcode.name(),
+            opcode == jitcode::insns::BC_JIT_MERGE_POINT_C,
+            self.jitcode.num_regs_i(),
+            self.registers_i.len(),
+            self.position,
+            self.last_opcode_position,
+            self.entry_position,
+        );
         let result_type = self.jitdrivers_sd[jdindex].result_type;
         match result_type {
             BhReturnType::Void => {
@@ -1235,19 +1304,7 @@ impl BlackholeInterpreter {
         // move (`w_exception_new_empty` allocates in the stable old gen), but
         // old gen is mark-sweep, so an unrooted one is collectable.
         self.exception_last_value = exc_value;
-        // pyopcode.py raise_varargs records the raising instruction before
-        // handler lookup; RaiseWithExplicitTraceback skips it for bare
-        // reraise.
-        if self.jitcode.code[self.last_opcode_position] != jitcode::insns::BC_RERAISE
-            && let Some(record) = self.record_caught_exception
-        {
-            record(
-                exc_value,
-                self.virtualizable_ptr,
-                self.jitcode.try_index().map_or(-1, |index| index as i64),
-                self.last_opcode_position as i64,
-            );
-        }
+        self.record_frame_traceback(exc_value);
         self.position = target;
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // A residual `bh_call` that raised published the exception into BOTH
@@ -1259,6 +1316,54 @@ impl BlackholeInterpreter {
         // Drain the backend cells here so the handler runs with a pristine cell.
         self.cpu().clear_stored_exception();
         true
+    }
+
+    /// `pyopcode.py:147-148 pytraceback.record_application_traceback` for the
+    /// frame this interpreter is leaving with `exc_value` live.
+    ///
+    /// Upstream takes the handler search and the traceback record from one
+    /// `handle_operation_error`, so a frame that raises always gets its node no
+    /// matter which way the search went.  Here the search half is the jitcode
+    /// `catch_exception` scan and the record half has no jitcode counterpart,
+    /// so every arm that ends an exception's stay in this frame has to make the
+    /// call — the caught arm ([`Self::route_to_catch`]) and the two propagate
+    /// arms in [`Self::resume_mainloop`] alike.
+    ///
+    /// `raise_varargs` records the raising instruction before the handler
+    /// lookup; `RaiseWithExplicitTraceback` skips it for a bare reraise. The
+    /// installed hook additionally drops a node the exception's chain head
+    /// already carries, so a second call for one delivery is a no-op.
+    fn record_frame_traceback(&self, exc_value: i64) {
+        if exc_value == 0 {
+            return;
+        }
+        if self.jitcode.code.get(self.last_opcode_position) == Some(&jitcode::insns::BC_RERAISE) {
+            return;
+        }
+        let jitcode_index = self.jitcode.try_index().map_or(-1, |index| index as i32);
+        let position = self.last_opcode_position as i32;
+        match self.record_caught_exception {
+            Some(record) => record(
+                exc_value,
+                self.virtualizable_ptr,
+                i64::from(jitcode_index),
+                i64::from(position),
+            ),
+            // The per-interpreter field is an override a chain builder or a
+            // test installs on the frames it owns.  An interpreter leased
+            // straight from the pool — every one the tracing-abort adoption
+            // drives — has none, and dropping the record there is what left a
+            // frame the blackhole finished out of its own traceback.  The
+            // process-global hook is the same host callback
+            // (`build_jit_driver_pair` installs one function for both) and
+            // no-ops while unset.
+            None => crate::pyjitpl::record_application_traceback_for_recording(
+                exc_value,
+                self.virtualizable_ptr,
+                jitcode_index,
+                position,
+            ),
+        }
     }
 
     /// Locate the `catch_exception` op that belongs to the just-executed
@@ -1819,13 +1924,9 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) -> i64 {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_i(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
     }
@@ -1841,13 +1942,9 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) -> f64 {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_f(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
     }
@@ -1863,13 +1960,9 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_v(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
     }

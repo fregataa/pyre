@@ -504,6 +504,16 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
             // locals/cells/valuestack — keeping both the block and its
             // contents live without sweeping the frame the generator holds.
             f(&mut gen_obj.frame_ptr as *mut *mut u8 as *mut majit_ir::GcRef);
+            // CPython 3.11+ exposes the interpreter frame's live values as
+            // direct coroutine/generator referents while the internal frame
+            // itself is absent from `gc.get_objects()`.  Re-read after the
+            // forwarding visitor and expose the same slots directly from the
+            // owner; the frame's own trace may visit them again for marking.
+            let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+            pyre_interpreter::eval::walk_suspended_generator_frame(
+                gen_obj.frame_ptr as *mut PyFrame,
+                &mut adapter,
+            );
         } else {
             // `std::alloc` fallback frame (no GC hook at generator birth):
             // the block is never swept, so only its contents need
@@ -1053,17 +1063,15 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
             true
         };
         // Stationary `std::alloc` blocks (never entered by
-        // `trace_and_update_object`) and old-gen GC blocks forward the FULL
-        // fixed-length array, not just the live prefix. The old-gen major
-        // walk is idempotent duplicate marking; the minor walk covers
-        // barrier-less interpreter stores. This matches RPython's
-        // phase-agnostic jitframe.py:104 `jitframe_trace`.
-        // This matches `walk_pyframe_roots` (eval.rs:626), which forwards
-        // popped-in-transit argument slots past `valuestackdepth`.
+        // `trace_and_update_object`) and old-gen GC blocks forward the
+        // locals/cells plus the live operand-stack prefix. PyPy clears every
+        // popped list slot to None; using `valuestackdepth` is the equivalent
+        // boundary for pyre's fixed-capacity array and prevents a stale
+        // resume/exception slot from retaining an otherwise-dead object.
         if walk_items {
             let arr = unsafe { &mut *array };
             let base = arr.items_mut_ptr();
-            for i in 0..arr.len() {
+            for i in 0..frame.valuestackdepth.min(arr.len()) {
                 f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
             }
         }
@@ -2031,11 +2039,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_module_tid,
     );
     pytype_to_tid.insert(&pyre_object::MODULE_TYPE as *const _ as usize, w_module_tid);
-    // `pyre-interpreter::pyframe::PyFrame` — execution frame for a
-    // Python code block. NOT an `rclass.OBJECT`-shaped instance
-    // (no `ob_type` header — virtualizable struct laid out for the
-    // JIT virtualize pass), so register with a bare size + trace hook
-    // rather than `object_subclass`.
+    // `pyre-interpreter::pyframe::PyFrame` — PyPy's
+    // `PyFrame(W_Root)`, and therefore an app-level object boundary for
+    // `gc.get_referents`.  Pyre's frame now carries the same `ob_header`
+    // at offset zero; retain the custom trace required by its
+    // virtualizable storage, but register it as an OBJECT subclass.
+    // Registering it as a raw struct makes the referents inspector look
+    // through the frame and incorrectly report every local as a direct
+    // referent of the owning traceback.
     //
     // The trace hook `pyframe_object_custom_trace` forwards exactly
     // the frame-owned GC slots `walk_pyframe_roots` visits per frame.
@@ -2061,11 +2072,24 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // unreachable; `FrameBox::drop` only frees the `std::alloc` snapshot /
     // bootstrap fallback regime.  With no destructor or weakref flag,
     // `type_alloc_is_plain` admits PYFRAME's normal allocation fast paths.
-    let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_custom_trace(
-        std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-        pyframe_object_custom_trace,
-    ));
+    let pyframe_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+            object_tid,
+            pyframe_object_custom_trace,
+        )
+        .hidden_from_app_level_inspector(),
+    );
     debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
+        pyframe_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
+        pyframe_tid,
+    );
     // `W_DictProxyObject` carries a single GC-traceable
     // `w_mapping: PyObjectRef` slot (the wrapped W_DictObject —
     // `pypy/objspace/std/dictproxyobject.py:17 self.w_mapping =
@@ -3659,6 +3683,9 @@ fn install_gc_root_walkers() {
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.
+    // The GC-managed weakref box holds its referent and callback outside any
+    // traced field, so the boxes' inner slots need their own root area.
+    majit_gc::shadow_stack::register_extra_root_walker(weakref_box_inner_root_walker);
 }
 
 fn register_thread_root_areas() {
@@ -3700,10 +3727,6 @@ fn register_thread_root_areas() {
         register(
             signal_handler_root_walker_area,
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
-        );
-        register(
-            weakref_box_inner_root_walker_area,
-            pyre_object::weakref::capture_gc_weakref_box_root_area(),
         );
         register(
             sre_pattern_root_walker_area,
@@ -4411,17 +4434,6 @@ unsafe fn signal_handler_root_walker_area(
             data,
             |slot| visit_pyobject_root(slot, visitor),
         );
-    }
-}
-
-unsafe fn weakref_box_inner_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe {
-        pyre_object::weakref::walk_gc_weakref_box_inner_roots_area(data, |slot| {
-            visit_pyobject_root(slot, visitor);
-        });
     }
 }
 
@@ -5487,6 +5499,15 @@ fn drive_unpack_iterable_trace(
     // shared global build-time pool, so install it before the walk reads the
     // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
+    // The walk below executes each residual concretely, so the raise that ends
+    // the unpack is recorded into the residual-call exception cells. Those are
+    // pyre's per-thread stand-in for `metainterp.last_exc_value`, which
+    // upstream owns per MetaInterp instance and drops with the tracing session
+    // (`pyjitpl.py:2763 execute_raised`). Scope them to this drive; otherwise
+    // the value outlives the walk and the next guard failure reads it as its
+    // own pending raise — a `StopIteration` surfacing at code that raised
+    // nothing.
+    let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         "baseobjspace::_unpackiterable_unknown_length",
@@ -6907,8 +6928,11 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
             // `eval_loop_jit` consumes `ExitFrameWithException` at its
             // `maybe_compile_and_run` site (offers it to the frame's exception
             // table, then re-loops or returns `Done`), so it never surfaces
-            // here; propagate defensively should that invariant change.
-            LoopResult::ExitFrameWithException(err) => return Err(err),
+            // here; make the same offer should that invariant change, rather
+            // than propagating past a handler this frame has.
+            LoopResult::ExitFrameWithException(err) => {
+                return deliver_exit_frame_exception(frame_root.frame(), err);
+            }
             LoopResult::ContinueRunningNormally => {
                 // RPython warmspot.py:976-978: result = portal_ptr(*args).
                 // The blackhole has already written back the merge point
@@ -6929,6 +6953,12 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
 /// into the interpreter loop), otherwise return it for propagation out of the
 /// frame.  The eval loop's own `maybe_compile_and_run` site handles the warm
 /// path inline via `continue` instead of recursing here.
+///
+/// This is not optional bookkeeping: pyre's Python-level handler search is
+/// interpreter machinery, so neither a compiled trace's exception exit nor the
+/// blackhole's `handle_exception_in_frame` (which only knows the jitcode
+/// `catch_exception` a residual helper's own RPython `try` emits) has consulted
+/// it.  Skipping it exits a frame without running its `finally`.
 fn deliver_exit_frame_exception(
     frame: &mut PyFrame,
     mut err: pyre_interpreter::PyError,
@@ -7751,6 +7781,8 @@ fn handle_fail(
         // This is an intentional replacement, unlike ordinary
         // GUARD_NOT_INVALIDATED handling: discard the range trace's target
         // tokens so the next walk compiles the generic FOR_ITER residual.
+        // The `ResumeInBlackhole` below decodes off the exit layout it was
+        // handed, so retiring the entry here cannot starve it of slot types.
         driver.remove_compiled_loop(green_key);
         return HandleFailOutcome::ResumeInBlackhole;
     }
@@ -7938,14 +7970,21 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // `jit_blackhole_resume_from_guard` (call_jit.rs:1855-1881) without the
     // green_key recovery that path needs.
     if let Some(storage) = exit_layout.storage.as_deref() {
-        let deadframe_types = {
-            let (driver, _) = driver_pair();
-            driver.get_recovery_slot_types(
-                exit_layout.rd_loop_token,
-                exit_layout.trace_id,
-                exit_layout.fail_index,
-            )
-        };
+        // The failing guard's own `exit_types`, not a re-lookup of them:
+        // `get_recovery_slot_types` is `exit_types.to_vec()` off a
+        // `(green_key, trace_id, fail_index)` re-resolution of *this*
+        // layout, and that resolution starts at `compiled_loops.get(&
+        // green_key)`, which `handle_fail` may have just emptied
+        // (`remove_compiled_loop` on the range-FOR_ITER demotion) before
+        // returning `ResumeInBlackhole`.  A miss produced `None`, which
+        // disarms both `ResumeDeadframeRoots::register` and the Ref/Int
+        // discrimination in `decode_ref` — an unrooted, mistyped raw word
+        // reaching the resume as a GCREF.  Upstream never retires metadata a
+        // pending resume is about to read: `compile.py:701-717 handle_fail`
+        // and `resume.py:1312 blackhole_from_resumedata` read every slot's
+        // kind out of the self-describing deadframe+descr it was handed.
+        // The sibling resume paths already pass this slice directly
+        // (`jitdriver.rs:493`, `:3772`).
         let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
@@ -7953,7 +7992,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             raw_values,
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
-            deadframe_types.as_deref(),
+            Some(exit_layout.exit_types.as_slice()),
             guard_exc,
             novable,
             all_virtuals,
@@ -8444,7 +8483,32 @@ fn compile_and_run_once(
                 return Some(LoopResult::Done(Ok(result)));
             }
             Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-                return Some(LoopResult::Done(Err(finish_concrete_raise_error(cv))));
+                // warmspot.py:998-1005 — the walk (or the blackhole that
+                // finished it) left the frame with this exception, so the
+                // interpreter owes it the frame's exception table before
+                // propagating: pyre's Python-level handler search is
+                // interpreter machinery, not jitcode, and the blackhole's
+                // `handle_exception_in_frame` scan only knows the jitcode
+                // `catch_exception` a residual helper's own RPython try
+                // emits.  Without this a `try`/`finally` whose body escaped
+                // through the blackhole exits without running its `finally`.
+                let mut err = finish_concrete_raise_error(cv);
+                // This frame's traceback node is already on the chain: the
+                // walk's own uncaught-raise arm records it
+                // (`record_top_level_application_traceback`) and a blackhole
+                // that finished the frame records it on the way out
+                // (`record_frame_traceback`).  `attach_tb` is exactly the flag
+                // that says so — `pyopcode.py:91-94` routes
+                // `RaiseWithExplicitTraceback` through the `attach_tb=False`
+                // branch for the same reason — so the delivery below runs the
+                // handler search without adding a second node.
+                // `handle_exception` restores the flag once this frame's
+                // decision is made, so an outer frame still records its own.
+                // The flag belongs here and not in `finish_concrete_raise_error`:
+                // its other caller is the bridge-walk raise, whose frame has no
+                // node yet.
+                err.attach_tb = false;
+                return Some(LoopResult::ExitFrameWithException(err));
             }
             None => {}
         }
@@ -8939,10 +9003,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         &env,
     ) {
         Some(LoopResult::Done(result)) => Some(result),
-        // `compile_and_run_once` resolves a compiled-code exception exit inside
-        // `handle_jit_outcome` (offering it to the frame's exception table), so
-        // it never surfaces `ExitFrameWithException` here; propagate defensively.
-        Some(LoopResult::ExitFrameWithException(err)) => Some(Err(err)),
+        // warmspot.py:998-1005: a walk that ended in an uncaught raise, or a
+        // compiled-code exception exit `handle_jit_outcome` surfaced, is offered
+        // to this frame's exception table before it propagates — the same
+        // delivery the eval loop's `maybe_compile_and_run` site performs.
+        Some(LoopResult::ExitFrameWithException(err)) => {
+            Some(deliver_exit_frame_exception(frame_root.frame(), err))
+        }
         Some(LoopResult::ContinueRunningNormally) => {
             // warmspot.py:976-978 portal re-entry.  Marker mode completed the
             // synchronous walk; continue from the adopted/restart state.

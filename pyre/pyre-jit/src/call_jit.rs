@@ -477,6 +477,18 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
 /// walkers (`walk_bh_last_exception`, `walk_jit_exc_value`), so this writer
 /// needs no rooting of its own.
 fn publish_residual_call_exception(exc_obj: i64) {
+    // Every residual raise enters the two exception channels here, so this is
+    // the one place that can hold the line on what they may carry — and the
+    // one place where the producer is still on the stack.  Both consumers
+    // (`GUARD_NO_EXCEPTION` in compiled code, `_exit_frame_with_exception` in
+    // the blackhole) end up reading the value's `ExcKind` tag through a match
+    // with no wildcard arm; see `exit_frame_exception_ref`.
+    let obj = exc_obj as PyObjectRef;
+    if !obj.is_null()
+        && unsafe { pyre_object::interp_exceptions::w_exception_kind_checked(obj) }.is_none()
+    {
+        reject_non_exception_channel_value(obj, "publish_residual_call_exception", String::new);
+    }
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
     store_jit_exception(exc_obj);
 }
@@ -555,6 +567,50 @@ fn unpark_residual_call_exception(parked: ParkedResidualException) {
     }
     if parked.backend_pinned {
         store_jit_exception(pyre_object::gc_roots::shadow_stack_get(index) as i64);
+    }
+}
+
+/// [`park_residual_call_exception`] as an RAII scope, for a region with more
+/// than one exit.
+///
+/// A whole tracing session needs this for the same reason a single residual
+/// call does. `pyjitpl.py:2763 execute_raised` records a residual's raise into
+/// `metainterp.last_exc_value` — an instance field, so upstream's dies with the
+/// MetaInterp that owned the session. Pyre's stand-in is one cell per thread,
+/// so a session that ends with a raise still recorded (a walk that executes
+/// residuals concretely ends on the loop-exit `StopIteration`) leaves that
+/// value visible to whatever runs next, and the next guard failure's blackhole
+/// resume reads it as its own pending raise.
+///
+/// Declare the guard before anything else in the scope so it drops last, after
+/// every inner [`pyre_object::gc_roots::RootScope`] has unwound and the shadow
+/// stack is back to the depth [`park_residual_call_exception`] recorded.
+pub(crate) struct ResidualExceptionScope {
+    parked: Option<ParkedResidualException>,
+    dbg: bool,
+}
+
+impl ResidualExceptionScope {
+    pub(crate) fn park(dbg: bool) -> Self {
+        Self {
+            parked: Some(park_residual_call_exception()),
+            dbg,
+        }
+    }
+}
+
+impl Drop for ResidualExceptionScope {
+    fn drop(&mut self) {
+        if self.dbg {
+            let bh = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+            let backend = crate::eval::jit_exc_value_peek_backend();
+            if bh != 0 || backend != 0 {
+                eprintln!("[residual-exc-scope] discarding bh={bh:#x} backend={backend:#x}");
+            }
+        }
+        if let Some(parked) = self.parked.take() {
+            unpark_residual_call_exception(parked);
+        }
     }
 }
 
@@ -1793,7 +1849,14 @@ fn jit_blackhole_resume_from_guard(
     // compile.py:853 guard-owned `ResumeGuardDescr` storage — share the
     // pool through `Arc<ResumeStorage>` so blackhole resume reads the
     // same `rd_consts` the GC root walker updates. No owned-Vec copy.
-    if let Some(storage) = driver.get_resume_storage(actual_green_key, trace_id, fail_index) {
+    // resume.py parity: deadframe_types tells decode_ref() whether a TAGBOX
+    // slot holds a raw int (needs boxing) or a GcRef (use as-is). Without it,
+    // unboxed ints are treated as pointers → SIGSEGV. Both come out of one
+    // layout resolution so the storage and the types cannot describe
+    // different deadframes.
+    if let Some((storage, deadframe_types)) =
+        driver.get_resume_storage_with_slot_types(actual_green_key, trace_id, fail_index)
+    {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
@@ -1802,11 +1865,6 @@ fn jit_blackhole_resume_from_guard(
                 raw_deadframe.len(),
             );
         }
-        // resume.py parity: deadframe_types tells decode_ref() whether a
-        // TAGBOX slot holds a raw int (needs boxing) or a GcRef (use as-is).
-        // Without this, unboxed ints are treated as pointers → SIGSEGV.
-        let deadframe_types =
-            driver.get_recovery_slot_types(actual_green_key, trace_id, fail_index);
         // resume.py:922 storage.rd_consts: the decoder borrows the shared
         // pool; TAGCONST Ref entries stay visible to `walk_rd_consts_refs`.
         // resume.py:924 _prepare_pendingfields(storage.rd_pendingfields):
@@ -1841,7 +1899,7 @@ fn jit_blackhole_resume_from_guard(
             raw_deadframe,
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
-            deadframe_types.as_deref(),
+            Some(deadframe_types.as_slice()),
             guard_exc,
             false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
             all_virtuals,
@@ -2007,6 +2065,82 @@ impl Drop for BareRefRoot {
             pyre_object::gc_hook::try_gc_remove_root(slot);
         }
     }
+}
+
+/// `blackhole.py:1679-1682 _exit_frame_with_exception`:
+///
+/// ```python
+/// e = cast_opaque_ptr(GCREF, e)
+/// raise ExitFrameWithExceptionRef(e)
+/// ```
+///
+/// Upstream hands the value on as an opaque GCREF and every later
+/// classification runs through a real class lookup.  Pyre instead reads a
+/// `#[repr(u8)]` `ExcKind` tag out of the object and feeds it to
+/// `kind_from_exc`, a wildcard-free match the compiler may lower to a
+/// bounds-check-free jump table — so a word that is not a `W_BaseException`
+/// becomes an indirect branch to an address derived from whatever byte sits
+/// at the tag offset.  `w_exception_kind_checked` restores the class check in
+/// front of that read; a value that fails it names itself here instead.
+fn exit_frame_exception_ref(
+    exc_value: i64,
+    site: &str,
+    context: impl FnOnce() -> String,
+) -> pyre_interpreter::PyError {
+    let obj = exc_value as PyObjectRef;
+    if unsafe { pyre_object::interp_exceptions::w_exception_kind_checked(obj) }.is_some() {
+        return unsafe { pyre_interpreter::PyError::from_exc_object(obj) };
+    }
+    if obj.is_null() {
+        return pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::RuntimeError,
+            "blackhole exception (null exc_value)",
+        );
+    }
+    reject_non_exception_channel_value(obj, site, context)
+}
+
+/// Report a value that reached an exception channel without being a
+/// `W_BaseException`, and abort.
+///
+/// Never returns: the caller is about to classify the value by its `ExcKind`
+/// tag, and there is no correct classification for a value that has no tag.
+fn reject_non_exception_channel_value(
+    obj: PyObjectRef,
+    site: &str,
+    context: impl FnOnce() -> String,
+) -> ! {
+    let tag = unsafe { pyre_object::interp_exceptions::w_exception_kind_byte(obj) };
+    // Report the raw header before touching anything reached *through* it: if
+    // `ob_type` is itself garbage the name lookup below faults, and then this
+    // line is all the evidence there is.
+    let words = unsafe { std::slice::from_raw_parts(obj as *const u64, 4) };
+    eprintln!(
+        "[jit][BUG] {site}: not a W_BaseException: obj={obj:p} tag_byte={tag} \
+         words=[{:#018x} {:#018x} {:#018x} {:#018x}]",
+        words[0], words[1], words[2], words[3],
+    );
+    // Second line, and only now: the context may probe words of unproven
+    // provenance, so the header above must already be out.
+    eprintln!("[jit][BUG] {site}: context: {}", context());
+    // `words[0]` is `ob_type` and `words[1]` is `w_class`; only read through
+    // either when the pointer has the shape of one.  `ob_type` names the
+    // built-in layout ("object" for every instance of a Python class), so the
+    // `w_class` name is the one that identifies the value.
+    let type_name = if words[0] != 0 && words[0].is_multiple_of(8) {
+        unsafe { pyre_object::pyobject::type_name_of(obj) }
+    } else {
+        "<unreadable>"
+    };
+    let class_name = if words[1] != 0 && words[1].is_multiple_of(8) {
+        unsafe { pyre_object::w_type_get_name(words[1] as PyObjectRef).to_string() }
+    } else {
+        "<none>".to_string()
+    };
+    panic!(
+        "{site}: exception channel value is not a W_BaseException \
+         (obj={obj:p} tag_byte={tag} type={type_name} class={class_name})"
+    );
 }
 
 /// resume.py:1312 blackhole_from_resumedata parity:
@@ -2385,11 +2519,11 @@ pub fn blackhole_resume_via_rd_numb(
                 None => {
                     // blackhole.py:1629 bottommost frame, unhandled →
                     // raise ExitFrameWithExceptionRef(exc).
-                    let err = unsafe {
-                        pyre_interpreter::PyError::from_exc_object(
-                            guard_exc as pyre_object::PyObjectRef,
+                    let err = exit_frame_exception_ref(guard_exc, "guard_exc propagation", || {
+                        format!(
+                            "jitcode={jitcode_index:?} last_opcode_position={last_opcode_position}"
                         )
-                    };
+                    });
                     if !frame_ptr.is_null() {
                         let last_instruction = jitcode_index
                             .and_then(|index| {
@@ -2510,16 +2644,47 @@ pub fn blackhole_resume_via_rd_numb(
             return BlackholeResult::Failed;
         }
         if bh.got_exception {
+            // `run()` brackets `exception_last_value` with `push_bh_regs` and
+            // pops that bracket on return, so from here the propagating
+            // exception lives only in a Rust local — and this block
+            // allocates: `record_application_traceback` builds a traceback
+            // node, and so does the caller's `handle_exception_in_frame` →
+            // `route_to_catch`.  Exception objects do not move
+            // (`w_exception_new_empty` uses the stable old gen) but old gen is
+            // mark-sweep, so an unrooted one in that window is collectable and
+            // its block reusable — which is what hands
+            // `exit_frame_exception_ref` a mapped object of the wrong class.
+            // `blackhole.py:1752 _run_forever` keeps every interp in the chain
+            // — and with it `exception_last_value` — transitively traced for
+            // its whole life; root the value across the equivalent window.
+            let _exc_roots = pyre_object::gc_roots::push_roots();
+            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(bh.exception_last_value as PyObjectRef);
             let exc_value = bh.exception_last_value;
             let next = bh.nextblackholeinterp.take();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
-            let bare_reraise = bh
+            let bh_entry_position = bh.entry_position;
+            let bh_opcode_at = bh.jitcode.code.get(last_opcode_position).copied();
+            let bh_jitcode_name = bh.jitcode.name().to_string();
+            // For `BC_RAISE` (`raise/r`) the following byte is the register the
+            // exception was read out of, so record which slot of which bank
+            // produced the value.
+            let bh_raise_reg = bh.jitcode.code.get(last_opcode_position + 1).copied();
+            let bh_regs_r_len = bh.registers_r.len();
+            // A copy, not a probe: a ref register may hold a raw non-object
+            // word (a force token, an erased unboxed buffer), so anything that
+            // dereferences these belongs on the failure path only.
+            let bh_regs_r = bh.registers_r.clone();
+            let bh_code_window: Vec<u8> = bh
                 .jitcode
                 .code
-                .get(last_opcode_position)
-                .is_some_and(|opcode| *opcode == majit_metainterp::jitcode::insns::BC_RERAISE)
+                .get(last_opcode_position.saturating_sub(10)..=last_opcode_position + 1)
+                .unwrap_or(&[])
+                .to_vec();
+            let bare_reraise = bh_opcode_at
+                .is_some_and(|opcode| opcode == majit_metainterp::jitcode::insns::BC_RERAISE)
                 || jitcode_index.is_some_and(|index| {
                     pyre_jit_trace::state::jitcode_pc_is_bare_reraise(
                         index,
@@ -2550,22 +2715,39 @@ pub fn blackhole_resume_via_rd_numb(
                 }
             }
             release_bh_rd(bh);
+            // Re-read through the pin: the records above are allocation
+            // points, so the pinned slot — not the stale local — is the live
+            // value from here on.
+            let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
             let Some(mut caller_bh) = next.map(|b| *b) else {
-                // blackhole.py:1679-1682 _exit_frame_with_exception:
-                //   e = cast_opaque_ptr(GCREF, e)
-                //   raise ExitFrameWithExceptionRef(e)
-                let err = if exc_value != 0 {
-                    unsafe {
-                        pyre_interpreter::PyError::from_exc_object(
-                            exc_value as pyre_object::PyObjectRef,
+                let err =
+                    exit_frame_exception_ref(exc_value, "blackhole exception propagation", || {
+                        format!(
+                            "jitcode={jitcode_index:?} name={bh_jitcode_name} \
+                             entry_position={bh_entry_position} \
+                             last_opcode_position={last_opcode_position} opcode={:?} \
+                             operand_reg={bh_raise_reg:?} registers_r.len={bh_regs_r_len} \
+                             regs_holding_exception={:?} \
+                             code[-10..]={bh_code_window:?} bare_reraise={bare_reraise}",
+                            bh_opcode_at,
+                            // Which ref registers hold a real
+                            // `W_BaseException`: a hit in a slot other than
+                            // `operand_reg` means the operand index is wrong,
+                            // no hit anywhere means the bank never received
+                            // the exception.
+                            bh_regs_r
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, v)| unsafe {
+                                    pyre_object::interp_exceptions::w_exception_kind_checked(
+                                        **v as PyObjectRef,
+                                    )
+                                    .is_some()
+                                })
+                                .map(|(i, _)| i)
+                                .collect::<Vec<_>>(),
                         )
-                    }
-                } else {
-                    pyre_interpreter::PyError::new(
-                        pyre_interpreter::PyErrorKind::RuntimeError,
-                        "blackhole exception (null exc_value)",
-                    )
-                };
+                    });
                 // `attach_tb` deliberately stays true on the way out.  It
                 // suppresses the traceback record of the re-raising frame
                 // only, and this frame's decision was already applied above by
@@ -2588,7 +2770,10 @@ pub fn blackhole_resume_via_rd_numb(
                 bh = caller_bh;
                 continue;
             }
-            caller_bh.exception_last_value = exc_value;
+            // `handle_exception_in_frame` records a traceback node on the way
+            // through, so take the pinned value again for the store.
+            caller_bh.exception_last_value =
+                pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
             caller_bh.got_exception = true;
             bh = caller_bh;
             continue;
@@ -4572,6 +4757,12 @@ bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 /// walks the caller chain, so the parent frame is resolved here from the
 /// execution context's top frame (`space.getexecutioncontext()
 /// .gettopframe()`), matching the upstream frame-less ABI.
+/// Whether the `PYRE_BH_NULL_ARG` residual-argument diagnostic is armed.
+fn bh_null_arg_diag() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var_os("PYRE_BH_NULL_ARG").is_some())
+}
+
 fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     // RPython's blackhole residual-call thunk is itself translated, so its
     // incoming GCREF arguments are shadowstack roots for the whole helper
@@ -4625,6 +4816,37 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         );
         publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
+    }
+    // Diagnostic (`PYRE_BH_NULL_ARG`): only `null_or_self` carries a checked
+    // `PY_NULL` sentinel here (`walker_abort_if_mayforce_null_ref_arg` exempts
+    // exactly that index).  A NULL in a real argument slot means the operand
+    // stack the blackhole read was never published, so the callee dereferences
+    // it — report the Python coordinate before that happens instead of leaving
+    // a SIGSEGV inside the callee as the only evidence.
+    if bh_null_arg_diag() {
+        for i in 0..args.len() {
+            if pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i).is_null() {
+                let frame = unsafe { &*parent_frame_ptr };
+                // A NULL here with a live fastlocal is an unbound blackhole
+                // register (the resume never seeded the slot); a NULL fastlocal
+                // means the frame itself lost the binding.
+                let locals_w = frame.locals_w();
+                let shown = locals_w.len().min(8);
+                let locals: Vec<Option<usize>> = (0..shown)
+                    .map(|i| {
+                        let v = locals_w[i];
+                        (!v.is_null()).then_some(v as usize)
+                    })
+                    .collect();
+                eprintln!(
+                    "[bh-null-arg] arg[{i}]/{} NULL vsd={} base={} locals={locals:?} at {}",
+                    args.len(),
+                    frame.valuestackdepth,
+                    frame.stack_base(),
+                    frame.descr_repr(),
+                );
+            }
+        }
     }
     // llmodel.py:822 bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
     // Hot path: Function callables dispatched directly here (builtin or user
@@ -4942,6 +5164,28 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
             Err(mut err) => {
                 publish_residual_call_exception(err.to_exc_object() as i64);
                 return 0;
+            }
+        }
+    }
+
+    // `load_from_dict_or_globals` (eval.rs) finishes through
+    // `load_global_value`, whose second leg is
+    // `self.get_builtin().getdictvalue(space, varname)` (`pyopcode.py:979`).
+    // This residual stopped after the globals leg, so a builtin name reached
+    // here as a bogus `NameError`.
+    if !parent_frame_ptr.is_null() {
+        let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
+        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            if !w_dict.is_null() {
+                match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
+                    Ok(Some(val)) => return val as i64,
+                    Ok(None) => {}
+                    Err(mut err) => {
+                        publish_residual_call_exception(err.to_exc_object() as i64);
+                        return 0;
+                    }
+                }
             }
         }
     }

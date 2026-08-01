@@ -363,12 +363,28 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         }
     }
 
+    // An `OpRef::None` register is an ABSENT BOX, not an unresolved one: the
+    // walk never defined this color.  `blackhole.py:1711-1730
+    // _copy_data_from_miframe` copies a register only `if box`, so upstream
+    // leaves the blackhole's slot exactly as unset as the MIFrame's, and the
+    // drive cannot read it — every path that reaches this coordinate with the
+    // color live also defines it, or the jitcode would read an undefined
+    // register.  It arrives undefined here because a `-live-` set is the union
+    // over the paths INTO its coordinate, and the walk took one of them.
+    // Declining refused the whole image over a register nothing will read; the
+    // shape it kept on the replay path is a `CALL_FUNCTION_EX` whose escape
+    // fell back to a legacy replay of an already-executed frame.
+    // A color that HAS a box but no recoverable concrete still declines: there
+    // the drive can read it and the walk lost the value.
     for &color in &live.int {
         let color = color as usize;
         if miframe.int_values.get(color).copied().flatten().is_some() {
             continue;
         }
         let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
+            if ctx.registers_i.get(color).copied()?.is_none() {
+                continue;
+            }
             return None;
         };
         *miframe.int_values.get_mut(color)? = Some(value);
@@ -388,6 +404,9 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             // that cannot resolve it.
             _ => {
                 let opref = ctx.registers_r.get(color).copied()?;
+                if opref.is_none() {
+                    continue;
+                }
                 match ctx.trace_ctx.recover_ref_value(opref, 8) {
                     Some(majit_ir::Value::Ref(gc)) => gc.0 as i64,
                     _ => return None,
@@ -402,6 +421,9 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             continue;
         }
         let opref = ctx.registers_f.get(color).copied()?;
+        if opref.is_none() {
+            continue;
+        }
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
             return None;
         };
@@ -1090,11 +1112,14 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
         for &opref in oprefs.iter() {
             match ctx.concrete_of_opref(opref) {
                 Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
-                    let obj = r.as_usize() as pyre_object::PyObjectRef;
-                    if obj.is_null() {
-                        return false;
-                    }
-                    stack.push(obj);
+                    // A recorded concrete NULL is a real operand, not an absent
+                    // one — `NO_CONCRETE` is what "unavailable" looks like.  It
+                    // is the `self_or_null` sentinel `PUSH_NULL` puts under a
+                    // callable, so refusing it made every `CALL` /
+                    // `CALL_FUNCTION_EX` escape fall through to the plain flush,
+                    // which then declines on that same NULL slot and leaves the
+                    // portal replaying the frame from its entry.
+                    stack.push(r.as_usize() as pyre_object::PyObjectRef);
                 }
                 _ => return false,
             }
@@ -2527,10 +2552,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     !ctx.fbw_mode.snapshot_sym.is_null(),
                 );
             }
-            // A top-level one-frame walk whose residual forced the vable and
-            // writes live heap resumes PAST the escaping opcode through the
-            // blackhole instead of falling back to escape/replay. Both the
-            // latch (`writes_live_heap`, odometer unchanged, non-bridge, empty
+            // A top-level one-frame walk whose residual forced the vable
+            // resumes PAST the escaping opcode through the blackhole instead of
+            // falling back to escape/replay. Both the latch (non-bridge, empty
             // framestack, no committed escape pc, resolvable snapshot sym) and
             // the adopt (`try_adopt_single_frame_blackhole` →
             // `apply_single_frame_blackhole_crn`, which validates every mapped
@@ -2538,9 +2562,24 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // decline to the pre-existing path on any unmet condition, so this
             // only ever replaces a replay that would have produced the same
             // state.
-            if writes_live_heap
-                && odometer_unchanged
-                && !ctx.trace_ctx.is_bridge_trace
+            //
+            // Neither `writes_live_heap` nor the odometer gates it.  Both
+            // describe hazards of RE-RUNNING the escaping opcode, which is what
+            // the rewind latch and the legacy replay do; this leg resumes past
+            // the opcode with the residual's result (or its raise) spliced in,
+            // so the residual runs exactly once no matter what it wrote or
+            // whether it entered a Python frame.  `writes_live_heap` is a static
+            // helper-kind list that does not even contain `CallFunctionEx`,
+            // whose callee is arbitrary user code; gating on it left exactly the
+            // frames whose replay is unsound — a re-entry guard plus a
+            // non-idempotent store ahead of the escaping call — on the replay
+            // path.  Upstream has no counterpart to either gate: ABORT_ESCAPE
+            // goes straight to `run_blackhole_interp_to_cancel_tracing`
+            // (`pyjitpl.py:2949` → `blackhole.py convert_and_run_from_pyjitpl`),
+            // which converts the framestack and runs FORWARD, never replays.
+            // The rewind latch stays mutually exclusive with this one through
+            // `committed_frame_escape_pc().is_none()` below.
+            if !ctx.trace_ctx.is_bridge_trace
                 && let Some((resume_pc, result_bank, result_color)) = blackhole_result
                 && !ctx.fbw_mode.snapshot_sym.is_null()
             {
@@ -2646,6 +2685,29 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         )
                     }
                 }
+            }
+            // `pyjitpl.py:3389-3392`: ABORT_ESCAPE is raised with
+            // `raising_exception=True` "because we must still have the eventual
+            // exception raised (this is normally done after the call to
+            // `vable_after_residual_call()`)" — the post-call `execute_raised`
+            // bookkeeping still owes its work even though the walk is over.
+            // Returning here skips the `Err(bh_exc)` arm below, and with it the
+            // half of that bookkeeping that has no upstream counterpart: the
+            // shared `bh_*` helper published this raise into the backend
+            // `_store_exception` cells as well as `BH_LAST_EXC_VALUE`
+            // (`publish_residual_call_exception`), and those cells belong to
+            // compiled / blackhole execution, which RPython tracing never
+            // touches.  A survivor is read by the next compiled trace's
+            // `must_save_exception` guard and delivered as that frame's own
+            // raise — an exception surfacing out of a frame that raised
+            // nothing.  `BH_LAST_EXC_VALUE` stays as `execute_residual_call`
+            // left it (cleared on read): the escape's consumers take the
+            // exception from `exec_result` directly, so restoring it would only
+            // outlive the walk.
+            if exec_result.is_err()
+                && let Some(cb) = crate::callbacks::try_get()
+            {
+                (cb.drain_backend_jit_exc)();
             }
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }

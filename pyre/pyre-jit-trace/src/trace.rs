@@ -2348,6 +2348,11 @@ fn try_adopt_single_frame_blackhole(
             ));
         }
         majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(value) => {
+            publish_terminal_raise_coordinate(
+                jitcode_index,
+                terminal.last_opcode_position,
+                &[cf_addr, forwarded_root_addr],
+            );
             crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
@@ -2696,7 +2701,7 @@ fn try_adopt_multi_frame_blackhole(
     mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
-        terminal: _mf_terminal,
+        terminal: mf_terminal,
     } = majit_metainterp::drive_multi_frame_blackhole(
         &mut mf_builder,
         &mut latched.framestack,
@@ -2809,6 +2814,19 @@ fn try_adopt_multi_frame_blackhole(
             ));
         }
         majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(value) => {
+            // The terminal image is the BOTTOMMOST level, which
+            // `convert_and_run_from_pyjitpl` made the portal frame — i.e. the
+            // one `cf_addr` / `root_addr` represent, the frame the raise is
+            // about to leave.  Same publication as the single-frame arm.
+            if let Some(image) = mf_terminal.as_ref()
+                && let Ok(jitcode_index) = i32::try_from(image.jitcode_index)
+            {
+                publish_terminal_raise_coordinate(
+                    jitcode_index,
+                    image.last_opcode_position,
+                    &[cf_addr, root_addr],
+                );
+            }
             crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
@@ -2823,6 +2841,39 @@ fn try_adopt_multi_frame_blackhole(
         eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
     }
     true
+}
+
+/// Publish the Python coordinate of the op a blackhole frame terminal raised at
+/// into every representation of that frame.
+///
+/// The interpreter takes the raise back from here and looks the frame's
+/// exception table up at `last_instr` (`handle_exception`) — pyre's Python-level
+/// handler search is interpreter machinery, so the blackhole's own
+/// `handle_exception_in_frame` scan (jitcode `catch_exception`, i.e. a residual
+/// helper's RPython `try`) never saw it.  The frame's coordinate is still the
+/// walk's at this point; without the raising op's pc the lookup misses and a
+/// `try`/`finally` around the escaped region does not run.  This is the same
+/// coordinate the terminal's traceback node carries.
+fn publish_terminal_raise_coordinate(
+    jitcode_index: i32,
+    last_opcode_position: usize,
+    frames: &[usize],
+) {
+    let Ok(position) = i32::try_from(last_opcode_position) else {
+        return;
+    };
+    let Some(py_pc) = crate::state::python_pc_for_jitcode_pc_public(jitcode_index, position) else {
+        return;
+    };
+    for &addr in frames {
+        if addr != 0 {
+            // SAFETY: every address here is a live `PyFrame` the adoption just
+            // published its register image into.
+            unsafe {
+                (*(addr as *mut pyre_interpreter::PyFrame)).last_instr = py_pc as isize;
+            }
+        }
+    }
 }
 
 fn try_adopt_blackhole(
