@@ -757,6 +757,10 @@ impl ShortBoxes {
         // `materialize_operand_at(arg)` lookup returns the same key (ptr_eq).
         let arg_res = ctx.materialize_operand_at(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_res.clone()]);
+        // ShortInputArg.preamble_op is the freshly renamed InputArg in
+        // RPython.  `ProducedShortOp` stores an OpRc, so majit uses a
+        // non-emitted SAME_AS stand-in whose result position is that renamed
+        // box; `res` above remains the original label box.
         same_as.pos.set(arg);
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // — keyed by the label-arg Box itself; `arg_res` is its canonical
@@ -1347,8 +1351,7 @@ fn imported_const_opref(
 /// (mod.rs) so the two consume sites cannot drift.
 ///
 /// - Slot: `arg ∈ short_inputargs` (positional) → Phase 2 OpRef from `short_args`
-/// - Const: `arg ∈ short_box_const_values` (producer-snapshotted) or `arg`
-///   has known consumer-side constant value → seed fresh consumer-side slot
+/// - Const: `arg` has a known constant value → seed fresh consumer-side slot
 /// - Produced: `arg ∈ produced_results` (a previously imported producer's source)
 pub(crate) fn classify_short_arg(
     ctx: &mut crate::optimizeopt::OptContext,
@@ -1357,7 +1360,6 @@ pub(crate) fn classify_short_arg(
     short_args: &[OpRef],
     produced_results: &indexmap::IndexMap<OpRef, OpRef>,
     imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
-    short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
 ) -> Option<crate::optimizeopt::ImportedShortPureArg> {
     if let Some(slot) = short_inputargs.iter().position(|i| *i == arg) {
         return short_args
@@ -1365,13 +1367,14 @@ pub(crate) fn classify_short_arg(
             .copied()
             .map(crate::optimizeopt::ImportedShortPureArg::OpRef);
     }
-    // Const lookup priority: producer snapshot first (handles bridges and
-    // unit-test consumer ctxs without pre-seeded const pool), then consumer
-    // ctx (production: pre-seeded at optimizer.rs:1927).
-    if let Some(value) = short_box_const_values.get(&arg).cloned().or_else(|| {
-        ctx.get_box_replacement_operand_opt(arg)
-            .and_then(|cb| cb.const_value())
-    }) {
+    // shortpreamble.py:288-289 `isinstance(op, Const): return op` — the Const
+    // box IS the value carrier. A const `OpRef` holds its value inline
+    // (history.py:227/268/314), so this decode needs no ctx state and answers
+    // the same in a bridge or a unit-test ctx as in the producer's own.
+    if let Some(value) = ctx
+        .get_box_replacement_operand_opt(arg)
+        .and_then(|cb| cb.const_value())
+    {
         let const_opref = imported_const_opref(imported_constants, arg, &value);
         return Some(crate::optimizeopt::ImportedShortPureArg::Const(
             value,
@@ -1421,7 +1424,6 @@ impl ProducedShortOp {
         result_map: &indexmap::IndexMap<OpRef, OpRef>,
         produced_results: &mut indexmap::IndexMap<OpRef, OpRef>,
         imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
-        short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let result = match self.kind {
             PreambleOpKind::Pure => self.produce_pure(
@@ -1431,7 +1433,6 @@ impl ProducedShortOp {
                 result_map,
                 produced_results,
                 imported_constants,
-                short_box_const_values,
             )?,
             PreambleOpKind::Heap => match self.preamble_op.opcode {
                 OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => self
@@ -1444,7 +1445,6 @@ impl ProducedShortOp {
                         result_map,
                         produced_results,
                         imported_constants,
-                        short_box_const_values,
                     )?,
                 OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => self
                     .produce_heap_array_item(
@@ -1456,7 +1456,6 @@ impl ProducedShortOp {
                         result_map,
                         produced_results,
                         imported_constants,
-                        short_box_const_values,
                     )?,
                 _ => return None,
             },
@@ -1467,7 +1466,6 @@ impl ProducedShortOp {
                 result_map,
                 produced_results,
                 imported_constants,
-                short_box_const_values,
             )?,
             // shortpreamble.py:233-234 ShortInputArg.produce_op asserts
             // `not invented_name` and otherwise does nothing; the source pos
@@ -1494,7 +1492,6 @@ impl ProducedShortOp {
         result_map: &indexmap::IndexMap<OpRef, OpRef>,
         produced_results: &mut indexmap::IndexMap<OpRef, OpRef>,
         imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
-        short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         // Result OpRef was fixed before ShortPreambleBuilder construction,
@@ -1557,7 +1554,6 @@ impl ProducedShortOp {
                     short_args,
                     produced_results,
                     imported_constants,
-                    short_box_const_values,
                 )
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1648,7 +1644,6 @@ impl ProducedShortOp {
         result_map: &indexmap::IndexMap<OpRef, OpRef>,
         produced_results: &indexmap::IndexMap<OpRef, OpRef>,
         imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
-        short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -1664,7 +1659,6 @@ impl ProducedShortOp {
             short_args,
             produced_results,
             imported_constants,
-            short_box_const_values,
         )?;
         let obj = match obj_class {
             crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
@@ -1733,11 +1727,10 @@ impl ProducedShortOp {
                 info.set_preamble_field(descr_idx, pop_for_field);
             }
         });
-        // The replay operation owns `result_opref`, but body references
-        // reached through `force_op_from_preamble_op` still name `source`.
-        // Forward `source -> result_opref` once the PtrInfo / const-info side
-        // tables have been seeded, so those reads resolve to the replayed
-        // value instead of re-deriving it on every import.
+        // shortpreamble.py:62-75 keeps `self.res` (the body-visible Box)
+        // distinct from `preamble_op` (the replayed GETFIELD result).  Do not
+        // forward one to the other: `force_op_from_preamble` returns
+        // `PreambleOp.op` and records the replay operation separately.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1766,7 +1759,6 @@ impl ProducedShortOp {
         result_map: &indexmap::IndexMap<OpRef, OpRef>,
         produced_results: &indexmap::IndexMap<OpRef, OpRef>,
         imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
-        short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -1779,7 +1771,6 @@ impl ProducedShortOp {
             short_args,
             produced_results,
             imported_constants,
-            short_box_const_values,
         )?;
         let obj = match obj_class {
             crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
@@ -1788,9 +1779,7 @@ impl ProducedShortOp {
         // shortpreamble.py:81 `g.getarg(1).getint()`: read the integer
         // VALUE of the index Const, not the OpRef raw bits.
         // `OpRef::raw()` returns the trace-namespace tagged u32 — it is
-        // NOT the constant integer.  Resolve via classify_short_arg
-        // which checks the producer snapshot (`short_box_const_values`)
-        // first, then the consumer ctx const pool.
+        // NOT the constant integer.  Resolve via classify_short_arg.
         let index_arg = self.preamble_op.arg(1);
         let index = match classify_short_arg(
             ctx,
@@ -1799,7 +1788,6 @@ impl ProducedShortOp {
             short_args,
             produced_results,
             imported_constants,
-            short_box_const_values,
         )? {
             crate::optimizeopt::ImportedShortPureArg::Const(majit_ir::Value::Int(v), _) => v,
             _ => return None,
@@ -1882,11 +1870,9 @@ impl ProducedShortOp {
                 }
             });
         }
-        // The replay operation owns `result_opref`, but body references
-        // reached through `force_op_from_preamble_op` still name `source`.
-        // Forward `source -> result_opref` once the PtrInfo / const-info side
-        // tables have been seeded, so those reads resolve to the replayed
-        // value instead of re-deriving it on every import.
+        // shortpreamble.py:80-85 has the same two-Box shape as GETFIELD:
+        // the carried body result and replayed GETARRAYITEM result remain
+        // distinct and are joined only by PreambleOp bookkeeping.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1910,7 +1896,6 @@ impl ProducedShortOp {
         result_map: &indexmap::IndexMap<OpRef, OpRef>,
         produced_results: &indexmap::IndexMap<OpRef, OpRef>,
         imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
-        short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -1925,22 +1910,14 @@ impl ProducedShortOp {
             short_args,
             produced_results,
             imported_constants,
-            short_box_const_values,
         )?;
         let func_ptr = match func_arg {
             crate::optimizeopt::ImportedShortPureArg::Const(majit_ir::Value::Int(v), _) => v,
             _ => return None,
         };
-        // Cat-2.2 alignment probe: forward `source -> result_opref` so body
-        // refs after `force_op_from_preamble_op` resolve to the body-visible
-        // OpRef without relying on the use-before-def assembly adaptation.
-        // PyPy `LoopInvariantOp.produce_op` stores `PreambleOp(op=self.res,
-        // preamble_op, invented_name)` in `loop_invariant_results`; self.res
-        // is the canonical body Box. pyre's flat-OpRef analog uses
-        // `result_opref = result_map[source]` as the body-visible slot and
-        // installs the `source -> result_opref` forwarding here so the
-        // consumer at `rewrite.rs:2809` resolves source to result_opref via
-        // get_box_replacement uniformly.
+        // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
+        // and the replay call separately in PreambleOp.  As with HeapOp, the
+        // two identities must not be collapsed.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let op_source = ctx
@@ -3369,6 +3346,67 @@ mod tests {
             op.pos
                 .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
+    }
+
+    /// Direct port of RPython test_short.py::TestShortBoxes::test_pure_ops.
+    #[test]
+    fn test_rpython_pure_ops_contract() {
+        let mut ctx =
+            crate::optimizeopt::OptContext::with_inputarg_types(16, &[Type::Int, Type::Int]);
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let mut add = Op::new(
+            OpCode::IntAdd,
+            &[
+                ctx.materialize_operand_at(i0),
+                ctx.materialize_operand_at(i1),
+            ],
+        );
+        add.pos.set(OpRef::int_op(2));
+
+        let mut sb = ShortBoxes::with_label_args(&[i0, i1]);
+        sb.add_pure_op(&mut ctx, add);
+        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0, i1], &[Type::Int, Type::Int]);
+
+        assert_eq!(short_boxes.len(), 3);
+        let short_inputargs = sb.create_short_inputargs(&[i0, i1]);
+        let pure = short_boxes
+            .iter()
+            .find(|produced| produced.kind == PreambleOpKind::Pure)
+            .expect("reachable IntAdd must be exported");
+        assert_eq!(
+            pure.preamble_op
+                .getarglist()
+                .iter()
+                .map(|arg| arg.to_opref())
+                .collect::<Vec<_>>(),
+            short_inputargs
+        );
+    }
+
+    /// Direct port of
+    /// RPython test_short.py::TestShortBoxes::test_pure_ops_does_not_work.
+    #[test]
+    fn test_rpython_pure_ops_missing_dependency_is_not_exported() {
+        let mut ctx =
+            crate::optimizeopt::OptContext::with_inputarg_types(16, &[Type::Int, Type::Int]);
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let mut add = Op::new(
+            OpCode::IntAdd,
+            &[
+                ctx.materialize_operand_at(i0),
+                ctx.materialize_operand_at(i1),
+            ],
+        );
+        add.pos.set(OpRef::int_op(2));
+
+        let mut sb = ShortBoxes::with_label_args(&[i0]);
+        sb.add_pure_op(&mut ctx, add);
+        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0], &[Type::Int]);
+
+        assert_eq!(short_boxes.len(), 1);
+        assert_eq!(short_boxes[0].kind, PreambleOpKind::InputArg);
     }
 
     #[test]
