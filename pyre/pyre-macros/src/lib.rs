@@ -1256,8 +1256,14 @@ fn expand_pyre_class(
         named.named.insert(0, ob_field);
     }
 
-    // Collect `PyObjectRef` fields' offsets for GC tracing.  Skip `ob`
-    // because the GC walks the header through the parent (object) tid.
+    // Collect `PyObjectRef` fields' offsets for GC tracing.  `ob` is the
+    // `PyObject` header; its `w_class` word is the instance -> class edge
+    // and is listed explicitly.  A `#[pyre_class]` instance created for a
+    // Python subclass carries the (managed) heap type there, and the
+    // collector traces nothing but the offsets registered for the
+    // instance's own type id — a parent tid contributes none — so leaving
+    // it out let the subclass type be swept while instances were live.
+    // `ob_type` stays out: it always points at the `static PyType`.
     let mut ptr_field_idents: Vec<syn::Ident> = Vec::new();
     for f in named.named.iter() {
         let Some(ident) = f.ident.clone() else {
@@ -1270,11 +1276,15 @@ fn expand_pyre_class(
             ptr_field_idents.push(ident);
         }
     }
-    let ptr_offsets_len = ptr_field_idents.len();
-    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> = ptr_field_idents
-        .iter()
-        .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) })
-        .collect();
+    let ptr_offsets_len = ptr_field_idents.len() + 1;
+    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> =
+        std::iter::once(quote! { ::std::mem::offset_of!(#st_name, ob.w_class) })
+            .chain(
+                ptr_field_idents
+                    .iter()
+                    .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) }),
+            )
+            .collect();
 
     Ok(quote! {
         #st
@@ -2063,7 +2073,14 @@ fn expand_pyre_methods(
                             ::std::option::Option::None => false,
                         };
                         if !__pyre_same_tp {
+                            // `ob.w_class` is a traced edge of every
+                            // `#[pyre_class]` layout, and an old-gen payload
+                            // can take a young heap type here, so the store
+                            // joins the remembered set.
                             unsafe { (*__pyre_obj).w_class = __pyre_cls; }
+                            ::pyre_object::gc_hook::try_gc_write_barrier(
+                                __pyre_obj as *mut u8,
+                            );
                         }
                     }
                 }
@@ -2105,6 +2122,16 @@ fn expand_pyre_methods(
             MethodKind::Instance => {
                 registrations.push(quote! {
                     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name, #raw_fn) };
+                });
+            }
+            // `__new__` is the one static entry that is not a `tp_methods`
+            // entry: `add_tp_new_wrapper` stores the carrier itself, so the
+            // namespace holds a `builtin_function_or_method` bound to the
+            // owning type rather than a `staticmethod` around one.
+            MethodKind::Static if py_name == "__new__" => {
+                registrations.push(quote! {
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
+                        crate::typedef::make_new_descr(#wrapper_name)) };
                 });
             }
             MethodKind::Static => {

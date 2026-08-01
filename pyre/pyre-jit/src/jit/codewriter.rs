@@ -5353,6 +5353,21 @@ impl CodeWriter {
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
     pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> Option<PyJitCode> {
+        // Label-space ceiling.  The pre-passes below claim one label per
+        // instruction index (`flatten.py`'s "pre-create labels for each
+        // block") plus one exception-landing label per covered pc, and a
+        // label id is a `u16` because the assembled jump target is a two-byte
+        // operand (`assembler.py:255 assert 0 <= target <= 0xFFFF`).  Upstream
+        // can assert on that ceiling: its jitcodes come from RPython
+        // functions, so a violation is a translation-time bug.  Pyre compiles
+        // arbitrary user bytecode, so the same ceiling has to DECLINE at
+        // runtime and leave the function to the interpreter — the treatment
+        // `JitCodeBuilder::try_finish` already gives the register-count and
+        // code-length ceilings.  Without this a large enough function aborted
+        // the process on `new_label`'s overflow before reaching either.
+        if code.instructions.len().saturating_mul(2) > u16::MAX as usize {
+            return None;
+        }
         // Recover the live globals-stamped PyCode wrapper for `code` from the
         // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
         // per-code wrapper that every compiled code has stamped (during the
@@ -9120,7 +9135,23 @@ impl CodeWriter {
                                 items,
                                 py_pc as i64,
                             );
-                            push_and_bump!(result_value.into(), py_pc);
+                            // Physically write the list into its value-stack slot
+                            // (`pyframe.py:389 pushvalue` → `setarrayitem_vable_r`
+                            // via `jtransform.py:1898 do_fixed_list_setitem`), not
+                            // just bump the symbolic depth.  `LIST_APPEND` reads
+                            // its accumulator back through `getarrayitem_vable_r`
+                            // (see below), and the blackhole runs
+                            // BUILD_LIST→LIST_APPEND from the jitcode on a
+                            // mid-frame resume, so the slot must be populated by
+                            // the emitted op rather than relying on a prior
+                            // interpreter write — the same pairing GET_ITER makes
+                            // for FOR_ITER's iterator reload.  A list display
+                            // longer than 30 elements compiles to `BUILD_LIST 0` +
+                            // repeated `LIST_APPEND`, so without this the append
+                            // receiver is whatever the slot last held.
+                            let pushed: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(pushed.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
                         }
 
                         // pyopcode.py:1463 BUILD_SLICE:

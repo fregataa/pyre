@@ -169,14 +169,26 @@ type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
 static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn> = OnceLock::new();
 
 thread_local! {
-    /// Call depth counter — incremented on every user function call,
-    /// decremented on return. Replaces the Box<dyn Any> depth bump
-    /// callback with a zero-allocation TLS increment.
-    static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Python recursion depth — the number of user Python frames currently
+    /// executing bytecode on this thread.  Bumped once at every `eval_loop` /
+    /// `eval_loop_jit` entry and dropped when that activation returns, so the
+    /// module-level frame, an `exec`ed body and a resumed generator each cost
+    /// one unit exactly like a called function does.  `stack_check()` compares
+    /// it against `sys.getrecursionlimit()`.
+    static PY_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+
+    /// The innermost frame whose activation has already spent its
+    /// [`PY_RECURSION_DEPTH`] unit.  A frame is executed through nested entry
+    /// points — the JIT wrapper may run it as compiled code, hand it to the
+    /// JIT eval loop, or decline and re-enter the plain evaluator for the very
+    /// same frame — and only the outermost of those pays.  Any frame reached
+    /// from here is a different, simultaneously-live frame, so its address
+    /// cannot collide with the one recorded.
+    static ACCOUNTED_ACTIVATION: Cell<usize> = const { Cell::new(0) };
 
     /// Monotonic count of Python frame eval-loop entries — bumped once per
     /// `eval_loop` / `eval_loop_jit` entry (every user-level bytecode frame
-    /// that begins running), NEVER decremented.  Unlike [`CALL_DEPTH`] (net
+    /// that begins running), NEVER decremented.  Unlike [`PY_RECURSION_DEPTH`] (net
     /// zero after a balanced call returns), this is a cumulative odometer, so
     /// a snapshot taken before a residual call and re-read after it reveals
     /// whether ANY user Python frame ran during the call regardless of how
@@ -189,15 +201,16 @@ thread_local! {
     static FRAME_ENTRY_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Get current call depth. Used by pyre-jit for JIT_CALL_DEPTH parity.
+/// Number of user Python frames currently executing bytecode on this thread.
+/// Used by pyre-jit for JIT_CALL_DEPTH parity.
 ///
 /// The counter is runtime-mutable execution-context state.  Like
 /// [`frame_entry_count`], its TLS read has no source-translatable graph and
 /// must remain a residual read rather than exposing `LocalKey::with` to the
 /// annotator.
 #[majit_macros::dont_look_inside]
-pub fn call_depth() -> u32 {
-    CALL_DEPTH.with(|d| d.get())
+pub fn py_recursion_depth() -> u32 {
+    PY_RECURSION_DEPTH.with(|d| d.get())
 }
 
 /// Snapshot of the monotonic Python frame eval-loop entry odometer
@@ -222,20 +235,58 @@ pub fn bump_frame_entry_count() {
     FRAME_ENTRY_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
-/// Increment call depth and return an RAII guard that decrements on drop.
-/// Used by _flat_pycall to match call_user_function's depth tracking.
-#[inline(always)]
-pub fn increment_call_depth() -> CallDepthGuardPublic {
-    CALL_DEPTH.with(|d| d.set(d.get() + 1));
-    CallDepthGuardPublic
+/// Spend one unit of the recursion budget on `frame`'s activation, returning a
+/// guard that gives it back when the activation finishes.  Re-entering for a
+/// frame that is already accounted spends nothing, so a frame costs exactly one
+/// unit whether it runs as compiled code, through the JIT eval loop, or in the
+/// plain evaluator.  `pyframe.py:360` (`execute_frame.insert_stack_check_here`)
+/// puts the matching stack check at the same seam.
+#[inline]
+pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
+    let key = frame as usize;
+    if ACCOUNTED_ACTIVATION.with(|c| c.get()) == key {
+        return RecursionDepthGuard {
+            prev: key,
+            spent: false,
+        };
+    }
+    PY_RECURSION_DEPTH.with(|d| d.set(d.get() + 1));
+    RecursionDepthGuard {
+        prev: ACCOUNTED_ACTIVATION.with(|c| c.replace(key)),
+        spent: true,
+    }
 }
 
-/// RAII guard that decrements CALL_DEPTH on drop.
-pub struct CallDepthGuardPublic;
-impl Drop for CallDepthGuardPublic {
-    #[inline(always)]
+/// Spend one unit of the recursion budget on a dispatch level that pushes no
+/// Python frame, returning the same guard [`enter_recursive_frame`] returns.
+///
+/// The self-referential `A.__call__ = A()` chain recurses through
+/// `user_call_slot` natively and never reaches a frame activation, so there is
+/// no activation to key on: the unit is spent unconditionally and
+/// `ACCOUNTED_ACTIVATION` is carried through unchanged, leaving the next real
+/// activation to account for itself.
+#[inline]
+pub fn enter_native_dispatch() -> RecursionDepthGuard {
+    PY_RECURSION_DEPTH.with(|d| d.set(d.get() + 1));
+    RecursionDepthGuard {
+        prev: ACCOUNTED_ACTIVATION.with(|c| c.get()),
+        spent: true,
+    }
+}
+
+/// RAII guard that releases the [`PY_RECURSION_DEPTH`] unit on drop.
+pub struct RecursionDepthGuard {
+    prev: usize,
+    spent: bool,
+}
+
+impl Drop for RecursionDepthGuard {
+    #[inline]
     fn drop(&mut self) {
-        CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if self.spent {
+            PY_RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            ACCOUNTED_ACTIVATION.with(|c| c.set(self.prev));
+        }
     }
 }
 
@@ -707,8 +758,6 @@ pub fn call_user_function_resolved(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let _depth_guard = increment_call_depth();
-
     let w_code = unsafe { crate::getcode(callable) };
     let w_globals = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
@@ -1358,7 +1407,7 @@ fn call_callable_with_mode(
         // natively.  The call-depth guard counts this dispatch level and, by
         // dropping only after the call returns, keeps it off the tail so LLVM
         // cannot rewrite the self-call into a loop that never grows the stack.
-        let _depth_guard = increment_call_depth();
+        let _depth_guard = enter_native_dispatch();
         return call_callable_with_mode(frame, target, args, mode);
     }
 
@@ -1412,7 +1461,6 @@ pub fn call_user_function(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let _depth_guard = increment_call_depth();
     let eval_fn = get_eval_fn();
     call_user_function_with_eval(frame, callable, args, eval_fn)
 }
@@ -1661,12 +1709,10 @@ pub(crate) fn resolve_kwargs(
         let Some(kw_name_obj) = kw_name else { continue };
         let kw_value = args[n_pos + ki];
 
-        // argument.py:630 — keywords must be strings (check before access)
+        // argument.py:630 — keywords must be strings (check before access).
+        // `_PyStack_UnpackDict` names neither the callable nor the key's type.
         if !unsafe { pyre_object::is_str(kw_name_obj) } {
-            return Err(crate::PyError::type_error(format!(
-                "{}() keywords must be strings",
-                fname
-            )));
+            return Err(crate::PyError::type_error("keywords must be strings"));
         }
         // A lone-surrogate keyword name (not valid UTF-8) never equals a
         // source-level parameter name, so it falls straight to **kwargs or
@@ -2164,7 +2210,10 @@ pub fn call_with_kwargs(
             };
             if arity <= 4 && !kwargs.is_empty() {
                 return Err(unsafe {
-                    crate::builtin_code_no_keyword_arguments(code as pyre_object::PyObjectRef)
+                    crate::builtin_code_no_keyword_arguments(
+                        code as pyre_object::PyObjectRef,
+                        pos_args.first().copied(),
+                    )
                 });
             }
             let mut full_args = pos_args.to_vec();
@@ -2601,7 +2650,7 @@ pub fn call_with_kwargs(
         // Depth guard: count this dispatch level and, dropping after the call,
         // keep it off the tail so a self-referential `A.__call__ = A()`
         // recurses natively for stack_check (see call_callable_with_mode).
-        let _depth_guard = increment_call_depth();
+        let _depth_guard = enter_native_dispatch();
         return call_with_kwargs(frame, target, pos_args, kwargs);
     }
 
@@ -2816,7 +2865,7 @@ pub fn call_function_impl_result(
             // Depth guard: count this dispatch level and, dropping after the
             // call, keep it off the tail so a self-referential
             // `A.__call__ = A()` recurses natively for stack_check.
-            let _depth_guard = increment_call_depth();
+            let _depth_guard = enter_native_dispatch();
             return call_function_impl_result(target, args);
         }
     }

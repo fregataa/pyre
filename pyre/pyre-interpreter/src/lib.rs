@@ -66,6 +66,9 @@ pub mod host_seam {
     /// only this one.
     #[majit_macros::dont_look_inside]
     pub fn emit_stdout(bytes: &[u8]) {
+        if super::print_hook_emit_bytes(bytes) {
+            return;
+        }
         use std::io::Write;
         let _ = std::io::stdout().write_all(bytes);
     }
@@ -73,6 +76,9 @@ pub mod host_seam {
     /// Emit bytes to the interpreter's stderr (fd 2).
     #[majit_macros::dont_look_inside]
     pub fn emit_stderr(bytes: &[u8]) {
+        if super::stderr_hook_emit(bytes) {
+            return;
+        }
         use std::io::Write;
         let _ = std::io::stderr().write_all(bytes);
     }
@@ -86,6 +92,7 @@ pub mod host_seam {
 pub mod async_operation;
 pub mod jit_fnaddr;
 pub mod listobject;
+pub mod listsort;
 pub mod opcode_ops;
 pub mod pycode;
 pub mod pyopcode;
@@ -306,11 +313,14 @@ macro_rules! py_module {
                     $crate::module_ns_store(
                         ns,
                         stringify!($ifn_name),
-                        $crate::make_module_builtin_function_with_arity_and_maybe_sig(
-                            stringify!($ifn_name),
-                            $ifn_name,
-                            ::paste::paste! { [<$ifn_name _pyre_arity>]() },
-                            ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                        $crate::gateway::with_module(
+                            $name,
+                            $crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                                stringify!($ifn_name),
+                                $ifn_name,
+                                ::paste::paste! { [<$ifn_name _pyre_arity>]() },
+                                ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                            ),
                         ),
                     );
                 }
@@ -318,13 +328,19 @@ macro_rules! py_module {
             $($(
                 $crate::module_ns_store(
                     ns, $fn_key,
-                    $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                    $crate::gateway::with_module(
+                        $name,
+                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                    ),
                 );
             )*)?
             $($(
                 $crate::module_ns_store(
                     ns, $mfn_key,
-                    $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                    $crate::gateway::with_module(
+                        $name,
+                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                    ),
                 );
             )*)?
             $(
@@ -950,6 +966,42 @@ pub fn all_foreign_pytypes() -> &'static [(
     PYTYPES
 }
 
+/// Managed `#[pyre_class]` types whose only inline GC edge is the header's
+/// `w_class`, in the order `build_gc` must register them.  `allocate_stable`
+/// puts their instances in the old generation, so the marker needs a type id
+/// carrying that offset — otherwise a `class L(_thread.LockType)` instance
+/// leaves its heap type unreachable.  The tail order pins the type ids the
+/// alias census below and `SUBCLASS_RANGE_HIERARCHY` assert.
+pub fn all_w_class_only_descriptors() -> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    vec![
+        <crate::module::thread::W_Lock as PyreClassPyTypeOf>::DESCRIPTOR,
+        <crate::module::thread::W_RLock as PyreClassPyTypeOf>::DESCRIPTOR,
+        <crate::module::thread::W_ThreadHandle as PyreClassPyTypeOf>::DESCRIPTOR,
+    ]
+}
+
+/// The same edge for `#[pyre_class]` types allocated through the immortal
+/// `allocate`: the collector never walks them, so their `w_class` is reached
+/// by the interpreter's immortal-root walker instead of a type id, and they
+/// take no place in the type-id censuses.  Each is behind a target/feature
+/// gate this crate spells exactly.
+pub fn all_immortal_w_class_only_descriptors()
+-> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
+    #[allow(unused_imports)]
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    vec![
+        // `select` is compiled out of a sandbox build (`module/mod.rs:93`), so
+        // its descriptors carry that gate too.
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        <crate::module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        <crate::module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        <crate::module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
+    ]
+}
+
 /// Interpreter-owned PyType aliases in the shared GC inheritance census.
 /// `pyre-object::pyobject::all_subclass_range_aliases` supplies the object
 /// layer; `init_typeobjects` passes both slices to the common numbering
@@ -1004,35 +1056,101 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(138, typed::<crate::module::_io::W_BufferedRandom>()),
         subclass_range_alias(139, typed::<crate::module::_io::W_TextIOWrapper>()),
         subclass_range_alias(140, typed::<crate::module::thread::W_Local>()),
+        // `all_w_class_only_descriptors` order, registered at the absolute
+        // tail of `build_gc` after `W_DequeBlock` and `W_BufferWrapper`.
+        subclass_range_alias(153, typed::<crate::module::thread::W_Lock>()),
+        subclass_range_alias(154, typed::<crate::module::thread::W_RLock>()),
+        subclass_range_alias(155, typed::<crate::module::thread::W_ThreadHandle>()),
     ]
 }
 
-// ── Print hook for wasm (stdout capture) ──
-use std::cell::RefCell;
-thread_local! {
-    static PRINT_HOOK: RefCell<Option<fn(&str)>> = RefCell::new(None);
+// ── Print / stderr hooks for wasm (fd-1 / fd-2 capture) ──
+//
+// An embedder installs these to receive everything the interpreter writes to
+// fd 1 and fd 2. The sink belongs to the *process*, not to whichever thread
+// installed it: a traceback or warning raised on any interpreter thread has to
+// reach the same embedder, and on wasm32 `std::io::stderr().write_all`
+// discards the bytes outright, so a thread that saw no hook would lose them.
+// Both are plain `fn` pointers, so one atomic word each holds them and the
+// write path takes no lock.
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static PRINT_HOOK: AtomicUsize = AtomicUsize::new(0);
+static STDERR_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+fn store_hook(slot: &AtomicUsize, hook: fn(&[u8])) {
+    slot.store(hook as usize, Ordering::Release);
 }
 
-/// Set a hook that receives all `print()` output instead of stdout.
-pub fn set_print_hook(hook: fn(&str)) {
-    PRINT_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+fn load_hook(slot: &AtomicUsize) -> Option<fn(&[u8])> {
+    match slot.load(Ordering::Acquire) {
+        0 => None,
+        // SAFETY: the slot only ever holds a `fn(&[u8])` written by
+        // `store_hook`, and a function pointer is pointer-sized.
+        raw => Some(unsafe { std::mem::transmute::<usize, fn(&[u8])>(raw) }),
+    }
+}
+
+/// Set a hook that receives all fd-1 output instead of stdout.
+///
+/// The hook takes bytes rather than `&str` so a write the filesystem or a
+/// `sys.stdout.buffer` caller made is handed over unmodified; decoding it is
+/// the embedder's decision, not a lossy conversion applied on the way out.
+pub fn set_print_hook(hook: fn(&[u8])) {
+    store_hook(&PRINT_HOOK, hook);
+}
+
+/// Offer already-encoded `bytes` to the print hook. Returns whether a hook
+/// consumed them; `false` leaves the caller on its own descriptor path.
+pub fn print_hook_emit_bytes(bytes: &[u8]) -> bool {
+    match load_hook(&PRINT_HOOK) {
+        Some(hook) => {
+            hook(bytes);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`print_hook_emit_bytes`] for callers holding a `str`.
+pub fn print_hook_emit(s: &str) -> bool {
+    print_hook_emit_bytes(s.as_bytes())
 }
 
 /// Write a string through the print hook (if set) or stdout.
 pub fn print_output(s: &str) {
-    PRINT_HOOK.with(|h| {
-        if let Some(hook) = *h.borrow() {
-            hook(s);
-        } else {
-            // Under sandbox fd 1 is the marshalling pipe, so route program
-            // output through ll_os_write(1,…) for the controller to relay; a
-            // raw `print!` would corrupt the protocol stream.
-            #[cfg(all(unix, feature = "sandbox"))]
-            let _ = crate::host_seam::ops::write(1, s.as_bytes());
-            #[cfg(not(all(unix, feature = "sandbox")))]
-            print!("{s}");
+    if print_hook_emit(s) {
+        return;
+    }
+    // Under sandbox fd 1 is the marshalling pipe, so route program
+    // output through ll_os_write(1,…) for the controller to relay; a
+    // raw `print!` would corrupt the protocol stream.
+    #[cfg(all(unix, feature = "sandbox"))]
+    let _ = crate::host_seam::ops::write(1, s.as_bytes());
+    #[cfg(not(all(unix, feature = "sandbox")))]
+    print!("{s}");
+}
+
+/// Set a hook that receives everything the interpreter writes to fd 2 —
+/// `sys.stderr.write`, tracebacks, warnings — instead of the real descriptor.
+///
+/// The wasm32 target has no descriptors: `std::io::stderr().write_all` there
+/// discards the bytes, so without a hook a traceback simply vanishes. The
+/// stdout twin is [`set_print_hook`].
+pub fn set_stderr_hook(hook: fn(&[u8])) {
+    store_hook(&STDERR_HOOK, hook);
+}
+
+/// Offer `bytes` to the stderr hook. Returns whether a hook consumed them;
+/// `false` leaves the caller on its own descriptor path.
+pub fn stderr_hook_emit(bytes: &[u8]) -> bool {
+    match load_hook(&STDERR_HOOK) {
+        Some(hook) => {
+            hook(bytes);
+            true
         }
-    });
+        None => false,
+    }
 }
 
 // baseobjspace call helpers are re-exported from `baseobjspace`.

@@ -1055,6 +1055,78 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(current as pyre_object::PyObjectRef)
         }),
     );
+    // `sys._getframemodulename(depth=0)` — the module name of the frame
+    // `depth` levels up, or None when the walk runs off the stack.  Used by
+    // `warnings` and `functools` to attribute a call to its module without
+    // materialising the frame.
+    //
+    // `sys__getframemodulename_impl` reads `PyFunction_GetModule(f->f_funcobj)`.
+    // A pyre frame carries `pycode` and `w_globals` but no link back to the
+    // function object (the JIT virtualizable layout is the hot path, and
+    // `debugdata` is allocated lazily), so the module name comes from
+    // `globals["__name__"]` — the value `__module__` is initialised from.  A
+    // function whose `__module__` was reassigned after definition therefore
+    // still reports its defining module.
+    module_ns_store(
+        ns,
+        "_getframemodulename",
+        crate::make_builtin_function("_getframemodulename", |args| {
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(kwargs, &["depth"], "_getframemodulename")?;
+            // The arity is judged on the total argument count, so supplying
+            // `depth` both ways is "takes at most 1 argument (2 given)" rather
+            // than the duplicate-binding report.
+            let supplied = positional.len() + crate::builtins::real_kwarg_count(kwargs);
+            if supplied > 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "_getframemodulename() takes at most 1 argument ({supplied} given)"
+                )));
+            }
+            let depth = match crate::builtins::bind_pos_or_kw(
+                positional,
+                kwargs,
+                0,
+                "depth",
+                "_getframemodulename",
+                1,
+            )? {
+                Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
+                None => 0,
+            };
+            let ec = current_execution_context();
+            if ec.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            // Force the frame `topframeref` names before walking, for the same
+            // reason `sys._getframe` above does: a JIT-inlined callee has no
+            // frame until the force materialises one, so an unforced walk would
+            // start at the caller and report the caller's module.
+            let mut current = unsafe {
+                (*ec).gettopframe();
+                (*ec).gettopframe_nohidden()
+            };
+            // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
+            // post-decrement test fails immediately for a negative depth, so a
+            // negative walks zero frames and reports the current module rather
+            // than `None`.
+            let mut remaining = depth.max(0);
+            while !current.is_null() && remaining > 0 {
+                current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
+                remaining -= 1;
+            }
+            if current.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let w_globals = unsafe { (*current).w_globals };
+            if w_globals.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
+                Some(name) if !name.is_null() => Ok(name),
+                _ => Ok(pyre_object::w_none()),
+            }
+        }),
+    );
     // sys.exc_info() → (type, value, traceback)
     //
     // Tuple construction is shared with `exc_info_direct` (the JIT fast-path
@@ -1177,7 +1249,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "setrecursionlimit() takes exactly one argument",
                     ));
                 }
-                let new_limit = crate::baseobjspace::c_int_w(args[0])?;
+                // `sys_setrecursionlimit_impl`'s clinic `int new_limit`
+                // converter reads `__index__`, so a non-index argument is
+                // named in the error rather than reported as a bare
+                // "expected integer".
+                let new_limit = crate::builtins::space_index_w(args[0])?;
+                if !(i32::MIN as i64..=i32::MAX as i64).contains(&new_limit) {
+                    return Err(crate::PyError::overflow_error(
+                        "expected a 32-bit integer",
+                    ));
+                }
+                let new_limit = new_limit as i32;
                 crate::stack_check::set_recursion_limit(new_limit)?;
                 Ok(w_none())
             },
@@ -1967,39 +2049,58 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         make_builtin_function(
             "getsizeof",
             |args| {
-                if args.len() > 2 {
-                    return Err(crate::PyError::type_error(format!(
-                        "getsizeof() takes at most 2 arguments ({} given)",
-                        args.len()
-                    )));
+                // `vm.py:355 getsizeof(space, w_object, w_default=None)` — both
+                // parameters are positional-or-keyword.
+                let scope = crate::builtins::bind_builtin_kwargs(
+                    args,
+                    &["object", "default"],
+                    &[true, false],
+                    "getsizeof",
+                )?;
+                let w_obj = scope[0];
+                let w_default = Some(scope[1]).filter(|d| !d.is_null());
+                // `sys_getsizeof` looks `__sizeof__` up on the type and calls
+                // it.  The `default` covers every TypeError along that route —
+                // a missing slot, an uncallable one, and a result that is not
+                // an integer — but not the negative-result ValueError.
+                // `vm.py:355 getsizeof` instead returns the default
+                // unconditionally ("not implemented on PyPy"); 3.14 reports the
+                // real size, and pyre's types all carry a working
+                // `__sizeof__`.  The GC header CPython adds for tracked
+                // objects has no fixed pyre counterpart, so the reported size
+                // is the object's own.
+                let sized = match unsafe {
+                    crate::baseobjspace::lookup_special(w_obj, "__sizeof__")
+                } {
+                    Ok(Some(method)) => crate::call::call_function_impl_result(method, &[]),
+                    Ok(None) => Err(crate::PyError::type_error(format!(
+                        "Type {} doesn't define __sizeof__",
+                        crate::baseobjspace::object_functionstr_type_name(w_obj)
+                    ))),
+                    Err(e) => Err(e),
                 }
-                let Some(&w_obj) = args.first() else {
-                    return Err(crate::PyError::type_error(
-                        "getsizeof() takes at least 1 argument (0 given)",
-                    ));
-                };
-                if let Some(w_type) = crate::typedef::r#type(w_obj) {
-                    if let Some(w_sizeof) = unsafe {
-                        crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__sizeof__")
-                    } {
-                        let w_size = unsafe {
-                            crate::baseobjspace::get_and_call_function(
-                                w_sizeof,
-                                w_obj,
-                                w_type.as_ptr(),
-                                &[],
-                            )
-                        }?;
-                        // getsizeof must yield a non-negative integer: a
-                        // non-int result is rejected like a failed index
-                        // coercion, and a negative one (including a bignum)
-                        // raises ValueError.
-                        if unsafe { !pyre_object::is_int(w_size) } {
-                            return Err(crate::PyError::type_error(format!(
-                                "'{}' object cannot be interpreted as an integer",
-                                crate::type_methods::arg_type_name(w_size)
-                            )));
-                        }
+                .and_then(|w_size| {
+                    // `PyLong_AsSsize_t(res)` — no `__index__` coercion, so a
+                    // non-integer result is the TypeError the default covers,
+                    // while a result too wide for the word is an OverflowError
+                    // it does not.  Both precede the `size < 0` test below, so
+                    // `__sizeof__` returning `-(1 << 100)` overflows rather
+                    // than reporting the negative.
+                    let is_integer = unsafe {
+                        pyre_object::is_int(w_size) || pyre_object::pyobject::is_long(w_size)
+                    };
+                    if !is_integer {
+                        return Err(crate::PyError::type_error("an integer is required"));
+                    }
+                    crate::baseobjspace::int_w(w_size).map_err(|_| {
+                        crate::PyError::overflow_error(
+                            "Python int too large to convert to C ssize_t",
+                        )
+                    })?;
+                    Ok(w_size)
+                });
+                match (sized, w_default) {
+                    (Ok(w_size), _) => {
                         let negative = crate::baseobjspace::is_true(
                             crate::objspace::descroperation::compare(
                                 w_size,
@@ -2012,14 +2113,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "__sizeof__() should return >= 0",
                             ));
                         }
-                        return Ok(w_size);
+                        Ok(w_size)
                     }
-                }
-                match args.get(1).copied() {
-                    Some(w_default) => Ok(w_default),
-                    None => Err(crate::PyError::type_error(
-                        "getsizeof(object, default) -> int: object size is not tracked; supply a default",
-                    )),
+                    (Err(e), Some(w_default)) if e.kind == crate::PyErrorKind::TypeError => {
+                        Ok(w_default)
+                    }
+                    (Err(e), _) => Err(e),
                 }
             },
         ),
@@ -2089,10 +2188,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "set_coroutine_origin_tracking_depth",
-        make_builtin_function_with_arity(
+        // `depth` is positional-or-keyword, so this cannot take the
+        // fixed-arity carrier (which rejects keywords before the body runs).
+        crate::make_builtin_function(
             "set_coroutine_origin_tracking_depth",
             sys_set_coroutine_origin_tracking_depth,
-            1,
         ),
     );
     module_ns_store(
@@ -2355,6 +2455,14 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(buffer);
     let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // `app_main.py:484 create_stdio` names the raw descriptor object rather
+    // than the wrapper, so `repr(sys.stdin.buffer)` reads `name='<stdin>'`
+    // instead of the bare descriptor number.
+    if let Ok(raw) =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(buffer_slot), "raw")
+    {
+        let _ = crate::baseobjspace::setattr_str(raw, "name", w_str_new(name));
+    }
     let (encoding, configured_errors) = stdio_encoding_and_errors();
     let errors = if to_stderr {
         "backslashreplace"
@@ -2404,17 +2512,21 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                 let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
                 let bytes =
                     crate::type_methods::encode_object(s_obj, &encoding, "backslashreplace")?;
-                // Under sandbox fd 1 is the marshalling pipe, so a raw write
-                // would corrupt the protocol: route through ll_os_write(2,…)
-                // and let the controller relay it to its own stderr.
-                #[cfg(not(feature = "sandbox"))]
-                {
-                    use std::io::Write;
-                    let _ = std::io::stderr().write_all(&bytes);
+                // An embedder with no fd 2 (wasm32) takes the bytes through
+                // its hook; otherwise fall through to the descriptor.
+                if !crate::stderr_hook_emit(&bytes) {
+                    // Under sandbox fd 1 is the marshalling pipe, so a raw write
+                    // would corrupt the protocol: route through ll_os_write(2,…)
+                    // and let the controller relay it to its own stderr.
+                    #[cfg(not(feature = "sandbox"))]
+                    {
+                        use std::io::Write;
+                        let _ = std::io::stderr().write_all(&bytes);
+                    }
+                    #[cfg(feature = "sandbox")]
+                    crate::host_seam::ops::write(2, &bytes)
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 }
-                #[cfg(feature = "sandbox")]
-                crate::host_seam::ops::write(2, &bytes)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
@@ -2424,14 +2536,19 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
                 let bytes = crate::type_methods::encode_object(s_obj, &encoding, &errors)?;
-                #[cfg(not(feature = "sandbox"))]
-                {
-                    use std::io::Write;
-                    let _ = std::io::stdout().write_all(&bytes);
+                // Same seam `print` rides, so an embedder that captures stdout
+                // (wasm32, which has no fd 1) sees `sys.stdout.write` too and
+                // the two stay in order.
+                if !crate::print_hook_emit_bytes(&bytes) {
+                    #[cfg(not(feature = "sandbox"))]
+                    {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(&bytes);
+                    }
+                    #[cfg(feature = "sandbox")]
+                    crate::host_seam::ops::write(1, &bytes)
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 }
-                #[cfg(feature = "sandbox")]
-                crate::host_seam::ops::write(1, &bytes)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))

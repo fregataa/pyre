@@ -2340,6 +2340,34 @@ impl PyFrame {
         Ok(self.get_w_locals())
     }
 
+    /// The mapping `locals()` hands back, and the implicit locals `exec` /
+    /// `eval` run against (`_PyEval_GetFrameLocals`).
+    ///
+    /// A frame whose `f_locals` is a `FrameLocalsProxy` — every optimized
+    /// frame — yields an INDEPENDENT dict copy, so `locals() is locals()` is
+    /// false, a snapshot does not track later stores, and writing into one
+    /// reaches neither the fast locals nor the next snapshot (PEP 667).
+    /// Module and class frames keep handing back their real namespace, which
+    /// is what makes a module-level `locals() is globals()` still hold.
+    pub fn frame_locals_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        let w_locals = self.getdictscope()?;
+        if w_locals.is_null() || !self.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
+            return Ok(w_locals);
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_locals);
+        let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+        // `dict_update_value` walks a mapping's `keys()`, so both sides are
+        // reloaded across it as well as across the `w_dict_new` above.
+        crate::opcode_ops::dict_update_value(
+            pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
+            pyre_object::gc_roots::shadow_stack_get(locals_slot),
+        )?;
+        Ok(pyre_object::gc_roots::shadow_stack_get(snapshot_slot))
+    }
+
     /// Test-helper constructor — creates a frame with a fresh execution
     /// context.
     ///

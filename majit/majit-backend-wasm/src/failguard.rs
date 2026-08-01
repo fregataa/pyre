@@ -78,6 +78,59 @@ pub struct WasmFrameData {
     /// exited through a GuardNoException / GuardException (0 = none), surfaced
     /// via `grab_exc_value`.
     pub exc_value: i64,
+    /// Slots handed to [`crate::wasm_gc_add_root`] by [`WasmFrameData::boxed`],
+    /// released again in `Drop`.
+    roots: Vec<usize>,
+}
+
+impl WasmFrameData {
+    /// `llmodel.py:225-238` reads `get_ref_value` straight out of the JITFRAME,
+    /// which stays a GC root (its `jf_gcmap` covers the exit slots) for as long
+    /// as the deadframe lives. wasm has no host-visible JITFRAME to hand back:
+    /// `execute_token` copies the exit values into `raw_values` and drops the
+    /// guest frame, so the copies must carry that rooting themselves. Between
+    /// the copy and the last `get_ref_value`, resume/blackhole reconstruction
+    /// allocates freely, and a minor collection there moves exactly the objects
+    /// these slots name.
+    ///
+    /// Only `Type::Ref` exit slots are rooted, matching the gcmap the guest
+    /// frame carried. A wasm32 `GcRef` occupies the low half of its `i64` slot,
+    /// so the root address is the slot address (same aliasing the Ref home
+    /// slots already rely on).
+    pub fn boxed(
+        raw_values: Vec<i64>,
+        fail_descr: Arc<WasmFailDescr>,
+        exc_value: i64,
+    ) -> Box<Self> {
+        let mut data = Box::new(WasmFrameData {
+            raw_values,
+            fail_descr,
+            exc_value,
+            roots: Vec::new(),
+        });
+        let mut roots: Vec<usize> = Vec::new();
+        for i in 0..data.raw_values.len() {
+            if data.fail_descr.fail_arg_types.get(i) == Some(&Type::Ref) {
+                roots.push(&mut data.raw_values[i] as *mut i64 as usize);
+            }
+        }
+        // `grab_exc_value` hands this out as a `GcRef` too, and the resume path
+        // reads it after it has already allocated.
+        roots.push(&mut data.exc_value as *mut i64 as usize);
+        for slot in &roots {
+            unsafe { crate::wasm_gc_add_root(*slot as *mut majit_ir::GcRef) };
+        }
+        data.roots = roots;
+        data
+    }
+}
+
+impl Drop for WasmFrameData {
+    fn drop(&mut self) {
+        for slot in self.roots.drain(..) {
+            crate::wasm_gc_remove_root(slot as *mut majit_ir::GcRef);
+        }
+    }
 }
 
 /// A resumable `LABEL` of a compiled loop, published in `LABEL_TARGETS` so a
@@ -93,9 +146,13 @@ pub struct LabelTarget {
     /// The label's arg count — the resume loader reads exactly this many
     /// positional frame slots, so the JUMP arity must equal it.
     pub num_args: usize,
-    /// Whether the label's args are the complete live set of the owning
-    /// trace's remainder (`codegen::label_resume_safety`).
+    /// Whether every live-in can be reconstructed from LABEL args or frozen
+    /// backend capture slots (`codegen::label_resume_info`).
     pub resume_safe: bool,
+    /// Backend capture slots are populated by this target loop's own
+    /// fall-through path. If true, a bridge may resume only its source loop,
+    /// not a sibling specialization that happens to share the geometry.
+    pub requires_own_frame: bool,
     /// Whether this is the owning loop's LAST label (the loop header). A
     /// bridge landing here re-runs no segment code before the `loop`, so the
     /// livelock advance-check applies; earlier labels execute the peeled
@@ -371,7 +428,9 @@ pub fn publish_label_target(descr_id: usize, target: LabelTarget) {
 /// guard that lives inside an already-chained bridge: the failing guard's
 /// meta descr carries `(trace_id, per-trace fail_index)`, and this record
 /// supplies the owning bridge's cell array and livelock advance flags — the
-/// same data `CompiledWasmLoop` holds for the loop's own guards.
+/// same data `CompiledWasmLoop` holds for the loop's own guards.  It also
+/// publishes whether another bridge may safely compose a CALL_ASSEMBLER arm
+/// while executing on this bridge's shared frozen frame.
 pub struct ChainedTraceMeta {
     /// Base address of the bridge's per-guard bridge-slot cell array
     /// (`CompiledWasmLoop::bridge_cells_base` analog); `0` = no dispatch.
@@ -381,6 +440,10 @@ pub struct ChainedTraceMeta {
     /// Per-guard, per-fail-arg induction-advance flags
     /// (`CompiledWasmLoop::guard_fail_arg_advanced` analog).
     pub guard_fail_arg_advanced: Vec<Vec<bool>>,
+    /// This bridge contains no host-trampoline lowering, so a nested bridge's
+    /// movable CALL_ASSEMBLER callee cannot strand a stale source-frame
+    /// pointer when control returns here.
+    pub ca_reentry_safe: bool,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
@@ -390,7 +453,17 @@ pub struct CompiledWasmLoop {
     pub token_number: u64,
     pub trace_id: u64,
     pub input_types: Vec<Type>,
-    pub func_handle: u32,
+    /// Shared-table slot of the materialized wasm function.  Straight-line
+    /// function-entry traces may keep this at zero until their first actual
+    /// execution: an invalidated trace that never reaches `execute_token`
+    /// must not pay the host Wasmtime compilation cost.
+    pub(crate) func_handle: Cell<u32>,
+    /// Encoded module retained until lazy host materialization.  This is
+    /// backend assembler state, not metainterpreter state: the optimized trace
+    /// and all per-token descriptors have already been installed exactly as
+    /// in the eager path.
+    #[cfg_attr(any(not(target_arch = "wasm32"), target_os = "wasi"), allow(dead_code))]
+    pub(crate) pending_wasm_bytes: RefCell<Option<Vec<u8>>>,
     /// This loop's own guard/finish exit descriptors (positions `[0,
     /// num_guard_cells)`, per-trace order), followed by the descr slices of
     /// every chained bridge `compile_bridge` appended (positional bookkeeping
@@ -490,6 +563,43 @@ pub struct CompiledWasmLoop {
 }
 
 impl CompiledWasmLoop {
+    pub fn eager_func_handle(&self) -> u32 {
+        self.func_handle.get()
+    }
+
+    /// Materialize a lazily-installed root trace.  The wasm host is
+    /// single-threaded, matching the RefCell/Cell ownership used throughout
+    /// this structure, so one trace can only cross this gate once.
+    pub fn materialize_func_handle(&self) -> Result<u32, majit_backend::BackendError> {
+        let current = self.func_handle.get();
+        if current != 0 {
+            return Ok(current);
+        }
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        {
+            return Ok(0);
+        }
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        {
+            let pending = self.pending_wasm_bytes.borrow();
+            let Some(bytes) = pending.as_deref() else {
+                return Err(majit_backend::BackendError::Unsupported(
+                    "wasm trace has neither a function handle nor pending module bytes".into(),
+                ));
+            };
+            let handle = crate::glue::compile_module_cached(bytes);
+            if handle == 0 {
+                return Err(majit_backend::BackendError::Unsupported(
+                    "wasm host rejected the lazily compiled trace module".into(),
+                ));
+            }
+            self.func_handle.set(handle);
+            drop(pending);
+            self.pending_wasm_bytes.borrow_mut().take();
+            Ok(handle)
+        }
+    }
+
     /// Incorporate the normal (non-CA unless this bridge is the candidate)
     /// codegen census for a bridge after it has been chained onto this token.
     /// Every earlier bridge remains reachable from a later CA recursion's
@@ -516,7 +626,7 @@ impl Drop for CompiledWasmLoop {
             for &id in &self.label_descrs {
                 if id != 0 {
                     if let Some(t) = map.get(&id) {
-                        if t.func_handle == self.func_handle {
+                        if t.func_handle == self.func_handle.get() {
                             map.remove(&id);
                             crate::BRIDGE_DIAG[22]
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -537,7 +647,8 @@ mod tests {
             token_number: 0,
             trace_id: 0,
             input_types: Vec::new(),
-            func_handle: 0,
+            func_handle: Cell::new(0),
+            pending_wasm_bytes: RefCell::new(None),
             fail_descrs: RefCell::new(Vec::new()),
             num_inputs: 0,
             max_output_slots: 0,

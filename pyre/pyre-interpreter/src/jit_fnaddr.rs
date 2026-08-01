@@ -1276,8 +1276,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_fnaddr(
         &mut entries,
-        "pyre_interpreter::call::call_depth",
-        crate::call::call_depth as *const (),
+        "pyre_interpreter::call::py_recursion_depth",
+        crate::call::py_recursion_depth as *const (),
     );
     push_fnaddr(
         &mut entries,
@@ -3107,6 +3107,18 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("functional::RANGE_ITER_TYPE", functional::RANGE_ITER_TYPE),
         pytype_addr!("memoryview::MEMORYVIEW_TYPE", memoryview::MEMORYVIEW_TYPE),
         pytype_addr!("iterobject::SEQ_ITER_TYPE", iterobject::SEQ_ITER_TYPE),
+        pytype_addr!(
+            "iterobject::STR_ASCII_ITER_TYPE",
+            iterobject::STR_ASCII_ITER_TYPE
+        ),
+        pytype_addr!("iterobject::STR_ITER_TYPE", iterobject::STR_ITER_TYPE),
+        pytype_addr!("iterobject::BYTES_ITER_TYPE", iterobject::BYTES_ITER_TYPE),
+        pytype_addr!(
+            "iterobject::BYTEARRAY_ITER_TYPE",
+            iterobject::BYTEARRAY_ITER_TYPE
+        ),
+        pytype_addr!("iterobject::MEMORY_ITER_TYPE", iterobject::MEMORY_ITER_TYPE),
+        pytype_addr!("iterobject::ARRAY_ITER_TYPE", iterobject::ARRAY_ITER_TYPE),
         pytype_addr!("iterobject::LIST_ITER_TYPE", iterobject::LIST_ITER_TYPE),
         pytype_addr!(
             "iterobject::LIST_REVERSE_ITER_TYPE",
@@ -3714,8 +3726,11 @@ mod tests {
             bump
         );
 
-        let call_depth = crate::call::call_depth as *const () as usize as i64;
-        assert_eq!(bindings["pyre_interpreter::call::call_depth"], call_depth);
+        let py_recursion_depth = crate::call::py_recursion_depth as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::call::py_recursion_depth"],
+            py_recursion_depth
+        );
 
         let recursion_limit =
             crate::module::sys::state::recursion_limit as *const () as usize as i64;

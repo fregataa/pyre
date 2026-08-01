@@ -97,7 +97,10 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
         Err(err) if err.kind != crate::PyErrorKind::AttributeError => return Err(err),
         Err(_) => {}
     }
-    Err(crate::PyError::type_error("must be real number"))
+    Err(crate::PyError::type_error(format!(
+        "must be real number, not {}",
+        crate::type_methods::arg_type_name(obj)
+    )))
 }
 
 type PyResult = Result<PyObjectRef, crate::PyError>;
@@ -418,6 +421,7 @@ pub fn atan2(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn hypot(args: &[PyObjectRef]) -> PyResult {
+    let args = no_keywords(args, "hypot")?;
     let coords: Vec<f64> = args
         .iter()
         .map(|&a| try_get_double(a))
@@ -484,14 +488,16 @@ fn math_unary_int(
     }
     if !fallback_float {
         return Err(crate::PyError::type_error(format!(
-            "type {} doesn't define {fname}() method",
+            "type {} doesn't define {dunder} method",
             crate::baseobjspace::object_functionstr_type_name(args[0])
         )));
     }
-    // Fall back to `__float__` coercion — `try_get_double` raises TypeError
-    // when the operand has no numeric interpretation.
-    let v = try_get_double(args[0])
-        .map_err(|_| crate::PyError::type_error(format!("type has no {fname}() method")))?;
+    // Fall back to `__float__` coercion.  `try_get_double` already reports
+    // "must be real number, not X" for an operand with no numeric
+    // interpretation, and its contract is that everything else — a raising
+    // `__float__`, or the `OverflowError` for an int too wide for an f64 —
+    // propagates; relabelling here would swallow exactly those.
+    let v = try_get_double(args[0])?;
     Ok(w_int_new(match dunder {
         "__ceil__" => v.ceil() as i64,
         "__floor__" => v.floor() as i64,
@@ -573,9 +579,34 @@ fn log_any(w_x: PyObjectRef, base: f64) -> PyResult {
     }
 }
 
+/// A `math` entry point declared `METH_VARARGS` takes no keywords at all, so
+/// one is rejected before the arguments are read — otherwise the trailing
+/// marker dict reaches the body as one more operand.
+pub(crate) fn no_keywords<'a>(
+    args: &'a [PyObjectRef],
+    name: &str,
+) -> Result<&'a [PyObjectRef], crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(format!(
+            "math.{name}() takes no keyword arguments"
+        )));
+    }
+    Ok(positional)
+}
+
 pub fn log(args: &[PyObjectRef]) -> PyResult {
-    if args.is_empty() || args.len() > 2 {
-        return Err(crate::PyError::type_error("log() takes 1 or 2 arguments"));
+    let args = no_keywords(args, "log")?;
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "log expected at least 1 argument, got 0",
+        ));
+    }
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "log expected at most 2 arguments, got {}",
+            args.len()
+        )));
     }
     let base = if args.len() >= 2 {
         // The base is validated before the argument, so log(x, base) with a
@@ -668,10 +699,23 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() != 2 {
-        return Err(crate::PyError::type_error(
-            "isclose() takes exactly 2 positional arguments",
-        ));
+    if pos.len() < 2 {
+        // `_PyArg_ParseStackAndKeywords` names the first slot it could not
+        // fill; both are positional-only, so a keyword never fills one.
+        let missing = if pos.is_empty() {
+            "a' (pos 1"
+        } else {
+            "b' (pos 2"
+        };
+        return Err(crate::PyError::type_error(format!(
+            "isclose() missing required argument '{missing})"
+        )));
+    }
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "isclose() takes exactly 2 positional arguments ({} given)",
+            pos.len()
+        )));
     }
     // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
     crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
@@ -700,14 +744,17 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
             "factorial() takes exactly 1 argument",
         ));
     }
-    // PyPy: pypy/module/math/app_math.py factorial — reject floats that aren't
-    // exact integers, and negative x.
-    unsafe {
-        if pyre_object::is_float(args[0]) {
-            return Err(crate::PyError::type_error(
-                "factorial() only accepts integral values",
-            ));
-        }
+    // pypy/module/math/app_math.py:factorial —
+    //     if '__index__' not in dir(n):
+    //         raise TypeError("'%s' object cannot be interpreted as an integer"
+    //                         % type(n).__name__)
+    // The check is on `__index__` alone, so floats are rejected for the same
+    // reason strings are rather than by a numeric-value test.
+    if unsafe { crate::baseobjspace::lookup_special(args[0], "__index__") }?.is_none() {
+        return Err(crate::PyError::type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            crate::baseobjspace::object_functionstr_type_name(args[0])
+        )));
     }
     let n_big = get_bigint(args[0])?;
     if n_big.int_lt(0) {
@@ -718,9 +765,10 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
     let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
         jit_bigint_to_i64_value(&n_big)
     } else {
-        return Err(crate::PyError::overflow_error(
-            "factorial() argument should not exceed i64::MAX",
-        ));
+        return Err(crate::PyError::overflow_error(format!(
+            "factorial() argument should not exceed {}",
+            i64::MAX
+        )));
     };
 
     // pypy/module/math/app_math.py:factorial — balanced odd-product tree.
@@ -818,6 +866,7 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
 }
 
 pub fn gcd(args: &[PyObjectRef]) -> PyResult {
+    let args = no_keywords(args, "gcd")?;
     // RPython's GC transform roots this running rbigint across the next
     // argument's potentially user-defined `__index__` call.
     let mut result = RBigIntGcRoot::new(BigInt::zero());
@@ -828,6 +877,7 @@ pub fn gcd(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn lcm(args: &[PyObjectRef]) -> PyResult {
+    let args = no_keywords(args, "lcm")?;
     if args.is_empty() {
         return Ok(w_int_new(1));
     }
@@ -923,6 +973,7 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn perm(args: &[PyObjectRef]) -> PyResult {
+    let args = no_keywords(args, "perm")?;
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "perm() takes at least 1 argument",

@@ -1373,9 +1373,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_int_tid,
     ));
     debug_assert_eq!(w_bool_tid, W_BOOL_GC_TYPE_ID);
-    let range_iter_tid = gc.register_type(TypeInfo::object_subclass(
+    // The payload is three machine ints; the one traced offset is the
+    // header's `w_class`, which a `class R(range_iterator)` instance points
+    // at a managed heap type.
+    let range_iter_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
         object_tid,
+        <pyre_object::functional::W_IntRangeIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+            .ptr_offsets
+            .to_vec(),
     ));
     debug_assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);
     // rlist.py:116 parity: W_ListObject has a single GC pointer
@@ -1749,12 +1756,37 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // W_SeqIterObject (list/tuple iterator) — typed payload via
     // `#[pyre_class]`.  Pre-registered ahead of the foreign-pytype
     // loop so the GC walker reaches the inline `seq` field.
-    register_pyre_class(
+    let seq_iter_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::iterobject::W_SeqIterObject
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // The producer-specific str / bytes / bytearray / memoryview / array
+    // iterator identities carry the same `W_SeqIterObject` payload and traced
+    // `seq` edge, so they alias its vtable rather than minting ids of their
+    // own — the shape the six dict view iterators use below.
+    for tp in [
+        &pyre_object::iterobject::STR_ASCII_ITER_TYPE,
+        &pyre_object::iterobject::STR_ITER_TYPE,
+        &pyre_object::iterobject::BYTES_ITER_TYPE,
+        &pyre_object::iterobject::BYTEARRAY_ITER_TYPE,
+        &pyre_object::iterobject::MEMORY_ITER_TYPE,
+        &pyre_object::iterobject::ARRAY_ITER_TYPE,
+    ] {
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            tp as *const _ as usize,
+            seq_iter_tid,
+        );
+        pytype_to_tid.insert(tp as *const _ as usize, seq_iter_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            <pyre_object::iterobject::W_SeqIterObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+                .ptr_offsets,
+        );
+    }
     // W_Count / W_Repeat (`itertools.count` / `itertools.repeat`) —
     // typed payload via `#[pyre_class]`.  Neither PyType is in
     // `all_foreign_pytypes()`, so pre-registration here is the only
@@ -3272,6 +3304,23 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::memoryview::W_BufferWrapper
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // The remaining `#[pyre_class]` types carry no inline `PyObjectRef`
+    // payload field, so the only edge the marker has to forward is the
+    // header's `w_class` — which a Python subclass instance
+    // (`class L(_thread.LockType)`) points at a managed heap type.  Appended
+    // last so every automatic type id assigned above stays put.
+    for descriptor in pyre_interpreter::all_w_class_only_descriptors() {
+        register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+    }
+    // Their immortal counterparts take no type id — the collector never walks
+    // an `allocate`d object — so only the immortal-root walker's offset
+    // registry learns the edge.
+    for descriptor in pyre_interpreter::all_immortal_w_class_only_descriptors() {
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descriptor.pytype_ptr as usize,
+            descriptor.ptr_offsets,
+        );
+    }
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
@@ -5259,12 +5308,12 @@ fn init_callbacks() {
     });
 }
 
-/// Read the call depth from pyre-interpreter's CALL_DEPTH TLS.
-/// Replaces the separate JIT_CALL_DEPTH — single source of truth.
-// dont_look_inside: reads CALL_DEPTH TLS; no registry-resolvable accessor.
+/// Read the Python recursion depth from pyre-interpreter's
+/// PY_RECURSION_DEPTH TLS — the single source of truth for both crates.
+// dont_look_inside: reads a TLS; no registry-resolvable accessor.
 #[majit_macros::dont_look_inside]
 pub(crate) fn call_depth() -> u32 {
-    pyre_interpreter::call::call_depth()
+    pyre_interpreter::call::py_recursion_depth()
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -5280,8 +5329,8 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
     majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
 
-// JIT_CALL_DEPTH removed — pyre-interpreter::call::CALL_DEPTH is the single
-// source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
+// JIT_CALL_DEPTH removed — pyre-interpreter::call::PY_RECURSION_DEPTH is the
+// single source of truth. call_depth() reads it.
 
 /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
 ///
@@ -6755,6 +6804,12 @@ fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> Unsupp
 }
 
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
+    // The JIT-side frame-activation seam: a frame that runs entirely as
+    // compiled code returns from `try_function_entry_jit` without reaching an
+    // eval loop, so the recursion budget is spent here, where every JIT route
+    // through the frame — compiled, JIT eval loop, or declined to the plain
+    // evaluator — passes exactly once.
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     // Phase B of GC init: register root walkers that reference
     // interpreter state.  Safe here — the interpreter is initialized.
     // Phase A (GC build + backend install) ran at boot in init_jit_hooks.
@@ -6848,56 +6903,9 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
     if let Some(result) = try_function_entry_jit(frame_root.frame()) {
-        if majit_metainterp::majit_log_enabled() {
-            log_named_global_result(
-                frame_root.frame(),
-                "eval_with_jit_inner.try_function_entry_jit",
-            );
-        }
         return result;
     }
-    let result = handle_jitexception(frame_root.frame());
-    if majit_metainterp::majit_log_enabled() {
-        log_named_global_result(
-            frame_root.frame(),
-            "eval_with_jit_inner.handle_jitexception",
-        );
-    }
-    result
-}
-
-fn log_named_global_result(frame: &PyFrame, label: &str) {
-    unsafe {
-        let w_globals = frame.get_w_globals();
-        if w_globals.is_null() {
-            return;
-        }
-        let Some(value) = pyre_object::w_dict_getitem_str(w_globals, "result") else {
-            return;
-        };
-        if value.is_null() {
-            eprintln!("[jit][{label}] result=NULL");
-            return;
-        }
-        // pyobject.rs:308 `is_int` returns true for both INT_TYPE and
-        // BOOL_TYPE (bool is a W_IntObject subclass sharing `intval`). Match
-        // INT_TYPE strictly here so the log labels a bool result distinctly
-        // in the branch below.
-        if pyre_object::pyobject::py_type_check(value, &pyre_object::pyobject::INT_TYPE) {
-            eprintln!(
-                "[jit][{label}] result_ptr=0x{:x} kind=int intval={}",
-                value as usize,
-                pyre_object::intobject::w_int_get_value(value),
-            );
-        } else if pyre_object::pyobject::is_bool(value) {
-            eprintln!("[jit][{label}] result_ptr=0x{:x} kind=bool", value as usize,);
-        } else {
-            eprintln!(
-                "[jit][{label}] result_ptr=0x{:x} kind=other",
-                value as usize,
-            );
-        }
-    }
+    handle_jitexception(frame_root.frame())
 }
 
 /// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
@@ -7125,6 +7133,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
+    // Spend one unit of the recursion budget on this frame's activation, in
+    // case this loop was reached without going through `eval_with_jit_inner`.
+    // A frame the wrapper already accounted spends nothing here.
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame_root.frame());
     // Count this eval-loop activation for the GC safepoint's
     // at_outermost_activation gate (gh#393). The gate allows collection
     // at depth ≤ 2 (module + one called function) where the CALL opcode
@@ -7791,6 +7803,16 @@ fn handle_fail(
     // already gone, and bridge setup decodes resume data (allocating) before
     // `setup_bridge_sym` copies it onto the sym. Park it for the walker first.
     let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
+    // The exit values are a host copy of the JITFRAME slots; the JITFRAME's
+    // own gcmap rooting ended when `execute_token` returned. Bridge tracing
+    // below allocates, so root the Ref slots for this whole call
+    // (`DeadFrameRefRoots`).
+    let _deadframe_roots = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
+            exit_layout.exit_types.get(index) == Some(&majit_ir::Type::Ref)
+                || exit_layout.gc_ref_slots.contains(&index)
+        })
+    };
 
     // A failure reported through a retired/inlined source descr can belong to
     // an invalidated JitCellToken even while the outer entry token is still
@@ -8010,6 +8032,14 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // decode must not consume one. jd0 guards pass `false`.
     novable: bool,
 ) -> crate::call_jit::BlackholeResult {
+    // Same deadframe rooting as `handle_fail`: `decode_ref`'s TAGBOX arm reads
+    // these slots after the resume construction has already allocated.
+    let _deadframe_roots = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
+            exit_layout.exit_types.get(index) == Some(&majit_ir::Type::Ref)
+                || exit_layout.gc_ref_slots.contains(&index)
+        })
+    };
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
@@ -10373,8 +10403,22 @@ pub(crate) fn decode_and_restore_guard_failure(
         // (outer) frame's depth, and the matching pc value does not make it
         // correct.  Single-frame guards keep the prior `resume_pc != ni`
         // behavior.
+        //
+        // It addresses the PHYSICAL frame, so it applies only while the
+        // innermost section belongs to that frame's OWN code object.
+        // `consume_vable_info` (resume.py:1399-1408) writes the virtualizable
+        // from its own resume section and nothing re-points it at an inlined
+        // callee: a callee frame is a separate object the rebuild
+        // materializes, and its depth does not index the portal frame's
+        // `locals_cells_stack_w`.  Writing a foreign code object's depth here
+        // left the live frame BELOW its own stack base (`_Unframer.read`'s 3
+        // on `_Unpickler.load`, base 5), and the paired `clear_stack_above`
+        // then nulled two live locals.
         if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(code) = innermost.map(|f| f.code as usize) {
+            if let Some(code) = innermost
+                .map(|f| f.code as usize)
+                .filter(|&code| code == jit_state.pycode_as_usize())
+            {
                 if let Some(corrected_vsd) =
                     pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
                 {
@@ -11243,6 +11287,23 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
 /// RPython delegates to self.cpu (metainterp_sd.cpu) for allocation.
 pub(crate) struct PyreBlackholeAllocator;
 
+/// The write barrier every blackhole ref store owes its container.
+///
+/// `llmodel.py:723 bh_setfield_gc_r` reaches `:495 write_ref_at_mem`, where the
+/// framework GC transformer supplies the barrier around the store. These
+/// blackhole setters are plain Rust writes with no transformer and no inline
+/// `TRACK_YOUNG_PTRS` test, and `allocate_with_vtable` materializes a resumed
+/// virtual into the non-moving old generation, so a young value stored into one
+/// creates an old→young edge that never enters `old_objects_pointing_to_young`
+/// — and the next minor collection reclaims the value while the container still
+/// points at it.
+fn write_barrier_after_ref_store(container: i64) {
+    let container = container as *mut u8;
+    if pyre_object::gc_hook::try_gc_owns_object(container) {
+        pyre_object::gc_hook::try_gc_write_barrier(container);
+    }
+}
+
 /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` byte-write
 /// helper for integer and float fields. Ref fields use a pointer-width
 /// store in `bh_setfield_gc_r`, matching `llmodel.py:723`.
@@ -11476,9 +11537,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
         // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
         // ref store carries an implied write barrier on the destination struct.
-        if pyre_object::gc_hook::try_gc_owns_object(struct_ptr as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(struct_ptr as *mut u8);
-        }
+        write_barrier_after_ref_store(struct_ptr);
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
@@ -11552,9 +11611,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // llmodel.py:659 `bh_setinteriorfield_gc_r` → :495
         // `write_ref_at_mem`: the ref store carries an implied write barrier
         // on the destination array.
-        if array != 0 && pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(array as *mut u8);
-        }
+        write_barrier_after_ref_store(array);
     }
 
     fn bh_setinteriorfield_gc_f(

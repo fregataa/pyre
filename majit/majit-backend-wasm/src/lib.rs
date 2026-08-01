@@ -63,6 +63,18 @@ pub fn jit_execute_count() -> u64 {
     glue::jit_execute_count()
 }
 
+/// Number of host modules materialized after the lazy-install gate.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+pub fn jit_compile_count() -> u64 {
+    glue::jit_compile_count()
+}
+
+/// Number of materializations served by the byte-identical module cache.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+pub fn jit_compile_cache_hits() -> u64 {
+    glue::jit_compile_cache_hits()
+}
+
 #[inline]
 fn diag_bump(i: usize) {
     BRIDGE_DIAG[i].fetch_add(1, Ordering::Relaxed);
@@ -316,10 +328,12 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
+    majit_gc::set_active_gc_id_or_identityhash(Some(wasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_is_tracked(Some(wasm_is_tracked));
+    majit_gc::set_active_collect_full(Some(wasm_collect_full));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
     majit_gc::set_active_major_threshold_reached(Some(active_gc_major_threshold_reached));
@@ -476,6 +490,18 @@ fn jf_top_addr() -> Option<u32> {
         .filter(|&addr| addr != 0)
 }
 
+/// `majit_gc::CollectFullFn` installed by `register_active_hooks`. Drives
+/// `gc.collect()` (`interp_gc.py:7-26`) through the active GC. Without it
+/// `majit_gc::collect_full` has no hook to dispatch to and silently returns,
+/// so no major cycle ever runs on this backend and
+/// `deal_with_objects_with_finalizers` — which lives inside the major — never
+/// executes: no `__del__`, no generator `finally`, not even under an explicit
+/// `gc.collect()`. Mirrors dynasm's `dynasm_collect_full` and cranelift's
+/// `collect_full_via_active_runtime`.
+fn wasm_collect_full() {
+    with_wasm_active_gc_mut(|gc| gc.collect_full());
+}
+
 /// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
 /// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
 /// default-on on wasm) through the active GC. Needs mutable access, so it
@@ -498,6 +524,16 @@ fn wasm_get_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
 
 fn wasm_is_tracked(obj: GcRef) -> bool {
     with_wasm_active_gc_mut(|gc| gc.is_tracked(obj)).unwrap_or(false)
+}
+
+/// `minimark.py:1900-1915 id_or_identityhash` trampoline. The collector
+/// records a move-stable hash in its side table before the object can be
+/// relocated; the unhooked `majit_gc::gc_id_or_identityhash` fallback returns
+/// the raw address instead, which changes under the object when a minor
+/// collection moves it out of the nursery. Mirrors dynasm's
+/// `dynasm_id_or_identityhash`.
+fn wasm_id_or_identityhash(addr: usize) -> usize {
+    with_wasm_active_gc_mut(|gc| gc.id_or_identityhash(addr)).unwrap_or(addr)
 }
 
 fn wasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
@@ -846,12 +882,12 @@ fn build_callee_gcmap(
 /// # Safety
 /// Caller must keep `slot` valid until [`wasm_gc_remove_root`] is
 /// called with the same pointer.
-unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
+pub(crate) unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| unsafe { gc.add_root(slot) });
 }
 
 /// Companion to [`wasm_gc_add_root`].
-fn wasm_gc_remove_root(slot: *mut GcRef) {
+pub(crate) fn wasm_gc_remove_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| gc.remove_root(slot));
 }
 
@@ -1160,6 +1196,38 @@ impl WasmBackend {
         .unwrap_or_default()
     }
 
+    /// Pull every reference constant out of `ops` into a per-loop `GcTable`
+    /// and replace it with a `LoadFromGcTable` of its slot
+    /// (`majit_gc::rewrite::remove_ref_constants`, rewrite.py:106-116).
+    ///
+    /// A `GcRef` baked as a code immediate is invisible to the moving
+    /// collector: the first minor collection that promotes the referenced
+    /// object out of the nursery leaves the immediate pointing into nursery
+    /// space that is later reused or zeroed by `reset`. The table slot is a
+    /// GC root the collector forwards in place, so the emitted load always
+    /// reads the object at its current address. Returns `None` for a trace
+    /// with no reference constant, leaving the module byte-identical.
+    fn intern_ref_constants(
+        inputargs: &[InputArg],
+        ops: Vec<Op>,
+    ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
+        let next_pos = codegen::next_value_pos(inputargs, &ops);
+        let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, next_pos);
+        let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        (ops, table)
+    }
+
+    /// `x86/assembler.py:823` `gcreftracers.append(tracer)` — keep the
+    /// per-loop table alive for as long as the compiled trace that bakes its
+    /// base address. `LIVE_GC_TABLES` holds only a `Weak`, so this strong
+    /// reference is what keeps the slots rooted and forwardable.
+    fn register_gc_table(token: &JitCellToken, table: Arc<majit_gc::GcTable>) {
+        if let Some(clt) = token.compiled_loop_token() {
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
+        }
+    }
+
     /// Validate that every constant OpRef appearing as an arg is resolvable.
     ///
     /// Inline-Const variants (`ConstInt`/`ConstFloat`/
@@ -1315,7 +1383,7 @@ fn general_int_call_assembler_target(
             return None;
         }
         let target_token = descr.call_target_token()?;
-        let registered = call_assembler_target(target_token)?;
+        let mut registered = call_assembler_target(target_token)?;
         let target = if let Some(self_) = pending_self.as_ref().filter(|self_| {
             target_token == self_.token_number
                 // A self target must be precisely the placeholder installed
@@ -1350,6 +1418,25 @@ fn general_int_call_assembler_target(
                 has_trampoline_calls: false,
             }
         } else {
+            // A straight-line function trace may have deferred host module
+            // compilation. CALL_ASSEMBLER is its first real consumer, so
+            // materialize it before baking the stable dispatch entry.
+            if registered.func_handle == 0 && registered.compiled_ptr != 0 {
+                let loop_ =
+                    unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() }?;
+                let handle = loop_.materialize_func_handle().ok()?;
+                if handle == 0 {
+                    return None;
+                }
+                registered.func_handle = handle;
+                ca_dispatch_publish(
+                    target_token,
+                    handle,
+                    registered.loop_finish_fi,
+                    registered.compiled_ptr as u32,
+                );
+                publish_call_assembler_target(target_token, registered.clone());
+            }
             if registered.input_types.as_slice() != arg_types
                 || registered.callee_frame_bytes == 0
                 || registered.callee_gcmap_ptr == 0
@@ -1544,11 +1631,7 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
         .map(|i| unsafe { *frame.add(1 + i) })
         .collect();
     DeadFrame {
-        data: Box::new(WasmFrameData {
-            raw_values,
-            fail_descr,
-            exc_value,
-        }),
+        data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
     }
 }
 
@@ -1716,6 +1799,8 @@ impl majit_backend::Backend for WasmBackend {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
+        let (ops_owned, gc_table) = Self::intern_ref_constants(inputargs, ops_owned);
+        let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;
         // Freeze this token's generated frame layout before CA resolution.  A
         // self-recursive CALL_ASSEMBLER reaches this point while its token is
@@ -1723,9 +1808,11 @@ impl majit_backend::Backend for WasmBackend {
         // geometry for both the loop and each nursery-allocated self callee.
         let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
         let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
+        let label_ref_slots = codegen::label_ref_capture_slots(inputargs, ops);
         let frame = codegen::FrameGeometry::compact(
             raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
-            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES),
+            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES) + label_ref_slots,
+            label_ref_slots,
         );
         let input_types: Vec<majit_ir::Type> = inputargs.iter().map(|ia| ia.tp).collect();
         // Count with CA direct-lowering enabled.  This is the safety census
@@ -1794,6 +1881,7 @@ impl majit_backend::Backend for WasmBackend {
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 Arc::as_ptr(&token.invalidated) as usize as u32,
+                gc_table_base,
                 fail_index_base,
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
                 0, // external_jump_key: unused without an external JUMP
@@ -1837,6 +1925,9 @@ impl majit_backend::Backend for WasmBackend {
             })
             .collect();
         register_fail_descrs(&fail_descrs);
+        if let Some(table) = gc_table {
+            Self::register_gc_table(token, table);
+        }
 
         let max_output_slots = guard_exits
             .iter()
@@ -1845,10 +1936,28 @@ impl majit_backend::Backend for WasmBackend {
             .unwrap_or(0)
             .max(inputargs.len());
 
+        // Straight-line function-entry traces finish the current invocation
+        // concretely.  Do not ask the host to compile their wasm module until
+        // a later invocation actually enters the token: quasi-immutable
+        // invalidation can retire such a token before it ever executes (the
+        // module-global `except ... as e` stress case does exactly that).
+        // Loop-bearing and CALL_ASSEMBLER traces stay eager because their
+        // published label/CA targets need a live table slot immediately.
+        let defer_host_compile = !ops.iter().any(|op| {
+            op.opcode == majit_ir::OpCode::Label
+                || op.opcode == majit_ir::OpCode::Jump
+                || op.opcode.is_call_assembler()
+        });
+        let code_size = wasm_bytes.len();
+
         // Instantiate via the host binding on wasm32, or store bytes for
         // testing on native (no wasm host available).
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        let func_handle = glue::compile_module(&wasm_bytes);
+        let func_handle = if defer_host_compile {
+            0
+        } else {
+            glue::compile_module_cached(&wasm_bytes)
+        };
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let func_handle = 0u32; // Placeholder — no wasm host available
 
@@ -1861,7 +1970,7 @@ impl majit_backend::Backend for WasmBackend {
         // Decline the compile so the metainterp keeps the interpreter fallback —
         // a backend capability limit, reported like any other unsupported shape.
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        if func_handle == 0 {
+        if !defer_host_compile && func_handle == 0 {
             return Err(BackendError::Unsupported(
                 "wasm host rejected the compiled trace module (oversized function body \
                  or invalid module)"
@@ -1918,7 +2027,7 @@ impl majit_backend::Backend for WasmBackend {
         // arg count and the label's args are the complete live set of the
         // trace remainder.
         let label_num_args = codegen::label_arg_counts(ops);
-        let label_resume_safe = codegen::label_resume_safety(ops);
+        let label_resume_info = codegen::label_resume_info(inputargs, ops, frame);
         // Per-guard, per-fail-arg induction-advance flags for
         // `compile_bridge`'s livelock check (see `guard_fail_args_advanced`).
         let guard_fail_arg_advanced = guard_fail_args_advanced(ops, &guard_exits);
@@ -1944,7 +2053,8 @@ impl majit_backend::Backend for WasmBackend {
                         func_handle,
                         key: j as u32 + 1,
                         num_args: label_num_args[j],
-                        resume_safe: label_resume_safe[j],
+                        resume_safe: label_resume_info[j].0,
+                        requires_own_frame: label_resume_info[j].1,
                         is_last_label: j == last,
                         frame,
                     },
@@ -1966,6 +2076,7 @@ impl majit_backend::Backend for WasmBackend {
                         key: 0,
                         num_args: inputargs.len(),
                         resume_safe: true,
+                        requires_own_frame: false,
                         // No real ops precede a non-peeled loop's header, so
                         // an entry re-run lands at the header without any
                         // advancing segment — the livelock check applies.
@@ -1980,7 +2091,8 @@ impl majit_backend::Backend for WasmBackend {
             token_number: token.number,
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp).collect(),
-            func_handle,
+            func_handle: std::cell::Cell::new(func_handle),
+            pending_wasm_bytes: std::cell::RefCell::new(defer_host_compile.then_some(wasm_bytes)),
             fail_descrs: std::cell::RefCell::new(fail_descrs),
             num_inputs: inputargs.len(),
             max_output_slots,
@@ -2038,7 +2150,7 @@ impl majit_backend::Backend for WasmBackend {
         // modules load this stable entry at runtime.
         ca_dispatch_publish(
             token.number,
-            compiled.func_handle,
+            compiled.eager_func_handle(),
             loop_finish_fi,
             compiled as *const CompiledWasmLoop as usize as u32,
         );
@@ -2046,7 +2158,7 @@ impl majit_backend::Backend for WasmBackend {
             token.number,
             CallAssemblerTarget {
                 token_number: token.number,
-                func_handle: compiled.func_handle,
+                func_handle: compiled.eager_func_handle(),
                 input_types: compiled.input_types.clone(),
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
@@ -2063,7 +2175,7 @@ impl majit_backend::Backend for WasmBackend {
 
         Ok(AsmInfo {
             code_addr: 0,
-            code_size: wasm_bytes.len(),
+            code_size,
         })
     }
 
@@ -2100,6 +2212,9 @@ impl majit_backend::Backend for WasmBackend {
         // argument-recovery layout is needed — hence `caller_recovery_layout`
         // and `previous_tokens` are unused.
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
+        // A bridge gets its own table, like `compile_loop`'s.
+        let (ops_owned, gc_table) = Self::intern_ref_constants(inputargs, ops_owned);
+        let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;
         diag_bump(0); // compile_bridge entered
 
@@ -2128,7 +2243,7 @@ impl majit_backend::Backend for WasmBackend {
         // `original_token` is released before the `&mut self` codegen calls.
         let (
             source_guard,
-            source_is_direct,
+            source_ca_reentry_safe,
             source_func_handle,
             source_has_preamble,
             source_frame,
@@ -2152,36 +2267,43 @@ impl majit_backend::Backend for WasmBackend {
             // per-fail-arg advance flags. `None` = foreign trace (declined
             // below, diag 3).
             let is_direct = source_trace_id == source_loop.trace_id;
-            let guard = if is_direct {
-                Some((
-                    source_loop.bridge_cells_base,
-                    source_loop.num_guard_cells,
-                    source_loop
-                        .guard_fail_arg_advanced
-                        .get(source_fail_index as usize)
-                        .cloned()
-                        .unwrap_or_default(),
-                ))
+            let (guard, ca_reentry_safe) = if is_direct {
+                (
+                    Some((
+                        source_loop.bridge_cells_base,
+                        source_loop.num_guard_cells,
+                        source_loop
+                            .guard_fail_arg_advanced
+                            .get(source_fail_index as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )),
+                    true,
+                )
             } else {
-                source_loop
+                match source_loop
                     .chained_trace_meta
                     .borrow()
                     .get(&source_trace_id)
-                    .map(|m| {
-                        (
+                {
+                    Some(m) => (
+                        Some((
                             m.cells_base,
                             m.num_cells,
                             m.guard_fail_arg_advanced
                                 .get(source_fail_index as usize)
                                 .cloned()
                                 .unwrap_or_default(),
-                        )
-                    })
+                        )),
+                        m.ca_reentry_safe,
+                    ),
+                    None => (None, false),
+                }
             };
             (
                 guard,
-                is_direct,
-                source_loop.func_handle,
+                ca_reentry_safe,
+                source_loop.materialize_func_handle()?,
                 source_loop.has_preamble,
                 source_loop.frame,
                 source_loop.ca_active.get(),
@@ -2207,9 +2329,13 @@ impl majit_backend::Backend for WasmBackend {
                 "wasm backend: bridge source guard index has no dispatch cell".into(),
             ));
         }
-        // Keep CA bridges attached directly to their source loop. Nested
-        // bridge metadata is not yet published as a CALL_ASSEMBLER target.
-        let mut allow_ca = ca_candidate && source_is_direct;
+        // A nested bridge may compose CALL_ASSEMBLER only when its owning
+        // bridge published that it has no host-trampoline lowering.  Merely
+        // finding the nested guard's cell is insufficient: after a movable
+        // callee returns, a trampoline-bearing source would retain a stale
+        // frame pointer. Direct loop guards satisfy the same condition through
+        // the token-wide trampoline census below.
+        let mut allow_ca = ca_candidate && source_ca_reentry_safe;
         let ca_trampoline_decline = if allow_ca && source_has_trampoline_calls {
             Some(
                 "wasm backend: self-recursive CA source token or chained bridge \
@@ -2245,7 +2371,7 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_value_slots = codegen::frame_value_slots(inputargs, ops);
         let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
         if bridge_value_slots > source_frame.value_slots
-            || bridge_ref_homes > source_frame.home_slots
+            || bridge_ref_homes > source_frame.ordinary_home_slots()
             || (source_ca_active && bridge_has_trampoline_calls)
         {
             if source_ca_active && bridge_has_trampoline_calls {
@@ -2263,7 +2389,8 @@ impl majit_backend::Backend for WasmBackend {
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \
                  source frozen layout has values={}, homes={}",
-                source_frame.value_slots, source_frame.home_slots,
+                source_frame.value_slots,
+                source_frame.ordinary_home_slots(),
             )));
         }
 
@@ -2340,6 +2467,12 @@ impl majit_backend::Backend for WasmBackend {
                 }
                 Some(t) if !t.resume_safe => {
                     diag_bump(9); // label args not the full live set
+                    false
+                }
+                Some(t) if t.requires_own_frame && t.func_handle != source_func_handle => {
+                    // The target's high capture homes were populated by its
+                    // own fall-through path, not by this sibling source loop.
+                    diag_bump(9);
                     false
                 }
                 Some(t) if t.frame != source_frame => {
@@ -2505,6 +2638,7 @@ impl majit_backend::Backend for WasmBackend {
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 Arc::as_ptr(&bridge_flag) as usize as u32,
+                gc_table_base,
                 base,
                 // A loop-closing bridge's terminal JUMP re-enters the target
                 // loop (own or sibling, resolved via `LABEL_TARGETS`) through
@@ -2551,6 +2685,13 @@ impl majit_backend::Backend for WasmBackend {
                     .to_string(),
             ));
         }
+        // Only a bridge that survived the decline above gets its reference
+        // constants rooted. The table is attached to the long-lived original
+        // loop token, so rooting a rejected bridge's table would keep its
+        // constants alive permanently, once per rejected attempt.
+        if let Some(table) = gc_table {
+            Self::register_gc_table(original_token, table);
+        }
         diag_bump(5); // bridge compiled — chained in-module
 
         {
@@ -2589,6 +2730,7 @@ impl majit_backend::Backend for WasmBackend {
                     cells_base: bridge_cells_base,
                     num_cells: guard_exits.len(),
                     guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
+                    ca_reentry_safe: !bridge_has_trampoline_calls,
                 },
             );
             // The bridge module lives as long as this source loop, so hand its
@@ -2819,6 +2961,10 @@ impl majit_backend::Backend for WasmBackend {
             .expect("no compiled code")
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        let func_handle = compiled
+            .materialize_func_handle()
+            .expect("wasm backend failed to materialize a runnable trace");
 
         // Host entry allocates the complete frozen geometry, including the tail
         // call area. Chained bridges share these exact offsets; only CA callee
@@ -2892,7 +3038,7 @@ impl majit_backend::Backend for WasmBackend {
                 }
 
                 let saved = majit_gc::shadow_stack::push_jf(jf_ref);
-                glue::execute(compiled.func_handle, items_base as u32);
+                glue::execute(func_handle, items_base as u32);
 
                 let exc_value = jit_exc_take();
                 let fail_index = unsafe { *(items_base as *const i64) } as u32;
@@ -2920,11 +3066,7 @@ impl majit_backend::Backend for WasmBackend {
                 drop(gcmap);
 
                 return DeadFrame {
-                    data: Box::new(WasmFrameData {
-                        raw_values,
-                        fail_descr,
-                        exc_value,
-                    }),
+                    data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
                 };
             }
 
@@ -2950,7 +3092,7 @@ impl majit_backend::Backend for WasmBackend {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 unsafe { wasm_gc_add_root(slot) };
             }
-            glue::execute(compiled.func_handle, frame_ptr);
+            glue::execute(func_handle, frame_ptr);
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
@@ -2963,11 +3105,7 @@ impl majit_backend::Backend for WasmBackend {
             let num_outputs = fail_descr.fail_arg_types.len();
             let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
             DeadFrame {
-                data: Box::new(WasmFrameData {
-                    raw_values,
-                    fail_descr,
-                    exc_value,
-                }),
+                data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
             }
         }
     }
@@ -3082,6 +3220,29 @@ impl majit_backend::Backend for WasmBackend {
                 old.number, new.number
             )));
         }
+        if new_target.func_handle == 0 && new_target.compiled_ptr != 0 {
+            let new_loop = unsafe {
+                (new_target.compiled_ptr as *const CompiledWasmLoop)
+                    .as_ref()
+                    .expect("published CALL_ASSEMBLER target has a live compiled loop")
+            };
+            let handle = new_loop.materialize_func_handle()?;
+            #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+            if handle == 0 {
+                return Err(BackendError::Unsupported(format!(
+                    "call-assembler redirect to token {} could not materialize wasm code",
+                    new.number
+                )));
+            }
+            new_target.func_handle = handle;
+            ca_dispatch_publish(
+                new.number,
+                handle,
+                new_target.loop_finish_fi,
+                new_target.compiled_ptr as u32,
+            );
+            publish_call_assembler_target(new.number, new_target.clone());
+        }
         let movable_callee = new_target.callee_frame_bytes != 0
             && new_target.callee_gcmap_ptr != 0
             && new_target.compiled_ptr != 0
@@ -3125,9 +3286,37 @@ impl majit_backend::Backend for WasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_backend::Backend;
+    use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
+
+    #[test]
+    fn straightline_trace_defers_host_module_until_execution() {
+        let mut backend = WasmBackend::new();
+        let token = JitCellToken::new(1);
+        let finish = Op::new(majit_ir::OpCode::Finish, &[]);
+        finish.pos.set(majit_ir::OpRef::void_op(0));
+        finish.set_fail_arg_types(Vec::new());
+        finish.setfailargs(Vec::new().into());
+
+        backend
+            .compile_loop(&[], &[std::rc::Rc::new(finish)], &token)
+            .expect("compile straight-line wasm trace");
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+            .expect("compiled wasm metadata");
+
+        assert_eq!(compiled.eager_func_handle(), 0);
+        assert!(compiled.pending_wasm_bytes.borrow().is_some());
+
+        // Retiring an unentered token must leave the module unmaterialized;
+        // this is the exception/global-version invalidation-storm case.
+        token.invalidate();
+        assert_eq!(compiled.eager_func_handle(), 0);
+        assert!(compiled.pending_wasm_bytes.borrow().is_some());
+    }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr

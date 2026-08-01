@@ -963,9 +963,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "chmod",
         "fchmod",
         "lchmod",
-        "chown",
         "fchown",
-        "lchown",
         "access",
         "faccessat",
         "chflags",
@@ -1028,7 +1026,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "confstr_names",
         "sysconf",
         "sysconf_names",
-        "pathconf_names",
         "setenv",
         // putenv/unsetenv are implemented above unless the host environment is
         // out of reach.
@@ -1186,6 +1183,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     fn io_err(e: std::io::Error, path: &str) -> crate::PyError {
         errno_err(crate::builtins::io_error_posix_errno(&e, 0), path)
+    }
+
+    /// A filesystem name reported back to the caller: `bytes` when the path
+    /// argument was `bytes` (`posixmodule.c path_converter`), else `str`.
+    ///
+    /// The name arrives as raw bytes because bytes mode exists precisely for
+    /// entries the filesystem encoding cannot round-trip: `readdir`'s `d_name`
+    /// is handed back unchanged, so a name like `b"bad_\xff"` stays openable
+    /// instead of decoding to U+FFFD first.
+    fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
+        if bytes_mode {
+            pyre_object::bytesobject::w_bytes_from_bytes(name)
+        } else {
+            pyre_object::w_str_new(&String::from_utf8_lossy(name))
+        }
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──
@@ -1825,10 +1837,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "listdir",
         crate::make_builtin_function("listdir", |args| {
-            let path = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
-                ".".to_string()
+            // One resolution yields both the path and its bytes-ness, so
+            // `__fspath__` runs exactly once (`fsencode_w_with_kind`).
+            let (path, bytes_mode) = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
+                (".".to_string(), false)
             } else {
-                extract_path(args[0])?
+                crate::gateway::fsencode_w_with_kind(args[0])?
             };
             #[cfg(feature = "sandbox")]
             {
@@ -1836,7 +1850,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
                 let items = names
                     .into_iter()
-                    .map(|n| pyre_object::w_str_new(&String::from_utf8_lossy(&n)))
+                    .map(|n| fs_name_obj(bytes_mode, &n))
                     .collect();
                 return Ok(pyre_object::w_list_new(items));
             }
@@ -1847,7 +1861,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 for entry in entries {
                     let entry = entry.map_err(|e| io_err(e, &path))?;
                     let name = entry.file_name();
-                    items.push(pyre_object::w_str_new(&name.to_string_lossy()));
+                    items.push(fs_name_obj(bytes_mode, name.as_encoded_bytes()));
                 }
                 Ok(pyre_object::w_list_new(items))
             }
@@ -2244,6 +2258,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         extras.push(("st_flags", pyre_object::w_int_new(st.st_flags as i64)));
         crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
+    /// `os.stat(path, *, dir_fd=None, follow_symlinks=True)` /
+    /// `os.lstat(path, *, dir_fd=None)` — `follow_symlinks` is keyword-only,
+    /// so `stat` cannot take the fixed-arity carrier that rejects keywords.
+    /// `dir_fd` stays unimplemented (the `*at` family is absent from
+    /// `_have_functions`), so only `None` is accepted.
+    fn stat_entry(
+        args: &[pyre_object::PyObjectRef],
+        default_follow: bool,
+    ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+        let name = if default_follow { "stat" } else { "lstat" };
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        let allowed: &[&str] = if default_follow {
+            &["path", "dir_fd", "follow_symlinks"]
+        } else {
+            &["path", "dir_fd"]
+        };
+        crate::builtins::kwarg_reject_unknown(kwargs, allowed, name)?;
+        if pos.len() > 1 {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes at most 1 positional argument ({} given)",
+                pos.len()
+            )));
+        }
+        let path = match crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", name, 1)? {
+            Some(path) => path,
+            None => {
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() missing required argument 'path' (pos 1)"
+                )));
+            }
+        };
+        if let Some(dir_fd) = crate::builtins::kwarg_get(kwargs, "dir_fd")
+            && !unsafe { pyre_object::is_none(dir_fd) }
+        {
+            return Err(crate::PyError::not_implemented(format!(
+                "{name}: dir_fd unavailable on this platform"
+            )));
+        }
+        let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+            Some(v) => crate::baseobjspace::is_true(v)?,
+            None => default_follow,
+        };
+        stat_impl(&[path], follow_symlinks)
+    }
+
     fn stat_impl(
         args: &[pyre_object::PyObjectRef],
         follow_symlinks: bool,
@@ -2478,20 +2537,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let path = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
-            ".".to_string()
+        // One resolution yields both the path and its bytes-ness, so
+        // `__fspath__` runs exactly once (`fsencode_w_with_kind`).
+        let (path, bytes_mode) = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
+            (".".to_string(), false)
         } else {
-            crate::gateway::fsencode_w(args[0])?
+            crate::gateway::fsencode_w_with_kind(args[0])?
         };
         let entries = host_fs::read_dir(&path).map_err(|e| io_err(e, &path))?;
         let list = pyre_object::w_list_new(Vec::new());
         for entry in entries {
             let entry = entry.map_err(|e| io_err(e, &path))?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            let full = entry.path().to_string_lossy().to_string();
+            let name = entry.file_name();
+            let full = entry.path().into_os_string();
             let de = pyre_object::w_instance_new(dir_entry_type());
-            let _ = crate::baseobjspace::setattr_str(de, "name", pyre_object::w_str_new(&name));
-            let _ = crate::baseobjspace::setattr_str(de, "path", pyre_object::w_str_new(&full));
+            let _ = crate::baseobjspace::setattr_str(
+                de,
+                "name",
+                fs_name_obj(bytes_mode, name.as_encoded_bytes()),
+            );
+            let _ = crate::baseobjspace::setattr_str(
+                de,
+                "path",
+                fs_name_obj(bytes_mode, full.as_encoded_bytes()),
+            );
             unsafe { pyre_object::w_list_append(list, de) };
         }
         let it = pyre_object::w_instance_new(scandir_iter_type());
@@ -2568,12 +2637,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "stat",
-        crate::make_builtin_function_with_arity("stat", |args| stat_impl(args, true), 1),
+        crate::make_builtin_function("stat", |args| stat_entry(args, true)),
     );
     crate::module_ns_store(
         ns,
         "lstat",
-        crate::make_builtin_function_with_arity("lstat", |args| stat_impl(args, false), 1),
+        crate::make_builtin_function("lstat", |args| stat_entry(args, false)),
     );
     crate::module_ns_store(
         ns,
@@ -3804,6 +3873,126 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
+        // os.chown(path, uid, gid, *, dir_fd=None, follow_symlinks=True) -> None
+        // os.lchown(path, uid, gid) -> None
+        // `uid`/`gid` of -1 means "leave unchanged", as for fchown.
+        fn chown_entry(
+            args: &[pyre_object::PyObjectRef],
+            name: &str,
+            default_follow: bool,
+        ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+            use std::os::fd::BorrowedFd;
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            let allowed: &[&str] = if default_follow {
+                &["path", "uid", "gid", "dir_fd", "follow_symlinks"]
+            } else {
+                &["path", "uid", "gid"]
+            };
+            crate::builtins::kwarg_reject_unknown(kwargs, allowed, name)?;
+            if pos.len() > 3 {
+                // `chown` declares keyword-only `dir_fd`/`follow_symlinks`, so
+                // its surplus-positional report is the "positional arguments"
+                // form; `lchown` takes no keywords at all and reports the
+                // plain "arguments" form.
+                let surplus = if default_follow {
+                    format!(
+                        "{name}() takes exactly 3 positional arguments ({} given)",
+                        pos.len()
+                    )
+                } else {
+                    format!("{name}() takes at most 3 arguments ({} given)", pos.len())
+                };
+                return Err(crate::PyError::type_error(surplus));
+            }
+            // Every parameter is bound duplicate-aware, so a call that supplies
+            // one both ways raises before the ownership syscall runs.
+            let arg = |index: usize, key: &'static str| -> Result<PyObjectRef, crate::PyError> {
+                match crate::builtins::bind_pos_or_kw(pos, kwargs, index, key, name, index + 1)? {
+                    Some(value) => Ok(value),
+                    None => Err(crate::PyError::type_error(format!(
+                        "{name}() missing required argument '{key}' (pos {})",
+                        index + 1
+                    ))),
+                }
+            };
+            let (path_obj, uid_obj, gid_obj) =
+                (arg(0, "path")?, arg(1, "uid")?, arg(2, "gid")?);
+            // `posixmodule.c path_converter` calls `__fspath__` and lets what it
+            // raises out: a `RuntimeError` from a user `__fspath__` is that
+            // object's error, not a statement that the argument was the wrong
+            // type.  Rewriting every failure into a `TypeError` here would also
+            // swallow the `UnicodeEncodeError` a lone surrogate produces.
+            let path = extract_path(path_obj)?;
+            // `_Py_Uid_Converter` / `_Py_Gid_Converter`: `uid_t` is unsigned, yet
+            // -1 is always accepted as the "leave unchanged" sentinel.  Only
+            // that one value means unchanged; every other id is judged by
+            // round-tripping through `uid_t`, so nothing is silently wrapped —
+            // 2**32 truncates to 0 and would otherwise request uid 0.
+            //
+            // The two range reports follow the C converter's own split: a value
+            // that still fits a C long but fails the round trip is "less than
+            // minimum" (including 2**32, whose truncation reads as underflow),
+            // while one too wide for a long is "greater than maximum".
+            let id_of =
+                |w: pyre_object::PyObjectRef, what: &str| -> Result<Option<u32>, crate::PyError> {
+                    if !unsafe { crate::builtins::index_check(w) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "{what} should be integer, not {}",
+                            crate::type_methods::arg_type_name(w)
+                        )));
+                    }
+                    let w_index = crate::baseobjspace::space_index(w)?;
+                    let raw = crate::baseobjspace::int_w(w_index).map_err(|_| {
+                        crate::PyError::overflow_error(format!("{what} is greater than maximum"))
+                    })?;
+                    if raw == -1 {
+                        return Ok(None);
+                    }
+                    let narrowed = raw as u32;
+                    if i64::from(narrowed) != raw {
+                        return Err(crate::PyError::overflow_error(format!(
+                            "{what} is less than minimum"
+                        )));
+                    }
+                    Ok(Some(narrowed))
+                };
+            let (uid, gid) = (id_of(uid_obj, "uid")?, id_of(gid_obj, "gid")?);
+            if let Some(dir_fd) = crate::builtins::kwarg_get(kwargs, "dir_fd")
+                && !unsafe { pyre_object::is_none(dir_fd) }
+            {
+                return Err(crate::PyError::not_implemented(format!(
+                    "{name}: dir_fd unavailable on this platform"
+                )));
+            }
+            let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                Some(v) => crate::baseobjspace::is_true(v)?,
+                None => default_follow,
+            };
+            // `fchownat` with `AT_FDCWD` is the `chown` / `lchown` pair:
+            // the flagless call follows the final symlink, `AT_SYMLINK_NOFOLLOW`
+            // does not.
+            let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+            host_posix::fchownat(
+                cwd,
+                std::ffi::OsStr::new(path.as_str()),
+                uid,
+                gid,
+                follow_symlinks,
+            )
+            .map_err(|e| io_err(e, &path))?;
+            Ok(pyre_object::w_none())
+        }
+        crate::module_ns_store(
+            ns,
+            "chown",
+            crate::make_builtin_function("chown", |args| chown_entry(args, "chown", true)),
+        );
+        crate::module_ns_store(
+            ns,
+            "lchown",
+            crate::make_builtin_function("lchown", |args| chown_entry(args, "lchown", false)),
+        );
+
         // os.fchown(fd, uid, gid) -> None  (uid/gid of -1 means "leave unchanged")
         crate::module_ns_store(
             ns,
@@ -4520,6 +4709,113 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             pyre_object::w_int_new(libc::PRIO_USER as i64),
         );
 
+        // `posixmodule.c` `pathconf_names` — the `_PC_*` table
+        // `conv_path_confname` resolves a string `name` argument through.
+        // `libc` exports the constants only on the BSD family, so the glibc
+        // values (`bits/confname.h`) are spelled out for Linux.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const PATHCONF_NAMES: &[(&str, i32)] = &[
+            ("PC_ALLOC_SIZE_MIN", libc::_PC_ALLOC_SIZE_MIN),
+            ("PC_ASYNC_IO", libc::_PC_ASYNC_IO),
+            ("PC_CHOWN_RESTRICTED", libc::_PC_CHOWN_RESTRICTED),
+            ("PC_FILESIZEBITS", libc::_PC_FILESIZEBITS),
+            ("PC_LINK_MAX", libc::_PC_LINK_MAX),
+            ("PC_MAX_CANON", libc::_PC_MAX_CANON),
+            ("PC_MAX_INPUT", libc::_PC_MAX_INPUT),
+            ("PC_MIN_HOLE_SIZE", libc::_PC_MIN_HOLE_SIZE),
+            ("PC_NAME_MAX", libc::_PC_NAME_MAX),
+            ("PC_NO_TRUNC", libc::_PC_NO_TRUNC),
+            ("PC_PATH_MAX", libc::_PC_PATH_MAX),
+            ("PC_PIPE_BUF", libc::_PC_PIPE_BUF),
+            ("PC_PRIO_IO", libc::_PC_PRIO_IO),
+            ("PC_REC_INCR_XFER_SIZE", libc::_PC_REC_INCR_XFER_SIZE),
+            ("PC_REC_MAX_XFER_SIZE", libc::_PC_REC_MAX_XFER_SIZE),
+            ("PC_REC_MIN_XFER_SIZE", libc::_PC_REC_MIN_XFER_SIZE),
+            ("PC_REC_XFER_ALIGN", libc::_PC_REC_XFER_ALIGN),
+            ("PC_SYMLINK_MAX", libc::_PC_SYMLINK_MAX),
+            ("PC_SYNC_IO", libc::_PC_SYNC_IO),
+            ("PC_VDISABLE", libc::_PC_VDISABLE),
+        ];
+        #[cfg(target_os = "linux")]
+        const PATHCONF_NAMES: &[(&str, i32)] = &[
+            ("PC_2_SYMLINKS", 20),
+            ("PC_ALLOC_SIZE_MIN", 18),
+            ("PC_ASYNC_IO", 10),
+            ("PC_CHOWN_RESTRICTED", 6),
+            ("PC_FILESIZEBITS", 13),
+            ("PC_LINK_MAX", 0),
+            ("PC_MAX_CANON", 1),
+            ("PC_MAX_INPUT", 2),
+            ("PC_NAME_MAX", 3),
+            ("PC_NO_TRUNC", 7),
+            ("PC_PATH_MAX", 4),
+            ("PC_PIPE_BUF", 5),
+            ("PC_PRIO_IO", 11),
+            ("PC_REC_INCR_XFER_SIZE", 14),
+            ("PC_REC_MAX_XFER_SIZE", 15),
+            ("PC_REC_MIN_XFER_SIZE", 16),
+            ("PC_REC_XFER_ALIGN", 17),
+            ("PC_SOCK_MAXBUF", 12),
+            ("PC_SYMLINK_MAX", 19),
+            ("PC_SYNC_IO", 9),
+            ("PC_VDISABLE", 8),
+        ];
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+        const PATHCONF_NAMES: &[(&str, i32)] = &[];
+        let _pathconf_roots = pyre_object::gc_roots::push_roots();
+        let names_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+        for (name, value) in PATHCONF_NAMES {
+            // The value is allocated before the store, and the dict is reloaded
+            // from its root slot every iteration because the insert itself can
+            // grow — and so relocate — the dict.
+            let w_value = pyre_object::w_int_new(*value as i64);
+            unsafe {
+                pyre_object::w_dict_setitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(names_slot),
+                    name,
+                    w_value,
+                )
+            };
+        }
+        crate::module_ns_store(
+            ns,
+            "pathconf_names",
+            pyre_object::gc_roots::shadow_stack_get(names_slot),
+        );
+
+        /// `posixmodule.c conv_path_confname`: an `int` passes through, a
+        /// `str` is resolved through `pathconf_names`.
+        fn confname_arg(w: PyObjectRef) -> Result<i32, crate::PyError> {
+            if unsafe { pyre_object::is_str(w) } {
+                // A str carrying a lone surrogate has no `&str` view.  It simply
+                // matches no known name, which is the ValueError below — not an
+                // interpreter abort, which is what reading the value unchecked
+                // would produce.
+                let name = unsafe { pyre_object::w_str_get_value_opt(w) };
+                return name
+                    .and_then(|name| {
+                        PATHCONF_NAMES
+                            .iter()
+                            .find(|(known, _)| *known == name)
+                            .map(|(_, value)| *value)
+                    })
+                    .ok_or_else(|| {
+                        crate::PyError::value_error("unrecognized configuration name")
+                    });
+            }
+            // `conv_confname` gates on `PyIndex_Check` before converting, so an
+            // object that is neither a str nor index-able is this TypeError,
+            // while an `__index__` that raises propagates its own exception.
+            if !unsafe { crate::builtins::index_check(w) } {
+                return Err(crate::PyError::type_error(
+                    "configuration names must be strings or integers",
+                ));
+            }
+            let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(w)?)?;
+            Ok(value as i32)
+        }
+
         // os.pathconf(path, name) -> int | None
         crate::module_ns_store(
             ns,
@@ -4534,7 +4830,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let cpath = std::ffi::CString::new(path.as_bytes()).map_err(|_| {
                         crate::PyError::value_error("pathconf: embedded null in path")
                     })?;
-                    let name = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                    let name = confname_arg(args[1])?;
                     match host_posix::pathconf(&cpath, name).map_err(|e| io_err(e, ""))? {
                         Some(v) => Ok(pyre_object::w_int_new(v as i64)),
                         None => Ok(pyre_object::w_none()),
@@ -4555,7 +4851,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("fpathconf() requires fd, name"));
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                    let name = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                    let name = confname_arg(args[1])?;
                     match host_posix::fpathconf(fd, name).map_err(|e| io_err(e, ""))? {
                         Some(v) => Ok(pyre_object::w_int_new(v as i64)),
                         None => Ok(pyre_object::w_none()),

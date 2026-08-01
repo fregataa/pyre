@@ -146,6 +146,10 @@ pub(crate) enum WalkEndCommitLeg {
     /// converted to blackhole frames and run forward, never replayed from the
     /// trace entry.
     TraceTooLong = 9,
+    /// A bridge carrier sub-walk stopped on a walker capability gap after
+    /// concrete-executing the reconstructed callee: its frames were converted
+    /// and run forward instead of the drain rewinding to the guard.
+    CarrierAbort = 10,
 }
 
 /// Where a committing leg puts the interpreter, relative to the effects the
@@ -1632,6 +1636,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
+    // A prior walk's blackhole image must not be adopted as this drain's
+    // continuation; the sub-walks below latch their own.
+    crate::jitcode_dispatch::reset_single_frame_blackhole();
+    // Odometer baseline for the abort tail: the drain may only rewind to the
+    // guard while the reconstructed frames it drove executed nothing
+    // irreversible.
+    let effects_at_entry = crate::jitcode_dispatch::fbw_executed_effect_count();
 
     let root_ec = sym.concrete_execution_context();
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
@@ -1903,14 +1914,45 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
     }
 
+    // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` →
+    // `blackhole.py:1799 convert_and_run_from_pyjitpl`.  The sub-walk above is
+    // the reconstructed callee's ONE real execution (`drive_bridge_frame_subwalk`
+    // is an authoritative executor), so once its odometer has moved the drain
+    // may not hand the guard back to a blackhole resume from `rd_numb`: the
+    // store journal unwinds the eager stores, but nothing unwinds a residual
+    // call that wrote the heap or entered a Python frame, and the guard resume
+    // re-runs the callee from the same coordinate.  Upstream has no such
+    // rewind — `_handle_guard_failure` ends `assert False, "should always
+    // raise"` (`pyjitpl.py:2956`).  Drive the frames the sub-walk reached
+    // instead; they were latched at its stop coordinate.
+    //
+    // Ordering: adopt BEFORE `discard_bridge_carrier_walk`, whose
+    // `carrier_ec_leave` closes the scopes the chain's frames still belong to.
+    // A declined adopt leaves everything to the rollback below, which is the
+    // pre-existing behaviour.
+    let live_root_addr = sym.live_vable_frame_addr();
+    let adopted = crate::jitcode_dispatch::fbw_executed_effect_count() != effects_at_entry
+        && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::CarrierAbort);
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!(
+            "[p2-drain-abort] effects={} adopted={adopted}",
+            crate::jitcode_dispatch::fbw_executed_effect_count() - effects_at_entry,
+        );
+    }
     discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
-    // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
-    // callee, and the blackhole replays it from the guard, so restore the
-    // pre-walk heap rather than dropping the journals (which would leave every
-    // eager store standing to be applied a second time).
-    crate::jitcode_dispatch::fbw_store_journal_rollback();
+    if adopted {
+        // The chain ran the callee forward from where the sub-walk stopped, so
+        // the eager stores it journaled stand exactly once.
+        crate::jitcode_dispatch::fbw_store_journal_commit();
+    } else {
+        // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
+        // callee, and the blackhole replays it from the guard, so restore the
+        // pre-walk heap rather than dropping the journals (which would leave every
+        // eager store standing to be applied a second time).
+        crate::jitcode_dispatch::fbw_store_journal_rollback();
+    }
     p2_drain_abort()
 }
 
@@ -2478,6 +2520,7 @@ fn try_adopt_multi_frame_blackhole(
         };
     }
     let Some(mut latched) = crate::jitcode_dispatch::take_multi_frame_blackhole() else {
+        mfdbg!("no latched multi-frame image");
         return false;
     };
     let depth = latched.framestack.len();
@@ -3673,22 +3716,22 @@ fn run_perfn_walk<Sym: WalkSym>(
                 &walk_result,
                 Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
             ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
-        let force_blackhole_adopted =
-            matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        let vable_escaped = matches!(
+            &walk_result,
+            Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+        );
+        let force_blackhole_adopted = vable_escaped
+            && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        let mut escape_pc_adopted = false;
         if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
         }
         if !force_blackhole_adopted
-            && matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            )
+            && vable_escaped
             && let Some((resume_py_pc, escape_kind)) =
                 crate::jitcode_dispatch::take_committed_frame_escape_pc()
         {
+            escape_pc_adopted = true;
             // BOTH flushes inside `flush_active_frame_escape` rewind: they take
             // the same `py_pc` and the same `last_instr = pc - 1`, so the
             // escaping opcode re-runs either way.  They differ in whether the
@@ -3738,6 +3781,21 @@ fn run_perfn_walk<Sym: WalkSym>(
                     );
                 }
             }
+        }
+        // The force arm withdrew its commit and DEFERRED the frame restore to
+        // here.  Neither continuation that keeps the flushed frame ran, so the
+        // walk falls back to replaying the traced region from its entry: put
+        // the pre-flush locals / operand stack / resume coordinate back so the
+        // replay re-derives them instead of compounding onto the walk's
+        // mid-region values.  When a blackhole terminal or a committed escape
+        // pc DID take over, the flush stands — `virtualizable.py:101-138
+        // write_boxes` has no undo once the vable is forced, and the resumed
+        // interpreter reads its fastlocals straight out of that array.
+        if crate::jitcode_dispatch::take_escape_flush_undo_pending()
+            && !force_blackhole_adopted
+            && !escape_pc_adopted
+        {
+            crate::jitcode_dispatch::restore_escape_flush_undo();
         }
         let call_forward_abort = match &walk_result {
             Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {

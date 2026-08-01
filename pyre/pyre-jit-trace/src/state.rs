@@ -4791,6 +4791,71 @@ fn flush_walk_end_state_to_frame_inner(
     true
 }
 
+/// Write back ONLY the locals/cells region (absolute slots `0..nlocals`) from
+/// the virtualizable shadow, leaving the operand-stack region,
+/// `valuestackdepth` and `last_instr` untouched.
+///
+/// `virtualizable.py:101-138 write_boxes` writes the whole array on every
+/// force, with no way to decline: a callee handed the frame reads its
+/// fastlocals straight out of the array (`pyframe.py:548-552 fast2locals`), and
+/// an unforced array of nulls renders as an EMPTY `f_locals` mapping — a wrong
+/// answer, not a stale one.  The merge-point flush cannot carry that on its
+/// own because it is all-or-nothing across the operand stack too, and a
+/// mid-expression stack slot reads NULL from the shadow, declining the whole
+/// write.  The locals region has no such hazard: a NULL local is a legitimate
+/// unbound local.
+///
+/// Resume-pc authority stays with the full flush — this writes state only, so
+/// the caller keeps the escape-flush undo armed and a legacy replay from the
+/// trace entry still re-enters the pre-flush frame.
+pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
+    if frame == 0 {
+        return false;
+    }
+    let Some(nlocals) = concrete_nlocals(frame) else {
+        return false;
+    };
+    let Some(info) = ctx.virtualizable_info() else {
+        return false;
+    };
+    let base = info.num_static_extra_boxes;
+    // Validation pass first: it allocates nothing, so a missing entry leaves
+    // the frame untouched (same all-or-nothing discipline as the full flush).
+    // `Value::Void` is the shadow's "no concrete half" sentinel, not a NULL
+    // local: writing it back would box to `PY_NULL` and DESTROY the slot the
+    // walk is holding in a register.  Decline instead.
+    for abs in 0..nlocals {
+        match ctx.virtualizable_entry_at(base + abs) {
+            Some((_, Value::Void)) | None => return false,
+            Some(_) => {}
+        }
+    }
+    let frame_ptr = frame as *const u8;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
+        return false;
+    }
+    for abs in 0..nlocals {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+        // Boxing an Int/Float slot allocates, and each minor collection
+        // consumes the array's remembered-set entry, so re-arm per store.
+        frame_array_write_barrier(frame as *mut u8, arr_ptr);
+    }
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!("[fbw-flush] locals-region written: nlocals={nlocals}");
+    }
+    true
+}
+
 /// gh#467 forward-flush AT an inlined-callee CALL boundary.  When an
 /// supported abort fires inside an inline sub-walk whose callee executed no
 /// concrete effect, the outer frame is flushed as of the CALL that
@@ -13567,6 +13632,61 @@ pub(crate) fn setup_reconstructed_callee_frame(
         w_globals_const,
         ec_const,
     );
+    // `perform_call` gives every MIFrame a real recording-time frame object
+    // before `setup_call` installs its argument boxes (`pyjitpl.py:2445-2476`),
+    // and the forward-inline callee mirrors that with a GC-managed `FrameBox`
+    // whose pointer is stamped onto the emitted vable
+    // (`inline_call.rs:3551-3569`).  The reconstructed carrier callee needs the
+    // same object: its residual calls run through
+    // `execute_inline_residual_call(frame, nargs)`, and the abort image names
+    // this framestack level by its frame pointer.  A vable with no concrete
+    // makes both decline — the residual call on its frame argument, and the
+    // blackhole preflight on the unset frame pointer — so the drain aborts
+    // after its sub-walk already executed a side effect and the rollback to the
+    // guard then replays it.
+    if !w_code.is_null() {
+        // `FrameBox::new` allocates, so the slot values captured at guard
+        // failure must be forwarded through real shadow-stack slots first
+        // (`gctransform/framework.py` push_roots/pop_roots around a collection
+        // point).  Mirror the vable image exactly: a slot with no box is the
+        // `NewArrayClear` zero-fill, i.e. an unbound local, and stays PY_NULL.
+        let arg_roots = pyre_object::gc_roots::push_roots();
+        let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
+        for (k, &opref) in locals_boxes.iter().enumerate() {
+            let obj = match recipe.concrete_r.get(k) {
+                Some(&majit_ir::Value::Ref(majit_ir::GcRef(ptr)))
+                    if ptr != 0 && !opref.is_none() =>
+                {
+                    ptr as pyre_object::PyObjectRef
+                }
+                _ => PY_NULL,
+            };
+            pyre_object::gc_roots::pin_root(obj);
+        }
+        let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..locals_boxes.len())
+            .map(|k| pyre_object::gc_roots::shadow_stack_get(arg_root_base + k))
+            .collect();
+        let mut frame = pyre_interpreter::pyframe::FrameBox::new(
+            pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+                w_code,
+                &concrete_locals,
+                w_globals,
+                execution_context,
+                PY_NULL,
+                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            ),
+        );
+        drop(arg_roots);
+        let concrete_frame_ptr = frame.as_mut_ptr();
+        ctx.set_opref_concrete(
+            frame_vable,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+        );
+        // GC-managed `FrameBox::drop` relinquishes only the host handle; the
+        // frontend op above keeps the frame reachable through
+        // `MetaInterp::walk_active_trace_refs`.
+        drop(frame);
+    }
 
     // pyjitpl.py:2445-2476 perform_call creates a concrete frame alongside
     // the callee MIFrame before setup_call installs its boxes. A bridge resume

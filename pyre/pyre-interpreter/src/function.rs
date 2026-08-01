@@ -760,6 +760,26 @@ pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// `meth_repr` — the receiver decides the wording, not how the carrier is
+/// spelled: a null or module `m_self` reports as a plain function, anything
+/// else as a method of that receiver.  A `__new__` entry carries its owning
+/// type, so it reads `<built-in method __new__ of type object at 0x...>`.
+///
+/// # Safety
+/// `w_self` must be null or a valid object pointer.
+pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> String {
+    let bound = !w_self.is_null()
+        && !unsafe { pyre_object::is_none(w_self) }
+        && !unsafe { pyre_object::is_module(w_self) };
+    if !bound {
+        return format!("<built-in function {name}>");
+    }
+    let type_name = crate::typedef::r#type(w_self)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+        .unwrap_or("object");
+    format!("<built-in method {name} of {type_name} object at {w_self:p}>")
+}
+
 /// CPython 3.14 `meth_reduce`: type-bound builtins reconstruct through
 /// `getattr(__self__, __name__)`; module-level builtins reduce by qualname.
 pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult {
@@ -2813,8 +2833,6 @@ fn _flat_pycall(
     frame: &mut crate::pyframe::PyFrame,
     dropvalues: usize,
 ) -> PyObjectRef {
-    // call.rs:423-424 parity — increment call depth for JIT depth tracking.
-    let _depth_guard = crate::call::increment_call_depth();
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -2844,6 +2862,14 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
+    // The callee's locals array is old-gen (`OldGenGc`) and the arguments
+    // just written into it are young. RPython's GC transform emits the
+    // old-to-young `write_barrier` (minimark.py:1065) after such a store;
+    // pyre has no transform pass, so the batch barrier runs here. Until the
+    // callee frame is installed on the `f_backref` chain nothing else exposes
+    // these slots, so a minor collection before then would leave every
+    // argument stale.
+    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -2888,7 +2914,6 @@ fn _flat_pycall_defaults(
     defs_to_load: usize,
     dropvalues: usize,
 ) -> PyObjectRef {
-    let _depth_guard = crate::call::increment_call_depth();
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -2928,6 +2953,9 @@ fn _flat_pycall_defaults(
         }
     }
 
+    // Same old-to-young barrier as `_flat_pycall`: positional arguments and
+    // defaults were written into the callee's old-gen locals array.
+    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 

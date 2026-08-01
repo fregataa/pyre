@@ -188,17 +188,7 @@ impl OperationError {
     ) -> Result<PyObjectRef, PyError> {
         let w_type = crate::baseobjspace::exception_getclass(w_inst);
         if w_type.is_null() || !unsafe { crate::baseobjspace::exception_is_valid_class_w(w_type) } {
-            let constructor = unsafe { crate::display::py_repr(w_constructor) }
-                .unwrap_or_else(|_| "<exception class>".to_string());
-            let returned_type = if w_type.is_null() {
-                "<unknown type>".to_string()
-            } else {
-                unsafe { crate::display::py_repr(w_type) }
-                    .unwrap_or_else(|_| "<unknown type>".to_string())
-            };
-            return Err(PyError::type_error(format!(
-                "calling {constructor} should have returned an instance of BaseException, not {returned_type}"
-            )));
+            return Err(exception_from_call_type_error(w_constructor, w_inst));
         }
         Ok(w_type)
     }
@@ -245,6 +235,25 @@ impl OperationError {
         }
         Ok(())
     }
+}
+
+/// The TypeError raised when instantiating a raised exception class yields
+/// something that is not a `BaseException` instance:
+/// "calling C should have returned an instance of BaseException, not T".
+/// A direct `raise non_exception`, which never calls a constructor, keeps
+/// the ordinary "exceptions must derive from BaseException" wording.
+pub fn exception_from_call_type_error(w_constructor: PyObjectRef, w_inst: PyObjectRef) -> PyError {
+    let constructor = unsafe { crate::display::py_repr(w_constructor) }
+        .unwrap_or_else(|_| "<exception class>".to_string());
+    let w_type = crate::baseobjspace::exception_getclass(w_inst);
+    let returned_type = if w_type.is_null() {
+        "<unknown type>".to_string()
+    } else {
+        unsafe { crate::display::py_repr(w_type) }.unwrap_or_else(|_| "<unknown type>".to_string())
+    };
+    PyError::type_error(format!(
+        "calling {constructor} should have returned an instance of BaseException, not {returned_type}"
+    ))
 }
 
 /// `pypy/interpreter/error.py:478-509 _break_context_cycle` parity —
@@ -560,6 +569,22 @@ impl PyError {
 
     pub fn value_error(msg: impl Into<String>) -> Self {
         Self::new(PyErrorKind::ValueError, msg)
+    }
+
+    /// Retag the materialised exception to a subclass that shares its
+    /// layout, the way `os_error_family_new` picks the errno subclass:
+    /// the `ExcKind` (and so the storage) stays put and only `w_class`
+    /// moves.  Used for `IndentationError` / `TabError`, which are
+    /// `SyntaxError` subclasses with no storage of their own.
+    pub fn retag_exception_class(&mut self, class_name: &str) {
+        if self.exc_object.is_null() {
+            return;
+        }
+        if let Some(w_target) = crate::builtins::lookup_exc_class(class_name) {
+            unsafe {
+                (*(self.exc_object as *mut pyre_object::PyObject)).w_class = w_target;
+            }
+        }
     }
 
     pub fn syntax_error(msg: impl Into<String>) -> Self {
@@ -888,6 +913,41 @@ impl PyError {
     /// platform message is superseded by the errno-derived strerror.
     pub fn os_error_with_errno(errno: i32, _msg: impl Into<String>) -> Self {
         Self::os_error_syscall(errno, pyre_object::PY_NULL)
+    }
+
+    /// `PyErr_SetFromErrno(exc)` for an exception class outside the OSError
+    /// family: `args` becomes the same `(errno, strerror)` pair, but with no
+    /// `__str__` override to fold it into `"[Errno N] strerror"` the message
+    /// is the args tuple's own repr — `OverflowError: (34, 'Result too
+    /// large')`.  A libm `ERANGE` out of `float.__pow__` is reported this way;
+    /// `floatobject.py:941` instead raises a plain `"float power"` message,
+    /// which 3.14 does not produce.
+    pub fn errno_pair(kind: PyErrorKind, exc_kind: ExcKind, errno: i32) -> Self {
+        let strerror = Self::clean_strerror(errno);
+        // Root the fresh exception across the args allocations: `exc` lives
+        // only in this Rust local while `w_int_new` / `w_str_new` /
+        // `w_list_new` run, so a collection there could sweep the unrooted
+        // exception before `w_exception_set_args` writes through it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc = w_exception_new(exc_kind, &strerror);
+        pyre_object::gc_roots::pin_root(exc);
+        let args_list = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(errno as i64),
+            pyre_object::w_str_new(&strerror),
+        ]);
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+        PyError {
+            kind,
+            // Leave the display message empty so `message_text` derives it
+            // from `exc_object`, whose `descr_str` renders the two-element
+            // `args` as a tuple repr rather than as a bare string.
+            message: String::new(),
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
     }
 
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
@@ -1503,20 +1563,26 @@ pub fn write_exception<W: Write>(
     err: &PyError,
     include_traceback: bool,
 ) -> std::io::Result<()> {
-    if include_traceback {
-        // `traceback.py:171-194` __cause__ / __context__ chain
-        // printing.  Recurse into the older exception first, emit
-        // the bridging banner, then print the current exception.
-        if !err.exc_object.is_null() {
-            write_chained_context(writer, err.exc_object)?;
-        }
-        writeln!(writer, "Traceback (most recent call last):")?;
-        write_traceback_chain(writer, err)?;
-        writeln!(writer, "{}", err.render_exception())?;
-        write_exception_notes(writer, err.exc_object)
-    } else {
-        writeln!(writer, "{}", err.render_exception())
+    if !include_traceback {
+        return writeln!(writer, "{}", err.render_exception());
     }
+    if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) } {
+        // The instance carries the whole report: the cause/context chain, the
+        // group tree, the notes and the suggestion suffix all hang off it, so
+        // render it through the same structured walk `_PyErr_Display` uses
+        // rather than re-deriving a flat header here.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(err.exc_object);
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        let mut context = ExceptionPrintContext::new(exc);
+        return write_exception_object_recursive(writer, exc, &mut context);
+    }
+    // A Rust-side error that never materialised an instance carries no chain,
+    // no group and no frame list — only the header.
+    writeln!(writer, "Traceback (most recent call last):")?;
+    write_traceback_chain(writer, err)?;
+    writeln!(writer, "{}", err.render_exception())
 }
 
 /// CPython 3.14 `_PyErr_Display(file, exc_type, exc_value, exc_tb)` shape used
@@ -2459,11 +2525,35 @@ fn write_traceback_chain_from_exc<W: Write>(
     write_traceback_chain_from_tb(writer, tb)
 }
 
+/// `traceback.py:_RECURSIVE_CUTOFF` — a frame repeating the same
+/// `(filename, lineno, name)` is printed at most this many times before the
+/// rest collapse into a single `[Previous line repeated N more times]`.
+const RECURSIVE_CUTOFF: usize = 3;
+
+/// `traceback.py:StackSummary.format` collapse line, emitted when a run of
+/// identical frames just ended (or the walk finished on one).  A run at or
+/// below the cutoff was printed in full and needs no marker.
+fn write_repeated_frames<W: Write>(writer: &mut W, count: usize) -> std::io::Result<()> {
+    if count <= RECURSIVE_CUTOFF {
+        return Ok(());
+    }
+    let count = count - RECURSIVE_CUTOFF;
+    let plural = if count > 1 { "s" } else { "" };
+    writeln!(
+        writer,
+        "  [Previous line repeated {count} more time{plural}]"
+    )
+}
+
 fn write_traceback_chain_from_tb<W: Write>(
     writer: &mut W,
     mut tb: PyObjectRef,
 ) -> std::io::Result<()> {
     let _roots = pyre_object::gc_roots::push_roots();
+    // `StackSummary.format` dedup state: the previous frame's identity and how
+    // many consecutive frames have carried it.
+    let mut last: Option<(String, i64, String)> = None;
+    let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(tb);
@@ -2503,12 +2593,44 @@ fn write_traceback_chain_from_tb<W: Write>(
                 )
             }
         };
+        let key = (filename, lineno, funcname);
+        if last.as_ref() != Some(&key) {
+            write_repeated_frames(writer, repeats)?;
+            last = Some(key.clone());
+            repeats = 0;
+        }
+        repeats += 1;
+        if repeats > RECURSIVE_CUTOFF {
+            let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
+            tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(current_tb) };
+            continue;
+        }
+        let (filename, lineno, funcname) = key;
         writeln!(
             writer,
             "  File \"{}\", line {}, in {}",
             filename, lineno, funcname
         )?;
-        if let Some(line) = read_source_line(&filename, lineno) {
+        // `FrameSummary._set_lines` collects every line the failing
+        // instruction spans, so a statement written across several lines (a
+        // class body, a multi-line call) shows all of them, dedented by the
+        // indentation they share.
+        if let Some((start_line, end_line, _, _)) = location
+            && usize::try_from(lineno).ok() == Some(start_line)
+            && end_line > start_line
+        {
+            let span: Vec<String> = (start_line..=end_line)
+                .map(|n| {
+                    read_source_line(&filename, n as i64)
+                        .map_or(String::new(), |l| l.trim_end().to_string())
+                })
+                .collect();
+            if !span.iter().all(|line| line.trim().is_empty()) {
+                for line in dedent_lines(&span) {
+                    writeln!(writer, "    {line}")?;
+                }
+            }
+        } else if let Some(line) = read_source_line(&filename, lineno) {
             let raw_line = line.trim_end_matches(['\n', '\r']);
             let shown_line = raw_line.trim_start();
             writeln!(writer, "    {shown_line}")?;
@@ -2559,7 +2681,41 @@ fn write_traceback_chain_from_tb<W: Write>(
         let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
         tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(current_tb) };
     }
-    Ok(())
+    write_repeated_frames(writer, repeats)
+}
+
+/// `textwrap.dedent` — drop the longest leading-whitespace prefix shared by
+/// every non-blank line; whitespace-only lines normalise to empty.
+fn dedent_lines(lines: &[String]) -> Vec<String> {
+    let mut prefix: Option<&str> = None;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = &line[..line.len() - line.trim_start().len()];
+        prefix = Some(match prefix {
+            None => indent,
+            Some(common) => {
+                let shared = common
+                    .bytes()
+                    .zip(indent.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                &common[..shared]
+            }
+        });
+    }
+    let prefix = prefix.unwrap_or("");
+    lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                line[prefix.len()..].to_string()
+            }
+        })
+        .collect()
 }
 
 /// `traceback.py:_should_show_carets` special case: a `<name> = <call>(…)` or
@@ -2660,11 +2816,14 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
         return None;
     }
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    #[cfg(feature = "host_env")]
     {
         // Read through the import machinery's source provider, not std::fs:
         // under sandbox that routes the read through the seam to the controller
         // VFS, so a guest-controlled traceback path cannot leak a host file.
+        // On wasm32 the provider is the embedder's — the host-FS bridge for the
+        // native-host build, `NullSourceProvider` in a browser — so the same
+        // call renders the offending line wherever one is actually reachable.
         let content =
             crate::importing::read_source_to_string(std::path::Path::new(filename)).ok()?;
         content
@@ -2672,7 +2831,7 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
             .nth((lineno - 1) as usize)
             .map(|s| s.to_string())
     }
-    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+    #[cfg(not(feature = "host_env"))]
     {
         // Sandbox-intentional: PyPy's `error.py:150 linecache.getline`
         // also returns silently when the source can't be read; with
@@ -2691,6 +2850,44 @@ pub fn eprint_exception(err: &PyError, include_traceback: bool) {
     let mut buf: Vec<u8> = Vec::new();
     let _ = write_exception(&mut buf, err, include_traceback);
     crate::host_seam::emit_stderr(&buf);
+}
+
+/// `app_main.py:114-129 handle_sys_exit` — `exitcode = e.code`; `None` exits
+/// 0; otherwise `int(exitcode)`, and a value `int()` rejects is printed to
+/// stderr with exit status 1. `e.code` itself is `args[0]` for a 1-arg raise
+/// and the whole args tuple otherwise (`interp_exceptions.py:993-998
+/// W_SystemExit.descr_init`). A `SystemExit` with no object behind it has no
+/// `code` attribute beyond the class default `None`, i.e. a success exit.
+///
+/// Lives here rather than in a launcher because pyre has two of them —
+/// `pyrex` and the wasm `run_python` entry — and both terminate on the same
+/// rule.
+pub fn system_exit_code(err: &PyError) -> i32 {
+    let exc = err.exc_object;
+    if exc.is_null() {
+        return 0;
+    }
+    let code = match crate::getattr(exc, pyre_object::w_str_new("code")) {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    if unsafe { pyre_object::is_none(code) } {
+        return 0;
+    }
+    // `pylifecycle.c _Py_HandleSystemExit` tests `PyLong_Check(exc)` — there is
+    // no `int()` coercion, so a float or any other non-integer code is printed
+    // rather than converted.
+    if unsafe { pyre_object::is_int_or_long(code) } {
+        // `exitcode = (int)PyLong_AsLong(exc)`: a value too wide for a machine
+        // word leaves the -1 `PyLong_AsLong` returns on overflow, and the
+        // narrowing to `int` is a plain truncation. So `SystemExit(10**100)`
+        // and `SystemExit(-1)` both exit 255.
+        return crate::baseobjspace::int_w(code).unwrap_or(-1) as i32;
+    }
+    let text =
+        unsafe { crate::display::py_str(code) }.unwrap_or_else(|_| "<unprintable>".to_string());
+    crate::host_seam::emit_stderr(format!("{text}\n").as_bytes());
+    1
 }
 
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {

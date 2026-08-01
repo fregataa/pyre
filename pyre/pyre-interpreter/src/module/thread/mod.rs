@@ -617,7 +617,7 @@ mod lock_class {
         }
     }
 }
-use lock_class::W_Lock;
+pub use lock_class::W_Lock;
 
 mod rlock_class {
     use super::*;
@@ -845,7 +845,7 @@ mod rlock_class {
         }
     }
 }
-use rlock_class::W_RLock;
+pub use rlock_class::W_RLock;
 
 mod handle_class {
     use super::*;
@@ -967,7 +967,7 @@ mod handle_class {
         }
     }
 }
-use handle_class::W_ThreadHandle;
+pub use handle_class::W_ThreadHandle;
 
 impl W_ThreadHandle {
     fn start(&self, ident: i64) -> Result<(), crate::PyError> {
@@ -1487,6 +1487,18 @@ fn spawn_thread(
     let stack_size = STACK_SIZE.load(Ordering::Relaxed);
     if stack_size != 0 {
         builder = builder.stack_size(stack_size);
+    } else {
+        // `stack_check`'s byte budget is `MAX_STACK_SIZE`, and the clamp that
+        // keeps it inside the real stack reads `RLIMIT_STACK` — which describes
+        // the *main* thread. A spawned thread takes the host default instead
+        // (2 MiB), narrower than the budget, so deep recursion here would reach
+        // the guard page before `stack_check` ever reported overflow. Give the
+        // default thread room for the budget plus the same quarter margin the
+        // clamp reserves. An explicit `_thread.stack_size(n)` is still honored
+        // as requested.
+        builder = builder.stack_size(
+            crate::stack_check::MAX_STACK_SIZE + (crate::stack_check::MAX_STACK_SIZE >> 2),
+        );
     }
     builder
         .spawn(move || {
