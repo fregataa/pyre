@@ -1886,11 +1886,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::next_version_tag_serial",
         next_version_tag_serial as *const (),
     );
+    // `quasiimmut.py:129-134 _invalidate_now`, shared by both `?` fields.
     push_alias_pair(
         &mut entries,
-        "pyre_object::celldict::sweep_version_watchers",
-        "pyre_object::sweep_version_watchers",
-        pyre_object::celldict::sweep_version_watchers as *const (),
+        "pyre_object::quasiimmut::sweep_quasi_immut_field",
+        "pyre_object::sweep_quasi_immut_field",
+        pyre_object::quasiimmut::sweep_quasi_immut_field as *const (),
     );
     // The three typed-storage promotions: `IndexMap` construction and refill
     // end to end, so the residual boundary is the whole migration.
