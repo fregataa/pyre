@@ -644,7 +644,7 @@ impl FrameBox {
             // argument / locals objects; remember it for the next minor
             // tracer, exactly as `generator.rs:72` does for a stable
             // generator wrapping young frame contents.
-            pyre_object::gc_hook::try_gc_write_barrier(raw);
+            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);
@@ -716,6 +716,19 @@ impl FrameBox {
     /// Raw pointer to the inner frame (header at `ptr - GC_HEADER_SIZE`).
     pub fn as_mut_ptr(&mut self) -> *mut PyFrame {
         self.ptr
+    }
+
+    /// Does the collector own this frame, so that [`Drop`] leaves the memory
+    /// alive for whatever roots still reach it?
+    ///
+    /// `false` is the [`FrameBox::new_boxed`] fallback, whose `Drop` frees the
+    /// frame at scope end — a caller that publishes `as_mut_ptr` past its own
+    /// scope must ask this first.  Answered from the ownership decision
+    /// [`FrameBox::new`] already made, so it neither re-enters the collector
+    /// (an ownership query can park behind another thread's collection) nor
+    /// relies on an address range test.
+    pub fn is_gc_owned(&self) -> bool {
+        self.owner_root.is_some()
     }
 
     /// pyframe.py:259 initialize_as_generator — wrap this frame in a generator

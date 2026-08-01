@@ -419,7 +419,7 @@ impl Default for CalleeLocalsShadow {
 
 impl CalleeLocalsShadow {
     /// A `NONE` value clears the slot.
-    fn set_opref(&mut self, slot: i64, value: OpRef) {
+    pub(crate) fn set_opref(&mut self, slot: i64, value: OpRef) {
         if value.is_none() {
             self.opref.remove(&slot);
         } else {
@@ -7126,26 +7126,40 @@ fn walker_guard_class<Sym: WalkSym>(
     Ok(())
 }
 
-/// Guard the fixed-layout instance representation, the receiver type's live
-/// version tag, and the exact map shape used by the mapdict attribute folds.
-/// `INSTANCE_TYPE` proves the receiver has `W_ObjectObject` fields; the
-/// promoted map identity pins its class and storage coordinates
-/// (mapdict.py).
+/// Guard the fixed-layout mapdict-carrier representation, the receiver type's
+/// live version tag, and the exact map shape used by the mapdict attribute
+/// folds.  The concrete layout vtable proves that the receiver has the shared
+/// `[PyObject | map | storage]` prefix (`W_ObjectObject`, or a native-layout
+/// carrier such as `W_Random`); the promoted map identity pins its class and
+/// storage coordinates (mapdict.py).
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     version_tag: u64,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
 ) -> Result<(), DispatchError> {
-    let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(instance_type_addr);
+    // `load/store_attr_*_fast_path` accepted this receiver only after
+    // `has_mapdict_storage` proved its prefix. Preserve the concrete layout
+    // tag here: claiming every carrier is `INSTANCE_TYPE` poisons the heap
+    // cache for native-layout subclasses and lets later folds use unrelated
+    // field descriptors on the same box.
+    //
+    // A cached class that DISAGREES with the layout tag is that poisoning,
+    // and gating on `is_class_known` alone would then skip the guard and let
+    // the storage coordinates below run against an unguarded layout. Compare
+    // the recorded class instead and guard whenever it is absent or differs;
+    // a contradictory pair is folded out by the optimizer's constant-class
+    // handling, which discards the trace rather than reading a wild slot.
+    let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
+    if ctx.trace_ctx.heap_cache().get_known_class(obj) != Some(layout_type_addr) {
+        let type_const = ctx.trace_ctx.const_int(layout_type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(obj, instance_type_addr);
+            .class_now_known(obj, layout_type_addr);
     }
 
     // The instance map pins the storage layout, but class mutation can change

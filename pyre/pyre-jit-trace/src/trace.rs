@@ -1478,11 +1478,14 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// canonical residual-call encoding.
 ///
 /// The result is always mirrored into `bridge_registers_r` for interior-entry
-/// bridge walks, whose Ref-bank seed is color-indexed.  Opcode-entry bridge
+/// bridge walks, whose Ref-bank seed is color-indexed. Opcode-entry bridge
 /// walks rebuild slot-indexed locals and operand-stack values from
-/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so mirror the destination
-/// there too.  Returns `false` (caller declines the compile) when the register
-/// is unresolved.
+/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so invert the destination
+/// color through the resume pc's color→semantic-slot map before mirroring it
+/// there. Treating a post-regalloc color as a localsplus slot corrupts an
+/// unrelated local whenever regalloc coalesces the call result.
+/// Returns `false` (caller declines the compile) when the register is
+/// unresolved.
 fn inject_root_call_result<Sym: WalkSym>(
     sym: &mut Sym,
     root_pc: usize,
@@ -1509,15 +1512,49 @@ fn inject_root_call_result<Sym: WalkSym>(
         }
         bridge_regs[result_reg] = result;
     }
-    if result_reg < nlocals {
+    let valuestackdepth = sym.valuestackdepth();
+    let stack_only = valuestackdepth.saturating_sub(nlocals);
+    let semantic_result_slot = payload
+        .jitcode
+        .try_index()
+        .map(|index| crate::state::bridge_semantic_maps_from_pc(index as i32, root_pc as i32))
+        .and_then(|maps| {
+            crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &maps.pcdep_entries,
+                result_reg,
+            )
+        })
+        // The raw-color fallback is load-bearing and simultaneously wrong,
+        // so neither keeping nor deleting it is the answer:
+        //
+        //   fib_recursive, dynasm, the one resume that misses the map —
+        //   `pc=569 reg=0 nlocals=1 stack_only=2 vsd=3`, entries
+        //   `[(1,0,4),(1,2,1),(1,3,2)]`.  Color 0 IS mapped, to semantic slot
+        //   4; the inversion rejects it because `4 - nlocals` is at/above the
+        //   runtime `stack_only`, which is what that gate is for.  The
+        //   fallback then answers slot 0 — a LOCAL, not the operand-stack slot
+        //   the map named.  Deleting it declines this bridge and costs 16x
+        //   (0.86s -> 14.2s), so the decline is not an option either.
+        //
+        // The result slot is by construction the one about to be pushed, i.e.
+        // at/above the resume's live depth, so resolving it needs a query that
+        // does not gate on that depth.  Until that resolves at this
+        // coordinate, keep the fallback and its measured cost visible.
+        .or_else(|| (result_reg < valuestackdepth).then_some(result_reg));
+    let Some(semantic_result_slot) = semantic_result_slot else {
+        return false;
+    };
+    if semantic_result_slot < nlocals {
         if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
-            if locals.len() <= result_reg {
-                locals.resize(result_reg + 1, majit_ir::OpRef::NONE);
+            if locals.len() <= semantic_result_slot {
+                locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
             }
-            locals[result_reg] = result;
+            locals[semantic_result_slot] = result;
         }
     } else {
-        let slot = result_reg - nlocals;
+        let slot = semantic_result_slot - nlocals;
         let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
         if bridge.len() <= slot {
             bridge.resize(slot + 1, majit_ir::OpRef::NONE);
@@ -1654,6 +1691,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
     // is known.
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
+    let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
     let local_concretes = &recipe.concrete_r[..nlocals];
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
@@ -1669,6 +1707,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         callee_w_globals,
         entry,
         &argboxes_r,
+        local_oprefs,
         local_concretes,
         // Depth-N: tell the deepest sub-walk that all shallower frames are
         // paused so its in-callee guard snapshots encode the full
@@ -1822,8 +1861,35 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
         Some(Err(e)) => {
             if p2_diag {
+                let raw_code = recipe.code_ptr as *const CodeObject;
+                let (callee_name, source_path) = if raw_code.is_null() {
+                    ("<unknown>", "<unknown>")
+                } else {
+                    unsafe {
+                        (
+                            (*raw_code).obj_name.as_str(),
+                            (*raw_code).source_path.as_str(),
+                        )
+                    }
+                };
+                let stop_op = match e {
+                    crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+                        pc,
+                    }
+                    | crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached {
+                        pc,
+                    } => crate::jitcode_runtime::decode_op_at(
+                        callee_pjc.jitcode.code.as_slice(),
+                        *pc,
+                    )
+                    .map(|op| op.opname)
+                    .unwrap_or("<undecodable>"),
+                    _ => "<n/a>",
+                };
                 eprintln!(
-                    "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
+                    "[p2-drain] callee sub-walk STOP callee={callee_name} \
+                     source={source_path} recipe_py_pc={} entry={entry} \
+                     stop_op={stop_op} err={e:?}",
                     crate::state::forward_py_pc_or_backxlat(
                         recipe.jitcode_index,
                         recipe.jitcode_pc
@@ -1893,6 +1959,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     };
     let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
+    let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
         ctx,
@@ -1904,6 +1971,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle_w_globals,
         middle_entry,
         &middle_argboxes_r,
+        middle_local_oprefs,
         middle_local_concretes,
         paused_parents,
         child_result,

@@ -221,6 +221,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+    majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
     majit_gc::set_active_finalizer_hooks(
         Some(dynasm_register_finalizer),
         Some(dynasm_finalizer_next_dead),
@@ -619,6 +620,10 @@ fn debug_validate_oldgen_freeblocks(site: std::fmt::Arguments<'_>) {
 }
 
 pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usize) {
+    // The call itself is only emitted under `PYRE_TRACE_CALL_DIAG`, which is
+    // what selects the failure-frame report below. The freelist walk is the
+    // only half `PYRE_GC_FREELIST_DIAG` owns, and it gates itself — so no
+    // early return here, or enabling one diagnostic would need the other.
     if site >= 1_000_000 {
         let top = majit_gc::shadow_stack::jf_top_ptr().0;
         eprintln!(
@@ -761,6 +766,20 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
         return;
     }
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier(obj));
+}
+
+fn dynasm_gc_write_barrier_managed(obj: GcRef) {
+    if DYNASM_ACTIVE_GC
+        .with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.write_barrier_managed(obj))
+        })
+        .is_some()
+    {
+        return;
+    }
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier_managed(obj));
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {
@@ -2503,7 +2522,11 @@ impl Backend for DynasmBackend {
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
             .collect();
-        if crate::majit_log_enabled() && trace_id == 2 {
+        let trace_ops_diag = std::env::var("PYRE_TRACE_OPS_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(trace_id);
+        if trace_ops_diag {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
