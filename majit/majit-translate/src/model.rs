@@ -568,6 +568,17 @@ pub enum OpKind {
     /// the common sentinel as `PY_NULL`; it materialises in the ref bank
     /// as address 0, not as an integer register.
     ConstRefNull,
+    /// The RPython annotator constant `None` — a `Constant(NoneType)` whose
+    /// `concretetype` is `lltype.Void`.  Distinct from [`ConstRefNull`]: the
+    /// latter is a null GCREF (`SomePtr`), whereas this folds to
+    /// `SomeValue::None_` (`SomeNone`) so the rtyper's `none_repr` /
+    /// `decompose_slice_args` `stop_is_none` selection see a true `None`.
+    /// The sole producer is the gated slice-range front recognizer, which
+    /// plants it as the `stop` operand of a `[start:]` (`StartOnly`)
+    /// `getslice`; it mirrors how `LOAD_CONST None` pushes `Constant(None)`
+    /// upstream.  Const-inlined by `legacy_const_define_hlvalue`, so no
+    /// SpaceOp reaches the assembler.
+    ConstNone,
     /// Process-wide singleton pointer that must be materialised in the
     /// ref bank (e.g. PyPy `space.fromcache(DictStrategy)` singletons
     /// represented by pyre's Rust `pub static *_DICT_STRATEGY` values).
@@ -1152,6 +1163,20 @@ pub enum OpKind {
     /// from N element values; the result is a new list object distinct
     /// from any individual element.
     NewList {
+        args: Vec<crate::flowspace::model::Variable>,
+    },
+
+    /// RPython `getslice` operation (`operation.py`) — `l[start:stop]`.
+    /// The three operands are `(list, start, stop)`; the annotator's
+    /// `getslice` handler (`unaryop.py:420-423`) builds a fresh
+    /// `listdef.offspring` (a copy, not a view), and the rtyper lowers it
+    /// through `AbstractBaseListRepr.rtype_getslice`
+    /// (`rlist.py:409-414`) to a `gendirectcall` of the per-kind
+    /// `ll_listslice_{startonly,startstop,minusone}` helper — so the op
+    /// never survives to the assembler as a bare primitive.  Emitted only
+    /// by the gated slice-range front recognizer; a graph that drops to
+    /// the legacy walker keeps the residual `slice::index` call instead.
+    GetSlice {
         args: Vec<crate::flowspace::model::Variable>,
     },
 

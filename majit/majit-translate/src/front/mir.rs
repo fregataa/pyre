@@ -1907,6 +1907,21 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.next_call_results,
             );
         }
+        // NOTE: the `&s[k..]` (`RangeFrom` sub-slice) → orthodox `getslice`
+        // copy recognizer (`front::slice_index`) is DORMANT — it is not wired
+        // into the pipeline here.  Empirically (census build 8c68710) it is a
+        // CAPSTONE, not a standalone slice: `getslice` + its Void `ConstNone`
+        // stop are UNWIRED at the legacy walker (unlike `slice_first`'s
+        // legacy-safe `ArrayRead`/`ConstInt`/discriminant ops), so planting
+        // them into a graph that still drops to legacy — which every real
+        // `&args[1..]` interpreter method does, blocked by a co-wall such as
+        // the scalar `args[1..][0]` slice index or a `compute_at_fixpoint`
+        // failure — crashes regalloc on the Void `ConstNone`
+        // (`assembler.rs:2529 lookup_coloring`) or breaks the unwired-opname
+        // snapshot on the bare `getslice`.  The recognizer, `ConstNone`, and
+        // the `getslice` rtyper lowering stay built + tested so the capstone
+        // can activate once these graphs' co-walls close (mirrors the dormant
+        // vec!/`NewList` recognizer, `design-346-foreign-lib-cluster-epic.md`).
         let next_rewritten = if lo.next_call_results.is_empty() {
             0
         } else {
@@ -4408,6 +4423,14 @@ impl<'a> Lowering<'a> {
                             end: arg_vars[1].clone(),
                         });
                 }
+                // NOTE: `RangeFrom { start }` aggregate (`&s[k..]`) capture for
+                // `front::slice_index`'s orthodox `getslice` copy is DORMANT —
+                // the recognizer is a capstone that cannot plant its unwired
+                // `getslice` + Void `ConstNone` into the co-wall-blocked
+                // `&args[1..]` graphs without crashing the legacy walker (see
+                // the post-pass note in `simplify_and_finalize`).  Re-enable
+                // the `slice_index_rangefrom_sites` push here + the post-pass
+                // once those graphs' co-walls close.
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -6987,6 +7010,17 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<[T]>::as_ptr` / `Vec::as_ptr` — the slice's data pointer is
+                // the receiver value in the erased array-pointer model.  Alias
+                // the result to the receiver (twin of the `as_slice` identity
+                // above and `NonNull::as_ptr`).
+                if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -9311,6 +9345,27 @@ impl<'a> Lowering<'a> {
                     | "pyre_object::int_array::<Impl>::as_mut_slice"
                     | "pyre_object::float_array::<Impl>::as_slice"
                     | "pyre_object::float_array::<Impl>::as_mut_slice"
+            )
+        })
+    }
+
+    /// `<[T]>::as_ptr` / `Vec::as_ptr` — the data-pointer projection of a
+    /// slice or vector receiver.  In the erased value-model a `&[T]` collapses
+    /// to a single GC array pointer (its length is read from the array header
+    /// by `ArrayLen`, not a companion fat-pointer word), so the slice's data
+    /// pointer IS the receiver value.  Alias the result to the receiver — the
+    /// same identity fold as `NonNull::as_ptr` (`nonnull_new_identity_alias`)
+    /// and `as_slice` above — instead of leaving an unregistered
+    /// `core::slice::<Impl>::as_ptr` residual whose only prior handling was a
+    /// `FOREIGN_STDLIB_EXTERNALS` `Address` annotation with no host address.
+    fn is_container_as_ptr_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::<Impl>::as_ptr" | "alloc::vec::<Impl>::as_ptr"
             )
         })
     }
@@ -18576,6 +18631,7 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
             | OpKind::ConstFloat(_)
             | OpKind::ConstRef(_)
             | OpKind::ConstRefNull
+            | OpKind::ConstNone
             | OpKind::ConstRefAddr(_)
             | OpKind::ConstSymbolic { .. }
             | OpKind::FieldRead { .. }

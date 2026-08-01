@@ -661,6 +661,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
+        | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
@@ -723,6 +724,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::JitDebug { args }
         | OpKind::NewTuple { args }
         | OpKind::NewList { args }
+        | OpKind::GetSlice { args }
         | OpKind::LoweredBlackholeOp { args, .. } => args.clone(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![cond.clone()],
         OpKind::GuardValue { value, .. }

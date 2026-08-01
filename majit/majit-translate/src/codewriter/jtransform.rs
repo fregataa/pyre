@@ -410,6 +410,7 @@ fn is_source_constant_variable(
                 | OpKind::ConstFloat(_)
                 | OpKind::ConstRef(_)
                 | OpKind::ConstRefNull
+                | OpKind::ConstNone
                 | OpKind::ConstRefAddr(_) => true,
                 OpKind::Call { target, .. } => match target {
                     CallTarget::FunctionPath { segments } => {
@@ -5693,6 +5694,7 @@ fn remap_op(
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
+        | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
@@ -5705,6 +5707,9 @@ fn remap_op(
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
         OpKind::NewList { args } => OpKind::NewList {
+            args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+        },
+        OpKind::GetSlice { args } => OpKind::GetSlice {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
         OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {

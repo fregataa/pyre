@@ -2593,6 +2593,7 @@ impl Assembler {
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::ConstRef(_) => "ConstRef",
                 OpKind::ConstRefNull => "ConstRefNull",
+                OpKind::ConstNone => "ConstNone",
                 OpKind::ConstRefAddr(_) => "ConstRefAddr",
                 OpKind::FieldRead { .. } => "FieldRead",
                 OpKind::FieldWrite { .. } => "FieldWrite",
@@ -2636,6 +2637,7 @@ impl Assembler {
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
                 OpKind::NewList { .. } => "NewList",
+                OpKind::GetSlice { .. } => "GetSlice",
                 OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
@@ -3998,6 +4000,16 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
         // SSA destination register.
         OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => "ref_copy".into(),
+        // `ConstNone` (Void `None`) is const-inlined by
+        // `legacy_const_define_hlvalue`, and `decompose_slice_args` DROPS
+        // the getslice `stop` operand for a `[start:]` slice
+        // (rtyper.rs:2841) — so it never reaches the assembler in a lifted
+        // graph.  It only appears here if a graph that planted it dropped
+        // to the legacy walker (the gate failed); the distinctive
+        // handler-less `const_none` opname trips
+        // `default_bh_builder_unwired_set_matches_task_85_snapshot` loudly
+        // rather than mis-materialising a Void into a register.
+        OpKind::ConstNone => "const_none".into(),
         // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f and `_pure`
         // variants from jtransform.py rewrite_op_getfield().
         OpKind::FieldRead { ty, pure, .. } => {
@@ -4159,6 +4171,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
         OpKind::NewList { .. } => "newlist".into(),
+        // `getslice` never reaches the assembler in a lifted graph — the
+        // rtyper's `rtype_getslice` replaces it with a `direct_call` to the
+        // `ll_listslice_*` helper, and the gated front recognizer keeps it
+        // out of graphs that drop to the legacy walker.  The opname exists
+        // only for exhaustiveness / diagnostics.
+        OpKind::GetSlice { .. } => "getslice".into(),
         // The opname-dispatch spine lowers the rtyper helper graphs to
         // register-shaped blackhole insns, carrying the resolved opname
         // (`strlen`/`strgetitem`/`strsetitem`/`newstr`/…) verbatim.  The

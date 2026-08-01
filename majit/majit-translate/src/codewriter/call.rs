@@ -7545,6 +7545,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
+        | OpKind::ConstNone
         | OpKind::ConstRefAddr(_) => RaiseClass::No,
         // JIT-specific ops that cannot raise
         OpKind::GuardTrue { .. }
@@ -7620,6 +7621,11 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython `newlist` is a `PureOperation`; pure list construction
         // cannot raise.
         OpKind::NewList { .. } => RaiseClass::No,
+        // RPython `getslice` is a `PureOperation` (`operation.py:461`);
+        // its high-level canraise is False (the MemoryError of the
+        // `ll_listslice_*` malloc is carried by the lowered `direct_call`
+        // after rtyping).
+        OpKind::GetSlice { .. } => RaiseClass::No,
         // `LoweredBlackholeOp` carries register-shaped blackhole insns
         // lowered from the rtyper helper graphs.  String allocation
         // (`newstr`/`newunicode`) has `canraise = (MemoryError,)`; the
