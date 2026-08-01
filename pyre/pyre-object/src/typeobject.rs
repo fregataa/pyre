@@ -1187,6 +1187,62 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
 
 // ── Subclass tree (typeobject.py:640-689) ────────────────────────────
 
+// `add_subclass` / `remove_subclass` / `get_subclasses` are indivisible under
+// PyPy's GIL: each one reallocates or reindexes the same out-of-line
+// `weak_subclasses` vector.  Pyre keeps the parent type as the sole semantic
+// owner and uses the same narrow address-striped reentrant synchronization
+// `w_list_lock` / `w_dict_lock` use around those transitions.  Reentrant
+// because `get_subclasses` can be reached from inside a mutation on the same
+// thread through the `mutated()` recursion.
+struct ForkSubclassesLock(std::cell::UnsafeCell<parking_lot::ReentrantMutex<()>>);
+unsafe impl Sync for ForkSubclassesLock {}
+
+impl ForkSubclassesLock {
+    fn new() -> Self {
+        Self(std::cell::UnsafeCell::new(
+            parking_lot::ReentrantMutex::new(()),
+        ))
+    }
+
+    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
+    }
+}
+
+static SUBCLASSES_LOCKS: std::sync::LazyLock<Vec<ForkSubclassesLock>> =
+    std::sync::LazyLock::new(|| (0..256).map(|_| ForkSubclassesLock::new()).collect());
+
+type SubclassesGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+/// Only the acquire is opaque to the tracer, the same split `w_list_lock` uses:
+/// the guard-holding bodies stay look-inside.
+#[majit_macros::dont_look_inside]
+unsafe fn w_type_subclasses_lock(w_parent: PyObjectRef) -> SubclassesGuard {
+    let lock = SUBCLASSES_LOCKS[(w_parent as usize >> 4) & (SUBCLASSES_LOCKS.len() - 1)].get();
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = majit_gc::gc_sync::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
+}
+
+pub fn subclasses_locks_after_fork_child() {
+    for lock in SUBCLASSES_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+}
+
 /// `typeobject.py:640-662 W_TypeObject.add_subclass`.
 ///
 /// Records `w_subclass` in `w_parent.weak_subclasses` if not
@@ -1208,6 +1264,10 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     if !is_type(w_parent) || !is_type(w_subclass) {
         return;
     }
+    // Serialize against a concurrent `remove_subclass` / `get_subclasses` /
+    // `add_subclass` on the same parent: the null-check-then-install below and
+    // the `push` reallocation both invalidate what another thread is indexing.
+    let _subclasses_guard = w_type_subclasses_lock(w_parent);
     let parent = &mut *(w_parent as *mut W_TypeObject);
     if parent.weak_subclasses.is_null() {
         parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
@@ -1271,6 +1331,7 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
     if !is_type(w_parent) {
         return;
     }
+    let _subclasses_guard = w_type_subclasses_lock(w_parent);
     let parent = &mut *(w_parent as *mut W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return;
@@ -1305,6 +1366,7 @@ pub unsafe fn w_type_get_subclasses(
     if w_parent.is_null() || !is_type(w_parent) {
         return Vec::new();
     }
+    let _subclasses_guard = w_type_subclasses_lock(w_parent);
     let parent = &*(w_parent as *const W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return Vec::new();
@@ -1513,5 +1575,53 @@ mod tests {
             assert!(!w_type_get_uses_object_getattribute(PY_NULL));
             assert!(!w_type_get_uses_object_setattr(PY_NULL));
         }
+    }
+
+    /// Concurrent class creation against one process-global builtin parent is
+    /// the shape the striped lock exists for: `add_subclass`'s `push`
+    /// reallocates and frees the buffer `get_subclasses` is indexing, and its
+    /// null-check-then-install lets two threads each install a `Box`.
+    ///
+    /// Without `w_type_subclasses_lock` this aborts inside the allocator —
+    /// `double free or corruption (fasttop)` on glibc, `STATUS_HEAP_CORRUPTION`
+    /// on Windows, SIGSEGV in `w_weakref_deref` on macOS. Delete the three
+    /// guards and re-run to confirm the gate still bites before trusting it.
+    #[test]
+    fn subclass_registry_survives_concurrent_mutation() {
+        let w_parent = w_type_new("SharedParent", PY_NULL, std::ptr::null_mut());
+        let parent_addr = w_parent as usize;
+
+        std::thread::scope(|scope| {
+            for t in 0..4 {
+                scope.spawn(move || {
+                    let w_parent = parent_addr as PyObjectRef;
+                    // Kept alive for the whole thread so `weak_subclasses`
+                    // holds live entries rather than immediately-dead refs.
+                    let children: Vec<PyObjectRef> = (0..16)
+                        .map(|i| {
+                            w_type_new(&format!("Child{t}_{i}"), PY_NULL, std::ptr::null_mut())
+                        })
+                        .collect();
+                    for _ in 0..500 {
+                        for &w_child in &children {
+                            unsafe { w_type_add_subclass(w_parent, w_child) };
+                        }
+                        // Reads and dereferences every entry in the vector the
+                        // other threads are reallocating — a stale buffer shows
+                        // up here as a garbage `*mut Weakref`. The contents are
+                        // racy by construction, so only the read is asserted on.
+                        let seen = unsafe { w_type_get_subclasses(w_parent, false) };
+                        assert!(seen.iter().all(|w| !w.is_null()));
+                        for &w_child in &children {
+                            unsafe { w_type_remove_subclass(w_parent, w_child) };
+                        }
+                    }
+                });
+            }
+        });
+
+        // Every thread removed everything it added, and no entry outlived it.
+        let leftover = unsafe { w_type_get_subclasses(w_parent, false) };
+        assert!(leftover.is_empty(), "{} entries leaked", leftover.len());
     }
 }
