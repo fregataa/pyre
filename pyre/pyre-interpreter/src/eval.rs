@@ -127,6 +127,18 @@ fn push_current_frame_previous_root(
     }
 }
 
+/// Flat TLS read of the per-thread `CURRENT_FRAME` slot — the frame a builtin
+/// was called from, since a builtin call creates no Python frame of its own.
+/// Null when no frame is installed.
+///
+/// The slot is runtime-mutable, not a build-time constant, so the JIT
+/// residualises the read instead of tracing into it (`@dont_look_inside`, the
+/// [`get_current_exception`] shape).
+#[majit_macros::dont_look_inside]
+pub fn current_frame() -> *mut PyFrame {
+    CURRENT_FRAME.with(|current| current.get())
+}
+
 pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     let previous = CURRENT_FRAME.with(|current| {
         let previous = current.get();
@@ -2151,19 +2163,24 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        let w_type = crate::typedef::r#type(obj).ok_or_else(|| {
-            PyError::type_error(format!(
-                "'{}' object does not support the context manager protocol",
-                crate::baseobjspace::object_functionstr_type_name(obj)
-            ))
-        })?;
-        let descr = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) }
-            .ok_or_else(|| {
-                PyError::type_error(format!(
+        let w_type = match crate::typedef::r#type(obj) {
+            Some(t) => t,
+            None => {
+                return Err(PyError::type_error(format!(
                     "'{}' object does not support the context manager protocol",
                     crate::baseobjspace::object_functionstr_type_name(obj)
-                ))
-            })?;
+                )));
+            }
+        };
+        let descr = match unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) } {
+            Some(d) => d,
+            None => {
+                return Err(PyError::type_error(format!(
+                    "'{}' object does not support the context manager protocol",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                )));
+            }
+        };
         Ok(unsafe { crate::baseobjspace::get(descr, obj, w_type.as_ptr()) }?.unwrap_or(descr))
     }
 

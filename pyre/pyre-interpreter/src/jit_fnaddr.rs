@@ -1086,6 +1086,51 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::sys_modules_registry_get",
         sys_modules_registry_get as *const (),
     );
+    // The same shape over four more runtime-mutable cells:
+    // `_io::unsupported_operation_type` reads the `UNSUPPORTED_OPERATION_TYPE`
+    // `OnceLock` the `_io` module init stamps with its module-local
+    // `UnsupportedOperation` class, `eval::current_frame` the `CURRENT_FRAME`
+    // thread-local `install_current_frame` moves, the two `display::repr_*`
+    // twins the `REPR_ACTIVE` mid-repr set (the
+    // `note_eval_activation_{enter,exit}` twin shape), and `autoflusher_add`
+    // the `AUTOFLUSHER` thread-local handle table.
+    let unsupported_operation_type: fn() -> pyre_object::PyObjectRef =
+        crate::module::_io::unsupported_operation_type;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::unsupported_operation_type",
+        "pyre_interpreter::unsupported_operation_type",
+        unsupported_operation_type as *const (),
+    );
+    let current_frame: fn() -> *mut crate::pyframe::PyFrame = crate::eval::current_frame;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::current_frame",
+        "pyre_interpreter::current_frame",
+        current_frame as *const (),
+    );
+    let repr_enter: fn(pyre_object::PyObjectRef) -> bool = crate::display::repr_enter;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::display::repr_enter",
+        "pyre_interpreter::repr_enter",
+        repr_enter as *const (),
+    );
+    let repr_leave: fn(pyre_object::PyObjectRef) = crate::display::repr_leave;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::display::repr_leave",
+        "pyre_interpreter::repr_leave",
+        repr_leave as *const (),
+    );
+    let autoflusher_add: fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
+        crate::module::_io::autoflusher_add;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::autoflusher_add",
+        "pyre_interpreter::autoflusher_add",
+        autoflusher_add as *const (),
+    );
     let warnings_state_ns: fn() -> pyre_object::PyObjectRef = crate::module::_warnings::state_ns;
     push_alias_pair(
         &mut entries,
@@ -1876,6 +1921,78 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_pop_last",
         pyre_object::dictmultiobject::dict_entries_pop_last as *const (),
     );
+    // The positional slot reads the post-scan lookup arms and the reentrant
+    // key scan perform: an index the caller already settled on, so no
+    // comparison runs behind these boundaries.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_value_at",
+        "pyre_object::dict_entries_value_at",
+        pyre_object::dictmultiobject::dict_entries_value_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_obj_at",
+        "pyre_object::dict_entries_key_obj_at",
+        pyre_object::dictmultiobject::dict_entries_key_obj_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_hash_at",
+        "pyre_object::dict_entries_key_hash_at",
+        pyre_object::dictmultiobject::dict_entries_key_hash_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_is_at",
+        "pyre_object::dict_entries_key_is_at",
+        pyre_object::dictmultiobject::dict_entries_key_is_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_capacity",
+        "pyre_object::dict_entries_capacity",
+        pyre_object::dictmultiobject::dict_entries_capacity as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_value_set_at",
+        "pyre_object::dict_entries_value_set_at",
+        pyre_object::dictmultiobject::dict_entries_value_set_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_insert_object",
+        "pyre_object::dict_entries_insert_object",
+        pyre_object::dictmultiobject::dict_entries_insert_object as *const (),
+    );
+    // The index-returning twins of the `dict_entries_probe_*` pair, for
+    // `setitem_str`'s borrow-key membership test.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_index_of_str_hashed",
+        "pyre_object::dict_entries_index_of_str_hashed",
+        pyre_object::dictmultiobject::dict_entries_index_of_str_hashed as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_index_of_object",
+        "pyre_object::dict_entries_index_of_object",
+        pyre_object::dictmultiobject::dict_entries_index_of_object as *const (),
+    );
+    // The module-dict storage's own `String`-keyed probe / store pair.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::module_dict_entries_get",
+        "pyre_object::module_dict_entries_get",
+        pyre_object::celldict::module_dict_entries_get as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::module_dict_entries_insert",
+        "pyre_object::module_dict_entries_insert",
+        pyre_object::celldict::module_dict_entries_insert as *const (),
+    );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
     // serial the build process saw.
@@ -1930,6 +2047,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::identitydict::w_dict_delete_identity_strategy",
         "pyre_object::w_dict_delete_identity_strategy",
         pyre_object::identitydict::w_dict_delete_identity_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::identitydict::w_dict_store_identity_strategy",
+        "pyre_object::w_dict_store_identity_strategy",
+        pyre_object::identitydict::w_dict_store_identity_strategy as *const (),
     );
     push_alias_pair(
         &mut entries,
