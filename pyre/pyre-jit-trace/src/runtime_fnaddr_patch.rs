@@ -75,12 +75,45 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
     // whose runtime lookup actually disagrees with the build value get
     // patched; identical entries are dropped so the constants_i scan
     // can early-exit on a `HashMap::get` miss without comparing.
+    //
+    // The key is an address from the build process and the value one from
+    // this one, so a build address can stand for two registered paths.  Both
+    // ways that happens are benign, and last write wins in each:
+    //
+    //   * Several spellings of one function are registered on purpose
+    //     (`jit_fnaddr.rs` lists both
+    //     `pyre_object::listobject::jit_list_reverse` and
+    //     `pyre_object::jit_list_reverse`); they resolve to the same runtime
+    //     address, so the repeated insert is idempotent.
+    //   * The build binary's identical-COMDAT folding (MSVC `/OPT:ICF`, or
+    //     LLVM `MergeFunctions`) merges two byte-identical bodies onto one
+    //     address.  With `#[inline(never)]` confined to the release-GIL
+    //     surface the tracing-policy helpers inline their callees, and several
+    //     distinct registered residuals then compile to the same code:
+    //     `label_arg_to_usize` / `load_fast_var_num_to_index` are both
+    //     `arg.get(op_arg).as_usize()`, `convert_value_arg` /
+    //     `special_method_arg` are both `arg.get(op_arg)`, and
+    //     `hash_str_hooked_bytes` decomposes its slice to the `(ptr, len)`
+    //     `hash_str_hooked` already takes.  The build binary folds each pair;
+    //     the runtime binary, built at a different optimization level, need
+    //     not, so the two runtime addresses differ.  Folding merges only
+    //     identical machine code, so a residual call patched to either twin
+    //     runs the same body.
+    //
+    // A genuinely wrong runtime target could only come from a path bound to
+    // the wrong `fn`, and that binding runs identically in both processes, so
+    // the build and runtime addresses would agree rather than collide.  The
+    // `jit_fnaddr` registry test guards against new same-address pairs but
+    // observes only this process, where nothing folds, so it cannot see a
+    // build-script fold.  There is therefore no collision this map must
+    // reject; picking any of the folded twins' runtime addresses is correct.
     let mut correspondence: HashMap<i64, i64> = HashMap::new();
     for (path, build_fnaddr) in &build_bindings {
-        if let Some(&runtime_fnaddr) = runtime_map.get(path.as_str()) {
-            if *build_fnaddr != runtime_fnaddr {
-                correspondence.insert(*build_fnaddr, runtime_fnaddr);
-            }
+        let Some(&runtime_fnaddr) = runtime_map.get(path.as_str()) else {
+            continue;
+        };
+        if *build_fnaddr != runtime_fnaddr {
+            correspondence.insert(*build_fnaddr, runtime_fnaddr);
         }
     }
 
