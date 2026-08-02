@@ -3953,6 +3953,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // Emit MAKE_FUNCTION's `Function.__init__` as New + SetField so a `def` in a
+    // loop body virtualizes away instead of allocating through the opaque
+    // residual.  Falls through to the residual for every shape the emit cannot
+    // reproduce constant-for-constant (SAFE — never declined).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::MakeFunction
+        && try_walker_specialize_make_function(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // #195 / #73: virtualize an arity-2 plain-int BUILD_TUPLE
     // (`newtuple_from_array`) as a `spec_ii` `new_with_vtable` +
     // `value0` / `value1`, so the backing array build and the partner
@@ -5223,6 +5235,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         ctx.last_exc_value_concrete = saved_last_exc_value_concrete;
                     }
                     folded
+                } else if (op_tag == 8 || op_tag == 9) && ctx.is_authoritative_executor {
+                    // `op_tag` 8 / 9 are `is` / `is_not` (`IS_OP`), which the
+                    // codewriter routes through the same `compare_fn`
+                    // residual as the six ordinary comparisons.  Fold them to
+                    // `ptr_eq` / `ptr_ne` — or, for a self-compare, straight
+                    // to the constant — so identity tests stop paying a
+                    // may-force call and its `GuardNotForced` per iteration.
+                    // Declines (falls through to the generic residual) for an
+                    // operand layout whose class compares `is_w` by value.
+                    try_walker_fold_is_op(ctx, op.pc, op_tag, &r_args, dst, dst_bank)?
                 } else {
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.

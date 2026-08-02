@@ -4121,6 +4121,312 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Does `tp` name a layout whose class overrides `is_w` with a value
+/// comparison?  `baseobjspace::is_w` gates one branch per overriding class,
+/// each demanding both operands be that exact type: `int`
+/// (`intobject.py:44`), `float` (`floatobject.py:196`), `complex`
+/// (`complexobject.py:287`), `tuple` (`tupleobject.py:47`), `bytes`
+/// (`bytesobject.py:25`), `str` (`unicodeobject.py:101`) and `frozenset`
+/// (`setobject.py:592`).  Every other class keeps the default pointer
+/// identity (`baseobjspace.py:246`).
+fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
+    [
+        &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::FLOAT_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::COMPLEX_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::TUPLE_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::bytesobject::BYTES_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::STR_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::setobject::FROZENSET_TYPE as *const pyre_object::pyobject::PyType,
+    ]
+    .iter()
+    .any(|special| std::ptr::eq(*special, tp))
+}
+
+/// Walker-native fold of the `IS_OP` residual — `bh_compare_fn(lhs, rhs,
+/// tag)` with tag 8 (`is`) or 9 (`is_not`), the tags
+/// `compare_op_tag_for_opname` assigns those two opnames.
+///
+/// `IS_OP` is `space.is_w(w_1, w_2)` plus a `newbool`
+/// (`pyopcode.py:1078-1092`), and `is_w` (`baseobjspace.py:833`) dispatches
+/// to `w_two.is_w(space, w_one)`, whose default is pointer identity.  Two
+/// tiers, mirroring `FASTPATHS_SAME_BOXES`' `ptr_eq`/`ptr_ne` entries
+/// (`pyjitpl.py:326-336`):
+///
+///   * Same box — `baseobjspace::is_w` answers at its opening `ptr::eq`
+///     whatever the class, so the result is the constant `True`/`False`.
+///     No op and no guard: this is the `b1 is b2` fast check itself.
+///   * Distinct boxes whose layouts both keep the default `is_w` — no
+///     value-comparison branch can fire, so `is_w` again reduces to that
+///     `ptr::eq`.  A `GuardClass` per operand pins the layout, then
+///     `ptr_eq`/`ptr_ne` replaces the may-force `compare_fn` and the
+///     `GuardNotForced` behind it.
+///
+/// Declining on a value-comparing layout is what keeps the second tier
+/// sound: `GuardClass` pins `ob_type`, and an `int` subclass instance
+/// shares `INT_TYPE` with a plain `int` while answering the exact-type gate
+/// differently, so the layout alone cannot separate them.  A tagged
+/// immediate is declined outright — it carries no `ob_type` to guard.
+pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 2 || dst_bank != 'r' || !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
+    let invert = match op_tag {
+        8 => false,
+        9 => true,
+        _ => return Ok(None),
+    };
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+
+    if lhs.same_box(rhs) {
+        // `x is x` / `x is not x` — statically determined.
+        return walker_write_const_bool_result(ctx, op_pc, !invert, dst, dst_bank).map(Some);
+    }
+
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, lhs),
+        walker_concrete_ref_object(ctx, rhs),
+    ) else {
+        return Ok(None);
+    };
+    if lhs_obj.is_null() || rhs_obj.is_null() {
+        return Ok(None);
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
+            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
+    {
+        return Ok(None);
+    }
+    let (lhs_type, rhs_type) = unsafe {
+        (
+            (*(lhs_obj as *const pyre_object::pyobject::PyObject)).ob_type,
+            (*(rhs_obj as *const pyre_object::pyobject::PyObject)).ob_type,
+        )
+    };
+    if is_w_compares_by_value(lhs_type) || is_w_compares_by_value(rhs_type) {
+        return Ok(None);
+    }
+    // The layout test above is the proof that `is_w` reduces to `ptr::eq`
+    // here; cross-check it against the real thing and decline rather than
+    // record a concrete the emitted `ptr_eq` disagrees with.
+    let same = std::ptr::eq(lhs_obj, rhs_obj);
+    if same != pyre_interpreter::baseobjspace::is_w(lhs_obj, rhs_obj) {
+        return Ok(None);
+    }
+
+    // --- commit to the fold: emit IR (no further declines) ---
+    for (operand, operand_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
+        if operand.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(operand) {
+            continue;
+        }
+        let type_addr = operand_type as usize as i64;
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[operand, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(operand, type_addr);
+    }
+    let cmp = if invert { OpCode::PtrNe } else { OpCode::PtrEq };
+    let truth = ctx.trace_ctx.record_op(cmp, &[lhs, rhs]);
+    let result = same != invert;
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(result as i64));
+    // Same boxed-bool elision as the int compare specialization: when the
+    // Ref dst is provably consumed only by the following `is_true`, write
+    // the raw truth and let `bool_box_truth_record` resolve it.
+    if compare_box_provably_dead(ctx, op_pc, dst as u8) {
+        bool_box_truth_record(truth, truth);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
+        return Ok(Some(()));
+    }
+    let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(result) as usize)),
+    );
+    bool_box_truth_record(boxed, truth);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// Write an immortal `bool` singleton into a residual call's Ref dst, along
+/// with the raw truth `bool_box_truth_record` needs so an immediately
+/// following `is_true` (`POP_JUMP_IF_*`) folds to the constant instead of
+/// unboxing through a residual.
+fn walker_write_const_bool_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    value: bool,
+    dst: usize,
+    dst_bank: char,
+) -> Result<(), DispatchError> {
+    let result_obj = pyre_object::w_bool_from(value);
+    let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
+    ctx.trace_ctx.set_opref_concrete(
+        const_bool,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+    );
+    let truth = ctx.trace_ctx.const_int(value as i64);
+    bool_box_truth_record(const_bool, truth);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)
+}
+
+/// MAKE_FUNCTION inline emission: replace the
+/// `jit_make_function_from_globals(globals, code)` residual with the
+/// `NewWithVtable` + `SetfieldGc` set `function.py:47-57 Function.__init__`
+/// performs, so a `def` in a loop body virtualizes away instead of allocating a
+/// `Function` per iteration.
+///
+/// Everything the constructor stores is loop-invariant here: `globals` and
+/// `code` arrive as baked constants (`codewriter.rs` MakeFunction arm bakes the
+/// frame's globals object, and the code object comes from a `LOAD_CONST`), and
+/// the remaining slots are derived from them:
+///
+/// * `name` — `function.py:51 self.name = code.co_name`, a pointer into the
+///   `Box::into_raw`'d `CodeObject`, which is never rewritten in place nor
+///   freed.  This is the same pointer the residual stores
+///   (`function_new_from_code` borrows it too), so a materialized function is
+///   indistinguishable from an interpreted one.
+/// * `w_qualname` — the code object's single realized `co_qualname`, shared by
+///   every function built from it.
+/// * `w_builtins` — CPython 3.14 `_PyEval_BuiltinsFromGlobals`, frozen at
+///   construction from `globals['__builtins__']`.  Only the allocation-free
+///   shape is reproduced: `__builtins__` naming a module, reduced to its dict.
+///   An absent or non-module `__builtins__` routes
+///   `pick_builtin_obj_checked` through `w_module_new_aliasing_dict` / the
+///   default-module build, which mint a fresh object per call and so cannot be
+///   baked — those decline to the residual.
+///
+/// Soundness rests on one guard beyond the constant operands: the module
+/// dict's `version?` is pinned, so rebinding `globals['__builtins__']` runs
+/// `mutated()` and revokes the loop, exactly as it does for a shadowing insert
+/// under the LOAD_GLOBAL cell fold.  Nothing watches the code object's
+/// `co_name` / `co_qualname` because neither is mutable in place —
+/// `code.replace()` clones first and yields a different code object, which is a
+/// different constant.
+///
+/// Declines (each falls through to the residual, which stays correct): a
+/// non-constant operand, a non-`PyCode` or bodyless code object, globals that
+/// are not a module dict, an unbakeable `__builtins__`, and any baked pointer
+/// the collector may relocate.
+pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    let (globals_op, code_op) = (r_args[0], r_args[1]);
+    if !globals_op.is_constant() || !code_op.is_constant() {
+        return Ok(None);
+    }
+    let Some(w_code) = walker_concrete_ref_object(ctx, code_op) else {
+        return Ok(None);
+    };
+    // A `BuiltinCode`-backed carrier is immortal and boxes its name through
+    // `malloc_raw`; `is_code` admits only the `PyCode` shape this reproduces.
+    if !unsafe { pyre_interpreter::is_code(w_code) } {
+        return Ok(None);
+    }
+    let code_ptr =
+        unsafe { pyre_interpreter::w_code_get_ptr(w_code) } as *const pyre_interpreter::CodeObject;
+    if code_ptr.is_null() {
+        return Ok(None);
+    }
+
+    // Realizing the qualname is the fold's one collection point (it allocates
+    // once per code object and hits the cache afterwards), so it runs here,
+    // while the only live pointers are the `Box::into_raw`'d code wrapper and
+    // its `CodeObject` — neither of which the collector relocates.  Everything
+    // read below is read after it.
+    let w_qualname = unsafe { pyre_interpreter::pycode::w_code_qualname_obj(w_code) };
+    if w_qualname.is_null() {
+        return Ok(None);
+    }
+    let Some(w_globals) = walker_concrete_ref_object(ctx, globals_op) else {
+        return Ok(None);
+    };
+    // Restrict to a module namespace before probing it directly, so the slot
+    // read below walks the same storage `pick_builtin_obj_checked`'s
+    // `finditem_str` does.  This is also what `walker_pin_namespace_version`
+    // needs, but that one emits IR, so it runs only once the fold commits.
+    if unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(w_globals) }.is_null() {
+        return Ok(None);
+    }
+    // `function_new_impl`'s `w_builtins` derivation, restricted to the branch
+    // that allocates nothing and therefore answers the same object each run.
+    let w_builtins_module = unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }
+        .unwrap_or(pyre_object::PY_NULL);
+    if w_builtins_module.is_null() || !unsafe { pyre_object::is_module(w_builtins_module) } {
+        return Ok(None);
+    }
+    let w_builtins = unsafe { pyre_object::w_module_get_w_dict(w_builtins_module) };
+    if w_builtins.is_null() {
+        return Ok(None);
+    }
+    for baked in [w_builtins, w_qualname] {
+        if majit_gc::can_move(majit_ir::GcRef(baked as usize)) {
+            return Ok(None);
+        }
+    }
+
+    // --- commit to the fold: emit IR (no further declines) ---
+    // The only mutable input: `globals['__builtins__']` may be rebound after
+    // this function is built, and a later iteration must then see the new
+    // mapping.  Pinning the namespace `version?` revokes the loop instead.
+    walker_pin_namespace_version(ctx, op_pc, w_globals)?;
+    let header_w_class = ctx
+        .trace_ctx
+        .const_ref(pyre_object::get_instantiate(&pyre_interpreter::FUNCTION_TYPE) as i64);
+    // `function.py:33 can_change_code = True` for a plain `def`.
+    let can_change_code = ctx.trace_ctx.const_int(1);
+    let name = ctx
+        .trace_ctx
+        .const_ref(unsafe { &(*code_ptr).obj_name } as *const String as i64);
+    let w_builtins_const = ctx.trace_ctx.const_ref(w_builtins as i64);
+    let w_qualname_const = ctx.trace_ctx.const_ref(w_qualname as i64);
+    let func_op = crate::helpers::emit_make_function_inline(
+        ctx.trace_ctx,
+        header_w_class,
+        code_op,
+        can_change_code,
+        name,
+        globals_op,
+        w_builtins_const,
+        w_qualname_const,
+    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(func_op, &pyre_interpreter::FUNCTION_TYPE as *const _ as i64);
+    // Tracing is execution: build the concrete function the rest of the walk
+    // observes.  A fresh `Function` per evaluation is what MAKE_FUNCTION
+    // produces anyway, so the trace allocating its own is not an identity
+    // divergence.
+    let func = pyre_interpreter::runtime_ops::make_function_from_code_obj_with_globals_obj(
+        w_code, w_globals,
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        func_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(func as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, func_op)?;
+    Ok(Some(()))
+}
+
 /// Mixed W_LongObject/W_IntObject COMPARE_OP specialization.
 ///
 /// `pypy/objspace/std/longobject.py:_make_descr_cmp` selects the corresponding
