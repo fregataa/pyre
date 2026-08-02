@@ -640,6 +640,55 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
     with_wasm_active_gc_mut(|gc| gc.alloc_oldgen_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
+/// Allocate the block a blackhole `bh_new*` descr describes, in the non-moving
+/// old generation as the dynasm and cranelift runners do: resume
+/// materialization keeps raw pointers to these across the forward blackhole
+/// run, and a nursery block would be relocated out from under them at the next
+/// minor collection.
+fn wasm_bh_alloc(type_id: u32, payload_size: usize) -> i64 {
+    let gc_ptr = if type_id != 0 {
+        wasm_alloc_oldgen_typed(type_id, payload_size).0
+    } else {
+        0
+    };
+    if gc_ptr != 0 {
+        return gc_ptr as i64;
+    }
+    wasm_bh_alloc_raw(payload_size)
+}
+
+/// Non-GC descrs (`type_id == 0`, raw buffers) and a runtime with no allocator
+/// installed keep the plain zeroed malloc the dynasm runner falls back to.
+fn wasm_bh_alloc_raw(size: usize) -> i64 {
+    let Ok(layout) = std::alloc::Layout::from_size_align(size.max(1), 8) else {
+        return 0;
+    };
+    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+}
+
+/// Allocate the struct a blackhole `bh_new` / `bh_new_with_vtable` describes,
+/// mirroring the dynasm runner's `bh_alloc_struct`.
+///
+/// A headerless descr names a struct from the interpreter's own
+/// `headerless_structs` pool, which carries no type word at `ref - 8`; a
+/// header-writing allocator returns `base + GcHeader::SIZE` and puts a block
+/// the interpreter owns onto the collector's lists.
+///
+/// `resolve_gc_tid` routes the serialized `path_hash` cache key back to the
+/// dense GC tid (`gc.py:536-542`); a raw cache key read as a tid indexes past
+/// the type table on the first collection that traces the block.
+fn wasm_bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    let size = sizedescr.as_size();
+    if sizedescr.is_headerless() {
+        let gc_ptr = wasm_alloc_nursery_headerless_no_collect(size).0;
+        if gc_ptr != 0 {
+            return gc_ptr as i64;
+        }
+        return wasm_bh_alloc_raw(size);
+    }
+    wasm_bh_alloc(sizedescr.resolve_gc_tid(), size)
+}
+
 /// JIT-trace allocation trampoline target for `New` / `NewWithVtable`.
 ///
 /// A compiled trace cannot allocate directly (the GC lives behind the
@@ -1685,45 +1734,19 @@ impl majit_backend::Backend for WasmBackend {
     // `W_IntObject` loop variable forced at loop exit) through these. Without
     // a real implementation `bhimpl_new*` returns 0 and the resumed frame
     // carries null operands. Mirrors `CraneliftBackend`'s overrides but routes
-    // through the wasm thread-local GC; allocation inputs carry no unrooted GC
-    // refs, so no collection-suppression beyond the no-collect fixed-size path
-    // is required.
+    // through the wasm thread-local GC; the old-generation allocator never
+    // collects, so allocation inputs need no rooting here.
 
     /// llmodel.py:775 bh_new(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let size = sizedescr.as_size();
-        // Resolve the serialized `path_hash` cache key back to the dense GC
-        // tid so the nursery object carries a header the collector can trace
-        // (`gc.py:536-542`); a raw cache key read as a tid indexes past the
-        // type table on the first minor collection.
-        //
-        // The nursery here is a deliberate deviation from the dynasm runner,
-        // which materializes blackhole structs and arrays in the old
-        // generation. Routing these three entry points to
-        // `alloc_oldgen_typed` miscompiles `synth/recursion_memo_branch`: a
-        // resumed frame reads a nursery-range address that no object has ever
-        // occupied as the `in` operand, while the dict the operand names is
-        // intact. It needs minor collections (a nursery large enough to
-        // suppress them runs clean) but is not a missed old->young edge —
-        // forcing every old-generation object into the remembered set on every
-        // minor does not change it — nor a descr/tid layout mismatch, nor
-        // major-collection sweep, nor the old-generation allocator's
-        // eval-breaker arming. Restore the old generation here only together
-        // with a fix for that.
-        let type_id = sizedescr.resolve_gc_tid();
-        with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
-            .unwrap_or(0)
+        wasm_bh_alloc_struct(sizedescr)
     }
 
     /// llmodel.py:778-782 bh_new_with_vtable(sizedescr): allocate, then write
     /// the type pointer at `vtable_offset`.
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
-        let type_id = sizedescr.resolve_gc_tid();
-        let ptr =
-            with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
-                .unwrap_or(0);
+        let ptr = wasm_bh_alloc_struct(sizedescr);
         if ptr != 0 && vtable != 0 {
             if let Some(vt_off) = self.vtable_offset {
                 unsafe {
@@ -1742,18 +1765,13 @@ impl majit_backend::Backend for WasmBackend {
             .array_len_offset()
             .expect("bh_new_array requires ArrayDescr.lendescr");
         let type_id = arraydescr.resolve_gc_tid();
-        with_wasm_active_gc_mut(|gc| {
-            let obj = gc.alloc_varsize_typed(type_id, base_size, itemsize, length);
-            if obj.is_null() {
-                0
-            } else {
-                unsafe {
-                    *((obj.0 as *mut u8).add(len_offset) as *mut usize) = length;
-                }
-                obj.0 as i64
+        let ptr = wasm_bh_alloc(type_id, base_size + itemsize * length);
+        if ptr != 0 {
+            unsafe {
+                *((ptr as *mut u8).add(len_offset) as *mut usize) = length;
             }
-        })
-        .unwrap_or(0)
+        }
+        ptr
     }
 
     /// llmodel.py:790 bh_new_array_clear = bh_new_array (allocator zeroes).
