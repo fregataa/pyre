@@ -29,11 +29,23 @@
 //! diverges is the slot type: this struct holds a raw `*mut PyFrame`
 //! rather than a `PyObjectRef`, and the edge reaches the collector
 //! only through the hand-written `pytraceback_object_custom_trace`
-//! hook, which forwards it as a mutable slot but skips a frame the GC
-//! does not own (a `FrameBox::new_boxed` tracer snapshot).  The
-//! pointee must additionally never move, which is not an upstream
-//! requirement and is not caused by anything in this file — see
-//! `w_pytraceback_new`.
+//! hook, which forwards it as a mutable slot.
+//!
+//! The pointee must additionally never move.  That is not an upstream
+//! requirement and nothing in this file causes it: an executing frame
+//! is reached through a live Rust `&mut PyFrame` that spans every
+//! allocation the running opcode performs, and RPython's translator
+//! rewrites exactly those live references in their shadow-stack slots
+//! (`rpython/memory/gctransform/shadowstack.py:43-46`) where Rust has
+//! no equivalent pass.  `FrameBox::new` allocating non-moving stands
+//! in for that rewrite, and this file's conditional frame edge and
+//! `w_code` snapshot are downstream of it.
+//!
+//! The rule holds for frames that reach here, not for every frame: a
+//! compiled trace's own inlined-callee frame is a nursery allocation,
+//! and making that uniform times `fib_recursive` out of its gate, so
+//! the crossing is guarded at the seams instead (see `gate-triage.md`).
+//! `record_application_traceback` is one of those seams.
 
 use pyre_object::pyobject::*;
 
@@ -59,11 +71,11 @@ pub struct PyTraceback {
     /// rather than a `PyObjectRef`, so it takes part in collection
     /// only through `pytraceback_object_custom_trace`.  That hook
     /// forwards the slot when the GC owns the frame, which keeps it
-    /// live and would rewrite it if the frame ever moved; it skips a
-    /// frame the GC does not own — a `FrameBox::new_boxed` tracer
-    /// snapshot, freed at the end of its walk — and such a pointer is
-    /// left dangling and must not be dereferenced.  The `w_code`
-    /// snapshot below is what readers use in that case.
+    /// live and would rewrite it if the frame ever moved.  Every frame
+    /// that can reach here is GC-owned: `FrameBox::new` allocates from
+    /// the GC whenever the hook is installed, and the one path that is
+    /// not — the pre-hook bootstrap window — collects nothing, so a
+    /// frame born there is never swept either way.
     pub frame: *mut crate::pyframe::PyFrame,
     /// `pytraceback.py:30 self.lasti = lasti` — bytecode index at
     /// which the exception was raised (in instruction units).
@@ -80,12 +92,20 @@ pub struct PyTraceback {
     /// Snapshot of the raising frame's `pycode`, with no upstream
     /// counterpart — `pytraceback.py` reads `self.frame.pycode`
     /// directly (`:36`), because upstream's frame edge is unconditional
-    /// and the frame therefore outlives the traceback.  Pyre's does not
-    /// hold for a frame the GC does not own, so consumers that must
-    /// keep working then (`write_traceback_chain`) read `source_path` /
-    /// `obj_name` / `qualname` through this handle instead.  Retiring
-    /// the field is blocked on making every frame that can reach a
-    /// traceback GC-owned.
+    /// and the frame therefore outlives the traceback.  Pyre's edge is
+    /// conditional on the GC owning the frame, so consumers that must
+    /// keep working otherwise (`write_traceback_chain`) read
+    /// `source_path` / `obj_name` / `qualname` through this handle
+    /// instead.
+    ///
+    /// The condition now excludes only the pre-hook bootstrap frame:
+    /// the tracer snapshot, which used to be the reachable case, is
+    /// GC-owned since `snapshot_for_tracing` moved to `FrameBox::new`,
+    /// and a full-corpus probe on the forwarding hook saw no non-GC
+    /// frame reach a traceback.  Retiring the field would still mean
+    /// deleting a guard whose failure mode is handing the collector a
+    /// `std::alloc` address, on evidence that is an absence rather than
+    /// a proof, so it stays.
     pub w_code: PyObjectRef,
 }
 
@@ -135,6 +155,12 @@ pub fn w_pytraceback_new(
         w_code,
     };
 
+    // The rule below cannot be spelled as a `debug_assert!` here: this crate
+    // is extracted to LLBC, so an assertion lands in the JIT's view of this
+    // function and its probe becomes a real call on every traceback the
+    // traced code builds — measurably, on the `getattr_*` gates.  It stays a
+    // stated obligation.
+    //
     // `frame` was copied into `value` above and is not among the roots
     // pinned here, so the allocation below — which can safepoint — must
     // not be able to move it.  Upstream has no such rule: a minor

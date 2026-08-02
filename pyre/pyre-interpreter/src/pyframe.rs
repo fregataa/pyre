@@ -577,6 +577,21 @@ impl FrameBox {
     /// reaches it, so `Drop` performs no manual free
     /// (`executioncontext.py:91-107 leave` frees nothing either).
     ///
+    /// The non-moving part is pyre's, not upstream's: `pyframe.py:52 class
+    /// PyFrame(W_Root)` declares no placement hint and a minor collection
+    /// relocates it, rewriting every referring slot
+    /// (`rpython/memory/gc/incminimark.py:2237` / `:2252`) because the
+    /// translator delivers roots as slot addresses and rewrites live GCREF
+    /// locals in them (`rpython/memory/gctransform/shadowstack.py:43-46`).
+    /// Rust has no such pass, and a running opcode holds a `&mut PyFrame`
+    /// across its own allocations, so this allocation standing still is what
+    /// takes the place of that rewrite.  It is not a rule about every frame —
+    /// a compiled trace's inlined-callee frame is a nursery allocation, and
+    /// making that uniform times `fib_recursive` out of its gate — so the
+    /// crossing into raw-pointer territory is guarded at the seams instead
+    /// (`gate-triage.md`, which also records why the ratio that experiment is
+    /// often quoted with is not reproducible).
+    ///
     /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
     /// returns `None`; fall back to the `std::alloc` `GcFramePrefix` box,
     /// which `Drop` frees manually.  The two regimes share one memory
@@ -589,26 +604,28 @@ impl FrameBox {
         // translated livevars across the frame allocation. Publish every field
         // before the first GC operation; a contended stable allocation parks
         // this mutator and lets another collector run.
-        let input_roots = [
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.ob_header.w_class as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.pycode as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.locals_cells_stack_w as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.debugdata as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.lastblock as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.f_generator_nowref as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.w_yielding_from as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.f_backref as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.w_builtin as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.w_globals as usize)),
-        ];
+        //
+        // One `push_roots(hop)` bracket over the whole set, not ten
+        // independently-owned slots: their lifetime is exactly this function
+        // body, which is the lexical shape `gc_enter_roots_frame` /
+        // `gc_leave_roots_frame` express (`shadowcolor.py:462-606`), and
+        // `pin_roots` is the one-phase publish `push_roots` performs — pinning
+        // them one at a time would query for forwarding after the first write
+        // and let a foreign collection run before the later values were
+        // visible.
+        let frame_root = pyre_object::gc_roots::push_roots();
+        let inputs = pyre_object::gc_roots::pin_roots(&[
+            frame.ob_header.w_class,
+            frame.pycode as pyre_object::PyObjectRef,
+            frame.locals_cells_stack_w as pyre_object::PyObjectRef,
+            frame.debugdata as pyre_object::PyObjectRef,
+            frame.lastblock as pyre_object::PyObjectRef,
+            frame.f_generator_nowref,
+            frame.w_yielding_from,
+            frame.f_backref as pyre_object::PyObjectRef,
+            frame.w_builtin,
+            frame.w_globals,
+        ]);
         let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
             PYFRAME_GC_TYPE_ID,
             std::mem::size_of::<PyFrame>(),
@@ -620,19 +637,20 @@ impl FrameBox {
             // GC operation: a contended barrier is an entry safepoint, so an
             // unrooted fresh frame could otherwise be swept by another
             // collector between this allocation and the barrier below.
-            let frame_root = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(raw as pyre_object::PyObjectRef);
-            frame.ob_header.w_class = input_roots[0].get().0 as pyre_object::PyObjectRef;
-            frame.pycode = input_roots[1].get().0 as *const ();
+            // Read back through the bracket's own cell rather than
+            // `shadow_stack_get`, which resolves the thread-local per slot.
+            frame.ob_header.w_class = frame_root.get(inputs);
+            frame.pycode = frame_root.get(inputs + 1) as *const ();
             frame.locals_cells_stack_w =
-                input_roots[2].get().0 as *mut pyre_object::FixedObjectArray;
-            frame.debugdata = input_roots[3].get().0 as *mut FrameDebugData;
-            frame.lastblock = input_roots[4].get().0 as *mut FrameBlock;
-            frame.f_generator_nowref = input_roots[5].get().0 as pyre_object::PyObjectRef;
-            frame.w_yielding_from = input_roots[6].get().0 as pyre_object::PyObjectRef;
-            frame.f_backref = input_roots[7].get().0 as *mut PyFrame;
-            frame.w_builtin = input_roots[8].get().0 as pyre_object::PyObjectRef;
-            frame.w_globals = input_roots[9].get().0 as pyre_object::PyObjectRef;
+                frame_root.get(inputs + 2) as *mut pyre_object::FixedObjectArray;
+            frame.debugdata = frame_root.get(inputs + 3) as *mut FrameDebugData;
+            frame.lastblock = frame_root.get(inputs + 4) as *mut FrameBlock;
+            frame.f_generator_nowref = frame_root.get(inputs + 5);
+            frame.w_yielding_from = frame_root.get(inputs + 6);
+            frame.f_backref = frame_root.get(inputs + 7) as *mut PyFrame;
+            frame.w_builtin = frame_root.get(inputs + 8);
+            frame.w_globals = frame_root.get(inputs + 9);
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as *mut u8
             ));
@@ -659,15 +677,15 @@ impl FrameBox {
         FrameBox::new_boxed(frame)
     }
 
-    /// Allocate a frame that is NOT GC-managed even when the GC hook is
-    /// installed — a plain `std::alloc` `GcFramePrefix` box reclaimed by
-    /// `Drop`.  Used for tracer snapshots (`snapshot_for_tracing`), which
-    /// a tracer holds off the `CURRENT_FRAME` chain across an entire
-    /// `trace_bytecode` walk: a major cycle can complete mid-walk, and no
-    /// root reaches the snapshot, so GC lifetime would reclaim it while the
-    /// tracer still reads it.  A deterministic scope-end free is correct
-    /// for these transient, tracer-private copies.
-    pub fn new_boxed(frame: PyFrame) -> Self {
+    /// Allocate a frame outside the GC — a plain `std::alloc`
+    /// `GcFramePrefix` box reclaimed by `Drop`.
+    ///
+    /// The sole caller is [`Self::new`]'s fallback for the window before the
+    /// GC hook is installed (bootstrap, unit tests).  Nothing is collected in
+    /// that window, so a frame allocated here is never swept and never moves,
+    /// which is what lets the rest of the interpreter treat every frame
+    /// address as stable.
+    fn new_boxed(frame: PyFrame) -> Self {
         let raw = Box::into_raw(Box::new(GcFramePrefix {
             gc_header: 0,
             frame,
@@ -679,10 +697,30 @@ impl FrameBox {
         }
     }
 
+    /// The frame's current address.
+    ///
+    /// `owner_root` is this handle's translated livevar slot.  A collection
+    /// rewrites the slot in place (`rpython/memory/gc/incminimark.py:2252`),
+    /// which is why RPython reads a GCREF local back out of its shadow-stack
+    /// slot rather than from a register it filled before the last operation
+    /// that could collect; the raw `ptr` field is that stale register, so
+    /// every read of the frame goes through the slot instead.  A
+    /// [`Self::new_boxed`] frame holds no slot and is not GC-managed, so its
+    /// address is fixed and the field is the only answer.
+    #[inline]
+    fn frame_ptr(&self) -> *mut PyFrame {
+        match &self.owner_root {
+            Some(owner_root) => owner_root.get().0 as *mut PyFrame,
+            None => self.ptr,
+        }
+    }
+
     /// Relinquish ownership, returning the inner-frame pointer. The header
     /// remains at `ptr - GC_HEADER_SIZE`; reclaim via [`FrameBox::from_raw`].
     pub fn into_raw(mut self) -> *mut PyFrame {
-        let ptr = self.ptr;
+        // Read the slot before releasing it — afterwards the handle has no
+        // root to answer from and only the stale field remains.
+        let ptr = self.frame_ptr();
         drop(self.owner_root.take());
         std::mem::forget(self);
         ptr
@@ -715,7 +753,7 @@ impl FrameBox {
 
     /// Raw pointer to the inner frame (header at `ptr - GC_HEADER_SIZE`).
     pub fn as_mut_ptr(&mut self) -> *mut PyFrame {
-        self.ptr
+        self.frame_ptr()
     }
 
     /// Does the collector own this frame, so that [`Drop`] leaves the memory
@@ -886,14 +924,14 @@ impl std::ops::Deref for FrameBox {
     type Target = PyFrame;
     #[inline]
     fn deref(&self) -> &PyFrame {
-        unsafe { &*self.ptr }
+        unsafe { &*self.frame_ptr() }
     }
 }
 
 impl std::ops::DerefMut for FrameBox {
     #[inline]
     fn deref_mut(&mut self) -> &mut PyFrame {
-        unsafe { &mut *self.ptr }
+        unsafe { &mut *self.frame_ptr() }
     }
 }
 
@@ -2451,10 +2489,21 @@ impl PyFrame {
     pub fn snapshot_for_tracing(&self) -> FrameBox {
         // A tracer holds this snapshot off the `CURRENT_FRAME` chain across
         // the whole `trace_bytecode` walk, during which a major GC cycle can
-        // complete; no root reaches it, so it must NOT have GC lifetime —
-        // `new_boxed` gives it a deterministic scope-end free.
+        // complete.  `FrameBox::new` is what makes that safe: it acquires a
+        // translated-livevar root for the frame, held for exactly the handle's
+        // lifetime, which is the walk (`trace_bytecode` takes the box by value
+        // and hands it back).  Before that root existed the snapshot had to be
+        // `new_boxed` — GC-invisible with a deterministic scope-end free —
+        // because nothing reached it.
+        //
+        // Being GC-owned is what lets the trace's synchronization target be a
+        // forwardable object: a `new_boxed` snapshot is an address the
+        // collector does not own, so `pytraceback_object_custom_trace` has to
+        // skip its frame edge and `TraceCtx::virtualizable_heap_ptr` has no
+        // slot to read back.  Same allocation shape as
+        // `snapshot_for_generator` below, for the same reason.
         let mut frame =
-            FrameBox::new_boxed(self.build_snapshot_frame(FrameLocalsArrayAllocation::StdAlloc));
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc));
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
@@ -3824,14 +3873,18 @@ impl PyFrame {
         // from those forwarded slots, matching gctransform/framework.py's
         // push_roots/pop_roots around a GC allocation.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(code as PyObjectRef);
-        pyre_object::gc_roots::pin_root(w_globals);
-        pyre_object::gc_roots::pin_root(closure);
-        pyre_object::gc_roots::pin_root(w_builtin);
-        for &arg in args {
-            pyre_object::gc_roots::pin_root(arg);
-        }
+        // The scalars and `args` are two slices of one livevar set, so both are
+        // written before either is queried: a forwarding query is a safepoint,
+        // and `args` would still be off the root stack while the scalars ran
+        // theirs.
+        let root_base = pyre_object::gc_roots::publish_roots(&[
+            code as PyObjectRef,
+            w_globals,
+            closure,
+            w_builtin,
+        ]);
+        let args_base = pyre_object::gc_roots::publish_roots(args);
+        pyre_object::gc_roots::normalize_roots(root_base, 4 + args.len());
         let code_ref = unsafe {
             &*(crate::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(root_base))
                 as *const CodeObject)
@@ -3845,10 +3898,10 @@ impl PyFrame {
         };
         // The allocation result is a translated livevar before it is stored in
         // the eventual PyFrame. Publish it before `w_cell_new`, the barrier,
-        // or any other GC operation can park this free-threaded mutator.
-        let _locals_owner_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-            locals_cells_stack_w as usize,
-        ));
+        // or any other GC operation can park this free-threaded mutator. It
+        // joins the bracket the call inputs already opened: its lifetime is
+        // the rest of this function body, so it needs no owner of its own.
+        pyre_object::gc_roots::pin_root(locals_cells_stack_w as PyObjectRef);
 
         {
             // Populate the freshly-allocated array via its mutable slice.
@@ -3857,7 +3910,7 @@ impl PyFrame {
             // Bind positional arguments directly -- no intermediate Vec.
             let nargs = args.len().min(num_locals);
             for i in 0..nargs {
-                arr[i] = pyre_object::gc_roots::shadow_stack_get(root_base + 4 + i);
+                arr[i] = pyre_object::gc_roots::shadow_stack_get(args_base + i);
             }
 
             // CPython 3.11+ `co_localsplusnames` unified slot layout:
