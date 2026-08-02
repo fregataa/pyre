@@ -2275,6 +2275,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.slice_first_sites,
             )
         };
+        // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
+        // the residual `saturating_sub` call block into an `if a < b { 0 } else
+        // { a - b }` diamond, same post-lowering shape and fail-safe contract as
+        // `slice_first`; gate the reachability sweep on an actual rewrite.
+        let saturating_sub_rewritten = if lo.saturating_sub_sites.is_empty() {
+            0
+        } else {
+            crate::front::saturating_sub::rewire_saturating_sub_call_sites(
+                &mut lo.graph,
+                &lo.saturating_sub_sites,
+            )
+        };
         // The `Option::unwrap_or` value-select rewrite
         // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
         // block into a `__discriminant` diamond, same post-lowering shape and
@@ -2377,6 +2389,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
+            || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
             || expect_rewritten > 0
@@ -2783,6 +2796,11 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_first::SliceFirstSite`]).
     slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
+    /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
+    /// diamond (`if a < b { 0 } else { a - b }`) the
+    /// `front::saturating_sub` post-pass synthesizes after body lowering (see
+    /// [`crate::front::saturating_sub::SaturatingSubSite`]).
+    saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -3015,6 +3033,7 @@ impl<'a> Lowering<'a> {
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
+            saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             range_contains_sites: Vec::new(),
@@ -6631,6 +6650,36 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `we_are_jitted()` is true during tracing and blackholing
+                // (rlib/jit.py:355-358); the rtyper folds the surviving
+                // `_we_are_jitted` symbolic to a constant True
+                // (rlib/jit.py:403-406, jtransform.py:1636-1639).  Folding it
+                // to `ConstBool(true)` here — at the front, before annotation —
+                // lets `simplify_lowered_graph`'s `fold_constant_exitswitch`
+                // drop each JIT-dead `if not we_are_jitted()` interpreter arm
+                // before the graph is annotated, instead of at
+                // `fold_we_are_jitted_calls` (jtransform post-annotation).  A
+                // dead interpreter arm reading a residual-only static (e.g.
+                // `baseobjspace::METHOD_CACHE` behind
+                // `lookup_where_with_method_cache`) would otherwise fail the
+                // phaseA lift and drop the whole graph to the legacy walker.
+                if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && fd.item_meta.name_path() == "majit_metainterp::jit::we_are_jitted"
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ConstBool(true),
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Reflexive blanket `into` — the callsite selected
                 // `impl<T> From<T> for T`, a pure `T -> T` identity
                 // conversion.  Bind the destination local to the
@@ -6941,6 +6990,43 @@ impl<'a> Lowering<'a> {
                         },
                     );
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `FixedObjectArray::set_ref(self, index, value)` — the
+                // length-prefixed array's GC-published element store.  The
+                // method body hand-rolls the write-barrier dance
+                // (`pin_root` / `try_gc_write_barrier` / reload-from-shadow-
+                // stack) because Rust has no GC-transform pass; in the
+                // lifted trace that is exactly RPython's single
+                // `setarrayitem_gc` (`ll_setitem_fast`, `rlist.py:377`),
+                // whose conditional write barrier is re-inserted by the
+                // backend rewrite (`handle_write_barrier_setarrayitem`,
+                // rewrite.py:403), not by a traced source call.  Collapse
+                // the whole call to one `ArrayWrite` over the receiver
+                // (a `FixedSizeListRepr`, `ll_fixed_items(l) = l`,
+                // rlist.py:399) so the barrier-body accessors
+                // (`items_mut_ptr`, `try_gc_owns_object`) never reach the
+                // annotator.  The call returns `()`; its dead destination
+                // binds to a fresh Void var.
+                if args.len() == 3 && self.is_object_array_set_ref_call(&reg) {
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::ArrayWrite {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            value: LinkArg::Value(args[2].clone()),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(
+                        self.graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                    );
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -8685,6 +8771,26 @@ impl<'a> Lowering<'a> {
         {
             self.slice_first_sites.push(site);
         }
+        // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
+        // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
+        // foreign leaf (its `Self` is a primitive integer, so `lower_call`
+        // keeps the raw `FunctionPath` segments), residualized as an
+        // unregistered callee the rtyper census Skips.  Restricted to unsigned
+        // receivers (every observed site is `usize`/`u16`/`u32`): the clamp
+        // floors at zero via `a < b`; a signed `saturating_sub` floors at
+        // `TYPE_MIN` (a different diamond) and stays residual.  A resolution
+        // miss leaves the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
+            && let Some(site) = self.recognize_saturating_sub_site(&call.dest.ty, &result_var)
+        {
+            self.saturating_sub_sites.push(site);
+        }
         // Capture `RangeInclusive::new(lo, hi)` sites for the
         // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
         // `new` is an inherent-impl associated function whose owner
@@ -8872,6 +8978,9 @@ impl<'a> Lowering<'a> {
                     Some(crate::front::option_closure_select::ClosureCombinator::UnwrapOrElse)
                 }
                 "or_else" => Some(crate::front::option_closure_select::ClosureCombinator::OrElse),
+                "is_some_and" => {
+                    Some(crate::front::option_closure_select::ClosureCombinator::IsSomeAnd)
+                }
                 _ => None,
             }
             && let Some(site) = self.recognize_closure_select_site(
@@ -9285,6 +9394,19 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
+    }
+
+    /// `FixedObjectArray::set_ref(self, index, value)` — the GC-published
+    /// element store whose body hand-rolls the write barrier.  Recognised as
+    /// the receiver of a `setarrayitem_gc` collapse (`ll_setitem_fast`,
+    /// rlist.py:377); the barrier is a backend rewrite, not a traced call.
+    fn is_object_array_set_ref_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::set_ref"
+        })
     }
 
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
@@ -10831,6 +10953,22 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve a recognized `{uN}::saturating_sub(a, b)` call into a
+    /// [`crate::front::saturating_sub::SaturatingSubSite`].  Gated on an
+    /// **unsigned** result type (`saturating_sub` returns the receiver `uN`):
+    /// the unsigned clamp floors at zero via `a < b`.  A signed `saturating_sub`
+    /// floors at `TYPE_MIN` (a different diamond) and is left residual (`None`).
+    fn recognize_saturating_sub_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::saturating_sub::SaturatingSubSite> {
+        self.tyref_literal_uint_atom(dest_ty)?;
+        Some(crate::front::saturating_sub::SaturatingSubSite {
+            result_var: result_var.clone(),
+        })
+    }
+
     /// Resolve a recognized `Option::unwrap_or(opt, default)` /
     /// `Result::unwrap_or(res, default)` call into an
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the enum root +
@@ -11204,12 +11342,14 @@ impl<'a> Lowering<'a> {
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
         // is `Option<T>` and its closure returns that same `Option<T>`;
-        // `unwrap_or_else`'s dest is the bare `T`.
+        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`'s closure and
+        // dest are both `bool`.
         let call_result_ty = match kind {
             ClosureCombinator::Map => self.tyref_option_payload_value_type(dest_ty)?,
             ClosureCombinator::AndThen
             | ClosureCombinator::OrElse
-            | ClosureCombinator::UnwrapOrElse => tyref_to_value_type(dest_ty, self.llbc),
+            | ClosureCombinator::UnwrapOrElse
+            | ClosureCombinator::IsSomeAnd => tyref_to_value_type(dest_ty, self.llbc),
         };
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_closure_select::ClosureSelectSite {
@@ -22708,6 +22848,209 @@ mod tests {
         assert!(
             array_writes >= 1,
             "fill_user_function_args: expected at least one native ArrayWrite (setarrayitem)"
+        );
+    }
+
+    /// Real-LLBC anchor for the unsigned `saturating_sub` clamp diamond:
+    /// `generic_alias_class_getitem`'s arg-count error path computes
+    /// `args.len().saturating_sub(1)`.  After the `front::saturating_sub`
+    /// post-pass there must be no residual `["num","<Impl>","saturating_sub"]`
+    /// call and at least one `lt` guard + one `sub` (the `if a < b { 0 } else
+    /// { a - b }` diamond).  `#[ignore]`d (loads the ~440MB real LLBC); run with
+    /// `cargo test -p majit-translate --lib saturating_sub_generic_alias_real
+    /// -- --ignored`.
+    #[test]
+    #[ignore]
+    fn saturating_sub_generic_alias_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "generic_alias_class_getitem")
+            .expect("lower generic_alias_class_getitem");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "generic_alias_class_getitem: residual saturating_sub after the clamp-diamond rewrite"
+        );
+        let lt_guards = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lt"))
+            .count();
+        let subs = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub"))
+            .count();
+        assert!(
+            lt_guards >= 1 && subs >= 1,
+            "generic_alias_class_getitem: expected the a<b guard and the a-b subtraction \
+             (lt={lt_guards}, sub={subs})"
+        );
+    }
+
+    /// Real-LLBC anchor for the `Option::is_some_and` closure-select fold:
+    /// `is_mmap` is `type(obj).is_some_and(|tp| ptr::eq(tp.as_ptr(),
+    /// mmap_type()))`.  After the `option_closure_select` post-pass there must
+    /// be no residual `is_some_and` `Method` call, and block A must branch two
+    /// ways (the `Some`/`None` discriminant diamond).  `#[ignore]`d (loads the
+    /// ~440MB real LLBC); run with `cargo test -p majit-translate --lib
+    /// is_some_and_is_mmap_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn is_some_and_is_mmap_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "is_mmap").expect("lower is_mmap");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == "is_some_and"
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "is_mmap: residual is_some_and call after the closure-select rewrite"
+        );
+        let branching = graph.blocks.iter().filter(|b| b.exits.len() == 2).count();
+        assert!(
+            branching >= 1,
+            "is_mmap: expected the Some/None discriminant branch (a 2-exit block)"
+        );
+    }
+
+    /// Real-LLBC anchor for the `FixedObjectArray::set_ref` setarrayitem
+    /// collapse: `set_locals_w` (the shared STORE_FAST-family leaf) calls
+    /// `self.locals_cells_stack_w.set_ref(index, value)`.  After the
+    /// whole-method lift there must be no residual
+    /// `["object_array","<Impl>","set_ref"]` call and no residual
+    /// `items_mut_ptr` / write-barrier accessor from the method body, and at
+    /// least one native `ArrayWrite` (the `setarrayitem_gc`).  `#[ignore]`d
+    /// (loads the ~440MB real LLBC); run with `cargo test -p majit-translate
+    /// --lib set_ref_set_locals_w_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn set_ref_set_locals_w_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["object_array", "<Impl>", "set_ref"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "set_locals_w: residual set_ref call after the setarrayitem collapse"
+        );
+        let array_writes = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::ArrayWrite { .. }))
+            .count();
+        assert!(
+            array_writes >= 1,
+            "set_locals_w: expected at least one native ArrayWrite (setarrayitem_gc)"
+        );
+    }
+
+    /// Real-LLBC anchor for the `we_are_jitted()` → `ConstBool(true)` front
+    /// fold: `lookup_in_type_where` branches on `if not we_are_jitted()` and,
+    /// in the interpreter arm, calls `_cached_lookup_where_name`, whose body
+    /// reads the residual-only `METHOD_CACHE` static.  After the front fold the
+    /// interpreter arm is JIT-dead and the annotator prunes it, but the fold
+    /// itself already removes the `we_are_jitted` call and collapses its
+    /// two-way branch to the JIT arm's unconditional goto — so the lowered
+    /// graph carries no `we_are_jitted` call.  `#[ignore]`d (loads the ~440MB
+    /// real LLBC); run with `cargo test -p majit-translate --lib
+    /// we_are_jitted_lookup_in_type_where_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn we_are_jitted_lookup_in_type_where_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "lookup_in_type_where")
+            .expect("lower lookup_in_type_where");
+        let we_are_jitted_residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["jit", "we_are_jitted"])
+                )
+            })
+            .count();
+        assert_eq!(
+            we_are_jitted_residual, 0,
+            "lookup_in_type_where: residual we_are_jitted call after the front fold"
+        );
+        // The interpreter arm's `_cached_lookup_where_name` call (which reads
+        // the residual-only `METHOD_CACHE` static) is JIT-dead once
+        // `we_are_jitted()` folds to True.  The front fold collapses the branch
+        // to the JIT arm's unconditional goto, so the interpreter arm becomes
+        // unreachable and `simplify_lowered_graph`'s `clear_unreachable_blocks`
+        // empties its operations — no `_cached_lookup_where_name` call survives.
+        let cached_lookup_residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["baseobjspace", "_cached_lookup_where_name"])
+                )
+            })
+            .count();
+        assert_eq!(
+            cached_lookup_residual, 0,
+            "lookup_in_type_where: residual _cached_lookup_where_name (METHOD_CACHE reader) \
+             after the we_are_jitted fold pruned the interpreter arm"
         );
     }
 
