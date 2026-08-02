@@ -937,6 +937,7 @@ fn maybe_print_jit_stats() {
         }
     }
     maybe_print_mc_diag();
+    maybe_print_gc_diag();
     if std::env::var_os("MAJIT_STATS").is_none() {
         return;
     }
@@ -1003,6 +1004,27 @@ use majit_metainterp::MC_DIAG_LABELS as MC_DIAG_FIELDS;
 /// `_jit_stats_snapshot` keeps the LAST such line, so a second one would
 /// silently replace the committed per-bench baseline. Its own env gate keeps it
 /// off the default `check.py` run, which sets `MAJIT_STATS` for every bench.
+/// Print the GC's deterministic pressure counters.
+///
+/// The perf question this answers is the one a loaded machine's clock cannot:
+/// "did that change actually allocate less?".  A minor collection happens once
+/// per nursery-full, so `minor` is a direct proxy for cumulative allocation and
+/// is identical across runs of the same program — unlike wall or even user CPU
+/// time, which on this tree can swing by more than any single change is worth.
+///
+/// Same prefix discipline as [`maybe_print_mc_diag`]: not `[jit-stats]`, and
+/// behind its own env gate, so the committed per-bench baselines never see it.
+fn maybe_print_gc_diag() {
+    if std::env::var_os("PYRE_GC_DIAG").is_none() {
+        return;
+    }
+    let (minor, major, heap_bytes, nursery_bytes) = pyre_jit::gc_diag_counters();
+    eprintln!(
+        "[jit-gc-diag] minor={minor} major={major} heap_bytes={heap_bytes} \
+         nursery_bytes={nursery_bytes}"
+    );
+}
+
 fn maybe_print_mc_diag() {
     if std::env::var_os("PYRE_MC_DIAG").is_none() {
         return;
@@ -1171,10 +1193,77 @@ fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
     }
 }
 
+/// Whether releasing this binding can remove anything from the reachable set,
+/// and so whether the collection that follows it could find garbage an earlier
+/// one did not. Answering `false` skips a full mark-and-sweep of the whole
+/// heap, which is what the release loop below otherwise costs per name.
+///
+/// Two values answer `false` outright:
+///
+/// * An exact `int`, `float`, `bool`, `str`, `bytes` or `None`. It holds no
+///   reference to another object, so nothing but the value itself can lose its
+///   last referrer, and no builtin scalar type defines `__del__`, so nothing
+///   observes it going. `is_exact_type` is what makes this safe rather than
+///   `is_str`/`is_int`, which key off the layout `ob_type` a subclass keeps: a
+///   `class MyStr(str)` instance retags `w_class` and is rejected here, so its
+///   `__del__` and its own attributes stay on the collecting path.
+/// * A module still registered in `sys.modules` under its own `__name__`. It
+///   stays reachable from there no matter what `__main__` does, so the release
+///   removes no object at all from the reachable set. This is every `import`
+///   name. Reading the live `sys.modules` rather than assuming is what keeps a
+///   program that replaced or deleted the entry on the collecting path.
+///
+/// The point is not that these values are cheap to collect — it is that the
+/// collection cannot reach a different answer, so every `__del__` still runs at
+/// exactly the same place in the loop.
+fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    unsafe {
+        if pyre_object::is_none(value)
+            || pyre_object::is_exact_type(value, &pyre_object::INT_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::BOOL_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::FLOAT_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::STR_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::BYTES_TYPE)
+        {
+            return true;
+        }
+        if pyre_object::is_module(value) {
+            // `Module.name` is the interpreter's own field, not the
+            // program-writable `__name__` attribute, so it is always a string —
+            // but `types.ModuleType.__new__` leaves it empty until `__init__`
+            // seeds it. An anonymous module proves nothing about reachability,
+            // so it takes the collecting path rather than a `sys.modules[""]`
+            // lookup that only an adversarial program could satisfy.
+            let name = pyre_object::w_module_get_name(value);
+            return !name.is_empty() && importing::get_sys_module(name).is_some_and(|m| m == value);
+        }
+    }
+    false
+}
+
 /// PyPy `ObjSpace.finish()` / module teardown ordering: join non-daemon
 /// threads, collect already-unreachable cycles, then release `__main__`
 /// globals from newest to oldest while the older globals their `__del__`
 /// methods may reference are still present.
+///
+/// Newest-to-oldest is what keeps those references working, and it is not
+/// interchangeable with the insertion order `_PyModule_ClearDict` uses. A name
+/// is bound before every name that could be finalized while reading it — most
+/// of all `import sys`, which is usually the very first — so releasing in
+/// insertion order strands `sys` at `None` and every finalizer that writes to
+/// `sys.stderr` dies with an `AttributeError` instead of running. Refcounting
+/// makes the question moot upstream: a finalizer there runs from the decref of
+/// the name being released, while every other slot still holds its original
+/// value, which is not reproducible without leaving dangling pointers in the
+/// dict.
+///
+/// The value is rebound to `None` rather than deleted, as `_PyModule_ClearDict`
+/// does: a `__del__` that reads an already-released name then sees `None`, the
+/// way it would upstream, instead of raising `NameError` at a name the program
+/// can see is still defined.
 fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
     run_threading_shutdown();
     // baseobjspace.py:498-501 `finish()` runs every started module's shutdown
@@ -1190,11 +1279,22 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
         if name == "__builtins__" {
             continue;
         }
+        // Re-read rather than trusting the snapshot: a `__del__` already run by
+        // this loop may have rebound the name, and the decision below is only
+        // sound about the value actually being released.
+        let value = unsafe { pyre_object::w_dict_getitem_str(canonical, &name) };
+        let frees_nothing = value.is_none_or(release_frees_nothing);
         unsafe {
-            pyre_object::w_dict_delitem_str(canonical, &name);
+            pyre_object::w_dict_setitem_str(canonical, &name, pyre_object::w_none());
         }
-        collect_and_run_finalizers(ec_ptr);
+        if !frees_nothing {
+            collect_and_run_finalizers(ec_ptr);
+        }
     }
+    // The loop ends on a collection whenever it releases anything collectable;
+    // this is the one for the case where the last releases were all skipped, so
+    // teardown still finishes with the heap swept and the queue drained.
+    collect_and_run_finalizers(ec_ptr);
 }
 
 /// Resolve a pending `SystemExit`'s status, then finalize and exit with it.

@@ -757,10 +757,17 @@ impl ShortBoxes {
         // `materialize_operand_at(arg)` lookup returns the same key (ptr_eq).
         let arg_res = ctx.materialize_operand_at(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_res.clone()]);
-        // ShortInputArg.preamble_op is the freshly renamed InputArg in
-        // RPython.  `ProducedShortOp` stores an OpRc, so majit uses a
-        // non-emitted SAME_AS stand-in whose result position is that renamed
-        // box; `res` above remains the original label box.
+        // `ProducedShortOp` stores an OpRc, so the fresh renamed InputArg
+        // that shortpreamble.py:257 carries as `preamble_op` is stood in for
+        // by this non-emitted SAME_AS. The stand-in stays at the ORIGINAL
+        // label box: exported entries carry original positions, and the
+        // rename is applied at import, where `produce_arg` maps the entry to
+        // its `short_inputargs` slot through `label_arg_idx`.
+        //
+        // Moving it to `renamed` splits the two halves of that contract —
+        // metadata stays seeded at the original while the replay consumes it
+        // from `preamble_op.pos` — and an input short box then loses its
+        // exported info and guards.
         same_as.pos.set(arg);
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // — keyed by the label-arg Box itself; `arg_res` is its canonical
@@ -1728,9 +1735,15 @@ impl ProducedShortOp {
             }
         });
         // shortpreamble.py:62-75 keeps `self.res` (the body-visible Box)
-        // distinct from `preamble_op` (the replayed GETFIELD result).  Do not
-        // forward one to the other: `force_op_from_preamble` returns
-        // `PreambleOp.op` and records the replay operation separately.
+        // distinct from `preamble_op` (the replayed GETFIELD result), joining
+        // them only through `PreambleOp(self.res, preamble_op, ...)`.
+        //
+        // DEVIATION: the forwarding below collapses the two onto one position.
+        // It is load-bearing as long as it stands — `force_op_from_preamble_op`
+        // keys `potential_extra_ops` off the forwarded box, and both the
+        // `force_box` pop and the post-hoc force sweep in unroll.rs carry a
+        // second lookup for the cases where the two resolutions disagree. The
+        // forwarding and those compensations have to come out together.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1870,9 +1883,11 @@ impl ProducedShortOp {
                 }
             });
         }
-        // shortpreamble.py:80-85 has the same two-Box shape as GETFIELD:
-        // the carried body result and replayed GETARRAYITEM result remain
-        // distinct and are joined only by PreambleOp bookkeeping.
+        // shortpreamble.py:80-85 has the same two-Box shape as GETFIELD: the
+        // carried body result and the replayed GETARRAYITEM result stay
+        // distinct upstream, joined only by PreambleOp bookkeeping. The same
+        // DEVIATION as the GETFIELD path applies — the forwarding below
+        // collapses them.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1916,8 +1931,9 @@ impl ProducedShortOp {
             _ => return None,
         };
         // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
-        // and the replay call separately in PreambleOp.  As with HeapOp, the
-        // two identities must not be collapsed.
+        // and the replay call separately in PreambleOp. As with HeapOp the two
+        // identities stay distinct upstream, and as with HeapOp the forwarding
+        // below is the DEVIATION that collapses them.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let op_source = ctx
