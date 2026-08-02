@@ -3200,6 +3200,17 @@ pub(crate) fn note_root_trace_too_long(
     }
 }
 
+/// Name `Counters.ABORT_FORCE_QUASIIMMUT` as the reason for the abort the
+/// walker is returning (`pyjitpl.py:1116`), so the single `aborted_tracing`
+/// that follows counts it under `profiler.abort_force_quasiimmut` instead of
+/// the `Generic` catch-all.
+pub(crate) fn note_force_quasi_immut_abort() {
+    let (driver, _) = crate::driver::driver_pair();
+    driver
+        .meta_interp_mut()
+        .stage_abort_reason(majit_metainterp::counters::ABORT_FORCE_QUASIIMMUT);
+}
+
 pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
 }
@@ -3413,6 +3424,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 majit_metainterp::counters::HEAPCACHED_OPS,
             );
         } else {
+            install_quasiimmut_field(ctx, obj, &descr);
             ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
             ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
             if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
@@ -3516,6 +3528,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 majit_metainterp::counters::HEAPCACHED_OPS,
             );
         } else {
+            install_quasiimmut_field(ctx, obj, &descr);
             ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
             ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
             if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
@@ -4443,6 +4456,7 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     // captured here; by the time the optimizer runs, the change it is looking
     // for has already happened.
     let constantfieldbox = current_quasiimmut_field_value(ctx, obj, &descr);
+    install_quasiimmut_field(ctx, obj, &descr);
     ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
     // Upstream carries the captured value on the per-op `QuasiImmutDescr`
     // (quasiimmut.py:113-159), a descr minted fresh for every recorded
@@ -4455,6 +4469,45 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     };
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
         ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+    }
+}
+
+/// `quasiimmut.py:116-126 get_current_qmut_instance`, reached from
+/// `pyjitpl.py:1081 QuasiImmutDescr(...)` — install the qmut instance at RECORD
+/// time.
+///
+/// Upstream builds a `QuasiImmutDescr` for every recorded `QUASIIMMUT_FIELD`,
+/// and its `__init__` installs the instance. It therefore exists for the rest of
+/// the recording, which is what arms `opimpl_jit_force_quasi_immutable`'s
+/// `mutatebox.nonnull()` (`pyjitpl.py:1112`) for a write reached later in that
+/// same trace.
+///
+/// Pyre installed only from `register_quasi_immutable_deps`
+/// (`pyre-jit/src/eval.rs`), which runs at COMPILE time, and every invalidation
+/// uninstalls — so through a whole recording the field stayed null and no
+/// write-side test could ever fire. This is the read dual of that function and
+/// resolves `(object, field_index)` → owner the same way it does.
+fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
+    let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) else {
+        return;
+    };
+    let struct_ptr = struct_ref.0 as i64;
+    if struct_ptr == 0 || struct_ptr == usize::MAX as i64 {
+        return;
+    }
+    // The non-module owner is a `W_TypeObject`; the accessor re-checks
+    // `is_type`, so a descr naming neither owner is a no-op rather than a
+    // mistyped write.
+    unsafe {
+        if descr.index() == crate::descr::module_dict_version_descr().index() {
+            pyre_object::dictmultiobject::module_dict_strategy_install_version_watcher(
+                struct_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
+            );
+        } else {
+            pyre_object::typeobject::w_type_install_quasi_immut(
+                struct_ptr as pyre_object::PyObjectRef,
+            );
+        }
     }
 }
 
