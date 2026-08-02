@@ -47,8 +47,6 @@ thread_local! {
         current_frame: CURRENT_FRAME.with(|frame| frame as *const _),
         last_exec_ctx: crate::call::capture_last_exec_ctx_cell(),
         import_roots: crate::importing::capture_import_root_area(),
-        mapdict_method_cache: crate::pycode::capture_mapdict_method_cache_root_area(),
-        w_globals_stamped_codes: crate::pycode::capture_w_globals_stamped_code_root_area(),
         in_flight_exception: IN_FLIGHT_EXCEPTION.with(|cell| cell as *const _),
         bh_last_exception: majit_metainterp::blackhole::BH_LAST_EXC_VALUE
             .with(|cell| cell as *const _),
@@ -64,8 +62,6 @@ struct PyFrameRootArea {
     current_frame: *const Cell<*mut PyFrame>,
     last_exec_ctx: *const (),
     import_roots: *const (),
-    mapdict_method_cache: *const (),
-    w_globals_stamped_codes: *const (),
     in_flight_exception: *const Cell<PyObjectRef>,
     bh_last_exception: *const Cell<i64>,
     guard_exception: *const Cell<i64>,
@@ -1076,27 +1072,14 @@ pub unsafe fn walk_pyframe_roots_area(
                     walk_raw_getset_roots(*slot, visitor);
                 };
                 crate::importing::walk_import_roots_area(area.import_roots, &mut forward);
-                // The per-pycode `_mapdict_caches` LOAD_METHOD slots hold a
-                // `w_method` pointer (mapdict.py:1418) that no custom trace
-                // reaches — code objects are Box-immortal — so forward those
-                // the same way.
-                crate::pycode::walk_mapdict_method_cache_root_area(
-                    area.mapdict_method_cache,
-                    &mut forward,
-                );
-                // `pycode.py:159-165 frame_stores_global` stamps `w_globals`
-                // permanently, and upstream traces it through the GC-managed
-                // `PyCode`.  Box-immortal code objects are reached only when
-                // `walk_raw_code_roots` runs on a `frame.pycode` / `func.code`
-                // that happens to be walked, so a stamped code object sitting
-                // off the frame chain keeps a pre-move address once its
-                // globals dict is promoted.  Forward every stamped slot.
-                crate::pycode::walk_w_globals_stamped_code_root_area(
-                    area.w_globals_stamped_codes,
-                    &mut |slot| {
-                        visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
-                    },
-                );
+                // The `_mapdict_caches` LOAD_METHOD `w_method` slots
+                // (mapdict.py:1418) and the stamped `w_globals` slots
+                // (`pycode.py:159-165 frame_stores_global`) used to ride here
+                // as per-thread areas.  Their holder is an immortal code
+                // object that outlives the stamping thread, so they moved to
+                // process-global walkers registered in `pyre-jit::eval`
+                // (`mapdict_method_cache_root_walker`,
+                // `w_globals_stamped_code_root_walker`).
             }
         }
     }
@@ -3196,6 +3179,24 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
     }
 }
 
+/// Shared WITH_EXCEPT_START call semantics for the interpreter and generated
+/// JitCode residual.  Keeping the call here preserves the bytecode operation's
+/// exact `__exit__(type, value, traceback)` argument construction on both paths.
+pub fn with_except_start_values(
+    exit_func: PyObjectRef,
+    exit_self: PyObjectRef,
+    val: PyObjectRef,
+) -> PyObjectRef {
+    let exc_type = crate::typedef::r#type(val).map_or(pyre_object::w_none(), |p| p.as_ptr());
+    let exc_tb =
+        crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
+    if exit_self.is_null() {
+        crate::call_function(exit_func, &[exc_type, val, exc_tb])
+    } else {
+        crate::call_function(exit_func, &[exit_self, exc_type, val, exc_tb])
+    }
+}
+
 impl OpcodeStepExecutor for PyFrame {
     /// SETUP_ANNOTATIONS — ensure `__annotations__` exists in the
     /// current locals namespace. PyPy: pyopcode.py SETUP_ANNOTATIONS
@@ -3262,14 +3263,7 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.locals_w()[depth - 1];
         let exit_self = self.locals_w()[depth - 4];
         let exit_func = self.locals_w()[depth - 5];
-        let exc_type = crate::typedef::r#type(val).map_or(pyre_object::w_none(), |p| p.as_ptr());
-        let exc_tb =
-            crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
-        let res = if exit_self.is_null() {
-            crate::call_function(exit_func, &[exc_type, val, exc_tb])
-        } else {
-            crate::call_function(exit_func, &[exit_self, exc_type, val, exc_tb])
-        };
+        let res = with_except_start_values(exit_func, exit_self, val);
         if res.is_null() {
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| crate::PyError::type_error("__exit__ failed"))

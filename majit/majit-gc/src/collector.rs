@@ -6,7 +6,7 @@
 /// - Write barrier with remembered set for old-to-young pointers
 ///
 /// Modeled after incminimark's minor/major collection.
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
 use majit_ir::GcRef;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -390,8 +390,8 @@ struct IncrementalMarkState {
     objects_marked: usize,
     /// Target number of bytes to trace per increment.
     ///
-    /// Mirrors incminimark's `gc_increment_step`, which defaults to
-    /// `nursery_size * 2`.
+    /// Mirrors incminimark.py:448,500-504 `gc_increment_step`, whose runtime
+    /// default is `nursery_size * 4` when `PYPY_GC_INCREMENT_STEP` is unset.
     mark_budget_per_step: usize,
     /// Reusable buffer for `mark_object`: the FIXED-part GC pointer offsets of
     /// the object currently being traced (bounded by the struct's field count),
@@ -405,10 +405,15 @@ struct IncrementalMarkState {
 
 impl IncrementalMarkState {
     fn new(nursery_size: usize) -> Self {
+        // incminimark.py:500-504: an explicit positive byte budget wins;
+        // otherwise mark four nursery sizes per incremental step.
+        let mark_budget_per_step = read_uint_from_env("PYPY_GC_INCREMENT_STEP")
+            .unwrap_or_else(|| nursery_size.saturating_mul(4))
+            .max(1);
         IncrementalMarkState {
             gray_stack: Vec::new(),
             objects_marked: 0,
-            mark_budget_per_step: (nursery_size.saturating_mul(2)).max(1),
+            mark_budget_per_step,
             mark_offsets: Vec::new(),
         }
     }
@@ -443,6 +448,10 @@ pub struct MiniMarkGC {
     /// These are old-gen object payload addresses whose TRACK_YOUNG_PTRS
     /// flag has been cleared by the write barrier.
     remembered_set: Vec<usize>,
+    /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
+    /// Immortal objects enter exactly once, when their first pointer write
+    /// clears NO_HEAP_PTRS in the write barrier.
+    prebuilt_root_objects: Vec<usize>,
     /// incminimark.py:346-352: objects with GCFLAG_CARDS_SET bit.
     /// Card bits are stored inline before each object's GcHeader.
     /// This list tracks which objects have at least one card bit set.
@@ -590,8 +599,10 @@ pub struct MiniMarkGC {
     /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
     /// arithmetically from the GC `type_info_group` base; pyre's GC
     /// keeps an explicit table because frontends register vtables
-    /// independently of any translator pipeline.
-    vtable_to_type_id: IndexMap<usize, u32>,
+    /// independently of any translator pipeline. This has RPython
+    /// AddressDict hashing: keys are addresses and insertion order is not
+    /// observable at any call site.
+    vtable_to_type_id: AddressMap<u32>,
     /// `gc.py:603-622 _setup_guard_is_object` instance state.
     /// `_infobits_offset` is the byte offset of `infobits` inside
     /// `TYPE_INFO`; `_infobits_offset_plus` is the additional offset
@@ -664,6 +675,7 @@ impl MiniMarkGC {
             types: TypeRegistry::new(),
             roots: RootSet::new(),
             remembered_set: Vec::new(),
+            prebuilt_root_objects: Vec::new(),
             old_objects_with_cards_set: Vec::new(),
             young_objects_with_weakrefs: Vec::new(),
             old_objects_with_weakrefs: Vec::new(),
@@ -698,7 +710,7 @@ impl MiniMarkGC {
             pinned_objects: IndexSet::new(),
             nursery_objects_shadows: AddressMap::default(),
             compiled_code_registry: CompiledCodeRegistry::new(),
-            vtable_to_type_id: IndexMap::new(),
+            vtable_to_type_id: AddressMap::default(),
             _infobits_offset: 0,
             _infobits_offset_plus: 0,
             _T_IS_RPYTHON_INSTANCE_BYTE: 0,
@@ -875,6 +887,32 @@ impl MiniMarkGC {
     #[inline]
     pub fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
+    }
+
+    /// Resolve a PyObject header without asking the nursery/oldgen allocators.
+    /// A registered vtable plus the exact matching header tid is the translated
+    /// type-layout witness. The tid equality rejects headerless bootstrap
+    /// objects whose preceding allocator word happens to look like flags.
+    ///
+    /// This is the ONLY admissible probe for an address outside both managed
+    /// generations, and both callers (`seed_major_root`, `do_write_barrier`)
+    /// must go through it. Recording every `alloc_with_gc_header` result in an
+    /// ownership table instead would make the answer exact, but that is a probe
+    /// on the allocation fast path — the same shape measured at −15% in the GC
+    /// box-probe experiment — so the tid witness stands.
+    #[inline]
+    fn registered_pyobject_header(&self, addr: usize) -> Option<*mut GcHeader> {
+        if addr < GcHeader::SIZE || addr % GcHeader::ALIGN != 0 {
+            return None;
+        }
+        let vtable = unsafe { *(addr as *const usize) };
+        let expected_type_id = *self.vtable_to_type_id.get(&vtable)?;
+        let hdr = unsafe { header_of(addr) };
+        if unsafe { (*hdr).type_id() } == expected_type_id {
+            Some(hdr)
+        } else {
+            None
+        }
     }
 
     /// Valid-object nursery check for arbitrary GC fields/roots.
@@ -2420,13 +2458,24 @@ impl MiniMarkGC {
     }
 
     fn seed_major_root(&mut self, gcref: GcRef) {
-        if gcref.is_null()
-            || !self.is_managed_heap_object(gcref.0)
-            || !self.may_enter_marking_worklist(gcref.0)
-        {
+        if gcref.is_null() {
             return;
         }
-        let hdr = unsafe { header_of(gcref.0) };
+        let hdr = if let Some(hdr) = self.registered_pyobject_header(gcref.0) {
+            // incminimark.py:2782-2800: an untouched prebuilt object is a leaf.
+            if unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) } {
+                return;
+            }
+            hdr
+        } else {
+            if !self.is_managed_heap_object(gcref.0) {
+                return;
+            }
+            unsafe { header_of(gcref.0) }
+        };
+        if !self.may_enter_marking_worklist(gcref.0) {
+            return;
+        }
         // SAFETY: header_of returns a raw pointer; keep each access
         // short-lived to avoid creating overlapping exclusive borrows.
         let newly_marked = unsafe {
@@ -2588,6 +2637,7 @@ impl MiniMarkGC {
     /// inspector.py's preallocated raw root list.
     fn enumerate_all_root_values(&self) -> Vec<GcRef> {
         let mut result = self.enumerate_root_walker_values();
+        result.extend(self.prebuilt_root_objects.iter().copied().map(GcRef));
         // incminimark.py:2734-2736 `enum_live_with_finalizers`: registered
         // finalizer objects remain roots even before they become unreachable
         // and move to an app-visible death queue. AddressDeque.foreach(..., 2)
@@ -2621,6 +2671,10 @@ impl MiniMarkGC {
         // seeds stack roots for a major marking cycle. Mirror the same
         // root sets as minor collection, but mark old objects instead of
         // copying nursery objects.
+        let prebuilt = self.prebuilt_root_objects.clone();
+        for addr in prebuilt {
+            self.seed_prebuilt_root(addr);
+        }
         let mut roots = self.enumerate_root_walker_values();
         // Objects already moved to a death queue remain ordinary roots until
         // app-level code pops them. Registered live finalizers are deliberately
@@ -2634,6 +2688,19 @@ impl MiniMarkGC {
         );
         for gcref in roots {
             self.seed_major_root(gcref);
+        }
+    }
+
+    /// incminimark.py:2706-2707 `prebuilt_root_objects.foreach(_collect_obj)`.
+    fn seed_prebuilt_root(&mut self, addr: usize) {
+        let hdr = unsafe { header_of(addr) };
+        debug_assert!(unsafe { !(*hdr).has_flag(flags::NO_HEAP_PTRS) });
+        if unsafe { !(*hdr).has_flag(flags::VISITED) } {
+            unsafe {
+                (*hdr).set_flag(flags::VISITED);
+                (*hdr).set_flag(flags::TRACK_YOUNG_PTRS);
+            }
+            self.incr_state.gray_stack.push(addr);
         }
     }
 
@@ -2828,6 +2895,10 @@ impl MiniMarkGC {
     /// roots are deliberately not repeated here: upstream repeats only
     /// `collect_nonstack_roots`, not `collect_roots`.
     fn rescan_major_nonstack_roots_and_drain(&mut self) {
+        let prebuilt = self.prebuilt_root_objects.clone();
+        for addr in prebuilt {
+            self.seed_prebuilt_root(addr);
+        }
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.seed_major_root(*gcref);
         });
@@ -3024,7 +3095,35 @@ impl MiniMarkGC {
     /// (incminimark.py:2739-2752) does not need this guard because RPython's
     /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
     /// away once every `gc_ptr_offsets` target is a real GC allocation.
-    fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
+    fn grey_child(
+        &mut self,
+        addr: usize,
+        holder_addr: usize,
+        slot_addr: usize,
+        site: &str,
+        header_bearing: bool,
+    ) {
+        // Most custom-trace slots are PyObjectRefs. Their registered vtable
+        // gives the exact header type id, so a matching header restores
+        // incminimark.py:2739-2752's direct `_collect_obj` path without an
+        // arena-membership query. The equality check is load-bearing: pyre's
+        // same erased callback also exposes GC storage boxes, while legacy raw
+        // stepping stones can carry a Python vtable without a real header.
+        if header_bearing {
+            if let Some(hdr) = self.registered_pyobject_header(addr) {
+                if unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) } {
+                    return;
+                }
+                if self.may_enter_marking_worklist(addr)
+                    && unsafe { !(*hdr).has_flag(flags::VISITED) }
+                {
+                    unsafe { (*hdr).set_flag(flags::VISITED) };
+                    self.incr_state.gray_stack.push(addr);
+                    self.note_nonmoving_nursery_mark(addr);
+                }
+                return;
+            }
+        }
         if self.is_managed_heap_object(addr) && self.may_enter_marking_worklist(addr) {
             let hdr = unsafe { header_of(addr) };
             let type_id = unsafe { (*hdr).type_id() };
@@ -3133,6 +3232,7 @@ impl MiniMarkGC {
                             obj_addr,
                             slot_ptr as usize,
                             "major_custom_trace",
+                            true,
                         );
                     }
                 });
@@ -3147,6 +3247,7 @@ impl MiniMarkGC {
                         obj_addr,
                         obj_addr + offset,
                         "major_fixed_field",
+                        false,
                     );
                 }
             }
@@ -3164,6 +3265,7 @@ impl MiniMarkGC {
                             obj_addr,
                             items_start + i * item_size,
                             "major_varsize_item",
+                            false,
                         );
                     }
                 }
@@ -3377,9 +3479,11 @@ impl MiniMarkGC {
             );
         }
 
-        // incminimark.py:2563-2564 resets VISITED on translated prebuilt root
-        // objects. Pyre creates all GC objects at runtime and has no immortal
-        // prebuilt-root list, so there is no corresponding reset pass.
+        // incminimark.py:2563-2564: prebuilt objects are outside the arena
+        // sweep, so reset their mark bit explicitly for the next cycle.
+        for &addr in &self.prebuilt_root_objects {
+            unsafe { (*header_of(addr)).clear_flag(flags::VISITED) };
+        }
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
         // size, but no more than `max_delta` above it, floored at
@@ -3815,10 +3919,28 @@ impl MiniMarkGC {
         // pyre's GcRef is nullable (GcRef::NULL is the sentinel) and reaches the
         // safe `write_barrier`/`gc_write_barrier` entry points, so guard null
         // before reading `header_of(obj)`; the card variant guards it likewise.
-        if obj.is_null() || self.is_in_nursery(obj.0) || !self.is_managed_heap_object(obj.0) {
+        if obj.is_null() || self.is_in_nursery(obj.0) {
             return;
         }
-        let hdr = unsafe { header_of(obj.0) };
+        if self.is_managed_heap_object(obj.0) {
+            let hdr = unsafe { header_of(obj.0) };
+            if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+                self.remember_young_pointer(obj);
+            }
+            return;
+        }
+        // `malloc_typed` bootstrap objects are incminimark's prebuilt family.
+        // The witness is `registered_pyobject_header`, not vtable membership
+        // alone: `w_tuple_new` / `w_specialisedtuple_new_*` fall back to a bare
+        // `Box::into_raw` when no GC is installed, and those objects carry the
+        // very same registered `ob_header` at offset 0 with NO preceding
+        // `GcHeader`. A vtable-only test therefore reads the allocator word in
+        // front of the box and — if its `TRACK_YOUNG_PTRS` bit happens to be
+        // set — has `remember_young_pointer` write flags back into that
+        // metadata. The tid equality is what separates the two families.
+        let Some(hdr) = self.registered_pyobject_header(obj.0) else {
+            return;
+        };
         if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
             self.remember_young_pointer(obj);
         }
@@ -3842,11 +3964,6 @@ impl MiniMarkGC {
     /// append the object to the remembered set (`old_objects_pointing_to_young`)
     /// and clear GCFLAG_TRACK_YOUNG_PTRS. Callers have already verified the flag
     /// (the inline COND_CALL_GC_WB test, or `do_write_barrier`).
-    ///
-    /// The incminimark "if tid & GCFLAG_NO_HEAP_PTRS: prebuilt_root_objects
-    /// .append(addr)" branch has no counterpart: pyre allocates every GC object
-    /// at runtime and never sets GCFLAG_NO_HEAP_PTRS (there are no immortal
-    /// prebuilt objects from translation), so no object ever reaches that arm.
     fn remember_young_pointer(&mut self, obj: GcRef) {
         // incminimark.py does not special-case STATE_SWEEPING in its barrier.
         // After the seam, every retained entry names a VISITED survivor. A new
@@ -3866,7 +3983,13 @@ impl MiniMarkGC {
                 self.gc_state
             );
         }
-        unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
+        unsafe {
+            (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS);
+            if (*hdr).has_flag(flags::NO_HEAP_PTRS) {
+                (*hdr).clear_flag(flags::NO_HEAP_PTRS);
+                self.prebuilt_root_objects.push(obj.0);
+            }
+        }
     }
 
     /// incminimark.py:1495-1501 write_barrier_from_array:
@@ -5779,6 +5902,48 @@ mod tests {
         assert_eq!(gc.remembered_set.len(), 1);
     }
 
+    #[test]
+    fn prebuilt_write_barrier_registers_root_once_and_traces_children() {
+        let mut gc = test_gc(1024);
+        let child_tid = gc.register_type(TypeInfo::simple(16));
+        let prebuilt_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+            2 * std::mem::size_of::<usize>(),
+            vec![std::mem::size_of::<usize>()],
+        ));
+        let vtable = 0x1234_5678usize;
+        crate::GcAllocator::register_vtable_for_type(&mut gc, vtable, prebuilt_tid);
+
+        let child = gc.alloc_with_type(child_tid, 16);
+        let prebuilt = crate::header::alloc_with_gc_header([vtable, child.0], prebuilt_tid);
+        let prebuilt_ref = GcRef(prebuilt as usize);
+        let hdr = unsafe { header_of(prebuilt_ref.0) };
+        // `alloc_with_gc_header` is pyre's runtime host allocator, not a
+        // translated prebuilt (see its docstring), so it leaves the flags
+        // clear. Stamp incminimark's `init_gc_object_immortal` shape by hand
+        // to exercise the lifecycle this test is about.
+        unsafe {
+            (*hdr).set_flag(flags::NO_HEAP_PTRS);
+            (*hdr).set_flag(flags::TRACK_YOUNG_PTRS);
+        }
+        assert!(unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) });
+
+        gc.do_write_barrier(prebuilt_ref);
+        assert!(unsafe { !(*hdr).has_flag(flags::NO_HEAP_PTRS) });
+        assert_eq!(gc.remembered_set, vec![prebuilt_ref.0]);
+        assert_eq!(gc.prebuilt_root_objects, vec![prebuilt_ref.0]);
+
+        gc.do_collect_nursery();
+        let promoted_child = unsafe { GcRef((*prebuilt)[1]) };
+        assert_ne!(promoted_child, child);
+        assert!(gc.oldgen.contains(promoted_child.0));
+
+        gc.do_write_barrier(prebuilt_ref);
+        assert_eq!(gc.prebuilt_root_objects, vec![prebuilt_ref.0]);
+        gc.collect_full();
+        assert!(gc.oldgen.contains(promoted_child.0));
+        assert!(unsafe { !(*hdr).has_flag(flags::VISITED) });
+    }
+
     // incminimark gates the write barrier solely on GCFLAG_TRACK_YOUNG_PTRS:
     // every old-gen producer sets it, and the barrier appends on the flag test
     // alone. These lock that invariant down across all four producers, plus a
@@ -5861,9 +6026,8 @@ mod tests {
     fn write_barrier_skips_object_without_track_young_ptrs() {
         let mut gc = test_gc(1024);
         gc.register_type(TypeInfo::simple(16));
-        // A zeroed-header object (the shape every non-old-gen managed object
-        // carries: FrameBox frames, leaked host objects, nursery objects) has
-        // TRACK_YOUNG_PTRS clear, so the barrier reads the flag and skips it.
+        // A fabricated header with TRACK_YOUNG_PTRS clear is skipped. Nursery
+        // objects have the same flag state but return through the range check.
         let mut buf = Box::new([0u64; 2]);
         let base = buf.as_mut_ptr() as usize;
         unsafe { *(base as *mut GcHeader) = GcHeader::new(0) };
@@ -5933,6 +6097,58 @@ mod tests {
         // `remember_young_pointer` clears TRACK_YOUNG_PTRS, so an unchanged
         // byte also proves the barrier never wrote through the fake header.
         assert_eq!(unsafe { *flag_byte }, flag_byte_before);
+
+        unsafe { std::alloc::dealloc(base, layout) };
+    }
+
+    #[test]
+    fn write_barrier_ignores_headerless_pyobject_with_registered_vtable() {
+        // `w_tuple_new` / `w_specialisedtuple_new_*` fall back to a bare
+        // `Box::into_raw` when `try_gc_alloc_stable` finds no installed
+        // collector, and the struct they build still starts with `ob_header` —
+        // the very vtable `register_vtable_for_type` knows. Such an object is
+        // in no managed generation, so `do_write_barrier` reaches its
+        // bootstrap-prebuilt arm; a vtable-only test there would read the
+        // allocator word in FRONT of the box as a `GcHeader` and, on a set
+        // `TRACK_YOUNG_PTRS` bit, have `remember_young_pointer` write flags
+        // back into that metadata. `registered_pyobject_header`'s tid equality
+        // is what rejects it.
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::simple(2 * std::mem::size_of::<usize>()));
+        let vtable = 0x1234_5678usize;
+        crate::GcAllocator::register_vtable_for_type(&mut gc, vtable, tid);
+
+        // One leading word standing in for the allocator metadata a real
+        // `Box` keeps there, then the headerless object itself.
+        let layout = std::alloc::Layout::from_size_align(
+            GcHeader::SIZE + 2 * std::mem::size_of::<usize>(),
+            GcHeader::SIZE,
+        )
+        .unwrap();
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null());
+        let obj = unsafe { base.add(GcHeader::SIZE) } as usize;
+        unsafe { (obj as *mut usize).write(vtable) };
+        assert!(!gc.is_managed_heap_object(obj));
+
+        // Make the fake header in front of the object look live: both the
+        // barrier's flag bit and a type id that is registered — but NOT this
+        // object's, which is the whole discriminator.
+        let other_tid = gc.register_type(TypeInfo::simple(8));
+        assert_ne!(other_tid, tid);
+        let fake = base as *mut GcHeader;
+        unsafe {
+            fake.write(GcHeader::new(other_tid));
+            (*fake).set_flag(flags::TRACK_YOUNG_PTRS);
+        }
+        let fake_bits_before = unsafe { (*fake).tid_and_flags };
+
+        gc.do_write_barrier(GcRef(obj));
+
+        assert_eq!(gc.remembered_set.len(), 0);
+        // `remember_young_pointer` clears TRACK_YOUNG_PTRS, so unchanged bits
+        // also prove the barrier never wrote through the fake header.
+        assert_eq!(unsafe { (*fake).tid_and_flags }, fake_bits_before);
 
         unsafe { std::alloc::dealloc(base, layout) };
     }

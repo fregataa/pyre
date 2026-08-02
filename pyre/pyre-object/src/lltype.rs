@@ -268,6 +268,30 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
     majit_gc::header::alloc_with_gc_header(value, type_id)
 }
 
+/// [`malloc_typed`] for an immortal leaf singleton — the header carries
+/// `init_gc_object_immortal`'s `NO_HEAP_PTRS | TRACK_YOUNG_PTRS`, so the
+/// collector recognises it as a prebuilt root and stops there instead of
+/// reading a payload it has no trace shape for.
+///
+/// Restricted to payloads that hold no reference at all: `None`, `True`,
+/// `False`, `NotImplemented`, `Ellipsis`. A box with reference fields must use
+/// [`malloc_typed`] and be reached through the raw-root walkers instead —
+/// `NO_HEAP_PTRS` there would be a false claim, and
+/// `majit_gc::header::alloc_with_gc_header_immortal` records what that costs.
+#[inline]
+pub fn malloc_typed_immortal<T: GcType>(value: T) -> *mut T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        T::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = match T::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    majit_gc::header::alloc_with_gc_header_immortal(value, type_id)
+}
+
 /// Managed typed allocation.
 ///
 /// `gct_fv_gc_malloc` / `init_gc_object(result, typeid, flags=0)`
