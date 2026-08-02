@@ -10,3 +10,4 @@ Cargo.lock
 # has at all: run_synthetic_bench passes vs_pypy=None for wasm, so no perf ratio
 # can catch a wasm-only trace-abort storm there.
 /check.snap/
+
