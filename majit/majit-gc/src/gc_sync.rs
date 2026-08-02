@@ -6,35 +6,71 @@
 //! unchanged inside the STW window — it already assumes a single-threaded
 //! world during collection.
 //!
-//! # P0 simplification
+//! # The operation gate
 //!
-//! Every GC operation (alloc, collect, barrier, query) acquires `gc_mutex`
-//! briefly. Single-threaded production has zero contention (~20ns
-//! uncontended Mutex). cargo test threads serialise correctly.
-//! P1 will restore performance with TLAB (per-thread nursery chunks).
+//! Every GC operation (alloc, collect, barrier, query) runs under one word,
+//! `IN_FAST_PATH`, holding the claimant's ident — `rpy_fastgil`
+//! (thread_gil.c:1-31), down to the spelling of its protocol: a
+//! compare-and-swap claims it (`_rpygil_acquire_fast_path`,
+//! threadlocal.h:153-156), a plain store drops it (`_RPyGilRelease`,
+//! :163-167), and a thread recognises its own claim by comparing against its
+//! ident (thread_gil.c:19-21).
+//!
+//! A claim **stands between operations**, as `rpy_fastgil` stays set for as
+//! long as its thread runs RPython code, so a repeated allocation only marks
+//! the claim it already holds instead of re-taking a free word. Only the sole
+//! registered mutator claims that way; once a second registers, claims are per
+//! operation and taken under `gc_mutex`.
+//!
+//! Upstream can leave a standing claim to its owner because every blocking
+//! call is `releasegil=True` and drops it. Pyre cannot assume that of arbitrary
+//! Rust blocking, so `revoke_standing_claim` takes it back instead, the way
+//! `RPyGilAcquireSlowPath` overwrites the holder's ident once it owns the real
+//! lock (:214-223). Waiting therefore never depends on the holder running
+//! again.
+//!
+//! What upstream reads off `mutex_gil` — whether the claimant is *using* the
+//! GIL or merely holding it — pyre keeps in `GATE_INSIDE`, the low bit of the
+//! same word. Upstream needs no such distinction (holding the GIL is being
+//! inside the GC); pyre does, because its collector re-enters for read-only
+//! queries. Keeping it in the claim makes entering one compare-and-swap and
+//! revocation one failed compare-and-swap, with no second word to interlock
+//! against.
 //!
 //! # Design
 //!
-//! This is NOT a GIL — mutators do not hold a lock during Python execution.
-//! The lock is held only for the duration of each individual GC operation.
-//! Collection begins only when every other registered thread is at an
-//! entry-style safepoint where all of its live GC references are rooted.
-//! A slow `gc_op` leaves RUNNING before blocking on `gc_mutex`, then rejoins
-//! RUNNING before its closure executes. A dispatch poll parks directly. There
-//! is no exit safepoint: a returned reference remains protected until the
-//! caller roots it before its next collection-capable call.
+//! This is not a GIL: the gate spans GC operations, not Python execution, and
+//! it is revocable by any thread that wants it. Collection begins only when
+//! every other registered thread is at an entry-style safepoint where all of
+//! its live GC references are rooted. A slow `gc_op` leaves RUNNING before
+//! blocking on `gc_mutex`, then rejoins RUNNING before its closure executes. A
+//! dispatch poll parks directly. There is no exit safepoint: a returned
+//! reference remains protected until the caller roots it before its next
+//! collection-capable call.
 
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
+use crate::collector::MiniMarkGC;
+// The singleton is concrete, but its `GcAllocator` methods still need the
+// trait in scope to resolve.
 use crate::GcAllocator;
 
 /// Process-global GC singleton storage.
 /// `UnsafeCell` provides interior mutability; access is serialised by
 /// `GC_SYNC.gc_mutex`. `Sync` is sound because all `&mut` access goes
 /// through the mutex.
-struct GcSingleton(UnsafeCell<Option<Box<dyn GcAllocator>>>);
+///
+/// The collector is named concretely rather than held behind
+/// `dyn GcAllocator`. `framework.py:132` resolves `GCClass` once from the
+/// translation config and `:272-338` `_declare_functions` binds every GC
+/// operation to `GCClass.<meth>.im_func`, so upstream reaches the collector
+/// through statically bound functions; nothing dispatches on an allocator
+/// value at run time. A trait object here would put a vtable call between
+/// every allocation site and the nursery bump, which is precisely what
+/// `:377-382` `getfn(malloc_fast, …, inline=True)` exists to avoid.
+struct GcSingleton(UnsafeCell<Option<Box<MiniMarkGC>>>);
 unsafe impl Sync for GcSingleton {}
 
 static GC_STORE: GcSingleton = GcSingleton(UnsafeCell::new(None));
@@ -81,7 +117,7 @@ static GC_SYNC: GcSync = GcSync {
 
 /// Store the GC singleton. Idempotent — subsequent calls are no-ops.
 /// Must be called before any `gc_op`.
-pub fn store_singleton(gc: Box<dyn GcAllocator>) {
+pub fn store_singleton(gc: Box<MiniMarkGC>) {
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
@@ -107,7 +143,7 @@ pub fn store_singleton(gc: Box<dyn GcAllocator>) {
 /// each per-worker test a pristine heap and empty root set, so a prior test's
 /// oldgen residue or stale registered roots cannot corrupt this test's
 /// collections.
-pub fn replace_singleton_leaking_old(gc: Box<dyn GcAllocator>) {
+pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
     let _guard = GC_SYNC.gc_mutex.lock().unwrap();
     // SAFETY: gc_mutex held; the gc_stress harness runs tests serially, so no
     // concurrent gc_op is in flight during the swap.
@@ -128,7 +164,7 @@ pub fn is_initialized() -> bool {
 
 /// Access the GC singleton mutably under gc_mutex protection.
 /// SAFETY: caller must hold gc_mutex.
-unsafe fn singleton_mut() -> &'static mut dyn GcAllocator {
+unsafe fn singleton_mut() -> &'static mut MiniMarkGC {
     // SAFETY: caller holds gc_mutex, so there is no concurrent access.
     unsafe { &mut *GC_STORE.0.get() }
         .as_deref_mut()
@@ -140,9 +176,13 @@ unsafe fn singleton_mut() -> &'static mut dyn GcAllocator {
 // ──────────────────────────────────────────────────────────────
 
 /// Per-thread GC-sync facts, kept in one struct like pypy_threadlocal_s
-/// (threadlocal.c:46-97). Its address doubles as this thread's ident for the
-/// global owner words below, mirroring how _rpygil_get_my_ident reads the
-/// ident out of the threadlocal struct (threadlocal.h:143-146).
+/// (threadlocal.c:46-97). Its address doubles as this thread's ident in
+/// [`IN_FAST_PATH`] and [`STW_OWNER`], mirroring how _rpygil_get_my_ident reads
+/// the ident out of the threadlocal struct (threadlocal.h:143-146).
+///
+/// Aligned so that idents leave [`GATE_INSIDE`] free; the fields alone would
+/// give this struct alignment 1.
+#[repr(align(8))]
 struct GcThreadState {
     /// Completed `register_thread`, represented in the RUNNING count.
     registered: Cell<bool>,
@@ -165,57 +205,31 @@ fn my_ident() -> usize {
     GC_THREAD.with(|t| t as *const GcThreadState as usize)
 }
 
-/// Ident of the thread currently holding the exclusive `&mut dyn GcAllocator`
-/// (inside a `gc_op` closure); 0 when none. `in_gc_op` compares against
-/// `my_ident()`, the `rpy_fastgil == get_ident()` idiom (thread_gil.c:21).
-static GC_OP_OWNER: AtomicUsize = AtomicUsize::new(0);
-
 /// Ident of the STW-owning collector thread; 0 when no STW. Only the owner
 /// nests (do_collect_full drives do_collect_nursery), so a global owner word
 /// plus depth replaces per-thread state.
 static STW_OWNER: AtomicUsize = AtomicUsize::new(0);
 static STW_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-/// RAII marker: sets `GC_OP_OWNER` for the exact span of a closure that holds
-/// the exclusive `&mut dyn GcAllocator`. Wraps every `singleton_mut()` call.
-struct OpGuard {
-    prev: usize,
-}
-impl OpGuard {
-    #[inline]
-    fn enter() -> Self {
-        let prev = GC_OP_OWNER.swap(my_ident(), Ordering::SeqCst);
-        assert!(
-            prev == 0,
-            "GC singleton exclusivity invariant violated: concurrent &mut access"
-        );
-        OpGuard { prev }
-    }
-}
-
-/// Releases an acquired fast-path gate on both normal return and unwind.
-struct FastPathGate {
+/// Restores [`IN_FAST_PATH`] on both normal return and unwind: to the bare
+/// ident for a claim that goes on standing, to 0 for one taken per operation.
+struct GateGuard {
     restore: usize,
 }
-impl Drop for FastPathGate {
+impl Drop for GateGuard {
     #[inline]
     fn drop(&mut self) {
         IN_FAST_PATH.store(self.restore, Ordering::Release);
     }
 }
-impl Drop for OpGuard {
-    #[inline]
-    fn drop(&mut self) {
-        GC_OP_OWNER.store(self.prev, Ordering::SeqCst);
-    }
-}
 
 /// Whether this thread is already inside a `gc_op` / `request_stw` closure
-/// (i.e. a collection is running on this thread and holds the `&mut`). Uses an
-/// owner-word comparison against this thread's ident.
+/// (i.e. a collection is running on this thread and holds the `&mut`). The
+/// `rpy_fastgil == get_ident()` idiom (thread_gil.c:19-21), read against the
+/// in-use form of this thread's claim.
 #[inline]
 pub fn in_gc_op() -> bool {
-    GC_OP_OWNER.load(Ordering::Relaxed) == my_ident()
+    IN_FAST_PATH.load(Ordering::Relaxed) == my_ident() | GATE_INSIDE
 }
 
 /// Shared reference to the singleton, re-derived from the static `UnsafeCell`.
@@ -227,7 +241,7 @@ pub fn in_gc_op() -> bool {
 /// collector. Re-derives from `GC_STORE.0.get()` each call (a pre-`&mut`-cached
 /// raw pointer would be invalidated by `singleton_mut`'s reborrow).
 #[inline]
-unsafe fn singleton_ref_reentrant() -> &'static dyn GcAllocator {
+unsafe fn singleton_ref_reentrant() -> &'static MiniMarkGC {
     unsafe { &*GC_STORE.0.get() }
         .as_deref()
         .expect("GC singleton not initialized — call store_singleton() first")
@@ -241,7 +255,7 @@ unsafe fn singleton_ref_reentrant() -> &'static dyn GcAllocator {
 /// `gc_mutex` (which would deadlock — the lock is non-recursive and, under STW,
 /// held by this very collector) or forming a second `&mut`.
 #[inline]
-pub fn gc_query_reentrant<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
+pub fn gc_query_reentrant<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
     if in_gc_op() {
         // SAFETY: in_gc_op() ⇒ this thread holds the &mut and is the sole
         // running mutator (parked/spinning invariant); read-only, bounded to `f`.
@@ -259,10 +273,93 @@ pub fn gc_query_reentrant<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
 /// `unregister_thread`.  When ≤ 1, `gc_op` skips the Mutex entirely.
 static REGISTERED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// Fast-path lock word: 0 when free, otherwise the holder thread's ident
-/// (`my_ident`), following rpy_fastgil (thread_gil.c:7-31). Self-ownership
-/// is checked by comparing against `my_ident()`.
+/// Fast-path lock word: 0 when free, otherwise the claimant's ident
+/// (`my_ident`) with [`GATE_INSIDE`] set while it is running a closure,
+/// following rpy_fastgil (thread_gil.c:7-31). Self-ownership is checked by
+/// comparing against `my_ident()`.
+///
+/// A claim stands across operations, the way `rpy_fastgil` stays set for as
+/// long as its thread runs RPython code (thread_gil.c:15-21). Only the fast
+/// path claims it that way; [`gc_op_slow`] claims and drops it per operation,
+/// so the word is transiently nonzero in multi-mutator runs too. A standing
+/// claim is dropped by its owner ([`release_gate`]) or taken from it
+/// ([`revoke_standing_claim`]).
 static IN_FAST_PATH: AtomicUsize = AtomicUsize::new(0);
+
+/// Set in [`IN_FAST_PATH`] while the claimant is inside a `gc_op` closure, so
+/// the claim and the exclusive `&mut` live in one word. Upstream needs no such
+/// bit — holding `rpy_fastgil` *is* being inside the GC — but pyre's collector
+/// re-enters for read-only queries ([`gc_query_reentrant`]) and has to tell the
+/// two states apart. Keeping it in the claim makes entering a claimed gate one
+/// compare-and-swap, and makes revocation a plain failed CAS instead of a
+/// cross-word handshake.
+const GATE_INSIDE: usize = 1;
+
+const _: () = assert!(
+    std::mem::align_of::<GcThreadState>() > GATE_INSIDE,
+    "idents must leave GATE_INSIDE free"
+);
+
+/// Drop this thread's standing claim, if it still has one.
+///
+/// `_RPyGilRelease` (threadlocal.h:163-167) is a plain store because upstream's
+/// word is only ever cleared by its owner. A standing claim here can also be
+/// revoked while its owner sits idle, so the release is a compare-and-swap:
+/// a plain store would drop whichever claim replaced it. Off the hot path —
+/// a standing claim is carried, not re-taken.
+#[inline]
+fn release_gate(ident: usize) {
+    let _ = IN_FAST_PATH.compare_exchange(ident, 0, Ordering::Release, Ordering::Relaxed);
+}
+
+/// Take a standing claim away from a thread that is not using it, so waiting
+/// never depends on the holder running again.
+///
+/// `RPyGilAcquireSlowPath` ends by overwriting whatever ident `rpy_fastgil`
+/// holds (thread_gil.c:214-223); it is safe there because `mutex_gil`, not the
+/// word, is the real exclusion. Here the exclusion is [`GATE_INSIDE`] in the
+/// same word, so the revoke is one compare-and-swap against the idle form of
+/// the claim: it fails outright while a closure is running, and a closure can
+/// only start by winning that same word.
+///
+/// The caller must hold `gc_mutex`, so no slow operation can be running and the
+/// word can only be carrying a standing claim. The cleared word may be
+/// re-claimed immediately by the revoked thread when it is still the only
+/// registered mutator; [`acquire_gate`] loops for that case.
+fn revoke_standing_claim(ident: usize) {
+    loop {
+        let claim = IN_FAST_PATH.load(Ordering::Acquire);
+        if claim == 0 || claim & !GATE_INSIDE == ident {
+            return;
+        }
+        if claim & GATE_INSIDE == 0
+            && IN_FAST_PATH
+                .compare_exchange(claim, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return;
+        }
+        // In use: the closure publishes the idle form when it returns.
+        std::hint::spin_loop();
+    }
+}
+
+/// Claim the gate for `ident` and mark it in use, revoking a standing claim if
+/// one is in the way — the stealer loop of `RPyGilAcquireSlowPath`
+/// (thread_gil.c:203-223). Callers hold `gc_mutex`, which excludes every other
+/// slow claimant.
+fn acquire_gate(ident: usize) {
+    loop {
+        if IN_FAST_PATH
+            .compare_exchange(0, ident | GATE_INSIDE, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        revoke_standing_claim(ident);
+        std::hint::spin_loop();
+    }
+}
 
 /// Register the current thread as a GC mutator. Paired with
 /// `unregister_thread`. An unregistered thread may still call `gc_op`; it is
@@ -274,12 +371,13 @@ pub fn register_thread() {
     );
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
-        // A second thread is arriving. Spin until the operation gate is free;
-        // after this, existing callers see REGISTERED_THREADS > 1 and take the
-        // Mutex path. CAS acquisition makes this stricter than the old marker.
-        while IN_FAST_PATH.load(Ordering::Acquire) != 0 {
-            std::hint::spin_loop();
-        }
+        // A second thread is arriving, so no standing claim may survive: from
+        // here on every caller sees REGISTERED_THREADS > 1 and takes the Mutex
+        // path. The count was raised first, so the previous holder cannot make
+        // a new standing claim once this one is revoked. `gc_mutex` is what
+        // `revoke_standing_claim` requires of its callers.
+        let _guard = GC_SYNC.gc_mutex.lock().unwrap();
+        revoke_standing_claim(my_ident());
     }
 
     let mut state = GC_SYNC.quiesce.lock().unwrap();
@@ -308,6 +406,11 @@ pub fn unregister_thread() {
         GC_THREAD.with(|t| t.registered.get()),
         "unregistering an unregistered GC mutator thread"
     );
+    // A thread that carried the gate out of its last operation must not take
+    // it with it: nothing would ever release it again.
+    if IN_FAST_PATH.load(Ordering::Relaxed) == my_ident() {
+        release_gate(my_ident());
+    }
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     assert!(
         GC_THREAD.with(|t| t.running.replace(false)),
@@ -356,6 +459,14 @@ impl Drop for BlockingGuard {
 
 #[inline]
 pub fn before_external_block() -> BlockingGuard {
+    // `rffi.aroundstate.before()` drops the GIL before a `releasegil=True`
+    // call (`_RPyGilRelease`, threadlocal.h:163-167). Dropping the standing
+    // claim here is not required for progress — `revoke_standing_claim` takes
+    // it back from a sleeping thread — but it spares the next claimant that
+    // work at a point which is already a syscall away.
+    if IN_FAST_PATH.load(Ordering::Relaxed) == my_ident() {
+        release_gate(my_ident());
+    }
     let registered = GC_THREAD.with(|t| t.registered.get());
     if registered {
         let mut state = GC_SYNC.quiesce.lock().unwrap();
@@ -388,7 +499,6 @@ pub fn after_fork_child() {
     let running = GC_THREAD.with(|t| t.running.get());
     REGISTERED_THREADS.store(usize::from(registered), Ordering::SeqCst);
     IN_FAST_PATH.store(0, Ordering::Release);
-    GC_OP_OWNER.store(0, Ordering::SeqCst);
     STW_OWNER.store(0, Ordering::SeqCst);
     STW_DEPTH.store(0, Ordering::SeqCst);
     GC_SYNC.stw_requested.store(false, Ordering::Release);
@@ -417,48 +527,75 @@ pub fn stw_required() -> bool {
 // GC operation gate — fast path when single-threaded
 // ──────────────────────────────────────────────────────────────
 
-/// Execute a closure with exclusive `&mut dyn GcAllocator` access.
+/// Execute a closure with exclusive `&mut MiniMarkGC` access.
 ///
-/// **Fast path** (single registered thread, no STW): direct access after
-/// acquiring `IN_FAST_PATH`, without taking the Mutex.
+/// **Fast path** (single registered thread, no STW): direct access under
+/// `IN_FAST_PATH`, without taking the Mutex. A claim this thread already holds
+/// carries over from the previous operation, so the steady state is the single
+/// compare-and-swap that marks it in use.
 ///
 /// **Slow path** (multiple threads or STW): acquires `gc_mutex`.
 /// Single-threaded production always takes the fast path.
 #[inline]
-pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
+pub fn gc_op<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
     let ident = my_ident();
     debug_assert!(
         !in_gc_op(),
         "reentrant &mut gc_op — a collection-time query must use gc_query_reentrant"
     );
-    // Fast path: single thread, no STW.
+    // This thread's claim is still standing. thread_gil.c:15-21 keeps
+    // `rpy_fastgil` set to the holder's ident for as long as it runs RPython
+    // code; re-acquiring once per operation has no upstream counterpart. One
+    // compare-and-swap both proves the claim survived revocation and publishes
+    // that a closure is running under it.
+    if IN_FAST_PATH
+        .compare_exchange(
+            ident,
+            ident | GATE_INSIDE,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        // `stw_requested` needs no recheck: raising it requires owning the
+        // gate, and this thread owns it.
+        debug_assert!(
+            !GC_SYNC.stw_requested.load(Ordering::Relaxed),
+            "STW was requested by a thread that does not own the operation gate"
+        );
+        let _gate = GateGuard { restore: ident };
+        // SAFETY: the claim excludes every other fast and slow operation for
+        // as long as it stands.
+        return f(unsafe { singleton_mut() });
+    }
+    // First claim: threadlocal.h:153-156 `_rpygil_acquire_fast_path`. Reached
+    // once per standing claim, not once per operation.
     if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
         && !GC_SYNC.stw_requested.load(Ordering::Acquire)
         && IN_FAST_PATH
-            .compare_exchange(0, ident, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, ident | GATE_INSIDE, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     {
-        let _fast_path_gate = FastPathGate { restore: 0 };
-        // Recheck after acquiring the fast-path lock: another thread may have
-        // registered or requested STW after the eligibility loads above.
+        // Recheck under the claim: another thread may have registered or
+        // requested STW after the eligibility loads above.
         if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
             && !GC_SYNC.stw_requested.load(Ordering::Acquire)
         {
-            // SAFETY: the fast-path lock excludes other fast operations, and
-            // slow operations drain it before accessing the singleton.
-            let r = {
-                let _op = OpGuard::enter();
-                f(unsafe { singleton_mut() })
-            };
-            return r;
+            let _gate = GateGuard { restore: ident };
+            // SAFETY: as above — the claim is this thread's.
+            return f(unsafe { singleton_mut() });
         }
+        // Ineligible after all — drop the claim entirely rather than leaving
+        // it standing for the slow path, which claims the gate again. Nothing
+        // else can touch the word while it is marked in use.
+        IN_FAST_PATH.store(0, Ordering::Release);
     }
     gc_op_slow(f)
 }
 
 /// Slow path: Mutex-guarded access with STW parking.
 #[cold]
-fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
+fn gc_op_slow<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
     let ident = my_ident();
     let registered = GC_THREAD.with(|t| t.registered.get());
     if registered {
@@ -478,24 +615,20 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
     // RUNNING, so a collector can hold the mutex while draining other threads.
     let _guard = GC_SYNC.gc_mutex.lock().unwrap();
 
-    // Drain a fast operation before borrowing the singleton. A fast holder
-    // never waits on gc_mutex, so this terminates. Together with CAS acquisition
-    // this makes fast and slow singleton accesses mutually exclusive.
-    let self_holds_fast_path = IN_FAST_PATH.load(Ordering::Acquire) == ident;
-    while IN_FAST_PATH.load(Ordering::Acquire) != 0 && !self_holds_fast_path {
-        std::hint::spin_loop();
-    }
-    if !self_holds_fast_path {
-        // Claim the gate after draining so a new fast operation cannot start
-        // between the final observation above and the singleton borrow.
-        while IN_FAST_PATH
-            .compare_exchange(0, ident, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::hint::spin_loop();
-        }
-    }
-    let _fast_path_gate = (!self_holds_fast_path).then_some(FastPathGate { restore: 0 });
+    // Take the gate before borrowing the singleton. A fast claimant never waits
+    // on gc_mutex, and `acquire_gate` revokes a standing claim rather than
+    // waiting for its owner, so this terminates. This is what makes fast and
+    // slow singleton accesses mutually exclusive.
+    let carried = IN_FAST_PATH.load(Ordering::Acquire) == ident;
+    let _gate = if carried {
+        // This thread's own standing claim: mark it in use and leave it
+        // standing afterwards, as the fast path would have.
+        IN_FAST_PATH.store(ident | GATE_INSIDE, Ordering::Release);
+        GateGuard { restore: ident }
+    } else {
+        acquire_gate(ident);
+        GateGuard { restore: 0 }
+    };
 
     if registered {
         let mut state = GC_SYNC.quiesce.lock().unwrap();
@@ -512,20 +645,16 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
         );
     }
 
-    let result = {
-        let _op = OpGuard::enter();
-        // There is deliberately no exit park. A returned reference is rooted
-        // by the caller before its next entry-style safepoint, matching the
-        // single-thread allocation discipline.
-        f(unsafe { singleton_mut() })
-    };
-    result
+    // There is deliberately no exit park. A returned reference is rooted by the
+    // caller before its next entry-style safepoint, matching the single-thread
+    // allocation discipline.
+    f(unsafe { singleton_mut() })
 }
 
-/// Execute a closure with `&dyn GcAllocator` access (read-only query).
+/// Execute a closure with `&MiniMarkGC` access (read-only query).
 /// Same fast/slow path as `gc_op`.
 #[inline]
-pub fn gc_query<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
+pub fn gc_query<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
     gc_op(|gc| f(gc))
 }
 
@@ -614,9 +743,9 @@ impl Drop for StwGuard {
 /// collector: it waits for all other threads to park, runs `collect_fn`
 /// with exclusive GC access, then resumes everyone.
 ///
-/// `collect_fn` receives `&mut dyn GcAllocator` — it can call
+/// `collect_fn` receives `&mut MiniMarkGC` — it can call
 /// `collect_nursery`, `collect_full`, etc.
-pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
+pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
     gc_op(|gc| {
         let _stw = quiesce_mutators();
         collect_fn(gc);
@@ -632,7 +761,7 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
 /// forwarded value only after the operation owns the GC.
 pub fn gc_op_with_root<R>(
     root: crate::GcRef,
-    f: impl FnOnce(&mut dyn GcAllocator, crate::GcRef) -> R,
+    f: impl FnOnce(&mut MiniMarkGC, crate::GcRef) -> R,
 ) -> R {
     struct RootGuard(usize);
     impl Drop for RootGuard {
@@ -710,7 +839,7 @@ fn park_until_stw_done() {
 }
 
 /// Poll for a collector request at a runtime dispatch safepoint.
-/// Steady state is one relaxed atomic load.
+/// Steady state is two relaxed atomic loads.
 #[inline]
 pub fn safepoint_poll() {
     if GC_SYNC.stw_requested.load(Ordering::Relaxed) {

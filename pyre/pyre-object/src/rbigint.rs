@@ -16,9 +16,10 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use crate::object_array::{
-    GC_INT_ARRAY_GC_TYPE_ID, TypedItemsBlock, alloc_typed_items_block_immortal,
-    alloc_typed_items_block_nursery, try_alloc_typed_items_block_nursery,
-    typed_items_block_capacity, typed_items_block_items_base,
+    GC_INT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
+    alloc_typed_items_block_immortal, alloc_typed_items_block_nursery,
+    try_alloc_typed_items_block_nursery, typed_items_block_capacity, typed_items_block_clear,
+    typed_items_block_items_base,
 };
 
 pub const SUPPORT_INT128: bool = true;
@@ -147,6 +148,33 @@ fn _load_unsigned_digit(x: Digit) -> UDigit {
     x as UDigit
 }
 
+/// Address of `l->items[x]`, the way `rtype_getitem` reaches it after
+/// translation.
+///
+/// `rtype_getitem` / `rtype_setitem` (rlist.py:247-266, :272-303) select
+/// `dum_checkidx` only where the source catches `IndexError`; every digit
+/// access takes the default `dum_nocheck`, under which `ll_getitem_nonneg`
+/// keeps `ll_assert(index >= 0, ...)` and folds the length test away. Going
+/// through a `&[Digit]` instead reloads the block's length header and branches
+/// on it once per digit, which the translated form never does.
+///
+/// # Safety
+///
+/// `digits` must be a live digit block and `x` an index within its capacity.
+#[majit_macros::always_inline]
+#[inline]
+unsafe fn digits_item(digits: *mut TypedItemsBlock, x: i64) -> *mut Digit {
+    debug_assert!(x >= 0, "unexpectedly negative digit index");
+    debug_assert!(!digits.is_null());
+    debug_assert!((x as usize) < unsafe { typed_items_block_capacity(digits) });
+    unsafe {
+        (digits as *mut u8)
+            .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+            .cast::<Digit>()
+            .add(x as usize)
+    }
+}
+
 pub const NULLDIGIT: Digit = 0;
 pub const ONEDIGIT: Digit = 1;
 
@@ -163,6 +191,33 @@ static NULLRBIGINT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static ONERBIGINT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static ONENEGATIVERBIGINT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static FIVERBIGINT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// The four owners above, in the order [`PREBUILT_DIGITS`] indexes them.
+fn prebuilt_slots() -> [&'static std::sync::OnceLock<usize>; 4] {
+    [&NULLRBIGINT, &ONERBIGINT, &ONENEGATIVERBIGINT, &FIVERBIGINT]
+}
+
+/// Digit-array identity of each prebuilt, held together and readable without
+/// touching the objects themselves.
+///
+/// A source line upstream spells `return NULLRBIGINT` — it hands back the
+/// module-global object, and nothing is rediscovered. pyre's `RBigInt` is a
+/// by-value handle that only becomes a heap object at the boxing step, so the
+/// boxing step is where that identity has to be recovered, on every allocation,
+/// almost always answering "not a prebuilt".
+///
+/// `prebuilt` gives each of the four its own one-element digit array, so that
+/// answer is decided by the digit pointer alone. Keeping the four pointers in
+/// one array makes the common case four plain loads out of a single cache line,
+/// instead of four `OnceLock` state words each followed by a dereference into a
+/// separately allocated payload. A candidate match still reads the object, so
+/// the test stays exactly as exact as it was.
+static PREBUILT_DIGITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
 
 fn _check_digits(digits: &[Digit]) {
     for &digit in digits {
@@ -494,12 +549,27 @@ pub fn rbigint_gc_type_id() -> u32 {
 /// slot, not numeric equality, is intentional: upstream has a few internal
 /// zero results that must remain fresh because their digits are filled later.
 fn prebuilt_payload_pointer(value: &RBigInt) -> Option<*mut RBigInt> {
-    for slot in [&NULLRBIGINT, &ONERBIGINT, &ONENEGATIVERBIGINT, &FIVERBIGINT] {
-        let Some(&raw) = slot.get() else {
+    // All four are single-digit objects: `zero()` carries `_size == 0` and the
+    // other three `|_size| == 1` (rbigint.py:1652-1656). Their digit arrays are
+    // one element long, so a value holding two or more digits cannot alias any
+    // of them — and `_normalize` (rbigint.py:1601-1603) is the only route by
+    // which a computed result reaches the zero form, where it assigns
+    // `self._digits = NULLDIGITS` itself. Deciding that from the size leaves
+    // the table for the values that can actually match.
+    if !(-1..=1).contains(&value._size) {
+        return None;
+    }
+    let digits = value._digits as usize;
+    for index in 0..PREBUILT_DIGITS.len() {
+        // An unpublished slot reads 0, which no live digit array can equal.
+        if PREBUILT_DIGITS[index].load(std::sync::atomic::Ordering::Relaxed) != digits {
+            continue;
+        }
+        let Some(&raw) = prebuilt_slots()[index].get() else {
             continue;
         };
         let prebuilt = unsafe { &*(raw as *const RBigInt) };
-        if value._digits == prebuilt._digits && value._size == prebuilt._size {
+        if value._size == prebuilt._size {
             return Some(raw as *mut RBigInt);
         }
     }
@@ -517,11 +587,13 @@ pub(crate) fn alloc_rbigint_nursery_impl(
     let tid = rbigint_gc_type_id();
     let mut needs_write_barrier = true;
     if tid != 0
-        && let Some(raw) = crate::gc_hook::try_gc_alloc_with_placement(
-            tid,
-            RBIGINT_PAYLOAD_SIZE,
-            &mut needs_write_barrier,
-        )
+        && let Some(raw) = unsafe {
+            crate::gc_hook::try_gc_alloc_fast_with_placement(
+                tid,
+                RBIGINT_PAYLOAD_SIZE,
+                &mut needs_write_barrier,
+            )
+        }
         .filter(|pointer| !pointer.is_null())
     {
         unsafe {
@@ -559,10 +631,15 @@ fn alloc_rbigint_nursery_collecting_impl(
         // collecting hook preserves that shape: the common nursery bump does
         // no dynamic root-set mutation, while the nursery-full slow path
         // temporarily registers and forwards this exact digit slot.
+        //
+        // The rbigint payload registers no destructor and is not a WEAKREF —
+        // its one traced edge is `_digits` — so this malloc site is one of the
+        // `malloc_fast` sites `gct_fv_gc_malloc` (`framework.py:820-838`)
+        // selects.
         let digit_slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
         let mut needs_write_barrier = true;
         let raw = unsafe {
-            crate::gc_hook::try_gc_alloc_collecting_rooted(
+            crate::gc_hook::try_gc_alloc_fast_collecting_rooted(
                 tid,
                 RBIGINT_PAYLOAD_SIZE,
                 digit_slot,
@@ -687,8 +764,8 @@ impl RBigInt {
     }
 
     #[inline]
-    fn prebuilt(slot: &'static std::sync::OnceLock<usize>, digit: Digit, sign: i64) -> Self {
-        let raw = *slot.get_or_init(|| {
+    fn prebuilt(index: usize, digit: Digit, sign: i64) -> Self {
+        let raw = *prebuilt_slots()[index].get_or_init(|| {
             let block = unsafe { alloc_typed_items_block_immortal(1) };
             unsafe {
                 *(typed_items_block_items_base(block) as *mut Digit) = digit;
@@ -697,7 +774,12 @@ impl RBigInt {
                 _digits: block,
                 _size: sign,
             };
-            Box::into_raw(Box::new(value)) as usize
+            let raw = Box::into_raw(Box::new(value)) as usize;
+            // Publish the digit identity only once the object it names exists;
+            // `prebuilt_payload_pointer` matches on this word and then reads
+            // the object through the owner slot.
+            PREBUILT_DIGITS[index].store(block as usize, std::sync::atomic::Ordering::Release);
+            raw
         }) as *const Self;
         // RPython assignment returns the process-global rbigint itself. The
         // host needs a shallow owned handle; source translation aliases the
@@ -707,12 +789,12 @@ impl RBigInt {
 
     #[inline]
     fn negative_one() -> Self {
-        Self::prebuilt(&ONENEGATIVERBIGINT, ONEDIGIT, -1)
+        Self::prebuilt(2, ONEDIGIT, -1)
     }
 
     #[inline]
     fn five() -> Self {
-        Self::prebuilt(&FIVERBIGINT, 5, 1)
+        Self::prebuilt(3, 5, 1)
     }
 
     /// rbigint.py:159 `__init__(digits=NULLDIGITS, sign=0, size=0)`.
@@ -776,12 +858,15 @@ impl RBigInt {
         })
     }
 
-    /// Allocate the translated equivalent of `[NULLDIGIT] * size`.
+    /// Allocate the translated equivalent of `[NULLDIGIT] * size`:
+    /// `ll_alloc_and_set(LIST, size, 0)`, which is `ll_newlist` followed by
+    /// `rgc.ll_arrayclear` (rtyper/rlist.py:494-503).
     #[inline]
     fn with_size(size: i64, sign: i64) -> Self {
         debug_assert!(size >= 0);
         let block =
             unsafe { alloc_typed_items_block_nursery(size as usize, GC_INT_ARRAY_GC_TYPE_ID) };
+        unsafe { typed_items_block_clear(block) };
         Self {
             _digits: block,
             _size: size * sign,
@@ -798,6 +883,7 @@ impl RBigInt {
             try_alloc_typed_items_block_nursery(allocation_size, GC_INT_ARRAY_GC_TYPE_ID)
         }
         .ok_or(RBigIntError::Memory)?;
+        unsafe { typed_items_block_clear(block) };
         Ok(Self {
             _digits: block,
             _size: size * sign,
@@ -806,12 +892,12 @@ impl RBigInt {
 
     #[inline]
     pub fn zero() -> Self {
-        Self::prebuilt(&NULLRBIGINT, NULLDIGIT, 0)
+        Self::prebuilt(0, NULLDIGIT, 0)
     }
 
     #[inline]
     pub fn one() -> Self {
-        Self::prebuilt(&ONERBIGINT, ONEDIGIT, 1)
+        Self::prebuilt(1, ONEDIGIT, 1)
     }
 
     #[inline]
@@ -819,16 +905,6 @@ impl RBigInt {
         unsafe {
             std::slice::from_raw_parts(
                 typed_items_block_items_base(self._digits) as *const Digit,
-                typed_items_block_capacity(self._digits),
-            )
-        }
-    }
-
-    #[inline]
-    fn digits_mut(&mut self) -> &mut [Digit] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                typed_items_block_items_base(self._digits) as *mut Digit,
                 typed_items_block_capacity(self._digits),
             )
         }
@@ -848,25 +924,25 @@ impl RBigInt {
     #[majit_macros::always_inline]
     #[inline]
     pub fn digit(&self, x: i64) -> Digit {
-        self.digits()[x as usize]
+        unsafe { *digits_item(self._digits, x) }
     }
 
     #[majit_macros::always_inline]
     #[inline]
     pub fn widedigit(&self, x: i64) -> WideDigit {
-        _widen_digit(self.digit(x))
+        _widen_digit(unsafe { *digits_item(self._digits, x) })
     }
 
     #[majit_macros::always_inline]
     #[inline]
     pub fn uwidedigit(&self, x: i64) -> UWideDigit {
-        _unsigned_widen_digit(self.digit(x))
+        _unsigned_widen_digit(unsafe { *digits_item(self._digits, x) })
     }
 
     #[majit_macros::always_inline]
     #[inline]
     pub fn udigit(&self, x: i64) -> UDigit {
-        _load_unsigned_digit(self.digit(x))
+        _load_unsigned_digit(unsafe { *digits_item(self._digits, x) })
     }
 
     #[majit_macros::always_inline]
@@ -874,7 +950,7 @@ impl RBigInt {
     fn setdigit(&mut self, x: i64, val: Digit) {
         let val = _mask_digit(val);
         debug_assert!(val >= 0);
-        self.digits_mut()[x as usize] = _store_digit(val);
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, Unsigned graph.
@@ -883,7 +959,7 @@ impl RBigInt {
     fn setdigit_udigit(&mut self, x: i64, val: UDigit) {
         let val = _mask_udigit(val);
         debug_assert!(val >= 0);
-        self.digits_mut()[x as usize] = _store_digit(val);
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, LONG_TYPE graph.
@@ -892,7 +968,7 @@ impl RBigInt {
     fn setdigit_widedigit(&mut self, x: i64, val: WideDigit) {
         let val = _mask_widedigit(val);
         debug_assert!(val >= 0);
-        self.digits_mut()[x as usize] = _store_digit(val);
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, ULONG_TYPE graph.
@@ -901,7 +977,7 @@ impl RBigInt {
     fn setdigit_uwidedigit(&mut self, x: i64, val: UWideDigit) {
         let val = _mask_uwidedigit(val);
         debug_assert!(val >= 0);
-        self.digits_mut()[x as usize] = _store_digit(val);
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     #[majit_macros::always_inline]
@@ -4624,7 +4700,7 @@ pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut u8)) {
     // FIVERBIGINT are translated prebuilt roots.  Do not initialize a
     // previously-unused constant from inside the collector; visit only slots
     // already published by ordinary execution.
-    for slot in [&NULLRBIGINT, &ONERBIGINT, &ONENEGATIVERBIGINT, &FIVERBIGINT] {
+    for slot in prebuilt_slots() {
         if let Some(&raw) = slot.get() {
             let value = unsafe { &mut *(raw as *mut RBigInt) };
             visitor(unsafe {
