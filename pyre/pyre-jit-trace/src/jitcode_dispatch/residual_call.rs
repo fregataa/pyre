@@ -42,10 +42,16 @@ thread_local! {
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
     /// post-call commit withdrawal can put the live frame back.  The legacy
     /// replay's correctness contract is "the live frame still holds pre-walk
-    /// state"; a committed force-flush breaks it, so every path that does NOT
-    /// adopt the committed resume pc must restore this first.
+    /// state"; a committed force-flush breaks it, so the replay leg restores
+    /// this before re-entering.  Which leg runs is only known at walk end, so
+    /// the withdrawal arms `ESCAPE_FLUSH_UNDO_PENDING` and the epilogue
+    /// decides.
     static ESCAPE_FLUSH_UNDO: std::cell::RefCell<Option<EscapeFlushUndo>> =
         const { std::cell::RefCell::new(None) };
+    /// Set when the force arm withdrew its commit: the pre-flush frame has to
+    /// come back, but only on the legacy-replay leg (see
+    /// `mark_escape_flush_undo_pending`).
+    static ESCAPE_FLUSH_UNDO_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Opcode-scoped purity window: `(py_pc, every_prior_residual_reentrant)`
     /// for the Python opcode currently being walked.  Re-executing a committed
     /// escape re-runs the WHOLE opcode, so the latch gate must know whether any
@@ -89,8 +95,17 @@ thread_local! {
 /// brackets the corresponding per-thread execution state with
 /// [`InlineConcreteFrameGuard`].  Vable writes use this accessor to keep that
 /// frame's own heap image coherent for a later multi-frame blackhole handoff.
+///
+/// Read back out of the guard's root rather than from a raw copy: the value
+/// is compared for identity against the concrete bank's own `Value::Ref`,
+/// which the collector forwards, so a relocated frame would make the two
+/// disagree and silently drop the mirror write.
 pub(crate) fn current_inline_concrete_frame() -> usize {
-    INLINE_CONCRETE_FRAME.with(|slot| slot.get() as usize)
+    INLINE_CONCRETE_FRAME.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(0, |owner_root| owner_root.get().0)
+    })
 }
 
 pub(crate) struct EscapeFlushUndo {
@@ -144,26 +159,53 @@ pub(crate) fn reset_single_frame_blackhole() {
     });
 }
 
-/// Snapshot the live meta-interpreter framestack for
-/// `SwitchToBlackhole(ABORT_TOO_LONG)`.
+/// Name each decline under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_
+/// miframe`'s `s2dbg!` and `try_adopt_multi_frame_blackhole`'s `mfdbg!` name
+/// theirs: an unlatched abort and a latch that was never reached both end in the
+/// same replay, and the two want different fixes.
+macro_rules! latchdbg {
+    ($($a:tt)*) => {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[latch-decline] {}", format!($($a)*));
+        }
+    };
+}
+
+/// Snapshot the live meta-interpreter framestack for a `SwitchToBlackhole`
+/// that stops the walk at an arbitrary coordinate.
 ///
-/// RPython calls `blackhole_if_trace_too_long()` immediately after
-/// `MIFrame.run_one_step()` and `convert_and_run_from_pyjitpl` copies every
-/// live MIFrame at its already-advanced `pc` (`pyjitpl.py:2863-2866`,
-/// `blackhole.py:1799-1821`).  The full-body walker has the same state here:
-/// `resume_pc` is `walk()`'s post-step `next_pc`, and the current
-/// [`WalkContext`] plus [`WalkSession::framestack`] own the concrete banks for
-/// the live frame and all paused callers.
+/// Two triggers reach it, and both need the same image:
+///
+/// - `ABORT_TOO_LONG`.  RPython calls `blackhole_if_trace_too_long()`
+///   immediately after `MIFrame.run_one_step()` and
+///   `convert_and_run_from_pyjitpl` copies every live MIFrame at its
+///   already-advanced `pc` (`pyjitpl.py:2863-2866`, `blackhole.py:1799-1821`).
+///   `resume_pc` is `walk()`'s post-step `next_pc`.
+/// - A bridge carrier sub-walk that stopped on a walker capability gap.  That
+///   sub-walk IS the reconstructed callee's one real execution (see
+///   `drive_bridge_frame_subwalk`'s `is_authoritative_executor` contract), so
+///   the drain may not discard it and let the guard resume from `rd_numb` —
+///   that re-runs every residual it already ran.  `resume_pc` is the
+///   unexecuted instruction the walk stopped at
+///   ([`DispatchError::stop_pc`]), which is the same "arbitrary coordinate"
+///   shape.  Upstream never rewinds an aborted bridge either:
+///   `_handle_guard_failure` ends `assert False, "should always raise"`
+///   (`pyjitpl.py:2956`) and the conversion continues from the frames
+///   `interpret()` reached.
+///
+/// Either way the current [`WalkContext`] plus [`WalkSession::framestack`] own
+/// the concrete banks for the live frame and all paused callers.
 ///
 /// Return `false` without publishing a partial image when any live value is
 /// unresolved.  A zero-effect walk may then use the legacy entry replay;
 /// an effectful walk must keep recording until a complete image can be built,
 /// because replaying it would apply the effect twice.
-pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
+pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
 ) -> bool {
     if !ctx.is_authoritative_executor {
+        latchdbg!("not-authoritative");
         return false;
     }
     let last_exc_value = match ctx.last_exc_value_concrete {
@@ -191,10 +233,12 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
                 })
             }
         }) else {
+            latchdbg!("no-snapshot-sym-jitcode");
             return false;
         };
         let Some(miframe) = build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
         else {
+            latchdbg!("sf-build-miframe");
             return false;
         };
         // `walk()` has already executed this step, so returning TraceTooLong
@@ -203,11 +247,13 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
         // to entry replay. Keep the same boundary: incomplete images merely
         // keep recording until a later step supplies a complete handoff.
         let Some(jitcode_index) = i32::try_from(miframe.jitcode.index()).ok() else {
+            latchdbg!("sf-jitcode-index");
             return false;
         };
         if ctx.trace_ctx.virtualizable_info().is_none()
             || crate::state::concrete_nlocals(cf_addr).is_none()
         {
+            latchdbg!("sf-no-vinfo-or-nlocals");
             return false;
         }
         let root_addr = if live_root_addr != 0 {
@@ -228,6 +274,7 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
             || !crate::state::can_write_back_outer_locals(ctx.trace_ctx, vable_frame)
             || !crate::state::can_publish_frame_stack(cf_addr, vable_frame)
         {
+            latchdbg!("sf-vable-frame-mismatch");
             return false;
         }
         // Keep the per-frame red identity seeded by `frame_box`.  The
@@ -248,9 +295,11 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
         let Some(framestack) =
             build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong)
         else {
+            latchdbg!("mf-build-miframe");
             return false;
         };
         if !multi_frame_blackhole_preflight(ctx, &framestack) {
+            latchdbg!("mf-preflight");
             return false;
         }
         FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
@@ -263,6 +312,11 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
         });
         true
     } else {
+        latchdbg!(
+            "no-arm framestack_empty={} inline_subwalk={}",
+            ctx.session.borrow().framestack.is_empty(),
+            ctx.fbw_mode.inline_subwalk
+        );
         false
     }
 }
@@ -278,6 +332,7 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
     framestack: &majit_metainterp::MIFrameStack,
 ) -> bool {
     if ctx.trace_ctx.virtualizable_info().is_none() || ctx.fbw_mode.snapshot_sym.is_null() {
+        latchdbg!("pf-no-vinfo-or-sym");
         return false;
     }
     let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
@@ -287,6 +342,13 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
         _ => sym.live_vable_frame_addr(),
     };
     let root = if live_root != 0 { live_root } else { snapshot };
+    latchdbg!(
+        "pf-root-caps snapshot={snapshot:#x} root={root:#x} nlocals={} locals={} writeback={} publish={}",
+        crate::state::concrete_nlocals(snapshot).is_some(),
+        crate::state::capture_frame_locals(root).is_some(),
+        crate::state::can_write_back_outer_locals(ctx.trace_ctx, root),
+        crate::state::can_publish_frame_stack(snapshot, root)
+    );
     if crate::state::concrete_nlocals(snapshot).is_none()
         || crate::state::capture_frame_locals(root).is_none()
         || !crate::state::can_write_back_outer_locals(ctx.trace_ctx, root)
@@ -298,23 +360,33 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
     let mut seen = Vec::with_capacity(framestack.frames.len());
     for (index, frame) in framestack.frames.iter().enumerate() {
         let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
+            latchdbg!("pf-jitcode-index");
             return false;
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
         if frame_reg == u16::MAX {
+            latchdbg!("pf-frame-reg-none");
             return false;
         }
         let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten() else {
+            latchdbg!(
+                "pf-frame-ptr-unset index={index}/{} jitcode={} frame_reg={frame_reg}",
+                framestack.frames.len(),
+                frame.jitcode.name()
+            );
             return false;
         };
         let frame_ptr = frame_ptr as usize;
         let Some(stack_base) = crate::state::concrete_nlocals(frame_ptr) else {
+            latchdbg!("pf-nlocals");
             return false;
         };
         let Some(stack_depth) = crate::state::concrete_stack_depth(frame_ptr) else {
+            latchdbg!("pf-stack-depth");
             return false;
         };
         let Some(array_len) = crate::state::concrete_frame_array_len(frame_ptr) else {
+            latchdbg!("pf-array-len");
             return false;
         };
         if stack_depth < stack_base
@@ -323,6 +395,7 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             || (index > 0 && frame_ptr == root)
             || seen.contains(&frame_ptr)
         {
+            latchdbg!("pf-shape");
             return false;
         }
         seen.push(frame_ptr);
@@ -468,6 +541,20 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             *slot = Some(value as i64);
         }
     }
+    // `num_regs_f()` is the third bank `_copy_data_from_miframe` walks, so the
+    // rationale above covers floats too.  There is no float concrete shadow —
+    // resolve the recorded box, and leave the color unset when it has none.
+    for color in 0..miframe.float_values.len() {
+        if miframe.float_values[color].is_some() {
+            continue;
+        }
+        let Some(&opref) = ctx.registers_f.get(color) else {
+            continue;
+        };
+        if let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) {
+            miframe.float_values[color] = Some(value.to_bits() as i64);
+        }
+    }
 
     Some(miframe)
 }
@@ -498,10 +585,30 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
 /// colors outside that marker-local live set may be read later. RPython copies
 /// all three complete MIFrame banks; do the same for this abort instead of
 /// relying on the narrower resume-liveness cache.
+///
+/// `_copy_data_from_miframe` (`blackhole.py:1713-1730`) guards every bank entry
+/// with `if box is not None` and has no failing path — but there, a `None`
+/// register is a **dead** one the jitcode's liveness already cleared, and every
+/// register that survives holds a box with a value.  "Live, but the walk knows
+/// no value" has no upstream counterpart, and skipping such a color would leave
+/// its pre-sized blackhole register at zero for a resume that can follow
+/// arbitrary control flow to an instruction that reads it.  So `OpRef::NONE`
+/// (dead, upstream's `box is None`) is skipped, and a live color with no
+/// concrete refuses the whole frame.
 fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     miframe: &mut majit_metainterp::MIFrame,
 ) -> bool {
+    // Name the declining bank and color under `PYRE_FBW_DEBUG_ABORT`, the way
+    // `build_multi_frame_miframe` names its own: "innermost declined" alone
+    // does not say which register had no concrete.
+    macro_rules! s2dbg {
+        ($($a:tt)*) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[s2-fill-decline] {}", format!($($a)*));
+            }
+        };
+    }
     for color in 0..miframe.int_values.len() {
         if let Some(value) = ctx
             .concrete_registers_i
@@ -524,6 +631,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
                 continue;
             }
             let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+                s2dbg!("int color={color} opref={opref:?} has no concrete");
                 return false;
             };
             miframe.int_values[color] = Some(value);
@@ -555,6 +663,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
         if let Some(value) = forwarded.or(from_shadow) {
             miframe.ref_values[color] = Some(value);
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
+            s2dbg!("ref color={color} opref={opref:?} has no concrete");
             return false;
         }
     }
@@ -570,6 +679,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             continue;
         }
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            s2dbg!("float color={color} opref={opref:?} has no concrete");
             return false;
         };
         miframe.float_values[color] = Some(value.to_bits() as i64);
@@ -676,9 +786,12 @@ pub(crate) fn escape_flush_undo_cell_ptr() -> *const std::cell::RefCell<Option<E
 
 thread_local! {
     /// The concrete `PyFrame` the innermost inline sub-walk is executing, or
-    /// null outside one.  Set by [`InlineConcreteFrameGuard`].
-    static INLINE_CONCRETE_FRAME: std::cell::Cell<*mut pyre_interpreter::PyFrame> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// `None` outside one.  Set by [`InlineConcreteFrameGuard`], and held as
+    /// a translated-livevar root rather than a raw pointer, the way
+    /// [`ResidualFrameChainGuard`] holds the `topframeref` it displaces.
+    static INLINE_CONCRETE_FRAME: std::cell::RefCell<
+        Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    > = const { std::cell::RefCell::new(None) };
 
     /// The concrete frame currently published on the interpreter chain by a
     /// live [`ResidualFrameChainGuard`], or null.  Distinct from
@@ -719,7 +832,7 @@ impl LiveLastInstrGuard {
     /// declines to latch a sub-walk's mirror), and writing it onto the outer
     /// frame strands that frame's replay on a stack depth it never had.
     fn enter(live_frame: usize, py_pc: u32) -> Option<Self> {
-        let inline = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        let inline = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
         let frame = if inline.is_null() {
             live_frame as *mut pyre_interpreter::PyFrame
         } else {
@@ -761,24 +874,28 @@ impl Drop for LiveLastInstrGuard {
 /// Names the frame an inline sub-walk executes concretely for the duration of
 /// that sub-walk.  Publishing it on the interpreter chain is left to
 /// [`ResidualFrameChainGuard`], which brackets only the residual calls.
-pub(crate) struct InlineConcreteFrameGuard(*mut pyre_interpreter::PyFrame);
+pub(crate) struct InlineConcreteFrameGuard(Option<majit_gc::shadow_stack::OwnerRootGuard>);
 
 impl InlineConcreteFrameGuard {
     pub(crate) fn enter(frame: *mut pyre_interpreter::PyFrame) -> Self {
-        // Set unconditionally, null included: a nested sub-walk whose seed
-        // block bailed has no frame of its own, and inheriting the enclosing
-        // callee's frame would publish it for the inner callee's residuals —
-        // resolving one level too shallow, the error this guard exists to
-        // stop.  A null slot makes `ResidualFrameChainGuard::enter` publish
-        // nothing.
-        let previous = INLINE_CONCRETE_FRAME.with(|slot| slot.replace(frame));
-        Self(previous)
+        // Set unconditionally, the empty case included: a nested sub-walk
+        // whose seed block bailed has no frame of its own, and inheriting the
+        // enclosing callee's frame would publish it for the inner callee's
+        // residuals — resolving one level too shallow, the error this guard
+        // exists to stop.  An empty slot makes `ResidualFrameChainGuard::enter`
+        // publish nothing.
+        //
+        // The displaced root stays in this guard, so the enclosing level's
+        // frame keeps its own root for the whole nested sub-walk.
+        let entered = (!frame.is_null())
+            .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame as usize)));
+        Self(INLINE_CONCRETE_FRAME.with(|slot| slot.replace(entered)))
     }
 }
 
 impl Drop for InlineConcreteFrameGuard {
     fn drop(&mut self) {
-        INLINE_CONCRETE_FRAME.with(|slot| slot.set(self.0));
+        INLINE_CONCRETE_FRAME.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
 
@@ -812,7 +929,7 @@ struct ResidualFrameChainGuard {
 
 impl ResidualFrameChainGuard {
     fn enter() -> Option<Self> {
-        let frame = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        let frame = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
         }
@@ -971,10 +1088,15 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                     EscapeResumeKind::RerunsOpcode
                 };
                 COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
-            } else {
+            } else if !crate::state::flush_locals_region_to_frame(ctx, expected) {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
             }
+            // A declined full flush still escaped the virtualizable, so the
+            // locals region is written anyway (`virtualizable.py:101-138
+            // write_boxes` has no decline) — otherwise the callee reads an
+            // array of nulls.  That write claims no resume pc, and the undo
+            // stays armed so the legacy replay re-enters the pre-flush frame.
             // A directly matched frame escaped whether or not the flush
             // committed, so the two signals stay decoupled.  A redirected one
             // is reported only once the resume pc is committed: forcing
@@ -1021,10 +1143,11 @@ fn capture_escape_flush_undo(frame: usize) {
     });
 }
 
-/// Put the pre-flush frame state back.  Called on every path that does not
-/// adopt the committed escape pc (commit withdrawal, an unforced or
-/// rootless continuation) so the
-/// legacy replay re-enters a pristine frame.
+/// Put the pre-flush frame state back so the legacy replay re-enters a
+/// pristine frame.  Called from the unforced / rootless continuation (where
+/// the walk goes on and must not see the moved frame) and, for a withdrawn
+/// commit, from the walk-end epilogue once no resume-PAST continuation has
+/// claimed the flushed frame.
 pub(crate) fn restore_escape_flush_undo() {
     ESCAPE_FLUSH_UNDO.with(|slot| {
         let Some(undo) = slot.borrow_mut().take() else {
@@ -1047,6 +1170,22 @@ pub(crate) fn discard_escape_flush_undo() {
     ESCAPE_FLUSH_UNDO.with(|slot| {
         *slot.borrow_mut() = None;
     });
+    ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.set(false));
+}
+
+/// Note that the forced residual's commit was withdrawn, so the pre-flush
+/// frame has to come back IF the walk ends up on the legacy replay.  The
+/// restore itself waits for [`take_escape_flush_undo_pending`] at walk end:
+/// the resume-PAST continuation keeps the flushed frame (upstream's
+/// `virtualizable.py:101-138 write_boxes` has no undo once the vable is
+/// forced), and only the replay-from-entry leg needs the pre-walk state back.
+fn mark_escape_flush_undo_pending() {
+    ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.set(true));
+}
+
+/// Consume the deferred-restore request armed by the force arm.
+pub(crate) fn take_escape_flush_undo_pending() -> bool {
+    ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.replace(false))
 }
 
 /// Opcode-scoped effect window check (see [`ESCAPE_OPCODE_WINDOW`]): true iff
@@ -1108,6 +1247,19 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
         let Some(oprefs) = latched.as_ref() else {
             return false;
         };
+        flush_with_latched_stack(ctx, frame, py_pc, oprefs)
+    })
+}
+
+/// Resolve a latched operand-stack OpRef mirror to concrete refs and flush the
+/// walk-end state with it, keeping the resolved refs rooted across the call.
+///
+/// Shared by the escape flush above and the `ABORT_FORCE_QUASIIMMUT` leg
+/// ([`flush_qmut_abort_state`]): both resume the interpreter
+/// mid-expression, where the vable shadow's stack region reads NULL and only the
+/// walk's own mirror can say what the operands are.
+fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: &[OpRef]) -> bool {
+    {
         let mut stack = Vec::with_capacity(oprefs.len());
         for &opref in oprefs.iter() {
             match ctx.concrete_of_opref(opref) {
@@ -1179,7 +1331,19 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
             crate::state::flush_walk_end_state_to_frame_with_full_stack(ctx, frame, py_pc, &stack);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
         committed
-    })
+    }
+}
+
+/// The `ABORT_FORCE_QUASIIMMUT` leg's flush: resume the interpreter at the
+/// opcode carrying the forcing write, with the operand stack the walk mirrored
+/// on entry to it ([`fbw_qmut_abort_stack_take`]).
+pub(crate) fn flush_qmut_abort_state(
+    ctx: &TraceCtx,
+    frame: usize,
+    py_pc: usize,
+    oprefs: &[OpRef],
+) -> bool {
+    flush_with_latched_stack(ctx, frame, py_pc, oprefs)
 }
 
 /// Take the committed escape resume pc and which flush produced it (the
@@ -1569,11 +1733,24 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     // `try_execute_residual_call_via_executor`.
     let is_store_deref =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
+    // `bh_load_global_fn(namespace_ptr, w_code, frame, namei)` — `namespace_ptr`
+    // (arg index 0) is never dereferenced.  The helper discards it and resolves
+    // the namespace from the executing frame or the callee's own promoted
+    // `w_code`, because an inlined / chained callee's frame register aliases an
+    // outer frame; the operand survives only as the cell-fold recogniser's hint.
+    // A nested function's `LOAD_GLOBAL` folds it to the NULL constant, so
+    // aborting on it stops the walk after an effectful residual has already run
+    // concretely and the caller replays that region.
+    let is_load_global =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
         }
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_load_global && i == 0 {
             continue;
         }
         if is_call_function_ex && (i == 1 || i == 3) {
@@ -1977,8 +2154,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the region on top of the residuals the walk already ran concretely.
     let is_store_deref =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
+    // Same `bh_load_global_fn` `namespace_ptr` exemption as
+    // `walker_abort_if_mayforce_null_ref_arg`: arg index 0 is discarded by the
+    // helper, so a concrete NULL there is the normal nested-function shape.
+    let is_load_global =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
     for (i, &arg) in args.iter().enumerate() {
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_load_global && i == 0 {
             continue;
         }
         if is_call_kw && i == 1 {
@@ -2252,7 +2437,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // outer code object and reports whatever line that byte happens to sit
         // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
         // concrete store, publishing onto the callee's own frame instead.
-        if INLINE_CONCRETE_FRAME.with(|slot| slot.get()).is_null() {
+        if current_inline_concrete_frame() == 0 {
             let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
             crate::trace_opcode::mirror_vable_static_to_boxes(
                 ctx.trace_ctx,
@@ -2358,19 +2543,28 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // Latch the operand-stack mirror for the escape flush: at force time
         // the walk-end flush needs the caller's mid-expression stack, which
         // the vable shadow cannot provide (`reconstructed_all_ref_call_stack`
-        // resolves the same mirror for the inline-abort Entry carrier).  Only
-        // a non-writing residual is latched — a committed escape resumes AT
-        // this opcode and re-executes it in the interpreter, which must not
-        // re-apply a heap write.  The write gate is load-bearing beyond the
-        // obvious setters: forcing is NOT limited to frame-introspection
-        // reads (`hook_access_field`, rvirtualizable.py:49-53, forces on
-        // every redirected-field access, reads AND writes), and the mutating
-        // forcers — the `f_lineno`/`f_trace` setters, `sys.settrace`,
-        // `_warnings.warn` (forces the caller frame for `__name__`, then
-        // mutates `__warningregistry__` with no user frame entered) — are
-        // excluded here only because every Python-visible frame MUTATOR is a
-        // Void-returning store or a CALL-shaped helper.  What survives the
-        // gates is attribute/item READS of frame-family objects, which are
+        // resolves the same mirror for the inline-abort Entry carrier).
+        //
+        // A WRITING residual is latched too, but never to resume AT this
+        // opcode: the withdrawal below cancels its commit and restores the
+        // pre-flush frame unconditionally, so the interpreter never
+        // re-executes it and never re-applies the write.  What the commit
+        // leaves behind for it is a WITNESS — it proves every mirror slot
+        // resolved to a concrete non-null Ref, i.e. the walk holds a complete
+        // mid-expression stack image, which is exactly the precondition for
+        // building the blackhole resume PAST the residual.  Forcing is NOT
+        // limited to frame-introspection reads (`hook_access_field`,
+        // rvirtualizable.py:49-53, forces on every redirected-field access,
+        // reads AND writes), and every Python-visible frame MUTATOR (the
+        // `f_lineno`/`f_trace` setters, `sys.settrace`, `_warnings.warn`,
+        // which forces the caller frame for `__name__` and then mutates
+        // `__warningregistry__` with no user frame entered) is a
+        // Void-returning store or a CALL-shaped helper, so all of them land
+        // on the writing side and take that withdrawal.
+        //
+        // A non-writing residual that entered no user frame keeps its commit
+        // and the resume-AT-opcode semantics: what survives the gates there
+        // is attribute/item READS of frame-family objects, which are
         // idempotently re-executable (re-execution reads the same flushed
         // values the first execution saw; a token re-force is a no-op).
         //
@@ -2401,7 +2595,6 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // run_perfn_walk epilogue that adopts (or restores) a committed
         // escape flush, so a commit there would strand a moved frame.
         let escape_stack = (escape_frame != 0
-            && !writes_live_heap
             && !ctx.fbw_mode.inline_subwalk
             && !ctx.trace_ctx.is_bridge_trace
             && ctx.vstack_valid
@@ -2487,18 +2680,40 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     func_ptr as usize,
                 );
             }
-            // The escaping residual also entered a user Python frame whose
-            // body may have committed irreversible effects; a committed
-            // escape resume would re-execute this opcode and re-run that
-            // body.  Withdraw the commit AND restore the pre-flush frame so
-            // the legacy replay re-enters pristine pre-walk state (the flush
-            // moved the live frame mid-iteration; replaying on top of it
-            // loses journal-rolled-back effects and re-runs partial state).
-            if heap_write_odometer_before
-                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
+            // Sampled BEFORE the withdrawal below: a commit means the escape
+            // flush made the LIVE frame authoritative at this opcode — the
+            // latched operand-stack mirror resolved and
+            // `flush_walk_end_state_to_frame_with_full_stack` wrote every
+            // local and every mid-expression stack slot.  Without it the frame
+            // still holds trace-entry values, which a resume PAST the residual
+            // would read back through the virtualizable and get a stale local.
+            let escape_flush_committed = committed_frame_escape_pc().is_some();
+            // The escaping residual either wrote live heap outside the
+            // journals, or entered a user Python frame whose body may have
+            // committed irreversible effects.  Either way a committed escape
+            // resume would re-execute this opcode and so re-apply that write
+            // / re-run that body.  Withdraw the commit AND restore the
+            // pre-flush frame so the legacy replay re-enters pristine
+            // pre-walk state (the flush moved the live frame mid-iteration;
+            // replaying on top of it loses journal-rolled-back effects and
+            // re-runs partial state).  The sample above already read the
+            // commit, so the mirror-resolved witness survives the withdrawal
+            // for the blackhole gate below.
+            if writes_live_heap
+                || heap_write_odometer_before
+                    .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
             {
                 cancel_committed_frame_escape_pc();
-                restore_escape_flush_undo();
+                // The restore is DEFERRED to the walk-end epilogue, which is
+                // where the legacy replay is actually chosen.  Undoing it here
+                // also undid `write_boxes`' locals materialization on the
+                // resume-PAST path below — the blackhole then continued into a
+                // frame whose fastlocals were back to their unwritten nulls
+                // (`x = 1; a = sys._getframe(0); return x` returned NULL).
+                // The capture stays armed; `run_perfn_walk` restores it only
+                // when neither the force blackhole nor a committed escape pc
+                // takes over the continuation.
+                mark_escape_flush_undo_pending();
             }
             // C3 S1: the writes-live-heap force shape cannot safely resume AT
             // this opcode, but a top-level one-frame walk can resume PAST it
@@ -3448,6 +3663,134 @@ pub(crate) fn residual_call_is_proven_truth(
     };
     numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
 }
+/// `pyjitpl.py:1094-1118 opimpl_jit_force_quasi_immutable` for the module
+/// namespace's `version?` (`celldict.py:34 _immutable_fields_ = ["version?"]`),
+/// asked ahead of an opaque STORE_NAME / STORE_GLOBAL / DELETE_NAME /
+/// DELETE_GLOBAL residual.
+///
+/// ```text
+///  mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R, mutatefielddescr, box)
+///  if mutatebox.nonnull():
+///      do_force_quasi_immutable(cpu, box.getref_base(), mutatefielddescr)
+///      raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)
+///  self.metainterp.generate_guard(rop.GUARD_ISNULL, mutatebox, resumepc=orgpc)
+/// ```
+///
+/// Upstream meets the rtyper's `jit_force_quasi_immutable` inside the traced
+/// write (`rclass.py:715-718`) and abandons the attempt cheaply, which is why
+/// PyPy reports thousands of `abort: force quasi-immut` on this program shape
+/// and still compiles its loops. Pyre's write runs inside a frontend helper the
+/// walker never looks into, so the walker asks the same question here instead of
+/// meeting the operation; without it the trace completes carrying a `version`
+/// constant that is already stale, and the optimizer's revalidation then
+/// discards the loop *and* every interpreter entry bridge.
+///
+/// `is_installed()` is `mutatebox.nonnull()`; the bump predicate is
+/// [`pyre_object::celldict::store_would_bump_version`], the side-effect-free
+/// twin of `write_cell`, because only the write that replaces the stored
+/// pointer reaches `mutated()` (`celldict.py:80-90`) — an in-place cell write
+/// leaves `version` alone and a hot module-scope loop must keep its trace.
+///
+/// Deliberately NO `GUARD_ISNULL` arm on the not-installed path. Upstream's
+/// guard licenses the traced *inline* setfield that bypasses the invalidation
+/// function (`pyjitpl.py:1095-1102`); pyre's write stays inside the residual,
+/// which runs `notify_version_watchers` itself at runtime, so there is no
+/// bypass to license.
+///
+/// Fires BEFORE the residual executes, so the write is still entirely ahead of
+/// the walk — that is what lets the abort resume the interpreter at this opcode
+/// and have the write happen exactly once.  Everything the walk applied EARLIER
+/// stays applied: [`DispatchError::ForceQuasiImmutable`] carries the abort to
+/// the flush leg that commits the journal instead of replaying the region.
+fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    helper: majit_ir::PyreHelperKind,
+    r_args: &[OpRef],
+) -> Option<()> {
+    use majit_ir::PyreHelperKind as K;
+    let is_store = matches!(helper, K::StoreName | K::StoreGlobal);
+    if !is_store && !matches!(helper, K::DeleteName | K::DeleteGlobal) {
+        return None;
+    }
+    let (&frame_opref, &name_opref) = (r_args.first()?, r_args.get(1)?);
+    let (
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(w_name_ptr))),
+    ) = (
+        ctx.trace_ctx.box_value(frame_opref),
+        ctx.trace_ctx.box_value(name_opref),
+    )
+    else {
+        return None;
+    };
+    if frame_ptr == 0 || w_name_ptr == 0 {
+        return None;
+    }
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let w_globals = frame.get_w_globals();
+    if w_globals.is_null() {
+        return None;
+    }
+    // A `*_NAME` opcode writes `w_locals`; only a module frame — where
+    // `w_locals` aliases `w_globals` — touches the namespace the folds pin.
+    // Same test as `try_walker_load_name_cell_fold`.
+    if matches!(helper, K::StoreName | K::DeleteName) {
+        let w_locals = frame.get_w_locals();
+        if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+            return None;
+        }
+    }
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(w_globals) };
+    // `mutatebox.nonnull()` — nothing is watching, so there is nothing to
+    // abandon the trace for. The write still runs its own invalidation.
+    if !unsafe {
+        pyre_object::dictmultiobject::module_dict_strategy_version_qmut_installed(strategy)
+    } {
+        return None;
+    }
+    let name = unsafe {
+        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    };
+    let slot = crate::state::module_dict_cell_slot_direct(w_globals, name);
+    let bumps = if is_store {
+        let &value_opref = r_args.get(2)?;
+        let Some(majit_ir::Value::Ref(majit_ir::GcRef(value_ptr))) =
+            ctx.trace_ctx.box_value(value_opref)
+        else {
+            return None;
+        };
+        if value_ptr == 0 {
+            return None;
+        }
+        let cell = slot.and_then(|s| crate::state::module_dict_cell_value_direct(w_globals, s));
+        unsafe {
+            pyre_object::celldict::store_would_bump_version(
+                cell,
+                value_ptr as pyre_object::PyObjectRef,
+            )
+        }
+    } else {
+        // `celldict.py:106-126 delitem` reaches `mutated()` only after a
+        // successful removal — `delitem_str` returns early on a missing key.
+        slot.is_some()
+    };
+    if !bumps {
+        return None;
+    }
+    // pyjitpl.py:1113-1115: the tracer performs the invalidation itself and
+    // then abandons the attempt. Idempotent (`quasiimmut.py:47-48`), so the
+    // interpreter re-running the opcode forces nothing a second time.
+    unsafe { pyre_object::dictmultiobject::module_dict_strategy_force_version_qmut(strategy) };
+    // Offer the flush leg the operand stack this opcode began with.  Same
+    // preconditions as the escape latch: a sub-walk's mirror describes the
+    // CALLEE frame, and a bridge walk's abort path never reaches the epilogue
+    // that would adopt the flush.
+    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
+        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+    }
+    Some(())
+}
+
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -3700,6 +4043,26 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // pyjitpl.py:1094-1118 `opimpl_jit_force_quasi_immutable`, asked at the
+    // residual boundary because pyre's namespace write lives inside one.
+    //
+    // Ordered AFTER the cell fold above (a successful in-place fold IS the
+    // no-bump case) and BEFORE `try_execute_residual_call_via_executor`, so
+    // nothing has been applied when the abort fires and the resume re-runs the
+    // whole opcode cleanly. Executing first — the order `do_not_in_trace_call`
+    // uses for its own contract — would double-apply the store or the delete.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'v'
+        && try_walker_force_quasi_immut_namespace_write(ctx, ei.pyre_helper, &r_args).is_some()
+    {
+        // Carry the reason to the `abort_trace` that follows, the way upstream
+        // carries it on the `SwitchToBlackhole` instance (pyjitpl.py:2906-2910).
+        // Without it the abort lands in the `Generic` catch-all and the
+        // `abort: force quasi-immut` counter stays at 0.
+        crate::state::note_force_quasi_immut_abort();
+        return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
+    }
+
     // pyjitpl.py OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
@@ -3800,6 +4163,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+    }
+
+    // Emit MAKE_FUNCTION's `Function.__init__` as New + SetField so a `def` in a
+    // loop body virtualizes away instead of allocating through the opaque
+    // residual.  Falls through to the residual for every shape the emit cannot
+    // reproduce constant-for-constant (SAFE — never declined).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::MakeFunction
+        && try_walker_specialize_make_function(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // #195 / #73: virtualize an arity-2 plain-int BUILD_TUPLE
@@ -3968,6 +4343,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_specialize_math_sqrt(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_math_log_trig(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -5065,6 +5447,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         ctx.last_exc_value_concrete = saved_last_exc_value_concrete;
                     }
                     folded
+                } else if (op_tag == 8 || op_tag == 9) && ctx.is_authoritative_executor {
+                    // `op_tag` 8 / 9 are `is` / `is_not` (`IS_OP`), which the
+                    // codewriter routes through the same `compare_fn`
+                    // residual as the six ordinary comparisons.  Fold them to
+                    // `ptr_eq` / `ptr_ne` — or, for a self-compare, straight
+                    // to the constant — so identity tests stop paying a
+                    // may-force call and its `GuardNotForced` per iteration.
+                    // Declines (falls through to the generic residual) for an
+                    // operand layout whose class compares `is_w` by value.
+                    try_walker_fold_is_op(ctx, op.pc, op_tag, &r_args, dst, dst_bank)?
                 } else {
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.

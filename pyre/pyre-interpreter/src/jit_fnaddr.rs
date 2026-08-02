@@ -1086,6 +1086,51 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::sys_modules_registry_get",
         sys_modules_registry_get as *const (),
     );
+    // The same shape over four more runtime-mutable cells:
+    // `_io::unsupported_operation_type` reads the `UNSUPPORTED_OPERATION_TYPE`
+    // `OnceLock` the `_io` module init stamps with its module-local
+    // `UnsupportedOperation` class, `eval::current_frame` the `CURRENT_FRAME`
+    // thread-local `install_current_frame` moves, the two `display::repr_*`
+    // twins the `REPR_ACTIVE` mid-repr set (the
+    // `note_eval_activation_{enter,exit}` twin shape), and `autoflusher_add`
+    // the `AUTOFLUSHER` thread-local handle table.
+    let unsupported_operation_type: fn() -> pyre_object::PyObjectRef =
+        crate::module::_io::unsupported_operation_type;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::unsupported_operation_type",
+        "pyre_interpreter::unsupported_operation_type",
+        unsupported_operation_type as *const (),
+    );
+    let current_frame: fn() -> *mut crate::pyframe::PyFrame = crate::eval::current_frame;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::current_frame",
+        "pyre_interpreter::current_frame",
+        current_frame as *const (),
+    );
+    let repr_enter: fn(pyre_object::PyObjectRef) -> bool = crate::display::repr_enter;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::display::repr_enter",
+        "pyre_interpreter::repr_enter",
+        repr_enter as *const (),
+    );
+    let repr_leave: fn(pyre_object::PyObjectRef) = crate::display::repr_leave;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::display::repr_leave",
+        "pyre_interpreter::repr_leave",
+        repr_leave as *const (),
+    );
+    let autoflusher_add: fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
+        crate::module::_io::autoflusher_add;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::autoflusher_add",
+        "pyre_interpreter::autoflusher_add",
+        autoflusher_add as *const (),
+    );
     let warnings_state_ns: fn() -> pyre_object::PyObjectRef = crate::module::_warnings::state_ns;
     push_alias_pair(
         &mut entries,
@@ -1231,8 +1276,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_fnaddr(
         &mut entries,
-        "pyre_interpreter::call::call_depth",
-        crate::call::call_depth as *const (),
+        "pyre_interpreter::call::py_recursion_depth",
+        crate::call::py_recursion_depth as *const (),
     );
     push_fnaddr(
         &mut entries,
@@ -1876,6 +1921,78 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_pop_last",
         pyre_object::dictmultiobject::dict_entries_pop_last as *const (),
     );
+    // The positional slot reads the post-scan lookup arms and the reentrant
+    // key scan perform: an index the caller already settled on, so no
+    // comparison runs behind these boundaries.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_value_at",
+        "pyre_object::dict_entries_value_at",
+        pyre_object::dictmultiobject::dict_entries_value_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_obj_at",
+        "pyre_object::dict_entries_key_obj_at",
+        pyre_object::dictmultiobject::dict_entries_key_obj_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_hash_at",
+        "pyre_object::dict_entries_key_hash_at",
+        pyre_object::dictmultiobject::dict_entries_key_hash_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_is_at",
+        "pyre_object::dict_entries_key_is_at",
+        pyre_object::dictmultiobject::dict_entries_key_is_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_capacity",
+        "pyre_object::dict_entries_capacity",
+        pyre_object::dictmultiobject::dict_entries_capacity as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_value_set_at",
+        "pyre_object::dict_entries_value_set_at",
+        pyre_object::dictmultiobject::dict_entries_value_set_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_insert_object",
+        "pyre_object::dict_entries_insert_object",
+        pyre_object::dictmultiobject::dict_entries_insert_object as *const (),
+    );
+    // The index-returning twins of the `dict_entries_probe_*` pair, for
+    // `setitem_str`'s borrow-key membership test.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_index_of_str_hashed",
+        "pyre_object::dict_entries_index_of_str_hashed",
+        pyre_object::dictmultiobject::dict_entries_index_of_str_hashed as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_index_of_object",
+        "pyre_object::dict_entries_index_of_object",
+        pyre_object::dictmultiobject::dict_entries_index_of_object as *const (),
+    );
+    // The module-dict storage's own `String`-keyed probe / store pair.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::module_dict_entries_get",
+        "pyre_object::module_dict_entries_get",
+        pyre_object::celldict::module_dict_entries_get as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::module_dict_entries_insert",
+        "pyre_object::module_dict_entries_insert",
+        pyre_object::celldict::module_dict_entries_insert as *const (),
+    );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
     // serial the build process saw.
@@ -1886,11 +2003,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::next_version_tag_serial",
         next_version_tag_serial as *const (),
     );
+    // `quasiimmut.py:129-134 _invalidate_now`, shared by both `?` fields.
     push_alias_pair(
         &mut entries,
-        "pyre_object::celldict::sweep_version_watchers",
-        "pyre_object::sweep_version_watchers",
-        pyre_object::celldict::sweep_version_watchers as *const (),
+        "pyre_object::quasiimmut::sweep_quasi_immut_field",
+        "pyre_object::sweep_quasi_immut_field",
+        pyre_object::quasiimmut::sweep_quasi_immut_field as *const (),
     );
     // The three typed-storage promotions: `IndexMap` construction and refill
     // end to end, so the residual boundary is the whole migration.
@@ -1929,6 +2047,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::identitydict::w_dict_delete_identity_strategy",
         "pyre_object::w_dict_delete_identity_strategy",
         pyre_object::identitydict::w_dict_delete_identity_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::identitydict::w_dict_store_identity_strategy",
+        "pyre_object::w_dict_store_identity_strategy",
+        pyre_object::identitydict::w_dict_store_identity_strategy as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -2983,6 +3107,18 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("functional::RANGE_ITER_TYPE", functional::RANGE_ITER_TYPE),
         pytype_addr!("memoryview::MEMORYVIEW_TYPE", memoryview::MEMORYVIEW_TYPE),
         pytype_addr!("iterobject::SEQ_ITER_TYPE", iterobject::SEQ_ITER_TYPE),
+        pytype_addr!(
+            "iterobject::STR_ASCII_ITER_TYPE",
+            iterobject::STR_ASCII_ITER_TYPE
+        ),
+        pytype_addr!("iterobject::STR_ITER_TYPE", iterobject::STR_ITER_TYPE),
+        pytype_addr!("iterobject::BYTES_ITER_TYPE", iterobject::BYTES_ITER_TYPE),
+        pytype_addr!(
+            "iterobject::BYTEARRAY_ITER_TYPE",
+            iterobject::BYTEARRAY_ITER_TYPE
+        ),
+        pytype_addr!("iterobject::MEMORY_ITER_TYPE", iterobject::MEMORY_ITER_TYPE),
+        pytype_addr!("iterobject::ARRAY_ITER_TYPE", iterobject::ARRAY_ITER_TYPE),
         pytype_addr!("iterobject::LIST_ITER_TYPE", iterobject::LIST_ITER_TYPE),
         pytype_addr!(
             "iterobject::LIST_REVERSE_ITER_TYPE",
@@ -3329,6 +3465,46 @@ mod tests {
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
     }
 
+    /// Two registered functions must never share an address.
+    ///
+    /// `pyre-jit-trace`'s `patch_constants_i_fnaddrs` rewrites residual-call
+    /// constants through a build-address → runtime-address map, so an address
+    /// standing for two functions sends one callee's call to the other.  Its
+    /// runtime assertion only fires once the patch path executes; this covers
+    /// the registry itself.
+    ///
+    /// Several path spellings for one function are deliberate — the module
+    /// path and the crate-root re-export both appear — and those agree on the
+    /// leaf name.  Two distinct leaf names on one address means the toolchain
+    /// folded unrelated functions together, which is the collision that
+    /// matters.  That is not hypothetical: MSVC links with `/OPT:ICF` by
+    /// default, and once `drain_list_append` lost `#[inline(never)]` its body
+    /// became byte-identical to `w_list_append` and the two folded.
+    ///
+    /// This covers only the address space it runs in.  The Windows fold
+    /// happened in the build-script binary while the test binary kept the two
+    /// apart, so a registry that passes here can still feed
+    /// `runtime_fnaddr_patch` an ambiguous build address — that direction is
+    /// what its own assertion catches.
+    #[test]
+    fn registered_paths_sharing_an_address_are_alias_spellings() {
+        let mut by_addr: HashMap<i64, Vec<&'static str>> = HashMap::new();
+        for (path, addr) in jit_trace_fnaddrs() {
+            by_addr.entry(addr).or_default().push(path);
+        }
+        for (addr, paths) in &by_addr {
+            let leaves: std::collections::BTreeSet<&str> = paths
+                .iter()
+                .map(|p| p.rsplit("::").next().unwrap_or(p))
+                .collect();
+            assert_eq!(
+                leaves.len(),
+                1,
+                "fnaddr {addr:#x} is claimed by unrelated functions {paths:?}",
+            );
+        }
+    }
+
     #[test]
     fn jit_static_pytype_addrs_covers_interpreter_function_types() {
         let bindings: HashMap<&'static str, i64> = jit_static_pytype_addrs().into_iter().collect();
@@ -3351,6 +3527,21 @@ mod tests {
             expected
         );
         assert_eq!(bindings["module::_random::Random::genrand32"], expected);
+    }
+
+    /// `BUILTIN_WRAPPER_DESCRIPTORS` is only pushed into the binding table off
+    /// wasm32, so the lookup below has nothing to find there.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn jit_trace_fnaddrs_covers_int_bit_length_gateway_wrapper() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            crate::typedef::__pyre_wrap_int_descr_bit_length as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::typedef::__pyre_wrap_int_descr_bit_length"],
+            expected,
+        );
     }
 
     #[test]
@@ -3535,8 +3726,11 @@ mod tests {
             bump
         );
 
-        let call_depth = crate::call::call_depth as *const () as usize as i64;
-        assert_eq!(bindings["pyre_interpreter::call::call_depth"], call_depth);
+        let py_recursion_depth = crate::call::py_recursion_depth as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::call::py_recursion_depth"],
+            py_recursion_depth
+        );
 
         let recursion_limit =
             crate::module::sys::state::recursion_limit as *const () as usize as i64;

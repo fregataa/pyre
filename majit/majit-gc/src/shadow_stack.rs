@@ -503,20 +503,36 @@ pub fn push(gcref: GcRef) -> usize {
 
 /// Pop entries from the shadow stack back to the given depth.
 ///
+/// `shadowstack.py:86-90 decr_stack` moves `root_stack_top` and returns it;
+/// the popped slots are not read back, and `pop_stack` (`:104-106`) is the
+/// separate operation for callers that want the value.  Shortening in place
+/// mirrors that.  Returning the popped entries instead — `Vec::split_off`,
+/// which this was — makes every root-scope exit a `malloc` + `memcpy` and
+/// leaves the caller a `free`, and no caller reads the result.
+///
+/// `depth` is asserted rather than saturated: every caller pairs this with a
+/// depth it pushed, so a too-large `depth` is an unbalanced scope, and
+/// silently shortening to nothing would strand roots the collector still
+/// needs.  A plain `assert!` and not `debug_assert!` — this crate is
+/// extracted to LLBC, where debug assertions are compiled in.
+///
 /// TODO: Rust drops thread-locals in reverse order on
 /// thread exit, and a TLS-owned `Drop` (e.g. `JitDriver`'s) may call
 /// this during its own teardown. If
 /// `SHADOW_STACK`'s destructor has already fired, `.with()` panics with
 /// `AccessError`. RPython has no analogous hazard — the GIL thread does
-/// not tear down TLS mid-run. Silently return an empty Vec so the
-/// exiting thread proceeds.
-pub fn pop_to(depth: usize) -> Vec<GcRef> {
-    SHADOW_STACK
-        .try_with(|ss| {
-            let mut ss = ss.borrow_mut();
-            ss.entries.split_off(depth)
-        })
-        .unwrap_or_default()
+/// not tear down TLS mid-run. Silently do nothing so the exiting thread
+/// proceeds.
+pub fn pop_to(depth: usize) {
+    let _ = SHADOW_STACK.try_with(|ss| {
+        let mut ss = ss.borrow_mut();
+        assert!(
+            depth <= ss.entries.len(),
+            "shadow stack pop_to({depth}) above depth {}",
+            ss.entries.len(),
+        );
+        ss.entries.truncate(depth);
+    });
 }
 
 /// Like `pop_to` but silently no-ops if the shadow stack thread-local
@@ -584,24 +600,37 @@ pub fn release_owner_root(index: usize) {
 /// RAII owner for one fixed translated-livevar root slot.
 pub struct OwnerRootGuard {
     index: usize,
-    /// `index` names a slot in the ACQUIRING thread's `OWNER_ROOTS`, so the
-    /// guard must not outlive that thread's stack frame.  Bare `usize` would
-    /// make it auto-`Send`, and dropping it elsewhere would release a foreign
-    /// thread's slot (or trip the inactive-slot assert).  The raw-pointer
-    /// marker pins it to one thread at compile time.
-    _not_send: std::marker::PhantomData<*mut ()>,
+    /// Address of the ACQUIRING thread's `OWNER_ROOTS` cell, resolved once.
+    ///
+    /// A guard is read back on every access to the value it roots, so paying
+    /// the thread-local resolution (`_tlv_get_addr` on macOS) each time would
+    /// make re-reading the root cost more than the stale copy it replaces.
+    /// The cell never moves once created — the same invariant `MutatorEntry`
+    /// and [`ShadowStackSlot`] rely on — and RPython's translated code
+    /// likewise resolves its root-stack base once per function
+    /// (`gc_enter_roots_frame`) and then addresses slots by fixed offset.
+    ///
+    /// It also pins the guard to one thread: `index` names a slot in that
+    /// thread's `OWNER_ROOTS`, and a bare `usize` would make the guard
+    /// auto-`Send`, so dropping it elsewhere would release a foreign thread's
+    /// slot (or trip the inactive-slot assert).
+    roots: *const RefCell<Vec<Option<GcRef>>>,
 }
 
 impl OwnerRootGuard {
     pub fn new(root: GcRef) -> Self {
         Self {
             index: acquire_owner_root(root),
-            _not_send: std::marker::PhantomData,
+            roots: OWNER_ROOTS.with(|roots| roots as *const _),
         }
     }
 
+    #[inline]
     pub fn get(&self) -> GcRef {
-        OWNER_ROOTS.with(|roots| roots.borrow()[self.index].expect("inactive owner-root guard"))
+        // SAFETY: `roots` is this thread's own `OWNER_ROOTS` cell, alive for
+        // as long as the guard (which cannot leave the thread), and the slot
+        // stays acquired until `Drop`.
+        unsafe { (*self.roots).borrow()[self.index].expect("inactive owner-root guard") }
     }
 }
 
@@ -847,6 +876,29 @@ pub fn jf_depth() -> usize {
 /// custom_trace), exactly as in RPython where `root_walker.walk_roots()`
 /// copies the jitframe, and then `jitframe_trace` (custom_trace hook)
 /// traces the gcmap-indicated ref slots during Phase 2.
+///
+/// The marker word is stepped over, not consumed. `walk_stack_root`
+/// (`shadowstack.py:44-70`) treats an odd slot as a skip bitmask: on a minor
+/// collection it negates an unmarked one and *returns* at an already-marked
+/// one, so the walk stops instead of descending further. Porting that loop
+/// here would be porting a no-op. Upstream keeps one root stack per thread, so
+/// the stoppers the JIT writes sit interleaved among interpreter roots and
+/// returning early skips those; this stack holds jitframe pointers only, and
+/// the deep interpreter stacks (`pyre_object::gc_roots`, `SHADOW_STACK`)
+/// carry no stopper to stop on. The early return becomes reachable once those
+/// stacks are one stack, not before.
+///
+/// It would also be unsound on its own: upstream disables the optimization for
+/// the first minor collection after a thread switch
+/// (`can_look_at_partial_stack`, `shadowstack.py:112-126`) and whenever the
+/// nursery holds objects pinned before the previous minor collection
+/// (`any_pinned_object_from_earlier`, `incminimark.py:1996-2006`). Neither
+/// condition has a counterpart here — `Collector::pinned_objects` does not
+/// distinguish pins carried over from an earlier cycle.
+///
+/// The marker is still written, by every backend, because the two-word entry
+/// is the layout the merge converges on; `test_jf_flat_array_layout` is what
+/// currently holds the writers to it.
 pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
     JF_ROOT_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
@@ -1204,8 +1256,9 @@ pub fn extra_root_walk_kind() -> ExtraRootWalkKind {
 // Walkers registered today: eval.rs registers twelve (rd_consts, partial
 // trace, active trace, compile snapshot, jitcode constants, fbw store
 // journal, fbw finish concrete, pyre interpreter side tables, signal
-// handlers, weakref-box inner, jit callee frames, and pyre objects), plus
-// gcreftracer.rs registers the per-loop gc_table walker — thirteen total.
+// handlers, the _io autoflusher handle list, jit callee frames, and pyre
+// objects), plus gcreftracer.rs registers the per-loop gc_table walker —
+// thirteen total.
 // Leave headroom above that so a future root source does not overflow the
 // array and poison the registry lock with a "capacity exceeded" panic on
 // first use.
@@ -1418,11 +1471,22 @@ mod tests {
         push(b);
         assert_eq!(super::depth(), 2);
 
-        let popped = pop_to(depth);
-        assert_eq!(popped.len(), 2);
-        assert_eq!(popped[0], a);
-        assert_eq!(popped[1], b);
+        assert_eq!(super::get(0), a);
+        assert_eq!(super::get(1), b);
+
+        pop_to(depth);
         assert_eq!(super::depth(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "shadow stack pop_to")]
+    fn test_pop_to_above_depth_panics() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        push(GcRef(0x1000));
+        // An unbalanced scope must not silently no-op: truncating past the
+        // top would strand the roots below it.
+        pop_to(5);
     }
 
     #[test]

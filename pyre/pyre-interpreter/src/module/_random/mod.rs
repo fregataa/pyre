@@ -120,8 +120,31 @@ impl Random {
 #[crate::pyre_class("_random.Random")]
 #[derive(Default)]
 pub struct W_Random {
+    /// PyPy composes `MapdictStorageMixin` into a native-layout object when
+    /// `space.allocate_instance(W_Random, w_subtype)` allocates a Python
+    /// subclass (`objspace.py:485-487`, `mapdict.py:907-910`).  Keep the same
+    /// `[PyObject | map | storage]` prefix as `W_ObjectObject`, so the shared
+    /// mapdict implementation can operate on both layouts.  The builtin
+    /// `_random.Random` itself simply retains the empty/null state.
+    pub map: *const u8,
+    pub storage: *mut pyre_object::object_array::ItemsBlock,
     rnd: Random,
 }
+
+// `has_mapdict_storage` admits a `_random.Random` to the shared mapdict path,
+// where `_obj_getdict` / `_obj_setdict` and `object_object_custom_trace` read
+// `map` and `storage` through a `W_ObjectObject` cast. Pin the prefix so a
+// field reorder here is a build error rather than a silently misread slot.
+const _: () = assert!(
+    std::mem::offset_of!(W_Random, map)
+        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
+    "W_Random must keep W_ObjectObject's map offset"
+);
+const _: () = assert!(
+    std::mem::offset_of!(W_Random, storage)
+        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
+    "W_Random must keep W_ObjectObject's storage offset"
+);
 
 #[crate::pyre_methods(
     doc = "Random() -> create a random number generator.\n\nNot for security or cryptographic use.",

@@ -111,6 +111,10 @@ pub struct W_TypeObject {
     /// App-level `__qualname__` object, with the same lazy/identity semantics
     /// as `w_name`.
     pub w_qualname: PyObjectRef,
+    /// typeobject.py:213 `text_signature` — an optional interpreter-level
+    /// string supplied by the builtin TypeDef.  This is not a Python object
+    /// and therefore is not a GC edge.
+    pub text_signature: *mut String,
     /// Tuple of base type objects (PyObjectRef → W_TupleObject or PY_NULL).
     pub bases: PyObjectRef,
     /// Raw pointer to the class dict backing storage (`dict_w` analogue).
@@ -221,12 +225,17 @@ pub struct W_TypeObject {
     /// The hidden `mutate__version_tag` field for `typeobject.py:177
     /// _immutable_fields_ = ['_version_tag?']` — see [`QuasiImmut`].
     ///
-    /// Heap allocated on the first registration and null until then, exactly
-    /// like [`W_TypeObject::weak_subclasses`], which it also matches in never
-    /// being freed: this tree has no `W_TypeObject` teardown path. Holds no GC
-    /// pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to walk
-    /// here.
-    pub quasi_immut_watchers: *mut QuasiImmut,
+    /// Allocated on the first registration (`get_current_qmut_instance`,
+    /// quasiimmut.py:116-126), null until then, and unlinked + freed on
+    /// invalidation (`_invalidate_now`, quasiimmut.py:129-134), so a type nobody
+    /// has mutated since its last compile is the only one holding a box. Holds
+    /// no GC pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to
+    /// walk here.
+    ///
+    /// Shares [`crate::quasiimmut::QuasiImmutField`] with
+    /// `ModuleDictStrategy.version?`, the tree's other `?` declaration, the way
+    /// upstream's one `QuasiImmut` class serves every quasi-immutable field.
+    pub quasi_immut_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
@@ -367,6 +376,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         w_name: PY_NULL,
         qualname,
         w_qualname: PY_NULL,
+        text_signature: std::ptr::null_mut(),
         bases,
         dict: dict_ptr,
         flag_heaptype: true,
@@ -397,7 +407,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
-        quasi_immut_watchers: std::ptr::null_mut(),
+        quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
     };
     let (w_type, gc_managed) = if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_TypeObject, value) };
@@ -485,6 +495,7 @@ pub fn w_type_new_builtin(
         w_name: PY_NULL,
         qualname,
         w_qualname: PY_NULL,
+        text_signature: std::ptr::null_mut(),
         bases,
         dict: dict_ptr,
         flag_heaptype: false,
@@ -516,7 +527,7 @@ pub fn w_type_new_builtin(
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
-        quasi_immut_watchers: std::ptr::null_mut(),
+        quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
     }) as PyObjectRef;
     // A builtin type is Box-immortal, so its namespace values and `bases` are reachable only
     // through `walk_builtin_type_dicts_gc` (`pyre_interpreter::eval`).
@@ -747,85 +758,10 @@ pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
         .store(v, std::sync::atomic::Ordering::Release);
 }
 
-/// `quasiimmut.py:55-109 QuasiImmut` — the loops that baked one quasi-immutable
-/// field's value as a constant, and must be revoked when it changes.
-///
-/// Upstream reaches this object through the hidden `mutate_<name>` field the
-/// rtyper adds for each `_immutable_fields_` entry spelled with a `?`
-/// (`get_mutate_field_name`), created on demand by
-/// `get_current_qmut_instance`. Pyre has no rtyper to synthesise the field, so
-/// [`W_TypeObject::quasi_immut_watchers`] is that field, spelled out and
-/// likewise allocated on the first registration.
-///
-/// The flag stands in for upstream's `looptoken` + `cpu.invalidate_loop`: the
-/// backend already routes `GUARD_NOT_INVALIDATED` through a per-artifact
-/// `AtomicBool`, so setting it is what `looptoken.invalidated = True` buys.
-pub struct QuasiImmut {
-    /// `quasiimmut.py:62-63` — weak so a retired loop drops out instead of
-    /// being kept alive by the type that it read.
-    looptokens_wrefs: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
-    /// `quasiimmut.py:57 compress_limit = 30`.
-    compress_limit: usize,
-}
-
-impl Default for QuasiImmut {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl QuasiImmut {
-    /// `quasiimmut.py:59-64 __init__`. The initial limit is the growth formula
-    /// in [`Self::compress_looptokens_list`] evaluated at length zero.
-    pub fn new() -> Self {
-        Self {
-            looptokens_wrefs: Vec::new(),
-            compress_limit: 30,
-        }
-    }
-
-    /// `quasiimmut.py:72-75 register_loop_token`.
-    fn register_loop_token(&mut self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        if self.looptokens_wrefs.len() > self.compress_limit {
-            self.compress_looptokens_list();
-        }
-        self.looptokens_wrefs.push(std::sync::Arc::downgrade(flag));
-    }
-
-    /// `quasiimmut.py:77-82 compress_looptokens_list` — drop the entries whose
-    /// loop is gone and re-derive the limit from what is left, so a type that
-    /// is recompiled many times and never mutated cannot grow without bound.
-    ///
-    /// Upstream's note that already-invalidated tokens must be kept applies
-    /// here too: the flag stays live while its artifact does, and re-flipping
-    /// an already-set flag is what keeps a multiply-invalidated loop revoked.
-    fn compress_looptokens_list(&mut self) {
-        self.looptokens_wrefs.retain(|w| w.strong_count() > 0);
-        self.compress_limit = (self.looptokens_wrefs.len() + 15) * 2;
-    }
-
-    /// `quasiimmut.py:84-109 invalidate` — every loop recorded here becomes
-    /// invalid, so each `GUARD_NOT_INVALIDATED` in it (and in its bridges) must
-    /// now fail. The list is emptied like upstream's `self.looptokens_wrefs =
-    /// []`; a loop that recompiles registers again.
-    ///
-    /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
-    /// upstream never reaches `invalidate` from traced code — it hangs off the
-    /// residual `jit_force_quasi_immutable` path — and the `Vec` walk has no
-    /// lowering either way. The caller's null check stays traced, so the
-    /// common no-watcher mutation still makes no call.
-    #[majit_macros::dont_look_inside]
-    fn invalidate(&mut self) {
-        for wref in std::mem::take(&mut self.looptokens_wrefs) {
-            if let Some(flag) = wref.upgrade() {
-                flag.store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
-    }
-}
-
 /// Register a compiled loop's invalidation flag against this type's
-/// `_version_tag?` (`quasiimmut.py:72-74 QuasiImmut.register_loop_token`).
+/// `_version_tag?` (`quasiimmut.py:72-74 QuasiImmut.register_loop_token`),
+/// creating the instance on demand exactly like `get_current_qmut_instance`
+/// (quasiimmut.py:116-126).
 ///
 /// The compile-time glue (`register_quasi_immutable_deps`) calls this once per
 /// type-keyed dependency the optimizer collected from a `QUASIIMMUT_FIELD`, so
@@ -841,20 +777,51 @@ pub unsafe fn w_type_register_quasi_immut_watcher(
     if obj.is_null() || !is_type(obj) {
         return;
     }
-    let w_type = &mut *(obj as *mut W_TypeObject);
-    if w_type.quasi_immut_watchers.is_null() {
-        w_type.quasi_immut_watchers = Box::into_raw(Box::new(QuasiImmut::new()));
+    (*(obj as *const W_TypeObject))
+        .quasi_immut_watchers
+        .register_loop_token(flag);
+}
+
+/// Install this type's `_version_tag?` qmut instance without registering a
+/// loop (`quasiimmut.py:116-126 get_current_qmut_instance`).
+///
+/// The recording half of the protocol: upstream's `QuasiImmutDescr.__init__`
+/// (`pyjitpl.py:1081`) installs while the trace is still being recorded, so a
+/// write reached later in that same trace sees a non-null `mutate_*` field and
+/// aborts the attempt. [`w_type_register_quasi_immut_watcher`] is the compile-
+/// time half and runs far too late to arm that test.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_install_quasi_immut(obj: PyObjectRef) {
+    if obj.is_null() || !is_type(obj) {
+        return;
     }
-    (*w_type.quasi_immut_watchers).register_loop_token(flag);
+    (*(obj as *const W_TypeObject))
+        .quasi_immut_watchers
+        .ensure_installed();
 }
 
 /// Revoke every loop that baked this type's `version_tag` as a constant
-/// (`quasiimmut.py:84-109 QuasiImmut.invalidate`).
+/// (`quasiimmut.py:129-134 make_invalidation_function._invalidate_now`).
 ///
-/// Called from [`w_type_set_version_tag`] right before the new tag is
-/// published. Upstream runs the whole walk outside traced code — `invalidate`
-/// is reached from the residual `jit_force_quasi_immutable` path, never from a
-/// trace — so the sweep is residualised the same way. The null check stays
+/// ```text
+///  def _invalidate_now(p):
+///      qmut_ptr = getattr(p, mutatefieldname)
+///      setattr(p, mutatefieldname, lltype.nullptr(rclass.OBJECT))
+///      qmut = cast_base_ptr_to_instance(QuasiImmut, qmut_ptr)
+///      qmut.invalidate(descr_repr)
+/// ```
+///
+/// The field is unlinked *before* the sweep and the instance becomes garbage
+/// right after it, so the next registration allocates a fresh one; dropping the
+/// [`Box`] here is that collection. Called from [`w_type_set_version_tag`] right
+/// before the new tag is published.
+///
+/// Upstream runs the whole walk outside traced code — `_invalidate_now` is
+/// reached from the residual `jit_force_quasi_immutable` path, never from a
+/// trace — so the sweep is residualised the same way
+/// ([`crate::quasiimmut::sweep_quasi_immut_field`]). The installed check stays
 /// traced, so mutating a type no loop depends on still makes no call.
 ///
 /// # Safety
@@ -863,11 +830,11 @@ pub unsafe fn w_type_notify_quasi_immut_watchers(obj: PyObjectRef) {
     if obj.is_null() || !is_type(obj) {
         return;
     }
-    let w_type = &mut *(obj as *mut W_TypeObject);
-    if w_type.quasi_immut_watchers.is_null() {
+    let field = &(*(obj as *const W_TypeObject)).quasi_immut_watchers;
+    if !field.is_installed() {
         return;
     }
-    (*w_type.quasi_immut_watchers).invalidate();
+    crate::quasiimmut::sweep_quasi_immut_field(field);
 }
 
 /// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the
@@ -1010,6 +977,23 @@ pub unsafe fn w_type_set_qualname(obj: PyObjectRef, w_qualname: PyObjectRef) {
     *t.qualname = crate::w_str_get_wtf8(w_qualname).to_string();
     t.w_qualname = w_qualname;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// typeobject.py:1220-1230 `type_get_text_signature` backing field.
+pub unsafe fn w_type_get_text_signature(obj: PyObjectRef) -> Option<&'static str> {
+    let signature = (*(obj as *const W_TypeObject)).text_signature;
+    if signature.is_null() {
+        None
+    } else {
+        Some(&*signature)
+    }
+}
+
+/// Set the initialization-time TypeDef `_text_signature_` value.
+pub unsafe fn w_type_set_text_signature(obj: PyObjectRef, signature: &str) {
+    let type_obj = &mut *(obj as *mut W_TypeObject);
+    debug_assert!(type_obj.text_signature.is_null());
+    type_obj.text_signature = crate::lltype::malloc_raw(signature.to_owned());
 }
 
 /// Get the bases tuple.
@@ -1246,6 +1230,62 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
 
 // ── Subclass tree (typeobject.py:640-689) ────────────────────────────
 
+// `add_subclass` / `remove_subclass` / `get_subclasses` are indivisible under
+// PyPy's GIL: each one reallocates or reindexes the same out-of-line
+// `weak_subclasses` vector.  Pyre keeps the parent type as the sole semantic
+// owner and uses the same narrow address-striped reentrant synchronization
+// `w_list_lock` / `w_dict_lock` use around those transitions.  Reentrant
+// because `get_subclasses` can be reached from inside a mutation on the same
+// thread through the `mutated()` recursion.
+struct ForkSubclassesLock(std::cell::UnsafeCell<parking_lot::ReentrantMutex<()>>);
+unsafe impl Sync for ForkSubclassesLock {}
+
+impl ForkSubclassesLock {
+    fn new() -> Self {
+        Self(std::cell::UnsafeCell::new(
+            parking_lot::ReentrantMutex::new(()),
+        ))
+    }
+
+    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
+    }
+}
+
+static SUBCLASSES_LOCKS: std::sync::LazyLock<Vec<ForkSubclassesLock>> =
+    std::sync::LazyLock::new(|| (0..256).map(|_| ForkSubclassesLock::new()).collect());
+
+type SubclassesGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+/// Only the acquire is opaque to the tracer, the same split `w_list_lock` uses:
+/// the guard-holding bodies stay look-inside.
+#[majit_macros::dont_look_inside]
+unsafe fn w_type_subclasses_lock(w_parent: PyObjectRef) -> SubclassesGuard {
+    let lock = SUBCLASSES_LOCKS[(w_parent as usize >> 4) & (SUBCLASSES_LOCKS.len() - 1)].get();
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = majit_gc::gc_sync::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
+}
+
+pub fn subclasses_locks_after_fork_child() {
+    for lock in SUBCLASSES_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+}
+
 /// `typeobject.py:640-662 W_TypeObject.add_subclass`.
 ///
 /// Records `w_subclass` in `w_parent.weak_subclasses` if not
@@ -1267,10 +1307,11 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     if !is_type(w_parent) || !is_type(w_subclass) {
         return;
     }
+    // Serialize against a concurrent `remove_subclass` / `get_subclasses` /
+    // `add_subclass` on the same parent: the null-check-then-install below and
+    // the `push` reallocation both invalidate what another thread is indexing.
+    let _subclasses_guard = w_type_subclasses_lock(w_parent);
     let parent = &mut *(w_parent as *mut W_TypeObject);
-    // Builtin parents need the prebuilt root walk; this is harmless for a
-    // GC-managed heap parent.
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     if parent.weak_subclasses.is_null() {
         parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
     }
@@ -1287,11 +1328,34 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
         }
         if existing.is_null() {
             subs[i] = newref;
-            crate::gc_hook::try_gc_write_barrier(w_parent as *mut u8);
+            note_weak_subclass_store(w_parent);
             return;
         }
     }
     subs.push(newref);
+    note_weak_subclass_store(w_parent);
+}
+
+/// Record the store of a freshly allocated weakref into `weak_subclasses`.
+///
+/// The mark covers builtin parents, whose list is off-GC and reachable only
+/// through `walk_builtin_type_dicts_gc`; the write barrier covers GC-managed
+/// heap parents, whose list is forwarded by the `W_TYPE_GC_TYPE_ID` custom
+/// trace.
+///
+/// Order matters, and it is the safepoint that fixes it, not the allocation:
+/// host-side allocation cannot collect (`dynasm_alloc_nursery_typed` routes to
+/// `try_alloc_nursery_no_collect_typed` and spills to old-gen on nursery full),
+/// but `try_gc_write_barrier` reaches `gc_sync::gc_op`, which leaves RUNNING and
+/// parks on `gc_mutex` — an entry-style safepoint where another thread's
+/// stop-the-world collection runs.  The dirty bit is consumable
+/// (`gc_roots::clear_prebuilt_roots_dirty` after each walk), so marking on the
+/// far side of that safepoint would let a collection walk the prebuilt family
+/// with the slot already updated and the bit still clear, and nothing else roots
+/// the young weakref.  Mark first, then take the barrier.
+#[inline]
+unsafe fn note_weak_subclass_store(w_parent: PyObjectRef) {
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     crate::gc_hook::try_gc_write_barrier(w_parent as *mut u8);
 }
 
@@ -1310,6 +1374,7 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
     if !is_type(w_parent) {
         return;
     }
+    let _subclasses_guard = w_type_subclasses_lock(w_parent);
     let parent = &mut *(w_parent as *mut W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return;
@@ -1344,6 +1409,7 @@ pub unsafe fn w_type_get_subclasses(
     if w_parent.is_null() || !is_type(w_parent) {
         return Vec::new();
     }
+    let _subclasses_guard = w_type_subclasses_lock(w_parent);
     let parent = &*(w_parent as *const W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return Vec::new();
@@ -1468,57 +1534,48 @@ mod tests {
         );
     }
 
-    /// `quasiimmut.py:84-109 invalidate` flips every registered flag and empties
-    /// the list, and a flag whose loop is gone is simply skipped.
+    /// The `_version_tag?` wiring: publishing a new tag runs the invalidation
+    /// function (`quasiimmut.py:129-134 _invalidate_now`), so the loops that
+    /// baked the old tag are revoked and the field is left uninstalled.
+    /// `quasiimmut::tests` covers the field itself.
     #[test]
-    fn quasi_immut_invalidate_flips_live_flags_and_clears() {
+    fn version_tag_write_unlinks_the_instance_and_revokes_its_loops() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut qi = QuasiImmut::new();
-        let live = Arc::new(AtomicBool::new(false));
-        let dead = Arc::new(AtomicBool::new(false));
-        qi.register_loop_token(&live);
-        qi.register_loop_token(&dead);
-        drop(dead);
-
-        qi.invalidate();
-        assert!(live.load(Ordering::Acquire), "a live loop must be revoked");
+        let obj = w_type_new("Quasi", PY_NULL, std::ptr::null_mut());
+        let w_type = unsafe { &*(obj as *const W_TypeObject) };
         assert!(
-            qi.looptokens_wrefs.is_empty(),
-            "invalidate empties the list; a recompile registers again",
+            !w_type.quasi_immut_watchers.is_installed(),
+            "no instance until the first registration",
         );
 
-        // A second invalidate with nothing registered is a no-op, and the flag
-        // stays set — `GUARD_NOT_INVALIDATED` has no un-set edge.
-        qi.invalidate();
-        assert!(live.load(Ordering::Acquire));
+        let flag = Arc::new(AtomicBool::new(false));
+        unsafe { w_type_register_quasi_immut_watcher(obj, &flag) };
+        assert!(w_type.quasi_immut_watchers.is_installed());
+
+        unsafe { w_type_set_version_tag(obj, new_version_tag()) };
+        assert!(flag.load(Ordering::Acquire), "the loop must be revoked");
+        assert!(
+            !w_type.quasi_immut_watchers.is_installed(),
+            "the field is nulled before the sweep",
+        );
+
+        // A second bump with nothing registered must not double-free.
+        unsafe { w_type_set_version_tag(obj, new_version_tag()) };
     }
 
-    /// `quasiimmut.py:72-82` — a type recompiled many times and never mutated
-    /// must not grow an unbounded watcher list.
+    /// A non-type pointer must not be walked as one.
     #[test]
-    fn quasi_immut_register_compresses_dead_loop_tokens() {
+    fn quasi_immut_watcher_helpers_ignore_non_types() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
-        let mut qi = QuasiImmut::new();
-        assert_eq!(qi.compress_limit, 30, "quasiimmut.py:57 compress_limit");
-        for _ in 0..500 {
-            // Each "recompile" drops its artifact immediately, so every
-            // registered weak ref is already dead by the next round.
-            let flag = Arc::new(AtomicBool::new(false));
-            qi.register_loop_token(&flag);
+        let flag = Arc::new(AtomicBool::new(false));
+        unsafe {
+            w_type_register_quasi_immut_watcher(PY_NULL, &flag);
+            w_type_notify_quasi_immut_watchers(PY_NULL);
         }
-        assert!(
-            qi.looptokens_wrefs.len() <= qi.compress_limit + 1,
-            "compress must bound the list, got {} against limit {}",
-            qi.looptokens_wrefs.len(),
-            qi.compress_limit,
-        );
-        // With every entry dead the limit collapses back to the empty-list
-        // value rather than ratcheting upward.
-        assert_eq!(qi.compress_limit, 30);
     }
 
     #[test]
@@ -1561,5 +1618,53 @@ mod tests {
             assert!(!w_type_get_uses_object_getattribute(PY_NULL));
             assert!(!w_type_get_uses_object_setattr(PY_NULL));
         }
+    }
+
+    /// Concurrent class creation against one process-global builtin parent is
+    /// the shape the striped lock exists for: `add_subclass`'s `push`
+    /// reallocates and frees the buffer `get_subclasses` is indexing, and its
+    /// null-check-then-install lets two threads each install a `Box`.
+    ///
+    /// Without `w_type_subclasses_lock` this aborts inside the allocator —
+    /// `double free or corruption (fasttop)` on glibc, `STATUS_HEAP_CORRUPTION`
+    /// on Windows, SIGSEGV in `w_weakref_deref` on macOS. Delete the three
+    /// guards and re-run to confirm the gate still bites before trusting it.
+    #[test]
+    fn subclass_registry_survives_concurrent_mutation() {
+        let w_parent = w_type_new("SharedParent", PY_NULL, std::ptr::null_mut());
+        let parent_addr = w_parent as usize;
+
+        std::thread::scope(|scope| {
+            for t in 0..4 {
+                scope.spawn(move || {
+                    let w_parent = parent_addr as PyObjectRef;
+                    // Kept alive for the whole thread so `weak_subclasses`
+                    // holds live entries rather than immediately-dead refs.
+                    let children: Vec<PyObjectRef> = (0..16)
+                        .map(|i| {
+                            w_type_new(&format!("Child{t}_{i}"), PY_NULL, std::ptr::null_mut())
+                        })
+                        .collect();
+                    for _ in 0..500 {
+                        for &w_child in &children {
+                            unsafe { w_type_add_subclass(w_parent, w_child) };
+                        }
+                        // Reads and dereferences every entry in the vector the
+                        // other threads are reallocating — a stale buffer shows
+                        // up here as a garbage `*mut Weakref`. The contents are
+                        // racy by construction, so only the read is asserted on.
+                        let seen = unsafe { w_type_get_subclasses(w_parent, false) };
+                        assert!(seen.iter().all(|w| !w.is_null()));
+                        for &w_child in &children {
+                            unsafe { w_type_remove_subclass(w_parent, w_child) };
+                        }
+                    }
+                });
+            }
+        });
+
+        // Every thread removed everything it added, and no entry outlived it.
+        let leftover = unsafe { w_type_get_subclasses(w_parent, false) };
+        assert!(leftover.is_empty(), "{} entries leaked", leftover.len());
     }
 }

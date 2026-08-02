@@ -64,17 +64,29 @@ fn iobase_set_internal_closed(obj: PyObjectRef, closed: bool) -> Result<(), crat
     }
 }
 
+/// Reads the `io.UnsupportedOperation` type installed into
+/// `UNSUPPORTED_OPERATION_TYPE` at module init; null before then.  The value is
+/// not a build-time constant, so the JIT residualises the read instead of
+/// tracing into it (`@dont_look_inside`).
+#[majit_macros::dont_look_inside]
+pub(crate) fn unsupported_operation_type() -> PyObjectRef {
+    UNSUPPORTED_OPERATION_TYPE
+        .get()
+        .map_or(std::ptr::null_mut(), |&addr| addr as PyObjectRef)
+}
+
 /// `interp_iobase.py:unsupported` — construct the module-local
 /// `UnsupportedOperation`, preserving its OSError + ValueError MRO.
 pub(crate) fn unsupported(message: &str) -> crate::PyError {
-    let Some(&type_addr) = UNSUPPORTED_OPERATION_TYPE.get() else {
+    let w_type = unsupported_operation_type();
+    if w_type.is_null() {
         return crate::PyError::value_error(message);
-    };
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_str_new(message));
     match crate::call::call_function_impl_result(
-        type_addr as PyObjectRef,
+        w_type,
         &[pyre_object::gc_roots::shadow_stack_get(sp)],
     ) {
         Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
@@ -219,10 +231,9 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
 //
 // `rweaklist.py:52 store_handle` holds each stream through `weakref.ref`; the
 // `GcWeakrefBox` is pyre's rweakref, so the handle list is a `Vec` of boxes.
-// Those are immortal, so their addresses stay valid across collections, but
-// their inner rweakref is walked by the boxing thread alone
-// (`weakref.rs WEAKREF_BOXES`) — hence the list lives with them, per thread, and
-// shutdown flushes the streams of the thread it runs on.
+// A box is collector-managed and this list is its only referent, so the slots
+// are walked as roots ([`walk_autoflusher_roots_area`]) — hence the list lives
+// with the boxing thread, and shutdown flushes that thread's streams.
 
 /// `rweaklist.py:4 INITIAL_SIZE`.
 const AUTOFLUSHER_INITIAL_SIZE: usize = 4;
@@ -273,12 +284,51 @@ thread_local! {
         std::cell::RefCell::new(AutoFlusher::default());
 }
 
+pub fn capture_autoflusher_root_area() -> *const () {
+    AUTOFLUSHER.with(|flusher| flusher as *const _ as *const ())
+}
+
+/// Visit each stored `GcWeakrefBox` as a strong root.
+///
+/// The box is an ordinary collector-managed object and this list is the only
+/// place that holds it, so without this walk a collection would sweep it — or
+/// relocate it and leave the slot pointing at the old address — and
+/// [`flush_all_streams`] would dereference a dangling handle.  Keeping the box
+/// alive does not make the handle strong with respect to the stream: the box's
+/// inner rweakref is still cleared by the collector's
+/// `invalidate_young_weakrefs` / `invalidate_old_weakrefs` when the stream
+/// itself dies, which is what turns the slot into `rweaklist.py`'s `dead_ref`.
+///
+/// # Safety
+/// `data` must come from [`capture_autoflusher_root_area`], and the owning
+/// thread must be quiesced.
+pub unsafe fn walk_autoflusher_roots_area(
+    data: *const (),
+    mut visitor: impl FnMut(&mut PyObjectRef),
+) {
+    // Read through `as_ptr`: the walk runs at a safepoint the borrowing
+    // stream-construction path may already be inside.
+    let flusher = unsafe { &mut *(*(data as *const std::cell::RefCell<AutoFlusher>)).as_ptr() };
+    for slot in flusher.handles.iter_mut() {
+        if slot.is_null() {
+            continue;
+        }
+        visitor(slot);
+    }
+}
+
 /// `interp_iobase.py:447-453 AutoFlusher.add`, reached from
 /// `interp_iobase.py:61-62 W_IOBase.__init__` for every stream that does not
 /// opt out.
 ///
 /// Returns `w_iobase`, which the rweakref allocation may have relocated.
-fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
+///
+/// Reads and rewrites the runtime-mutable `AUTOFLUSHER` thread-local handle
+/// table, not a build-time constant, so the JIT residualises the call instead
+/// of tracing into it (`@dont_look_inside`, the `importing::sys_modules_dict`
+/// shape).
+#[majit_macros::dont_look_inside]
+pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
     if w_iobase.is_null() {
         return w_iobase;
     }
@@ -313,10 +363,25 @@ pub fn flush_all_streams() {
             // flushed twice.
             std::mem::take(&mut flusher.handles)
         });
+        // `initialize` has rebound the list the walker reads, so the detached
+        // boxes have no root left — in RPython the local `handles` list is
+        // itself traced.  A `flush` runs Python code, so a collection between
+        // two iterations would sweep the boxes this round has not reached yet.
+        // Pin them for the round and read each one back, the way
+        // `autoflusher_add` reads its pinned stream back.  The `dead_ref`
+        // placeholder slots carry nothing to keep alive.
+        let handles: Vec<PyObjectRef> =
+            handles.into_iter().filter(|slot| !slot.is_null()).collect();
+        let _handle_roots = pyre_object::gc_roots::push_roots();
+        let handles_root = pyre_object::gc_roots::shadow_stack_len();
+        for &handle in &handles {
+            pyre_object::gc_roots::pin_root(handle);
+        }
         let mut progress = false;
-        for handle in handles {
+        for index in 0..handles.len() {
             let _roots = pyre_object::gc_roots::push_roots();
             let stream_root = pyre_object::gc_roots::shadow_stack_len();
+            let handle = pyre_object::gc_roots::shadow_stack_get(handles_root + index);
             let stream = unsafe { pyre_object::weakref::w_gc_weakref_box_deref(handle) };
             if stream.is_null() {
                 continue;

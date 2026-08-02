@@ -101,6 +101,22 @@ pub(crate) extern "C" fn sqrt_nonneg_jit(x: f64) -> f64 {
     x.sqrt()
 }
 
+/// RPython `ll_math_{log,cos,sin}` fast-path calls after their exceptional
+/// branches have been pinned by the walker.  These are the raw libm calls the
+/// translated PyPy trace carries; boxing stays outside so optimizeopt can
+/// virtualize the resulting `W_FloatObject`.
+pub(crate) extern "C" fn math_log_positive_jit(x: f64) -> f64 {
+    x.ln()
+}
+
+pub(crate) extern "C" fn math_cos_finite_jit(x: f64) -> f64 {
+    x.cos()
+}
+
+pub(crate) extern "C" fn math_sin_finite_jit(x: f64) -> f64 {
+    x.sin()
+}
+
 pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
     match pyre_interpreter::float_pow_raw(x, y) {
         Ok(z) => z,
@@ -210,9 +226,8 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
             };
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,
-                Ok(_) => {
-                    PyError::type_error("exceptions must derive from BaseException").to_exc_object()
-                }
+                Ok(obj) => pyre_interpreter::error::exception_from_call_type_error(exc, obj)
+                    .to_exc_object(),
                 Err(mut err) => err.to_exc_object(),
             }
         } else {

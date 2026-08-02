@@ -419,7 +419,7 @@ impl Default for CalleeLocalsShadow {
 
 impl CalleeLocalsShadow {
     /// A `NONE` value clears the slot.
-    fn set_opref(&mut self, slot: i64, value: OpRef) {
+    pub(crate) fn set_opref(&mut self, slot: i64, value: OpRef) {
         if value.is_none() {
             self.opref.remove(&slot);
         } else {
@@ -1598,6 +1598,23 @@ pub enum DispatchError {
         len: usize,
         bank: &'static str,
     },
+    /// A register operand byte indexed a slot the walk never wrote.
+    /// `MIFrame.registers_*` start as `[None] * num_regs`
+    /// (`pyjitpl.py:190-197`) and a jitcode only names a register the
+    /// codewriter's liveness proves is assigned on every path reaching the
+    /// read, so upstream never observes the hole.  Pyre's codewriter can
+    /// still emit one — an exception edge whose merge block reads a
+    /// value-stack slot none of its predecessors renames into — and the
+    /// `OpRef::NONE` that read yields is not a box: recording it produces an
+    /// op argument no backend can bind (`regalloc.py:611-622` `env[box]`
+    /// KeyError; dynasm `RegisterManager.loc`, cranelift `resolve_opref`).
+    /// Decline the walk at the read instead of carrying the hole into the
+    /// trace.
+    RegisterReadUnbound {
+        pc: usize,
+        reg: usize,
+        bank: &'static str,
+    },
     /// A `d`-coded descr index resolved past the descr pool. Surfaces
     /// either an assembler-pass bug (descr index out of range) or a
     /// caller mismatch between the codewriter's descr table size and
@@ -1973,6 +1990,20 @@ pub enum DispatchError {
     /// through pyre's abort ceiling, so the permanent mapping records the
     /// structural nature of this abort without changing runtime behavior.
     BranchGuardUnrestorableKeptStackPermanent { pc: usize },
+    /// `pyjitpl.py:1112-1116 opimpl_jit_force_quasi_immutable`: the mutate
+    /// field was already non-null when the walk reached a write that bumps the
+    /// guarded version, so the tracer forced the invalidation itself and
+    /// abandons the attempt (`raise SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).
+    ///
+    /// Carried as a typed error rather than a `SwitchToBlackhole` OUTCOME so it
+    /// reaches the abort-pc flush leg: upstream's blackhole resumes at the
+    /// `-live-` in front of the write with every earlier residual already
+    /// applied, and pyre's only equivalent is committing the walk and resuming
+    /// the interpreter AT the enclosing Python opcode.  An `Ok` outcome falls
+    /// through to the plain `Abort`, whose journal rollback replays the walked
+    /// region from its start and re-executes every residual the walk already
+    /// ran (`pickle_terminal_raise_resume` is the corpus detector).
+    ForceQuasiImmutable { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
     /// `vable_*` op that found it to be a non-standard virtualizable,
@@ -2031,6 +2062,7 @@ impl DispatchError {
             Self::UndecodableOpcode { .. } => "UndecodableOpcode",
             Self::UnsupportedOpname { .. } => "UnsupportedOpname",
             Self::RegisterOutOfRange { .. } => "RegisterOutOfRange",
+            Self::RegisterReadUnbound { .. } => "RegisterReadUnbound",
             Self::DescrIndexOutOfRange { .. } => "DescrIndexOutOfRange",
             Self::ExpectedJitCodeDescr { .. } => "ExpectedJitCodeDescr",
             Self::SubJitCodeNotFound { .. } => "SubJitCodeNotFound",
@@ -2073,6 +2105,7 @@ impl DispatchError {
             Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
+            Self::ForceQuasiImmutable { .. } => "ForceQuasiImmutable",
             Self::NonStandardVableFinishPortalUnsupported { .. } => {
                 "NonStandardVableFinishPortalUnsupported"
             }
@@ -2090,6 +2123,68 @@ impl DispatchError {
             }
             Self::ExcEdgeNoInFrameCatch { .. } => "ExcEdgeNoInFrameCatch",
             Self::TraceTooLong { .. } => "TraceTooLong",
+        }
+    }
+
+    /// The jitcode coordinate the walk stopped at.  Every variant records the
+    /// `pc` of the instruction that could not be walked, and none of them ran
+    /// that instruction's arm, so this doubles as the resume coordinate a
+    /// blackhole conversion has to `setposition` to (`blackhole.py:1804`
+    /// `copy_data_from_miframe` reads each level's `frame.pc` the same way).
+    /// One arm per variant so a new variant fails to compile until it says
+    /// where it stopped.
+    pub(crate) fn stop_pc(&self) -> usize {
+        match self {
+            Self::UndecodableOpcode { pc, .. }
+            | Self::UnsupportedOpname { pc, .. }
+            | Self::RegisterOutOfRange { pc, .. }
+            | Self::RegisterReadUnbound { pc, .. }
+            | Self::DescrIndexOutOfRange { pc, .. }
+            | Self::ExpectedJitCodeDescr { pc, .. }
+            | Self::SubJitCodeNotFound { pc, .. }
+            | Self::InlineCallArityMismatch { pc, .. }
+            | Self::InlineCallIntArityMismatch { pc, .. }
+            | Self::InlineCallFloatArityMismatch { pc, .. }
+            | Self::UnexpectedVoidSubReturn { pc, .. }
+            | Self::UnexpectedNonVoidSubReturn { pc, .. }
+            | Self::ReraiseWithoutLastExcValue { pc, .. }
+            | Self::LastExcValueWithoutActiveException { pc, .. }
+            | Self::CatchExceptionWithActiveException { pc, .. }
+            | Self::ResidualCallDescrNotCallDescr { pc, .. }
+            | Self::ResidualCallArgUnbound { pc, .. }
+            | Self::ExpectedSwitchDescr { pc, .. }
+            | Self::SwitchValueNotConcrete { pc, .. }
+            | Self::GotoIfNotValueNotConcrete { pc, .. }
+            | Self::IntOvfOperandNotConcrete { pc, .. }
+            | Self::NotInTraceRequiresConcreteExecution { pc, .. }
+            | Self::JitForceVirtualRequiresConcreteResolver { pc, .. }
+            | Self::VableBoxNotSeeded { pc, .. }
+            | Self::VableArrayDescrMalformed { pc, .. }
+            | Self::VableArrayMissingVirtualizableInfo { pc, .. }
+            | Self::VableArrayIndexOutOfRange { pc, .. }
+            | Self::VableArrayIndexNotConcrete { pc, .. }
+            | Self::AbortMarkerReached { pc, .. }
+            | Self::ConcreteShadowAllocationFailed { pc, .. }
+            | Self::AbortPermanentMarkerReached { pc, .. }
+            | Self::MayForceNullRefArgUnsupported { pc, .. }
+            | Self::VableEscapedDuringResidualCall { pc, .. }
+            | Self::GuardSnapshotVableUntyped { pc, .. }
+            | Self::GuardResumeCoordinateUnavailable { pc, .. }
+            | Self::LastExceptionWithoutActiveException { pc, .. }
+            | Self::JitMergePointGreenKeyUnresolved { pc, .. }
+            | Self::LoopHeaderJdIndexUnresolved { pc, .. }
+            | Self::SubWalkClosedLoop { pc, .. }
+            | Self::BranchGuardKeptStackUnsupported { pc, .. }
+            | Self::ForceQuasiImmutable { pc, .. }
+            | Self::NonStandardVableFinishPortalUnsupported { pc, .. }
+            | Self::LoopBearingCalleeInlineUnsupported { pc, .. }
+            | Self::FieldDescrMissingParentDescr { pc, .. }
+            | Self::OrthodoxSubWalkTraceUnsupported { pc, .. }
+            | Self::UnfoldableListAppendResidualUnsupported { pc, .. }
+            | Self::BranchGuardUnrestorableKeptStackPermanent { pc, .. }
+            | Self::InplaceContainerMutationUnsupported { pc, .. }
+            | Self::ExcEdgeNoInFrameCatch { pc, .. }
+            | Self::TraceTooLong { pc, .. } => *pc,
         }
     }
 
@@ -2309,7 +2404,7 @@ pub fn walk<Sym: WalkSym>(
         //
         // `blackhole_if_trace_too_long` raises AFTER `run_one_step`, so the
         // forward image must carry `pc`, the already-advanced `next_pc`, rather
-        // than `opcode_position`.  `latch_trace_too_long_blackhole` copies the
+        // than `opcode_position`.  `latch_abort_blackhole` copies the
         // live MIFrame registers while this WalkContext still owns them; the
         // run-per-fn epilogue drives that image forward exactly like RPython's
         // `run_blackhole_interp_to_cancel_tracing`.
@@ -2331,7 +2426,7 @@ pub fn walk<Sym: WalkSym>(
             // replay would resume the caller without delivering the return or
             // raise that this step produced.
             let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
-            let blackhole_latched = snapshot_safe && latch_trace_too_long_blackhole(ctx, pc);
+            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc);
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
@@ -2517,6 +2612,32 @@ pub fn walk<Sym: WalkSym>(
 /// to its symbolic [`OpRef`]. RPython
 /// `pyjitpl.py:registers_r[code[pc+1]]` for an `r`-coded operand.
 fn read_ref_reg<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Result<OpRef, DispatchError> {
+    let reg = code[op.pc + 1 + operand_offset] as usize;
+    let value = read_ref_reg_raw(code, op, operand_offset, ctx)?;
+    // `[None] * num_regs` initial state (`pyjitpl.py:190-197`): a slot the
+    // walk never wrote holds no box, and `OpRef::NONE` is not one.  See
+    // [`DispatchError::RegisterReadUnbound`].
+    if value.is_none() {
+        return Err(DispatchError::RegisterReadUnbound {
+            pc: op.pc,
+            reg,
+            bank: "r",
+        });
+    }
+    Ok(value)
+}
+
+/// [`read_ref_reg`] without the unbound-slot check, for the handful of arms
+/// that give an unwritten slot their own, more specific decline — the
+/// `*_vable_*` family reads its object operand this way so an unseeded
+/// virtualizable register still surfaces [`DispatchError::VableBoxNotSeeded`]
+/// instead of the generic [`DispatchError::RegisterReadUnbound`].
+fn read_ref_reg_raw<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
@@ -5149,6 +5270,35 @@ thread_local! {
     static FBW_EXECUTED_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
+    /// `ABORT_FORCE_QUASIIMMUT` resume carrier: `(py_pc, operand-stack OpRef
+    /// mirror)` taken at the abort, for the flush leg that resumes the
+    /// interpreter at that opcode.
+    ///
+    /// The mirror is needed because the abort lands MID-EXPRESSION: the vable
+    /// shadow's stack region reads NULL outside a merge point, so the plain
+    /// flush declines on the first operand slot and the walk falls back to the
+    /// replay this leg exists to avoid.  Holds symbolic `OpRef`s only — the
+    /// concrete refs are resolved and rooted inside the flush.
+    static FBW_QMUT_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
+    /// opcode it is currently inside, as `(py_pc, odometer)`.
+    ///
+    /// A leg that resumes the interpreter at a Python opcode re-executes that
+    /// whole opcode — `flush_walk_end_state_to_frame` sets `last_instr = pc - 1`
+    /// — so it owes a proof that the opcode has applied nothing yet.  This is
+    /// that proof's sample point, and it must be the OPCODE boundary: a
+    /// per-`-live-` or per-jitcode-op sample would read zero for an opcode whose
+    /// earlier ops already ran effects.
+    ///
+    /// Recorded only on the top-level walk (`reconcile_vstack_at_boundary`, the
+    /// boundary detector).  A callee sub-walk's `py_pc` names a different code
+    /// object, so leaving the sample absent there makes the gate decline rather
+    /// than compare coordinates from two universes.
+    static FBW_OPCODE_ENTRY_EFFECTS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+
     /// Effect-count delta of the exact JitCode opcode that most recently
     /// returned `LoopBearingCalleeInlineUnsupported`.  The structural
     /// mid-body carrier accepts only a zero delta: pyre re-runs the enclosing
@@ -7126,26 +7276,40 @@ fn walker_guard_class<Sym: WalkSym>(
     Ok(())
 }
 
-/// Guard the fixed-layout instance representation, the receiver type's live
-/// version tag, and the exact map shape used by the mapdict attribute folds.
-/// `INSTANCE_TYPE` proves the receiver has `W_ObjectObject` fields; the
-/// promoted map identity pins its class and storage coordinates
-/// (mapdict.py).
+/// Guard the fixed-layout mapdict-carrier representation, the receiver type's
+/// live version tag, and the exact map shape used by the mapdict attribute
+/// folds.  The concrete layout vtable proves that the receiver has the shared
+/// `[PyObject | map | storage]` prefix (`W_ObjectObject`, or a native-layout
+/// carrier such as `W_Random`); the promoted map identity pins its class and
+/// storage coordinates (mapdict.py).
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     version_tag: u64,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
 ) -> Result<(), DispatchError> {
-    let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(instance_type_addr);
+    // `load/store_attr_*_fast_path` accepted this receiver only after
+    // `has_mapdict_storage` proved its prefix. Preserve the concrete layout
+    // tag here: claiming every carrier is `INSTANCE_TYPE` poisons the heap
+    // cache for native-layout subclasses and lets later folds use unrelated
+    // field descriptors on the same box.
+    //
+    // A cached class that DISAGREES with the layout tag is that poisoning,
+    // and gating on `is_class_known` alone would then skip the guard and let
+    // the storage coordinates below run against an unguarded layout. Compare
+    // the recorded class instead and guard whenever it is absent or differs;
+    // a contradictory pair is folded out by the optimizer's constant-class
+    // handling, which discards the trace rather than reading a wild slot.
+    let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
+    if ctx.trace_ctx.heap_cache().get_known_class(obj) != Some(layout_type_addr) {
+        let type_const = ctx.trace_ctx.const_int(layout_type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(obj, instance_type_addr);
+            .class_now_known(obj, layout_type_addr);
     }
 
     // The instance map pins the storage layout, but class mutation can change
@@ -7276,6 +7440,38 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
         crate::descr::type_version_tag_descr(),
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
+/// The `celldict.py:34 _immutable_fields_ = ["version?"]` twin of
+/// [`walker_pin_type_version_tag`]: pin the module namespace's strategy version
+/// so the folds that bake a slot's stored cell (or the absence of a name) are
+/// revoked by `mutated()` instead of re-reading the dict each iteration.
+///
+/// The marker attaches to the strategy box, not the dict object, because
+/// `version` lives on the strategy — `getdictvalue_no_unwrapping`
+/// (celldict.py:47-55) promotes `self` and then `self.version` for the same
+/// reason. One marker covers every fold against one namespace, since they all
+/// depend on that single field.
+///
+/// `Ok(false)` when the dict has no strategy box to pin, which declines the
+/// fold rather than baking a constant nothing watches.
+fn walker_pin_namespace_version<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    ns: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(ns) };
+    if strategy.is_null() {
+        return Ok(false);
+    }
+    let strategy_const = ctx.trace_ctx.const_ref(strategy as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        strategy_const,
+        crate::descr::module_dict_version_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    Ok(true)
 }
 
 fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(
@@ -7747,19 +7943,14 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
         return Ok(false);
     }
-    let ns_const = ctx.trace_ctx.const_ref(ns as i64);
-    let slot_const = ctx.trace_ctx.const_int(slot as i64);
-    crate::state::record_namespace_quasiimmut_field(
-        ctx.trace_ctx,
-        ns_const,
-        slot_const,
-        slot as u32,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
     // Bake the immovable cell as a `ConstPtr` (pypy `ConstPtr(cell)`).  The
-    // `QuasiimmutField(ns, slot)` guard above invalidates the loop on a
-    // rebind / strategy-version bump (`optimize_QUASIIMMUT_FIELD` watches the
-    // `(dict, slot)` pair, not the cell), and the caller's `can_move` check
+    // `QuasiimmutField(strategy, version)` guard above invalidates the loop on a
+    // rebind / strategy-version bump (`_setitem_str_cell_known` calls
+    // `mutated()` before every write that replaces the stored pointer), and the
+    // caller's `can_move` check
     // guarantees the address is stable — the optimizer already folds the
     // equivalent elidable `jit_namespace_cell_lookup` down to this same const
     // ptr.  A genuine constant (not the elidable call's `RefOp` result, which
@@ -7837,16 +8028,10 @@ fn emit_namespace_cell_store_fold<Sym: WalkSym>(
     stored: pyre_object::PyObjectRef,
     raw_int: OpRef,
     new_int: i64,
-) -> Result<(), DispatchError> {
-    let ns_const = ctx.trace_ctx.const_ref(ns as i64);
-    let slot_const = ctx.trace_ctx.const_int(slot as i64);
-    crate::state::record_namespace_quasiimmut_field(
-        ctx.trace_ctx,
-        ns_const,
-        slot_const,
-        slot as u32,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+) -> Result<bool, DispatchError> {
+    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
     // Bake the immovable cell as a `ConstPtr`, identical to the LOAD fold
     // (`emit_namespace_cell_fold`), so this `setfield_gc_i` and the LOAD's
     // `getfield_gc_i` canonicalise onto one trace-heapcache slot via
@@ -7907,7 +8092,7 @@ fn emit_namespace_cell_store_fold<Sym: WalkSym>(
     // exception clear exactly as [`emit_namespace_cell_fold`] does.
     ctx.last_exc_value = None;
     ctx.last_exc_value_concrete = ConcreteValue::Null;
-    Ok(())
+    Ok(true)
 }
 
 /// #67 shape fix: append virtualizable data boxes so the walker merge-point
@@ -10288,66 +10473,77 @@ fn handle<Sym: WalkSym>(
                     .bridge_info()
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(key);
+                // A close that did not compile is not retried on a later
+                // crossing of the same header: the attempt runs the optimizer
+                // over the whole trace-so-far, and the decline is deterministic,
+                // so an inner loop crossed N times would pay N optimizer passes
+                // over a growing trace (see
+                // `TraceCtx::declined_cross_loop_closes`).
+                let already_declined = ctx.trace_ctx.cross_loop_close_declined(key);
                 if !has_partial && has_targets {
-                    let outcome = match bridge_origin {
-                        // Guard-origin: existing bridge path.
-                        Some(_) => {
-                            driver
-                                .meta_interp_mut()
-                                .compile_trace(key, &live_args, bridge_origin)
-                        }
-                        // pyjitpl.py interp-origin: a
-                        // function-entry trace (ResumeFromInterpDescr)
-                        // closes as an entry bridge jumping into the
-                        // already-compiled hot loop (compile.py);
-                        // a trace rooted at a *loop header* falls back to
-                        // the plain bridge shape.
-                        None => match driver.compile_trace_entry_data() {
-                            Some((original_green_key, mut entry_meta)) => {
-                                // `compile_trace_entry_data` clones the active
-                                // trace metadata, whose `namespace_dependent` is
-                                // only finalized by `finish_trace_namespace_dependency`
-                                // after the walk returns. An entry bridge is
-                                // compiled mid-walk, before that finalize, so a
-                                // trace that has already read a module global
-                                // would otherwise install the bridge with a stale
-                                // `namespace_dependent = false` and let it be
-                                // re-entered after later namespace growth. Fold in
-                                // the live per-trace flag so the bridge keeps the
-                                // conservative namespace gate.
-                                entry_meta.namespace_dependent |= ctx.trace_ctx.reads_module_global;
-                                driver.meta_interp_mut().compile_trace_from_interp(
-                                    key,
-                                    &live_args,
-                                    original_green_key,
-                                    entry_meta,
-                                )
-                            }
-                            None => driver
-                                .meta_interp_mut()
-                                .compile_trace(key, &live_args, None),
-                        },
-                    };
-                    if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][walker-reached-loop-header] compile_trace success: \
-                                 key={} pc={} bridge={:?}",
-                                key, next_instr, bridge_origin
-                            );
-                        }
-                        // pyjitpl.py raise_if_successful() — the
-                        // successful compile_trace ends tracing; surface
-                        // the dedicated outcome so the driver maps it to
-                        // `TraceAction::CompileTrace` (no further compile
-                        // or abort on this session).
-                        driver.note_compile_trace_success();
-                        return Ok((
-                            DispatchOutcome::CompileTracePending {
-                                loop_header_pc: next_instr,
+                    if !already_declined {
+                        let outcome = match bridge_origin {
+                            // Guard-origin: existing bridge path.
+                            Some(_) => driver.meta_interp_mut().compile_trace(
+                                key,
+                                &live_args,
+                                bridge_origin,
+                            ),
+                            // pyjitpl.py interp-origin: a
+                            // function-entry trace (ResumeFromInterpDescr)
+                            // closes as an entry bridge jumping into the
+                            // already-compiled hot loop (compile.py);
+                            // a trace rooted at a *loop header* falls back to
+                            // the plain bridge shape.
+                            None => match driver.compile_trace_entry_data() {
+                                Some((original_green_key, mut entry_meta)) => {
+                                    // `compile_trace_entry_data` clones the active
+                                    // trace metadata, whose `namespace_dependent` is
+                                    // only finalized by `finish_trace_namespace_dependency`
+                                    // after the walk returns. An entry bridge is
+                                    // compiled mid-walk, before that finalize, so a
+                                    // trace that has already read a module global
+                                    // would otherwise install the bridge with a stale
+                                    // `namespace_dependent = false` and let it be
+                                    // re-entered after later namespace growth. Fold in
+                                    // the live per-trace flag so the bridge keeps the
+                                    // conservative namespace gate.
+                                    entry_meta.namespace_dependent |=
+                                        ctx.trace_ctx.reads_module_global;
+                                    driver.meta_interp_mut().compile_trace_from_interp(
+                                        key,
+                                        &live_args,
+                                        original_green_key,
+                                        entry_meta,
+                                    )
+                                }
+                                None => driver
+                                    .meta_interp_mut()
+                                    .compile_trace(key, &live_args, None),
                             },
-                            op.next_pc,
-                        ));
+                        };
+                        if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                            if majit_metainterp::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit][walker-reached-loop-header] compile_trace success: \
+                                 key={} pc={} bridge={:?}",
+                                    key, next_instr, bridge_origin
+                                );
+                            }
+                            // pyjitpl.py raise_if_successful() — the
+                            // successful compile_trace ends tracing; surface
+                            // the dedicated outcome so the driver maps it to
+                            // `TraceAction::CompileTrace` (no further compile
+                            // or abort on this session).
+                            driver.note_compile_trace_success();
+                            return Ok((
+                                DispatchOutcome::CompileTracePending {
+                                    loop_header_pc: next_instr,
+                                },
+                                op.next_pc,
+                            ));
+                        }
+                        ctx.trace_ctx.note_cross_loop_close_declined(key);
                     }
                     // The jump did not take (`compile.compile_trace` returns
                     // None when none of the existing loop tokens match). Fall

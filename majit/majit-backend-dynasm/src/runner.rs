@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
+// `gc_sync` hands out the concrete collector; the trait must be in scope for
+// its methods to resolve on that type.
+use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
@@ -125,7 +128,9 @@ pub(crate) fn with_dynasm_active_gc<R>(f: impl Fn(&dyn majit_gc::GcAllocator) ->
         return Some(r);
     }
     if majit_gc::gc_sync::is_initialized() {
-        return Some(majit_gc::gc_sync::gc_query_reentrant(f));
+        // The singleton is the concrete collector; the box path above is what
+        // keeps this forwarder's argument a trait object.
+        return Some(majit_gc::gc_sync::gc_query_reentrant(|gc| f(gc)));
     }
     None
 }
@@ -170,7 +175,7 @@ pub(crate) fn with_dynasm_active_gc_mut<R>(
         });
     }
     if majit_gc::gc_sync::is_initialized() {
-        return Some(majit_gc::gc_sync::gc_op(f));
+        return Some(majit_gc::gc_sync::gc_op(|gc| f(gc)));
     }
     None
 }
@@ -221,6 +226,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+    majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
     majit_gc::set_active_finalizer_hooks(
         Some(dynasm_register_finalizer),
         Some(dynasm_finalizer_next_dead),
@@ -619,6 +625,10 @@ fn debug_validate_oldgen_freeblocks(site: std::fmt::Arguments<'_>) {
 }
 
 pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usize) {
+    // The call itself is only emitted under `PYRE_TRACE_CALL_DIAG`, which is
+    // what selects the failure-frame report below. The freelist walk is the
+    // only half `PYRE_GC_FREELIST_DIAG` owns, and it gates itself — so no
+    // early return here, or enabling one diagnostic would need the other.
     if site >= 1_000_000 {
         let top = majit_gc::shadow_stack::jf_top_ptr().0;
         eprintln!(
@@ -657,7 +667,9 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
     {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.get_referents(obj, &mut visit));
+    // See `MajitGc::get_referents`: the fallback can park, so the argument is
+    // published and reloaded rather than passed as the raw local.
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_referents(obj, &mut visit));
 }
 
 fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
@@ -666,7 +678,7 @@ fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
     {
         return tracked;
     }
-    majit_gc::gc_sync::gc_op(|g| g.is_tracked(obj))
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.is_tracked(obj))
 }
 
 /// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float
@@ -761,6 +773,20 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
         return;
     }
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier(obj));
+}
+
+fn dynasm_gc_write_barrier_managed(obj: GcRef) {
+    if DYNASM_ACTIVE_GC
+        .with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.write_barrier_managed(obj))
+        })
+        .is_some()
+    {
+        return;
+    }
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier_managed(obj));
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {
@@ -2503,7 +2529,11 @@ impl Backend for DynasmBackend {
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
             .collect();
-        if crate::majit_log_enabled() && trace_id == 2 {
+        let trace_ops_diag = std::env::var("PYRE_TRACE_OPS_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(trace_id);
+        if trace_ops_diag {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
@@ -2800,12 +2830,14 @@ impl Backend for DynasmBackend {
             }
         }
 
-        // llmodel.py:323: ll_frame = func(ll_frame). The compiled
+        // llmodel.py:276-285 `make_execute_token` fixes the entry signature as
+        // `(jitframe, threadlocal_addr) -> jitframe`, and `:317-323` reads the
+        // address with `llop.threadlocalref_addr` before the call. The compiled
         // prologue (gen_shadowstack_header) / epilogue
         // (gen_footer_shadowstack) push/pop the jf_ptr onto the shadow
         // stack inline, matching aarch64/assembler.py:1422/1438 — no
         // manual push_jf/pop_jf_to around the call.
-        let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
+        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         if crate::dynasm_exec_diag_enabled() {
             eprintln!(
@@ -2816,7 +2848,7 @@ impl Backend for DynasmBackend {
             );
         }
         debug_validate_oldgen_freeblocks(format_args!("before trace {}", compiled.trace_id));
-        let result_jf = unsafe { func(jf_ptr) };
+        let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
         debug_validate_oldgen_freeblocks(format_args!("after trace {}", compiled.trace_id));
 
         if crate::majit_log_enabled() {
@@ -2938,9 +2970,9 @@ impl Backend for DynasmBackend {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
         }
 
-        let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
+        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
-        let result_jf = unsafe { func(jf_ptr) };
+        let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);

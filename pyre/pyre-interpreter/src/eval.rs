@@ -127,6 +127,18 @@ fn push_current_frame_previous_root(
     }
 }
 
+/// Flat TLS read of the per-thread `CURRENT_FRAME` slot — the frame a builtin
+/// was called from, since a builtin call creates no Python frame of its own.
+/// Null when no frame is installed.
+///
+/// The slot is runtime-mutable, not a build-time constant, so the JIT
+/// residualises the read instead of tracing into it (`@dont_look_inside`, the
+/// [`get_current_exception`] shape).
+#[majit_macros::dont_look_inside]
+pub fn current_frame() -> *mut PyFrame {
+    CURRENT_FRAME.with(|current| current.get())
+}
+
 pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     let previous = CURRENT_FRAME.with(|current| {
         let previous = current.get();
@@ -291,6 +303,10 @@ pub unsafe fn walk_raw_code_roots(
             visited.push(identity);
             let code = &mut *(value as *mut crate::pycode::PyCode);
             visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
+            // The realized `co_qualname` is an ordinary movable string object
+            // shared by every function built from this code; the wrapper is
+            // Box-immortal, so only this raw-root walker forwards it.
+            visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
             if !code.co_consts_w.is_null() {
                 for slot in (&*code.co_consts_w).iter() {
                     let mut child = slot.load(std::sync::atomic::Ordering::Acquire);
@@ -1207,6 +1223,20 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         };
         crate::module::_pickle::walk_pickle_state_gc(&mut fwd);
     }
+    // `space.fromcache(MethodCache)` is a live interpreter-global GC root,
+    // not a write-once prebuilt object, and one cache serves every mutator.
+    // A cached young function may survive one minor collection and move again
+    // at the next; a single dirty bit cannot model minimark's remembered-set
+    // lifetime. Forward every cache slot on every collection, as RPython's
+    // traced MethodCache object does.
+    unsafe {
+        let mut forward_cache = |slot: &mut PyObjectRef| {
+            visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+            walk_raw_function_roots(*slot, visitor);
+            walk_raw_getset_roots(*slot, visitor);
+        };
+        crate::baseobjspace::walk_method_cache_gc(&mut forward_cache);
+    }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
@@ -1226,10 +1256,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             walk_raw_getset_roots(*slot, visitor);
         };
         walk_builtin_type_dicts_gc(&mut forward);
-        // `space.fromcache(MethodCache)` is owned by the shared object space,
-        // not by an execution context. Trace its cached `(w_class, w_value)`
-        // slots once through the interpreter-global root walker.
-        crate::baseobjspace::walk_method_cache_gc(&mut forward);
         // interp_codecs.CodecState is `space.fromcache(CodecState)` in PyPy:
         // one process/interpreter-owned registry, not one copy per mutator.
         crate::module::_codecs::walk_codec_state_gc(&mut forward);
@@ -1382,6 +1408,27 @@ pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
         }
     }
     value
+}
+
+/// `pyopcode.py:764-766` — `raise Class` instantiates the class, and
+/// `normalize_exception` then validates the result.  `space.call_function`
+/// propagates the constructor's own error in RPython; pyre's returns
+/// `PY_NULL` with the error parked in the pending-call slot, so an unchecked
+/// null would both lose that error and report the raise as
+/// "exceptions must derive from BaseException".
+///
+/// # Safety
+/// `w_type` must be a live exception class (`exception_is_valid_obj_as_class_w`).
+unsafe fn instantiate_raised_class(w_type: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let result = unsafe { crate::call_function(w_type, &[]) };
+    if result.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| PyError::type_error("exceptions must derive from BaseException")));
+    }
+    if !unsafe { pyre_object::is_exception(result) } {
+        return Err(crate::error::exception_from_call_type_error(w_type, result));
+    }
+    Ok(result)
 }
 
 /// Normalize the `from` cause of a `raise X from Y` statement: instantiate
@@ -1824,6 +1871,11 @@ pub(crate) fn eval_frame_plain_with_resume(
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> PyResult {
+    // Spend one unit of the recursion budget on this frame's activation and
+    // give it back when it returns.  Every Python frame costs the same unit —
+    // module body, called function, `exec`ed code, resumed generator — so the
+    // depth `stack_check()` reads is the number of live Python frames.
+    let _recursion_depth = crate::call::enter_recursive_frame(frame);
     frame.fix_array_ptrs();
     if frame.execution_context.is_null() {
         match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {
@@ -2151,19 +2203,24 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        let w_type = crate::typedef::r#type(obj).ok_or_else(|| {
-            PyError::type_error(format!(
-                "'{}' object does not support the context manager protocol",
-                crate::baseobjspace::object_functionstr_type_name(obj)
-            ))
-        })?;
-        let descr = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) }
-            .ok_or_else(|| {
-                PyError::type_error(format!(
+        let w_type = match crate::typedef::r#type(obj) {
+            Some(t) => t,
+            None => {
+                return Err(PyError::type_error(format!(
                     "'{}' object does not support the context manager protocol",
                     crate::baseobjspace::object_functionstr_type_name(obj)
-                ))
-            })?;
+                )));
+            }
+        };
+        let descr = match unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) } {
+            Some(d) => d,
+            None => {
+                return Err(PyError::type_error(format!(
+                    "'{}' object does not support the context manager protocol",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                )));
+            }
+        };
         Ok(unsafe { crate::baseobjspace::get(descr, obj, w_type.as_ptr()) }?.unwrap_or(descr))
     }
 
@@ -3405,15 +3462,9 @@ impl OpcodeStepExecutor for PyFrame {
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
                         // pyopcode.py:711-713 — class raise: call the type.
-                        let result = crate::call_function(w_value, &[]);
-                        if pyre_object::is_exception(result) {
-                            attach_raise_cause(result, None)?;
-                            Err(PyError::from_exc_object(result))
-                        } else {
-                            Err(PyError::type_error(
-                                "exceptions must derive from BaseException",
-                            ))
-                        }
+                        let result = instantiate_raised_class(w_value)?;
+                        attach_raise_cause(result, None)?;
+                        Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {
                         attach_raise_cause(w_value, None)?;
                         Err(PyError::from_exc_object(w_value))
@@ -3445,15 +3496,9 @@ impl OpcodeStepExecutor for PyFrame {
                             pyre_object::gc_roots::pin_root(c);
                         }
                         // pyopcode.py:711-713 — class raise: call the type.
-                        let result = crate::call_function(w_value, &[]);
-                        if pyre_object::is_exception(result) {
-                            attach_raise_cause(result, cause)?;
-                            Err(PyError::from_exc_object(result))
-                        } else {
-                            Err(PyError::type_error(
-                                "exceptions must derive from BaseException",
-                            ))
-                        }
+                        let result = instantiate_raised_class(w_value)?;
+                        attach_raise_cause(result, cause)?;
+                        Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {
                         attach_raise_cause(w_value, cause)?;
                         Err(PyError::from_exc_object(w_value))

@@ -4336,11 +4336,10 @@ fn register_helper_fn_pointers(
 /// produces one SSA-driven alive set as the sole authority, and
 /// `assembler.py:150-152` only splits that set by kind.
 ///
-/// Note: `live_r` carries an extra LV∩SSA
-/// `retain` step on top of the SSA bank — see the inline comment
-/// in the loop body below.  Removing it requires extending the
-/// encoder + symbolic-state pair to track scratch Ref colors,
-/// matching `pyjitpl.py:218-225` line by line.
+/// `live_r` is the SSA bank plus the frame-live colors backward
+/// liveness cannot reach — the portal reds and the FOR_ITER
+/// loop-carried operands — see the inline comments in the loop
+/// body below.
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
 /// `LiveVars` analysis. The direct-dispatch walker emits one
@@ -4541,15 +4540,20 @@ fn filter_liveness_in_place(
                 }
             }
 
-            // Note: LV∩SSA retain narrows the Ref bank to post-rename
-            // colors that correspond to LV-live Python locals or live
-            // stack slots at this PC.  Scratch registers (temporaries
-            // SSA-live but with no Python-frame slot) remain
-            // `OpRef::NONE` in `registers_r` because no trace-time
-            // writer populates them.  Removing this retain requires
-            // either (a) populating scratch colors during tracing
-            // (graph regalloc) or (b) the encoder tolerating
-            // NONE for non-frame live registers.
+            // `pc_live_r` ships whole.  `liveness.py:5-12` expands a
+            // `-live-` marker's args to "all values that are alive at this
+            // point (written to before, and read afterwards)" — the SSA-live
+            // set, under no frame-slot condition.  Narrowing it to
+            // frame-backed colors drops a temporary that is SSA-live across
+            // the marker but whose value sits in no frame slot at that PC
+            // (`r = frame[12]` read before a guard and consumed after it,
+            // while slot 12 is itself dead at the guard): the guard's resume
+            // data then names no box for that color and a bridge resuming
+            // there reads it unbound.
+            //
+            // `lv_live` below is the converse set — colors that are
+            // frame-live but SSA-DEAD, which backward liveness cannot
+            // supply.  It feeds the portal reds and the FOR_ITER re-add.
             let lv_live: std::collections::BTreeSet<u16> = {
                 // #348 Part (2): the per-PC map's entries at this PC are the
                 // live frame colors — each slot's TRUE per-program-point SSA
@@ -4571,9 +4575,8 @@ fn filter_liveness_in_place(
                 // RPython force-alive mechanism (`liveness.py:11-12`):
                 // `emit_live_placeholder!` emits every PC's `-live-` op
                 // with explicit Register args for `portal_frame_reg` /
-                // `portal_ec_reg`.  Gate the portal colors past the
-                // LV∩SSA retain so the retain does not drop the
-                // RPython-tracked live registers.  Portal-bridge
+                // `portal_ec_reg`.  Carry the portal colors in `lv_live`
+                // so the re-add paths below name them.  Portal-bridge
                 // installs sentinel-skip (`u16::MAX`).
                 if portal_frame_reg != u16::MAX {
                     s.insert(portal_frame_reg);
@@ -4583,9 +4586,8 @@ fn filter_liveness_in_place(
                 }
                 s
             };
-            pc_live_r.retain(|idx| lv_live.contains(idx));
-            // Re-add the per-PC frame-live colors the SSA-backward retain
-            // dropped — FOR_ITER body PCs only.  A loop-carried operand-
+            // Re-add the per-PC frame-live colors backward liveness
+            // omitted — FOR_ITER body PCs only.  A loop-carried operand-
             // stack value (the iterator) is frame-live at a body PC but
             // SSA-backward-DEAD there, so `pc_live_r` omits it and the
             // guard snapshot leaves the slot `OpRef::NONE`.  Re-adding
@@ -4602,12 +4604,10 @@ fn filter_liveness_in_place(
             }
 
             // Restore the portal red args (`interp_jit.py:67 reds =
-            // ['frame', 'ec']`) on the splice path.  The retain above only
-            // KEEPS a color present in `pc_live_r`; it cannot re-add a color
-            // the marker dropped.  The walker's explicit per-PC `-live-`
-            // markers always carry `portal_frame_reg` / `portal_ec_reg`
-            // (RPython force-alive, `liveness.py:11-12`), so `pc_live_r`
-            // holds them and the retain keeps them.  The canonical
+            // ['frame', 'ec']`) on the splice path.  The walker's explicit
+            // per-PC `-live-` markers always carry `portal_frame_reg` /
+            // `portal_ec_reg` (RPython force-alive, `liveness.py:11-12`), so
+            // `pc_live_r` already holds them.  The canonical
             // `flatten_graph` stream's markers are filled by backward
             // `compute_liveness`, which drops a portal red never read in the
             // body (a leaf function's `ec`), leaving `pc_live_r` short.  The
@@ -5353,6 +5353,21 @@ impl CodeWriter {
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
     pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> Option<PyJitCode> {
+        // Label-space ceiling.  The pre-passes below claim one label per
+        // instruction index (`flatten.py`'s "pre-create labels for each
+        // block") plus one exception-landing label per covered pc, and a
+        // label id is a `u16` because the assembled jump target is a two-byte
+        // operand (`assembler.py:255 assert 0 <= target <= 0xFFFF`).  Upstream
+        // can assert on that ceiling: its jitcodes come from RPython
+        // functions, so a violation is a translation-time bug.  Pyre compiles
+        // arbitrary user bytecode, so the same ceiling has to DECLINE at
+        // runtime and leave the function to the interpreter — the treatment
+        // `JitCodeBuilder::try_finish` already gives the register-count and
+        // code-length ceilings.  Without this a large enough function aborted
+        // the process on `new_label`'s overflow before reaching either.
+        if code.instructions.len().saturating_mul(2) > u16::MAX as usize {
+            return None;
+        }
         // Recover the live globals-stamped PyCode wrapper for `code` from the
         // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
         // per-code wrapper that every compiled code has stamped (during the
@@ -8731,6 +8746,14 @@ impl CodeWriter {
                             // rebindable one.  Classes / modules are created at
                             // module load and are neither grown nor rebound, so
                             // const-folding them stays safe.
+                            //
+                            // Widening the register form to every jitcode costs
+                            // a `ForceToken` / `GuardNotForced` /
+                            // `GuardNoException` per global in a non-portal
+                            // body.  On `bench/synth/
+                            // exception_reraise_tb_depth_hot` that turns five
+                            // const-folded loads into five residual calls and
+                            // takes `guard_failures` from 1803 to 63769.
                             let result_value: super::flow::FlowValue = if is_true_portal {
                                 let ns_var = emit_graph_op_with_result(
                                     &mut graph,
@@ -9120,7 +9143,23 @@ impl CodeWriter {
                                 items,
                                 py_pc as i64,
                             );
-                            push_and_bump!(result_value.into(), py_pc);
+                            // Physically write the list into its value-stack slot
+                            // (`pyframe.py:389 pushvalue` → `setarrayitem_vable_r`
+                            // via `jtransform.py:1898 do_fixed_list_setitem`), not
+                            // just bump the symbolic depth.  `LIST_APPEND` reads
+                            // its accumulator back through `getarrayitem_vable_r`
+                            // (see below), and the blackhole runs
+                            // BUILD_LIST→LIST_APPEND from the jitcode on a
+                            // mid-frame resume, so the slot must be populated by
+                            // the emitted op rather than relying on a prior
+                            // interpreter write — the same pairing GET_ITER makes
+                            // for FOR_ITER's iterator reload.  A list display
+                            // longer than 30 elements compiles to `BUILD_LIST 0` +
+                            // repeated `LIST_APPEND`, so without this the append
+                            // receiver is whatever the slot last held.
+                            let pushed: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(pushed.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
                         }
 
                         // pyopcode.py:1463 BUILD_SLICE:
@@ -9657,20 +9696,24 @@ impl CodeWriter {
                             // has a proper terminator (mirrors
                             // `flatten.py:189 make_exception_link`
                             // exception-edge shape).
-                            let symbolic_exc = current_state.stack.last().cloned();
-                            let exc_value = if matches!(
-                                symbolic_exc,
-                                Some(super::flow::FlowValue::Constant(ref constant))
-                                    if constant.value == super::flow::ConstantValue::None
-                            ) {
-                                // Handler entry can carry a null symbolic
-                                // placeholder while exception dispatch has
-                                // already installed the value in the semantic
-                                // frame slot. Read it before popvalue clears it.
-                                let exc_depth = current_depth.saturating_sub(1);
-                                let exc_slot = stack_base_absolute + exc_depth as usize;
-                                let exc_slot_value: super::flow::FlowValue =
-                                    super::flow::Constant::signed(exc_slot as i64).into();
+                            // pyframe.py:411-417 `popvalue_maybe_none` first
+                            // reads `locals_cells_stack_w[depth - 1]`, then
+                            // clears that exact slot.  Read the authoritative
+                            // vable slot here before `emit_popvalue_ref!`
+                            // records the clear, rather than reusing the
+                            // handler-entry shadow Variable.  In a
+                            // `COPY 3; POP_EXCEPT; RERAISE 1` cleanup the
+                            // shadow exception and boxed lasti can otherwise
+                            // coalesce to one colour; the raise edge then
+                            // receives the lasti integer even though the live
+                            // frame TOS still contains the exception.  PyPy's
+                            // direct `self.popvalue()` load makes that collapse
+                            // impossible.
+                            let exc_depth = current_depth.saturating_sub(1);
+                            let exc_slot = stack_base_absolute + exc_depth as usize;
+                            let exc_slot_value: super::flow::FlowValue =
+                                super::flow::Constant::signed(exc_slot as i64).into();
+                            let exc_value =
                                 super::flow::FlowValue::from(emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -9681,10 +9724,7 @@ impl CodeWriter {
                                     ),
                                     Kind::Ref,
                                     py_pc as i64,
-                                ))
-                            } else {
-                                symbolic_exc.unwrap_or_else(|| fresh_ref_value(&mut graph))
-                            };
+                                ));
                             let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
                             // RERAISE: pyre-only deviation from RPython
@@ -15722,8 +15762,14 @@ mod tests {
         assert_eq!(state.variable_slot(&v_absent), None);
     }
 
+    /// `liveness.py:5-12` expands a `-live-` marker to "all values that are
+    /// alive at this point", under no frame-slot condition: a Ref color that
+    /// is SSA-live across the marker but names no frame slot at that PC stays
+    /// in the bank.  Narrowing it to frame-backed colors leaves the guard's
+    /// resume data naming no box for that color, and a bridge resuming there
+    /// reads the register unbound.
     #[test]
-    fn filter_liveness_drops_non_lv_live_colors_from_live_r() {
+    fn filter_liveness_keeps_ssa_live_ref_color_with_no_frame_slot() {
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
         let reachable_pc = (0..code.instructions.len())
@@ -15745,8 +15791,8 @@ mod tests {
             ]));
         }
 
-        // Drive `lv_live` via the per-PC map: color 0 (the live local `x`) maps
-        // to slot 0, so the LV∩SSA retain keeps color 0 and drops color 7.
+        // Per-PC map: color 0 (the live local `x`) maps to slot 0; color 7
+        // maps to nothing, so it stands in for an SSA-live scratch temp.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
             vec![vec![(1, 0, 0)]; code.instructions.len()];
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
@@ -15772,9 +15818,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            !refs.contains(&7),
-            "scratch-stand-in color 7 must be dropped by LV∩SSA retain",
+        assert_eq!(
+            refs,
+            std::collections::BTreeSet::from([0, 7]),
+            "the Ref bank must keep every SSA-live color, frame-backed or not",
         );
         let ints: std::collections::BTreeSet<u16> = live_args
             .iter()
@@ -15792,7 +15839,7 @@ mod tests {
 
     #[test]
     fn filter_liveness_clears_int_float_banks_under_splice() {
-        // Mirror of `filter_liveness_drops_non_lv_live_colors_from_live_r`
+        // Mirror of `filter_liveness_keeps_ssa_live_ref_color_with_no_frame_slot`
         // but with `clear_unboxed_banks = true` (the splice path).  Under
         // the splice, the canonical jitcode-level stream surfaces unboxed
         // int/float temporaries the interpreter-frame resume cannot supply;

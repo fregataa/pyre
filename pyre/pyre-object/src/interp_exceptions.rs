@@ -59,6 +59,9 @@ pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType =
 pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
 pub static EXC_MEMORY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("MemoryError");
 pub static EXC_SYSTEM_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SystemError");
+/// PyPy `W_EOFError`, a direct `Exception` subclass used by stream readers
+/// such as pickle and marshal.
+pub static EXC_EOF_ERROR_TYPE: PyType = crate::pyobject::new_pytype("EOFError");
 /// `BufferError` — raised when an operation cannot proceed because a
 /// buffer is exported (e.g. resizing a bytearray that backs a live
 /// memoryview).  Direct subclass of Exception.
@@ -111,6 +114,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::SystemExit => &EXC_SYSTEM_EXIT_TYPE,
         ExcKind::MemoryError => &EXC_MEMORY_ERROR_TYPE,
         ExcKind::SystemError => &EXC_SYSTEM_ERROR_TYPE,
+        ExcKind::EOFError => &EXC_EOF_ERROR_TYPE,
         ExcKind::BufferError => &EXC_BUFFER_ERROR_TYPE,
         ExcKind::LookupError => &EXC_LOOKUP_ERROR_TYPE,
         ExcKind::UnicodeError => &EXC_UNICODE_ERROR_TYPE,
@@ -219,6 +223,9 @@ pub enum ExcKind {
     /// Signals exhaustion of an asynchronous iterator.  Appended so the
     /// existing discriminants embedded by the JIT remain stable.
     StopAsyncIteration = 33,
+    /// Direct Exception subclass raised when a stream ends before an object.
+    /// Appended so existing JIT-baked discriminants remain stable.
+    EOFError = 34,
 }
 
 impl ExcKind {
@@ -643,7 +650,7 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::StopAsyncIteration as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::EOFError as u8 as usize) + 1;
 
 static EXC_CLASS_BY_KIND: [std::sync::atomic::AtomicUsize; EXC_KIND_COUNT] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; EXC_KIND_COUNT];
@@ -1409,25 +1416,34 @@ pub unsafe fn w_exception_kind_byte(obj: PyObjectRef) -> u8 {
 /// the class check in front of the tag read: `is_exception` is the
 /// `ll_isinstance` port.
 ///
-/// The tag byte is range-checked *before* the class check because it is the
-/// cheaper load — one dereference of `obj` rather than a dereference of the
-/// `ob_type` loaded out of it — and it is the exact byte the jump table
-/// would index.
+/// The class check runs *before* the tag range check. `kind` is a tail field
+/// past `ob_header`, so reading it out of a value that is not an exception can
+/// read past the object — `W_NoneObject` is a bare header and ends exactly
+/// where `kind` starts. `ob_type` sits at offset 0, so the class check needs
+/// only the header to be readable, and once `is_exception` holds the object is
+/// a `W_BaseException` and the tag load is in bounds. The range check stays
+/// after it because the class check does not prove the byte is a live
+/// discriminant, and that byte is what indexes the jump table.
+///
+/// The screens stop at the shape of `ob_type`: they do not prove it addresses
+/// a live type. `is_exception` reads the subclass range through it, so an
+/// aligned non-null word that is not a type header still faults. Proving it
+/// would need a heap-membership test, and the only one available (`is_tracked`)
+/// runs as a `gc_op` — it leaves RUNNING and can park the mutator, which is not
+/// something a classification on the blackhole resume path may do. The caller's
+/// contract carries that obligation instead.
 ///
 /// # Safety
-/// `obj` must be null or point to at least `size_of::<W_BaseException>()`
-/// readable bytes.
+/// `obj` must be null or point to at least `size_of::<PyObject>()` readable
+/// bytes, and its `ob_type` must be null or address a readable type header.
 #[inline]
 pub unsafe fn w_exception_kind_checked(obj: PyObjectRef) -> Option<ExcKind> {
-    // Every screen below precedes the dereference it protects, cheapest
-    // first, so that a value which is not an object at all is rejected rather
-    // than faulting: alignment before the tag load, the tag range before the
-    // `ob_type` load, and `ob_type`'s own shape before `ll_issubclass` reads
-    // the subclass range through it.
+    // Every screen below precedes the dereference it protects, so that a value
+    // which is not an object at all is rejected rather than faulting:
+    // alignment before the `ob_type` load, `ob_type`'s own shape before
+    // `ll_issubclass` reads the subclass range through it, and the class
+    // before the tail-field tag load.
     if obj.is_null() || !(obj as usize).is_multiple_of(align_of::<W_BaseException>()) {
-        return None;
-    }
-    if unsafe { w_exception_kind_byte(obj) } > ExcKind::MAX_DISCRIMINANT {
         return None;
     }
     let ob_type = unsafe { (*obj).ob_type };
@@ -1437,6 +1453,9 @@ pub unsafe fn w_exception_kind_checked(obj: PyObjectRef) -> Option<ExcKind> {
         return None;
     }
     if !unsafe { is_exception(obj) } {
+        return None;
+    }
+    if unsafe { w_exception_kind_byte(obj) } > ExcKind::MAX_DISCRIMINANT {
         return None;
     }
     Some(unsafe { w_exception_get_kind(obj) })
@@ -1486,6 +1505,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::SystemExit => "SystemExit",
         ExcKind::MemoryError => "MemoryError",
         ExcKind::SystemError => "SystemError",
+        ExcKind::EOFError => "EOFError",
         ExcKind::LookupError => "LookupError",
         ExcKind::UnicodeError => "UnicodeError",
         ExcKind::UnicodeTranslateError => "UnicodeTranslateError",
@@ -1606,6 +1626,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "SystemExit" => Some(ExcKind::SystemExit),
         "MemoryError" => Some(ExcKind::MemoryError),
         "SystemError" => Some(ExcKind::SystemError),
+        "EOFError" => Some(ExcKind::EOFError),
         "LookupError" => Some(ExcKind::LookupError),
         "UnicodeError" => Some(ExcKind::UnicodeError),
         "UnicodeTranslateError" => Some(ExcKind::UnicodeTranslateError),
@@ -1636,23 +1657,48 @@ mod tests {
         }
     }
 
-    /// A word that is not a `W_BaseException` must not reach
-    /// `kind_from_exc`: that match has no wildcard arm, so an out-of-range
-    /// byte indexes a bounds-check-free jump table.  The range check has to
-    /// reject before the class check dereferences `ob_type`, so this uses a
-    /// buffer whose header is deliberately not a live type pointer.
+    /// A byte that is not a live discriminant must not reach `kind_from_exc`:
+    /// that match has no wildcard arm, so an out-of-range byte indexes a
+    /// bounds-check-free jump table.
+    ///
+    /// The subject is a stack copy of a real exception, so it clears the
+    /// alignment and class screens and the tag range is the gate under test.
+    /// A `[u8; N]` buffer would not: its alignment is 1 and its header is
+    /// null, so either of the earlier screens could be the one that rejects.
     #[test]
     fn test_kind_checked_rejects_out_of_range_tag() {
-        let mut buf = [0u8; std::mem::size_of::<W_BaseException>()];
-        let kind_offset = std::mem::offset_of!(W_BaseException, kind);
+        let live = w_exception_new(ExcKind::ValueError, "bad value");
+        let mut copy: W_BaseException = unsafe { std::ptr::read(live as *const W_BaseException) };
+        let obj = std::ptr::addr_of_mut!(copy) as PyObjectRef;
+        assert_eq!(
+            unsafe { w_exception_kind_checked(obj) },
+            Some(ExcKind::ValueError),
+            "the copy must pass every screen before the tag is corrupted"
+        );
+        let tag = std::ptr::addr_of_mut!(copy.kind).cast::<u8>();
         for raw in [ExcKind::MAX_DISCRIMINANT + 1, 128, 160, u8::MAX] {
-            buf[kind_offset] = raw;
+            unsafe { tag.write(raw) };
             assert_eq!(
-                unsafe { w_exception_kind_checked(buf.as_ptr() as PyObjectRef) },
+                unsafe { w_exception_kind_checked(obj) },
                 None,
                 "tag byte {raw} must be rejected"
             );
         }
+    }
+
+    /// The class screen rejects a word whose header is not an exception type
+    /// without ever loading the tail field the tag lives in.
+    #[test]
+    fn test_kind_checked_rejects_non_exception_header() {
+        let buf = [0usize; std::mem::size_of::<W_BaseException>() / 8];
+        assert_eq!(
+            unsafe { w_exception_kind_checked(buf.as_ptr() as PyObjectRef) },
+            None
+        );
+        assert_eq!(
+            unsafe { w_exception_kind_checked(crate::noneobject::w_none()) },
+            None
+        );
     }
 
     #[test]
@@ -1736,6 +1782,7 @@ mod tests {
             ExcKind::SystemExit,
             ExcKind::MemoryError,
             ExcKind::SystemError,
+            ExcKind::EOFError,
             ExcKind::LookupError,
             ExcKind::UnicodeError,
             ExcKind::UnicodeTranslateError,

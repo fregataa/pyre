@@ -327,6 +327,14 @@ impl RootSet {
 
     /// Remove a root.
     pub fn remove(&mut self, root: *mut GcRef) {
+        // Host root brackets are stack-shaped, matching RPython's
+        // shadowstack push/pop discipline.  Keep the general out-of-order
+        // fallback for callers that hold overlapping guards, but make the
+        // overwhelmingly common matching-pop path O(1).
+        if self.roots.last().copied() == Some(root) {
+            self.roots.pop();
+            return;
+        }
         if let Some(pos) = self.roots.iter().position(|r| *r == root) {
             self.roots.swap_remove(pos);
         }
@@ -458,7 +466,7 @@ pub struct MiniMarkGC {
     /// incminimark.py:407 `self.young_objects_with_destructors =
     /// self.AddressStack()`. Nursery-resident objects whose type carries
     /// a lightweight `TypeInfo.destructor`. Populated by
-    /// `register_destructor_if_needed` at allocation (incminimark.py:689
+    /// `register_young_object_if_needed` at allocation (incminimark.py:689
     /// `if needs_finalizer:`). Drained at end of minor cycle by
     /// `deal_with_young_objects_with_destructors` (incminimark.py:1868,
     /// :2884-2895): a dead object's destructor runs, a survivor moves to
@@ -865,7 +873,7 @@ impl MiniMarkGC {
     /// indistinguishable from the slow path's, so a side table would
     /// not stay in sync.
     #[inline]
-    fn is_managed_heap_object(&self, addr: usize) -> bool {
+    pub fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
@@ -877,6 +885,10 @@ impl MiniMarkGC {
 
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
     /// Returns a GcRef pointing to the object payload (after the header).
+    ///
+    /// Split into an inline bump and an out-of-line tail like
+    /// [`alloc_with_type_rooted`](Self::alloc_with_type_rooted).
+    #[inline]
     pub fn alloc_with_type(&mut self, type_id: u32, payload_size: usize) -> GcRef {
         // gc_stress: force a full collection *before* allocating so that any
         // object live at this allocation point but unreachable from a
@@ -897,58 +909,59 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if total_size <= self.config.large_object_threshold {
+            let ptr = self.nursery.alloc(total_size);
+            if !ptr.is_null() {
+                return self.finish_nursery_object(ptr, type_id);
+            }
+        }
+        self.alloc_with_type_slow(type_id, total_size)
+    }
+
+    /// The outcomes [`alloc_with_type`](Self::alloc_with_type) leaves out of
+    /// line: a large object, and a nursery too full to serve the bump.
+    #[cold]
+    #[inline(never)]
+    fn alloc_with_type_slow(&mut self, type_id: u32, total_size: usize) -> GcRef {
         // Large objects go directly to old gen.
         if total_size > self.config.large_object_threshold {
             return self.alloc_in_oldgen(type_id, total_size);
         }
 
-        let ptr = self.nursery.alloc(total_size);
-        if ptr.is_null() {
-            // Nursery full: trigger minor collection and retry.
-            // minimark.py:1282 collect_and_reserve parity. Carry the triggering
-            // allocation size so a bounded major collection applies the
-            // PYPY_GC_MAX out-of-memory policy against it (threshold_reached).
-            self.pending_reserving_size = total_size;
-            self.do_collect_nursery();
-            self.pending_reserving_size = 0;
-            // incminimark.py:2603-2615 — a bounded major collection that leaves
-            // the heap over `max_heap_size` asks this allocation to fail so the
-            // caller raises MemoryError: NULL propagates to the compiled-code
-            // `CHECK_MEMORY_ERROR` path and to the interpreter allocation
-            // chokepoint. Never taken in the unbounded default (`PYPY_GC_MAX`
-            // unset), so the fallback below is unchanged there.
-            if std::mem::take(&mut self.oom_pending) {
-                return GcRef(0);
-            }
-            let ptr = self.nursery.alloc(total_size);
-            let ptr = if ptr.is_null() {
-                self.reserve_nursery_gap(total_size)
-            } else {
-                ptr
-            };
-            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
-                // Production incminimark keeps `nonlarge_max` below the
-                // nursery size. Tiny backend tests can configure the two
-                // independently; retain their external-allocation fallback
-                // only for an object that cannot physically fit anywhere.
-                return self.alloc_in_oldgen(type_id, total_size);
-            }
-            assert!(
-                !ptr.is_null(),
-                "collect_and_reserve could not find nursery space for a non-large object"
-            );
-            Self::init_nursery_object(ptr, type_id);
-            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-            self.register_weakref_if_needed(type_id, obj.0);
-            self.register_destructor_if_needed(type_id, obj.0);
-            return obj;
+        // Nursery full: trigger minor collection and retry.
+        // minimark.py:1282 collect_and_reserve parity. Carry the triggering
+        // allocation size so a bounded major collection applies the
+        // PYPY_GC_MAX out-of-memory policy against it (threshold_reached).
+        self.pending_reserving_size = total_size;
+        self.do_collect_nursery();
+        self.pending_reserving_size = 0;
+        // incminimark.py:2603-2615 — a bounded major collection that leaves
+        // the heap over `max_heap_size` asks this allocation to fail so the
+        // caller raises MemoryError: NULL propagates to the compiled-code
+        // `CHECK_MEMORY_ERROR` path and to the interpreter allocation
+        // chokepoint. Never taken in the unbounded default (`PYPY_GC_MAX`
+        // unset), so the fallback below is unchanged there.
+        if std::mem::take(&mut self.oom_pending) {
+            return GcRef(0);
         }
-
-        Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
-        obj
+        let ptr = self.nursery.alloc(total_size);
+        let ptr = if ptr.is_null() {
+            self.reserve_nursery_gap(total_size)
+        } else {
+            ptr
+        };
+        if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+            // Production incminimark keeps `nonlarge_max` below the
+            // nursery size. Tiny backend tests can configure the two
+            // independently; retain their external-allocation fallback
+            // only for an object that cannot physically fit anywhere.
+            return self.alloc_in_oldgen(type_id, total_size);
+        }
+        assert!(
+            !ptr.is_null(),
+            "collect_and_reserve could not find nursery space for a non-large object"
+        );
+        self.finish_nursery_object(ptr, type_id)
     }
 
     /// `malloc_fixedsize` / `collect_and_reserve` with one native-stack root.
@@ -960,11 +973,66 @@ impl MiniMarkGC {
     /// required; this preserves the upstream fast path instead of doing a
     /// root-set add/remove for every allocation.
     ///
+    /// Split into a `malloc_fast` body and its exceptional tail the way
+    /// `framework.py:361-382` does: the copy it declares `inline=True` carries
+    /// only the bump, so a caller pays a bump and a branch, while a large
+    /// object or a full nursery costs a call. Without the split the whole
+    /// function is a frame that saves ten callee-saved registers before it
+    /// can reach a ten-instruction bump.
+    ///
     /// # Safety
     /// `root` must point to a valid mutable `GcRef` slot until this call
     /// returns. `needs_write_barrier` must point to a valid mutable `bool`
     /// slot.
+    #[inline]
     pub unsafe fn alloc_with_type_rooted(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.alloc_with_type_rooted_body::<false>(
+                type_id,
+                payload_size,
+                root,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// [`alloc_with_type_rooted`](Self::alloc_with_type_rooted) for a type that
+    /// carries neither a finalizer nor the weakref flag: `malloc_fast`
+    /// (`framework.py:361-382`), the copy `gct_fv_gc_malloc` selects at
+    /// `framework.py:830-838` for exactly that case.
+    ///
+    /// # Safety
+    /// Same contract as [`alloc_with_type_rooted`](Self::alloc_with_type_rooted),
+    /// plus `type_id` must name a type with no destructor and no weakref flag.
+    #[inline]
+    pub unsafe fn alloc_fast_with_type_rooted(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.alloc_with_type_rooted_body::<true>(
+                type_id,
+                payload_size,
+                root,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// # Safety
+    /// See [`alloc_with_type_rooted`](Self::alloc_with_type_rooted); `FAST`
+    /// additionally carries `malloc_fast`'s obligation on `type_id`.
+    #[inline]
+    unsafe fn alloc_with_type_rooted_body<const FAST: bool>(
         &mut self,
         type_id: u32,
         payload_size: usize,
@@ -984,6 +1052,29 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if total_size <= self.config.large_object_threshold {
+            let ptr = self.nursery.alloc(total_size);
+            if !ptr.is_null() {
+                return self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
+            }
+        }
+        unsafe { self.alloc_with_type_rooted_slow(type_id, total_size, root, needs_write_barrier) }
+    }
+
+    /// The outcomes [`alloc_with_type_rooted`] leaves out of line: a large
+    /// object, and a nursery too full to serve the bump.
+    ///
+    /// # Safety
+    /// Same contract as [`alloc_with_type_rooted`].
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_with_type_rooted_slow(
+        &mut self,
+        type_id: u32,
+        total_size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
         // Large objects never trigger a nursery collection, so the native
         // slot needs no temporary registration.
         if total_size > self.config.large_object_threshold {
@@ -991,42 +1082,110 @@ impl MiniMarkGC {
             return self.alloc_in_oldgen(type_id, total_size);
         }
 
+        self.pending_reserving_size = total_size;
+        unsafe { self.roots.add(root) };
+        self.do_collect_nursery();
+        self.roots.remove(root);
+        self.pending_reserving_size = 0;
+        if std::mem::take(&mut self.oom_pending) {
+            return GcRef(0);
+        }
         let ptr = self.nursery.alloc(total_size);
-        if ptr.is_null() {
-            self.pending_reserving_size = total_size;
-            unsafe { self.roots.add(root) };
-            self.do_collect_nursery();
-            self.roots.remove(root);
-            self.pending_reserving_size = 0;
-            if std::mem::take(&mut self.oom_pending) {
-                return GcRef(0);
-            }
-            let ptr = self.nursery.alloc(total_size);
-            let ptr = if ptr.is_null() {
-                self.reserve_nursery_gap(total_size)
-            } else {
-                ptr
-            };
-            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
-                unsafe { *needs_write_barrier = true };
-                return self.alloc_in_oldgen(type_id, total_size);
-            }
-            assert!(
-                !ptr.is_null(),
-                "collect_and_reserve could not find nursery space for a non-large object"
+        let ptr = if ptr.is_null() {
+            self.reserve_nursery_gap(total_size)
+        } else {
+            ptr
+        };
+        if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+            unsafe { *needs_write_barrier = true };
+            return self.alloc_in_oldgen(type_id, total_size);
+        }
+        assert!(
+            !ptr.is_null(),
+            "collect_and_reserve could not find nursery space for a non-large object"
+        );
+        self.finish_nursery_object(ptr, type_id)
+    }
+
+    /// The tail a successful nursery bump runs: `init_gc_object`, then
+    /// incminimark.py:687-693's two registrations.
+    ///
+    /// `FAST` is `malloc_fast` (`framework.py:361-382`), the copy of
+    /// `malloc_fixedsize` annotated `s_False, s_False, s_False` — under that
+    /// annotation both `if`s constant-fold away, so the common allocation never
+    /// reaches the type's flags at all. `gct_fv_gc_malloc`
+    /// (`framework.py:830-838`) selects the copy only for a type with no
+    /// finalizer, and never passes `contains_weakptr=True` for a fixed-size
+    /// malloc: a WEAKREF is built by `gct_weakref_create` instead. The
+    /// obligation rides with the caller here too, so the `ll_assert` the
+    /// general body spells out becomes a debug assertion.
+    #[inline]
+    fn finish_bumped_nursery_object<const FAST: bool>(
+        &mut self,
+        ptr: *mut u8,
+        type_id: u32,
+    ) -> GcRef {
+        if FAST {
+            debug_assert!(
+                !self.type_needs_young_registration(type_id),
+                "malloc_fast served a type that needs a young weakref/destructor registration"
             );
             Self::init_nursery_object(ptr, type_id);
-            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-            self.register_weakref_if_needed(type_id, obj.0);
-            self.register_destructor_if_needed(type_id, obj.0);
-            return obj;
+            return GcRef((ptr as usize) + GcHeader::SIZE);
         }
+        self.finish_nursery_object(ptr, type_id)
+    }
 
+    /// The `malloc_fast` precondition, as the debug build checks it.
+    fn type_needs_young_registration(&self, type_id: u32) -> bool {
+        if (type_id as usize) >= self.types.len() {
+            return false;
+        }
+        let info = self.types.get(type_id);
+        info.is_weakref || info.destructor.is_some()
+    }
+
+    /// The tail every non-`malloc_fast` nursery bump shares: `init_gc_object`
+    /// plus the weakref and destructor registration of incminimark.py:687-693.
+    #[inline]
+    fn finish_nursery_object(&mut self, ptr: *mut u8, type_id: u32) -> GcRef {
         Self::init_nursery_object(ptr, type_id);
         let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
+        self.register_young_object_if_needed(type_id, obj.0);
         obj
+    }
+
+    /// incminimark.py:687-693's pair of `if`s, reached the way upstream reaches
+    /// them: with both flags already in hand.
+    ///
+    /// A WEAKREF (`T_IS_WEAKREF` in its TYPE_INFO) joins the young-weakref list
+    /// so the next minor collection can invalidate the single `weakptr` slot at
+    /// `weakref::WEAKPTR_OFFSET` inside the payload (gctypelayout.py:592) if its
+    /// target dies. A type carrying a lightweight `TypeInfo.destructor` joins
+    /// the young-destructor list, so that collection either runs the destructor
+    /// or promotes the entry to `old_objects_with_destructors`.
+    /// `obj_addr` is the payload base (post-header) in both cases.
+    ///
+    /// `malloc_fixedsize` takes `needs_finalizer` and `contains_weakptr` as
+    /// arguments, so its tail costs two tests on values the caller supplied —
+    /// and in the `malloc_fast` copy (`framework.py:371-382`, annotated
+    /// `s_False, s_False, s_False`) both fold away entirely. pyre resolves them
+    /// from the type table instead, which is one row lookup, not two: probing
+    /// separately repeats the bound test, the table base load and the stride
+    /// multiply that the first probe already performed.
+    #[inline]
+    fn register_young_object_if_needed(&mut self, type_id: u32, obj_addr: usize) {
+        if (type_id as usize) >= self.types.len() {
+            return;
+        }
+        let info = self.types.get(type_id);
+        let (is_weakref, has_destructor) = (info.is_weakref, info.destructor.is_some());
+        if is_weakref {
+            self.young_objects_with_weakrefs.push(obj_addr);
+        }
+        if has_destructor {
+            self.young_objects_with_destructors.push(obj_addr);
+        }
     }
 
     /// incminimark.py:865-930 `collect_and_reserve` pinned-barrier walk.
@@ -1124,11 +1283,7 @@ impl MiniMarkGC {
             return self.alloc_in_oldgen(type_id, total_size);
         }
 
-        Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
-        obj
+        self.finish_nursery_object(ptr, type_id)
     }
 
     /// Fallible host-side counterpart of `alloc_with_type_no_collect`.
@@ -1147,6 +1302,27 @@ impl MiniMarkGC {
         }
     }
 
+    /// [`try_alloc_with_type_no_collect`](Self::try_alloc_with_type_no_collect)
+    /// for a type that carries neither a finalizer nor the weakref flag:
+    /// `malloc_fast` (`framework.py:361-382`).
+    ///
+    /// # Safety
+    /// `type_id` must name a type with no destructor and no weakref flag.
+    pub unsafe fn try_alloc_fast_with_type_no_collect(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+    ) -> GcRef {
+        let mut needs_write_barrier = true;
+        unsafe {
+            self.try_alloc_fast_with_type_no_collect_with_placement(
+                type_id,
+                payload_size,
+                &mut needs_write_barrier,
+            )
+        }
+    }
+
     /// Placement-reporting counterpart of
     /// [`try_alloc_with_type_no_collect`](Self::try_alloc_with_type_no_collect).
     ///
@@ -1154,10 +1330,58 @@ impl MiniMarkGC {
     /// fresh nursery allocation. The no-collect path can instead spill to
     /// old-gen, so report that exceptional placement to the initializer.
     ///
+    /// Split like [`alloc_with_type_rooted`](Self::alloc_with_type_rooted):
+    /// the bump inlines into the caller, the old-gen spill is a call.
+    ///
     /// # Safety
     /// `needs_write_barrier` must point to a valid mutable `bool` slot for the
     /// duration of this call.
+    #[inline]
     pub unsafe fn try_alloc_with_type_no_collect_with_placement(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.try_alloc_with_type_no_collect_body::<false>(
+                type_id,
+                payload_size,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement)
+    /// for a type that carries neither a finalizer nor the weakref flag:
+    /// `malloc_fast` (`framework.py:361-382`).
+    ///
+    /// # Safety
+    /// Same contract as
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement),
+    /// plus `type_id` must name a type with no destructor and no weakref flag.
+    #[inline]
+    pub unsafe fn try_alloc_fast_with_type_no_collect_with_placement(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.try_alloc_with_type_no_collect_body::<true>(
+                type_id,
+                payload_size,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// # Safety
+    /// See
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement);
+    /// `FAST` additionally carries `malloc_fast`'s obligation on `type_id`.
+    #[inline]
+    unsafe fn try_alloc_with_type_no_collect_body<const FAST: bool>(
         &mut self,
         type_id: u32,
         payload_size: usize,
@@ -1168,58 +1392,25 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
-        if total_size > self.config.large_object_threshold {
-            return self
-                .try_alloc_in_oldgen(type_id, total_size)
-                .unwrap_or(GcRef(0));
+        if total_size <= self.config.large_object_threshold {
+            let ptr = self.nursery.alloc(total_size);
+            if !ptr.is_null() {
+                let obj = self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
+                unsafe { *needs_write_barrier = false };
+                return obj;
+            }
         }
-
-        let ptr = self.nursery.alloc(total_size);
-        if ptr.is_null() {
-            return self
-                .try_alloc_in_oldgen(type_id, total_size)
-                .unwrap_or(GcRef(0));
-        }
-
-        Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
-        unsafe { *needs_write_barrier = false };
-        obj
+        self.spill_to_oldgen_or_null(type_id, total_size)
     }
 
-    /// incminimark.py:690-692 parity. When a freshly-allocated object
-    /// is a WEAKREF (T_IS_WEAKREF in its TYPE_INFO), push it onto the
-    /// young-weakref list so the next minor collection can invalidate
-    /// its weakptr if the target dies.
-    ///
-    /// `obj_addr` is the payload base (post-header). The weakref's
-    /// single `weakptr` slot lives at `weakref::WEAKPTR_OFFSET`
-    /// inside that payload (gctypelayout.py:592).
-    fn register_weakref_if_needed(&mut self, type_id: u32, obj_addr: usize) {
-        if (type_id as usize) >= self.types.len() {
-            return;
-        }
-        if self.types.get(type_id).is_weakref {
-            self.young_objects_with_weakrefs.push(obj_addr);
-        }
-    }
-
-    /// incminimark.py:689-690 parity. When a freshly nursery-allocated
-    /// object's type carries a lightweight `TypeInfo.destructor`, push it
-    /// onto the young-destructor list so the next minor collection runs
-    /// the destructor if the object dies (or promotes it to the
-    /// old-destructor list if it survives).
-    ///
-    /// `obj_addr` is the payload base (post-header).
-    fn register_destructor_if_needed(&mut self, type_id: u32, obj_addr: usize) {
-        if (type_id as usize) >= self.types.len() {
-            return;
-        }
-        if self.types.get(type_id).destructor.is_some() {
-            self.young_objects_with_destructors.push(obj_addr);
-        }
+    /// The old-gen spill
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement)
+    /// leaves out of line, for a large object or a nursery with no room.
+    #[cold]
+    #[inline(never)]
+    fn spill_to_oldgen_or_null(&mut self, type_id: u32, total_size: usize) -> GcRef {
+        self.try_alloc_in_oldgen(type_id, total_size)
+            .unwrap_or(GcRef(0))
     }
 
     /// Run the lightweight destructor registered for `obj_addr`'s type,
@@ -1354,7 +1545,7 @@ impl MiniMarkGC {
             None
         };
         let walk_all_mutators = crate::gc_sync::mutators_quiesced();
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[gc][minor] start count={} remembered={} cards_set={}",
                 self.minor_collections + 1,
@@ -2759,6 +2950,67 @@ impl MiniMarkGC {
         GcHeader::SIZE + payload_size
     }
 
+    /// Total size of `addr`, or `None` when its header does not decode to a
+    /// registered type. The panicking [`Self::object_total_size`] is unusable
+    /// from a diagnostic that is already reporting a corrupt heap.
+    fn try_object_total_size(&self, addr: usize) -> Option<usize> {
+        let type_id = unsafe { (*header_of(addr)).type_id() } as usize;
+        if type_id >= self.types.len() {
+            return None;
+        }
+        let type_info = self.types.get(type_id as u32);
+        let payload_size = if type_info.item_size > 0 {
+            let length = unsafe { *((addr + type_info.length_offset) as *const usize) };
+            type_info.total_instance_size(length)
+        } else {
+            type_info.size
+        };
+        Some(GcHeader::SIZE + payload_size)
+    }
+
+    /// Which object actually owns `slot_addr`.
+    ///
+    /// A `custom_trace` may hand the collector slots that live outside the
+    /// object it was called on — the mapdict storage block and the module-dict
+    /// storage boxes are walked that way. When the child in such a slot is
+    /// corrupt, the discriminating question is whether the *container* was
+    /// reclaimed (its own header would be a freelist link) or the child was, and
+    /// the panic's `holder_*` fields answer neither. Locate the container by
+    /// testing each of the holder's leading words for an extent that covers the
+    /// slot, and report its header.
+    fn describe_enclosing_container(
+        &self,
+        holder_addr: usize,
+        slot_addr: usize,
+        holder_words: &[usize],
+    ) -> String {
+        if self.is_managed_heap_object(holder_addr)
+            && let Some(size) = self.try_object_total_size(holder_addr)
+            && (holder_addr..holder_addr + size).contains(&slot_addr)
+        {
+            return "self".to_string();
+        }
+        for (index, &word) in holder_words.iter().enumerate() {
+            if !self.is_managed_heap_object(word) {
+                continue;
+            }
+            let Some(size) = self.try_object_total_size(word) else {
+                continue;
+            };
+            if !(word..word + size).contains(&slot_addr) {
+                continue;
+            }
+            let hdr = unsafe { *header_of(word) };
+            return format!(
+                "word{index}@{word:#x} tid={} tid_and_flags={:#x} size={size} slot_offset={}",
+                hdr.type_id(),
+                hdr.tid_and_flags,
+                slot_addr - word,
+            );
+        }
+        "unknown".to_string()
+    }
+
     /// Grey one child reference: if it is a managed, not-yet-visited heap
     /// object, set VISITED and push it onto the gray stack. The
     /// `is_managed_heap_object` guard mirrors `seed_major_root`: a
@@ -2785,11 +3037,14 @@ impl MiniMarkGC {
                     *word = unsafe { *((addr as *const usize).add(index)) };
                 }
                 let child_vtable_type_id = self.vtable_to_type_id.get(&child_words[0]).copied();
+                let holder_hdr = unsafe { *header_of(holder_addr) };
                 panic!(
                     "GC BUG: invalid major child type_id={} at child_addr={:#x} \
                      holder_addr={:#x} holder_type_id={} slot_addr={:#x} \
                      holder_offset={:?} site={} holder_words={:#x?} \
-                     child_vtable_type_id={:?} child_words={:#x?}",
+                     child_vtable_type_id={:?} child_words={:#x?} \
+                     holder_tid_and_flags={:#x} holder_in_remembered={} \
+                     enclosing={} gc_state={:?} minors={} majors={}",
                     type_id,
                     addr,
                     holder_addr,
@@ -2800,6 +3055,12 @@ impl MiniMarkGC {
                     holder_words,
                     child_vtable_type_id,
                     child_words,
+                    holder_hdr.tid_and_flags,
+                    self.remembered_set.contains(&holder_addr),
+                    self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
+                    self.gc_state,
+                    self.minor_collections,
+                    self.major_collections,
                 );
             }
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
@@ -2938,6 +3199,49 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py:1792-1799 turns every old object modified since the cycle
+    /// began back to gray — "precisely the old objects that have been modified
+    /// and need rescanning" — before the sweep decides survivors, and
+    /// :2478-2481 rescans the roots that can grow after the cycle's opening
+    /// snapshot. Upstream needs only the non-stack half there, because its
+    /// stack roots are covered by two invariants pyre does not share: a
+    /// JITFRAME is nursery-allocated, so every minor re-traces it and a
+    /// promotion during MARKING re-queues it (:2079-2083), and the objects a
+    /// mutator stores into a stack slot mid-cycle were promoted during MARKING
+    /// and are therefore born black.
+    ///
+    /// pyre's stack root sets are mutated with no write barrier and hold
+    /// pre-cycle objects: a JitFrame lives in the old gen so its pointer stays
+    /// valid across a collecting call while compiled code stores Refs into its
+    /// gcmap slots, the blackhole register banks and resume-construction roots
+    /// are plain slices, and `seed_major_root` arms a newly seeded old root
+    /// into the remembered set only once — the next minor drains that set and
+    /// nothing re-arms it. A black root can therefore come to hold the only
+    /// reference to a white object. Walk the root sets once more here and turn
+    /// the black ones gray again; this can only add survivors, never free a
+    /// reachable object.
+    fn rescan_major_stack_roots_black_and_drain(&mut self) {
+        for gcref in self.enumerate_root_walker_values() {
+            if gcref.is_null() {
+                continue;
+            }
+            // incminimark.py:1322-1340 keeps nursery objects out of a marking
+            // worklist, so a nursery root goes through the seeding path, which
+            // marks it without queueing it.
+            let regray = !self.is_in_nursery(gcref.0)
+                && self.is_managed_heap_object(gcref.0)
+                && unsafe { (*header_of(gcref.0)).has_flag(flags::VISITED) };
+            if regray {
+                self.incr_state.gray_stack.push(gcref.0);
+            } else {
+                self.seed_major_root(gcref);
+            }
+        }
+        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+            self.mark_object(obj_addr);
+        }
+    }
+
     /// incminimark.py:2473-2533: finish MARKING and freeze this cycle's sweep
     /// candidates.  Every VISITED-dependent consumer runs before either raw or
     /// arena memory is freed.
@@ -2947,6 +3251,10 @@ impl MiniMarkGC {
         // modified since the last minor) before the sweep, or a cycle finished
         // between minors frees reachable old->old targets.
         self.rescan_remembered_black_and_drain();
+        // Barrier-less stack-root stores (JitFrame gcmap slots, blackhole
+        // register banks, resume-construction roots): re-gray the black roots
+        // before the sweep freezes survivors.
+        self.rescan_major_stack_roots_black_and_drain();
         // incminimark.py:2478-2481: process-global/non-stack roots can grow
         // after the cycle's initial snapshot.  Rescan and trace them before
         // finalizers, weakrefs, and sweep inspect VISITED.
@@ -3059,7 +3367,7 @@ impl MiniMarkGC {
         debug_assert_eq!(self.gc_state, GcState::Sweeping);
         debug_assert!(!self.oldgen.rawmalloc_sweep_pending());
         self.major_collections += 1;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[gc][major] complete count={} oldgen_bytes={}",
                 self.major_collections,
@@ -3506,6 +3814,20 @@ impl MiniMarkGC {
         // safe `write_barrier`/`gc_write_barrier` entry points, so guard null
         // before reading `header_of(obj)`; the card variant guards it likewise.
         if obj.is_null() || self.is_in_nursery(obj.0) || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        let hdr = unsafe { header_of(obj.0) };
+        if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            self.remember_young_pointer(obj);
+        }
+    }
+
+    /// `do_write_barrier` sibling for a pointer returned by this collector's
+    /// allocation API.  RPython's barrier receives only GC-managed structs;
+    /// the membership guard exists solely for pyre's mixed bootstrap heap and
+    /// is redundant for a freshly allocated managed result.
+    fn do_write_barrier_managed(&mut self, obj: GcRef) {
+        if obj.is_null() {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
@@ -4163,6 +4485,16 @@ impl GcAllocator for MiniMarkGC {
         unsafe { self.alloc_with_type_rooted(type_id, size, root, needs_write_barrier) }
     }
 
+    unsafe fn alloc_fast_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe { self.alloc_fast_with_type_rooted(type_id, size, root, needs_write_barrier) }
+    }
+
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(0, size)
     }
@@ -4175,6 +4507,14 @@ impl GcAllocator for MiniMarkGC {
         self.try_alloc_with_type_no_collect(type_id, size)
     }
 
+    unsafe fn try_alloc_fast_nursery_no_collect_typed(
+        &mut self,
+        type_id: u32,
+        size: usize,
+    ) -> GcRef {
+        unsafe { self.try_alloc_fast_with_type_no_collect(type_id, size) }
+    }
+
     unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
         &mut self,
         type_id: u32,
@@ -4183,6 +4523,21 @@ impl GcAllocator for MiniMarkGC {
     ) -> GcRef {
         unsafe {
             self.try_alloc_with_type_no_collect_with_placement(type_id, size, needs_write_barrier)
+        }
+    }
+
+    unsafe fn try_alloc_fast_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.try_alloc_fast_with_type_no_collect_with_placement(
+                type_id,
+                size,
+                needs_write_barrier,
+            )
         }
     }
 
@@ -4253,7 +4608,7 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
+        MiniMarkGC::is_managed_heap_object(self, addr)
     }
 
     fn is_nursery_object(&self, addr: usize) -> bool {
@@ -4271,6 +4626,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn write_barrier(&mut self, obj: GcRef) {
         self.do_write_barrier(obj);
+    }
+
+    fn write_barrier_managed(&mut self, obj: GcRef) {
+        self.do_write_barrier_managed(obj);
     }
 
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
@@ -4675,6 +5034,31 @@ mod tests {
             large_object_threshold: nursery_size / 2,
             ..GcConfig::default()
         })
+    }
+
+    #[test]
+    fn root_set_removes_lifo_and_out_of_order_roots() {
+        let mut roots = RootSet::new();
+        let mut a = GcRef(1);
+        let mut b = GcRef(2);
+        let mut c = GcRef(3);
+        let (a, b, c) = (
+            &mut a as *mut GcRef,
+            &mut b as *mut GcRef,
+            &mut c as *mut GcRef,
+        );
+        unsafe {
+            roots.add(a);
+            roots.add(b);
+            roots.add(c);
+        }
+
+        roots.remove(c);
+        assert_eq!(roots.roots, vec![a, b]);
+        roots.remove(a);
+        assert_eq!(roots.roots, vec![b]);
+        roots.remove(b);
+        assert!(roots.is_empty());
     }
 
     /// A born-old allocation that crosses the next-major threshold asks for a

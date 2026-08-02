@@ -9,7 +9,8 @@
 //!     grow downward). Raw read, returns 0 when never captured.
 //!   * [`pyre_stack_get_length`] — effective stack budget in bytes.
 //!   * [`pyre_stack_set_length_fraction`] — multiply `MAX_STACK_SIZE` by
-//!     `frac` and store the result as the new effective length.
+//!     `frac`, clamp to the OS stack, and store the result as the new
+//!     effective length.
 //!   * [`pyre_stack_too_big_slowpath`] — four-case slow path: first-time
 //!     capture, thread-switch cache refresh, stack-underflow base
 //!     revision, real overflow.
@@ -23,8 +24,10 @@
 //! (`stack.c:30`); the slow path reads the TLS value first and refreshes
 //! the global cache from it on a thread switch (`stack.c:49`), then
 //! writes both when the base is newly captured or revised
-//! (`stack.c:63-64`). Pyre is single-threaded today, but keeping the
-//! TLS-mirror + global-cache shape matches upstream byte-for-byte.
+//! (`stack.c:63-64`). The requested stack length remains process-global;
+//! only its safety clamp uses the current thread's actual OS stack size.
+//! That is genuine thread state, and the slow path refreshes the same
+//! backend-visible global cache that RPython uses.
 //!
 //! `sys.setrecursionlimit(N)` calls `pyre_stack_set_length_fraction(N *
 //! 0.001)` and stores `N` as the visible recursion limit. The default
@@ -35,7 +38,7 @@
 //! `rpython/jit/backend/x86/assembler.py:1080
 //! _call_header_with_stack_check`).
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 use pyre_object::interp_exceptions::{ExcKind, w_exception_new};
 
@@ -48,33 +51,40 @@ use crate::PyError;
 /// writes it via the accessor functions.
 pub use crate::module::sys::state::{DEFAULT_RECURSION_LIMIT, MAX_RECURSION_LIMIT};
 
-/// rpython/translator/c/src/stack.h:8-19 `MAX_STACK_SIZE` parity.
-/// RPython hard-codes `3 << 18 = 768 KB` for most architectures and
-/// `11 << 18 = 2.8 MB` for `__powerpc__` / `__PPC__` / `__s390x__`
-/// (where stack frames are significantly larger). Pyre inherits that
-/// architecture-specific default unchanged so
-/// `_stack_set_length_fraction(frac) * MAX_STACK_SIZE` produces a
-/// byte budget identical to an equivalent PyPy build.
+/// rpython/translator/c/src/stack.h:8-19 `MAX_STACK_SIZE` adaptation.
 ///
-/// Note that Rust interpreter frames are larger than RPython's
-/// translated-C frames, so the default recursion budget will exhaust
-/// sooner (in terms of Python-level call depth) than CPython or
-/// translated PyPy at the same `sys.setrecursionlimit()`. User
-/// programs that expect CPython-style depth should raise the
-/// recursion limit accordingly; the budget formula itself now
-/// matches PyPy byte-for-byte.
-#[cfg(any(
-    target_arch = "powerpc",
-    target_arch = "powerpc64",
-    target_arch = "s390x"
-))]
-pub const MAX_STACK_SIZE: usize = 11 << 18;
-#[cfg(not(any(
-    target_arch = "powerpc",
-    target_arch = "powerpc64",
-    target_arch = "s390x"
-)))]
+/// stack.h picks the constant per architecture for exactly one reason:
+/// 768 KB "is only enough for 406 levels on ppc64", so platforms whose
+/// frames are bigger get the larger budget instead. Rust interpreter
+/// frames are bigger than RPython's translated-C frames in the same way
+/// — 768 KB bottoms out around 476 Python call levels here — so pyre
+/// applies the same rule and takes `11 << 18` on the platforms that
+/// have room for it. That keeps the byte budget above the recursion
+/// limit's own cutoff, so `sys.setrecursionlimit(N)` is what bounds
+/// Python call depth and the byte budget stays the hard-stack guard it
+/// is upstream.
+///
+/// `wasm32` keeps `3 << 18`: its linear-memory stack is sized at link
+/// time (1 MB by default) with no guard page and no `getrlimit` for
+/// [`pyre_stack_set_length_fraction`] to clamp against, so a budget
+/// wider than the real stack would corrupt memory instead of raising.
+#[cfg(target_arch = "wasm32")]
 pub const MAX_STACK_SIZE: usize = 3 << 18;
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_STACK_SIZE: usize = 11 << 18;
+
+/// Default native stack for Python-created threads.  Rust's platform default
+/// can be as small as 2 MiB, which cannot hold pyre's translated Rust frame
+/// shape even for stdlib recursion such as `functools.lru_cache`'s `fib(100)`.
+/// `_thread.stack_size()` still reports/configures the Python-visible value;
+/// zero selects this implementation default.
+pub const DEFAULT_RUNTIME_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Process-wide requested byte budget, corresponding to RPython's
+/// `MAX_STACK_SIZE * recursionlimit / 1000`.  This is semantic configuration
+/// and therefore deliberately global.  Only the OS stack capacity used to
+/// clamp it is thread-local.
+static REQUESTED_STACK_LENGTH: AtomicUsize = AtomicUsize::new(MAX_STACK_SIZE);
 
 /// rpython/translator/c/src/stack.h:23-27 `rpy_stacktoobig_t` parity.
 ///
@@ -128,6 +138,12 @@ thread_local! {
     /// the TLS on first-time capture / underflow revision
     /// (stack.c:63-64).
     static TL_STACK_END: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Capacity of the current OS thread's native stack.  Unlike type/module
+    /// state, this is intrinsically thread-specific.  A zero value means
+    /// "query the platform limit lazily"; Python-created threads install the
+    /// exact size supplied to `std::thread::Builder`.
+    static TL_OS_STACK_SIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
     /// stack.c:18 `report_error`, mirrored per thread for free-threaded
     /// critical-code suppression. The global struct field remains the
@@ -210,6 +226,56 @@ pub fn reset_stack_base() {
     let sp = current_sp();
     TL_STACK_END.with(|c| c.set(sp));
     PYRE_STACKTOOBIG.stack_end.store(sp, Ordering::Relaxed);
+    PYRE_STACKTOOBIG
+        .stack_length
+        .store(effective_stack_length(), Ordering::Relaxed);
+}
+
+/// Install the actual native stack size for the current runtime thread.
+///
+/// This is called at the outermost entry of Python-created threads.  Passing
+/// zero leaves platform discovery in charge, matching the main-thread path.
+pub fn configure_current_thread_stack_size(size: usize) {
+    TL_OS_STACK_SIZE.with(|slot| slot.set(size));
+    reset_stack_base();
+}
+
+#[cfg(unix)]
+fn platform_stack_size() -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    let limit = unsafe { limit.assume_init() }.rlim_cur;
+    if limit == libc::RLIM_INFINITY || limit == 0 {
+        0
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(not(unix))]
+fn platform_stack_size() -> usize {
+    0
+}
+
+/// RPython's stack.c safety clamp: retain one quarter of the native stack for
+/// Rust/C frames between the probe and the guard page.
+fn effective_stack_length() -> usize {
+    let requested = REQUESTED_STACK_LENGTH.load(Ordering::Relaxed);
+    let os_size = TL_OS_STACK_SIZE.with(|slot| {
+        let installed = slot.get();
+        if installed == 0 {
+            platform_stack_size()
+        } else {
+            installed
+        }
+    });
+    if os_size == 0 {
+        requested
+    } else {
+        requested.min(os_size.saturating_sub(os_size >> 2))
+    }
 }
 
 /// Test-only helper that plants a synthetic `stack_end` into both the
@@ -258,19 +324,62 @@ pub extern "C" fn pyre_stack_get_length_adr() -> usize {
     &raw const PYRE_STACKTOOBIG.stack_length as usize
 }
 
-/// rpython/translator/c/src/stack.c:20-23 `LL_stack_set_length_fraction`.
+/// rpython/translator/c/src/stack.c:23-36 `_ll_stack_os_limit`. Size in
+/// bytes of this thread's C stack as the OS sees it, or 0 when
+/// unknown/unlimited. Computed once and cached: this is not on a hot
+/// path, but `test.support.infinite_recursion()` toggles the recursion
+/// limit in a loop, so caching keeps repeated calls free.
+#[cfg(not(any(windows, target_arch = "wasm32")))]
+fn stack_os_limit() -> usize {
+    static CACHED: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != usize::MAX {
+        return cached;
+    }
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    let limit = match unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rl) } {
+        0 if rl.rlim_cur != libc::RLIM_INFINITY && rl.rlim_cur != 0 => rl.rlim_cur as usize,
+        _ => 0,
+    };
+    CACHED.store(limit, Ordering::Relaxed);
+    limit
+}
+
+/// Windows before `GetCurrentThreadStackLimits` (Windows 8) and wasm32
+/// have no runtime query, so no clamp applies — matching the
+/// `#ifdef` fallthrough at stack.c:36-45.
+#[cfg(any(windows, target_arch = "wasm32"))]
+fn stack_os_limit() -> usize {
+    0
+}
+
+/// rpython/translator/c/src/stack.c:58-77 `LL_stack_set_length_fraction`.
 ///
 /// ```c
 /// void LL_stack_set_length_fraction(double fraction) {
-///     rpy_stacktoobig.stack_length = (Signed)(MAX_STACK_SIZE * fraction);
+///     Signed length = (Signed)(MAX_STACK_SIZE * fraction);
+///     Signed os_limit = _ll_stack_os_limit();
+///     if (os_limit > 0) {
+///         Signed cap = os_limit - (os_limit >> 2);
+///         if (cap > 0 && length > cap)
+///             length = cap;
+///     }
+///     rpy_stacktoobig.stack_length = length;
 /// }
 /// ```
+///
+/// `sys.setrecursionlimit()` scales `length` linearly, so a high limit
+/// can push it past the real OS stack and segfault before the check
+/// ever reports an overflow. Clamping to the stack the OS actually
+/// gives this thread, minus a 25% margin for the frames between the
+/// check and the guard page, keeps the check firing first.
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_stack_set_length_fraction(frac: f64) {
     let length = (MAX_STACK_SIZE as f64 * frac) as usize;
+    REQUESTED_STACK_LENGTH.store(length, Ordering::Relaxed);
     PYRE_STACKTOOBIG
         .stack_length
-        .store(length, Ordering::Relaxed);
+        .store(effective_stack_length(), Ordering::Relaxed);
 }
 
 /// rpython/translator/c/src/stack.c:25-66 `LL_stack_too_big_slowpath`.
@@ -298,7 +407,10 @@ pub extern "C" fn pyre_stack_set_length_fraction(frac: f64) {
 #[unsafe(no_mangle)]
 #[majit_macros::dont_look_inside]
 pub extern "C" fn pyre_stack_too_big_slowpath(current: usize) -> u8 {
-    let max_stack_size = PYRE_STACKTOOBIG.stack_length.load(Ordering::Relaxed);
+    let max_stack_size = effective_stack_length();
+    PYRE_STACKTOOBIG
+        .stack_length
+        .store(max_stack_size, Ordering::Relaxed);
     // stack.c:38-40 OP_THREADLOCALREF_ADDR + baseptr = tl1->stack_end.
     // Explicit `usize` annotation pins the variable kind to Signed for
     // the pyre annotator; `Cell::get()` through a `thread_local!`
@@ -492,35 +604,51 @@ pub extern "C" fn pyre_stack_criticalcode_stop() {
     TL_REPORT_ERROR.with(|c| c.set(1));
 }
 
+/// Largest recursion limit ever requested on this process.  The native byte
+/// budget is reserved from it, never from a lowered limit.
+static NATIVE_STACK_RESERVE: AtomicI32 = AtomicI32::new(DEFAULT_RECURSION_LIMIT);
+
 /// pypy/module/sys/vm.py:63 `setrecursionlimit`, with Python 3.14's
 /// logical-depth rejection before PyPy's byte-budget update.  The check must
-/// use Python call depth: native Rust frame size is unrelated to CPython's
-/// `py_recursion_remaining` and cannot decide whether a Python limit is below
-/// the current interpreter depth.
+/// use Python frame depth: native Rust frame size is unrelated to the Python
+/// recursion budget and cannot decide whether a limit is below the current
+/// interpreter depth.
 pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
     if new_limit <= 0 {
         return Err(PyError::value_error("recursion limit must be positive"));
     }
     // pypy/module/sys/vm.py:86-87 silent upper bound.
     let limit = new_limit.min(MAX_RECURSION_LIMIT);
-    let old_limit = get_recursion_limit();
-    // CPython 3.14 Python/sysmodule.c `sys_setrecursionlimit_impl`: reject
+    // Python/sysmodule.c `sys_setrecursionlimit_impl`: reject
     // when the current Python recursion depth has already reached the limit.
-    let depth = crate::call::call_depth();
+    let depth = crate::call::py_recursion_depth();
     if depth >= limit as u32 {
         return Err(PyError::recursion_error(format!(
             "cannot set the recursion limit to {limit} at the recursion depth {depth}: the limit is too low"
         )));
     }
 
-    // CPython 3.14 keeps Python recursion accounting separate from native
-    // stack protection.  Preserve PyPy's native byte guard as a high-water
-    // allocation: lowering the Python limit must not shrink it underneath
-    // the already-running Rust interpreter stack.  Logical depth below is
-    // what enforces the newly lowered Python limit.
-    pyre_stack_set_length_fraction(old_limit.max(limit) as f64 * 0.001);
+    // Python 3.14 keeps Python recursion accounting separate from native stack
+    // protection.  Preserve PyPy's native byte guard as a high-water
+    // allocation: lowering the Python limit must not shrink it underneath the
+    // already-running Rust interpreter stack.  Logical depth below is what
+    // enforces the newly lowered Python limit.  The mark is the largest limit
+    // ever requested, not the previous one — `setrecursionlimit(n)` called
+    // twice would otherwise collapse the reservation from the startup 5000 to
+    // `n` on the second call, and the native guard would then cut a recursion
+    // short far above the Python limit.
+    let reserved = NATIVE_STACK_RESERVE
+        .fetch_max(limit, Ordering::Relaxed)
+        .max(limit);
+    pyre_stack_set_length_fraction(reserved as f64 * 0.001);
     crate::module::sys::state::set_recursion_limit(limit);
-    majit_gc::shadow_stack::increase_root_stack_depth((limit as f64 * 0.001 * 163840.0) as usize);
+    // pypy/module/sys/vm.py:97 `increase_root_stack_depth(int(new_limit *
+    // 0.001 * 163840))`.  Both of pyre's root stacks are sized off it: the
+    // jitframe one compiled code pushes to, and the interpreter's `push_roots`
+    // stack, which holds a slot per pinned livevar across a recursive call.
+    let root_stack_depth = (limit as f64 * 0.001 * 163840.0) as usize;
+    majit_gc::shadow_stack::increase_root_stack_depth(root_stack_depth);
+    pyre_object::gc_roots::increase_root_stack_depth(root_stack_depth);
     Ok(())
 }
 
@@ -548,7 +676,7 @@ pub fn stack_check() -> Result<(), PyError> {
     // CPython 3.14 checks `py_recursion_remaining`, i.e. Python interpreter
     // depth, independently of native stack protection.  pyre's matching
     // counter is bumped around every user-function call.
-    if crate::call::call_depth() >= get_recursion_limit() as u32 {
+    if crate::call::py_recursion_depth() >= get_recursion_limit() as u32 {
         return Err(PyError::recursion_error("maximum recursion depth exceeded"));
     }
     let current = current_sp();
@@ -622,13 +750,13 @@ mod tests {
     /// so neither another stack-state test nor a compiled trace can
     /// observe the synthetic values.
     fn reset_all() {
+        REQUESTED_STACK_LENGTH.store(MAX_STACK_SIZE, Ordering::Relaxed);
+        TL_OS_STACK_SIZE.with(|slot| slot.set(0));
         reset_stack_base();
-        PYRE_STACKTOOBIG
-            .stack_length
-            .store(MAX_STACK_SIZE, Ordering::Relaxed);
         PYRE_STACKTOOBIG.report_error.store(1, Ordering::Relaxed);
         TL_REPORT_ERROR.with(|c| c.set(1));
         crate::module::sys::state::reset_recursion_limit_for_tests();
+        NATIVE_STACK_RESERVE.store(DEFAULT_RECURSION_LIMIT, Ordering::Relaxed);
         clear_jit_pending_exception();
     }
 
@@ -720,6 +848,20 @@ mod tests {
         // pypy/module/sys/vm.py:67 — values above 1_000_000 are clamped.
         set_recursion_limit(50_000_000).expect("positive");
         assert_eq!(get_recursion_limit(), MAX_RECURSION_LIMIT);
+        reset_all();
+    }
+
+    #[test]
+    fn configured_thread_stack_clamps_native_budget() {
+        let _g = lock_tests();
+        reset_all();
+        configure_current_thread_stack_size(1024 * 1024);
+        pyre_stack_set_length_fraction(20.0);
+        assert_eq!(
+            pyre_stack_get_length(),
+            768 * 1024,
+            "one quarter of the configured native stack must remain reserved"
+        );
         reset_all();
     }
 

@@ -31,6 +31,25 @@ pub fn force_frame(frame: *mut PyFrame) {
     }
 }
 
+/// Force a frame whose fastlocals application code is about to read.
+///
+/// RPython needs no such call: storing the frame pointer anywhere the JIT
+/// cannot see forces the virtualizable by escape analysis, so
+/// `pyframe.py:539 fast2locals` always finds a materialized
+/// `locals_cells_stack_w`.  Pyre forces through explicit hooks instead, and
+/// [`PyExecutionContext::gettopframe_nohidden`] only covers the frames IT
+/// walks — a frame handed out some other way (a traceback's `tb_frame`)
+/// reaches `fast2locals` unforced, whose null slots render as an EMPTY
+/// mapping rather than a stale one.
+///
+/// # Safety
+/// `frame` must be a live `PyFrame` (or null).
+pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
+    if !frame.is_null() {
+        force_frame(frame);
+    }
+}
+
 /// `_jit_vref.py:48-52` `vref()` = `jit_force_virtual`.
 ///
 /// `topframeref` and every frame's `f_backref` hold a `jit.virtual_ref` — at
@@ -295,6 +314,11 @@ pub struct ExecutionContext {
     /// `Context.run`.  Execution-context-owned, not a process global or an
     /// independent Rust TLS side table.
     pub contextvar_context: PyObjectRef,
+    /// `objspace.py:131` `ec._py_repr` — the identity dict of objects currently
+    /// being `repr()`'d (`__pypy__.objects_in_repr()`), lazily created.
+    /// Recursive `__repr__` (e.g. `OrderedDict`) consults it to emit `...`
+    /// instead of recursing.  Execution-context-owned like `contextvar_context`.
+    pub py_repr: PyObjectRef,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -359,6 +383,7 @@ impl ExecutionContext {
             w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
             w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
             contextvar_context: pyre_object::PY_NULL,
+            py_repr: pyre_object::PY_NULL,
         }
     }
 
@@ -392,6 +417,7 @@ impl ExecutionContext {
         ec.w_asyncgen_firstiter_fn = pyre_object::PY_NULL;
         ec.w_asyncgen_finalizer_fn = pyre_object::PY_NULL;
         ec.contextvar_context = pyre_object::PY_NULL;
+        ec.py_repr = pyre_object::PY_NULL;
         ec
     }
 
@@ -411,6 +437,7 @@ impl ExecutionContext {
         visitor(unsafe {
             &mut *(&mut self.contextvar_context as *mut PyObjectRef as *mut majit_ir::GcRef)
         });
+        visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
     }
 
     pub fn __init__(&mut self, space: PyObjectRef) {
@@ -1317,6 +1344,14 @@ impl ExecutionContext {
     /// the Module identity so identity-sensitive callers (PyPy
     /// `pick_builtin` `if w_builtin is space.builtin: return space.builtin`)
     /// observe the same object every call.
+    /// The dict half of [`Self::get_builtin`] — `interp->builtins`, the
+    /// object 3.14 plants as `__builtins__` in a fresh `exec`/`eval`
+    /// namespace and in every imported module (only `__main__` gets the
+    /// module itself).
+    pub fn get_builtin_dict(&self) -> PyObjectRef {
+        self.builtins_module
+    }
+
     pub fn get_builtin(&self) -> PyObjectRef {
         let cached = execution_context_builtin_cache_get(self);
         if !cached.is_null() {
@@ -1349,15 +1384,12 @@ impl ExecutionContext {
             }
         }
         self.builtin_dict_cache.set(module);
-        // `pypy/interpreter/baseobjspace.py:647` —
-        // `self.setitem(self.builtin.w_dict, 'builtins',  w_builtin)`.
-        // After the builtins module exists, install the self-reference
-        // so `__builtins__.__builtins__ is __builtins__` and
-        // user-level `import builtins; builtins.__builtins__` round-trips
-        // through `space.builtin.w_dict[__builtins__]`.
-        unsafe {
-            pyre_object::w_dict_setitem_str(self.builtins_module, "__builtins__", module);
-        }
+        // `baseobjspace.py:650` installs a self-reference here
+        // (`self.setitem(self.builtin.w_dict, '__builtins__', w_builtin)`).
+        // 3.14 does not: `__builtins__` is planted by the frame/import
+        // machinery into *other* modules' globals, so `builtins` itself has
+        // no such key and `import builtins; builtins.__builtins__` raises
+        // AttributeError.
         module
     }
 
@@ -2238,6 +2270,12 @@ impl UserDelAction {
         if let Some(iter) = crate::module::r#struct::unpack_iter::W_UnpackIter::from_obj(current())
         {
             iter.release_export();
+            return;
+        }
+        if unsafe { pyre_object::interp_sre::is_sre_scanner(current()) } {
+            unsafe {
+                crate::module::_sre::interp_sre::sre_scanner_release_export(current());
+            }
             return;
         }
         if unsafe { pyre_object::generator::is_generator_or_coroutine(current()) } {

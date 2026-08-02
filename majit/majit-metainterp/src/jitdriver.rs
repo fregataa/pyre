@@ -457,7 +457,12 @@ pub(crate) fn spdiag_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_SPDIAG").is_some())
 }
-fn no_bridge_enabled() -> bool {
+/// `MAJIT_NO_BRIDGE`: suppress bridge recording so every guard failure resumes
+/// through the blackhole.  Public because a frontend that owns its own
+/// guard-failure entry point has to honour it there too — gating only the
+/// jitdriver-internal paths leaves the variable set but inert, which reads as
+/// "bridges are off" while they keep recording.
+pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
 }
@@ -1221,14 +1226,6 @@ pub struct JitDriver<S: JitState> {
     /// PyPy JitDriver(is_recursive=True): enables max_unroll_recursion
     /// for recursive portal calls (pyjitpl.py _opimpl_recursive_call).
     is_recursive: bool,
-    /// Shared quasi-immutable notifier for periodic loop invalidation.
-    /// RPython compile.py:205: loop.quasi_immutable_deps registration.
-    /// All compiled loops register their invalidation flag here.
-    /// A background thread periodically calls invalidate() to force
-    /// GUARD_NOT_INVALIDATED exits in compiled code.
-    epoch_qmut: std::sync::Arc<std::sync::Mutex<crate::quasiimmut::QuasiImmut>>,
-    /// Handle for the background invalidation thread.
-    _invalidation_thread: Option<std::thread::JoinHandle<()>>,
     /// Driver-shared `Assembler`: holds the
     /// `all_liveness` payload (`assembler.py:30`) populated incrementally
     /// by `__JitMeta::install_canonical_liveness` (canonical entry) and
@@ -1358,45 +1355,10 @@ fn install_state_field_fvc(data: &StateFieldFvcData) {
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
-        Self::with_options(threshold, true)
-    }
-
-    /// Create a new JitDriver, optionally skipping the background timer that
-    /// periodically invalidates all compiled loops.
-    ///
-    /// The periodic invalidation is a portable stand-in for RPython's
-    /// GC/signal-triggered invalidation, used by quasi-immutable-bearing
-    /// consumers (a Python JIT). A consumer with no quasi-immutable state — e.g.
-    /// a fixed-bytecode interpreter over plain integer reds — has nothing to
-    /// invalidate; for it the timer only forces pointless re-tracing (and
-    /// exercises the GUARD_NOT_INVALIDATED resume path needlessly), so it should
-    /// pass `periodic_invalidation = false`.
-    pub fn with_options(threshold: u32, periodic_invalidation: bool) -> Self {
         let mut meta = MetaInterp::new(threshold);
         if let Some(info) = S::__build_virtualizable_info() {
             meta.set_virtualizable_info(info);
         }
-        let epoch_qmut =
-            std::sync::Arc::new(std::sync::Mutex::new(crate::quasiimmut::QuasiImmut::new()));
-        // Background thread: periodically invalidate all registered loops.
-        // RPython uses GC/signal-triggered invalidation; we use a timer as
-        // a portable equivalent. Period matches PyPy's checkinterval (~10ms).
-        #[cfg(not(target_arch = "wasm32"))]
-        let invalidation_thread = if periodic_invalidation {
-            let qmut = epoch_qmut.clone();
-            Some(std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if let Ok(mut qmut) = qmut.lock() {
-                        if qmut.has_watchers() {
-                            qmut.invalidate();
-                        }
-                    }
-                }
-            }))
-        } else {
-            None
-        };
         JitDriver {
             meta,
             sym: None,
@@ -1409,11 +1371,6 @@ impl<S: JitState> JitDriver<S> {
             bridge_body_start_op_count: None,
             entry_points: Vec::new(),
             is_recursive: false,
-            epoch_qmut,
-            #[cfg(not(target_arch = "wasm32"))]
-            _invalidation_thread: invalidation_thread,
-            #[cfg(target_arch = "wasm32")]
-            _invalidation_thread: None,
             blackhole_allocator: None,
             portal_runner: None,
             portal_jd_index: None,
@@ -3425,7 +3382,16 @@ impl<S: JitState> JitDriver<S> {
                 let abort_raising_exception = pending_stb
                     .as_ref()
                     .is_some_and(|stb| stb.raising_exception);
-                let reason_int = match pending_stb.map(|stb| stb.reason) {
+                // A walker raise site outside this crate cannot reach
+                // `TraceCtx::pending_switch_to_blackhole`, so its
+                // `Counters.ABORT_*` travels in `stage_abort_reason` instead.
+                // It ranks with `stb.reason` rather than below the too-long
+                // fallback: upstream raises at the site and never reaches the
+                // `blackhole_if_trace_too_long` check on that unwind.
+                let reason_int = match pending_stb
+                    .map(|stb| stb.reason)
+                    .or_else(|| self.meta.take_pending_abort_reason())
+                {
                     Some(r) => r,
                     None => self
                         .meta
@@ -6331,17 +6297,6 @@ impl<S: JitState> JitDriver<S> {
             }
         }
         pre_run();
-
-        // RPython compile.py:205-207: register loop token with
-        // quasi-immutable deps so the background invalidation thread
-        // can force GUARD_NOT_INVALIDATED exits periodically.
-        if let Some(token) = self.meta.get_loop_token(key_hash) {
-            if let Ok(mut qmut) = self.epoch_qmut.lock() {
-                for flag in token.all_invalidation_flags() {
-                    qmut.register(&flag);
-                }
-            }
-        }
 
         loop {
             let (

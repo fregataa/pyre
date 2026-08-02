@@ -516,20 +516,180 @@ holds a forwarding-capable `owner_root` and never reads it back, so every
 `Deref` goes through the stale raw field; `eval_loop` runs behind a
 `&mut PyFrame` across a safepoint (the exact class RPython's translated
 shadowstack enumerates for free); the blackhole keeps the virtualizable as a
-bare integer, as does `INLINE_CONCRETE_FRAME`.  Converging means, in order:
-teach `FrameBox::deref` to read its own root and root the inline concrete frame
-the same way; then give compiled code a virtualizable reload after collecting
-calls — pyre has only the JITFRAME half (`reload_frame_if_necessary` in the
-dynasm aarch64 assembler, cited against `assembler.py:1369-1377`).  Only after
-both does dropping the non-moving frame allocation become safe, and with it the
-`PyTraceback.w_code` snapshot, which exists solely because the frame edge is
-conditional.
+bare integer, as did `INLINE_CONCRETE_FRAME`.
 
-Two hand-placed props currently hold the invariant up rather than the allocator:
-the dynasm runner routes a resume-materialized virtual `PyFrame` to oldgen on
-purpose, and the JIT's traceback recorder builds a fresh oldgen frame instead of
-handing `record_application_traceback` a materialized virtual.  Both are
-comment-enforced.
+The first two of those are now closed: `FrameBox` reads its frame back out of
+its own `owner_root` instead of the raw field it had cached (and `into_raw`
+reads the slot before releasing it, which it previously did in the opposite
+order), and `INLINE_CONCRETE_FRAME` is held as a root rather than a bare
+`Cell<*mut PyFrame>`.
+
+**There is no "virtualizable reload" to port** — an earlier revision of this
+section named one, and it does not exist upstream.  `_reload_frame_if_necessary`
+reloads the JITFRAME alone (`ebp` from the root-stack top,
+`rpython/jit/backend/x86/assembler.py:1369-1377`), which pyre already has in the
+dynasm aarch64 assembler; `rg reload_frame_if_necessary rpython/jit/backend/`
+turns up no vable counterpart on any target.  Upstream needs none: the
+virtualizable is an ordinary GCREF box (`metainterp.virtualizable_boxes[-1]`),
+so it rides the same gcmap-covered jitframe slots as every other ref across a
+collecting call, and `llsupport/assembler.py:301` notes it is deliberately "not
+in a register".
+
+What is left is the remaining raw copies — and chasing them to the end shows the
+non-moving frame allocation is not a deferrable TODO but a forced adaptation.
+
+`eval_loop` holds `frame: &mut PyFrame` across the loop and hands it to
+`execute_opcode_step`, which allocates.  The JIT eval loop already runs the
+RPython discipline for its own copy — `FrameRoot` pushes the frame on the shadow
+stack, caches the `ShadowStackSlot`, and every collection point is followed by a
+fresh `let f: *mut PyFrame = frame_root.frame()`, with the comments naming
+`execute_opcode_step`, `handle_exception` and the ec block as the points.  It is
+load-bearing there because a JIT-inlined callee frame really can be nursery-
+resident (`emit_new_pyframe_inline_with_params` lowers to a nursery bump).
+
+But that discipline protects only the LOOP's copy.  The reference handed *into*
+`execute_opcode_step` is live across every allocation the opcode performs, and
+so is every frame reference below it.  Making frames movable therefore requires
+re-deriving the frame after each collection point inside every handler — which
+is precisely what RPython gets for free, because the translator rewrites live
+GCREF locals in their shadow-stack slots
+(`rpython/memory/gctransform/shadowstack.py:43-46`) and the interpreter never
+writes a reload by hand.  Rust has no such pass, and hand-writing it across the
+opcode implementations is neither reviewable nor maintainable.
+
+So the enabling condition for movable frames is a mechanism, not a patch: some
+automatic rewrite of live frame references across collection points.  Until one
+exists, `FrameBox::new` allocating non-moving is the thing standing in for it,
+and it should be read as pyre's stand-in for the translator's shadow-stack
+rewrite rather than as an accident awaiting cleanup.  The same holds for what it
+props up: `PyTraceback.w_code` stays, and so does the conditional frame edge —
+though the edge's reachable case has narrowed to the pre-hook bootstrap frame
+(see `TraceCtx::virtualizable_heap_ptr` below), which is why the guard is now
+kept for its failure mode rather than for a case anyone has observed.
+
+Two cached raw copies were checked against upstream individually rather than
+left on a list.  Neither is a hazard, and only one is even the deviation it
+looked like:
+
+*The blackhole's `virtualizable_ptr: i64` — not the field it resembles.*
+Upstream's `BlackholeInterpreter` has no such field: every vable bhimpl takes
+the virtualizable as an explicit argument (`blackhole.py:1374`
+`bhimpl_getarrayitem_vable_i(cpu, vable, index, fielddescr, arraydescr)`, and
+the same shape for the `set*`/`arraylen` family), sourced from the register
+bank, which pyre roots too (`push_bh_regs`).  Pyre's field is not that carrier.
+It is the frame identity pyre's blackhole traceback recording needs —
+`record_frame_traceback` passes it to `record_application_traceback_for_recording`
+— and upstream has no counterpart to that at all, because its blackhole does not
+record application tracebacks.  Lifetime is already covered: the frame is on the
+interpreter chain, and `run` additionally pushes the vable's array-field slots
+onto the resume-ref root stack for the whole run
+(`VirtualizableInfo::push_resume_ref_roots`, which forwards those slots in
+place).  What the field does not do is forward *itself*, and that is exactly
+what the non-moving contract above makes unnecessary.  Rooting it would forward
+nothing.
+
+*`TraceCtx::virtualizable_heap_ptr` — half closed; the rest is architectural.*
+It caches what upstream unwraps per use (`pyjitpl.py:3472-3474
+synchronize_virtualizable` re-derives the write target from
+`virtualizable_boxes[-1]` every time), and a root portal seed points it at the
+`snapshot_for_tracing` copy while baking the identity against the live frame,
+so the two name different objects where upstream has one.
+
+The half that was a rooting problem is gone.  The snapshot used to be a
+`FrameBox::new_boxed` allocation the GC did not own, which is what left the
+cached pointer with no slot to forward — and, downstream, what made the
+traceback the walk records against it (`pyjitpl.rs`
+`record_application_traceback(excvalue, self.vable_ptr, frame)`) carry a frame
+pointer that dangled as soon as the walk ended.  `FrameBox::new`'s `owner_root`
+now supplies the root that was missing, so `snapshot_for_tracing` allocates
+GC-owned, the traceback's conditional frame edge forwards and keeps it alive,
+and a full-corpus probe on that edge observed no non-GC frame reaching a
+traceback at all.
+
+The half that remains is not a rooting change and not a tracer change either.
+The two objects exist because pyre's tracer steps a *copy*: the walk executes
+the iteration concretely against the snapshot while the live frame stays parked
+at the loop header for the compiled loop to run from.  That forces the split in
+both directions — the identity must be the live frame or
+`patch_new_loop_to_load_virtualizable_fields` gets a frame unrelated to the
+boxes (`compile.py:458 assert i == len(inputargs)`), and the synchronization
+target must be the snapshot or `refresh_virtualizable_shadow_from_heap` reads a
+frame the walk never mutated and the shadow drifts.  Upstream needs one field
+because its metainterp *is* the interpreter for that iteration.  So this cache
+converges when the copy-walk does, and not before.
+
+**The invariant is narrower than "frames are non-moving", and that is by
+design.**  A compiled trace's own `NewWithVtable(pyframe_size_descr())` really
+does lower to a nursery bump, so JIT-emitted frames are movable — the audit left
+this inferred, and it is now measured.  Making it uniform is one line, with a
+direct in-tree precedent: the `W_ObjectObject` group marks its size descr
+`non_moving` for the identical reason ("the instance layer reaches an instance
+through raw pointers it does not root"), and `rewrite.rs` then declines the
+nursery and lands on the old-gen `gen_malloc_fixedsize`.  Marking the PyFrame
+group the same way costs:
+
+| bench | nursery frames | non-moving frames |
+|---|---|---|
+| `fib_recursive` | 1193 ms | **9249 ms (7.75x)** |
+| `inline_helper` | 219 ms | 213 ms (0.97x) |
+| `nested_loop` | 298 ms | 302 ms (1.01x) |
+
+PERF-CLAIM-UNVERIFIED: this table.  The command that produced it, the sha of
+each arm, and the round count were never recorded, so it cannot be reproduced
+or falsified.  `check.py` did not produce it — `check.py:174` returns
+`("", 0.0, 124, "")` on `TimeoutExpired`, so the harness cannot report 9249 ms
+for a run it killed, and the 1193 ms denominator is stale (`fib_recursive` runs
+in ~650 ms today).  What *is* doubly attested is the `check.py` result of
+applying the change: `FAIL dynasm fib_recursive timeout (>5s)`, 1 failed / 353
+passed, with no wrong output anywhere.  Read the effect as **">4x, direction
+certain"** and the table as an unsourced elaboration of it.  The conclusion
+below does not depend on the precision.
+
+**Scope, which is the sharper limit on this experiment.** The flag it toggled
+has exactly one production reader — `rewrite.rs:1091`, on the JIT's
+`NewWithVtable` lowering.  `FrameBox::new` never consults a descr: it calls
+`try_gc_alloc_stable_raw` unconditionally (`pyre-interpreter/src/pyframe.rs`)
+and lands on `alloc_oldgen_typed` (`pyre-jit/src/eval.rs`).  Interpreter frames
+were therefore old-gen in **both** arms, and the measurement says nothing about
+them.  Every conclusion here is scoped to JIT-emitted frames.
+
+Also worth stating because it bounds how far this can be generalized: upstream
+cannot express the arm that was measured.  `rpython/jit/codewriter/jtransform.py:1012-1015`
+rejects the flag outright — `if d.get('nonmovable', False): raise UnsupportedMallocFlags(d)`
+— and upstream's own `malloc_big_fixedsize` still takes the nursery for
+frame-sized objects (`jit/backend/llsupport/rewrite.py:778-788`).  The penalty
+is the cost of enabling a behaviour with no upstream counterpart, not the cost
+of an upstream design pyre declined.
+
+So, within that scope: the nursery frame path is not merely reachable but hot on
+recursive calls, and making JIT-emitted frames uniform with interpreter frames
+is unaffordable.
+
+What the system actually maintains is the narrower rule: *a frame that escapes
+into raw-pointer-holding territory is old-gen; a frame that stays inside a
+compiled trace may be nursery.*  The two seam-local props below are how that is
+enforced — they are the design, not an unmaintained accident, and the audit
+reading them as belt-and-braces over an unreachable case was wrong.
+
+An attempt to check the rule with an assertion turned up a second reason it
+stays comment-enforced.  A `debug_assert!` in `w_pytraceback_new` that the frame is not
+nursery-resident cost three `getattr_*` perf gates (`9.1x > 6x`, `8.9x > 5x`,
+`8.1x > 5x`) even in a release build: `pyre-interpreter` is extracted to LLBC,
+so the assertion is in the JIT's view of the function regardless of the host
+profile, and `gc_is_nursery_object` became a real call on every traceback the
+traced code builds — `rg gc_is_nursery_object build/llbc/pyre-interpreter.ullbc`
+confirms it landed there.  A `debug_assert!` is not free in an LLBC-extracted
+crate on a traced path.
+
+The two props that carry the narrow rule are therefore load-bearing: the dynasm
+runner routes a resume-materialized virtual `PyFrame` to oldgen on purpose, and
+the JIT's traceback recorder builds a fresh oldgen frame instead of handing
+`record_application_traceback` a materialized virtual.  Both sit exactly where a
+nursery frame would otherwise cross into raw-pointer territory, and the
+measurement above is why the crossing is guarded there rather than removed at
+the allocator.  This is also why the runtime half of the inlined-level traceback
+anchor stays declined: it would hand the recorder the one frame class the props
+exist to keep away from it.
 
 One thing the ON path already fixes: with a side-effecting inlined callee under
 a `while` loop that returns from inside the loop, the OFF path runs the callee's

@@ -87,6 +87,7 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
         itemsize: a.item_size(),
         len_offset: a.len_descr().map(|fd| fd.offset()),
         type_id: a.cache_key(),
+        gc_type_id: a.type_id(),
         item_type: a.item_type(),
         is_array_of_pointers: a.is_array_of_pointers(),
         is_array_of_structs: false,
@@ -359,6 +360,23 @@ pub struct TraceCtx {
     /// namespace-length gate).  Per-trace: a fresh ctx starts `false`, so no
     /// manual reset is needed.
     pub reads_module_global: bool,
+    /// Green keys whose cross-loop close this recording walk already attempted
+    /// and did not get compiled.
+    ///
+    /// `reached_loop_header` (pyjitpl.py:3020-3050) answers a cancelled close by
+    /// `cancel_count += 1` and, once `cancelled_too_many_times()` holds
+    /// (`max_unroll_loops` defaults to 0, `rlib/jit.py:598`), by
+    /// `SwitchToBlackhole(ABORT_BAD_LOOP)` — so upstream re-attempts a close at
+    /// most once per tracing pass. The walker instead keeps tracing when the
+    /// crossed key is not its own root, because closing there would store the
+    /// loop where nothing enters. Without this set it would also re-attempt the
+    /// close on every later crossing of the same header, and each attempt
+    /// re-optimizes the whole trace-so-far: an inner loop crossed N times costs
+    /// N optimizer passes over a trace that keeps growing. A structural decline
+    /// is deterministic — the same key rebuilds the same unsupported bridge —
+    /// which is the reasoning `MetaInterp::declined_bridge_guards` records for
+    /// guards. Per-trace, so a fresh walk retries once.
+    pub declined_cross_loop_closes: Vec<u64>,
     /// For a bridge trace (`is_bridge_trace`), the loop-header bytecode pc of
     /// the parent loop the bridge will JUMP into. The bridge closes when it
     /// reaches this pc (a real compiled-loop header), NOT when it transiently
@@ -624,6 +642,9 @@ pub struct ReconstructRecipe {
     /// Guard-carried JitCode offset from the decoded resume frame;
     /// `majit_ir::resumedata::NO_JITCODE_PC` when the frame carried none.
     pub jitcode_pc: i32,
+    /// Semantic stack base: `co_nlocals + ncellvars + nfreevars`, matching
+    /// `MIFrame.registers_r` / `PyFrame.locals_cells_stack_w`.  This was
+    /// historically named `nlocals`; keep the field name for wire stability.
     pub nlocals: usize,
     pub valuestackdepth: usize,
     pub registers_i: Vec<OpRef>,
@@ -1421,6 +1442,7 @@ impl TraceCtx {
             compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
+            declined_cross_loop_closes: Vec::new(),
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
@@ -1503,6 +1525,7 @@ impl TraceCtx {
             compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
+            declined_cross_loop_closes: Vec::new(),
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
@@ -1867,6 +1890,20 @@ impl TraceCtx {
     /// to a reached loop header during tracing.
     pub fn root_green_key(&self) -> u64 {
         self.root_green_key
+    }
+
+    /// Whether this walk already tried, and failed, to close across `key`.
+    /// See [`TraceCtx::declined_cross_loop_closes`].
+    pub fn cross_loop_close_declined(&self, key: u64) -> bool {
+        self.declined_cross_loop_closes.contains(&key)
+    }
+
+    /// Record that closing across `key` did not compile, so a later crossing of
+    /// the same header does not re-run the optimizer on the trace-so-far.
+    pub fn note_cross_loop_close_declined(&mut self, key: u64) {
+        if !self.cross_loop_close_declined(key) {
+            self.declined_cross_loop_closes.push(key);
+        }
     }
 
     /// Mark that the current back-edge was reached inside an inline callee
@@ -2594,6 +2631,36 @@ impl TraceCtx {
         self.virtualizable_values
             .as_ref()
             .and_then(|values| values.last().copied())
+    }
+
+    /// Trace every concrete Ref carried by `virtualizable_boxes`.
+    ///
+    /// RPython stores these values directly on `BoxPtr` instances, so the GC
+    /// forwards them through the ordinary object graph.  Pyre's parallel
+    /// `virtualizable_values` vector is the concrete half of those same boxes
+    /// and therefore needs the identical in-place walk.  In particular, the
+    /// trailing identity is `virtualizable_boxes[-1]`; a bridge must keep that
+    /// rebuilt frame identity live instead of falling back to an older cached
+    /// portal-frame pointer.
+    pub(crate) fn walk_virtualizable_value_refs(
+        &mut self,
+        mut visitor: impl FnMut(&mut majit_ir::GcRef),
+    ) {
+        let Some(values) = self.virtualizable_values.as_mut() else {
+            return;
+        };
+        for value in values.iter_mut() {
+            if let Value::Ref(gcref) = value {
+                visitor(gcref);
+            }
+        }
+        if let Some(Value::Ref(identity)) = values.last() {
+            self.virtualizable_heap_ptr = if identity.is_null() {
+                None
+            } else {
+                Some(identity.as_usize() as *const u8)
+            };
+        }
     }
 
     /// Best-effort concrete (runtime) value associated with an OpRef, from

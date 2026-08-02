@@ -3246,16 +3246,94 @@ fn bh_size_spec_from_callcontrol(
         return None;
     }
     // RPython keys SizeDescrs on the low-level STRUCT object, not on an
-    // annotation-side generic instantiation.  Charon registers one physical
-    // layout for the generic TypeDecl, so `Result<T>::Ok` and
-    // `Result<U>::Ok` must converge on the template variant here while their
-    // ClassDefs remain distinct in the annotator.
-    let layout_owner = majit_ir::descr::strip_generic_args(owner);
+    // annotation-side generic instantiation. Charon registers one physical
+    // layout for a nominal generic TypeDecl, so `Result<T>::Ok` and
+    // `Result<U>::Ok` converge on the template variant. A tuple is different:
+    // `TupleRepr` creates one low-level GcStruct per item shape, so preserve
+    // its full `Tuple<T,...>` identity and layout.
+    let layout_owner = if majit_ir::descr::is_shaped_tuple_name(owner) {
+        std::borrow::Cow::Borrowed(owner)
+    } else {
+        majit_ir::descr::strip_generic_args(owner)
+    };
     let layout_owner = layout_owner.as_ref();
-    let size = cc
+    let mut size = cc
         .struct_layout_for(layout_owner)
         .map(|layout| layout.size)
         .or_else(|| heuristic_struct_size_for_bh(cc, layout_owner))?;
+    // `rclass.py` lays a subclass's inherited fields out before its own
+    // fields.  Annotation metadata deliberately keeps enum-variant attrs
+    // variant-local, so reconstruct that inherited physical slot here for
+    // the explicit Result shell.  PtrInfo indexes virtual fields by
+    // `index_in_parent`; without the base tag in this list both the tag and
+    // payload are slot 0 and the payload replaces the tag despite living at
+    // byte offset 8.
+    let result_variant = layout_owner.ends_with("result::Result::Ok")
+        || layout_owner.ends_with("result::Result::Err")
+        || layout_owner == "Result::Ok"
+        || layout_owner == "Result::Err";
+    // The bare Charon variant can contain only the inherited enum tag while
+    // the annotator keeps the payload row on the concrete instantiation
+    // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
+    // STRUCT at this point, whose embedded base and variant fields are flattened
+    // together by `heaptracker.all_fielddescrs`.  Prefer the instantiated rows
+    // for Result variants, falling back to the template only when no such rows
+    // exist, so the payload participates in that same flattened slot list.
+    let mut all_fielddescrs = if result_variant {
+        let instantiated = bh_result_variant_field_specs(cc, owner);
+        if instantiated.is_empty() {
+            bh_result_variant_field_specs(cc, layout_owner)
+        } else {
+            instantiated
+        }
+    } else {
+        bh_all_field_specs_for_struct(cc, layout_owner)
+    };
+    if result_variant {
+        size = size.max(16);
+    }
+    if result_variant
+        && !all_fielddescrs
+            .iter()
+            .any(|field| field.field_key() == "__discriminant")
+    {
+        for (index, field) in all_fielddescrs.iter_mut().enumerate() {
+            field.index = (index + 1) as u32;
+            field.index_in_parent = index + 1;
+        }
+        all_fielddescrs.insert(
+            0,
+            bh_field_spec_from_parts(
+                0,
+                layout_owner,
+                "__discriminant",
+                0,
+                8,
+                majit_ir::value::Type::Int,
+                majit_ir::descr::ArrayFlag::Signed,
+                false,
+                false,
+                0,
+            ),
+        );
+    }
+    if result_variant {
+        // `heaptracker.get_fielddescr_index_in` counts through the embedded
+        // base before the variant's own fields.  Source registries assign
+        // indices within each owner, so normalize the combined physical list
+        // after adding the inherited tag.  Offset order is the low-level
+        // STRUCT order for this explicit shell (tag at 0, payload at 8).
+        all_fielddescrs.sort_by_key(|field| {
+            (
+                field.offset,
+                usize::from(field.field_key() != "__discriminant"),
+            )
+        });
+        for (index, field) in all_fielddescrs.iter_mut().enumerate() {
+            field.index = index as u32;
+            field.index_in_parent = index;
+        }
+    }
     Some(crate::jitcode::BhSizeSpec {
         size,
         // Analyzer-side structs keep the guard (unchanged); the raw
@@ -3279,7 +3357,7 @@ fn bh_size_spec_from_callcontrol(
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
         type_id: majit_ir::descr::path_hash(layout_owner),
         vtable: 0,
-        all_fielddescrs: bh_all_field_specs_for_struct(cc, layout_owner),
+        all_fielddescrs,
     })
 }
 
@@ -3289,6 +3367,58 @@ fn bh_all_field_specs_for_struct(
 ) -> Vec<crate::jitcode::BhFieldSpec> {
     let mut specs = Vec::new();
     bh_all_field_specs_for_struct_into(cc, owner, owner, "", 0, &mut specs);
+    specs
+}
+
+/// Build the variant-owned portion of the explicit `Result<T, PyError>`
+/// shell.  The front end deliberately represents this as one inherited tag
+/// word followed by one-word payload fields (`front/mir.rs`'s
+/// `synthetic_result_shell`), rather than as Rust's native enum layout.  The
+/// shared nominal layout registry cannot describe each generic payload at
+/// once, so read the concrete instantiation's rows directly and place them
+/// after the inherited tag, matching RPython's concrete low-level STRUCT.
+fn bh_result_variant_field_specs(
+    cc: &CallControl,
+    owner: &str,
+) -> Vec<crate::jitcode::BhFieldSpec> {
+    let Some(fields) = cc.struct_field_entries(owner) else {
+        return Vec::new();
+    };
+    let mut specs = Vec::new();
+    let mut offset = 8usize;
+    for (field_name, field_type_str) in fields {
+        // This builder lays out the variant's own payload rows, which start
+        // past the inherited tag at byte 8.  The registry can also carry the
+        // enum base's synthetic `__discriminant` row (`layout.rs`,
+        // `front/semantic.rs`); emitting it here would place the tag at
+        // offset 8 alongside the payload AND make the caller's
+        // `any(field_key() == "__discriminant")` check skip the slot-0 /
+        // offset-0 tag it synthesizes.  Leave the tag to the caller.
+        if field_name == "__discriminant" {
+            continue;
+        }
+        let (field_flag, field_type, field_size) = type_flag_from_str(field_type_str);
+        if field_type == majit_ir::value::Type::Void || field_size == 0 {
+            continue;
+        }
+        let align = scalar_align(field_size);
+        offset = (offset + align - 1) & !(align - 1);
+        let index = specs.len() + 1;
+        let rank = cc.field_immutability(Some(owner), field_name);
+        specs.push(bh_field_spec_from_parts(
+            index as u32,
+            owner,
+            field_name,
+            offset,
+            field_size,
+            field_type,
+            field_flag,
+            rank.is_some(),
+            rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
+            index,
+        ));
+        offset += field_size;
+    }
     specs
 }
 
@@ -3499,13 +3629,26 @@ fn fielddescrof(
         {
             parent_spec.type_id = owner_id.as_u64();
         }
+        let mut found_parent_field = false;
         if let Some(parent_spec) = parent.as_ref() {
             let full_name = bh_field_name(owner, &field.name);
-            if let Some(spec) = parent_spec
+            // `all_fielddescrs` is flattened depth-first, so a nested
+            // `Outer.inner.x` precedes the `Outer.x` the caller named. A
+            // single `find` over the disjunction would let that nested row
+            // win on the dotted-suffix arm alone; run the exact spellings to
+            // exhaustion first and keep the suffix match as the fallback.
+            let dotted_suffix = format!(".{}", field.name);
+            let matched = parent_spec
                 .all_fielddescrs
                 .iter()
-                .find(|spec| spec.name == full_name)
-            {
+                .find(|spec| spec.name == full_name || spec.field_key() == field.name)
+                .or_else(|| {
+                    parent_spec
+                        .all_fielddescrs
+                        .iter()
+                        .find(|spec| spec.name.ends_with(&dotted_suffix))
+                });
+            if let Some(spec) = matched {
                 offset = spec.offset;
                 field_size = spec.field_size;
                 field_type = spec.field_type;
@@ -3514,11 +3657,13 @@ fn fielddescrof(
                 is_immutable = spec.is_immutable;
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = spec.index_in_parent;
+                found_parent_field = true;
             }
         }
-        if let Some(layout_field) = cc
-            .struct_layout_for(owner)
-            .and_then(|layout| layout.fields.iter().find(|fl| fl.name == field.name))
+        if !found_parent_field
+            && let Some(layout_field) = cc
+                .struct_layout_for(owner)
+                .and_then(|layout| layout.fields.iter().find(|fl| fl.name == field.name))
         {
             offset = layout_field.offset;
             field_size = layout_field.size;
@@ -3527,13 +3672,14 @@ fn fielddescrof(
             is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
             is_immutable = layout_field.is_immutable();
             is_quasi_immutable = layout_field.is_quasi_immutable();
-        } else if let Some((
-            computed_offset,
-            computed_size,
-            computed_type,
-            computed_flag,
-            computed_signed,
-        )) = heuristic_field_layout(cc, owner, &field.name)
+        } else if !found_parent_field
+            && let Some((
+                computed_offset,
+                computed_size,
+                computed_type,
+                computed_flag,
+                computed_signed,
+            )) = heuristic_field_layout(cc, owner, &field.name)
         {
             offset = computed_offset;
             field_size = computed_size;
@@ -3738,6 +3884,7 @@ fn arraydescrof(
             // Round-trips through `_cache_array[LLType::Array(cache_key)]`
             // on the runtime side.
             type_id: array_descr.cache_key(),
+            gc_type_id: array_descr.type_id(),
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),
@@ -3808,6 +3955,7 @@ fn arraydescrof(
         itemsize,
         len_offset,
         type_id: 0,
+        gc_type_id: 0,
         item_type,
         is_array_of_pointers: flag == majit_ir::descr::ArrayFlag::Pointer,
         is_array_of_structs: flag == majit_ir::descr::ArrayFlag::Struct,
@@ -3856,6 +4004,7 @@ fn vable_arraydescrof(
         itemsize,
         len_offset: Some(0),
         type_id: 0,
+        gc_type_id: 0,
         item_type,
         is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
         is_array_of_structs: false,
@@ -4084,6 +4233,11 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             // jtransform-rewritten float operands carry the full RPython
             // opname (`float_add` / `float_lt` / etc.) — preserve as-is.
             s if s.starts_with("float_") => op.clone(),
+            // Already-canonical unsigned low-level ops the front-end emits
+            // directly (`uint_mul_high` / `uint_lt` from
+            // `front::checked_arith_uint`); pass through so the `int_` prefix
+            // does not double up (`int_uint_lt` has no `insns` entry).
+            s if s.starts_with("uint_") => op.clone(),
             _ => format!("int_{op}"),
         },
         // RPython `blackhole.py:488-498`: bitwise NOT on i64 is `int_invert`.
@@ -4485,6 +4639,7 @@ impl AssemblerDescrKey {
                 itemsize,
                 len_offset,
                 type_id,
+                gc_type_id: _,
                 item_type,
                 is_array_of_pointers,
                 is_array_of_structs,
@@ -4660,6 +4815,65 @@ mod tests {
             parent_type_id("core::result::Result<i64,PyError>"),
             owner_id.as_u64(),
         );
+    }
+
+    #[test]
+    fn explicit_result_variant_size_inherits_discriminant_slot() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "core::result::Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let spec = bh_size_spec_from_callcontrol(&cc, "core::result::Result<i64,PyError>::Ok")
+            .expect("explicit Result variant size");
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
+    }
+
+    #[test]
+    fn instantiated_result_payload_follows_template_discriminant_slot() {
+        use crate::call::CallControl;
+
+        let owner = "core::result::Result<*mut PyObject,PyError>::Ok";
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        // The production registry keeps the enum-root tag on the template,
+        // while the concrete payload row belongs to the instantiation.
+        struct_fields.fields.insert(
+            "core::result::Result::Ok".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "*mut PyObject".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let spec =
+            bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Result variant size");
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].offset, 8);
+        assert_eq!(spec.all_fielddescrs[1].field_size, 8);
+        assert_eq!(
+            spec.all_fielddescrs[1].field_flag,
+            majit_ir::descr::ArrayFlag::Pointer
+        );
+        assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
     }
 
     #[test]

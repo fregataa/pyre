@@ -101,6 +101,12 @@ use crate::resume::{
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 
+#[inline]
+fn guardlog_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
+}
+
 /// No direct RPython equivalent — Rust struct carrying data that RPython
 /// passes through internal method calls in handle_guard_failure
 /// (pyjitpl.py:2890). Fields correspond to:
@@ -1856,6 +1862,11 @@ impl<M: Clone> MetaInterp<M> {
                 visitor(gcref);
             }
         }
+        // pyjitpl.py:3290-3306 `self.virtualizable_boxes` stores ordinary
+        // BoxPtr objects whose concrete refs are traced by RPython's object
+        // graph.  Pyre keeps their concrete half in `virtualizable_values`;
+        // forward those refs in place as the same Box-attached state.
+        trace_ctx.walk_virtualizable_value_refs(&mut visitor);
         // heapcache.py:50-104 — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
         // consts (history.py:314 `ConstPtr.value`) those value slots can be
@@ -1977,6 +1988,9 @@ impl<M: Clone> MetaInterp<M> {
 
     #[inline]
     fn record_guard_failure_event(&mut self, green_key: u64, fail_index: u32) {
+        if guardlog_enabled() {
+            eprintln!("@@@GUARD key={green_key} fail={fail_index}");
+        }
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] guard failure at key={}, guard={}",
@@ -5364,6 +5378,17 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ptr) = from_consts {
             return ptr;
         }
+        // resume.py:1083-1091 `consume_virtualizable_boxes` finds the bridge's
+        // virtualizable in `nums[-1]` and `load_list_of_boxes` returns it as
+        // the trailing box, which `rebuild_state_after_failure` installs as
+        // `metainterp.virtualizable_boxes`.  That is the authoritative bridge
+        // identity; prefer its concrete value over MetaInterp's portal-entry
+        // cache. `walk_active_trace_refs` forwards this Value::Ref in place.
+        if let Some(Value::Ref(frame)) = ctx.standard_virtualizable_concrete() {
+            if !frame.is_null() {
+                return frame.as_usize() as *const u8;
+            }
+        }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
         // virtualizable inputarg's ConstPtr.  The TraceCtx pointer is the
@@ -5379,6 +5404,11 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ptr) = ctx.virtualizable_heap_ptr() {
             return ptr;
         }
+        // Bridge traces start from rebuilt resume state, not a fresh portal
+        // entry, so `initial_inputarg_consts` is not seeded with the
+        // virtualizable inputarg's ConstPtr.  `vable_ptr` is retained only as
+        // the legacy/test fallback when neither the rebuilt boxes nor their
+        // heap mirror were installed.
         if !self.vable_ptr.is_null() {
             return self.vable_ptr;
         }
@@ -7587,10 +7617,29 @@ impl<M: Clone> MetaInterp<M> {
         // one accounting event, as `aborted_tracing(stb.reason)` does for the
         // reason the `SwitchToBlackhole` raise carried.
         let reason = self
-            .pending_abort_reason
-            .take()
+            .take_pending_abort_reason()
             .unwrap_or(AbortReason::Generic.as_int());
         self.aborted_tracing(reason);
+    }
+
+    /// Name the `Counters.ABORT_*` reason the abort that is about to happen
+    /// carries, for callers that decide to give the trace up somewhere the
+    /// `abort_trace` call itself cannot see.
+    ///
+    /// RPython carries the reason on the `SwitchToBlackhole` instance from the
+    /// raise site to the `_interpret` catch (`pyjitpl.py:2906-2910`); pyre's
+    /// walker returns a `DispatchError` up through layers that do not spell
+    /// abort reasons, so the reason travels in this slot instead and
+    /// `abort_trace` consumes it exactly once.
+    pub fn stage_abort_reason(&mut self, reason: i32) {
+        self.pending_abort_reason = Some(reason);
+    }
+
+    /// Consume the reason [`MetaInterp::stage_abort_reason`] staged, for the
+    /// abort paths that do their own `abort_trace_live` + `aborted_tracing`
+    /// pair instead of calling `abort_trace`.
+    pub fn take_pending_abort_reason(&mut self) -> Option<i32> {
+        self.pending_abort_reason.take()
     }
 
     /// Live-cleanup half of `abort_trace` — no stats, no hooks.
@@ -12425,11 +12474,11 @@ impl<M: Clone> MetaInterp<M> {
 
         // pyjitpl.py:1404 `dont_trace_here(greenboxes)` — the only `&mut`,
         // flagged by `decide_recursive_inline` when recursion reached
-        // `max_unroll_recursion`. Pyre's tracer also calls
-        // `disable_noninlinable_function` at the same decision point
-        // (trace_opcode.rs:3044-3049); doing it here too is idempotent and
-        // keeps the metainterp path self-consistent when entered without
-        // the tracer wrapper.
+        // `max_unroll_recursion`. This is the ONLY place the recursion bound
+        // applies it: pyre's FBW walker bounds self-recursive inlining with
+        // its own counter (`pyre-jit-trace` `jitcode_dispatch::inline_call`,
+        // against `FBW_MAX_INLINE_RECURSION`) and applies no side effect
+        // there, so do not read this comment as "the tracer does it too".
         if should_disable {
             self.warm_state.disable_noninlinable_function(callee_key);
         }

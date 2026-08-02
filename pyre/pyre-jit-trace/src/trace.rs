@@ -146,6 +146,10 @@ pub(crate) enum WalkEndCommitLeg {
     /// converted to blackhole frames and run forward, never replayed from the
     /// trace entry.
     TraceTooLong = 9,
+    /// A bridge carrier sub-walk stopped on a walker capability gap after
+    /// concrete-executing the reconstructed callee: its frames were converted
+    /// and run forward instead of the drain rewinding to the guard.
+    CarrierAbort = 10,
 }
 
 /// Where a committing leg puts the interpreter, relative to the effects the
@@ -1478,11 +1482,14 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// canonical residual-call encoding.
 ///
 /// The result is always mirrored into `bridge_registers_r` for interior-entry
-/// bridge walks, whose Ref-bank seed is color-indexed.  Opcode-entry bridge
+/// bridge walks, whose Ref-bank seed is color-indexed. Opcode-entry bridge
 /// walks rebuild slot-indexed locals and operand-stack values from
-/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so mirror the destination
-/// there too.  Returns `false` (caller declines the compile) when the register
-/// is unresolved.
+/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so invert the destination
+/// color through the resume pc's color→semantic-slot map before mirroring it
+/// there. Treating a post-regalloc color as a localsplus slot corrupts an
+/// unrelated local whenever regalloc coalesces the call result.
+/// Returns `false` (caller declines the compile) when the register is
+/// unresolved.
 fn inject_root_call_result<Sym: WalkSym>(
     sym: &mut Sym,
     root_pc: usize,
@@ -1509,15 +1516,49 @@ fn inject_root_call_result<Sym: WalkSym>(
         }
         bridge_regs[result_reg] = result;
     }
-    if result_reg < nlocals {
+    let valuestackdepth = sym.valuestackdepth();
+    let stack_only = valuestackdepth.saturating_sub(nlocals);
+    let semantic_result_slot = payload
+        .jitcode
+        .try_index()
+        .map(|index| crate::state::bridge_semantic_maps_from_pc(index as i32, root_pc as i32))
+        .and_then(|maps| {
+            crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &maps.pcdep_entries,
+                result_reg,
+            )
+        })
+        // The raw-color fallback is load-bearing and simultaneously wrong,
+        // so neither keeping nor deleting it is the answer:
+        //
+        //   fib_recursive, dynasm, the one resume that misses the map —
+        //   `pc=569 reg=0 nlocals=1 stack_only=2 vsd=3`, entries
+        //   `[(1,0,4),(1,2,1),(1,3,2)]`.  Color 0 IS mapped, to semantic slot
+        //   4; the inversion rejects it because `4 - nlocals` is at/above the
+        //   runtime `stack_only`, which is what that gate is for.  The
+        //   fallback then answers slot 0 — a LOCAL, not the operand-stack slot
+        //   the map named.  Deleting it declines this bridge and costs 16x
+        //   (0.86s -> 14.2s), so the decline is not an option either.
+        //
+        // The result slot is by construction the one about to be pushed, i.e.
+        // at/above the resume's live depth, so resolving it needs a query that
+        // does not gate on that depth.  Until that resolves at this
+        // coordinate, keep the fallback and its measured cost visible.
+        .or_else(|| (result_reg < valuestackdepth).then_some(result_reg));
+    let Some(semantic_result_slot) = semantic_result_slot else {
+        return false;
+    };
+    if semantic_result_slot < nlocals {
         if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
-            if locals.len() <= result_reg {
-                locals.resize(result_reg + 1, majit_ir::OpRef::NONE);
+            if locals.len() <= semantic_result_slot {
+                locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
             }
-            locals[result_reg] = result;
+            locals[semantic_result_slot] = result;
         }
     } else {
-        let slot = result_reg - nlocals;
+        let slot = semantic_result_slot - nlocals;
         let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
         if bridge.len() <= slot {
             bridge.resize(slot + 1, majit_ir::OpRef::NONE);
@@ -1595,6 +1636,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
+    // A prior walk's blackhole image must not be adopted as this drain's
+    // continuation; the sub-walks below latch their own.
+    crate::jitcode_dispatch::reset_single_frame_blackhole();
+    // Odometer baseline for the abort tail: the drain may only rewind to the
+    // guard while the reconstructed frames it drove executed nothing
+    // irreversible.
+    let effects_at_entry = crate::jitcode_dispatch::fbw_executed_effect_count();
 
     let root_ec = sym.concrete_execution_context();
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
@@ -1654,6 +1702,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
     // is known.
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
+    let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
     let local_concretes = &recipe.concrete_r[..nlocals];
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
@@ -1669,6 +1718,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         callee_w_globals,
         entry,
         &argboxes_r,
+        local_oprefs,
         local_concretes,
         // Depth-N: tell the deepest sub-walk that all shallower frames are
         // paused so its in-callee guard snapshots encode the full
@@ -1822,8 +1872,35 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
         Some(Err(e)) => {
             if p2_diag {
+                let raw_code = recipe.code_ptr as *const CodeObject;
+                let (callee_name, source_path) = if raw_code.is_null() {
+                    ("<unknown>", "<unknown>")
+                } else {
+                    unsafe {
+                        (
+                            (*raw_code).obj_name.as_str(),
+                            (*raw_code).source_path.as_str(),
+                        )
+                    }
+                };
+                let stop_op = match e {
+                    crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+                        pc,
+                    }
+                    | crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached {
+                        pc,
+                    } => crate::jitcode_runtime::decode_op_at(
+                        callee_pjc.jitcode.code.as_slice(),
+                        *pc,
+                    )
+                    .map(|op| op.opname)
+                    .unwrap_or("<undecodable>"),
+                    _ => "<n/a>",
+                };
                 eprintln!(
-                    "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
+                    "[p2-drain] callee sub-walk STOP callee={callee_name} \
+                     source={source_path} recipe_py_pc={} entry={entry} \
+                     stop_op={stop_op} err={e:?}",
                     crate::state::forward_py_pc_or_backxlat(
                         recipe.jitcode_index,
                         recipe.jitcode_pc
@@ -1837,14 +1914,45 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
     }
 
+    // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` →
+    // `blackhole.py:1799 convert_and_run_from_pyjitpl`.  The sub-walk above is
+    // the reconstructed callee's ONE real execution (`drive_bridge_frame_subwalk`
+    // is an authoritative executor), so once its odometer has moved the drain
+    // may not hand the guard back to a blackhole resume from `rd_numb`: the
+    // store journal unwinds the eager stores, but nothing unwinds a residual
+    // call that wrote the heap or entered a Python frame, and the guard resume
+    // re-runs the callee from the same coordinate.  Upstream has no such
+    // rewind — `_handle_guard_failure` ends `assert False, "should always
+    // raise"` (`pyjitpl.py:2956`).  Drive the frames the sub-walk reached
+    // instead; they were latched at its stop coordinate.
+    //
+    // Ordering: adopt BEFORE `discard_bridge_carrier_walk`, whose
+    // `carrier_ec_leave` closes the scopes the chain's frames still belong to.
+    // A declined adopt leaves everything to the rollback below, which is the
+    // pre-existing behaviour.
+    let live_root_addr = sym.live_vable_frame_addr();
+    let adopted = crate::jitcode_dispatch::fbw_executed_effect_count() != effects_at_entry
+        && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::CarrierAbort);
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!(
+            "[p2-drain-abort] effects={} adopted={adopted}",
+            crate::jitcode_dispatch::fbw_executed_effect_count() - effects_at_entry,
+        );
+    }
     discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
-    // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
-    // callee, and the blackhole replays it from the guard, so restore the
-    // pre-walk heap rather than dropping the journals (which would leave every
-    // eager store standing to be applied a second time).
-    crate::jitcode_dispatch::fbw_store_journal_rollback();
+    if adopted {
+        // The chain ran the callee forward from where the sub-walk stopped, so
+        // the eager stores it journaled stand exactly once.
+        crate::jitcode_dispatch::fbw_store_journal_commit();
+    } else {
+        // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
+        // callee, and the blackhole replays it from the guard, so restore the
+        // pre-walk heap rather than dropping the journals (which would leave every
+        // eager store standing to be applied a second time).
+        crate::jitcode_dispatch::fbw_store_journal_rollback();
+    }
     p2_drain_abort()
 }
 
@@ -1893,6 +2001,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     };
     let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
+    let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
         ctx,
@@ -1904,6 +2013,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle_w_globals,
         middle_entry,
         &middle_argboxes_r,
+        middle_local_oprefs,
         middle_local_concretes,
         paused_parents,
         child_result,
@@ -2410,6 +2520,7 @@ fn try_adopt_multi_frame_blackhole(
         };
     }
     let Some(mut latched) = crate::jitcode_dispatch::take_multi_frame_blackhole() else {
+        mfdbg!("no latched multi-frame image");
         return false;
     };
     let depth = latched.framestack.len();
@@ -3605,22 +3716,22 @@ fn run_perfn_walk<Sym: WalkSym>(
                 &walk_result,
                 Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
             ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
-        let force_blackhole_adopted =
-            matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        let vable_escaped = matches!(
+            &walk_result,
+            Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+        );
+        let force_blackhole_adopted = vable_escaped
+            && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        let mut escape_pc_adopted = false;
         if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
         }
         if !force_blackhole_adopted
-            && matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            )
+            && vable_escaped
             && let Some((resume_py_pc, escape_kind)) =
                 crate::jitcode_dispatch::take_committed_frame_escape_pc()
         {
+            escape_pc_adopted = true;
             // BOTH flushes inside `flush_active_frame_escape` rewind: they take
             // the same `py_pc` and the same `last_instr = pc - 1`, so the
             // escaping opcode re-runs either way.  They differ in whether the
@@ -3670,6 +3781,21 @@ fn run_perfn_walk<Sym: WalkSym>(
                     );
                 }
             }
+        }
+        // The force arm withdrew its commit and DEFERRED the frame restore to
+        // here.  Neither continuation that keeps the flushed frame ran, so the
+        // walk falls back to replaying the traced region from its entry: put
+        // the pre-flush locals / operand stack / resume coordinate back so the
+        // replay re-derives them instead of compounding onto the walk's
+        // mid-region values.  When a blackhole terminal or a committed escape
+        // pc DID take over, the flush stands — `virtualizable.py:101-138
+        // write_boxes` has no undo once the vable is forced, and the resumed
+        // interpreter reads its fastlocals straight out of that array.
+        if crate::jitcode_dispatch::take_escape_flush_undo_pending()
+            && !force_blackhole_adopted
+            && !escape_pc_adopted
+        {
+            crate::jitcode_dispatch::restore_escape_flush_undo();
         }
         let call_forward_abort = match &walk_result {
             Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
@@ -3943,6 +4069,83 @@ fn run_perfn_walk<Sym: WalkSym>(
                 eprintln!(
                     "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
                          (no outer caller resume pc) — legacy replay kept"
+                );
+            }
+        }
+
+        // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` (pyjitpl.py:1116) landed
+        // as a resume, not a replay.  Upstream's blackhole picks up at the
+        // `-live-` in front of the forcing write with every earlier residual
+        // already applied and never re-runs one; the walker's equivalent is to
+        // keep the journal and resume the interpreter AT the Python opcode the
+        // write belongs to, which has not run yet (the abort fires before the
+        // residual executes).  Falling through to the plain `Abort` instead
+        // rolls the journal back and replays the walked region from its start,
+        // re-executing every residual the walk already ran.
+        if let Err(crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { pc }) =
+            &walk_result
+        {
+            let abort_jit_pc = *pc;
+            // A recorded-but-unexecuted residual is applied only by the replay
+            // this leg removes, so committing would DROP it; a sub-walk abort's
+            // resume coordinate names the callee's code object, not `sym`'s.
+            if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                || session.borrow().abort_in_subwalk
+            {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-qmut-flush] declined at abort_jit_pc={abort_jit_pc} \
+                         (unjournaled effect or inline sub-walk) — legacy replay kept"
+                    );
+                }
+            } else if let Some((resume_py_pc, oprefs)) =
+                crate::jitcode_dispatch::fbw_qmut_abort_stack_take()
+            {
+                // The resume RE-RUNS this opcode (`last_instr = pc - 1`), so it
+                // owes the `Rewind` proof: nothing of it may have been applied
+                // yet.  The sample is taken at the opcode boundary itself, and
+                // its absence (no boundary crossed, or a different opcode)
+                // leaves the leg unprovable — `walk_end_resume_provable`
+                // declines and the legacy replay stands.
+                let resume =
+                    match crate::jitcode_dispatch::fbw_opcode_entry_effects_at(resume_py_pc) {
+                        Some(effects_at_resume_point) => WalkEndResume::Rewind {
+                            effects_at_resume_point,
+                        },
+                        None => WalkEndResume::RewindUnproven,
+                    };
+                if !walk_end_resume_provable(resume) {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
+                             (opcode already applied an effect, or no entry sample) \
+                             — legacy replay kept"
+                        );
+                    }
+                } else if crate::jitcode_dispatch::flush_qmut_abort_state(
+                    ctx,
+                    cf_addr,
+                    resume_py_pc,
+                    &oprefs,
+                ) {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-qmut-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                             resume_py_pc={resume_py_pc}"
+                        );
+                    }
+                    let committed = commit_walk_end(WalkEndCommitLeg::AbortPc, resume);
+                    debug_assert!(committed, "provability re-checked after a pure flush");
+                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
+                         (operand slot without concrete / depth / lastblock) — legacy replay kept"
+                    );
+                }
+            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-qmut-flush] declined at abort_jit_pc={abort_jit_pc} \
+                     (no operand-stack mirror latched) — legacy replay kept"
                 );
             }
         }
@@ -5011,6 +5214,13 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 | DE::NonStandardVableFinishPortalUnsupported { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
+                // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS
+                // attempt because the version was live when the walk met the
+                // write.  The forcing already ran, so the next attempt finds a
+                // stabilised namespace and traces — the reason PyPy reports
+                // thousands of these and still compiles the loop.  Retiring the
+                // location would be strictly wrong.
+                | DE::ForceQuasiImmutable { .. }
                 | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
                 // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time

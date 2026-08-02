@@ -142,8 +142,8 @@ fn socket_converted_error(
 ) -> crate::PyError {
     let cls = match applevelerrcls {
         "timeout" => crate::builtins::lookup_exc_class("TimeoutError"),
-        "gaierror" => crate::builtins::lookup_exc_class("_socket.gaierror"),
-        "herror" => crate::builtins::lookup_exc_class("_socket.herror"),
+        "gaierror" => crate::builtins::lookup_exc_class("socket.gaierror"),
+        "herror" => crate::builtins::lookup_exc_class("socket.herror"),
         _ => crate::builtins::lookup_exc_class("OSError"),
     }
     .or_else(|| crate::builtins::lookup_exc_class("OSError"))
@@ -1052,6 +1052,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     //   herror   = new_exception_class("_socket.herror",   w_OSError)
     //   gaierror = new_exception_class("_socket.gaierror", w_OSError)
     //   timeout  = new_exception_class("_socket.timeout",  w_OSError)
+    // `socketmodule.c` names them `socket.herror` / `socket.gaierror`
+    // instead, and `type.__module__` reads the qualified prefix back, so
+    // `socket.gaierror.__module__` is `"socket"` rather than `"_socket"`.
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before _socket init");
     crate::module_ns_store(ns, "error", w_os_error);
@@ -1059,7 +1062,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "herror",
         crate::builtins::make_exc_type(
-            "_socket.herror",
+            "socket.herror",
             crate::builtins::exc_exception_new,
             w_os_error,
         ),
@@ -1068,7 +1071,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "gaierror",
         crate::builtins::make_exc_type(
-            "_socket.gaierror",
+            "socket.gaierror",
             crate::builtins::exc_exception_new,
             w_os_error,
         ),
@@ -1077,7 +1080,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "timeout",
         crate::builtins::make_exc_type(
-            "_socket.timeout",
+            "socket.timeout",
             crate::builtins::exc_exception_new,
             w_os_error,
         ),
@@ -2123,10 +2126,17 @@ fn pack_inet_addr(
             "AF_INET address must be a (host, port) tuple",
         ));
     }
+    // `getsockaddrarg` parses the AF_INET form with `"O&i"` — exactly two
+    // items — and the AF_INET6 form with `"O&i|II"` — two to four.
     let len = unsafe { pyre_object::w_tuple_len(addr) };
-    if family == libc::AF_INET && len < 2 {
+    if family == libc::AF_INET && len != 2 {
         return Err(crate::PyError::type_error(
-            "AF_INET address must be a (host, port) tuple",
+            "AF_INET address must be a pair (host, port)",
+        ));
+    }
+    if family == libc::AF_INET6 && !(2..=4).contains(&len) {
+        return Err(crate::PyError::type_error(
+            "AF_INET6 address must be a tuple (host, port[, flowinfo[, scopeid]])",
         ));
     }
     let host_obj = unsafe { pyre_object::w_tuple_getitem(addr, 0) }
@@ -2313,7 +2323,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__new__",
-        crate::make_builtin_function("__new__", |args| {
+        crate::typedef::make_new_descr(|args| {
             let cls = args
                 .first()
                 .copied()
@@ -2802,28 +2812,36 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
                 crate::PyError::type_error("send: buffer must be bytes-like")
             })?;
-            let buf = buffer.as_bytes();
             let flags = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
             };
-            let n = loop {
-                let r = unsafe {
-                    libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
-                };
-                if r >= 0 {
-                    break r;
+            // `PyBuffer_Release` after the call — `SimpleBufferBytes` has no
+            // `Drop`, so an export that is never released leaves a `bytearray`
+            // argument permanently exported and unable to be resized. The
+            // borrow of `buffer` is scoped to the closure so the release also
+            // covers the error paths.
+            let result = (|| -> Result<isize, crate::PyError> {
+                let buf = buffer.as_bytes();
+                loop {
+                    let r = unsafe {
+                        libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
+                    };
+                    if r >= 0 {
+                        return Ok(r);
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return Err(socket_io_err(err));
+                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    crate::module::signal::interp_signal::checksignals_now()?;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                crate::module::signal::interp_signal::checksignals_now()?;
-            };
-            Ok(pyre_object::w_int_new(n as i64))
+            })();
+            buffer.release();
+            Ok(pyre_object::w_int_new(result? as i64))
         }),
     ) };
 
@@ -2839,34 +2857,41 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
                 crate::PyError::type_error("sendall: buffer must be bytes-like")
             })?;
-            let buf = buffer.as_bytes();
             let flags = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
             };
-            let mut off = 0usize;
-            while off < buf.len() {
-                let n = unsafe {
-                    libc::send(
-                        fd,
-                        buf[off..].as_ptr() as *const libc::c_void,
-                        buf.len() - off,
-                        flags,
-                    )
-                };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        // `rsocket.py:1132` signal_checker — deliver a pending
-                        // signal, then retry the remaining bytes.
-                        crate::module::signal::interp_signal::checksignals_now()?;
-                        continue;
+            // See `send` above: the export is released once the borrow of
+            // `buffer` ends, on the error path as well.
+            let result = (|| -> Result<(), crate::PyError> {
+                let buf = buffer.as_bytes();
+                let mut off = 0usize;
+                while off < buf.len() {
+                    let n = unsafe {
+                        libc::send(
+                            fd,
+                            buf[off..].as_ptr() as *const libc::c_void,
+                            buf.len() - off,
+                            flags,
+                        )
+                    };
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            // `rsocket.py:1132` signal_checker — deliver a
+                            // pending signal, then retry the remaining bytes.
+                            crate::module::signal::interp_signal::checksignals_now()?;
+                            continue;
+                        }
+                        return Err(socket_io_err(err));
                     }
-                    return Err(socket_io_err(err));
+                    off += n as usize;
                 }
-                off += n as usize;
-            }
+                Ok(())
+            })();
+            buffer.release();
+            result?;
             Ok(pyre_object::w_none())
         }),
     ) };
@@ -2930,7 +2955,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
                 crate::PyError::type_error("sendto: buffer must be bytes-like")
             })?;
-            let buf = buffer.as_bytes();
             // 3-arg form: (buf, flags, addr).  4-arg form: (self, buf, flags, addr).
             // We always take self-as-args[0], so 3 args = (self, buf, addr) [no flags]
             // and 4 args = (self, buf, flags, addr).
@@ -2942,31 +2966,38 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     args[3],
                 )
             };
-            let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-            let (storage, slen) = pack_inet_addr(family, addr_obj)?;
-            let n = loop {
-                let r = unsafe {
-                    libc::sendto(
-                        fd,
-                        buf.as_ptr() as *const libc::c_void,
-                        buf.len(),
-                        flags,
-                        &storage as *const _ as *const libc::sockaddr,
-                        slen,
-                    )
-                };
-                if r >= 0 {
-                    break r;
+            // See `send` above: the export is released once the borrow of
+            // `buffer` ends, on the error path as well. `pack_inet_addr` runs
+            // Python, so it is inside the released scope too.
+            let result = (|| -> Result<isize, crate::PyError> {
+                let buf = buffer.as_bytes();
+                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
+                let (storage, slen) = pack_inet_addr(family, addr_obj)?;
+                loop {
+                    let r = unsafe {
+                        libc::sendto(
+                            fd,
+                            buf.as_ptr() as *const libc::c_void,
+                            buf.len(),
+                            flags,
+                            &storage as *const _ as *const libc::sockaddr,
+                            slen,
+                        )
+                    };
+                    if r >= 0 {
+                        return Ok(r);
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return Err(socket_io_err(err));
+                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    crate::module::signal::interp_signal::checksignals_now()?;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                crate::module::signal::interp_signal::checksignals_now()?;
-            };
-            Ok(pyre_object::w_int_new(n as i64))
+            })();
+            buffer.release();
+            Ok(pyre_object::w_int_new(result? as i64))
         }),
     ) };
 

@@ -35,7 +35,17 @@ use rustpython_wtf8::Wtf8Buf;
 pub(crate) mod host {
     #[cfg(not(target_arch = "wasm32"))]
     pub use rustpython_host_env::fs;
-    pub use rustpython_host_env::os;
+    pub mod os {
+        pub use rustpython_host_env::os::*;
+        // `replace` lives in the host layer's `posix`, which is only built for
+        // unix, wasi and windows. Targets without it have no replace-specific
+        // platform call, so the name degrades to `rename` exactly as the
+        // unix-like body does.
+        #[cfg(not(any(unix, windows, target_os = "wasi")))]
+        pub use rustpython_host_env::os::rename as replace;
+        #[cfg(any(unix, windows, target_os = "wasi"))]
+        pub use rustpython_host_env::posix::replace;
+    }
 }
 #[cfg(not(feature = "host_env"))]
 pub(crate) mod host {
@@ -59,6 +69,12 @@ pub(crate) mod host {
             unsafe { libc::isatty(fd) != 0 }
         }
         pub fn rename(
+            from: impl AsRef<std::path::Path>,
+            to: impl AsRef<std::path::Path>,
+        ) -> std::io::Result<()> {
+            std::fs::rename(from, to)
+        }
+        pub fn replace(
             from: impl AsRef<std::path::Path>,
             to: impl AsRef<std::path::Path>,
         ) -> std::io::Result<()> {
@@ -482,7 +498,7 @@ pub fn builtin_module_names() -> Vec<&'static str> {
 /// `default_modules` / `working_modules`) is likewise an explicit set of
 /// string literals with platform conditionals, not filesystem discovery.
 /// Automatic discovery is intentionally not done: it could not express
-/// the alias arms (`"_operator"` → `operator`), explicit-path arms
+/// the alias arms (`"builtins"` → `__builtin__`), explicit-path arms
 /// (`importlib.machinery` → a non-default init fn), or the
 /// `#[cfg(unix)]` gating that `resource` / `fcntl` / `syslog` require.
 pub fn install_builtin_modules() {
@@ -534,6 +550,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(msvcrt);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
+    pyre_install_module!(_symtable);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
     pyre_install_module!(_immutables_map);
@@ -901,7 +918,13 @@ fn init_sysconfigdata_empty(ns: PyObjectRef) {
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
 pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
-    let module_def = BUILTIN_MODULES.lock().unwrap().get(name).copied()?;
+    // The registry key outlives the module, which is what lets the sweep below
+    // hand the name to `BuiltinCode.module` without copying it.
+    let (static_name, module_def) = {
+        let table = BUILTIN_MODULES.lock().unwrap();
+        let (static_name, def) = table.get_key_value(name)?;
+        (*static_name, *def)
+    };
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
@@ -938,6 +961,11 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
                     pyre_object::gc_roots::shadow_stack_get(save_point + 1),
                 );
             }
+            // The same name on the code object, where the error wordings read
+            // it (`math.sqrt() takes exactly one argument`).  A module built by
+            // a registration table already stamped its own functions, so this
+            // only reaches the hand-built namespaces.
+            crate::gateway::with_module(static_name, value);
         }
     }
     let module = pyre_object::w_module_new_aliasing_dict(name, w_dict);
@@ -2134,7 +2162,7 @@ fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, Strin
 // instead of erasing the field).
 
 fn exec_code_module(
-    code: CodeObject,
+    w_code: PyObjectRef,
     w_globals: pyre_object::PyObjectRef,
     execution_context: *const PyExecutionContext,
     pathname: Option<&str>,
@@ -2195,8 +2223,6 @@ fn exec_code_module(
             }
         }
     }
-    let code_ptr = Box::into_raw(Box::new(code));
-    let w_code = crate::w_code_new(code_ptr as *const ());
     // importing.py:300 code_w.exec_code(space, w_dict, w_dict) → eval.py:31-33
     // Code.exec_code → space.createframe(...) + frame.run().  Surface
     // initialize_frame_scopes' freevar/closure mismatch (TypeError /
@@ -2309,19 +2335,46 @@ fn load_source_module(
     })?;
 
     let pathname_str = pathname.to_string_lossy();
-    let code = parse_source_module(&pathname_str, &source).map_err(|e| {
-        crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("cannot compile '{}': {e}", pathname.display()),
-        )
-    })?;
+
+    let _root = pyre_object::gc_roots::push_roots();
+    // The two importlib bootstrap sources are imported by the native importer
+    // before `SourceFileLoader` exists, so they never reach the `.pyc` cache and
+    // otherwise recompile on every startup.  `_frozen_importlib._cached_compile`:
+    // reload a marshalled, source-validated code object when the cache holds one
+    // for this binary, recompiling only on a miss.
+    let cache_key = match modulename {
+        "importlib._bootstrap" | "importlib._bootstrap_external" => Some(modulename),
+        _ => None,
+    };
+    let (w_code, store) = match cache_key
+        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, &source))
+    {
+        Some(w_code) => (w_code, false),
+        None => {
+            let code = parse_source_module(&pathname_str, &source).map_err(|e| {
+                crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    format!("cannot compile '{}': {e}", pathname.display()),
+                )
+            })?;
+            (
+                crate::w_code_new(Box::into_raw(Box::new(code)) as *const ()),
+                cache_key.is_some(),
+            )
+        }
+    };
+    // Root before any allocation (fresh_module_globals, the cache write) can
+    // collect the freshly boxed code out from under us.
+    pyre_object::gc_roots::pin_root(w_code);
+    if let (true, Some(key)) = (store, cache_key) {
+        crate::module::imp::interp_imp::frozen_cache_store(key, &source, w_code);
+    }
 
     // Create a fresh namespace for the module, seeded with builtins.
     // PyPy equivalent: Module.__init__ creates w_dict = space.newdict()
     // then exec_code_module sets __builtins__ and runs code in w_dict.
     let ctx = unsafe { &*execution_context };
     let w_globals = ctx.fresh_module_globals();
-    let _root = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_globals);
 
     // PyPy `interpreter/module.py:Module.__init__` seeds `__name__` on
@@ -2399,7 +2452,7 @@ fn load_source_module(
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
     if let Err(e) = exec_code_module(
-        code,
+        w_code,
         w_globals,
         execution_context,
         Some(&pathname_str),

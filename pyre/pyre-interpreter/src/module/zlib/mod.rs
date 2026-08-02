@@ -63,14 +63,7 @@ fn zlib_error(msg: impl Into<String>) -> crate::PyError {
 }
 
 fn eof_error(msg: &str) -> crate::PyError {
-    let mut err = crate::PyError::value_error(msg.to_string());
-    if let Some(cls) = crate::builtins::lookup_exc_class("EOFError") {
-        let args = [cls, w_str_new(msg)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
-    err
+    crate::PyError::new(crate::PyErrorKind::EOFError, msg)
 }
 
 // ── argument helpers ────────────────────────────────────────────────────
@@ -367,7 +360,7 @@ fn init_zdecompress_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            crate::make_builtin_function("__new__", |args| {
+            crate::typedef::make_new_descr(|args| {
                 // args[0] is the type; the rest are the constructor arguments.
                 let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
                 let wbits = to_wbits(arg_int(pos, kwargs, "wbits", 0, backend::MAX_WBITS as i64)?);

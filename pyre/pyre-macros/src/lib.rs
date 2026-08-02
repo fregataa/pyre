@@ -112,6 +112,8 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         call_args.push(quote! { #ident });
     }
 
+    reject_duplicate_param_names(&param_names, user_name.span())?;
+
     // Keyword-binding preamble: when the call carried a `__pyre_kw__`
     // dict, rebind positional+keyword args into a resolved scope keyed by
     // parameter name; otherwise the positional fast path runs unchanged.
@@ -126,11 +128,16 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let fn_name_str = user_name.to_string();
         quote! {
             let __pyre_has_kwargs = crate::builtins::has_builtin_kwargs(args);
-            let __pyre_positional_count = if __pyre_has_kwargs {
-                args.len() - 1
-            } else {
-                args.len()
-            };
+            // `bind_kwargs_to_signature` pads `args` out to the full
+            // parameter count with PY_NULL, so keyword-only slots and absent
+            // optionals would otherwise be counted as positional.  PY_NULL is
+            // never a real argument, so the leading non-null run is the true
+            // positional count on both the bound and the raw path.
+            let __pyre_positional_count = crate::builtins::split_builtin_kwargs(args)
+                .0
+                .iter()
+                .take_while(|slot| !slot.is_null())
+                .count();
             const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
             const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
             let __pyre_bound_args;
@@ -168,13 +175,6 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             .iter()
             .filter(|&&positional| positional)
             .count();
-        // `Arguments.parse_obj` fills every parameter slot before the body
-        // runs, so a keyword-only parameter widens the received `args` past
-        // the positional count.  The positional bound stays in the message,
-        // but the surplus guard compares against the full slot count — the
-        // same bound `bind_builtin_kwargs` uses — so a keyword-only slot is
-        // not mistaken for a surplus positional.
-        let slot_total = param_positional.len();
         let required = param_required
             .iter()
             .zip(param_positional.iter())
@@ -206,7 +206,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
         };
         quote! {
-            if args.len() < #required {
+            if __pyre_positional_count < #required {
                 return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
             }
             #too_many_guard
@@ -264,7 +264,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     for arg in user_sig.inputs.iter() {
         let FnArg::Typed(pt) = arg else { continue };
         let name_lit = match &*pt.pat {
-            Pat::Ident(pi) => python_keyword_name(&pi.ident.to_string()),
+            Pat::Ident(pi) => python_param_keyword(&pi.ident.to_string()),
             _ => continue,
         };
         if pt.attrs.iter().any(|a| a.path().is_ident("kwargs")) {
@@ -776,12 +776,42 @@ fn python_keyword_name(ident: &str) -> String {
     }
 }
 
+/// The Python keyword a `w_`-prefixed wrapped-object parameter binds under.
+/// A bare `w_` has no name left after stripping, so it keeps the identifier
+/// rather than binding under the empty keyword.
+fn python_param_keyword(ident: &str) -> String {
+    let visible = match ident.strip_prefix("w_") {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => ident,
+    };
+    python_keyword_name(visible)
+}
+
+/// Reject two parameters that would bind under the same Python keyword.
+/// `w_obj` and `obj` both render as `obj`, so by-name binding would silently
+/// resolve every `obj=` to the first slot and the rendered signature would
+/// name the keyword twice.
+fn reject_duplicate_param_names(names: &[String], span: proc_macro2::Span) -> syn::Result<()> {
+    for (i, name) in names.iter().enumerate() {
+        if names[..i].contains(name) {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "two parameters bind under the Python keyword `{name}`; \
+                     rename one (a `w_` prefix is stripped from the keyword)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The keyword name a parameter binds under — its identifier, or a
 /// synthetic positional-only placeholder for a non-ident pattern (which
 /// no real keyword can match).
 fn param_name(idx: usize, pt: &PatType) -> String {
     match &*pt.pat {
-        Pat::Ident(pi) => python_keyword_name(&pi.ident.to_string()),
+        Pat::Ident(pi) => python_param_keyword(&pi.ident.to_string()),
         _ => format!("__pyre_positional_{idx}"),
     }
 }
@@ -803,20 +833,20 @@ fn arity_message(
         let plural = if bound == 1 { "" } else { "s" };
         let at = if too_many { "at most" } else { "at least" };
         let text = format!("{name} expected {at} {bound} argument{plural}, got {{}}");
-        return quote! { format!(#text, args.len()) };
+        return quote! { format!(#text, __pyre_positional_count) };
     }
     match total {
         0 => {
             let text = format!("{name}() takes no arguments ({{}} given)");
-            quote! { format!(#text, args.len()) }
+            quote! { format!(#text, __pyre_positional_count) }
         }
         1 => {
             let text = format!("{name}() takes exactly one argument ({{}} given)");
-            quote! { format!(#text, args.len()) }
+            quote! { format!(#text, __pyre_positional_count) }
         }
         n => {
             let text = format!("{name} expected {n} arguments, got {{}}");
-            quote! { format!(#text, args.len()) }
+            quote! { format!(#text, __pyre_positional_count) }
         }
     }
 }
@@ -1256,8 +1286,14 @@ fn expand_pyre_class(
         named.named.insert(0, ob_field);
     }
 
-    // Collect `PyObjectRef` fields' offsets for GC tracing.  Skip `ob`
-    // because the GC walks the header through the parent (object) tid.
+    // Collect `PyObjectRef` fields' offsets for GC tracing.  `ob` is the
+    // `PyObject` header; its `w_class` word is the instance -> class edge
+    // and is listed explicitly.  A `#[pyre_class]` instance created for a
+    // Python subclass carries the (managed) heap type there, and the
+    // collector traces nothing but the offsets registered for the
+    // instance's own type id — a parent tid contributes none — so leaving
+    // it out let the subclass type be swept while instances were live.
+    // `ob_type` stays out: it always points at the `static PyType`.
     let mut ptr_field_idents: Vec<syn::Ident> = Vec::new();
     for f in named.named.iter() {
         let Some(ident) = f.ident.clone() else {
@@ -1270,11 +1306,15 @@ fn expand_pyre_class(
             ptr_field_idents.push(ident);
         }
     }
-    let ptr_offsets_len = ptr_field_idents.len();
-    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> = ptr_field_idents
-        .iter()
-        .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) })
-        .collect();
+    let ptr_offsets_len = ptr_field_idents.len() + 1;
+    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> =
+        std::iter::once(quote! { ::std::mem::offset_of!(#st_name, ob.w_class) })
+            .chain(
+                ptr_field_idents
+                    .iter()
+                    .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) }),
+            )
+            .collect();
 
     Ok(quote! {
         #st
@@ -1433,6 +1473,9 @@ pub fn pyre_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[derive(Default)]
 struct PyreMethodsAttrs {
     doc: Option<syn::LitStr>,
+    /// TypeDef `_text_signature_` — the constructor signature exposed by
+    /// `type.__text_signature__`.
+    text_signature: Option<syn::LitStr>,
     weakrefable: bool,
     unhashable: bool,
     /// Optional base class expression — the `__base` of the TypeDef.
@@ -1455,6 +1498,10 @@ impl syn::parse::Parse for PyreMethodsAttrs {
                     input.parse::<syn::Token![=]>()?;
                     out.doc = Some(input.parse()?);
                 }
+                "_text_signature_" => {
+                    input.parse::<syn::Token![=]>()?;
+                    out.text_signature = Some(input.parse()?);
+                }
                 "weakrefable" => out.weakrefable = true,
                 "unhashable" => out.unhashable = true,
                 "base" => {
@@ -1466,7 +1513,8 @@ impl syn::parse::Parse for PyreMethodsAttrs {
                         key.span(),
                         format!(
                             "unknown `#[pyre_methods]` key `{other}` — expected \
-                             `doc = \"...\"` / `weakrefable` / `unhashable` / `base = <expr>`",
+                             `doc = \"...\"` / `_text_signature_ = \"...\"` / \
+                             `weakrefable` / `unhashable` / `base = <expr>`",
                         ),
                     ));
                 }
@@ -1842,6 +1890,7 @@ fn expand_pyre_methods(
         let mut param_positional = Vec::<bool>::new();
         let mut has_varargs = false;
         let mut kwonly_tail = false;
+        let mut kwonly_start = None;
         for (offset, arg) in inputs.enumerate() {
             let FnArg::Typed(pt) = arg else {
                 return Err(syn::Error::new(
@@ -1857,6 +1906,10 @@ fn expand_pyre_methods(
             let is_kwargs = pt.attrs.iter().any(|a| a.path().is_ident("kwargs"));
             if is_kwonly {
                 kwonly_tail = true;
+                // The first kwonly offset splits the rendered signature text.
+                if kwonly_start.is_none() {
+                    kwonly_start = Some(offset);
+                }
             }
             param_names.push(param_name(offset, pt));
             // Optional iff it has a `#[default(...)]` or is `Option<T>`.
@@ -1866,6 +1919,8 @@ fn expand_pyre_methods(
             unwrap_stmts.push(stmt);
             call_args.push(quote! { #ident });
         }
+
+        reject_duplicate_param_names(&param_names, m.sig.span())?;
 
         // Keyword-binding preamble (mirrors `#[pyre_function]`): when the
         // call carried a trailing `__pyre_kw__` dict, rebind positional +
@@ -1917,11 +1972,17 @@ fn expand_pyre_methods(
                 let fn_name_str = mname.to_string();
                 quote! {
                     let __pyre_has_kwargs = crate::builtins::has_builtin_kwargs(args);
-                    let __pyre_positional_count = if __pyre_has_kwargs {
-                        args.len() - 1
-                    } else {
-                        args.len()
-                    };
+                    // `bind_kwargs_to_signature` pads `args` out to the
+                    // full parameter count with PY_NULL, so keyword-only
+                    // slots and absent optionals would otherwise be counted
+                    // as positional.  PY_NULL is never a real argument, so
+                    // the leading non-null run is the true positional count
+                    // on both the bound and the raw path.
+                    let __pyre_positional_count = crate::builtins::split_builtin_kwargs(args)
+                        .0
+                        .iter()
+                        .take_while(|slot| !slot.is_null())
+                        .count();
                     const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
                     const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
                     let __pyre_bound_args;
@@ -1951,7 +2012,12 @@ fn expand_pyre_methods(
                 kind,
                 MethodKind::Getter(..) | MethodKind::Setter(..) | MethodKind::Deleter(..)
             );
-            if has_varargs || is_property {
+            let has_keyword_slots = param_positional.iter().any(|positional| !positional);
+            if has_varargs || is_property || has_keyword_slots {
+                // See `expand_pyre_function`: once a slot can be filled by
+                // keyword, the resolved scope no longer distinguishes it from
+                // a positional one, and `bind_kwargs_to_signature` has already
+                // applied the bound.
                 quote! {}
             } else {
                 let receiver_slots = usize::from(matches!(kind, MethodKind::Instance));
@@ -1993,11 +2059,7 @@ fn expand_pyre_methods(
                         crate::gateway::method_arity_failure(
                             #fn_name,
                             #expected,
-                            if args.len() >= #receiver_slots {
-                                args.len() - #receiver_slots
-                            } else {
-                                0
-                            },
+                            __pyre_positional_count.saturating_sub(#receiver_slots),
                         )
                     }
                 } else {
@@ -2005,19 +2067,19 @@ fn expand_pyre_methods(
                         crate::gateway::method_min_arity_failure(
                             #fn_name,
                             #visible_required,
-                            args.len().saturating_sub(#receiver_slots),
+                            __pyre_positional_count.saturating_sub(#receiver_slots),
                         )
                     }
                 };
                 quote! {
-                    if args.len() < #expected_min {
+                    if __pyre_positional_count < #expected_min {
                         return #too_few;
                     }
                     if __pyre_positional_count > #expected_total {
                         return crate::gateway::method_arity_failure(
                             #fn_name,
                             #expected,
-                            args.len() - #receiver_slots,
+                            __pyre_positional_count.saturating_sub(#receiver_slots),
                         );
                     }
                 }
@@ -2063,7 +2125,14 @@ fn expand_pyre_methods(
                             ::std::option::Option::None => false,
                         };
                         if !__pyre_same_tp {
+                            // `ob.w_class` is a traced edge of every
+                            // `#[pyre_class]` layout, and an old-gen payload
+                            // can take a young heap type here, so the store
+                            // joins the remembered set.
                             unsafe { (*__pyre_obj).w_class = __pyre_cls; }
+                            ::pyre_object::gc_hook::try_gc_write_barrier(
+                                __pyre_obj as *mut u8,
+                            );
                         }
                     }
                 }
@@ -2100,11 +2169,77 @@ fn expand_pyre_methods(
                     func: #wrapper_name,
                 };
         });
-        let raw_fn = quote! { crate::make_builtin_function(#py_name, #wrapper_name) };
+        // gateway.py:1146-1211 `_generate_text_signature`: a regular
+        // interp2app instance method whose arguments are all required and
+        // non-variadic has a lossless generated signature. Defaults need
+        // their Python repr, so those continue to require an explicit
+        // declaration rather than guessing from Rust tokens.
+        let raw_fn = if let Some(kwonly_start) = kwonly_start {
+            let names = param_names.iter().map(|name| name.as_str());
+            let receiver = if matches!(kind, MethodKind::Instance) {
+                quote! {
+                    __b.append("self");
+                    __b.marker_posonly();
+                }
+            } else {
+                quote! {}
+            };
+            let before_kwonly = names.clone().take(kwonly_start);
+            let after_kwonly = names.skip(kwonly_start);
+            quote! {
+                crate::make_builtin_function_maybe_sig(
+                    #py_name,
+                    #wrapper_name,
+                    {
+                        let mut __b = crate::SignatureBuilder::default();
+                        #receiver
+                        #(__b.append(#before_kwonly);)*
+                        __b.marker_kwonly();
+                        #(__b.append(#after_kwonly);)*
+                        ::std::option::Option::Some(__b.signature())
+                    },
+                )
+            }
+        } else if matches!(kind, MethodKind::Instance)
+            && !has_varargs
+            && param_required.iter().all(|required| *required)
+        {
+            let mut parts = vec!["$self".to_string()];
+            parts.extend(param_names.iter().cloned());
+            parts.push("/".to_string());
+            let text_signature = format!("({})", parts.join(", "));
+            quote! {
+                crate::gateway::make_builtin_function_with_text_signature(
+                    #py_name,
+                    #wrapper_name,
+                    #text_signature,
+                )
+            }
+        } else if is_new {
+            // A `tp_new` wrapper is `builtin_function_or_method`, the type
+            // `make_new_descr` hands to every by-hand `__new__`.  `inspect`
+            // decides whether a class has a user-defined `__new__` by testing
+            // for that type, so leaving this one a plain `function` routes the
+            // class down the bound-method path instead of reading its
+            // `__text_signature__`.
+            quote! { crate::gateway::make_builtin_function_as_builtin(#py_name, #wrapper_name) }
+        } else {
+            quote! { crate::make_builtin_function(#py_name, #wrapper_name) }
+        };
         match &kind {
             MethodKind::Instance => {
                 registrations.push(quote! {
                     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name, #raw_fn) };
+                });
+            }
+            // `__new__` is the one static entry that is not a `tp_methods`
+            // entry: `add_tp_new_wrapper` stores the carrier itself, so the
+            // namespace holds a `builtin_function_or_method` bound to the
+            // owning type rather than a `staticmethod` around one.
+            MethodKind::Static if py_name == "__new__" => {
+                registrations.push(quote! {
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
+                        crate::typedef::make_new_descr(#wrapper_name)) };
                 });
             }
             MethodKind::Static => {
@@ -2232,7 +2367,11 @@ fn expand_pyre_methods(
         });
         for arg in m.sig.inputs.iter_mut() {
             if let FnArg::Typed(pt) = arg {
-                pt.attrs.retain(|a| !a.path().is_ident("default"));
+                pt.attrs.retain(|a| {
+                    !a.path().is_ident("default")
+                        && !a.path().is_ident("kwonly")
+                        && !a.path().is_ident("kwargs")
+                });
             }
         }
         rewrite_alias_args(&mut m.sig);
@@ -2243,6 +2382,12 @@ fn expand_pyre_methods(
     let base_expr = match &attrs.base {
         Some(e) => quote! { #e },
         None => quote! { crate::typedef::w_object() },
+    };
+    let set_type_text_signature = match &attrs.text_signature {
+        Some(signature) => quote! {
+            unsafe { ::pyre_object::w_type_set_text_signature(tp, #signature) };
+        },
+        None => quote! {},
     };
 
     let type_object_fn = quote! {
@@ -2265,6 +2410,7 @@ fn expand_pyre_methods(
                         },
                         tp,
                     );
+                    #set_type_text_signature
                     tp as usize
                 }) as ::pyre_object::PyObjectRef
         }

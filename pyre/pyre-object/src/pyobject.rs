@@ -620,6 +620,11 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (149, Some(0)),
     (150, Some(0)),
     (152, Some(0)),
+    // `_thread` lock / RLock / handle, registered at the absolute tail of
+    // `build_gc` for the header `w_class` edge (`all_w_class_only_descriptors`).
+    (153, Some(0)),
+    (154, Some(0)),
+    (155, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
@@ -982,6 +987,10 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE,
             &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
+        (
+            &crate::interp_exceptions::EXC_EOF_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
+        ),
     ];
     PYTYPES
 }
@@ -1015,6 +1024,15 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(21, &crate::function::CLASSMETHOD_TYPE),
         subclass_range_alias(22, &crate::_pypy_generic_alias::UNION_TYPE),
         subclass_range_alias(23, &crate::iterobject::SEQ_ITER_TYPE),
+        // The producer-specific str/bytes/bytearray/memoryview/array iterator
+        // identities all carry the `W_SeqIterObject` payload, so they share
+        // its GC type id the way the six dict view iterators share 115.
+        subclass_range_alias(23, &crate::iterobject::STR_ASCII_ITER_TYPE),
+        subclass_range_alias(23, &crate::iterobject::STR_ITER_TYPE),
+        subclass_range_alias(23, &crate::iterobject::BYTES_ITER_TYPE),
+        subclass_range_alias(23, &crate::iterobject::BYTEARRAY_ITER_TYPE),
+        subclass_range_alias(23, &crate::iterobject::MEMORY_ITER_TYPE),
+        subclass_range_alias(23, &crate::iterobject::ARRAY_ITER_TYPE),
         subclass_range_alias(24, typed::<crate::interp_itertools::W_Count>()),
         subclass_range_alias(25, typed::<crate::interp_itertools::W_Repeat>()),
         // `enumerate` W_Enumerate — auto-id `allocate_stable` registered at the
@@ -1045,6 +1063,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(31, &crate::interp_exceptions::EXC_UNBOUND_LOCAL_ERROR_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE),
+        subclass_range_alias(31, &crate::interp_exceptions::EXC_EOF_ERROR_TYPE),
         subclass_range_alias(32, &crate::generator::GENERATOR_TYPE),
         subclass_range_alias(33, &TYPE_TYPE),
         subclass_range_alias(34, &STR_TYPE),

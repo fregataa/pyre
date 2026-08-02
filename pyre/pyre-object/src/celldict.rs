@@ -292,29 +292,88 @@ pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> O
     // prebuilt-family root walk; record the store so the next minor
     // collection rescans it (gc_roots.rs prebuilt-root write tracking).
     crate::gc_roots::mark_prebuilt_roots_dirty();
+    match classify_cell_write(w_cell, w_value) {
+        CellWrite::InPlaceObject(cell) => {
+            (*(cell as *mut ObjectMutableCell)).w_value = w_value;
+            None
+        }
+        CellWrite::InPlaceInt(cell, intvalue) => {
+            (*(cell as *mut IntMutableCell)).intvalue = intvalue;
+            None
+        }
+        CellWrite::Unchanged => None,
+        CellWrite::StoreBare => Some(w_value),
+        CellWrite::Replace => {
+            if crate::listobject::is_plain_int1(w_value) {
+                return Some(w_int_mutable_cell_new(crate::listobject::plain_int_w(
+                    w_value,
+                )));
+            }
+            Some(w_object_mutable_cell_new(w_value))
+        }
+    }
+}
+
+/// What [`write_cell`] will do with the slot.
+///
+/// Split out from the mutation so the tracer's bump predicate
+/// ([`store_would_bump_version`]) cannot drift from the write it predicts.
+enum CellWrite {
+    /// Write through the existing cell; the stored pointer, and therefore
+    /// `version?`, stands.
+    InPlaceObject(PyObjectRef),
+    InPlaceInt(PyObjectRef, i64),
+    /// The slot already holds this exact value.
+    Unchanged,
+    /// No cell yet: store the value itself, without a level of indirection.
+    /// A later write over it is what promotes the slot to a cell.
+    StoreBare,
+    /// A cell is there but cannot take the value in place, so the slot gets a
+    /// fresh one.
+    Replace,
+}
+
+/// The decision half of [`write_cell`]; performs no store.
+unsafe fn classify_cell_write(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> CellWrite {
     let Some(w_cell) = w_cell else {
         // attribute does not exist at all, write it without a cell first
-        return Some(w_value);
+        return CellWrite::StoreBare;
     };
     if is_object_mutable_cell(w_cell) {
-        (*(w_cell as *mut ObjectMutableCell)).w_value = w_value;
-        return None;
+        return CellWrite::InPlaceObject(w_cell);
     }
     if is_int_mutable_cell(w_cell) && crate::listobject::is_plain_int1(w_value) {
-        (*(w_cell as *mut IntMutableCell)).intvalue = crate::listobject::plain_int_w(w_value);
-        return None;
+        return CellWrite::InPlaceInt(w_cell, crate::listobject::plain_int_w(w_value));
     }
     // If the new value and the current value are the same, don't
     // create a level of indirection, or mutate the version.
     if std::ptr::eq(w_cell, w_value) {
-        return None;
+        return CellWrite::Unchanged;
     }
-    if crate::listobject::is_plain_int1(w_value) {
-        return Some(w_int_mutable_cell_new(crate::listobject::plain_int_w(
-            w_value,
-        )));
-    }
-    Some(w_object_mutable_cell_new(w_value))
+    CellWrite::Replace
+}
+
+/// Whether storing `w_value` over the raw slot contents `w_cell` would reach
+/// `mutated()`, i.e. would assign the `version?` quasi-immutable field.
+///
+/// This is the tracer's stand-in for the rtyper-inserted
+/// `jit_force_quasi_immutable` that upstream places on that write
+/// (`rclass.py:715-718`). Pyre's store runs inside a residual helper the walker
+/// never looks into, so the walker has to ask the question ahead of the call
+/// instead of meeting the operation inside it. Side-effect-free by
+/// construction — it only classifies.
+///
+/// An in-place cell write must answer `false`: it leaves the stored pointer
+/// alone, so `version` stays valid and a hot module-scope loop must keep its
+/// compiled trace.
+///
+/// # Safety
+/// `w_cell` (when `Some`) and `w_value` must point at live objects.
+pub unsafe fn store_would_bump_version(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> bool {
+    matches!(
+        classify_cell_write(w_cell, w_value),
+        CellWrite::StoreBare | CellWrite::Replace
+    )
 }
 
 /// `pypy/objspace/std/celldict.py:20-21 VersionTag`:
@@ -408,6 +467,44 @@ pub fn module_dict_storage_gc_type_id() -> u32 {
     MODULE_DICT_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The single `IndexMap` probe [`ModuleDictStorage::get`] runs —
+/// `celldict.py:143-145 getitem_str`'s
+/// `self.unerase(w_dict.dstorage).get(key)`.
+///
+/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py:139`), the
+/// twin of `dictmultiobject::dict_entries_probe_str`: the `IndexMap::get` it
+/// wraps is an external-crate heap lookup the tracer cannot model — the
+/// oopspec'd residual arm of `rordereddict.ll_dict_getitem` (traced only for a
+/// virtual dict).  The keys are owned `String`s, so no user `__eq__` or
+/// `__hash__` can run inside the boundary at all.
+#[majit_macros::dont_look_inside]
+pub fn module_dict_entries_get(
+    entries: &indexmap::IndexMap<String, PyObjectRef>,
+    key: &str,
+) -> Option<PyObjectRef> {
+    entries.get(key).copied()
+}
+
+/// The store side of [`module_dict_entries_get`] — `celldict.py:47`'s
+/// `self.unerase(w_dict.dstorage)[key] = w_value`, returning the displaced
+/// value so the caller can tell an overwrite from an insert.
+///
+/// `IndexMap::insert` preserves the existing slot's position on overwrite,
+/// matching Python `{}`'s assignment semantics (rewriting an existing key does
+/// not move it to the end).  Residualised for [`module_dict_entries_get`]'s
+/// reason; upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py:674`)
+/// is likewise `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`
+/// and neither conjunct can hold for an `IndexMap` here.  The borrowed name is
+/// copied to the owned `String` the entry table stores inside the boundary.
+#[majit_macros::dont_look_inside]
+pub fn module_dict_entries_insert(
+    entries: &mut indexmap::IndexMap<String, PyObjectRef>,
+    key: &str,
+    w_value: PyObjectRef,
+) -> Option<PyObjectRef> {
+    entries.insert(key.to_string(), w_value)
+}
+
 impl ModuleDictStorage {
     pub fn new() -> Self {
         Self {
@@ -427,7 +524,7 @@ impl ModuleDictStorage {
     /// `dict.__getitem__(key)` returning the raw stored value (or
     /// cell — eventually).  None when absent.
     pub fn get(&self, key: &str) -> Option<PyObjectRef> {
-        self.entries.get(key).copied()
+        module_dict_entries_get(&self.entries, key)
     }
 
     /// `dict[key] = w_value` — insertion-ordered.  Returns the
@@ -436,10 +533,7 @@ impl ModuleDictStorage {
         // Prebuilt-family store (see `write_cell`): the module-dict storage
         // is Box-immortal, so the write-tracking bit is its write barrier.
         crate::gc_roots::mark_prebuilt_roots_dirty();
-        // `IndexMap::insert` preserves the existing slot's position
-        // on overwrite, matching Python `{}`'s assignment semantics
-        // (rewriting an existing key does not move it to the end).
-        self.entries.insert(key.to_string(), w_value)
+        module_dict_entries_insert(&mut self.entries, key, w_value)
     }
 
     /// `del dict[key]` — returns the removed value or None.
@@ -593,14 +687,20 @@ pub struct ModuleDictStrategy {
     pub caches: std::sync::Mutex<
         Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<GlobalCache>>>>,
     >,
-    /// JIT loop-invalidation flags watching the `version?` quasi-immutable
-    /// field.  Each compiled loop whose trace promoted `self.version`
-    /// (and folded a module-global lookup keyed on it) registers its
-    /// `JitCellToken` invalidation flag here.  `mutated()` reassigns
-    /// `version`, which under `_immutable_fields_ = ["version?"]` must
-    /// invalidate every such loop, so it flips all live flags.  Weak refs
-    /// so a dead loop token drops out without keeping the flag alive.
-    version_watchers: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
+    /// The hidden `mutate_version` field for `celldict.py:34
+    /// _immutable_fields_ = ["version?"]`.  Each compiled loop whose trace
+    /// promoted `self.version` (and folded a module-global lookup keyed on it)
+    /// registers its `JitCellToken` invalidation flag here; `mutated()`
+    /// reassigns `version`, which under the `?` declaration must invalidate
+    /// every such loop.
+    ///
+    /// The same [`crate::quasiimmut::QuasiImmutField`] `W_TypeObject`'s
+    /// `_version_tag?` uses, as upstream's one `QuasiImmut` class serves every
+    /// quasi-immutable field.  Before that it was a bare `Vec` pushed to
+    /// without synchronisation while `mutated()` swept it from another thread,
+    /// and it had no `compress_looptokens_list`, so a module recompiled against
+    /// many times and never mutated grew one entry per compile.
+    version_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Runtime-assigned GC type id for the [`ModuleDictStrategy`] box.
@@ -618,36 +718,6 @@ pub fn module_dict_strategy_gc_type_id() -> u32 {
     MODULE_DICT_STRATEGY_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Flip every live watcher flag and drop the dead weak refs — the non-empty
-/// half of [`ModuleDictStrategy::notify_version_watchers`].
-///
-/// This is the `version?` quasi-immutable invalidation walk, and upstream runs
-/// the whole of it outside traced code: `QuasiImmut.invalidate`
-/// (`metainterp/quasiimmut.py`) iterates `looptokens_wrefs` and calls
-/// `invalidate_loop` from the residual `jit_force_quasi_immutable` path, never
-/// from a trace.  Residualise it here for the same reason
-/// (`@dont_look_inside`, `rlib/jit.py:139`); the `Vec::retain` closure over
-/// `Weak::upgrade` has no lowering either way.  The `is_empty` early-out stays
-/// traced, so the common no-watcher mutation still makes no call.
-#[majit_macros::dont_look_inside]
-pub fn sweep_version_watchers(watchers: &mut Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>) {
-    // `QuasiImmut.invalidate` takes the list and empties it BEFORE walking it
-    // (`wrefs = self.looptokens_wrefs; self.looptokens_wrefs = []`), so a loop
-    // is invalidated exactly once and then drops out.  Keeping the live
-    // watchers instead would be doubly wrong: the flag is already `true`, so
-    // re-storing it does nothing, and the list would only ever grow — one
-    // entry per compiled loop that folded a module-global.  A module-level
-    // `except X as e:` runs `del e` every iteration, and `delitem` calls
-    // `mutated()`, so retaining would make each iteration walk every loop ever
-    // compiled in the module: O(compiled loops) per store, and the JIT
-    // compiling more loops would make the interpreter slower.
-    for w in std::mem::take(watchers) {
-        if let Some(flag) = w.upgrade() {
-            flag.store(true, std::sync::atomic::Ordering::Release);
-        }
-    }
-}
-
 impl Default for ModuleDictStrategy {
     fn default() -> Self {
         Self::new()
@@ -660,32 +730,53 @@ impl ModuleDictStrategy {
         Self {
             version: VersionTag::fresh(),
             caches: std::sync::Mutex::new(None),
-            version_watchers: Vec::new(),
+            version_watchers: crate::quasiimmut::QuasiImmutField::new(),
         }
     }
 
     /// Register a JIT loop's invalidation flag against the `version?`
-    /// quasi-immutable field.  The compile-time glue
-    /// (`register_quasi_immutable_deps` analogue) calls this once per
+    /// quasi-immutable field (`quasiimmut.py:116-126
+    /// get_current_qmut_instance` + `:72-75 register_loop_token`).  The
+    /// compile-time glue (`register_quasi_immutable_deps`) calls this once per
     /// version-keyed module-global dependency, passing the
-    /// `JitCellToken.invalidation_flag()`.  Mirrors
-    /// `DictStorage::register_slot_watcher` but keyed on the strategy
-    /// version rather than a per-slot index.
-    pub fn register_version_watcher(
-        &mut self,
-        flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        self.version_watchers.push(std::sync::Arc::downgrade(flag));
+    /// `JitCellToken.invalidation_flag()`.
+    pub fn register_version_watcher(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.version_watchers.register_loop_token(flag);
     }
 
-    /// Invalidate every loop watching `version`.  Sets each live flag to
-    /// `true` (the polarity `GuardNotInvalidated` tests) and drops dead
-    /// weak refs.  Mirrors `DictStorage::notify_slot_watchers`.
-    fn notify_version_watchers(&mut self) {
-        if self.version_watchers.is_empty() {
+    /// `quasiimmut.py:116-126 get_current_qmut_instance` alone — install the
+    /// instance while the trace is still recording, so a `mutated()` reached
+    /// later in the same trace finds the field non-null.
+    pub fn install_version_watcher(&self) {
+        self.version_watchers.ensure_installed();
+    }
+
+    /// `pyjitpl.py:1112 mutatebox.nonnull()` — whether some trace or loop is
+    /// watching `version?` right now.
+    pub fn version_qmut_installed(&self) -> bool {
+        self.version_watchers.is_installed()
+    }
+
+    /// `quasiimmut.py:46-51 do_force_quasi_immutable`, which the tracer calls
+    /// itself before aborting (`pyjitpl.py:1113-1115`). Idempotent: a field
+    /// already taken returns early, so the interpreter re-running the opcode
+    /// after the abort forces nothing a second time.
+    pub fn force_version_qmut(&self) {
+        self.version_watchers.invalidate();
+    }
+
+    /// Invalidate every loop watching `version`
+    /// (`quasiimmut.py:129-134 _invalidate_now`).  Sets each live flag to
+    /// `true`, the polarity `GuardNotInvalidated` tests.
+    ///
+    /// The installed check stays traced and the sweep is residual, for the
+    /// reason upstream's own walk is out of line: it hangs off
+    /// `jit_force_quasi_immutable`, never a trace.
+    fn notify_version_watchers(&self) {
+        if !self.version_watchers.is_installed() {
             return;
         }
-        sweep_version_watchers(&mut self.version_watchers);
+        unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.version_watchers) };
     }
 
     /// `celldict.py:214-240 get_global_cache`:
@@ -1251,9 +1342,10 @@ mod tests {
         strategy.register_version_watcher(&flag);
         // Drop the only strong ref: the weak watcher can no longer upgrade.
         drop(flag);
-        // notify (via mutated) must not panic and must purge the dead weak.
+        // notify (via mutated) must not panic, and `_invalidate_now` unlinks
+        // the instance whether or not any flag could still be upgraded.
         strategy.mutated();
-        assert!(strategy.version_watchers.is_empty());
+        assert!(!strategy.version_watchers.is_installed());
     }
 
     #[test]

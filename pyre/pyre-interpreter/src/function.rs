@@ -17,7 +17,8 @@ pub static BUILTIN_FUNCTION_TYPE: PyType =
 ///
 /// PyPy represents these as `FunctionWithFixedCode`; the separate public
 /// type preserves that payload and call ABI while exposing CPython's
-/// `method_descriptor` surface.
+/// `method_descriptor` surface.  Staying distinct from a user `function` is
+/// load-bearing: the stdlib reducers classify descriptors by this type.
 pub static METHOD_DESCRIPTOR_TYPE: PyType = pyre_object::pyobject::new_pytype("method_descriptor");
 /// CPython-compatible slot wrapper descriptor.
 ///
@@ -25,6 +26,27 @@ pub static METHOD_DESCRIPTOR_TYPE: PyType = pyre_object::pyobject::new_pytype("m
 /// payload deliberately reuses [`Function`]: both are immutable BuiltinCode
 /// carriers and therefore have identical GC edges and call ABI.
 pub static SLOT_WRAPPER_TYPE: PyType = pyre_object::pyobject::new_pytype("wrapper_descriptor");
+/// The bound form of a slot wrapper — `descrobject.c PyMethodWrapper_Type`.
+///
+/// A `wrapper_descriptor` accessed on an instance yields this, the way a
+/// `method_descriptor` yields a `builtin_function_or_method`.  Like that pair
+/// the payload stays PyPy's [`Method`], so only the public class differs; the
+/// separate type is what lets `inspect.ismethodwrapper` and `inspect.isbuiltin`
+/// tell the two bound forms apart.
+pub static METHOD_WRAPPER_TYPE: PyType = pyre_object::pyobject::new_pytype("method-wrapper");
+/// A `METH_CLASS` entry of a builtin type — `descrobject.c
+/// PyClassMethodDescr_Type`.
+///
+/// `type_ready_fill_dict` wraps such an entry in the same [`ClassMethod`]
+/// carrier a `@classmethod` uses, so the payload is shared and only the public
+/// class differs.  Keeping the two apart is what makes `dict.fromkeys` a
+/// descriptor while a user `@classmethod` stays an ordinary wrapper, which
+/// `inspect._signature_get_user_defined_method` relies on to decide whether a
+/// `__init__` / `__new__` / `__call__` was written in Python.
+///
+/// [`ClassMethod`]: pyre_object::function::ClassMethod
+pub static CLASSMETHOD_DESCRIPTOR_TYPE: PyType =
+    pyre_object::pyobject::new_pytype("classmethod_descriptor");
 
 /// User-defined function object.
 ///
@@ -353,11 +375,77 @@ pub fn function_new_with_closure(
     function_new_impl(
         &FUNCTION_TYPE,
         code,
-        name,
+        FunctionName::Owned(name),
         w_func_globals_obj,
         closure,
         true,
     )
+}
+
+/// Where a new function's `name` slot points.
+///
+/// `function.py:51 self.name = forcename or code.co_name` copies the code
+/// object's own string; RPython strings are immutable and shared, so no second
+/// allocation exists upstream.  Pyre's names live in explicit storage, so the
+/// two shapes are named here: `Owned` boxes a string the caller built, while
+/// `Borrowed` hands over a pointer whose storage outlives every function that
+/// names it.
+pub enum FunctionName {
+    /// Box the string — a GC storage box for a mortal (`PyCode`) function, a
+    /// `malloc_raw` box for an immortal builtin.
+    Owned(String),
+    /// Point at existing permanent storage: a `Box::into_raw`'d `CodeObject`'s
+    /// `co_name`, which is never rewritten in place (`code.replace()` clones
+    /// first) and is never freed.  The GC walker's managed-heap guard skips the
+    /// edge for the same reason it skips an immortal builtin's `malloc_raw`
+    /// name, and `function_set_func_name` replaces this pointer instead of
+    /// writing through it, so several functions may share one string.
+    Borrowed(*const String),
+}
+
+/// `pyopcode.py:1457 MAKE_FUNCTION` construction: both the name and the
+/// qualified name come off the code object, so neither allocates.
+///
+/// `function.py:51-54`:
+///
+/// ```python
+/// self.name = forcename or code.co_name
+/// self.qualname = qualname or self.name
+/// ```
+///
+/// `w_code` is the code wrapper the new function keeps in its `code` slot; it
+/// owns the borrowed `co_name` and the shared realized `co_qualname`.
+pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectRef) -> PyObjectRef {
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let name = if code_ptr.is_null() {
+        FunctionName::Owned(String::new())
+    } else {
+        FunctionName::Borrowed(unsafe { &(*code_ptr).obj_name } as *const String)
+    };
+    // `function.py:54 self.qualname = qualname or self.name`.  The code object
+    // realizes one wrapped qualname and every function built from it names that
+    // object, so a later `__code__ = new_code` assignment leaves
+    // `__qualname__` alone (`pyopcode.py:1457` stamps it at construction).
+    // Realize it BEFORE the function so the one allocation that can collect
+    // runs while no unrooted function is live.
+    unsafe { crate::pycode::w_code_qualname_obj(w_code) };
+    let func = function_new_impl(
+        &FUNCTION_TYPE,
+        w_code as *const (),
+        name,
+        w_func_globals_obj,
+        PY_NULL,
+        true,
+    );
+    // `pick_builtin_obj` inside the constructor is a collection point, so read
+    // the realized qualname back through the Box-immortal code wrapper (whose
+    // slot the raw-root walker forwards) rather than through a stale pre-call
+    // copy.  This second call is a plain cache hit.
+    let w_qualname = unsafe { crate::pycode::w_code_qualname_obj(w_code) };
+    if !w_qualname.is_null() {
+        unsafe { function_set_qualname(func, w_qualname) };
+    }
+    func
 }
 
 /// Allocate a `Function` object, GC-managed for user code and immortal for
@@ -372,7 +460,7 @@ pub fn function_new_with_closure(
 pub(crate) fn function_new_impl(
     ob_type: &'static PyType,
     code: *const (),
-    name: String,
+    name: FunctionName,
     w_func_globals_obj: PyObjectRef,
     closure: PyObjectRef,
     can_change_code: bool,
@@ -434,13 +522,16 @@ pub(crate) fn function_new_impl(
     // is stored into the Function below.
     let is_builtin =
         !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
-    let name_ptr = if is_builtin {
-        pyre_object::lltype::malloc_raw(name) as *const String
-    } else {
-        pyre_object::gc_storage::gc_alloc_storage_box(
+    let name_ptr = match name {
+        // Already-permanent storage owned by the code object; nothing to box.
+        FunctionName::Borrowed(ptr) => ptr,
+        FunctionName::Owned(name) if is_builtin => {
+            pyre_object::lltype::malloc_raw(name) as *const String
+        }
+        FunctionName::Owned(name) => pyre_object::gc_storage::gc_alloc_storage_box(
             name,
             pyre_object::typeobject::name_storage_gc_type_id(),
-        ) as *const String
+        ) as *const String,
     };
     let function = Function {
         ob: PyObject {
@@ -506,11 +597,29 @@ pub fn function_new_with_fixed_code(
     function_new_impl(
         &FUNCTION_TYPE,
         code,
-        name,
+        FunctionName::Owned(name),
         w_func_globals_obj,
         PY_NULL,
         false,
     )
+}
+
+/// Expose a type-owned `FunctionWithFixedCode` as a method descriptor.
+///
+/// PyPy performs the ownership step in `TypeCache.build`, where it finds
+/// `FunctionWithFixedCode` values in a `TypeDef` and stamps their
+/// `objclass`/qualified name.  A fixed-code function can also be a standalone
+/// callable (for example `itertools.chain`), so allocation alone cannot decide
+/// its public descriptor kind.  Retag it only when that same TypeCache step
+/// establishes a defining type.
+///
+/// The payload and GC layout are unchanged: `METHOD_DESCRIPTOR_TYPE` is an
+/// alias of the `Function` GC type, just as `SLOT_WRAPPER_TYPE` is.
+pub unsafe fn function_mark_method_descriptor(function: PyObjectRef) {
+    unsafe {
+        (*function).ob_type = &METHOD_DESCRIPTOR_TYPE;
+        (*function).w_class = pyre_object::get_instantiate(&METHOD_DESCRIPTOR_TYPE);
+    }
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -523,7 +632,7 @@ pub fn function_new_builtin(
     function_new_impl(
         &BUILTIN_FUNCTION_TYPE,
         code,
-        name,
+        FunctionName::Owned(name),
         w_func_globals_obj,
         PY_NULL,
         false,
@@ -532,7 +641,14 @@ pub fn function_new_builtin(
 
 /// Allocate an immutable slot-wrapper descriptor backed by `BuiltinCode`.
 pub fn function_new_slot_wrapper(code: *const (), name: String) -> PyObjectRef {
-    function_new_impl(&SLOT_WRAPPER_TYPE, code, name, PY_NULL, PY_NULL, false)
+    function_new_impl(
+        &SLOT_WRAPPER_TYPE,
+        code,
+        FunctionName::Owned(name),
+        PY_NULL,
+        PY_NULL,
+        false,
+    )
 }
 
 /// Retag a freshly materialised `FunctionWithFixedCode` as the public
@@ -545,9 +661,29 @@ pub unsafe fn function_retag_method_descriptor(obj: PyObjectRef) {
     }
 }
 
+/// Retag a freshly materialised `FunctionWithFixedCode` as the public
+/// slot-wrapper carrier — the `add_operators` half of the same namespace sweep
+/// [`function_retag_method_descriptor`] serves.
+///
+/// # Safety
+/// `obj` must be a valid, live `FunctionWithFixedCode` carrier.
+pub unsafe fn function_retag_slot_wrapper(obj: PyObjectRef) {
+    unsafe {
+        (*obj).ob_type = &SLOT_WRAPPER_TYPE as *const PyType;
+        (*obj).w_class = get_instantiate(&SLOT_WRAPPER_TYPE);
+    }
+}
+
 /// Allocate an immutable ordinary method descriptor backed by `BuiltinCode`.
 pub fn function_new_method_descriptor(code: *const (), name: String) -> PyObjectRef {
-    function_new_impl(&METHOD_DESCRIPTOR_TYPE, code, name, PY_NULL, PY_NULL, false)
+    function_new_impl(
+        &METHOD_DESCRIPTOR_TYPE,
+        code,
+        FunctionName::Owned(name),
+        PY_NULL,
+        PY_NULL,
+        false,
+    )
 }
 
 /// function.py:385-388 — `_check_code_mutable(attr)`:
@@ -624,6 +760,60 @@ pub fn builtin_bound_method_new(
         pyre_object::function::w_method_set_module(method, pyre_object::w_none());
     }
     method
+}
+
+/// `descrobject.c PyWrapper_New` — bind a slot wrapper to its receiver.
+///
+/// Same `Method` payload as [`builtin_bound_method_new`]; only the public class
+/// differs, so `type(object().__str__)` reports `method-wrapper` while
+/// `type([].append)` reports `builtin_function_or_method`.  `PyMethodWrapper_Type`
+/// has no `__module__`, but the field is part of the shared payload, so it is
+/// filled the same way and simply left unpublished by the typedef.
+pub fn method_wrapper_new(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_class: PyObjectRef,
+) -> PyObjectRef {
+    let method = pyre_object::w_method_new(descr, obj, w_class);
+    unsafe {
+        pyre_object::function::w_method_set_public_class(
+            method,
+            crate::typedef::gettypeobject(&METHOD_WRAPPER_TYPE),
+        );
+        pyre_object::function::w_method_set_module(method, pyre_object::w_none());
+    }
+    method
+}
+
+/// Publish a `ClassMethod` carrier built for a `METH_CLASS` entry as
+/// [`CLASSMETHOD_DESCRIPTOR_TYPE`].
+///
+/// The `ob_type` stays `CLASSMETHOD_TYPE`, so `is_classmethod` and every
+/// binding path that reads the payload keep working; only the type the
+/// namespace publishes changes.
+///
+/// A namespace swept before the type object exists is retagged again by the
+/// closing pass of `init_typeobjects`, so this is a no-op until then.
+pub fn classmethod_retag_descriptor(obj: PyObjectRef) {
+    let w_class = get_instantiate(&CLASSMETHOD_DESCRIPTOR_TYPE);
+    if w_class.is_null() {
+        return;
+    }
+    unsafe {
+        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        (*obj).w_class = w_class;
+    }
+}
+
+/// Whether `obj` is a `ClassMethod` carrier published as a
+/// `classmethod_descriptor` rather than as an ordinary `classmethod`.
+pub fn is_classmethod_descriptor(obj: PyObjectRef) -> bool {
+    !obj.is_null()
+        && unsafe { pyre_object::function::is_classmethod(obj) }
+        && std::ptr::eq(
+            unsafe { (*obj).w_class },
+            get_instantiate(&CLASSMETHOD_DESCRIPTOR_TYPE),
+        )
 }
 
 /// Function-layout carriers accepted by the interpreter call machinery.
@@ -760,6 +950,26 @@ pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// `meth_repr` — the receiver decides the wording, not how the carrier is
+/// spelled: a null or module `m_self` reports as a plain function, anything
+/// else as a method of that receiver.  A `__new__` entry carries its owning
+/// type, so it reads `<built-in method __new__ of type object at 0x...>`.
+///
+/// # Safety
+/// `w_self` must be null or a valid object pointer.
+pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> String {
+    let bound = !w_self.is_null()
+        && !unsafe { pyre_object::is_none(w_self) }
+        && !unsafe { pyre_object::is_module(w_self) };
+    if !bound {
+        return format!("<built-in function {name}>");
+    }
+    let type_name = crate::typedef::r#type(w_self)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+        .unwrap_or("object");
+    format!("<built-in method {name} of {type_name} object at {w_self:p}>")
+}
+
 /// CPython 3.14 `meth_reduce`: type-bound builtins reconstruct through
 /// `getattr(__self__, __name__)`; module-level builtins reduce by qualname.
 pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult {
@@ -777,6 +987,36 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
     Ok(pyre_object::w_str_new(&unsafe {
         function_get_qualname(obj)
     }))
+}
+
+/// CPython `methodobject.c:meth_reduce` / `descrobject.c` reduction shape for
+/// an unbound builtin method or slot descriptor:
+/// `(<builtins.getattr>, (__objclass__, __name__))`.
+///
+/// PyPy represents these descriptors as `FunctionWithFixedCode`; its
+/// `w_objclass` field is stamped by `TypeCache.build`, so use that existing
+/// owner instead of inventing a descriptor side table.
+pub unsafe fn descr_fixed_code_reduce(obj: PyObjectRef) -> crate::PyResult {
+    let owner = unsafe { fget_func_objclass(obj)? };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(owner);
+    let name = pyre_object::w_str_new(unsafe { function_get_name(obj) });
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(name);
+    let getattr = crate::baseobjspace::builtin_callable("getattr");
+    let getattr_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(getattr);
+    let args = pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(owner_slot),
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    ]);
+    pyre_object::gc_roots::pin_root(args);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(getattr_slot),
+        pyre_object::gc_roots::shadow_stack_get(args_slot),
+    ]))
 }
 
 /// Stamp PyPy `BuiltinFunction.w_moduleobj` after the defining module object
@@ -807,12 +1047,18 @@ pub unsafe fn builtin_function_set_module_obj(obj: PyObjectRef, w_module: PyObje
 /// own `BUILTIN_FUNCTION_TYPE`, so a strict `FUNCTION_TYPE` check
 /// excludes it (function.py:786 makes BuiltinFunction a sibling
 /// subclass of Function, not a subclass of FunctionWithFixedCode).
+/// `METHOD_DESCRIPTOR_TYPE` is the public retag a type-owned fixed-code
+/// function receives in `function_mark_method_descriptor`; it does not
+/// change what the object is, so it stays inside this check.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_function_with_fixed_code(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FUNCTION_TYPE) && !(*(obj as *const Function)).can_change_code }
+    unsafe {
+        (py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &METHOD_DESCRIPTOR_TYPE))
+            && !(*(obj as *const Function)).can_change_code
+    }
 }
 
 /// function.py:78-83 — `getcode(self)`: three-way dispatch.
@@ -916,6 +1162,8 @@ pub unsafe fn fset_func_qualname(
     }
 }
 
+/// Return the function-owned qualified-name object.
+///
 /// `function.py:470-471 fget_func_qualname` parity:
 ///
 /// ```python
@@ -929,19 +1177,56 @@ pub unsafe fn fset_func_qualname(
 /// from `codeobj.co_qualname` at construction, so subsequent
 /// `__code__ = new_code` assignments do NOT alter `__qualname__`
 /// (matching `pypy/interpreter/pyopcode.py:1457` + `function.py:54`).
-/// When `w_qualname` is still `PY_NULL` (legacy callers that never
-/// stamped it — builtins built via `gateway.rs` / unit tests), fall
-/// back to the bare `name` string per `qualname or self.name`.
+/// Pyre keeps the wrapped text object in `w_qualname`, the direct equivalent
+/// of that object-owned PyPy field.  Returning it directly preserves the
+/// identity installed by `f.__qualname__ = value`, which `update_wrapper`
+/// observes.  When the field is still `PY_NULL` (legacy gateway/unit-test
+/// callers), materialise the `qualname or self.name` fallback once and cache
+/// it on the function instead of manufacturing a fresh string per read.
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
+pub unsafe fn fget_func_qualname(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let func = &*(obj as *const Function);
+        let cached = func.w_qualname;
+        if !cached.is_null() && pyre_object::is_str(cached) {
+            return cached;
+        }
+        // CPython methodobject.c exposes a type-bound builtin's qualified
+        // name as `<self type>.<name>` (`object.__new__`), which is also what
+        // pickle.save_global needs in order to reconstruct the carrier via
+        // `getattr(object, "__new__")`.  `w_new_self` is the defining type
+        // stamped by type finalisation; ordinary/module builtins retain the
+        // plain-name fallback.
+        let qualname =
+            if !func.w_new_self.is_null() && pyre_object::typeobject::is_type(func.w_new_self) {
+                format!(
+                    "{}.{}",
+                    pyre_object::w_type_get_qualname(func.w_new_self),
+                    function_get_name(obj)
+                )
+            } else {
+                function_get_name(obj).to_owned()
+            };
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let value = pyre_object::w_str_new(&qualname);
+        function_set_qualname(pyre_object::gc_roots::shadow_stack_get(obj_slot), value);
+        value
+    }
+}
+
+/// Get the qualified-name text for formatting/error-reporting paths.
+///
+/// Attribute access itself uses [`fget_func_qualname`] so it returns the
+/// function-owned Python object rather than a re-wrapped copy.
 pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
     unsafe {
-        let cached = (*(obj as *const Function)).w_qualname;
-        if !cached.is_null() && pyre_object::is_str(cached) {
-            return pyre_object::w_str_get_value(cached).to_string();
-        }
-        function_get_name(obj).to_string()
+        pyre_object::w_str_get_wtf8(fget_func_qualname(obj))
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -1083,8 +1368,14 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let func = obj as *mut Function;
         if (*func).w_func_dict.is_null() {
+            // Allocate before the barrier: `w_dict_new` can collect, and that
+            // collection consumes the prebuilt-dirty bit this store needs.
+            // Marking first would leave the young dict stored under a clean
+            // bit, so the next minor walk skips the slot and the dict goes
+            // stale (`walk_raw_function_roots` then drags a dead pointer).
+            let w_dict = pyre_object::w_dict_new();
             function_write_barrier(obj);
-            (*func).w_func_dict = pyre_object::w_dict_new();
+            (*func).w_func_dict = w_dict;
         }
         (*func).w_func_dict
     }
@@ -2813,8 +3104,6 @@ fn _flat_pycall(
     frame: &mut crate::pyframe::PyFrame,
     dropvalues: usize,
 ) -> PyObjectRef {
-    // call.rs:423-424 parity — increment call depth for JIT depth tracking.
-    let _depth_guard = crate::call::increment_call_depth();
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -2844,6 +3133,14 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
+    // The callee's locals array is old-gen (`OldGenGc`) and the arguments
+    // just written into it are young. RPython's GC transform emits the
+    // old-to-young `write_barrier` (minimark.py:1065) after such a store;
+    // pyre has no transform pass, so the batch barrier runs here. Until the
+    // callee frame is installed on the `f_backref` chain nothing else exposes
+    // these slots, so a minor collection before then would leave every
+    // argument stale.
+    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -2888,7 +3185,6 @@ fn _flat_pycall_defaults(
     defs_to_load: usize,
     dropvalues: usize,
 ) -> PyObjectRef {
-    let _depth_guard = crate::call::increment_call_depth();
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -2928,6 +3224,9 @@ fn _flat_pycall_defaults(
         }
     }
 
+    // Same old-to-young barrier as `_flat_pycall`: positional arguments and
+    // defaults were written into the callee's old-gen locals array.
+    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 

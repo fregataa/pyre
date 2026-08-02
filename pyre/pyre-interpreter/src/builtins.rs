@@ -1019,10 +1019,13 @@ unsafe fn memoryview_get_offset(
     }
 }
 
-/// An index key — `getindex_w` accepts any object with `__index__`, not only
-/// an exact int, so a scalar key or a multi-index tuple element counts as an
-/// index when it is an int or exposes `__index__`.
-unsafe fn memoryview_is_index(w: PyObjectRef) -> bool {
+/// `_PyIndex_Check(v)` — whether the type exposes `nb_index` at all.
+///
+/// This is a *type* test and never a conversion, which is what lets a caller
+/// substitute its own "not an index" message for a miss while anything
+/// `__index__` itself raises still propagates unchanged.  Converting here
+/// instead would both run a user slot twice and relabel its exception.
+pub(crate) unsafe fn index_check(w: PyObjectRef) -> bool {
     unsafe { pyre_object::is_int(w) || crate::baseobjspace::lookup(w, "__index__").is_some() }
 }
 
@@ -1037,7 +1040,7 @@ unsafe fn memoryview_start_from_tuple(
         let mut start = 0;
         for dim in 0..n {
             let w = pyre_object::w_tuple_getitem(index, dim).unwrap_or(w_none());
-            if !memoryview_is_index(w) {
+            if !index_check(w) {
                 return Err(crate::PyError::type_error("memoryview: invalid slice key"));
             }
             let index = getindex_w(w)?;
@@ -1060,7 +1063,7 @@ unsafe fn memoryview_tuple_kind(index: PyObjectRef) -> (bool, bool) {
         let mut all_slice = n > 0;
         for i in 0..n {
             let w = pyre_object::w_tuple_getitem(index, i as i64).unwrap_or(w_none());
-            if !memoryview_is_index(w) {
+            if !index_check(w) {
                 all_index = false;
             }
             if !pyre_object::is_slice(w) {
@@ -1084,7 +1087,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if pyre_object::is_slice(index) {
             return memoryview_slice_view(mv, index);
         }
-        if memoryview_is_index(index) {
+        if index_check(index) {
             if ndim == 0 {
                 return Err(crate::PyError::type_error(
                     "invalid indexing of 0-dim memory",
@@ -1265,7 +1268,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             full[addr..addr + isz].copy_from_slice(&packed);
             return Ok(w_none());
         }
-        if !memoryview_is_index(index) {
+        if !index_check(index) {
             return Err(crate::PyError::type_error(
                 "memoryview: invalid slice key, must be int or slice",
             ));
@@ -2862,7 +2865,12 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "SystemExit",
-        make_exc_type("SystemExit", exc_system_exit_new, base_exc),
+        make_exc_type_with_init(
+            "SystemExit",
+            exc_system_exit_new,
+            Some(exc_system_exit_init),
+            base_exc,
+        ),
     );
     crate::module_ns_store(
         ns,
@@ -3002,10 +3010,19 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "EOFError",
-        make_exc_type("EOFError", exc_exception_new, exception),
+        make_exc_type("EOFError", exc_eof_error_new, exception),
     );
     let syntax_error = make_exc_type("SyntaxError", exc_syntax_error_new, exception);
     crate::module_ns_store(ns, "SyntaxError", syntax_error);
+    // Python 3.14 `exceptions.c` — the private exception raised by
+    // `compile(..., flags=PyCF_ALLOW_INCOMPLETE_INPUT)` for an unfinished
+    // interactive input.  `codeop._maybe_compile` intentionally resolves the
+    // underscore-prefixed name through builtins rather than importing it.
+    crate::module_ns_store(
+        ns,
+        "_IncompleteInputError",
+        make_exc_type("_IncompleteInputError", exc_syntax_error_new, syntax_error),
+    );
     let indentation_error = make_exc_type("IndentationError", exc_syntax_error_new, syntax_error);
     crate::module_ns_store(ns, "IndentationError", indentation_error);
     crate::module_ns_store(
@@ -3295,7 +3312,7 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .copied()
         .unwrap_or_else(|| pyre_object::w_str_new(""));
     let Some(sys) = crate::importing::get_sys_module("sys") else {
-        return Err(crate::PyError::runtime_error("input: lost sys.stdin"));
+        return Err(crate::PyError::runtime_error("lost sys.stdin"));
     };
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -3303,13 +3320,15 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     pyre_object::gc_roots::pin_root(sys);
     pyre_object::gc_roots::pin_root(prompt);
 
+    // `bltinmodule.c builtin_input_impl`: an absent — or `None` — standard
+    // stream is a `RuntimeError`, not an attribute error from the stream call.
     let stream = |name: &str| -> Result<PyObjectRef, crate::PyError> {
         let sys = pyre_object::gc_roots::shadow_stack_get(root);
+        let lost = || crate::PyError::runtime_error(format!("lost sys.{name}"));
         match crate::baseobjspace::getattr_str(sys, name) {
+            Ok(value) if unsafe { pyre_object::is_none(value) } => Err(lost()),
             Ok(value) => Ok(value),
-            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Err(
-                crate::PyError::runtime_error(format!("input: lost sys.{name}")),
-            ),
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Err(lost()),
             Err(error) => Err(error),
         }
     };
@@ -3752,7 +3771,7 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
     }
     Err(crate::PyError::type_error(format!(
-        "unsupported operand type for unary abs: '{}'",
+        "bad operand type for abs(): '{}'",
         crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
@@ -3940,6 +3959,62 @@ pub(crate) fn resolve_pos_or_kw(
     }
 }
 
+/// `_PyArg_UnpackKeywords`' two argument-count checks for a callable
+/// declaring `maxpos` positional-or-keyword slots followed by `kwonly`
+/// keyword-only ones, of which `minargs` are required.
+///
+/// A call whose positionals and keywords together exceed the declared total
+/// is reported against that total ("takes at most 2 arguments (3 given)"),
+/// and only a call that stays within it but oversupplies the positional part
+/// is reported against `maxpos`.  The order matters: `list.sort` declares no
+/// positional slot and two keyword-only ones, so one stray positional is a
+/// positional error while three arguments are a total-count error.
+pub(crate) fn clinic_arity(
+    fn_name: &str,
+    npos: usize,
+    nkw: usize,
+    minargs: usize,
+    maxpos: usize,
+    kwonly: usize,
+) -> Result<(), crate::PyError> {
+    let maxargs = maxpos + kwonly;
+    if npos + nkw > maxargs {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() takes {} {maxargs} {}argument{} ({} given)",
+            if minargs < maxargs {
+                "at most"
+            } else {
+                "exactly"
+            },
+            // bpo-31229: a call that passed only keywords names them, so
+            // "takes exactly 1 argument (2 given)" cannot read as a claim
+            // about positional arguments that were never supplied.
+            if npos == 0 { "keyword " } else { "" },
+            if maxargs == 1 { "" } else { "s" },
+            npos + nkw,
+        )));
+    }
+    if npos > maxpos {
+        let limit = if maxpos == 0 {
+            "no positional arguments".to_string()
+        } else {
+            format!(
+                "{} {maxpos} positional argument{} ({npos} given)",
+                if minargs < maxpos {
+                    "at most"
+                } else {
+                    "exactly"
+                },
+                if maxpos == 1 { "" } else { "s" },
+            )
+        };
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() takes {limit}"
+        )));
+    }
+    Ok(())
+}
+
 /// Bind positional + `__pyre_kw__` keyword arguments into a resolved
 /// scope of length `names.len()`, mirroring the gateway's
 /// `Arguments._match_signature` (`pypy/interpreter/argument.py`). Each
@@ -3960,16 +4035,17 @@ pub(crate) fn bind_builtin_kwargs(
     fn_name: &str,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
-    if positional.len() > names.len() {
-        return Err(crate::PyError::type_error(format!(
-            "{fn_name}() takes at most {} positional argument{} ({} given)",
-            names.len(),
-            if names.len() == 1 { "" } else { "s" },
-            positional.len(),
-        )));
-    }
+    clinic_arity(
+        fn_name,
+        positional.len(),
+        real_kwarg_count(kwargs),
+        required.iter().filter(|r| **r).count(),
+        names.len(),
+        0,
+    )?;
     let mut scope: Vec<PyObjectRef> = vec![PY_NULL; names.len()];
     let mut filled: Vec<bool> = vec![false; names.len()];
+    let mut unknown: Option<String> = None;
     for (i, &v) in positional.iter().enumerate() {
         scope[i] = v;
         filled[i] = true;
@@ -3984,27 +4060,35 @@ pub(crate) fn bind_builtin_kwargs(
                 Some(idx) => {
                     if filled[idx] {
                         return Err(crate::PyError::type_error(format!(
-                            "{fn_name}() got multiple values for argument '{key}'"
+                            "argument for {fn_name}() given by name ('{key}') and position ({})",
+                            idx + 1,
                         )));
                     }
                     scope[idx] = *val;
                     filled[idx] = true;
                 }
-                None => {
-                    return Err(crate::PyError::type_error(format!(
-                        "{fn_name}() got an unexpected keyword argument '{key}'"
-                    )));
-                }
+                // `_PyArg_UnpackKeywords` collects the unrecognized names and
+                // only reports them once every declared slot has been filled,
+                // so a call that misses a required argument is reported
+                // against that argument even when it also passed a keyword
+                // the function does not know.
+                None => unknown = Some(key.to_string_lossy().into_owned()),
             }
         }
     }
     for i in 0..names.len() {
         if !filled[i] && required[i] {
             return Err(crate::PyError::type_error(format!(
-                "{fn_name}() missing required argument: '{}'",
-                names[i]
+                "{fn_name}() missing required argument '{}' (pos {})",
+                names[i],
+                i + 1,
             )));
         }
+    }
+    if let Some(key) = unknown {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() got an unexpected keyword argument '{key}'"
+        )));
     }
     Ok(scope)
 }
@@ -4161,16 +4245,17 @@ fn min_max_dispatch(
     fn_name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
-    // functional.py:198-201 — only `key` and `default` are accepted.
-    kwarg_reject_unknown(kwargs, &["key", "default"], fn_name)?;
-    let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
-    let default = kwarg_get(kwargs, "default");
-    // functional.py:216-218 — empty positional → TypeError, not panic.
+    // `min_max` unpacks its positionals before it looks at the keywords, so a
+    // keywords-only call is reported against the missing operand.
     if positional.is_empty() {
         return Err(crate::PyError::type_error(format!(
             "{fn_name} expected at least 1 argument, got 0"
         )));
     }
+    // functional.py:198-201 — only `key` and `default` are accepted.
+    kwarg_reject_unknown(kwargs, &["key", "default"], fn_name)?;
+    let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
+    let default = kwarg_get(kwargs, "default");
     // functional.py:206-210 — `default=` is only meaningful for the
     // single-iterable form; combining it with multiple positional args
     // is a user error.
@@ -4636,7 +4721,10 @@ fn type_descr_new_with_metaclass(
                             if args.len() > 3 {
                                 metaclass_args.extend_from_slice(&args[3..]);
                             }
-                            return Ok(crate::call_function(w_metaclass, &metaclass_args));
+                            return crate::call::call_function_impl_result(
+                                w_metaclass,
+                                &metaclass_args,
+                            );
                         }
                     }
                 }
@@ -4813,7 +4901,7 @@ fn type_descr_new_with_metaclass(
                 if args.len() > 3 {
                     new_args.extend_from_slice(&args[3..]);
                 }
-                return Ok(crate::call_function(w_metaclass_new, &new_args));
+                return crate::call::call_function_impl_result(w_metaclass_new, &new_args);
             }
         }
         let w_metaclass = w_winner;
@@ -5024,6 +5112,10 @@ exc_constructor!(
 exc_constructor!(
     exc_exception,
     pyre_object::interp_exceptions::ExcKind::Exception
+);
+exc_constructor!(
+    exc_eof_error,
+    pyre_object::interp_exceptions::ExcKind::EOFError
 );
 exc_constructor!(
     exc_arithmetic_error,
@@ -5529,6 +5621,19 @@ fn base_exception_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }
 }
 
+/// `BaseException_setstate` / `ImportError_setstate` reject a non-dict state
+/// before touching the instance dict; `None` is the "nothing to restore"
+/// case, which both leave alone.
+fn require_setstate_dict(state: PyObjectRef) -> Result<bool, crate::PyError> {
+    if unsafe { pyre_object::is_none(state) } {
+        return Ok(false);
+    }
+    if !unsafe { pyre_object::is_dict(state) } {
+        return Err(crate::PyError::type_error("state is not a dictionary"));
+    }
+    Ok(true)
+}
+
 /// `interp_exceptions.py:239-241 BaseException.descr_setstate` —
 /// `self.getdict(space).update(state)`.
 fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5538,6 +5643,9 @@ fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let w_state = *args.get(1).ok_or_else(|| {
         crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'state'")
     })?;
+    if !require_setstate_dict(w_state)? {
+        return Ok(pyre_object::w_none());
+    }
     let w_olddict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
     if crate::baseobjspace::call_method(w_olddict, "update", &[w_state]).is_null() {
         if let Some(e) = crate::call::take_call_error() {
@@ -5605,6 +5713,9 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let w_state = *args.get(1).ok_or_else(|| {
         crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'state'")
     })?;
+    if !require_setstate_dict(w_state)? {
+        return Ok(pyre_object::w_none());
+    }
     type ExcSetter = unsafe fn(PyObjectRef, PyObjectRef);
     for (key, set) in [
         ("name", interp_exceptions::w_exception_set_name as ExcSetter),
@@ -6097,6 +6208,7 @@ macro_rules! exc_new_wrapper {
 
 exc_new_wrapper!(exc_base_exception_new, exc_base_exception);
 exc_new_wrapper!(exc_exception_new, exc_exception);
+exc_new_wrapper!(exc_eof_error_new, exc_eof_error);
 exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
 exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
 exc_new_wrapper!(exc_type_error_new, exc_type_error);
@@ -6124,6 +6236,222 @@ exc_new_wrapper!(exc_memory_error_new, exc_memory_error);
 exc_new_wrapper!(exc_reference_error_new, exc_reference_error);
 exc_new_wrapper!(exc_system_error_new, exc_system_error);
 exc_new_wrapper!(exc_syntax_error_new, exc_syntax_error);
+
+/// True when `method` is one of the `descr_str` / `descr_repr` builtins that
+/// `make_exc_type_with_init` installs.  `py_str` / `py_repr` already run those
+/// rules natively, so the native path must not dispatch back into them —
+/// unlike, say, `BaseExceptionGroup.__str__`, which has no native arm and
+/// whose builtin the native path does have to call.
+pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
+    // Every fixed-code carrier, not just `is_function`: `__str__` and
+    // `__repr__` are slot names, so the namespace sweep publishes the three
+    // builtins below as `wrapper_descriptor`, which `is_function` excludes.
+    // Missing them here lets `exc_user_dunder_obj` call the native dunder back
+    // and recurse until the stack overflows.
+    if method.is_null() || !unsafe { crate::function::is_function_carrier(method) } {
+        return false;
+    }
+    let code = crate::function::getcode(method) as PyObjectRef;
+    if code.is_null() || !unsafe { crate::gateway::is_builtin_code(code) } {
+        return false;
+    }
+    let f = unsafe { crate::gateway::builtin_code_get(code) };
+    [
+        base_exception_str_method as crate::gateway::BuiltinCodeFn,
+        exception_str_method as crate::gateway::BuiltinCodeFn,
+        exception_repr_method as crate::gateway::BuiltinCodeFn,
+    ]
+    .iter()
+    .any(|&target| std::ptr::fn_addr_eq(f, target))
+}
+
+/// `interp_exceptions.py:993-998 W_SystemExit.descr_init` — a lone argument
+/// becomes `code` verbatim, several become the args tuple, and none leaves
+/// the `None` class default; `W_BaseException.descr_init` then stamps `args`.
+/// It runs first here so its keyword rejection precedes the `code` write.
+fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    exc_base_exception_init(args)?;
+    let (positional, _) = split_builtin_kwargs(&args[1..]);
+    let code = match positional.len() {
+        0 => return Ok(pyre_object::w_none()),
+        1 => positional[0],
+        _ => pyre_object::w_tuple_new(positional.to_vec()),
+    };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_code(w_self, code) };
+    Ok(pyre_object::w_none())
+}
+
+/// `interp_exceptions.py:126-133 W_BaseException.descr_str` — the base rule,
+/// which reports the args alone.  It is what `BaseException.__str__(exc)`
+/// runs even when `exc`'s own class registers a `descr_str` override.
+fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args[0];
+    Ok(pyre_object::w_str_new(&unsafe {
+        crate::display::base_exception_str(obj)?
+    }))
+}
+
+/// The `descr_str` of the class that registers one, falling back to
+/// `W_BaseException.descr_str` for an arg shape it does not special-case
+/// (`KeyError('a', 'b')`, an `OSError` with neither errno nor strerror).
+fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args[0];
+    let text = unsafe {
+        match crate::display::exception_kind_str(obj)? {
+            Some(s) => s,
+            None => crate::display::base_exception_str(obj)?,
+        }
+    };
+    Ok(pyre_object::w_str_new(&text))
+}
+
+/// `interp_exceptions.py:135-151 W_BaseException.descr_repr` — every builtin
+/// exception class inherits this one, so it is registered on `BaseException`
+/// alone and reads the receiver's own class name.
+fn exception_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args[0];
+    Ok(pyre_object::w_str_new(&unsafe {
+        crate::display::py_repr(obj)?
+    }))
+}
+
+/// `interp_exceptions.py` typedef `GetSetProperty` entries, per class.
+///
+/// Each class declares only the attributes its own `TypeDef` adds; a
+/// subclass reaches the rest through the MRO the way
+/// `ModuleNotFoundError` reaches `ImportError.msg`.
+fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
+    match class_name {
+        "BaseException" => &[
+            "args",
+            "__cause__",
+            "__context__",
+            "__suppress_context__",
+            "__traceback__",
+        ],
+        "SystemExit" => &["code"],
+        "StopIteration" => &["value"],
+        "OSError" => &[
+            "characters_written",
+            "errno",
+            "filename",
+            "filename2",
+            "strerror",
+        ],
+        "ImportError" => &["msg", "name", "name_from", "path"],
+        "NameError" => &["name"],
+        "AttributeError" => &["name", "obj"],
+        "SyntaxError" => &[
+            "end_lineno",
+            "end_offset",
+            "filename",
+            "lineno",
+            "msg",
+            "offset",
+            "print_file_and_line",
+            "text",
+        ],
+        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => {
+            &["encoding", "end", "object", "reason", "start"]
+        }
+        "BaseExceptionGroup" => &["exceptions", "message"],
+        _ => &[],
+    }
+}
+
+/// The attribute name a descriptor built by [`make_exception_getset`] carries.
+fn exception_getset_name(w_descr: PyObjectRef) -> String {
+    let w_name = unsafe { pyre_object::typedef::w_getset_get_name(w_descr) };
+    if w_name.is_null() || !unsafe { pyre_object::is_str(w_name) } {
+        return String::new();
+    }
+    unsafe { pyre_object::w_str_get_value(w_name) }.to_string()
+}
+
+/// A name the receiving exception kind does not declare — `OSError`'s
+/// `characters_written` on anything but a `BlockingIOError`, say.  The
+/// descriptor is inherited but reads back as absent.
+fn exception_getset_absent(w_obj: PyObjectRef, name: &str) -> crate::PyError {
+    crate::PyError::attribute_error_with_context(
+        format!(
+            "'{}' object has no attribute '{name}'",
+            crate::baseobjspace::object_functionstr_type_name(w_obj)
+        ),
+        w_obj,
+        name,
+    )
+}
+
+fn exception_getset_fget(args: &[PyObjectRef]) -> crate::PyResult {
+    let (w_descr, w_obj) = (args[0], args[1]);
+    let name = exception_getset_name(w_descr);
+    let found = crate::baseobjspace::exception_attr_get(w_obj, &name)?;
+    if found.is_null() {
+        return Err(exception_getset_absent(w_obj, &name));
+    }
+    Ok(found)
+}
+
+fn exception_getset_fset(args: &[PyObjectRef]) -> crate::PyResult {
+    let (w_descr, w_obj, w_value) = (args[0], args[1], args[2]);
+    let name = exception_getset_name(w_descr);
+    let handled = crate::baseobjspace::exception_attr_set(w_obj, &name, w_value)?;
+    if handled.is_null() {
+        return Err(exception_getset_absent(w_obj, &name));
+    }
+    Ok(handled)
+}
+
+fn exception_getset_fdel(args: &[PyObjectRef]) -> crate::PyResult {
+    let (w_descr, w_obj) = (args[0], args[1]);
+    let name = exception_getset_name(w_descr);
+    let handled = crate::baseobjspace::exception_attr_delete(w_obj, &name)?;
+    if handled.is_null() {
+        return Err(exception_getset_absent(w_obj, &name));
+    }
+    Ok(handled)
+}
+
+/// The three ends of every exception `GetSetProperty`.  One function object
+/// backs all of them, so `exception_attr_slot_fold` recognises a descriptor
+/// it may look through by comparing the `fget` it found against this one.
+fn exception_getset_ends() -> (PyObjectRef, PyObjectRef, PyObjectRef) {
+    static ENDS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    let (fget, fset, fdel) = *ENDS.get_or_init(|| {
+        (
+            make_builtin_function_with_arity("__get__", exception_getset_fget, 2) as usize,
+            make_builtin_function_with_arity("__set__", exception_getset_fset, 3) as usize,
+            make_builtin_function_with_arity("__delete__", exception_getset_fdel, 2) as usize,
+        )
+    });
+    (
+        fget as PyObjectRef,
+        fset as PyObjectRef,
+        fdel as PyObjectRef,
+    )
+}
+
+/// The shared `fget` every exception `GetSetProperty` carries.
+pub(crate) fn exception_getset_fget_obj() -> PyObjectRef {
+    exception_getset_ends().0
+}
+
+/// Install the class's `interp_exceptions.py` typedef getsets into `ns`.
+fn install_exception_getsets(ns: PyObjectRef, class_name: &str) {
+    let (fget, fset, fdel) = exception_getset_ends();
+    for attr in exception_typedef_attrs(class_name) {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                attr,
+                crate::typedef::make_getset_property_named(fget, fset, fdel, attr),
+            )
+        };
+    }
+}
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 pub(crate) fn make_exc_type(
@@ -6163,7 +6491,7 @@ fn make_exc_type_with_init(
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    make_builtin_function("__new__", new_fn),
+                    crate::typedef::make_new_descr(new_fn),
                 )
             };
             if let Some(init_fn) = init_fn {
@@ -6172,6 +6500,46 @@ fn make_exc_type_with_init(
                         ns,
                         "__init__",
                         make_builtin_function("__init__", init_fn),
+                    )
+                };
+            }
+            // `interp_exceptions.py` declares each class's typed attributes
+            // as `GetSetProperty` entries on its own `TypeDef`.
+            install_exception_getsets(ns, name);
+            // `interp_exceptions.py:291-292` registers `__str__` /
+            // `__repr__` on `BaseException`'s typedef, and each of the
+            // classes below registers a `descr_str` of its own on top.  A
+            // class that inherits both stays out of this list, so
+            // `LookupError.__str__` resolves up the MRO to
+            // `BaseException`'s the way `KeyError.__str__` does not.
+            if name == "BaseException" {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__repr__",
+                        make_builtin_function_with_arity("__repr__", exception_repr_method, 1),
+                    );
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__str__",
+                        make_builtin_function_with_arity("__str__", base_exception_str_method, 1),
+                    );
+                };
+            } else if matches!(
+                name,
+                "KeyError"
+                    | "OSError"
+                    | "ImportError"
+                    | "SyntaxError"
+                    | "UnicodeDecodeError"
+                    | "UnicodeEncodeError"
+                    | "UnicodeTranslateError"
+            ) {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__str__",
+                        make_builtin_function_with_arity("__str__", exception_str_method, 1),
                     )
                 };
             }
@@ -6253,13 +6621,19 @@ fn make_exc_type_with_init(
                                 })?;
                                 // `interp_exceptions.py:257-260` — accept
                                 // `str` and any `str` subclass
-                                // (`isinstance_w(w_note, space.w_unicode)`);
-                                // otherwise `oefmt("note must be a str, not %T")`.
+                                // (`isinstance_w(w_note, space.w_unicode)`).
+                                // The rejection wording is the argument-clinic
+                                // one (`_PyArg_BadArgument`), which names the
+                                // method and renders `None` as `None` rather
+                                // than as its type.
                                 if !unsafe { crate::baseobjspace::isinstance_str_w(w_note) } {
-                                    let tp_name =
-                                        crate::baseobjspace::object_functionstr_type_name(w_note);
+                                    let got = if w_note == pyre_object::w_none() {
+                                        "None".to_string()
+                                    } else {
+                                        crate::baseobjspace::object_functionstr_type_name(w_note)
+                                    };
                                     return Err(crate::PyError::type_error(format!(
-                                        "note must be a str, not {tp_name}"
+                                        "add_note() argument must be str, not {got}"
                                     )));
                                 }
                                 // `interp_exceptions.py:240-254` — lazy
@@ -6382,7 +6756,7 @@ pub(crate) fn make_exc_type_multi(
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    make_builtin_function("__new__", new_fn),
+                    crate::typedef::make_new_descr(new_fn),
                 )
             };
         },
@@ -6924,7 +7298,7 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
                 pyre_object::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    make_builtin_function("__new__", exception_group_new),
+                    crate::typedef::make_new_descr(exception_group_new),
                 );
                 pyre_object::w_dict_setitem_str_no_proxy(
                     ns,
@@ -7608,6 +7982,14 @@ pub(crate) fn parse_int_from_str(
     Ok(w_long_new(value))
 }
 
+/// The error every decimal `int` conversion raises once the result would
+/// exceed `sys.get_int_max_str_digits()` digits.
+pub(crate) fn int_max_str_digits_error(maxdigits: i32) -> crate::PyError {
+    crate::PyError::value_error(format!(
+        "Exceeds the limit ({maxdigits} digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+    ))
+}
+
 /// PyPy `W_AbstractLongObject.descr_str` / Python 3.14 integer-to-decimal
 /// conversion guard. The bit-length lower bound rejects enormous values
 /// before the quadratic decimal conversion; the resulting string supplies
@@ -7625,6 +8007,7 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
         pyre_object::w_long_get_value(obj)
     };
     let maxdigits = crate::module::sys::state::int_max_str_digits();
+    let too_long = int_max_str_digits_error;
     if maxdigits != 0 {
         let bits = value.bits();
         let decimal_digits_lower_bound = if bits == 0 {
@@ -7633,9 +8016,7 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
             ((bits - 1).saturating_mul(30_103) / 100_000) + 1
         };
         if decimal_digits_lower_bound > maxdigits as u64 {
-            return Err(crate::PyError::value_error(format!(
-                "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
-            )));
+            return Err(too_long(maxdigits));
         }
     }
     // longobject.py:109 calls `self.asbigint().str(max_str_digits=...)`.
@@ -7643,9 +8024,7 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
     // MaxIntError and MemoryError edges (and can turn either into a formatting
     // panic), so preserve the direct consumer contract.
     value.str(maxdigits as i64).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::MaxStrDigits => crate::PyError::value_error(format!(
-            "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
-        )),
+        pyre_object::rbigint::RBigIntError::MaxStrDigits => too_long(maxdigits),
         pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
         _ => unreachable!("rbigint.str returned an unrelated error"),
     })
@@ -8063,6 +8442,27 @@ pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyE
     collect_iterator(it)
 }
 
+/// `PySequence_Fast(seq, msg)` — materialise `seq`, replacing only the
+/// `TypeError` raised while obtaining the iterator with `msg`.  A `TypeError`
+/// the iterator raises later keeps its own message, and every other error
+/// propagates unchanged.
+pub(crate) fn sequence_fast(
+    obj: PyObjectRef,
+    msg: &str,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let it = match crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
+        Ok(it) => it,
+        Err(e) if e.kind == crate::PyErrorKind::TypeError => {
+            return Err(crate::PyError::type_error(msg));
+        }
+        Err(e) => return Err(e),
+    };
+    collect_iterator(it)
+}
+
 /// Consume an iterator that has already been obtained.  Kept separate from
 /// [`collect_iterable`] for CPython `PySequence_Fast` parity: callers such as
 /// dict sequence-pair conversion must distinguish an error from `iter(obj)`
@@ -8235,6 +8635,16 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 crate::baseobjspace::object_functionstr_type_name(cls)
             )));
         }
+        // descriptor.py:28-30 — `None` for the second argument builds the
+        // *unbound* super object (`super_init_impl`'s `if (obj == Py_None)
+        // obj = NULL`), so `_super_check` never runs on it.
+        if unsafe { pyre_object::is_none(obj) } {
+            return Ok(pyre_object::descriptor::w_super_new(
+                cls,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+            ));
+        }
         let obj_type = super_check(cls, obj)?;
         return Ok(pyre_object::descriptor::w_super_new(cls, obj_type, obj));
     }
@@ -8368,7 +8778,7 @@ fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     match positional.len() {
         0 => Err(crate::PyError::type_error(
-            "iter() requires at least one argument",
+            "iter expected at least 1 argument, got 0",
         )),
         1 => crate::baseobjspace::iter(positional[0]),
         2 => {
@@ -8396,7 +8806,7 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     if args.is_empty() {
         return Err(crate::PyError::type_error(
-            "next() requires at least one argument",
+            "next expected at least 1 argument, got 0",
         ));
     }
     if args.len() > 2 {
@@ -8452,24 +8862,316 @@ pub fn compile_err_to_syntax_error(
     e: crate::compile::CompileError,
     source: &str,
 ) -> crate::PyError {
-    let msg = e.to_string();
-    let (lineno, offset) = e.python_location();
-    if lineno == 0 {
-        return crate::PyError::syntax_error(msg);
+    compile_err_to_syntax_error_maybe_incomplete(e, source, false)
+}
+
+/// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
+/// private Python 3.14 `_IncompleteInputError` subclass for parser failures
+/// which end at an unfinished interactive input when
+/// `PyCF_ALLOW_INCOMPLETE_INPUT` is set.  PyPy's compiler has the same
+/// parser-level distinction through its `compile_command` path; pyre consumes
+/// RustPython's parser, so keep its exact error-shape classification here.
+fn compile_err_to_syntax_error_maybe_incomplete(
+    e: crate::compile::CompileError,
+    source: &str,
+    allow_incomplete: bool,
+) -> crate::PyError {
+    use rustpython_compiler::parser::{
+        InterpolatedStringErrorType, LexicalErrorType, ParseErrorType,
+    };
+
+    // Parser locations are byte offsets, so index the source as bytes: a
+    // non-ASCII character ahead of the quote would otherwise shift a
+    // character-indexed lookup off the run being tested.  Quotes are ASCII,
+    // so the byte comparison is exact.
+    fn opens_triple_quote(source: &str, loc: usize) -> bool {
+        let bytes = source.as_bytes();
+        bytes.get(loc).is_some_and(|quote| {
+            bytes.get(loc + 1) == Some(quote) && bytes.get(loc + 2) == Some(quote)
+        })
     }
-    let (end_lineno, end_offset) = e.python_end_location().unwrap_or((lineno, offset));
-    let filename = e.source_path().to_string();
-    // The offending source line, keeping its trailing newline like `e.text`.
-    let text = source.split_inclusive('\n').nth(lineno - 1);
-    crate::PyError::syntax_error_located(
-        msg,
-        &filename,
-        lineno as i64,
-        offset as i64,
-        end_lineno as i64,
-        end_offset as i64,
-        text,
-    )
+
+    let incomplete = if allow_incomplete {
+        match &e {
+            crate::compile::CompileError::Parse(error) => match &error.error {
+                ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
+                _ if error.is_unclosed_bracket => true,
+                ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                    InterpolatedStringErrorType::UnterminatedTripleQuotedString,
+                )) => true,
+                ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
+                    opens_triple_quote(source, error.raw_location.start().to_usize())
+                }
+                ParseErrorType::OtherError(message)
+                    if message.starts_with("Expected an indented block after")
+                        || message.starts_with("expected an indented block after") =>
+                {
+                    // Byte offsets again: the span covers the blank run that
+                    // should have held the indented block.
+                    let bytes = source.as_bytes();
+                    let from = error
+                        .raw_location
+                        .start()
+                        .to_usize()
+                        .saturating_add(1)
+                        .min(bytes.len());
+                    let to = error
+                        .raw_location
+                        .end()
+                        .to_usize()
+                        .saturating_add(1)
+                        .min(bytes.len());
+                    from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+                }
+                // `codeop._maybe_compile` retries a failed command with one
+                // trailing newline.  The pinned RustPython parser reports the
+                // first unterminated triple quote as `UnclosedStringError`,
+                // but the newline retry as this `OtherError` shape.  CPython
+                // keeps both attempts incomplete; preserve RustPython's
+                // triple-quote test across that parser-shape variation.
+                ParseErrorType::OtherError(message)
+                    if message.starts_with("unterminated triple-quoted string literal") =>
+                {
+                    opens_triple_quote(source, error.raw_location.start().to_usize())
+                }
+                ParseErrorType::OtherError(_) => {
+                    error.raw_location.end().to_usize() >= source.len() && !source.ends_with('\n')
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    // `syntax_error_subclass` can supply a replacement message, so it
+    // runs before the located error is built.
+    let subclass = syntax_error_subclass(&e, source);
+    let msg = match subclass {
+        Some((_, Some(replacement))) => replacement.to_string(),
+        _ => e.to_string(),
+    };
+    let (lineno, offset) = e.python_location();
+    let mut error = if lineno == 0 {
+        crate::PyError::syntax_error(msg)
+    } else {
+        let (end_lineno, end_offset) = e.python_end_location().unwrap_or((lineno, offset));
+        let filename = e.source_path().to_string();
+        // The offending source line, keeping its trailing newline like `e.text`.
+        let text = source.split_inclusive('\n').nth(lineno - 1);
+        crate::PyError::syntax_error_located(
+            msg,
+            &filename,
+            lineno as i64,
+            offset as i64,
+            end_lineno as i64,
+            end_offset as i64,
+            text,
+        )
+    };
+    if incomplete {
+        let w_error = error.to_exc_object();
+        let w_type = lookup_exc_class("_IncompleteInputError")
+            .expect("_IncompleteInputError must be installed before compile()");
+        unsafe {
+            (*(w_error as *mut pyre_object::PyObject)).w_class = w_type;
+            return crate::PyError::from_exc_object(w_error);
+        }
+    }
+    // An incomplete input has returned already; the indentation subclass
+    // is the remaining retag.
+    if let Some((name, _)) = subclass {
+        error.retag_exception_class(name);
+    }
+    error
+}
+
+/// Which of `tokenizer.c tok_get_normal_mode`'s two indentation rejections a
+/// line hits first.
+enum IndentFault {
+    /// `TabError`: the line's indentation measures differently with tabs
+    /// expanded to 8 columns than with tabs counted as 1, so which block it
+    /// belongs to depends on the tab width.
+    TabsAndSpaces,
+    /// `IndentationError`: a dedent that lands between two enclosing levels.
+    UnmatchedDedent,
+}
+
+/// The first indentation the tokenizer would reject, and why.
+///
+/// `tokenizer.c tok_get_normal_mode` keeps two indent stacks — `indstack`
+/// measured with tabs expanded to the next multiple of 8, `altindstack` with
+/// each tab counted as 1 — and compares the incoming line against both. Equal,
+/// deeper and shallower each have an `altcol` companion check, and it is the
+/// disagreement between the two measures that is `TabError`; a dedent matching
+/// no `indstack` entry is the plain indentation error.
+///
+/// A file-wide census cannot stand in for this. Tabs in one block and spaces in
+/// another is legal as long as no single comparison disagrees, so counting both
+/// characters anywhere in the source retags an unrelated failure.
+///
+/// Answers `None` for anything this cannot decide from lines alone — an
+/// unterminated string, or a line still inside brackets when the source runs
+/// out — because the tokenizer processes indentation only outside both, and
+/// `TabError` should be claimed only on positive evidence.
+fn first_indent_fault(source: &str) -> Option<IndentFault> {
+    let mut indstack = vec![0usize];
+    let mut altindstack = vec![0usize];
+    let mut depth = 0usize;
+    let mut in_triple: Option<u8> = None;
+    for line in source.lines() {
+        let bytes = line.as_bytes();
+        // Only a logical line's first physical line carries indentation; a
+        // continuation inside brackets or a triple-quoted string does not.
+        let measures = (depth == 0 && in_triple.is_none()).then(|| {
+            let mut col = 0usize;
+            let mut altcol = 0usize;
+            let mut i = 0;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b' ' => {
+                        col += 1;
+                        altcol += 1;
+                    }
+                    b'\t' => {
+                        col = col / 8 * 8 + 8;
+                        altcol += 1;
+                    }
+                    _ => break,
+                }
+                i += 1;
+            }
+            (col, altcol, i)
+        });
+        scan_line_nesting(bytes, &mut depth, &mut in_triple)?;
+        let Some((col, altcol, indent_len)) = measures else {
+            continue;
+        };
+        // `tok->blankline`: a blank or comment-only line is not indentation.
+        match bytes.get(indent_len) {
+            None | Some(b'#') | Some(b'\r') => continue,
+            _ => {}
+        }
+        let (top, alttop) = (
+            indstack[indstack.len() - 1],
+            altindstack[altindstack.len() - 1],
+        );
+        if col == top {
+            if altcol != alttop {
+                return Some(IndentFault::TabsAndSpaces);
+            }
+        } else if col > top {
+            if altcol <= alttop {
+                return Some(IndentFault::TabsAndSpaces);
+            }
+            indstack.push(col);
+            altindstack.push(altcol);
+        } else {
+            while indstack.len() > 1 && col < indstack[indstack.len() - 1] {
+                indstack.pop();
+                altindstack.pop();
+            }
+            if col != indstack[indstack.len() - 1] {
+                return Some(IndentFault::UnmatchedDedent);
+            }
+            if altcol != altindstack[altindstack.len() - 1] {
+                return Some(IndentFault::TabsAndSpaces);
+            }
+        }
+    }
+    None
+}
+
+/// Advance `depth` (bracket nesting) and `in_triple` (the open triple quote's
+/// character) across one physical line, skipping what a quote or a `#` hides.
+/// `None` when the line ends inside a single-quoted string that is not a
+/// continuation, which means this scan has lost track.
+fn scan_line_nesting(bytes: &[u8], depth: &mut usize, in_triple: &mut Option<u8>) -> Option<()> {
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(quote) = *in_triple {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote && bytes[i + 1..].starts_with(&[quote, quote]) {
+                *in_triple = None;
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'#' => return Some(()),
+            b'(' | b'[' | b'{' => *depth += 1,
+            b')' | b']' | b'}' => *depth = depth.saturating_sub(1),
+            b'"' | b'\'' => {
+                if bytes[i + 1..].starts_with(&[c, c]) {
+                    *in_triple = Some(c);
+                    i += 3;
+                    continue;
+                }
+                // A single-quoted string closes on this line or the source is
+                // malformed in a way this scan cannot follow.
+                let mut j = i + 1;
+                loop {
+                    match bytes.get(j) {
+                        None => return None,
+                        Some(b'\\') => j += 2,
+                        Some(&b) if b == c => break,
+                        Some(_) => j += 1,
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Some(())
+}
+
+/// The `SyntaxError` subclass a compile failure belongs to.  3.14 raises
+/// `IndentationError` for every indentation-shaped tokenizer failure,
+/// `TabError` when that failure comes from mixing tabs and spaces, and plain
+/// `SyntaxError` for the rest.
+fn syntax_error_subclass(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(&'static str, Option<&'static str>)> {
+    use rustpython_compiler::parser::{LexicalErrorType, ParseErrorType};
+    let crate::compile::CompileError::Parse(parse_err) = e else {
+        return None;
+    };
+    // Every indentation-shaped failure is one of the two the tokenizer
+    // distinguishes, and only the source says which — the parser reports a
+    // single column, having already collapsed the two measures.  `TabError`
+    // carries the tokenizer's own message rather than the parser's, which
+    // describes the shape it saw instead of the tab/space clash behind it.
+    let indentation = |plain: Option<&'static str>| match first_indent_fault(source) {
+        Some(IndentFault::TabsAndSpaces) => (
+            "TabError",
+            Some("inconsistent use of tabs and spaces in indentation"),
+        ),
+        _ => ("IndentationError", plain),
+    };
+    match &parse_err.error {
+        // The parser spells this one "Unexpected indentation"; the tokenizer
+        // raises `unexpected indent`.  The dedent message below already reads
+        // as the tokenizer writes it, so it keeps the parser's.
+        ParseErrorType::UnexpectedIndentation => Some(indentation(Some("unexpected indent"))),
+        ParseErrorType::Lexical(LexicalErrorType::IndentationError) => Some(indentation(None)),
+        // `pegen`'s "expected an indented block after <clause> on line N",
+        // which the compiler reconstructs as a plain message.
+        ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {
+            Some(("IndentationError", None))
+        }
+        _ => None,
+    }
 }
 
 /// `pypy/interpreter/astcompiler/consts.py` compilation flag bits.
@@ -8539,6 +9241,18 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // flags/dont_inherit/optimize are positional-or-keyword; _feature_version
     // is keyword-only.  PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
     let (pos, kwargs) = split_builtin_kwargs(args);
+    let source = bind_pos_or_kw(pos, kwargs, 0, "source", "compile", 1)?.ok_or_else(|| {
+        crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
+    })?;
+    let filename_obj =
+        bind_pos_or_kw(pos, kwargs, 1, "filename", "compile", 2)?.ok_or_else(|| {
+            crate::PyError::type_error("compile() missing required argument 'filename' (pos 2)")
+        })?;
+    let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
+        crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
+    })?;
+    // Every declared slot binds before the unrecognized keywords are
+    // reported, so a call missing a required argument names that argument.
     kwarg_reject_unknown(
         kwargs,
         &[
@@ -8552,16 +9266,6 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         ],
         "compile",
     )?;
-    let source = bind_pos_or_kw(pos, kwargs, 0, "source", "compile", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
-    })?;
-    let filename_obj =
-        bind_pos_or_kw(pos, kwargs, 1, "filename", "compile", 2)?.ok_or_else(|| {
-            crate::PyError::type_error("compile() missing required argument 'filename' (pos 2)")
-        })?;
-    let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
-        crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
-    })?;
     let filename = if unsafe { pyre_object::is_str(filename_obj) } {
         crate::baseobjspace::str_utf8_w(filename_obj)?.to_string()
     } else {
@@ -8622,10 +9326,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         "exec" => crate::compile::Mode::Exec,
         "eval" => crate::compile::Mode::Eval,
         "single" => crate::compile::Mode::Single,
-        other => {
+        _ => {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
-                format!("compile() mode must be 'exec', 'eval' or 'single', not {other:?}"),
+                "compile() mode must be 'exec', 'eval' or 'single'",
             ));
         }
     };
@@ -8702,8 +9406,14 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         return Ok(crate::w_code_new(code_ptr));
     }
     let source = source_str.as_deref().expect("non-AST source");
-    let code = crate::compile::compile_source_with_opts(source, mode, &filename, opts)
-        .map_err(|e| compile_err_to_syntax_error(e, source))?;
+    let code =
+        crate::compile::compile_source_with_opts(source, mode, &filename, opts).map_err(|e| {
+            compile_err_to_syntax_error_maybe_incomplete(
+                e,
+                source,
+                flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
+            )
+        })?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     Ok(crate::w_code_new(code_ptr))
 }
@@ -8715,19 +9425,21 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// the supplied namespaces.  When the namespaces are dicts, pyre converts
 /// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
-fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
     // positional-only; globals/locals are positional-or-keyword; `closure` is
     // keyword-only.  `closure` supplies the cell objects that bind a code
     // object's free variables (bltinmodule.c builtin_exec_impl); a None
     // closure normalises to "absent" (PY_NULL).
     let (pos, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["globals", "locals", "closure"], "exec")?;
+    // The positional-only `source` is bound before the unrecognized keywords
+    // are reported, so a keywords-only call is reported against `source`.
     if pos.is_empty() {
         return Err(crate::PyError::type_error(
             "exec() takes at least 1 positional argument (0 given)",
         ));
     }
+    kwarg_reject_unknown(kwargs, &["globals", "locals", "closure"], "exec")?;
     let source = pos[0];
     let globals_arg =
         bind_pos_or_kw(pos, kwargs, 1, "globals", "exec", 2)?.unwrap_or(pyre_object::PY_NULL);
@@ -8747,12 +9459,14 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `eval(source, /, globals=None, locals=None)`: source is positional-only;
     // globals/locals are positional-or-keyword.
     let (pos, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["globals", "locals"], "eval")?;
+    // The positional-only `source` is bound before the unrecognized keywords
+    // are reported, so a keywords-only call is reported against `source`.
     if pos.is_empty() {
         return Err(crate::PyError::type_error(
             "eval() takes at least 1 positional argument (0 given)",
         ));
     }
+    kwarg_reject_unknown(kwargs, &["globals", "locals"], "eval")?;
     let source = pos[0];
     let globals_arg =
         bind_pos_or_kw(pos, kwargs, 1, "globals", "eval", 2)?.unwrap_or(pyre_object::PY_NULL);
@@ -8836,6 +9550,18 @@ fn exec_or_eval(
         }
     }
 
+    /// `PyEval_GetBuiltins()` — the value `exec`/`eval` plant under
+    /// `__builtins__` in a namespace that lacks it.  PyPy stores the picked
+    /// `Module` (`compiling.py:110 space.builtin`); 3.14 stores that module's
+    /// *dict*, which is what `isinstance(__builtins__, dict)` inside
+    /// `exec(src, {})` observes.
+    fn planted_builtins(w_builtin: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            return unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        }
+        w_builtin
+    }
+
     fn ensure_eval_builtins(
         w_globals: pyre_object::PyObjectRef,
         exec_ctx: *const crate::PyExecutionContext,
@@ -8850,7 +9576,7 @@ fn exec_or_eval(
         // not fire for eval() in PyPy.  Dispatch on the dict object so
         // the str-keyed write fans into the storage proxy.
         let w_builtin = if !exec_ctx.is_null() {
-            unsafe { (*exec_ctx).get_builtin() }
+            planted_builtins(unsafe { (*exec_ctx).get_builtin() })
         } else {
             pyre_object::PY_NULL
         };
@@ -8880,9 +9606,9 @@ fn exec_or_eval(
         // `w_globals` object so a dict-subclass `setdefault` override
         // fires.
         let w_builtin = if !caller_frame.is_null() {
-            unsafe { (*caller_frame).get_builtin() }
+            planted_builtins(unsafe { (*caller_frame).get_builtin() })
         } else if !exec_ctx.is_null() {
-            unsafe { (*exec_ctx).get_builtin() }
+            planted_builtins(unsafe { (*exec_ctx).get_builtin() })
         } else {
             pyre_object::PY_NULL
         };
@@ -8899,20 +9625,36 @@ fn exec_or_eval(
     //   globals: not None ⇒ isinstance_w(w_dict) else TypeError
     //   locals : not None ⇒ space.lookup(__getitem__) is not None
     //                       else TypeError "must be a mapping or None"
-    let funcname = if is_eval { "eval" } else { "exec" };
     if !is_none_or_null(globals_arg) && !is_dict_w(globals_arg) {
-        return Err(crate::PyError::type_error(format!(
-            "{funcname}() arg 2 must be a dict, not {}",
-            type_name_of(globals_arg)
-        )));
+        // `builtin_eval_impl` splits on `PyMapping_Check`, so a mapping that
+        // is merely not a dict is told how to pass it as the locals instead;
+        // `builtin_exec_impl` names the type it got.
+        let message = if is_eval {
+            if unsafe { crate::baseobjspace::lookup(globals_arg, "__getitem__").is_some() } {
+                "globals must be a real dict; try eval(expr, {}, mapping)".to_string()
+            } else {
+                "globals must be a dict".to_string()
+            }
+        } else {
+            format!(
+                "exec() globals must be a dict, not {}",
+                type_name_of(globals_arg)
+            )
+        };
+        return Err(crate::PyError::type_error(message));
     }
     if !is_none_or_null(locals_arg)
         && unsafe { crate::baseobjspace::lookup(locals_arg, "__getitem__").is_none() }
     {
-        return Err(crate::PyError::type_error(format!(
-            "{funcname}() arg 3 must be a mapping or None, not {}",
-            type_name_of(locals_arg)
-        )));
+        let message = if is_eval {
+            "locals must be a mapping".to_string()
+        } else {
+            format!(
+                "locals must be a mapping or None, not {}",
+                type_name_of(locals_arg)
+            )
+        };
+        return Err(crate::PyError::type_error(message));
     }
 
     // bltinmodule.c builtin_exec_impl — validate the closure against the
@@ -9017,10 +9759,11 @@ fn exec_or_eval(
     // locals=globals and pyre's existing same-dict path handles it.
     let mut implicit_caller_locals: pyre_object::PyObjectRef = std::ptr::null_mut();
     if is_none_or_null(globals_arg) && is_none_or_null(locals_arg) && !caller_frame.is_null() {
-        // pyframe.py:540 getdictscope returns the caller's
-        // w_locals (PyObjectRef) — same dict-or-mapping the
-        // interpreter sees inside the calling function body.
-        implicit_caller_locals = unsafe { (*caller_frame).getdictscope()? };
+        // The caller's locals as `locals()` reports them: its real namespace
+        // for a module or class frame, an independent snapshot for an
+        // optimized one.  The snapshot is what keeps `exec("y = 1")` inside a
+        // function from adding `y` to that function's locals.
+        implicit_caller_locals = unsafe { (*caller_frame).frame_locals_snapshot()? };
     }
     let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
     if !is_none_or_null(locals_arg) {
@@ -9171,31 +9914,43 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     })
 }
 
+/// The frame whose locals `locals()` / `vars()` / `dir()` report on
+/// (`interp_inspect.py:7-11 locals` — `ec.gettopframe_nohidden()`).
+///
+/// Going through `gettopframe_nohidden` is what makes the frame's fastlocals
+/// readable: it runs `force_frame` on every frame it walks
+/// (`executioncontext.rs:409-421`), and `fast2locals` reads
+/// `locals_cells_stack_w` directly, so an unforced virtualizable hands back an
+/// array of nulls — which `fast2locals` renders as an EMPTY mapping rather
+/// than a stale one.  Reading `CURRENT_FRAME` instead skips that force, and
+/// under the JIT the caller then sees no locals at all.
+fn topframe_for_locals() -> *mut crate::PyFrame {
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*ec).gettopframe_nohidden() }
+}
+
 fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !args.is_empty() {
         return Err(crate::PyError::type_error("locals() takes no arguments"));
     }
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "locals() requires an active frame",
-            ));
-        }
-        // `interp_inspect.py:7-11 locals` returns
-        // `ec.gettopframe_nohidden().getdictscope()` unconditionally.
-        // `getdictscope` (`pyframe.py:525-530`) always runs `fast2locals()`
-        // before returning `debugdata.w_locals`, so a second `locals()`
-        // re-syncs the mapping with the current fast locals —
-        // `x = 1; locals(); x = 2; locals()["x"]` reads `2`.  `fast2locals`
-        // lazily allocates and caches the mapping on first call, so identity
-        // holds (`locals() is locals()`, and `locals() is globals()` at
-        // module scope where `debugdata.w_locals is w_globals`); for a
-        // non-dict exec/eval mapping it returns that live object and writes
-        // through its `__setitem__`.
-        let frame_mut = unsafe { &mut *frame };
-        frame_mut.getdictscope()
-    })
+    // `frame_locals_snapshot` (`_PyEval_GetFrameLocals`) hands an optimized
+    // frame an independent copy, so a snapshot neither tracks later stores nor
+    // writes back — `x = 1; d = locals(); x = 2; d["x"]` still reads `1`, and
+    // `locals() is locals()` is false.  Module and class frames keep returning
+    // their real namespace, so `locals() is globals()` still holds at module
+    // scope and a non-dict exec/eval mapping is still the live object written
+    // through its `__setitem__`.
+    let frame = topframe_for_locals();
+    if frame.is_null() {
+        return Err(crate::PyError::runtime_error(
+            "locals() requires an active frame",
+        ));
+    }
+    let frame_mut = unsafe { &mut *frame };
+    frame_mut.frame_locals_snapshot()
 }
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -9209,9 +9964,10 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return builtin_locals(args);
     }
     if args.len() != 1 {
-        return Err(crate::PyError::type_error(
-            "vars() takes at most 1 argument.",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "vars expected at most 1 argument, got {}",
+            args.len()
+        )));
     }
     let obj = args[0];
     let has_dict = unsafe {
@@ -9326,27 +10082,34 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if args.is_empty() {
         // `bltinmodule.c builtin_dir` — with no argument, list the names in
         // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
-        // locals mapping exactly as `locals()` does (module scope returns
-        // the globals dict), then return its sorted keys.
-        return crate::eval::CURRENT_FRAME.with(|current| {
-            let frame = current.get();
-            if frame.is_null() {
-                return Ok(w_list_new(vec![]));
-            }
-            let frame_mut = unsafe { &mut *frame };
-            let w_locals_dict = frame_mut.getdictscope()?;
-            if w_locals_dict.is_null() {
-                return Ok(w_list_new(vec![]));
-            }
-            // PyPy app_inspect.py:50 calls
-            // `sorted(_caller_locals().keys())`, not `sorted(locals)`.
-            // This distinction is observable for a general eval locals
-            // mapping which implements `keys()` and sequence-style
-            // `__getitem__` but no `__iter__`.
-            let keys_method = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
-            let keys = crate::call_and_check(keys_method, &[])?;
-            builtin_sorted(&[keys])
-        });
+        // frame exactly as `locals()` does (module scope returns the globals
+        // dict), then return the mapping's sorted keys.  `getdictscope` rather
+        // than `frame_locals_snapshot`: only the key set is read, and the two
+        // agree on it, so the snapshot copy would be a pure allocation.
+        let frame = topframe_for_locals();
+        if frame.is_null() {
+            return Ok(w_list_new(vec![]));
+        }
+        let frame_mut = unsafe { &mut *frame };
+        let w_locals_dict = frame_mut.getdictscope()?;
+        if w_locals_dict.is_null() {
+            return Ok(w_list_new(vec![]));
+        }
+        // `_dir_locals` reads the key set through `PyMapping_Keys(locals)`,
+        // so a locals mapping that overrides `keys()` (`eval(src, {}, A())`
+        // with `A(dict)`) is honoured; only an exact dict takes the
+        // `PyDict_Keys` fast path that iterates the storage directly.
+        let w_keys = if unsafe {
+            pyre_object::pyobject::is_exact_type(w_locals_dict, &pyre_object::pyobject::DICT_TYPE)
+        } {
+            w_locals_dict
+        } else {
+            let keys_meth = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
+            crate::call_and_check(keys_meth, &[])?
+        };
+        let keys_iter = crate::baseobjspace::iter(w_keys)?;
+        let keys = collect_iterable(keys_iter)?;
+        return builtin_sorted(&[w_list_new(keys)]);
     }
     if args.len() > 1 {
         return Err(crate::PyError::type_error(format!(
@@ -9636,6 +10399,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // guard, so a nest deep enough to exhaust the C stack has to be
             // caught on the way down.
             crate::stack_check::stack_check()?;
+            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+                return Ok(hash);
+            }
             let n = w_tuple_len(obj);
             let mut hashes = Vec::with_capacity(n);
             for i in 0..(n as i64) {
@@ -9665,13 +10431,17 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // agrees with `__eq__`'s set equality.
             let args = pyre_object::w_union_get_args(obj);
             let n = pyre_object::w_tuple_len(args);
-            let mut members = Vec::with_capacity(n);
+            let mut hashes = Vec::with_capacity(n);
             for i in 0..n {
                 if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
-                    members.push(item);
+                    // Preserve frozenset construction's fallible element-hash
+                    // phase.  Building a low-level frozenset first would use
+                    // its stored infallible digest path and hide an
+                    // unhashable union member.
+                    hashes.push(try_hash_value(item)?);
                 }
             }
-            return try_hash_value(pyre_object::w_frozenset_from_items(&members));
+            return Ok(_hash_frozenset(&hashes));
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
@@ -9937,6 +10707,14 @@ fn _hash_bytes(bytes: &[u8]) -> i64 {
 /// selecting one-, two-, or four-byte native-endian units from the maximum
 /// code point.  Pyre stores WTF-8, so materialize only this hash input.
 fn _hash_unicode_with_key(wtf8: &rustpython_wtf8::Wtf8, secret: &[u8; 16]) -> i64 {
+    // An all-ASCII string's PEP 393 canonical code-unit storage is its
+    // one-byte-per-char form, byte-identical to the WTF-8 bytes, so hash those
+    // directly instead of materializing a separate code-unit buffer. This is
+    // the common case (identifiers, dict keys) and skips two Vec allocations.
+    let storage = wtf8.as_bytes();
+    if storage.is_ascii() {
+        return _hash_bytes_with_key(storage, secret);
+    }
     let codepoints: Vec<u32> = wtf8.code_points().map(|cp| cp.to_u32()).collect();
     let maxchar = codepoints.iter().copied().max().unwrap_or(0);
     let mut bytes = Vec::with_capacity(
@@ -9974,6 +10752,11 @@ fn _hash_unicode(wtf8: &rustpython_wtf8::Wtf8) -> i64 {
 /// without a `W_UnicodeObject`.
 #[inline]
 pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
+    // ASCII fast path (see `_hash_unicode_with_key`): the storage bytes are the
+    // canonical hash input, so hash them without validating/constructing a Wtf8.
+    if bytes.is_ascii() {
+        return _hash_bytes(bytes);
+    }
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes).expect("str storage is valid WTF-8");
     _hash_unicode(wtf8)
 }
@@ -10347,6 +11130,10 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // Pyre's flat builtin ABI surfaces kwargs as a trailing dict; strip it
     // before the positional walk and look up `strict` from it.
     let (args, kwargs) = split_builtin_kwargs(args);
+    // `zip_new` parses its keywords with `PyArg_ParseTupleAndKeywords(empty,
+    // kwds, "|$p:zip", ...)`, so the keyword *count* is checked against the
+    // single `strict` slot before any name is looked at.
+    clinic_arity("zip", 0, real_kwarg_count(kwargs), 0, 0, 1)?;
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::shadow_stack_len();
@@ -10624,48 +11411,152 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 ///     instead of silently falling back to "treat as not less".
 pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
-    if positional.is_empty() {
-        return Err(crate::PyError::type_error(
-            "sorted() requires at least one argument",
-        ));
-    }
-    if positional.len() > 1 {
+    // `builtin_sorted` unpacks its one positional itself and leaves every
+    // keyword to the `list.sort` it delegates to, so an unknown keyword is
+    // reported by `sort`, not by `sorted`.
+    if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
-            "sorted() takes at most 1 positional argument ({} given)",
+            "sorted expected 1 argument, got {}",
             positional.len()
         )));
     }
-    kwarg_reject_unknown(kwargs, &["key", "reverse"], "sorted")?;
+    kwarg_reject_unknown(kwargs, &["key", "reverse"], "sort")?;
     let iterable = positional[0];
     let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
     let reverse = kwarg_get(kwargs, "reverse")
         .map(|v| crate::baseobjspace::is_true(v))
         .transpose()?
         .unwrap_or(false);
-    let items = collect_iterable(iterable)?;
+    // `app_functional.py:7` `sorted` is `list(iterable)` followed by
+    // `sorted_lst.sort(key=key, reverse=reverse)`, so the built list picks its
+    // storage strategy first and the sort runs through the same body
+    // `list.sort` uses.
+    let w_list = w_list_new(collect_iterable(iterable)?);
     let _roots = pyre_object::gc_roots::push_roots();
-    let item_base = pyre_object::gc_roots::shadow_stack_len();
-    for item in items {
-        pyre_object::gc_roots::pin_root(item);
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_list);
+    sort_list_in_place(list_slot, key_fn, reverse)?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
+}
+
+/// `listobject.py:809 descr_sort` — the shared body of `list.sort` and
+/// `sorted`.  `list_slot` is a shadow-stack slot holding the list, because a
+/// key call or a comparison dunder can collect and move it.
+pub(crate) fn sort_list_in_place(
+    list_slot: usize,
+    key_fn: Option<PyObjectRef>,
+    reverse: bool,
+) -> Result<(), crate::PyError> {
+    // `descr_sort` sorts through the strategy's own `sort` whenever the list
+    // is not object-strategy and no key was given: the storage is already
+    // unwrapped, so there is no boxing, no comparison dunder, and no need to
+    // empty the receiver first — no user code can run to observe it.
+    if key_fn.is_none() {
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        unsafe {
+            if let Some((items, len)) = pyre_object::listobject::w_list_int_items_raw(list) {
+                sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
+                return Ok(());
+            }
+            if let Some((items, len)) = pyre_object::listobject::w_list_float_items_raw(list) {
+                sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
+                return Ok(());
+            }
+        }
     }
-    let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-    let order = sort_rooted_items(item_base, item_len, key_fn, reverse)?;
-    let result = order
-        .into_iter()
-        .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
-        .collect();
-    Ok(w_list_new(result))
+    unsafe {
+        // Hold the detached values in shadow-stack slots, not a bare Rust Vec,
+        // while key and comparison calls can collect.  The receiver is empty
+        // for the whole operation, so user code cannot alter this sorting
+        // slice through the visible list.
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        let saved = pyre_object::listobject::w_list_items_copy_as_vec(list);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let item_base = pyre_object::gc_roots::shadow_stack_len();
+        for item in saved {
+            pyre_object::gc_roots::pin_root(item);
+        }
+        let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+        pyre_object::listobject::w_list_clear(list);
+
+        let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse);
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        // Whether the user mucked with the list during the sort: any mutation
+        // switches the emptied receiver away from the Empty strategy, and a
+        // list never switches back, so a net-zero append+pop is caught too.
+        let mucked = !pyre_object::listobject::w_list_is_empty_strategy(list);
+
+        // `descr_sort`'s `finally` puts the items back unconditionally,
+        // discarding whatever the user stored into the receiver meanwhile.
+        let restored = order
+            .into_iter()
+            .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
+            .collect();
+        pyre_object::listobject::w_list_init_items(list, restored);
+        sorted?;
+        if mucked {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "list modified during sort",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `IntegerListStrategy.sort` (`listobject.py:1963`) / `FloatListStrategy.sort`
+/// (`:2067`) on the unwrapped storage.
+///
+/// `descr_sort`'s reverse handling — reverse, stable ascending sort, reverse
+/// again — is kept here rather than the strategies' single trailing
+/// `l.reverse()`: for `float` the difference is observable, since `-0.0` and
+/// `0.0` compare equal but are distinct values whose relative order a stable
+/// sort must preserve.
+fn sort_scalars<T: Copy>(items: &mut [T], reverse: bool) -> Result<(), crate::PyError>
+where
+    ScalarLt: crate::listsort::SortLt<T>,
+{
+    if reverse {
+        items.reverse();
+    }
+    crate::listsort::sort_with(items, &mut ScalarLt)?;
+    if reverse {
+        items.reverse();
+    }
+    Ok(())
+}
+
+/// `listobject.py:2429 IntSort.lt` / `:2434 FloatSort.lt` — a direct scalar
+/// comparison, never a dunder.
+struct ScalarLt;
+
+impl crate::listsort::SortLt<i64> for ScalarLt {
+    fn lt(&mut self, a: i64, b: i64) -> Result<bool, crate::PyError> {
+        Ok(a < b)
+    }
+}
+
+impl crate::listsort::SortLt<f64> for ScalarLt {
+    fn lt(&mut self, a: f64, b: f64) -> Result<bool, crate::PyError> {
+        Ok(a < b)
+    }
 }
 
 /// Sort rooted item slots and return the resulting permutation.  All object
 /// references that survive a Python call live in the shadow stack; the sort
 /// itself only moves integer indices.
+///
+/// The permutation comes back even when a key call or a comparison raises,
+/// because `descr_sort` puts `sorter.list` back from a `finally` — an
+/// interrupted sort leaves the list holding its elements in whatever order the
+/// merge had reached, not the order it started in.
 pub(crate) fn sort_rooted_items(
     item_base: usize,
     item_len: usize,
     key_fn: Option<PyObjectRef>,
     reverse: bool,
-) -> Result<Vec<usize>, crate::PyError> {
+) -> (Vec<usize>, Result<(), crate::PyError>) {
+    let mut order: Vec<usize> = (0..item_len).collect();
     let _key_roots = pyre_object::gc_roots::push_roots();
     let key_base = pyre_object::gc_roots::shadow_stack_len();
     let key_fn_slot = key_fn.map(|key| {
@@ -10675,105 +11566,131 @@ pub(crate) fn sort_rooted_items(
     let key_base = key_base + usize::from(key_fn_slot.is_some());
     if let Some(key_fn_slot) = key_fn_slot {
         for index in 0..item_len {
-            let key = crate::call::call_function_impl_result(
+            // `_compute_keys_for_sorting` (listobject.py:894) runs before the
+            // `reverse` flip, so a raising key leaves the input order.
+            match crate::call::call_function_impl_result(
                 pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
                 &[pyre_object::gc_roots::shadow_stack_get(item_base + index)],
-            )?;
-            pyre_object::gc_roots::pin_root(key);
+            ) {
+                Ok(key) => pyre_object::gc_roots::pin_root(key),
+                Err(err) => return (order, Err(err)),
+            }
         }
     }
 
-    let mut order: Vec<usize> = (0..item_len).collect();
-    // `rpython/rlib/listsort.py listsort.lt` defers to
-    // `space.lt(a, b)` and propagates exceptions; if the user's
-    // `__lt__` raises, sort halts with that error.  Rust's
-    // `sort_by` closure cannot return Result, so capture the first
-    // error via a Cell and surface it after the sort completes.
-    // `pypy/objspace/std/listobject.py descr_sort` reverses before and after a stable
-    // ascending sort for `reverse=True`, so equal elements keep their
-    // original relative order (a stable descending sort). A single
-    // post-sort reverse would instead flip ties.
+    // `descr_sort` reverses before and after a stable ascending sort for
+    // `reverse=True`, so equal elements keep their original relative order (a
+    // stable descending sort).  A single post-sort reverse would instead flip
+    // ties.
     if reverse {
         order.reverse();
     }
-    let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
-    let sort_lt = |left: usize, right: usize| -> bool {
-        if sort_error
-            .take()
-            .map(|e| {
-                sort_error.set(Some(e));
-                true
-            })
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-            key_base + left
-        } else {
-            item_base + left
-        });
-        let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-            key_base + right
-        } else {
-            item_base + right
-        });
-        match crate::baseobjspace::compare(left, right, crate::baseobjspace::CompareOp::Lt) {
-            Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
-                sort_error.set(Some(e));
-                false
-            }),
-            Err(e) => {
-                sort_error.set(Some(e));
-                false
-            }
-        }
+    let base = if key_fn_slot.is_some() {
+        key_base
+    } else {
+        item_base
     };
-    order.sort_by(|left, right| {
-        let ab = sort_lt(*left, *right);
-        if ab {
-            return std::cmp::Ordering::Less;
-        }
-        let ba = sort_lt(*right, *left);
-        if ba {
-            return std::cmp::Ordering::Greater;
-        }
-        // Fast-path tail kept for the cases where `compare` returns
-        // `False` for both directions (legacy unhashable / unorderable
-        // pairs that pyre still has) — preserves prior behaviour.
-        unsafe {
-            let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-                key_base + *left
-            } else {
-                item_base + *left
-            });
-            let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-                key_base + *right
-            } else {
-                item_base + *right
-            });
-            if is_int(left) && is_int(right) {
-                return w_int_get_value(left).cmp(&w_int_get_value(right));
-            }
-            if is_str(left) && is_str(right) {
-                return w_str_get_value(left).cmp(w_str_get_value(right));
-            }
-            if is_float(left) && is_float(right) {
-                return pyre_object::w_float_get_value(left)
-                    .partial_cmp(&pyre_object::w_float_get_value(right))
-                    .unwrap_or(std::cmp::Ordering::Equal);
-            }
-            std::cmp::Ordering::Equal
-        }
-    });
-    if let Some(err) = sort_error.take() {
-        return Err(err);
-    }
-    // Second half of the `reverse=True` double-reverse (see above).
+    let mut compare = sort_compare_for(base, item_len, key_fn_slot.is_some());
+    let result = crate::listsort::sort_with(&mut order, &mut compare);
+    // Second half of the double-reverse (see above), which runs on the raising
+    // path too — an interrupted `reverse=True` sort must not leave the list in
+    // the opposite orientation from the one it was handed.  `descr_sort` puts
+    // this reverse inside its `try` and so skips it; `list_sort_impl` does not,
+    // and that is the behaviour to match.
     if reverse {
         order.reverse();
     }
-    Ok(order)
+    (order, result)
+}
+
+/// The comparison primitive `listsort.py`'s TimSort drives, holding the
+/// shadow-stack base of the values being compared (the keys under `key=`,
+/// otherwise the items themselves).
+///
+/// `descr_sort` (`listobject.py:809`) resolves the sorter class from the
+/// list's storage strategy, so an integer-strategy list sorts through
+/// `IntSort` (`listobject.py:2429`) and never dispatches a comparison dunder
+/// at all; `FloatSort` (`:2434`) is the same for floats, and `SimpleSort`
+/// (`:2423`) / `CustomKeySort` (`:2446`) are the generic `space.lt` path.
+enum SortCompare {
+    Int(usize),
+    Float(usize),
+    Str(usize),
+    Generic(usize),
+}
+
+impl crate::listsort::SortLt<usize> for SortCompare {
+    fn lt(&mut self, a: usize, b: usize) -> Result<bool, crate::PyError> {
+        let (Self::Int(base) | Self::Float(base) | Self::Str(base) | Self::Generic(base)) = *self;
+        let left = pyre_object::gc_roots::shadow_stack_get(base + a);
+        let right = pyre_object::gc_roots::shadow_stack_get(base + b);
+        // Each arm is what `compare_slot` reaches for that exact pair, taken
+        // directly: `int_lt`'s `int_value`, `float_lt`'s unwrapped `<`, and the
+        // WTF-8 byte order the str arm compares on.
+        unsafe {
+            match self {
+                Self::Int(_) => Ok(crate::objspace::descroperation::int_value(left)
+                    < crate::objspace::descroperation::int_value(right)),
+                Self::Float(_) => Ok(
+                    pyre_object::w_float_get_value(left) < pyre_object::w_float_get_value(right)
+                ),
+                Self::Str(_) => {
+                    Ok(w_str_get_wtf8(left).as_bytes() < w_str_get_wtf8(right).as_bytes())
+                }
+                Self::Generic(_) => {
+                    let result = crate::baseobjspace::compare(
+                        left,
+                        right,
+                        crate::baseobjspace::CompareOp::Lt,
+                    )?;
+                    crate::baseobjspace::is_true(result)
+                }
+            }
+        }
+    }
+}
+
+/// Pick the sorter the way `descr_sort` picks it from the list's strategy.
+///
+/// pyre's list stores plain object references with no strategy to read, so the
+/// same decision is one pass over the values.  What makes the specialization
+/// equivalent is that a subclass carrying its own `__lt__` must fail the test
+/// and take the generic path, exactly as it would keep an object-strategy list
+/// upstream — so the test has to be `is_exact_type` (pyobject.rs:179), which
+/// compares the instance's `w_class` against the builtin's type object and so
+/// rejects a subclass, which retags `w_class` to its own.  `is_int` / `is_str`
+/// / `is_float` are NOT usable here: they are `py_type_check`, an `ob_type`
+/// layout test a subclass instance also passes because it shares the builtin
+/// vtable.  A `key=` sort is `CustomKeySort`, generic upstream as well.
+fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
+    if keyed {
+        return SortCompare::Generic(base);
+    }
+    let (mut all_int, mut all_float, mut all_str) = (true, true, true);
+    for index in 0..len {
+        let item = pyre_object::gc_roots::shadow_stack_get(base + index);
+        unsafe {
+            // `bool` is admitted alongside `int` because it cannot be
+            // subclassed, so it can never carry an overriding `__lt__`, and
+            // `int_value` reads it the same way.
+            all_int &= pyre_object::is_exact_type(item, &pyre_object::INT_TYPE)
+                || pyre_object::is_exact_type(item, &pyre_object::BOOL_TYPE);
+            all_float &= pyre_object::is_exact_type(item, &pyre_object::FLOAT_TYPE);
+            all_str &= pyre_object::is_exact_type(item, &pyre_object::STR_TYPE);
+        }
+        if !(all_int || all_float || all_str) {
+            return SortCompare::Generic(base);
+        }
+    }
+    if all_int {
+        SortCompare::Int(base)
+    } else if all_float {
+        SortCompare::Float(base)
+    } else if all_str {
+        SortCompare::Str(base)
+    } else {
+        SortCompare::Generic(base)
+    }
 }
 
 /// `any(iterable)` — PyPy: operation.py any
@@ -12330,6 +13247,11 @@ fn fileio_close_owned_fd(fd: i32) {
 /// wrapper.  In particular, binary unbuffered I/O returns the raw `FileIO`.
 pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
+    // Every declared slot binds before the unrecognized keywords are
+    // reported, so a call missing `file` names `file`.
+    let file = bind_pos_or_kw(positional, kwargs, 0, "file", "open", 1)?.ok_or_else(|| {
+        crate::PyError::type_error("open() missing required argument 'file' (pos 1)")
+    })?;
     kwarg_reject_unknown(
         kwargs,
         &[
@@ -12344,8 +13266,6 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         ],
         "open",
     )?;
-    let file = bind_pos_or_kw(positional, kwargs, 0, "file", "open", 1)?
-        .ok_or_else(|| crate::PyError::type_error("open() missing 'file' argument"))?;
     let w_mode =
         bind_pos_or_kw(positional, kwargs, 1, "mode", "open", 2)?.unwrap_or_else(|| w_str_new("r"));
     if unsafe { !pyre_object::is_str(w_mode) } {
@@ -12557,7 +13477,9 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// has constructed the real `_io.FileIO` object.
 fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return Err(crate::PyError::type_error("open() missing 'file' argument"));
+        return Err(crate::PyError::type_error(
+            "open() missing required argument 'file' (pos 1)",
+        ));
     }
     let (open_pos, open_kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(
@@ -12575,7 +13497,9 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         "open",
     )?;
     let path_obj = resolve_pos_or_kw(open_pos.first().copied(), open_kwargs, "file", "open", 1)?
-        .ok_or_else(|| crate::PyError::type_error("open() missing 'file' argument"))?;
+        .ok_or_else(|| {
+            crate::PyError::type_error("open() missing required argument 'file' (pos 1)")
+        })?;
     let mode_obj = resolve_pos_or_kw(open_pos.get(1).copied(), open_kwargs, "mode", "open", 2)?;
     let encoding_obj =
         resolve_pos_or_kw(open_pos.get(3).copied(), open_kwargs, "encoding", "open", 4)?;
@@ -12933,11 +13857,12 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `sum(sequence, start=0)` — PyPy `__builtin__/app_functional.py sum`.
 ///
-/// A plain left-fold through `space.add` (`_regular_sum`'s
-/// `last = last + x`).  No Kahan/Neumaier compensation: float operands
-/// accumulate with ordinary left-to-right IEEE rounding, exactly as PyPy
-/// does (`sum([0.1, 0.2, 0.3])` is `0.6000000000000001`, not `0.6`).  A
-/// `str`/`bytes`/`bytearray` `start` is rejected up front.
+/// A left-fold through `space.add` (`_regular_sum`'s `last = last + x`) while
+/// the running total is an exact int, then the improved Kahan-Babuška
+/// (Neumaier) compensated float accumulator `builtin_sum_impl` uses — so
+/// `sum([0.1] * 10)` is exactly `1.0` rather than the naive partial sum
+/// `functional.py:_sum` produces.  A `str`/`bytes`/`bytearray` `start` is
+/// rejected up front.
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `sum(iterable, /, start=0)`: iterable is positional-only, start is
     // positional-or-keyword; at most two arguments total.
@@ -12975,11 +13900,79 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // (so generators, ranges, sets, dict views, ... all work).  Very
     // intentionally `last + x`, not `+=` — preserving a mutable `start`
     // (e.g. a list) matches PyPy's app-level definition.
+    let items = crate::builtins::collect_iterable(iterable)?;
     let mut last = start;
-    for item in crate::builtins::collect_iterable(iterable)? {
+    let mut i = 0;
+    // `builtin_sum_impl` runs an exact-int accumulator until the running
+    // total turns into an exact float, then a float accumulator that carries
+    // the improved Kahan-Babuška (Neumaier) compensation term — so
+    // `sum([0.1] * 10)` is exactly `1.0` rather than the naive partial sum
+    // `functional.py:_sum` produces.  The int phase is the generic `last + x`
+    // loop, which already keeps exact ints exact and promotes to a float on
+    // the first float item, so only the float phase needs its own arithmetic.
+    while i < items.len()
+        && unsafe { is_exact_int_operand(last) }
+        && !unsafe { is_exact_float_operand(last) }
+    {
+        last = crate::baseobjspace::add(last, items[i])?;
+        i += 1;
+    }
+    if unsafe { is_exact_float_operand(last) } {
+        let mut total = unsafe { pyre_object::w_float_get_value(last) };
+        let mut compensation = 0.0f64;
+        while i < items.len() {
+            let item = items[i];
+            // A float *subclass* leaves the fast path — its `__add__` may be
+            // overridden — while `bool` and an `int` subclass stay in it,
+            // matching the `PyFloat_CheckExact` / `PyLong_Check` asymmetry of
+            // the C loop.  An int too wide for a machine word leaves it too,
+            // the way `PyLong_AsLongAndOverflow` signals overflow.
+            let x = unsafe {
+                if pyre_object::is_float(item) && pyre_object::is_exact_builtin_instance(item) {
+                    pyre_object::w_float_get_value(item)
+                } else if pyre_object::pyobject::is_int(item) {
+                    pyre_object::w_int_get_value(item) as f64
+                } else {
+                    break;
+                }
+            };
+            let t = total + x;
+            compensation += if total.abs() >= x.abs() {
+                (total - t) + x
+            } else {
+                (x - t) + total
+            };
+            total = t;
+            i += 1;
+        }
+        // The residual is folded back only while the total is still finite.
+        // Once it reaches an infinity the term degenerates — `(total - t)` is
+        // `inf - inf` — and adding that NaN in would report `sum([inf, 1.0])`
+        // as NaN instead of `inf`.
+        last = pyre_object::w_float_new(if total.is_finite() {
+            total + compensation
+        } else {
+            total
+        });
+    }
+    for &item in &items[i..] {
         last = crate::baseobjspace::add(last, item)?;
     }
     Ok(last)
+}
+
+/// `PyLong_CheckExact` — an exact `int`, excluding `bool` and any subclass.
+unsafe fn is_exact_int_operand(obj: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::pyobject::is_int_or_long(obj)
+            && !pyre_object::pyobject::is_bool(obj)
+            && pyre_object::is_exact_builtin_instance(obj)
+    }
+}
+
+/// `PyFloat_CheckExact` — an exact `float`, excluding any subclass.
+unsafe fn is_exact_float_operand(obj: PyObjectRef) -> bool {
+    unsafe { pyre_object::is_float(obj) && pyre_object::is_exact_builtin_instance(obj) }
 }
 
 /// `round(number, ndigits=None)` — PyPy: operation.py round
@@ -13036,10 +14029,10 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             "round() takes at most 2 arguments ({total} given)"
         )));
     }
-    kwarg_reject_unknown(kwargs, &["number", "ndigits"], "round")?;
     let obj = bind_pos_or_kw(pos, kwargs, 0, "number", "round", 1)?.ok_or_else(|| {
         crate::PyError::type_error("round() missing required argument 'number' (pos 1)")
     })?;
+    kwarg_reject_unknown(kwargs, &["number", "ndigits"], "round")?;
     let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
     let ndigits = ndigits_arg.as_ref();
     unsafe {
@@ -13187,8 +14180,10 @@ fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     if args.len() != 2 {
+        // `_PyArg_CheckPositional` names the function bare and parenthesis-free
+        // once it declares two or more arguments.
         return Err(crate::PyError::type_error(format!(
-            "divmod() takes exactly two arguments ({} given)",
+            "divmod expected 2 arguments, got {}",
             args.len()
         )));
     }
@@ -13205,13 +14200,13 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "pow() takes at most 3 arguments ({total} given)"
         )));
     }
-    kwarg_reject_unknown(kwargs, &["base", "exp", "mod"], "pow")?;
     let base = bind_pos_or_kw(pos, kwargs, 0, "base", "pow", 1)?.ok_or_else(|| {
         crate::PyError::type_error("pow() missing required argument 'base' (pos 1)")
     })?;
     let exp = bind_pos_or_kw(pos, kwargs, 1, "exp", "pow", 2)?.ok_or_else(|| {
         crate::PyError::type_error("pow() missing required argument 'exp' (pos 2)")
     })?;
+    kwarg_reject_unknown(kwargs, &["base", "exp", "mod"], "pow")?;
     let modulus = bind_pos_or_kw(pos, kwargs, 2, "mod", "pow", 3)?;
     match modulus {
         Some(m) if !unsafe { pyre_object::is_none(m) } => crate::baseobjspace::pow3(base, exp, m),
@@ -13526,10 +14521,9 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     if args.is_empty() {
-        return Err(crate::PyError::type_error(format!(
-            "format() takes at least one argument ({} given)",
-            args.len()
-        )));
+        return Err(crate::PyError::type_error(
+            "format expected at least 1 argument, got 0",
+        ));
     }
     if args.len() > 2 {
         return Err(crate::PyError::type_error(format!(
@@ -13612,6 +14606,11 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if !unsafe { pyre_object::is_str(name_obj) } {
         return Err(crate::PyError::type_error("module name must be a string"));
     }
+    // Keep the wrapped name live across `level.__index__`: the precise
+    // collector can relocate a young string while the index protocol runs.
+    let _name_roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(name_obj);
     let globals = scope[1];
     let locals = scope[2];
     let fromlist = scope[3];
@@ -13632,7 +14631,9 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         }
     });
     // The native importer keys every lookup by `&str`, so a name that has no
-    // such spelling goes straight to the app-level bootstrap.
+    // such spelling goes straight to the app-level bootstrap.  Re-read the
+    // name through its root: `space_index_w` above may have moved it.
+    let name_obj = pyre_object::gc_roots::shadow_stack_get(name_slot);
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
         return crate::importing::dunder_import_name_obj(
             name_obj, globals, locals, fromlist, level,
@@ -13964,6 +14965,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn int_string_rejects_trailing_nondigit() {
+        crate::typedef::init_typeobjects();
+        for text in ["1234L", "12x", "0x12g"] {
+            let source = w_str_new(text);
+            let base = if text.starts_with("0x") { 0 } else { 10 };
+            let err = parse_int_from_str(source, text, base).unwrap_err();
+            assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        }
+    }
     /// PyPy `interp_io._open` constructs `W_FileIO`, and
     /// `W_FileIO.descr_init` calls `_open_fd` before returning.  A writable
     /// pathname must therefore be created/truncated while the stream is still

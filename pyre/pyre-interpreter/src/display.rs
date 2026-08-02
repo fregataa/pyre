@@ -7,8 +7,8 @@ use pyre_object::pyobject::{
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::{
-    BUILTIN_CODE_TYPE, BUILTIN_FUNCTION_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_name,
-    function_get_qualname,
+    BUILTIN_CODE_TYPE, BUILTIN_FUNCTION_TYPE, FUNCTION_TYPE, METHOD_DESCRIPTOR_TYPE,
+    builtin_code_name, function_get_name, function_get_qualname,
 };
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
@@ -162,34 +162,51 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Record `obj` as mid-repr on this thread, or report `false` when it already
+/// is (`Py_ReprEnter`).  Writes the runtime-mutable `REPR_ACTIVE` thread-local,
+/// not a build-time constant, so the JIT residualises the call instead of
+/// tracing into it (`@dont_look_inside`, the `eval::set_in_flight_exception`
+/// shape), the [`repr_leave`] twin.
+#[majit_macros::dont_look_inside]
+pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
+    let key = obj as usize;
+    REPR_ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        if active.contains(&key) {
+            false
+        } else {
+            active.push(key);
+            true
+        }
+    })
+}
+
+/// Drop `obj` from the mid-repr set (`Py_ReprLeave`) — see [`repr_enter`].
+#[majit_macros::dont_look_inside]
+pub(crate) fn repr_leave(obj: PyObjectRef) {
+    let key = obj as usize;
+    REPR_ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        if let Some(pos) = active.iter().rposition(|&k| k == key) {
+            active.remove(pos);
+        }
+    });
+}
+
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
 /// repr'd on this thread — the caller emits the `...` placeholder — and
 /// otherwise records `obj`, removing it again when the guard drops.
-pub(crate) struct ReprGuard(usize);
+pub(crate) struct ReprGuard(PyObjectRef);
 
 impl ReprGuard {
     pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
-        let key = obj as usize;
-        REPR_ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            if active.contains(&key) {
-                None
-            } else {
-                active.push(key);
-                Some(ReprGuard(key))
-            }
-        })
+        repr_enter(obj).then_some(ReprGuard(obj))
     }
 }
 
 impl Drop for ReprGuard {
     fn drop(&mut self) {
-        REPR_ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            if let Some(pos) = active.iter().rposition(|&k| k == self.0) {
-                active.remove(pos);
-            }
-        });
+        repr_leave(self.0);
     }
 }
 
@@ -352,6 +369,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             || std::ptr::eq(tp, &BOOL_TYPE as *const PyType)
             || std::ptr::eq(tp, &STR_TYPE as *const PyType)
             || std::ptr::eq(tp, &pyre_object::LIST_TYPE as *const PyType)
+            || pyre_object::is_tuple(obj)
             || std::ptr::eq(
                 tp,
                 &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
@@ -524,7 +542,16 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
             return Ok(None);
         };
+        // `object`'s and `BaseException`'s registrations are the two the
+        // native formatting stands in for, and so are the `descr_str`
+        // builtins the exception classes install on top of them — calling
+        // any of those back from here would recurse.  A builtin that the
+        // native path does *not* implement, such as
+        // `BaseExceptionGroup.__str__`, still has to be dispatched.
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
+            return Ok(None);
+        }
+        if crate::builtins::is_native_exception_dunder(method) {
             return Ok(None);
         }
         if let Some(base) = crate::builtins::lookup_exc_class("BaseException") {
@@ -754,14 +781,19 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let owner_name = pyre_object::w_type_get_name(owner);
             format!("<method '{name}' of '{owner_name}' objects>")
         } else if std::ptr::eq(tp, &BUILTIN_FUNCTION_TYPE as *const PyType) {
-            // function.py:721 BuiltinFunction.descr_function_repr
+            // function.py:721 BuiltinFunction.descr_function_repr.  Same text
+            // the `__repr__` this type registers in `typedef.rs` produces;
+            // this native arm is the one `repr()` actually reaches.
             let name = function_get_name(obj);
-            format!("<built-in function {name}>")
+            let w_self = crate::function::function_get_self_or_none(obj);
+            crate::function::builtin_function_repr_text(name, w_self)
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
-            // CPython 3.14 func_repr, selected by `init_function_type`.
-            // Exact builtin values take this fast path instead of dispatching
-            // through that type-dict descriptor, so it must preserve the same
-            // address-bearing representation.
+            // function.py:283 Function.descr_function_repr —
+            // `self.getrepr(space, 'function %s' % self.qualname)`, and
+            // `baseobjspace.py:115 getrepr` appends ` at 0x<addr>`.  Exact
+            // builtin values take this fast path instead of dispatching
+            // through the `__repr__` the type registers in `typedef.rs`, so it
+            // must produce the same address-bearing text.
             let name = function_get_qualname(obj);
             format!("<function {name} at {obj:p}>")
         } else if unsafe { pyre_object::is_exception(obj) } {
@@ -845,10 +877,8 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                         )
                     {
                         parts.push("None".to_string());
-                    } else if pyre_object::is_type(item) {
-                        parts.push(pyre_object::w_type_get_name(item).to_string());
                     } else {
-                        parts.push(py_repr(item)?);
+                        parts.push(crate::_pypy_generic_alias::repr_item(item)?);
                     }
                 }
             }
@@ -1008,135 +1038,9 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 return Ok(s);
             }
         }
-        // `pypy/module/exceptions/interp_exceptions.py:126-133
-        // W_BaseException.descr_str`:
-        //
-        // ```python
-        // def descr_str(self, space):
-        //     lgt = len(self.args_w)
-        //     if lgt == 0:
-        //         return space.newtext('')
-        //     elif lgt == 1:
-        //         return space.str(self.args_w[0])
-        //     else:
-        //         return space.str(space.newtuple(self.args_w))
-        // ```
-        //
-        // PyPy reads `self.args_w` on every call so `e.args = (...)`
-        // mutations are reflected by subsequent `str(e)` reads.  Pyre
-        // previously returned the constructor-time `message` snapshot,
-        // which split repr/str apart after the user mutated args.
         if unsafe { pyre_object::is_exception(obj) } {
-            // `pypy/module/exceptions/interp_exceptions.py:447-459`
-            // `W_UnicodeTranslateError.descr_str`,
-            // `:1061-1071` `W_UnicodeDecodeError.descr_str`,
-            // `:1175-1191` `W_UnicodeEncodeError.descr_str` — each
-            // typedef registers `__str__ = interp2app(descr_str)`,
-            // overriding the inherited `W_BaseException.descr_str`.
-            // Dispatched on `ExcKind` because Pyre flattens the three
-            // PyPy subclasses into the single `W_BaseException`
-            // struct.
-            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-            match kind {
-                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => {
-                    return Ok(unicode_translate_error_str(obj));
-                }
-                pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
-                    return Ok(unicode_decode_error_str(obj));
-                }
-                pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
-                    return Ok(unicode_encode_error_str(obj));
-                }
-                // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
-                // a single-argument KeyError stringifies as `repr(args[0])`
-                // so `str(KeyError('k'))` is `"'k'"`; with any other arg
-                // count it falls back to `W_BaseException.descr_str` below.
-                pyre_object::interp_exceptions::ExcKind::KeyError => {
-                    let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
-                    if !args.is_null()
-                        && pyre_object::is_tuple(args)
-                        && pyre_object::w_tuple_len(args) == 1
-                    {
-                        let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
-                        return py_repr(first);
-                    }
-                }
-                // `interp_exceptions.py:667-703 W_OSError.descr_str` reads
-                // the `errno`/`strerror`/`filename`/`filename2` slots:
-                // the 2-argument form renders as `"[Errno N] strerror"`,
-                // extended with `": 'filename'"` and `" -> 'filename2'"`
-                // when those are present.  `_init_error` drops filename
-                // from `args`, so prefer the slot and fall back to the
-                // positional arg (same 2..=5 gate as the getters) for the
-                // internal-constructor path that leaves the slots `PY_NULL`.
-                // Both errno and strerror absent falls back to
-                // `W_BaseException.descr_str` below.
-                pyre_object::interp_exceptions::ExcKind::OSError
-                | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
-                    let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
-                    let n = if !args.is_null() && pyre_object::is_tuple(args) {
-                        pyre_object::w_tuple_len(args)
-                    } else {
-                        0
-                    };
-                    let slot_or_arg = |slot: pyre_object::PyObjectRef,
-                                       idx: usize|
-                     -> Option<pyre_object::PyObjectRef> {
-                        if !slot.is_null() {
-                            return Some(slot);
-                        }
-                        if (2..=5).contains(&n) && idx < n {
-                            unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
-                        } else {
-                            None
-                        }
-                    };
-                    let w_errno = slot_or_arg(
-                        pyre_object::interp_exceptions::w_exception_get_errno(obj),
-                        0,
-                    );
-                    let w_strerror = slot_or_arg(
-                        pyre_object::interp_exceptions::w_exception_get_strerror(obj),
-                        1,
-                    );
-                    if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
-                        let errno = py_str(w_errno)?;
-                        let strerror = py_str(w_strerror)?;
-                        let w_filename = slot_or_arg(
-                            pyre_object::interp_exceptions::w_exception_get_filename(obj),
-                            2,
-                        )
-                        .filter(|&f| !pyre_object::is_none(f));
-                        if let Some(fname) = w_filename {
-                            let w_filename2 = slot_or_arg(
-                                pyre_object::interp_exceptions::w_exception_get_filename2(obj),
-                                4,
-                            )
-                            .filter(|&f| !pyre_object::is_none(f));
-                            if let Some(fname2) = w_filename2 {
-                                return Ok(format!(
-                                    "[Errno {errno}] {strerror}: {} -> {}",
-                                    py_repr(fname)?,
-                                    py_repr(fname2)?
-                                ));
-                            }
-                            return Ok(format!("[Errno {errno}] {strerror}: {}", py_repr(fname)?));
-                        }
-                        return Ok(format!("[Errno {errno}] {strerror}"));
-                    }
-                }
-                // `interp_exceptions.py:859-883 W_SyntaxError.descr_str` —
-                // a non-str `msg` stringifies plainly; otherwise the message
-                // is suffixed with the `basename(filename)` and `line N` /
-                // `lines N-M` derived from the location attributes.  The
-                // WTF-8 path already implements this; reuse it and drop any
-                // lone surrogates for the plain-`String` caller.
-                pyre_object::interp_exceptions::ExcKind::SyntaxError => {
-                    if let Some(w) = exception_descr_str_wtf8(obj)? {
-                        return Ok(w.to_string_lossy().into_owned());
-                    }
-                }
-                _ => {}
+            if let Some(s) = exception_kind_str(obj)? {
+                return Ok(s);
             }
             // A user subclass that overrides `__str__` shadows the builtin
             // `W_BaseException.descr_str`; dispatch it before the generic
@@ -1147,22 +1051,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             if let Some(s) = exc_user_dunder(obj, "__str__")? {
                 return Ok(s);
             }
-            let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
-            if args.is_null() {
-                return Ok(String::new());
-            }
-            if !pyre_object::is_tuple(args) {
-                return py_str(args);
-            }
-            let n: usize = pyre_object::w_tuple_len(args);
-            if n == 0 {
-                return Ok(String::new());
-            }
-            if n == 1 {
-                let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
-                return py_str(first);
-            }
-            return py_str(args);
+            return base_exception_str(obj);
         }
         // `int`/`float`/... define no `tp_str`, so `str()` falls back to
         // `repr()` (a `__str__` override wins, otherwise the `__repr__`
@@ -1180,6 +1069,175 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             }
         }
         py_repr(obj)
+    }
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:126-133
+/// W_BaseException.descr_str`:
+///
+/// ```python
+/// def descr_str(self, space):
+///     lgt = len(self.args_w)
+///     if lgt == 0:
+///         return space.newtext('')
+///     elif lgt == 1:
+///         return space.str(self.args_w[0])
+///     else:
+///         return space.str(space.newtuple(self.args_w))
+/// ```
+///
+/// PyPy reads `self.args_w` on every call so `e.args = (...)` mutations are
+/// reflected by subsequent `str(e)` reads.
+///
+/// # Safety
+/// `obj` must be a live `W_BaseException`.
+pub(crate) unsafe fn base_exception_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    unsafe {
+        let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
+        if args.is_null() {
+            return Ok(String::new());
+        }
+        if !pyre_object::is_tuple(args) {
+            return py_str(args);
+        }
+        let n: usize = pyre_object::w_tuple_len(args);
+        if n == 0 {
+            return Ok(String::new());
+        }
+        if n == 1 {
+            let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+            return py_str(first);
+        }
+        py_str(args)
+    }
+}
+
+/// The `descr_str` overrides the builtin exception classes register on top of
+/// `W_BaseException.descr_str`, dispatched on the instance's `ExcKind` because
+/// pyre flattens PyPy's subclasses into the single `W_BaseException` struct.
+/// `None` means the instance's class inherits the base `descr_str`.
+///
+/// # Safety
+/// `obj` must be a live `W_BaseException`.
+pub(crate) unsafe fn exception_kind_str(
+    obj: PyObjectRef,
+) -> Result<Option<String>, crate::PyError> {
+    unsafe {
+        // `pypy/module/exceptions/interp_exceptions.py:447-459`
+        // `W_UnicodeTranslateError.descr_str`,
+        // `:1061-1071` `W_UnicodeDecodeError.descr_str`,
+        // `:1175-1191` `W_UnicodeEncodeError.descr_str` — each
+        // typedef registers `__str__ = interp2app(descr_str)`,
+        // overriding the inherited `W_BaseException.descr_str`.
+        // Dispatched on `ExcKind` because Pyre flattens the three
+        // PyPy subclasses into the single `W_BaseException`
+        // struct.
+        let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+        match kind {
+            pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => {
+                return Ok(Some(unicode_translate_error_str(obj)));
+            }
+            pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+                return Ok(Some(unicode_decode_error_str(obj)));
+            }
+            pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
+                return Ok(Some(unicode_encode_error_str(obj)));
+            }
+            // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
+            // a single-argument KeyError stringifies as `repr(args[0])`
+            // so `str(KeyError('k'))` is `"'k'"`; with any other arg
+            // count it falls back to `W_BaseException.descr_str` below.
+            pyre_object::interp_exceptions::ExcKind::KeyError => {
+                let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
+                if !args.is_null()
+                    && pyre_object::is_tuple(args)
+                    && pyre_object::w_tuple_len(args) == 1
+                {
+                    let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+                    return Ok(Some(py_repr(first)?));
+                }
+            }
+            // `interp_exceptions.py:667-703 W_OSError.descr_str` reads
+            // the `errno`/`strerror`/`filename`/`filename2` slots:
+            // the 2-argument form renders as `"[Errno N] strerror"`,
+            // extended with `": 'filename'"` and `" -> 'filename2'"`
+            // when those are present.  `_init_error` drops filename
+            // from `args`, so prefer the slot and fall back to the
+            // positional arg (same 2..=5 gate as the getters) for the
+            // internal-constructor path that leaves the slots `PY_NULL`.
+            // Both errno and strerror absent falls back to
+            // `W_BaseException.descr_str` below.
+            pyre_object::interp_exceptions::ExcKind::OSError
+            | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
+                let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
+                let n = if !args.is_null() && pyre_object::is_tuple(args) {
+                    pyre_object::w_tuple_len(args)
+                } else {
+                    0
+                };
+                let slot_or_arg = |slot: pyre_object::PyObjectRef,
+                                   idx: usize|
+                 -> Option<pyre_object::PyObjectRef> {
+                    if !slot.is_null() {
+                        return Some(slot);
+                    }
+                    if (2..=5).contains(&n) && idx < n {
+                        unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
+                    } else {
+                        None
+                    }
+                };
+                let w_errno = slot_or_arg(
+                    pyre_object::interp_exceptions::w_exception_get_errno(obj),
+                    0,
+                );
+                let w_strerror = slot_or_arg(
+                    pyre_object::interp_exceptions::w_exception_get_strerror(obj),
+                    1,
+                );
+                if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
+                    let errno = py_str(w_errno)?;
+                    let strerror = py_str(w_strerror)?;
+                    let w_filename = slot_or_arg(
+                        pyre_object::interp_exceptions::w_exception_get_filename(obj),
+                        2,
+                    )
+                    .filter(|&f| !pyre_object::is_none(f));
+                    if let Some(fname) = w_filename {
+                        let w_filename2 = slot_or_arg(
+                            pyre_object::interp_exceptions::w_exception_get_filename2(obj),
+                            4,
+                        )
+                        .filter(|&f| !pyre_object::is_none(f));
+                        if let Some(fname2) = w_filename2 {
+                            return Ok(Some(format!(
+                                "[Errno {errno}] {strerror}: {} -> {}",
+                                py_repr(fname)?,
+                                py_repr(fname2)?
+                            )));
+                        }
+                        return Ok(Some(format!(
+                            "[Errno {errno}] {strerror}: {}",
+                            py_repr(fname)?
+                        )));
+                    }
+                    return Ok(Some(format!("[Errno {errno}] {strerror}")));
+                }
+            }
+            // `interp_exceptions.py:859-883 W_SyntaxError.descr_str` —
+            // a non-str `msg` stringifies plainly; otherwise the message
+            // is suffixed with the `basename(filename)` and `line N` /
+            // `lines N-M` derived from the location attributes.  The
+            // WTF-8 path already implements this; reuse it and drop any
+            // lone surrogates for the plain-`String` caller.
+            pyre_object::interp_exceptions::ExcKind::SyntaxError => {
+                if let Some(w) = exception_descr_str_wtf8(obj)? {
+                    return Ok(Some(w.to_string_lossy().into_owned()));
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 }
 
@@ -1339,21 +1397,19 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
                 } else {
                     None
                 };
-            // `have_filename` → `os.path.basename(self.filename or "???")`.
+            // `have_filename` → `my_basename(self.filename)`.
+            // `interp_exceptions.py:875` substitutes `"???"` for a falsy
+            // filename; 3.14 only tests `PyUnicode_Check`, so an *empty*
+            // filename basenames to the empty string.
             let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
             if pyre_object::pyobject::is_exact_type(w_filename, &STR_TYPE) {
                 let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
-                let fname = if fbuf.as_bytes().is_empty() {
-                    Wtf8Buf::from_string("???".to_string())
-                } else {
-                    let start = fbuf
-                        .as_bytes()
-                        .iter()
-                        .rposition(|&b| b == b'/')
-                        .map_or(0, |i| i + 1);
-                    fbuf[start..].to_wtf8_buf()
-                };
-                let mut inner = fname;
+                let start = fbuf
+                    .as_bytes()
+                    .iter()
+                    .rposition(|&b| b == b'/')
+                    .map_or(0, |i| i + 1);
+                let mut inner = fbuf[start..].to_wtf8_buf();
                 if let Some(l) = lineno_str {
                     inner.push_str(", ");
                     inner.push_wtf8(&l);

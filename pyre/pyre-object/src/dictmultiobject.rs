@@ -113,6 +113,14 @@ unsafe fn key_as_utf8(key: PyObjectRef) -> Option<&'static str> {
 /// fails loud rather than substituting a divergent structural hash.
 #[inline]
 pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
+    // `hash_w` runs the key's `__hash__` and is therefore a collection point,
+    // while this key caches the pointer — the hazard [`object_key_hashed`]
+    // documents. Publish `obj` across the call and build the key from the
+    // reloaded address, or the entry lands in the `IndexMap` under the
+    // pre-move pointer and every later probe dereferences reclaimed memory.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error() {
@@ -123,6 +131,7 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     // an infallible probe's own error is then swallowed by the next key
     // construction, never leaking into a later checked op.
     crate::dict_eq_hook::take_eq_error();
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     ObjectKey { hash, obj }
 }
 
@@ -294,6 +303,132 @@ pub unsafe fn dict_entries_insert_hashed(
     entries.insert(ObjectKey { hash, obj }, value)
 }
 
+/// Read the value stored at an entry index the caller already settled on —
+/// `rordereddict.py:709 ll_dict_getitem`'s `d.entries[i].value` after
+/// `ll_dict_lookup` returned the slot.
+///
+/// Residualised for [`dict_entries_probe_hashed`]'s reason: `IndexMap` has no
+/// lowering, so `get_index` is the last modellable point.  No comparison runs
+/// here — the index is already known, so this is a pure slot read and the
+/// residual boundary swallows no user code at all.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_hashed`]; `index` must be a live entry index.
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_value_at(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    index: usize,
+) -> PyObjectRef {
+    *entries.get_index(index).unwrap().1
+}
+
+/// Overwrite the value at an entry index the caller already settled on —
+/// `dictmultiobject.py:1220-1221 setitem_str`'s in-place update, which reuses
+/// the stored key rather than re-inserting.
+///
+/// Residualised for [`dict_entries_value_at`]'s reason, and the store twin of
+/// it: the index is already known, so the boundary swallows a slot write and
+/// no comparison.
+///
+/// # Safety
+/// Same as [`dict_entries_value_at`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_value_set_at(
+    entries: &mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    index: usize,
+    value: PyObjectRef,
+) {
+    *entries.get_index_mut(index).unwrap().1 = value;
+}
+
+/// The owned-key store — [`dict_entries_probe_object`]'s twin, hashing `key`
+/// through [`object_key_for`] the way `dict_entries_remove_object` does.
+///
+/// Residualised for [`dict_entries_insert_hashed`]'s reason: `IndexMap` has no
+/// lowering, and upstream's `_ll_dict_setitem_lookup_done`
+/// (`rordereddict.py:674`) is `@jit.look_inside_iff(jit.isvirtual(d) and
+/// jit.isconstant(key))`, neither conjunct of which can hold here.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_object`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_insert_object(
+    entries: &mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) {
+    entries.insert(object_key_for(key), value);
+}
+
+/// The stored key's object word at an entry index, `None` once the walk has
+/// passed the last entry — `rordereddict.py:1051-1052 ll_dict_lookup`'s
+/// `entries[i].key` plus the bound that ends its scan.
+///
+/// Residualised for [`dict_entries_value_at`]'s reason: a positional slot read
+/// runs no comparison, so the boundary swallows no user code.  It is the read
+/// [`scan_dict_key_reentrant`] performs per step; the scan's `keyeq` loop and
+/// its paranoia restart stay traced around it, which is what
+/// `ll_dict_lookup`'s own `@jit.look_inside_iff(jit.isvirtual(d))` keeps
+/// visible for a dict the tracer can see.
+///
+/// # Safety
+/// Same as [`dict_entries_value_at`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_key_obj_at(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    index: usize,
+) -> Option<PyObjectRef> {
+    entries.get_index(index).map(|(stored, _)| stored.obj)
+}
+
+/// The stored key's cached digest at an entry index — `rordereddict.py:1053
+/// entries.hash(i)`, the hash compared before `keyeq` is allowed to run.
+///
+/// Split from [`dict_entries_key_obj_at`] rather than returned beside it: an
+/// `ObjectKey` by value is not a residual-ABI argument shape, and the caller
+/// reads both words at the same index with no callback in between.
+///
+/// # Safety
+/// Same as [`dict_entries_value_at`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_key_hash_at(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    index: usize,
+) -> i64 {
+    entries.get_index(index).unwrap().0.hash
+}
+
+/// `entries.valid(index) && entries[index].key == checkingkey` — the second
+/// half of `ll_dict_lookup`'s paranoia condition (`rordereddict.py:1058`),
+/// answered against the two key words the caller sampled before the
+/// comparison it is validating.
+///
+/// # Safety
+/// Same as [`dict_entries_value_at`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_key_is_at(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    index: usize,
+    hash: i64,
+    obj: PyObjectRef,
+) -> bool {
+    entries
+        .get_index(index)
+        .is_some_and(|(stored, _)| stored.hash == hash && stored.obj == obj)
+}
+
+/// The table's allocation identity, as `ll_dict_lookup`'s paranoia restart
+/// reads it (`rordereddict.py:1058 entries != d.entries`): a grow reallocates
+/// every entry, so a capacity change is the observable that a stale index can
+/// no longer be trusted.
+///
+/// # Safety
+/// Same as [`dict_entries_value_at`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_capacity(entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>) -> usize {
+    entries.capacity()
+}
+
 /// Drop the last entry — the undo the checked store runs when a user `__eq__`
 /// raised mid-probe and `insert` therefore appended a spurious entry.
 ///
@@ -343,10 +478,49 @@ unsafe fn dict_entries_index_of_str(
     match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
         Some(hash) => {
             crate::dict_eq_hook::take_eq_error();
-            entries.get_index_of(&StrLookupKey { hash, key })
+            dict_entries_index_of_str_hashed(entries, hash, key)
         }
-        None => entries.get_index_of(&object_key_for(crate::w_str_new(key))),
+        None => dict_entries_index_of_object(entries, crate::w_str_new(key)),
     }
+}
+
+/// The borrow-key membership probe [`dict_entries_index_of_str`] runs once the
+/// str hash hook has produced `hash` — [`dict_entries_probe_str`]'s twin,
+/// returning the entry index instead of the value.
+///
+/// Residualised for [`dict_entries_probe_str`]'s reason: the
+/// `IndexMap::get_index_of` it wraps is the same external-crate heap lookup,
+/// and the user `__eq__` a str-subclass key can run sits inside the probe
+/// upstream too (`rdict.py:576 ll_dict_lookup` carries
+/// `@jit.oopspec('dict.lookup')` over the whole `keyeq` loop).  The enclosing
+/// router keeps its hook gate and its allocating fallback visible.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_str`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_index_of_str_hashed(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    hash: i64,
+    key: &str,
+) -> Option<usize> {
+    entries.get_index_of(&StrLookupKey { hash, key })
+}
+
+/// The owned-key membership probe [`dict_entries_index_of_str`]'s no-hook arm
+/// runs — [`dict_entries_probe_object`]'s twin.
+///
+/// Residualised for [`dict_entries_probe_object`]'s reason: a body that
+/// reaches either `get_index_of` stops there, so leaving one arm traced keeps
+/// the enclosing graph blocked no matter what the other arm does.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_object`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_index_of_object(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    key: PyObjectRef,
+) -> Option<usize> {
+    entries.get_index_of(&object_key_for(key))
 }
 
 /// Build the persistent exact-str key for a new `setitem_str` entry.
@@ -373,6 +547,11 @@ unsafe fn object_key_for_new_str(key: &str) -> ObjectKey {
 /// error from the interpreter-side error slot.
 #[inline]
 pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, DictKeyError> {
+    // Same publication as [`object_key_for`]: `hash_w` can collect and this
+    // key caches the pointer, so key on the reloaded address.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error() {
@@ -381,6 +560,7 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
     // Clean slate for the bucket probe that follows in the caller; its
     // eq error is read back via `take_dict_key_error` after the access.
     crate::dict_eq_hook::take_eq_error();
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     Ok(ObjectKey { hash, obj })
 }
 
@@ -964,28 +1144,68 @@ pub unsafe fn module_dict_storage_len(obj: PyObjectRef) -> Option<usize> {
     Some((*md.dstorage).len())
 }
 
-/// Register a compiled loop's invalidation `flag` against the module
-/// dict's `ModuleDictStrategy.version?` quasi-immutable field
-/// (`celldict.py:34 _immutable_fields_ = ["version?"]`).  The compile-time
-/// glue calls this once per version-keyed module-global dependency so a
-/// later `mutated()` (new key, `del`, or `switch_to_object_strategy`)
-/// flips the flag and fails the loop's `GUARD_NOT_INVALIDATED`.  No-op
-/// when `obj` is not a `W_ModuleDictObject`.
+/// Register a compiled loop's invalidation `flag` against a module dict
+/// strategy's `version?` quasi-immutable field (`celldict.py:34
+/// _immutable_fields_ = ["version?"]`).  The compile-time glue calls this once
+/// per version-keyed module-global dependency so a later `mutated()` (new key,
+/// `del`, `switch_to_object_strategy`, or a write that replaces a stored cell)
+/// flips the flag and fails the loop's `GUARD_NOT_INVALIDATED`.
+///
+/// Takes the strategy rather than the dict because that is what the trace pins:
+/// `version` lives on the strategy, so the `QUASIIMMUT_FIELD` names it directly.
 ///
 /// # Safety
-/// `obj` must be null or a valid PyObjectRef.
-pub unsafe fn module_dict_register_version_watcher(
-    obj: PyObjectRef,
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_register_version_watcher(
+    strategy: *mut crate::celldict::ModuleDictStrategy,
     flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if obj.is_null() || !is_module_dict(obj) {
+    if strategy.is_null() {
         return;
     }
-    let md = &*(obj as *const W_ModuleDictObject);
-    if md.mstrategy.is_null() {
+    (*strategy).register_version_watcher(flag);
+}
+
+/// Install this strategy's `version?` qmut instance without registering a loop
+/// (`quasiimmut.py:116-126 get_current_qmut_instance`).
+///
+/// The recording-time half, for the reason spelled out on
+/// [`crate::typeobject::w_type_install_quasi_immut`].
+///
+/// # Safety
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_install_version_watcher(
+    strategy: *mut crate::celldict::ModuleDictStrategy,
+) {
+    if strategy.is_null() {
         return;
     }
-    (*md.mstrategy).register_version_watcher(flag);
+    (*strategy).install_version_watcher();
+}
+
+/// `pyjitpl.py:1112 mutatebox.nonnull()` for this strategy's `version?`.
+///
+/// # Safety
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_version_qmut_installed(
+    strategy: *const crate::celldict::ModuleDictStrategy,
+) -> bool {
+    !strategy.is_null() && (*strategy).version_qmut_installed()
+}
+
+/// `quasiimmut.py:46-51 do_force_quasi_immutable` for this strategy's
+/// `version?` — the invalidation the tracer performs itself before aborting
+/// (`pyjitpl.py:1113-1115`).
+///
+/// # Safety
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_force_version_qmut(
+    strategy: *const crate::celldict::ModuleDictStrategy,
+) {
+    if strategy.is_null() {
+        return;
+    }
+    (*strategy).force_version_qmut();
 }
 
 /// Allocate a new empty dict per `dictmultiobject.py:67-69
@@ -1810,11 +2030,11 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
         let entries = w_module_dict_object_storage_mut(obj);
         match dict_entries_index_of_str(entries, key) {
             Some(idx) => {
-                *entries.get_index_mut(idx).unwrap().1 = w_value;
+                dict_entries_value_set_at(entries, idx, w_value);
             }
             None => {
                 let w_key = crate::w_str_new(key);
-                entries.insert(object_key_for(w_key), w_value);
+                dict_entries_insert_object(entries, w_key, w_value);
                 w_dict_bump_keys_version(obj);
             }
         };
@@ -2269,22 +2489,23 @@ unsafe fn scan_dict_key_reentrant(
         let (table_capacity, clear_generation) = {
             let dict = &*(obj as *const W_DictObject);
             (
-                (*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)).capacity(),
+                dict_entries_capacity(
+                    &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>),
+                ),
                 dict.clear_gen,
             )
         };
         let mut i = 0;
         loop {
             obj = crate::gc_roots::shadow_stack_get(obj_slot);
-            let Some((stored_hash, stored_obj)) = ({
+            let (stored_hash, stored_obj) = {
                 let dict = &*(obj as *const W_DictObject);
                 let entries =
                     &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-                entries
-                    .get_index(i)
-                    .map(|(stored, _)| (stored.hash, stored.obj))
-            }) else {
-                return Ok((None, key, obj));
+                let Some(stored_obj) = dict_entries_key_obj_at(entries, i) else {
+                    return Ok((None, key, obj));
+                };
+                (dict_entries_key_hash_at(entries, i), stored_obj)
             };
 
             if stored_hash == key.hash {
@@ -2313,12 +2534,10 @@ unsafe fn scan_dict_key_reentrant(
                     // `entries != d.entries`: a realloc grew the table, or a
                     // `clear` reset it in place (`clear_gen`) — either
                     // reallocates `d.entries` in `ll_dict_lookup`'s eyes.
-                    entries.capacity() != table_capacity
+                    dict_entries_capacity(entries) != table_capacity
                         || dict.clear_gen != clear_generation
                         // `entries.valid(index) && entries[index].key == checkingkey`.
-                        || !entries.get_index(i).is_some_and(|(stored, _)| {
-                            stored.hash == stored_hash && stored.obj == stored_obj
-                        })
+                        || !dict_entries_key_is_at(entries, i, stored_hash, stored_obj)
                 };
                 if disturbed {
                     continue 'restart;
@@ -2355,7 +2574,7 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
     if let Some(result) = callback_free_dict_op!({
         let dict = &*(obj as *const W_DictObject);
         let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-        entries.get(&object_key).copied()
+        dict_entries_probe_hashed(entries, object_key.hash, object_key.obj)
     }) {
         return result;
     }
@@ -2363,7 +2582,7 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
     Ok(found.map(|i| {
         let dict = &*(obj as *const W_DictObject);
         let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-        *entries.get_index(i).unwrap().1
+        dict_entries_value_at(entries, i)
     }))
 }
 
@@ -2659,7 +2878,7 @@ pub unsafe fn w_dict_setdefault_checked(
                 match index {
                     Some(i) => Some(*entries.get_index(i).unwrap().1),
                     None => {
-                        entries.insert(object_key, value);
+                        dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
                         w_dict_bump_keys_version(obj);
                         dict_write_barrier(obj);
                         Some(value)
@@ -2692,7 +2911,7 @@ pub unsafe fn w_dict_setdefault_checked(
         crate::dict_eq_hook::begin_callback_free_probe();
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-        entries.insert(object_key, value);
+        dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
         let _ = crate::dict_eq_hook::end_callback_free_probe();
         w_dict_bump_keys_version(obj);
         dict_write_barrier(obj);
@@ -2816,10 +3035,20 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
     hash: Option<i64>,
 ) -> Result<(), DictKeyError> {
     debug_assert!(!value.is_null(), "w_dict_store_object_strategy: null value");
+    // `object_key_for_checked` hashes through the key's `__hash__`, so it is a
+    // collection point; the caller's `lock_dict_refs!` bindings are raw copies
+    // taken before it. Publish the receiver and the value here and reload them
+    // once the key exists, or the insert below writes a moved `value` and
+    // reaches the `IndexMap` through the dict's pre-move address.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, value]);
+    let value_slot = obj_slot + 1;
     let object_key = match hash {
         Some(hash) => object_key_hashed(key, hash),
         None => object_key_for_checked(key)?,
     };
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let value = crate::gc_roots::shadow_stack_get(value_slot);
     // Single setitem probe (matches `r_dict.setitem`'s one bucket scan), run
     // callback-free so no user `__eq__` mutates the dict while the `IndexMap`
     // borrow is live.  When every same-hash comparison stays inside the
@@ -2836,7 +3065,7 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
                     *entries.get_index_mut(i).unwrap().1 = value;
                 }
                 None => {
-                    entries.insert(object_key, value);
+                    dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
                     dict.keys_version = dict.keys_version.wrapping_add(1);
                 }
             }
@@ -2867,7 +3096,7 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
             crate::dict_eq_hook::begin_callback_free_probe();
             let dict = &mut *(obj as *mut W_DictObject);
             let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-            entries.insert(object_key, value);
+            dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
             let _ = crate::dict_eq_hook::end_callback_free_probe();
             dict.keys_version = dict.keys_version.wrapping_add(1);
         }
@@ -2899,7 +3128,9 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
         w_module_dict_switch_to_object_strategy(obj);
     }
     let entries = w_module_dict_object_storage_mut(obj);
-    let inserted = entries.insert(object_key_for(key), value).is_none();
+    let object_key = object_key_for(key);
+    let inserted =
+        dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value).is_none();
     let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
     strategy.mutated();
     if inserted {
@@ -2970,7 +3201,7 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
     debug_assert!(!is_module_dict(w_copy));
 
     let dst_dict = &mut *(dst as *mut W_DictObject);
-    let copy_dict = &mut *(w_copy as *mut W_DictObject);
+    let copy_dict = &*(w_copy as *const W_DictObject);
     let old_dstorage = dst_dict.dstorage;
 
     dst_dict.dstrategy = copy_dict.dstrategy;
@@ -3360,6 +3591,147 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     }
     entries.shift_remove_index(index);
     dict.keys_version = dict.keys_version.wrapping_add(1);
+    Ok(true)
+}
+
+/// Reposition `k` to the back (`last`) or front of a native insertion-ordered
+/// typed store, bumping `keys_version` only on a real move.  Returns whether the
+/// key existed.  Shared by the Int/Bytes fast paths of
+/// [`w_dict_move_to_end_checked`]; the caller has proven the strategy so the
+/// `IndexMap<K, _>` cast matches `dstorage`.
+///
+/// # Safety
+/// `dict` must point to a valid `W_DictObject` whose `dstorage` is an
+/// `IndexMap<K, PyObjectRef>`.
+unsafe fn typed_move_to_end<K: std::hash::Hash + Eq>(
+    dict: *mut W_DictObject,
+    k: &K,
+    last: bool,
+) -> bool {
+    let dict = &mut *dict;
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<K, PyObjectRef>);
+    match entries.get_index_of(k) {
+        Some(index) => {
+            let target = if last { entries.len() - 1 } else { 0 };
+            if index != target {
+                entries.move_index(index, target);
+                dict.keys_version = dict.keys_version.wrapping_add(1);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// PyPy `W_DictMultiObject.nondescr_move_to_end` (`dictmultiobject.py:221`):
+/// reposition an existing key to the back (`last`) or front of the insertion
+/// order, bypassing any subclass hooks.  Locates the entry callback-free,
+/// falling back to the reentrant scan when a probing `__eq__`/`__hash__`
+/// escapes the builtin ladder, then shifts it with `IndexMap::move_index` (the
+/// in-place equivalent of `objectmodel.move_to_end`, `:1175`).  Returns whether
+/// the key existed; `false` maps to `KeyError` at the wrapper.  `keys_version`
+/// is bumped: a reorder invalidates index-keyed caches (dict-view cursors,
+/// module-dict global slots) and raises the mutation-during-iteration guard,
+/// matching `OrderedDict` under CPython 3.14.
+///
+/// # Safety
+/// `obj` must point to a valid dict backing (`W_DictObject` or module dict).
+pub unsafe fn w_dict_move_to_end_checked(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    last: bool,
+) -> Result<bool, DictKeyError> {
+    if is_module_dict(obj) {
+        if !w_module_dict_is_object_strategy(obj) {
+            w_module_dict_switch_to_object_strategy(obj);
+        }
+        let object_key = object_key_for_checked(key)?;
+        if let Some(result) = callback_free_dict_op!({
+            let entries = w_module_dict_object_storage_mut(obj);
+            match entries.get_index_of(&object_key) {
+                Some(index) => {
+                    let target = if last { entries.len() - 1 } else { 0 };
+                    // A key already at the target is a positional no-op; skip
+                    // the version bump so a live iterator is not spuriously
+                    // invalidated (as in w_dict_delitem_if_value_is_checked).
+                    if index != target {
+                        entries.move_index(index, target);
+                        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+                        strategy.mutated();
+                        w_dict_bump_keys_version(obj);
+                    }
+                    true
+                }
+                None => false,
+            }
+        }) {
+            return result;
+        }
+        // Module dicts key on interned strings, which compare callback-free; a
+        // key needing a user `__eq__` has no reentrant fallback here, matching
+        // w_dict_delitem_if_value_is_checked's module branch.
+        return Err(DictKeyError);
+    }
+
+    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let kind = strategy.strategy_kind();
+
+    // Typed stores reorder in place, preserving the strategy — the
+    // `AbstractTypedStrategy.move_to_end` fast path (`dictmultiobject.py:1170`).
+    // Int and Bytes keep their native `IndexMap<i64>` / `IndexMap<Vec<u8>>`
+    // storage; the lookup compares native keys, so it is callback-free and
+    // needs no reentrant fallback.  A foreign-type key cannot be present in a
+    // typed store, so it falls through to the object-strategy path below.
+    if kind == StrategyKind::Int && crate::listobject::is_plain_int1(key) {
+        let k = crate::listobject::plain_int_w(key);
+        return Ok(typed_move_to_end::<i64>(obj as *mut W_DictObject, &k, last));
+    }
+    if kind == StrategyKind::Bytes && crate::is_exact_type(key, &crate::bytesobject::BYTES_TYPE) {
+        let k = crate::w_bytes_data(key).to_vec();
+        return Ok(typed_move_to_end::<Vec<u8>>(
+            obj as *mut W_DictObject,
+            &k,
+            last,
+        ));
+    }
+
+    // Object and Unicode share the `IndexMap<ObjectKey>` representation, so the
+    // reorder below runs in place; only a genuinely foreign store (a typed
+    // store reached with a non-native key, or Kwargs/Map/Empty) is converted.
+    if kind != StrategyKind::Object && kind != StrategyKind::Unicode {
+        strategy.switch_to_object_strategy(obj);
+    }
+    let object_key = object_key_for_checked(key)?;
+    if let Some(result) = callback_free_dict_op!({
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        match entries.get_index_of(&object_key) {
+            Some(index) => {
+                let target = if last { entries.len() - 1 } else { 0 };
+                if index != target {
+                    entries.move_index(index, target);
+                    dict.keys_version = dict.keys_version.wrapping_add(1);
+                }
+                true
+            }
+            None => false,
+        }
+    }) {
+        return result;
+    }
+    // A probing `__eq__` may have run and moved the container; the reentrant
+    // scan re-pins it and returns the current index (no `value` to carry).
+    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
+    let Some(index) = found else {
+        return Ok(false);
+    };
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let target = if last { entries.len() - 1 } else { 0 };
+    if index != target {
+        entries.move_index(index, target);
+        dict.keys_version = dict.keys_version.wrapping_add(1);
+    }
     Ok(true)
 }
 
@@ -4848,6 +5220,26 @@ pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 /// into the Object fallback.
 pub struct EmptyDictStrategy;
 
+/// Install a freshly allocated strategy storage on an empty dict.
+///
+/// RPython's `w_dict.dstorage = strategy.erase(storage)` is a `setfield_gc`:
+/// the GC transform roots and reloads `w_dict` across the storage allocation,
+/// then records the old-to-young edge.  Do the same explicitly here.
+unsafe fn install_empty_strategy(
+    w_dict: PyObjectRef,
+    strategy: &'static dyn crate::dictmultiobject::DictStrategy,
+) {
+    let _roots = crate::gc_roots::push_roots();
+    let dict_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_dict);
+    let storage = strategy.get_empty_storage();
+    let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    dict.dstorage = storage;
+    dict.dstrategy = strategy;
+    crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+}
+
 impl EmptyDictStrategy {
     /// `dictmultiobject.py:692-705 switch_to_correct_strategy`.
     ///
@@ -4867,7 +5259,7 @@ impl EmptyDictStrategy {
         // `:696-698 type(w_key) is self.space.UnicodeObjectCls`
         // (Python 2 unicode / Python 3 str).
         if crate::is_exact_type(w_key, &crate::STR_TYPE) {
-            crate::dictmultiobject::w_dict_set_strategy(w_dict, &UNICODE_DICT_STRATEGY);
+            install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY);
             return;
         }
         // `:700-701 is_w(w_type, self.space.w_int)` — plain int only;
@@ -4912,11 +5304,7 @@ impl EmptyDictStrategy {
     /// `w_dict` must point at a valid `W_DictObject` whose strategy
     /// is currently `EmptyDictStrategy`.
     unsafe fn switch_to_int_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // Overwrite the placeholder box (`setfield_gc`); the unreachable old
-        // Object-shape box is reclaimed by the sweep.
-        dict.dstorage = INT_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &INT_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &INT_DICT_STRATEGY);
     }
 
     /// `dictmultiobject.py:707-711 switch_to_bytes_strategy`:
@@ -4935,9 +5323,7 @@ impl EmptyDictStrategy {
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_bytes_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = BYTES_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &BYTES_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &BYTES_DICT_STRATEGY);
     }
 
     /// `dictmultiobject.py:725-730 switch_to_identity_strategy`:
@@ -4959,9 +5345,7 @@ impl EmptyDictStrategy {
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_identity_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = crate::identitydict::IDENTITY_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &crate::identitydict::IDENTITY_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &crate::identitydict::IDENTITY_DICT_STRATEGY);
     }
 }
 
@@ -4993,12 +5377,7 @@ impl EmptyKwargsDictStrategy {
     /// `w_dict` must be a W_DictObject whose strategy is
     /// `EMPTY_KWARGS_DICT_STRATEGY`.
     unsafe fn switch_to_kwargs_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // No legacy Vec to drop — EmptyKwargsDictStrategy keeps a
-        // null `dstorage` like its parent until the first switch
-        // installs typed storage.
-        dict.dstorage = crate::kwargsdict::KWARGS_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &crate::kwargsdict::KWARGS_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &crate::kwargsdict::KWARGS_DICT_STRATEGY);
     }
 
     /// `dictmultiobject.py:692-705 switch_to_correct_strategy`
@@ -5165,9 +5544,7 @@ impl DictStrategy for EmptyDictStrategy {
     /// pointer.  The field overwrite is a `setfield_gc`; the unreachable
     /// old placeholder box is reclaimed by the sweep.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = OBJECT_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY);
     }
 
     unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
@@ -5227,7 +5604,7 @@ impl DictStrategy for EmptyDictStrategy {
         //   w_dict.setitem_str(key, w_value)
         // Unicode-strategy promotion is direct since the caller has
         // already chosen the str-keyed path.
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &UNICODE_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY);
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
@@ -5697,7 +6074,7 @@ impl DictStrategy for UnicodeDictStrategy {
             }
             None => {
                 let stored_key = object_key_for_new_str(key);
-                entries.insert(stored_key, w_value);
+                dict_entries_insert_hashed(entries, stored_key.hash, stored_key.obj, w_value);
                 dict.keys_version = dict.keys_version.wrapping_add(1);
             }
         };

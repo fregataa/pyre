@@ -35,15 +35,36 @@ const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 18] = crate::aarch64::registers:
 
 const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = crate::aarch64::registers::ALL_VFP_REGS;
 
-/// Bytes the trace entry frame reserves: the frame-pointer/link pair and the
-/// callee-saved registers the trace body clobbers. The prologue, the
-/// stack-overflow early return and the epilogue must all agree on this, or the
-/// return unwinds a corrupt SP.
-const CALL_FRAME_SIZE: u32 = 48;
+/// Bytes the trace entry frame reserves: the frame-pointer/link pair, the
+/// callee-saved registers the trace body clobbers, and the thread-local base
+/// slot. The prologue, the stack-overflow early return and the epilogue must
+/// all agree on this, or the return unwinds a corrupt SP.
+const CALL_FRAME_SIZE: u32 = 64;
+
+/// Frame offset of the thread-local base a compiled entry receives in `x1`.
+///
+/// `aarch64/assembler.py:1128-1129` names this `saved_threadlocal_addr` and
+/// spills the incoming `x1` there once per entry, so any point inside the
+/// trace can reach `pypy_threadlocal_s` without the caller keeping a register
+/// live across the body. The upstream constant is `3 * WORD` because its frame
+/// reserves eight scratch words below the callee-saved area
+/// (`_call_header`: `STP_rri(..., (i + 8) * WORD)`); this frame packs its three
+/// register pairs from offset 0, so the slot lands above them instead. The
+/// offset differs, the mechanism does not.
+///
+/// Reads must add any `sub sp, sp, #n` in effect at the read point, the way
+/// `aarch64/callbuilder.py:173` adds `self.current_sp`. The only reader today
+/// (`genop_call_assembler`) runs outside the stack-argument window.
+const SAVED_THREADLOCAL_OFS: u32 = 48;
 
 const _: () = assert!(
     CALL_FRAME_SIZE % 16 == 0,
     "aarch64 SP stays 16-byte aligned"
+);
+
+const _: () = assert!(
+    SAVED_THREADLOCAL_OFS + 8 <= CALL_FRAME_SIZE,
+    "the thread-local slot lives inside the entry frame"
 );
 
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
@@ -1380,6 +1401,9 @@ impl<'a> AssemblerARM64<'a> {
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
             ; stp x21, x22, [sp, #32]   // save callee-saved regs
+            // assembler.py:1128-1129: spill the thread-local base the entry
+            // received in x1, then take the jitframe out of x0.
+            ; str x1, [sp, #SAVED_THREADLOCAL_OFS]
             ; mov x29, x0
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
@@ -4058,18 +4082,12 @@ impl<'a> AssemblerARM64<'a> {
         let fail_label = self.mc.new_dynamic_label();
         if self.invalidated_flag_addr != 0 {
             self.emit_mov_imm64(16, self.invalidated_flag_addr as i64);
-            // `CBNZ` reaches +-32KB, but this guard sits at the head of the
-            // peeled loop body while its recovery stub is emitted after the
-            // whole trace, so a long body puts the stub out of range and
-            // dynasm rejects the relocation at commit. Branch over an
-            // unconditional `B` (+-128MB) instead, the standard veneer.
-            let continue_label = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch aarch64
-                ; ldrb w17, [x16]
-                ; cbz w17, =>continue_label
-                ; b =>fail_label
-                ; =>continue_label
-            );
+            dynasm!(self.mc ; .arch aarch64 ; ldrb w17, [x16]);
+            // The recovery stub is emitted after the whole trace body, so a
+            // bare `cbnz` (19-bit, ±1MB) cannot reach it once the body passes
+            // 1MB — the same reach the other guards route around via
+            // `emit_bcond_to_label`.
+            self.emit_cbnz_w_to_label(17, fail_label);
         }
         self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
     }
@@ -4829,6 +4847,18 @@ impl<'a> AssemblerARM64<'a> {
 
     fn emit_jcc_to_label(&mut self, fail_cc: u8, fail_label: DynamicLabel) {
         self.emit_bcond_to_label(fail_cc, fail_label);
+    }
+
+    /// `cbnz W(reg), =>label` for a `label` that may sit past the 19-bit /
+    /// ±1MB reach of `cbnz`, using the same inversion as
+    /// [`Self::emit_bcond_to_label`]: `cbz skip; b =>label; skip:`.
+    fn emit_cbnz_w_to_label(&mut self, reg: u8, label: DynamicLabel) {
+        let skip = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch aarch64
+            ; cbz W(reg), =>skip
+            ; b =>label
+            ; =>skip
+        );
     }
 
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
@@ -6099,10 +6129,17 @@ impl<'a> AssemblerARM64<'a> {
             // pre-existing adaptation; it is not part of the RPython fast
             // path and is too expensive for recursive CALL_ASSEMBLER.
             let pushed_gcmap = self.push_pending_call_gcmap();
+            // `_call_assembler_emit_call` opens with `LDR x1, [sp, ofs]` — the
+            // callee's prologue re-spills x1 into its own frame, so the base
+            // has to be reloaded here rather than assumed live. The target
+            // address goes through ip0 because x1 is now an argument.
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x1, [sp, #SAVED_THREADLOCAL_OFS]
+            );
             if let Some(addr) = target_addr.immediate {
                 let addr = addr as i64;
-                self.emit_mov_imm64(1, addr);
-                dynasm!(self.mc ; .arch aarch64 ; blr x1);
+                self.emit_mov_imm64(16, addr);
+                dynasm!(self.mc ; .arch aarch64 ; blr x16);
             } else if let Some(entry_label) = self.self_entry_label {
                 dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
             }

@@ -787,14 +787,14 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
-        known_struct_names,
+        mut known_struct_names,
         known_trait_names,
         mut struct_fields,
         mut enum_variant_by_discriminant,
         mut struct_origins,
-        struct_field_attrs,
+        mut struct_field_attrs,
         exact_layouts,
-        struct_ids,
+        mut struct_ids,
     ) = derive_program_metadata(llbc);
     harden_duplicate_leaf_metadata(
         &mut struct_fields,
@@ -1042,6 +1042,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             returns_objectptr,
         });
     }
+    register_synthetic_tuple_metadata(
+        &functions,
+        &mut known_struct_names,
+        &mut struct_fields,
+        &mut struct_field_attrs,
+        &mut struct_ids,
+    );
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
     // the driver could not lower — already after the reverse-postorder
     // retry in `lower_fun_decl`. The single known, tracked gap is an
@@ -1150,6 +1157,146 @@ fn should_lower_function(
     name: &str,
 ) -> bool {
     function_filter.is_none_or(|names| names.contains(name))
+}
+
+/// Register the low-level struct identity and fields for every non-empty MIR
+/// tuple shape that survived into a translated graph.
+///
+/// RPython creates one distinct `GcStruct('tupleN', item0, item1, ...)` per
+/// [`SomeTuple`] representation (`rtyper/rtuple.py:115-125`), then
+/// `TupleRepr.newtuple` allocates that struct and writes its fields
+/// (`rtuple.py:153-169`). Charon has no `TypeDecl` row for Rust's built-in
+/// tuple aggregate, so [`derive_program_metadata`] cannot discover these
+/// layouts from the declaration table. The graph is the authoritative
+/// rtyper input here: `front::mir` has already attached the complete
+/// `Tuple<T,...>` shape to the synthetic constructor and its `__pos_N`
+/// fields.
+///
+/// Each full shape gets its own [`StructId`]. Generic nominal ADTs share their
+/// template layout, but tuples do not: `(A,)` and `(A, B)` are distinct
+/// low-level struct objects in RPython and must not collapse onto a bare
+/// `Tuple` identity.
+fn register_synthetic_tuple_metadata(
+    functions: &[crate::front::semantic::SemanticFunction],
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+) {
+    let mut shapes = std::collections::BTreeSet::new();
+    for function in functions {
+        for op in function
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+        {
+            let OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if owner_path.is_empty()
+                && args.is_empty()
+                && majit_ir::descr::is_shaped_tuple_name(name)
+            {
+                shapes.insert(name.clone());
+            }
+        }
+    }
+
+    for shape in shapes {
+        let Some(inner) = shape
+            .strip_prefix("Tuple<")
+            .and_then(|rest| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        let items = split_top_level_type_args(inner);
+        if items.is_empty() {
+            continue;
+        }
+        let rows: Vec<(String, String)> = items
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (format!("__pos_{index}"), (*ty).to_string()))
+            .collect();
+        let attrs: Vec<(String, ValueType)> = items
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (format!("__pos_{index}"), tuple_field_value_type(ty)))
+            .collect();
+        let sid = majit_ir::descr::StructId::from_canonical(&shape);
+        known_struct_names.insert(shape.clone());
+        struct_fields.fields.insert(shape.clone(), rows);
+        struct_field_attrs.insert(shape.clone(), attrs);
+        record_struct_id(struct_ids, shape, sid);
+    }
+}
+
+/// Byte size of the explicit `Result` shell that carries `field_offsets`.
+///
+/// The shell is a non-overlapping `[tag@0 | payload@8 | ...]` laid out by this
+/// module rather than borrowed from Rust's enum layout, so its size follows
+/// from the offsets recorded for it: the last field's offset plus its word.
+/// A fixed 16 would truncate any shell that ever records more than one payload
+/// word.  The floor keeps a tag-only shell at the full `[tag | payload]` width,
+/// matching the `size.max(16)` the codewriter applies to the same shell.
+fn result_shell_size(field_offsets: &std::collections::HashMap<String, u64>) -> u64 {
+    field_offsets
+        .values()
+        .copied()
+        .max()
+        .map_or(16, |last| (last + 8).max(16))
+}
+
+/// Split `A,B<C,D>,[E;2]` at top-level commas only.
+fn split_top_level_type_args(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut prev = '\0';
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            // The `>` of a `->` return arrow closes nothing; treating it as a
+            // closer drops the depth a level early and splits a `Fn(A) -> B`
+            // argument at the next top-level comma.
+            '>' if prev == '-' => {}
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let item = input[start..index].trim();
+                if !item.is_empty() {
+                    out.push(item);
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+        prev = ch;
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn tuple_field_value_type(type_name: &str) -> ValueType {
+    match type_name.trim() {
+        "()" => ValueType::Void,
+        "f64" => ValueType::Float,
+        // 128-bit fields are twice the machine word, so they carry their own
+        // kind rather than collapsing into `Int` like the word-sized integers.
+        "i128" => ValueType::Int128,
+        "u128" => ValueType::UInt128,
+        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32"
+        | "u64" | "usize" => ValueType::Int,
+        _ => ValueType::Ref(None),
+    }
 }
 
 /// Derive whole-program type-metadata fields of `SemanticProgram` from
@@ -1424,6 +1571,20 @@ fn derive_program_metadata(
                 // `{enum_leaf}::{variant}`.  No cross-variant dedup: each
                 // variant owns its field namespace.
                 let enum_layout = td.layout_for_target(&target);
+                // `Result<T, E>` is not materialised as Rust's native enum in
+                // translated code.  The inverse exception transform removes
+                // ordinary `?` paths; a hand-written `match` that remains is
+                // represented by the explicit rtyper shell emitted below:
+                // `{ __discriminant: Signed, __pos_0: payload }`.  Rust's
+                // niche layout commonly places both the implicit tag and the
+                // payload at offset 0, but applying that host layout to this
+                // explicit shell makes the payload store overwrite the tag
+                // and every following switch take its unreachable default.
+                // RPython's low-level representation is the explicit fields
+                // the graph declares, so give that synthetic struct its own
+                // non-overlapping layout instead of borrowing Rust's enum
+                // layout.
+                let synthetic_result_shell = name == "core::result::Result";
                 // Register the enum BASE in `exact_layouts`: a single
                 // `__discriminant` field at the tag's real byte position
                 // (`discriminator.Branch.offset` via `discriminant_offset`).
@@ -1434,18 +1595,31 @@ fn derive_program_metadata(
                 // heuristic exactly; a single-variant type has no `Branch`
                 // tag (`discriminant_offset` → `None`) and also registers 0.
                 // Fieldless enums skip this (int-valued, no base ClassDef).
-                if !fieldless && let Some(l) = enum_layout.as_ref() {
-                    let mut base_offsets = std::collections::HashMap::new();
-                    base_offsets.insert(
-                        "__discriminant".to_string(),
-                        l.discriminant_offset().unwrap_or(0),
-                    );
-                    let base_exact = crate::front::semantic::ExactLayout {
-                        size: l.size,
-                        align: l.align,
-                        field_offsets: base_offsets,
-                    };
-                    exact_layouts.insert(base_sid, base_exact);
+                if !fieldless {
+                    if synthetic_result_shell {
+                        let mut base_offsets = std::collections::HashMap::new();
+                        base_offsets.insert("__discriminant".to_string(), 0);
+                        exact_layouts.insert(
+                            base_sid,
+                            crate::front::semantic::ExactLayout {
+                                size: Some(result_shell_size(&base_offsets)),
+                                align: Some(8),
+                                field_offsets: base_offsets,
+                            },
+                        );
+                    } else if let Some(l) = enum_layout.as_ref() {
+                        let mut base_offsets = std::collections::HashMap::new();
+                        base_offsets.insert(
+                            "__discriminant".to_string(),
+                            l.discriminant_offset().unwrap_or(0),
+                        );
+                        let base_exact = crate::front::semantic::ExactLayout {
+                            size: l.size,
+                            align: l.align,
+                            field_offsets: base_offsets,
+                        };
+                        exact_layouts.insert(base_sid, base_exact);
+                    }
                 }
                 // Per-variant subclasses carry each variant's OWN payload
                 // fields; a fieldless enum has none, so it needs no variant
@@ -1475,9 +1649,12 @@ fn derive_program_metadata(
                                     tyref_to_attr_value_type(&f.ty, llbc),
                                 )
                             };
-                            if let Some(off) =
+                            let field_offset = if synthetic_result_shell {
+                                Some(8 + (i as u64) * 8)
+                            } else {
                                 enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i))
-                            {
+                            };
+                            if let Some(off) = field_offset {
                                 voffsets.insert(fname.clone(), off);
                             }
                             vattrs.push((fname.clone(), attr_ty));
@@ -1496,7 +1673,14 @@ fn derive_program_metadata(
                         record_struct_id(&mut struct_ids, variant_qual.clone(), vsid);
                         record_struct_id(&mut struct_ids, variant_leaf.clone(), vsid);
                         record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
-                        if let Some(l) = enum_layout.as_ref() {
+                        if synthetic_result_shell {
+                            let exact = crate::front::semantic::ExactLayout {
+                                size: Some(result_shell_size(&voffsets)),
+                                align: Some(8),
+                                field_offsets: voffsets,
+                            };
+                            exact_layouts.insert(vsid, exact);
+                        } else if let Some(l) = enum_layout.as_ref() {
                             let exact = crate::front::semantic::ExactLayout {
                                 size: l.size,
                                 align: l.align,
@@ -1888,8 +2072,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
     let result_exc_ok_is_unit = result_exc_callee
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
-    let option_try_return_owner =
-        crate::front::option_try::tyref_option_owner(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
@@ -2004,6 +2186,51 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.checked_arith_call_results,
             )
         };
+        // The unsigned checked-arith rewrite (`front::checked_arith_uint`) runs
+        // AFTER `checked_arith`: a signed match-shape site the first pass
+        // already rewrote is now a `*_ovf` BinOp producer (skipped by the "the
+        // producer must still be the `Call`" gate), so the two passes never
+        // fight over a site.  It replaces each residual in place with native
+        // `uint_mul_high` / `uint_lt` overflow tests + a virtualized `Option`;
+        // the block-local rewrite detaches no edges, but reuses the same
+        // reachability-sweep gate for safety.
+        let checked_arith_uint_rewritten = if lo.checked_arith_uint_sites.is_empty() {
+            0
+        } else {
+            crate::front::checked_arith_uint::rewire_checked_arith_uint_sites(
+                &mut lo.graph,
+                &lo.checked_arith_uint_sites,
+            )
+        };
+        // The `Layout::from_size_align(..).ok()` rewrite
+        // (`front::from_size_align`) collapses the `from_size_align` + `ok`
+        // residual pair into a native `uint_lt` bound test + a virtualized
+        // nested `Option<Layout>` aggregate.  Independent of the checked-arith
+        // passes (it consumes their `Option<usize>` result as its `size` arg
+        // only after they have already produced it); the block-local rewrite
+        // detaches no edges but reuses the same reachability-sweep gate.
+        let from_size_align_rewritten = if lo.from_size_align_sites.is_empty() {
+            0
+        } else {
+            crate::front::from_size_align::rewire_from_size_align_sites(
+                &mut lo.graph,
+                &lo.from_size_align_sites,
+            )
+        };
+        // The by-value `Layout::from_size_align(..).expect(..)` sibling
+        // (`front::from_size_align`) collapses the `from_size_align` + `expect`
+        // residual pair into the same native `uint_lt` bound test + a by-value
+        // virtualized `Layout`, branching to an implicit raise on overflow.  It
+        // splits the `from_size_align` block into a fits/overflow diamond, so it
+        // needs the reachability sweep gate below.
+        let from_size_align_expect_rewritten = if lo.from_size_align_expect_sites.is_empty() {
+            0
+        } else {
+            crate::front::from_size_align::rewire_from_size_align_expect_sites(
+                &mut lo.graph,
+                &lo.from_size_align_expect_sites,
+            )
+        };
         // The `Option` `?` rewrite (`front::option_try`) consumes the same
         // `Try::branch` / `ControlFlow` diamond as `result_exc`, but its break
         // arm returns a freshly-built `None` to this graph's returnblock.  It
@@ -2012,10 +2239,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         let option_try_stats = if lo.option_try_sites.is_empty() {
             crate::front::option_try::OptionTryStats::default()
         } else {
+            // The `?`-None return owner is spelled per-instantiation to match
+            // the suffixed producers reaching the returnblock (ref/str/float
+            // payloads); the `Int`/`Unsigned`/niche carve-out stays bare.
+            let return_owner = lo.resolve_option_return_owner(&fd.signature.output);
             crate::front::option_try::rewire_option_try_call_sites(
                 &mut lo.graph,
                 &lo.option_try_sites,
-                option_try_return_owner.as_deref(),
+                return_owner.as_deref(),
             )
         };
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
@@ -2044,6 +2275,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.slice_first_sites,
             )
         };
+        // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
+        // the residual `saturating_sub` call block into an `if a < b { 0 } else
+        // { a - b }` diamond, same post-lowering shape and fail-safe contract as
+        // `slice_first`; gate the reachability sweep on an actual rewrite.
+        let saturating_sub_rewritten = if lo.saturating_sub_sites.is_empty() {
+            0
+        } else {
+            crate::front::saturating_sub::rewire_saturating_sub_call_sites(
+                &mut lo.graph,
+                &lo.saturating_sub_sites,
+            )
+        };
         // The `Option::unwrap_or` value-select rewrite
         // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
         // block into a `__discriminant` diamond, same post-lowering shape and
@@ -2066,6 +2309,16 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             0
         } else {
             crate::front::option_unwrap::rewire_unwrap_call_sites(&mut lo.graph, &lo.unwrap_sites)
+        };
+        // The `Option::expect` guard rewrite (`front::option_expect`) splits the
+        // residual `expect` call block into a `__discriminant` guard the same
+        // way `unwrap` does — its `Some` arm extracts `__pos_0`, its `None` arm
+        // raises the implicit `AssertionError` and drops the panic message; same
+        // fail-safe contract, gate the reachability sweep on an actual rewrite.
+        let expect_rewritten = if lo.expect_sites.is_empty() {
+            0
+        } else {
+            crate::front::option_expect::rewire_expect_call_sites(&mut lo.graph, &lo.expect_sites)
         };
         // The `Option::map_or` closure-select rewrite (`front::option_map_or`)
         // splits the residual `map_or` call block into a `__discriminant`
@@ -2130,11 +2383,16 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || result_exc_callee
             || next_rewritten > 0
             || checked_arith_rewritten > 0
+            || checked_arith_uint_rewritten > 0
+            || from_size_align_rewritten > 0
+            || from_size_align_expect_rewritten > 0
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
+            || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
+            || expect_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
         {
@@ -2507,6 +2765,22 @@ struct Lowering<'a> {
     /// (`front::checked_arith`) that runs after the body lowering
     /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
     checked_arith_call_results: Vec<Variable>,
+    /// Unsigned `usize::checked_{add,mul}()` call sites (`Option<usize>`-
+    /// typed) recorded for the native-overflow rewiring pass
+    /// (`front::checked_arith_uint`) that runs after `front::checked_arith`,
+    /// replacing each residual with `uint_mul_high`/`uint_lt`-based overflow
+    /// tests + a virtualized `Option`.  Kept separate from
+    /// `checked_arith_call_results` because it needs the `Option`/`Some`
+    /// owners + payload type resolved at the recording site.
+    checked_arith_uint_sites: Vec<crate::front::checked_arith_uint::CheckedArithUintSite>,
+    /// `Layout::from_size_align(size, const_align).ok()` call sites
+    /// (`Option<Layout>`-typed) recorded for the native bound-check rewiring
+    /// pass (`front::from_size_align`), which replaces the `from_size_align` +
+    /// `ok` residual pair with a `uint_lt` bound test + a virtualized nested
+    /// `Option<Layout>` aggregate.  The `Option`/`Some`/`Layout` owners and the
+    /// payload type are resolved here from the `.ok()` destination type.
+    from_size_align_sites: Vec<crate::front::from_size_align::FromSizeAlignSite>,
+    from_size_align_expect_sites: Vec<crate::front::from_size_align::FromSizeAlignExpectSite>,
     /// `Try::branch(opt)` call sites where `opt: Option<T>`, recorded for
     /// the `Option` `?` rewiring pass (`front::option_try`) that runs after
     /// body lowering completes.
@@ -2522,6 +2796,11 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_first::SliceFirstSite`]).
     slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
+    /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
+    /// diamond (`if a < b { 0 } else { a - b }`) the
+    /// `front::saturating_sub` post-pass synthesizes after body lowering (see
+    /// [`crate::front::saturating_sub::SaturatingSubSite`]).
+    saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -2546,6 +2825,11 @@ struct Lowering<'a> {
     /// `front::option_unwrap` post-pass synthesizes (see
     /// [`crate::front::option_unwrap::UnwrapSite`]).
     unwrap_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
+    /// `Option::expect(opt, msg)` call sites recorded for the discriminant
+    /// guard the `front::option_expect` post-pass synthesizes — the two-arg
+    /// sibling of `unwrap` (the panic message is dropped; see
+    /// [`crate::front::option_expect::ExpectSite`]).
+    expect_sites: Vec<crate::front::option_expect::ExpectSite>,
     /// `Option::map_or(opt, default, closure)` call sites recorded for the
     /// discriminant closure-select the `front::option_map_or` post-pass
     /// synthesizes (see [`crate::front::option_map_or::MapOrSite`]).
@@ -2743,14 +3027,19 @@ impl<'a> Lowering<'a> {
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
+            checked_arith_uint_sites: Vec::new(),
+            from_size_align_sites: Vec::new(),
+            from_size_align_expect_sites: Vec::new(),
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
+            saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
+            expect_sites: Vec::new(),
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
@@ -3996,6 +4285,7 @@ impl<'a> Lowering<'a> {
                         Operand::Const(_) => None,
                     };
                     let src_kind = self.operand_value_kind(&operand);
+                    let src_root = self.operand_class_root(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
                     // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
@@ -4075,38 +4365,19 @@ impl<'a> Lowering<'a> {
                             }
                             // Same bank (or a bank pair with no host cast
                             // callable): alias the operand — except a
-                            // ptr→ptr cast to a registered struct root,
-                            // which narrows to `SomeInstance(root)` so a
-                            // field read on the pointee resolves (#298;
-                            // see the `Rvalue::Cast` arm for the full
-                            // rationale).  The SOURCE must already be a Ref
-                            // for this to be a genuine `cast_pointer`
-                            // (ptr→ptr); an int→ptr or unknown-source cast
-                            // is `cast_int_to_ptr` territory and aliases
-                            // instead of narrowing to an instance.
+                            // ptr→ptr cast whose destination pointee type
+                            // the annotator must honour, which travels as a
+                            // marker call ([`Lowering::ptr_cast_marker`],
+                            // shared with the `Rvalue::Cast` arm).
                             None => {
-                                if matches!(src_kind, Some(ValueType::Ref(_)))
-                                    && let ValueType::Ref(_) = dst_kind
-                                    && let Some(root) = tyref_class_root(dest_ty, self.llbc)
-                                {
-                                    let res = self.graph.alloc_value_var_with_type(
-                                        crate::model::ConcreteType::Unknown,
-                                    );
-                                    (
-                                        Some(OpKind::Call {
-                                            target: CallTarget::FunctionPath {
-                                                segments: vec![
-                                                    "__pyre_cast_instance".to_string(),
-                                                    root.clone(),
-                                                ],
-                                            },
-                                            args: vec![arg],
-                                            result_ty: ValueType::Ref(Some(root)),
-                                        }),
-                                        res,
-                                    )
-                                } else {
-                                    (None, arg)
+                                match self.ptr_cast_marker(
+                                    src_kind.as_ref(),
+                                    src_root.as_deref(),
+                                    dest_ty,
+                                    &arg,
+                                ) {
+                                    Some((op, res)) => (Some(op), res),
+                                    None => (None, arg),
                                 }
                             }
                         },
@@ -4244,45 +4515,23 @@ impl<'a> Lowering<'a> {
             Rvalue::Cast(kind, operand, ty) => {
                 // Classify the source BEFORE `resolve_operand` consumes
                 // `operand` (mirrors the `UnaryOp::Cast` twin above): only a
-                // Ref source may narrow to an instance downcast below.
+                // Ref source may narrow or erase below.
                 let src_kind = self.operand_value_kind(&operand);
+                let src_root = self.operand_class_root(&operand);
                 let v = self.resolve_operand(mir_bb, operand)?;
-                // #298: a same-bank ptr→ptr cast to a registered struct
-                // root (`obj as *const PyCode`) keeps the i64
-                // pointer carrier in place, so it would alias like above
-                // — but the result is then read like an instance of that
-                // struct (`(*p).code_ptr`), and aliasing leaves the
-                // pointer classdef-less so the field read blocks at the
-                // annotator getattr arm.  `tyref_class_root` returns
-                // `Some` only for a named-ADT pointee (None for
-                // primitives / builtin containers / generics / multi-impl
-                // type-vars), so emit a `__pyre_cast_instance` narrow
-                // whose annotator types the result `SomeInstance(root)`
-                // and whose typer folds to a `cast_pointer`.  Gate on the
+                // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
+                // place, so it would alias — but the pointee type it
+                // reinterprets to is load-bearing for the annotator, in both
+                // directions ([`Lowering::ptr_cast_marker`]).  Gate on the
                 // raw-pointer cast kind: `lltype.cast_pointer`
                 // (`lltype.py:964-975`) is pointer-to-pointer only, and
                 // int-to-pointer is the separate `cast_int_to_ptr`
-                // analyzer, so an `addr_usize as *const Struct` reinterpret
-                // must NOT be narrowed to an instance downcast — the
-                // `src_kind` Ref guard enforces exactly that.
+                // analyzer.
                 if cast_kind_is_raw_ptr(&kind)
-                    && matches!(src_kind, Some(ValueType::Ref(_)))
-                    && let ValueType::Ref(_) = tyref_to_value_type(&ty, self.llbc)
-                    && let Some(root) = tyref_class_root(&ty, self.llbc)
+                    && let Some((op, res)) =
+                        self.ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
                 {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    return Ok((
-                        Some(OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
-                            },
-                            args: vec![v],
-                            result_ty: ValueType::Ref(Some(root)),
-                        }),
-                        res,
-                    ));
+                    return Ok((Some(op), res));
                 }
                 Ok((None, v))
             }
@@ -4701,6 +4950,81 @@ impl<'a> Lowering<'a> {
             }
             Operand::Const(_) => None,
         }
+    }
+
+    /// The monomorphic-ADT class root of a `Copy` / `Move` operand's
+    /// place type, or `None` for a `Const` operand / a pointee-less
+    /// pointer.  Read by [`Self::ptr_cast_marker`] to tell a genuine
+    /// type erasure (`*mut PyFrame` → `*mut u8`) apart from a cast whose
+    /// source already carries no pointee class.
+    fn operand_class_root(&self, op: &Operand) -> Option<String> {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => tyref_class_root(&place.ty, self.llbc),
+            Operand::Const(_) => None,
+        }
+    }
+
+    /// The marker call a same-bank pointer-to-pointer reinterpret lowers
+    /// to, or `None` when the cast simply aliases its operand.
+    ///
+    /// Two shapes share this decision, so both `Cast` lowering arms route
+    /// through here:
+    ///
+    /// * **erase** — `p as *mut u8` drops the pointee class.  Aliasing
+    ///   would keep `SomeInstance(PyFrame)` on a value whose declared type
+    ///   is a bare byte pointer, so a callee taking `*mut u8` from
+    ///   heterogeneous heap blocks (`gc_hook::try_gc_owns_object`,
+    ///   `try_gc_write_barrier`) unions `PyFrame ∪ ItemsBlock` at its slot
+    ///   0 and blocks with "cannot unify instances with no common base
+    ///   class".  `llmemory.cast_ptr_to_adr` is the upstream erasure: a
+    ///   GC ownership / write-barrier hook operates on a type-erased
+    ///   `Address`, never on `Ptr(instance)`.  `__pyre_cast_address` is
+    ///   that erasure — its annotator drops the classdef, which is the
+    ///   annotation a pointee-less raw pointer already carries here, so
+    ///   the erased callers and the callers that pass an untyped `*mut u8`
+    ///   straight through agree on one annotation.
+    /// * **narrow** — `obj as *const RegisteredStruct` (#298); see
+    ///   `__pyre_cast_instance` below.
+    ///
+    /// Both are pointer-to-pointer only: a `Ref` source is required, since
+    /// an `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
+    /// territory and must alias instead.
+    fn ptr_cast_marker(
+        &mut self,
+        src_kind: Option<&ValueType>,
+        src_root: Option<&str>,
+        dest_ty: &TyRef,
+        arg: &Variable,
+    ) -> Option<(OpKind, Variable)> {
+        if !matches!(src_kind, Some(ValueType::Ref(_)))
+            || !matches!(tyref_to_value_type(dest_ty, self.llbc), ValueType::Ref(_))
+        {
+            return None;
+        }
+        let (segments, result_ty) =
+            if src_root.is_some() && tyref_is_raw_byte_ptr(dest_ty, self.llbc) {
+                (
+                    vec!["__pyre_cast_address".to_string()],
+                    ValueType::Ref(None),
+                )
+            } else {
+                let root = tyref_class_root(dest_ty, self.llbc)?;
+                (
+                    vec!["__pyre_cast_instance".to_string(), root.clone()],
+                    ValueType::Ref(Some(root)),
+                )
+            };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        Some((
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args: vec![arg.clone()],
+                result_ty,
+            },
+            res,
+        ))
     }
 
     /// Decode a Charon `Operand::Const` value and emit the matching
@@ -6326,6 +6650,36 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `we_are_jitted()` is true during tracing and blackholing
+                // (rlib/jit.py:355-358); the rtyper folds the surviving
+                // `_we_are_jitted` symbolic to a constant True
+                // (rlib/jit.py:403-406, jtransform.py:1636-1639).  Folding it
+                // to `ConstBool(true)` here — at the front, before annotation —
+                // lets `simplify_lowered_graph`'s `fold_constant_exitswitch`
+                // drop each JIT-dead `if not we_are_jitted()` interpreter arm
+                // before the graph is annotated, instead of at
+                // `fold_we_are_jitted_calls` (jtransform post-annotation).  A
+                // dead interpreter arm reading a residual-only static (e.g.
+                // `baseobjspace::METHOD_CACHE` behind
+                // `lookup_where_with_method_cache`) would otherwise fail the
+                // phaseA lift and drop the whole graph to the legacy walker.
+                if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && fd.item_meta.name_path() == "majit_metainterp::jit::we_are_jitted"
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ConstBool(true),
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Reflexive blanket `into` — the callsite selected
                 // `impl<T> From<T> for T`, a pure `T -> T` identity
                 // conversion.  Bind the destination local to the
@@ -6636,6 +6990,43 @@ impl<'a> Lowering<'a> {
                         },
                     );
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `FixedObjectArray::set_ref(self, index, value)` — the
+                // length-prefixed array's GC-published element store.  The
+                // method body hand-rolls the write-barrier dance
+                // (`pin_root` / `try_gc_write_barrier` / reload-from-shadow-
+                // stack) because Rust has no GC-transform pass; in the
+                // lifted trace that is exactly RPython's single
+                // `setarrayitem_gc` (`ll_setitem_fast`, `rlist.py:377`),
+                // whose conditional write barrier is re-inserted by the
+                // backend rewrite (`handle_write_barrier_setarrayitem`,
+                // rewrite.py:403), not by a traced source call.  Collapse
+                // the whole call to one `ArrayWrite` over the receiver
+                // (a `FixedSizeListRepr`, `ll_fixed_items(l) = l`,
+                // rlist.py:399) so the barrier-body accessors
+                // (`items_mut_ptr`, `try_gc_owns_object`) never reach the
+                // annotator.  The call returns `()`; its dead destination
+                // binds to a fresh Void var.
+                if args.len() == 3 && self.is_object_array_set_ref_call(&reg) {
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::ArrayWrite {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            value: LinkArg::Value(args[2].clone()),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(
+                        self.graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                    );
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -7754,6 +8145,35 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
+        // A derived `PartialEq` comparison between two FIELDLESS enums is an
+        // integer comparison of their discriminants.  The enum is modelled
+        // by-value as that discriminant (`tyref_to_value_type` colors it
+        // `Int`), so the derived `eq` arrives as a `CallTarget::Method` whose
+        // receiver already sits in the int bank — and `SomeInteger` has no
+        // `eq` attribute, so leaving the call residual blocks the annotator
+        // with `Cannot find attribute "eq" on Integer`.  Emit the `BinOp`
+        // instead: RPython spells a C-like enum's dispatch as an `int_eq`
+        // chain against named int constants (`pypy/interpreter/pyopcode.py`
+        // `dispatch_bytecode`, folded by `merge_if_blocks`), never as a
+        // method on the tag.  Twin of the `<str as PartialEq>::eq` fold.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && let CallTarget::Method { name, .. } = target
+            && let Some(binop) = fieldless_enum_cmp_binop(name)
+            && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
+                .iter()
+                .all(|t| t.is_some_and(|t| self.tyref_is_borrowed_fieldless_enum(t)))
+        {
+            OpKind::BinOp {
+                op: binop.to_string(),
+                lhs: args[0].clone(),
+                rhs: args[1].clone(),
+                result_ty: ValueType::Int,
+            }
+        } else {
+            op_kind
+        };
+
         // Mixed W_LongObject/W_IntObject comparisons use rbigint.int_* in
         // both operand orders (the int-left descriptor reverses the relation).
         // The receiver remains one RBigInt GCREF, the other operand is exactly
@@ -8203,6 +8623,85 @@ impl<'a> Lowering<'a> {
         {
             self.checked_arith_call_results.push(result_var.clone());
         }
+        // Capture UNSIGNED `usize::checked_{add,mul}()` results
+        // (`Option<usize>`) for the native-overflow rewiring pass
+        // (`front::checked_arith_uint`).  Signed arithmetic stays on
+        // `front::checked_arith` (→ `*_ovf` + OverflowError); unsigned has no
+        // signed-overflow op, so it lowers to `uint_mul_high` / `uint_lt`
+        // overflow tests + a virtualized `Option`.  The operand-signedness
+        // gate lives here because the operand types are only in hand at the
+        // call site; `checked_sub` is excluded (no `?`-shape census site).
+        if let OpKind::Call { target, .. } = &op_kind
+            && let CallTarget::FunctionPath { segments } = target
+            && matches!(
+                segments.last().map(String::as_str),
+                Some("checked_add" | "checked_mul")
+            )
+            && crate::front::checked_arith::is_checked_arith_target(target)
+            && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_to_value_type(t, self.llbc) == ValueType::Unsigned)
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_to_value_type(t, self.llbc) == ValueType::Unsigned)
+            && let Some(site) = self.recognize_checked_arith_uint_site(&call.dest.ty, &result_var)
+        {
+            self.checked_arith_uint_sites.push(site);
+        }
+        // Capture `Result::ok()` results whose payload is `Layout`
+        // (`Option<Layout>`) for the `from_size_align` bound-check rewiring pass
+        // (`front::from_size_align`).  The `.ok()` is the second residual of
+        // `Layout::from_size_align(size, align).ok()`; the destination
+        // `Option<Layout>` type resolves the `Option`/`Some`/`Layout` owners
+        // here, and the post-pass validates the preceding `from_size_align`
+        // residual + folded-const align before mutating.  A miss leaves both
+        // residual calls for the existing Skip fallback.
+        if let OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name,
+                    receiver_root,
+                    ..
+                },
+            args,
+            ..
+        } = &op_kind
+            && name == "ok"
+            && receiver_root.as_deref() == Some("Result")
+            && args.len() == 1
+            && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+            && let Some(site) = self.recognize_from_size_align_ok_site(&call.dest.ty, &result_var)
+        {
+            self.from_size_align_sites.push(site);
+        }
+        // Capture `Result::expect(res, msg)` results whose payload is `Layout`
+        // (the by-value `Layout`) for the `from_size_align` bound-check rewiring
+        // pass (`front::from_size_align`).  The `.expect()` is the second
+        // residual of `Layout::from_size_align(size, align).expect(msg)`; unlike
+        // `.ok()`, the destination is `Layout` (not `Option<Layout>`), so the
+        // receiver is `Result` (not `Option`) — distinguishing it from
+        // `Option::expect`.  The post-pass validates the preceding
+        // `from_size_align` residual before mutating; a miss leaves both
+        // residual calls for the existing Skip fallback.
+        if let OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name,
+                    receiver_root,
+                    ..
+                },
+            args,
+            ..
+        } = &op_kind
+            && name == "expect"
+            && receiver_root.as_deref() == Some("Result")
+            && args.len() == 2
+            && let Some(site) =
+                self.recognize_from_size_align_expect_site(&call.dest.ty, &result_var)
+        {
+            self.from_size_align_expect_sites.push(site);
+        }
         // Capture `Try::branch(opt)` sites where the receiver is an
         // `Option<T>`, the compiler-generated core call behind `opt?`.  The
         // rewrite validates the surrounding `ControlFlow` diamond and the
@@ -8271,6 +8770,26 @@ impl<'a> Lowering<'a> {
             && let Some(site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
             self.slice_first_sites.push(site);
+        }
+        // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
+        // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
+        // foreign leaf (its `Self` is a primitive integer, so `lower_call`
+        // keeps the raw `FunctionPath` segments), residualized as an
+        // unregistered callee the rtyper census Skips.  Restricted to unsigned
+        // receivers (every observed site is `usize`/`u16`/`u32`): the clamp
+        // floors at zero via `a < b`; a signed `saturating_sub` floors at
+        // `TYPE_MIN` (a different diamond) and stays residual.  A resolution
+        // miss leaves the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
+            && let Some(site) = self.recognize_saturating_sub_site(&call.dest.ty, &result_var)
+        {
+            self.saturating_sub_sites.push(site);
         }
         // Capture `RangeInclusive::new(lo, hi)` sites for the
         // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
@@ -8371,6 +8890,24 @@ impl<'a> Lowering<'a> {
         {
             self.unwrap_sites.push(site);
         }
+        // Capture `Option::expect(opt, msg)` sites for the discriminant guard
+        // `front::option_expect` synthesizes — the two-arg sibling of `unwrap`.
+        // Its body is Opaque (foreign `core`) and its receiver is the `Option`
+        // ADT, so `first_is_self` routes it to a `CallTarget::Method` (receiver
+        // `args[0]`, panic message `args[1]`).  `recognize_expect_site` confirms
+        // the receiver is an `Option` (not `Result`).  A resolution miss leaves
+        // the residual call — an unregistered callee the rtyper census Skips.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && name == "expect"
+            && let Some(site) = self.recognize_expect_site(first_arg_ty.as_ref(), &result_var)
+        {
+            self.expect_sites.push(site);
+        }
         // Capture `Option::map_or(opt, default, closure)` sites for the
         // discriminant closure-select `front::option_map_or` synthesizes.
         // Like `unwrap_or`, `map_or`'s body is Opaque (foreign `core`) and its
@@ -8441,6 +8978,9 @@ impl<'a> Lowering<'a> {
                     Some(crate::front::option_closure_select::ClosureCombinator::UnwrapOrElse)
                 }
                 "or_else" => Some(crate::front::option_closure_select::ClosureCombinator::OrElse),
+                "is_some_and" => {
+                    Some(crate::front::option_closure_select::ClosureCombinator::IsSomeAnd)
+                }
                 _ => None,
             }
             && let Some(site) = self.recognize_closure_select_site(
@@ -8854,6 +9394,19 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
+    }
+
+    /// `FixedObjectArray::set_ref(self, index, value)` — the GC-published
+    /// element store whose body hand-rolls the write barrier.  Recognised as
+    /// the receiver of a `setarrayitem_gc` collapse (`ll_setitem_fast`,
+    /// rlist.py:377); the barrier is a backend rewrite, not a traced call.
+    fn is_object_array_set_ref_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::set_ref"
+        })
     }
 
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
@@ -10066,6 +10619,45 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Peel `Ref` / `RawPtr` wrappers (through dedup / hash-cons
+    /// indirections) to the pointee as an owned [`TyRef`] — the by-value shape
+    /// the `Option` owner resolvers expect.  Returns `ty` itself (cloned) when
+    /// it is not a reference.  Used to feed an `&Option<..>` receiver (e.g.
+    /// `is_none`/`is_some`, which take `&self`) into
+    /// [`Self::resolve_option_consumer_owners`], whose payload / suffix reads
+    /// need the un-wrapped `Option<..>`.  Same wrapper set as
+    /// [`Self::tyref_ref_adt_def_id`], which resolves to a `def_id` instead.
+    fn tyref_peel_ref_to_pointee(&self, ty: &TyRef) -> Option<TyRef> {
+        let mut v: &serde_json::Value = match ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        loop {
+            let obj = v.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                v = self.llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+                v = arr.get(1)?;
+                continue;
+            }
+            if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+                v = arr.first()?;
+                continue;
+            }
+            return serde_json::from_value(v.clone()).ok();
+        }
+    }
+
     /// The `Option`'s payload type `T` (its first `generics.types` entry)
     /// projected to a [`ValueType`] — the `call_once` result kind and the
     /// `Some::__pos_0` field kind the `bool::then` diamond writes.  `None`
@@ -10234,6 +10826,60 @@ impl<'a> Lowering<'a> {
         Some((option_owner, some_owner, payload_ty))
     }
 
+    /// Resolve the `(option_owner, some_owner, payload_ty)` an `Option`
+    /// *consumer* pass (`option_try` `?`, `expect`) must spell so its
+    /// `__discriminant` / `__pos_0` reads key the SAME classdef the value's
+    /// *producer* wrote.
+    ///
+    /// Agreement is by construction: the suffixed producers (`bool::then` /
+    /// `then_some`, `map_or`, `slice_first`, `from_size_align`) mint a
+    /// per-instantiation `Option<X>` root through
+    /// [`Self::resolve_bool_then_option_dest`], so the consumer reuses that
+    /// exact derivation — a `Str`/`Float`/`Ref`/nested-enum payload keys the
+    /// suffixed root identically on both sides.  The one deviation is
+    /// [`crate::front::checked_arith_uint`], which mints a BARE `Option` root
+    /// for its `Int`/`Unsigned` payload; an integer-payload `Option` therefore
+    /// stays bare here to match it.  A niche `Option<NonNull>` has no aggregate
+    /// `__discriminant` / `__pos_0` (the arms use a pointer null-test and an
+    /// identity payload), so its owners are never read — keep them bare, which
+    /// also mirrors [`Self::resolve_bool_then_option_dest`]'s own aggregate
+    /// applicability.
+    fn resolve_option_consumer_owners(
+        &self,
+        recv_ty: &TyRef,
+    ) -> Option<(String, String, ValueType)> {
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        if matches!(payload_ty, ValueType::Int | ValueType::Unsigned)
+            || self.tyref_is_niche_option_ptr(recv_ty)
+        {
+            let def_id = self.tyref_adt_def_id(recv_ty)?;
+            let td = self.llbc.type_by_id(def_id)?;
+            let option_owner = td.item_meta.name_path();
+            let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+            return Some((option_owner, some_owner, payload_ty));
+        }
+        self.resolve_bool_then_option_dest(recv_ty)
+    }
+
+    /// Resolve the enclosing function's return `Option` owner for the
+    /// `?`-None construction ([`crate::front::option_try`]).  It must MATCH the
+    /// spelling of the suffixed producers whose `Some` values reach the same
+    /// returnblock — otherwise a suffixed `Some` and a bare `None` union to the
+    /// bare template, payload-erasing the return.  Reuses
+    /// [`Self::resolve_option_consumer_owners`], so a ref/str/float-payload
+    /// return is instantiation-suffixed and the `Int`/`Unsigned` /
+    /// niche-pointer carve-out stays bare (matching
+    /// [`crate::front::checked_arith_uint`]).  `None` when the output is not a
+    /// resolvable `Option` — the `?` rewrite then declines all sites.
+    fn resolve_option_return_owner(&self, output_ty: &TyRef) -> Option<String> {
+        if !crate::front::result_exc::tyref_is_option(output_ty, self.llbc) {
+            return None;
+        }
+        let (option_owner, _some_owner, _payload_ty) =
+            self.resolve_option_consumer_owners(output_ty)?;
+        Some(option_owner)
+    }
+
     /// Resolve a recognized `bool::then(cond, closure_env)` call into a
     /// [`crate::front::bool_then::BoolThenSite`] — the owners and payload
     /// type the short-circuit diamond post-pass needs.  `None` (leaving the
@@ -10307,6 +10953,22 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve a recognized `{uN}::saturating_sub(a, b)` call into a
+    /// [`crate::front::saturating_sub::SaturatingSubSite`].  Gated on an
+    /// **unsigned** result type (`saturating_sub` returns the receiver `uN`):
+    /// the unsigned clamp floors at zero via `a < b`.  A signed `saturating_sub`
+    /// floors at `TYPE_MIN` (a different diamond) and is left residual (`None`).
+    fn recognize_saturating_sub_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::saturating_sub::SaturatingSubSite> {
+        self.tyref_literal_uint_atom(dest_ty)?;
+        Some(crate::front::saturating_sub::SaturatingSubSite {
+            result_var: result_var.clone(),
+        })
+    }
+
     /// Resolve a recognized `Option::unwrap_or(opt, default)` /
     /// `Result::unwrap_or(res, default)` call into an
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the enum root +
@@ -10329,24 +10991,34 @@ impl<'a> Lowering<'a> {
         // left residual (Skip) rather than risk a value-select on an
         // exception-form value.  Only `Option` and plain-error `Result` (e.g.
         // `io::Result`) select here.
-        let (payload_disc, payload_on_disc_true) =
-            if crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
-                (1, true)
-            } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
-                && !crate::front::result_exc::tyref_is_result_of_pyerror(recv_ty, self.llbc)
-            {
-                (0, false)
-            } else {
-                return None;
-            };
-        let def_id = self.tyref_adt_def_id(recv_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        let enum_owner = td.item_meta.name_path();
-        let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, payload_disc)?;
+        let is_option = crate::front::result_exc::tyref_is_option(recv_ty, self.llbc);
+        let (payload_disc, payload_on_disc_true) = if is_option {
+            (1, true)
+        } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
+            && !crate::front::result_exc::tyref_is_result_of_pyerror(recv_ty, self.llbc)
+        {
+            (0, false)
+        } else {
+            return None;
+        };
         // The payload `T` is the first type arg for both `Option<T>` and
         // `Result<T, E>`.
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        // An `Option` payload read keys the per-instantiation classdef its
+        // producer wrote (bare for the `Int`/`Unsigned`/niche carve-out); a
+        // plain-error `Result` has no suffixed producers here, so its `Ok`/`Err`
+        // owners stay bare.
+        let (enum_owner, payload_owner) = if is_option {
+            let (option_owner, some_owner, _) = self.resolve_option_consumer_owners(recv_ty)?;
+            (option_owner, some_owner)
+        } else {
+            let def_id = self.tyref_adt_def_id(recv_ty)?;
+            let td = self.llbc.type_by_id(def_id)?;
+            let enum_owner = td.item_meta.name_path();
+            let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, payload_disc)?;
+            (enum_owner, payload_owner)
+        };
         Some(crate::front::option_unwrap_or::UnwrapOrSite {
             result_var: result_var.clone(),
             enum_owner,
@@ -10375,9 +11047,13 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option_ref(recv_ty, self.llbc) {
             return None;
         }
-        let def_id = self.tyref_ref_adt_def_id(recv_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
+        // Resolve the enum root the same way a value consumer does, off the
+        // peeled `Option<..>`, so the `__discriminant` read keys the classdef
+        // the producer wrote — per-instantiation for a ref/str/float payload,
+        // bare for the `Int`/`Unsigned`/niche carve-out.
+        let pointee = self.tyref_peel_ref_to_pointee(recv_ty)?;
+        let (option_owner, _some_owner, _payload_ty) =
+            self.resolve_option_consumer_owners(&pointee)?;
         Some(crate::front::option_is_none::IsNoneSite {
             result_var: result_var.clone(),
             option_owner,
@@ -10401,13 +11077,40 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
             return None;
         }
-        let def_id = self.tyref_adt_def_id(recv_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
-        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
-        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let (option_owner, some_owner, payload_ty) =
+            self.resolve_option_consumer_owners(recv_ty)?;
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_unwrap::UnwrapSite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
+            niche,
+        })
+    }
+
+    /// Resolve a recognized `Option::expect(opt, msg)` call into an
+    /// [`crate::front::option_expect::ExpectSite`] — the two-arg sibling of
+    /// [`Self::recognize_unwrap_site`].  Guards on `Option` (not `Result`:
+    /// `Result::expect` shares the name but its `Ok`/`Err` tags do not match
+    /// `Some`=1/`None`=0).  The owners route through
+    /// [`Self::resolve_option_consumer_owners`] so the synthesized
+    /// `__discriminant` / `__pos_0` reads key the same classdef the value's
+    /// producer wrote.  `None` (leaving the residual call) when the receiver is
+    /// not a resolvable `Option`.
+    fn recognize_expect_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::option_expect::ExpectSite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let (option_owner, some_owner, payload_ty) =
+            self.resolve_option_consumer_owners(recv_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        Some(crate::front::option_expect::ExpectSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
@@ -10419,6 +11122,98 @@ impl<'a> Lowering<'a> {
     /// Resolve a recognized `Try::branch(opt)` call where `opt: Option<T>`
     /// into an [`crate::front::option_try::OptionTrySite`].  `None` leaves the
     /// residual call untouched when the receiver is not a resolvable `Option`.
+    /// Resolve an unsigned `usize::checked_{add,mul}` call whose result is an
+    /// `Option<usize>` into a
+    /// [`crate::front::checked_arith_uint::CheckedArithUintSite`] — the
+    /// `Option` enum root + `Some` variant owners and the payload type, keyed
+    /// off the destination `Option<usize>` type.  Mirrors
+    /// [`Self::recognize_option_try_site`]'s owner derivation so the
+    /// virtualized `Option` this pass builds shares field descrs with the
+    /// downstream `?` reads (`front::option_try`).
+    fn recognize_checked_arith_uint_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::checked_arith_uint::CheckedArithUintSite> {
+        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(dest_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
+        Some(crate::front::checked_arith_uint::CheckedArithUintSite {
+            opt: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
+    /// Resolve a `Result::ok()` call whose result is an `Option<Layout>` into a
+    /// [`crate::front::from_size_align::FromSizeAlignSite`] — the `Option` enum
+    /// root + `Some` variant owners, the payload `ValueType`, and the nested
+    /// `Layout` ADT owner, keyed off the `.ok()` destination `Option<Layout>`
+    /// type.  Gated on the payload being `core::alloc::layout::Layout` so only
+    /// the `from_size_align(..).ok()` shape is recorded; the post-pass validates
+    /// the preceding `from_size_align` residual.  The `Option` root is
+    /// **instantiation-suffixed** (`resolve_bool_then_option_dest`, matching
+    /// `bool::then`): the enclosing `try_typed_items_block_layout` also builds
+    /// `checked_{mul,add}` `Option<usize>` values, and a bare `Option` root
+    /// would share one `core.option.Option::Some::__pos_0` field with them,
+    /// unioning `Integer` with `Instance(Layout)` (annotator UnionError).  The
+    /// suffix gives `Option<Layout>` its own ClassDef and `__pos_0` field.
+    fn recognize_from_size_align_ok_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::from_size_align::FromSizeAlignSite> {
+        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
+            return None;
+        }
+        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        // The `Some` payload must be the opaque `core::alloc::layout::Layout`
+        // ADT — this gates recording to the `from_size_align(..).ok()` shape.
+        let payload_ty_ref = self.tyref_adt_type_arg(dest_ty, 0)?;
+        let layout_def_id = self.tyref_adt_def_id(&payload_ty_ref)?;
+        let layout_owner = self.llbc.type_by_id(layout_def_id)?.item_meta.name_path();
+        if layout_owner != "core::alloc::layout::Layout" {
+            return None;
+        }
+        Some(crate::front::from_size_align::FromSizeAlignSite {
+            ok_result: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
+            layout_owner,
+        })
+    }
+
+    /// Resolve a `Result::expect(res, msg)` call whose result is a by-value
+    /// `Layout` into a
+    /// [`crate::front::from_size_align::FromSizeAlignExpectSite`] — the
+    /// by-value sibling of [`Self::recognize_from_size_align_ok_site`].  Gated
+    /// on the destination being `core::alloc::layout::Layout` so only the
+    /// `from_size_align(..).expect(..)` shape is recorded; the post-pass
+    /// validates the preceding `from_size_align` residual + folded-const align
+    /// before mutating.  `None` (leaving the residual call) otherwise.
+    fn recognize_from_size_align_expect_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::from_size_align::FromSizeAlignExpectSite> {
+        let layout_def_id = self.tyref_adt_def_id(dest_ty)?;
+        let layout_owner = self.llbc.type_by_id(layout_def_id)?.item_meta.name_path();
+        if layout_owner != "core::alloc::layout::Layout" {
+            return None;
+        }
+        Some(crate::front::from_size_align::FromSizeAlignExpectSite {
+            result_var: result_var.clone(),
+            layout_owner,
+        })
+    }
+
     fn recognize_option_try_site(
         &self,
         recv_ty: Option<&TyRef>,
@@ -10428,11 +11223,15 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
             return None;
         }
-        let def_id = self.tyref_adt_def_id(recv_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
-        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
-        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        // The branched `__discriminant` / `__pos_0` reads key the SAME classdef
+        // the branched Option's producer wrote — per-instantiation for a
+        // ref/str/float payload, bare for the `Int`/`Unsigned` carve-out.  A
+        // cross-payload `?` (branch `Option<usize>`, return `Option<Layout>`)
+        // is fine: the branched owners here are independent of the enclosing
+        // function's return owner (`front::option_try` reads the Some arm from
+        // these owners and builds the None arm from the return owner).
+        let (option_owner, some_owner, payload_ty) =
+            self.resolve_option_consumer_owners(recv_ty)?;
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_try::OptionTrySite {
             branch_result_var: result_var.clone(),
@@ -10543,12 +11342,14 @@ impl<'a> Lowering<'a> {
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
         // is `Option<T>` and its closure returns that same `Option<T>`;
-        // `unwrap_or_else`'s dest is the bare `T`.
+        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`'s closure and
+        // dest are both `bool`.
         let call_result_ty = match kind {
             ClosureCombinator::Map => self.tyref_option_payload_value_type(dest_ty)?,
             ClosureCombinator::AndThen
             | ClosureCombinator::OrElse
-            | ClosureCombinator::UnwrapOrElse => tyref_to_value_type(dest_ty, self.llbc),
+            | ClosureCombinator::UnwrapOrElse
+            | ClosureCombinator::IsSomeAnd => tyref_to_value_type(dest_ty, self.llbc),
         };
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_closure_select::ClosureSelectSite {
@@ -10572,18 +11373,20 @@ impl<'a> Lowering<'a> {
     /// and keep the `__discriminant` field read against their aggregate
     /// `Ref` base.
     fn tyref_is_fieldless_enum(&self, ty: &TyRef) -> bool {
-        let Some(def_id) = self.tyref_adt_def_id(ty) else {
-            return false;
-        };
-        let Some(td) = self.llbc.type_by_id(def_id) else {
-            return false;
-        };
-        match &td.kind {
-            TypeDeclKind::Enum(variants) => {
-                !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty())
-            }
-            _ => false,
-        }
+        self.tyref_adt_def_id(ty)
+            .and_then(|def_id| self.llbc.type_by_id(def_id))
+            .is_some_and(type_decl_is_fieldless_enum)
+    }
+
+    /// [`Self::tyref_is_fieldless_enum`] through a `&` borrow — the shape a
+    /// derived trait method sees, since `PartialEq::eq(&self, &other)` types
+    /// both operands as references.  A fieldless enum is modelled by-value as
+    /// its discriminant integer, and `Rvalue::Ref` is the identity on it, so
+    /// the borrow carries no representation of its own.
+    fn tyref_is_borrowed_fieldless_enum(&self, ty: &TyRef) -> bool {
+        self.tyref_ref_adt_def_id(ty)
+            .and_then(|def_id| self.llbc.type_by_id(def_id))
+            .is_some_and(type_decl_is_fieldless_enum)
     }
 
     /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>` or
@@ -11539,7 +12342,7 @@ impl<'a> Lowering<'a> {
         Some(td.item_meta.name_path())
     }
 
-    /// The struct-root `name_path()` of `ty` when it resolves to a
+    /// The struct-root canonical name of `ty` when it resolves to a
     /// zero-field unit struct — the shape of the prebuilt dict-strategy
     /// singletons (`EmptyDictStrategy`, `ObjectDictStrategy`, …).  The
     /// `PlaceKind::Global` reader narrows a `refs`-bucket static of such a
@@ -11547,12 +12350,25 @@ impl<'a> Lowering<'a> {
     /// `SomeInstance`.  Returns `None` for a field-bearing struct (the
     /// object singletons `W_NoneObject` / `W_BoolObject` / … in the same
     /// bucket keep their raw-pointer lowering) or any non-struct shape.
+    ///
+    /// The name is crate-stripped ([`strip_crate_prefix`]) so it matches
+    /// the canonical `module::Leaf` spelling every other classdef path keys
+    /// on (`STRUCT_ORIGIN_REGISTRY` / `canonical_struct_name`, the struct
+    /// field registry, and the `register_trait_family` impl subclasses).
+    /// The raw `name_path()` carries the crate segment (`pyre_object::…`),
+    /// which `canonical_struct_name` passes through verbatim, minting a
+    /// SEPARATE `ClassDef` from the trait-family subclass — so the singleton
+    /// instance would have no `basedef` and two sibling strategy singletons
+    /// (`EmptyDictStrategy` / `EmptyKwargsDictStrategy`) `commonbase` to
+    /// nothing at a `mergeinputargs` join (`UnionError: no common base`).
     fn refs_static_zerofield_struct_root(&self, ty: &TyRef) -> Option<String> {
         let v = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(v)?;
         let td = self.llbc.type_by_id(def_id)?;
         match &td.kind {
-            TypeDeclKind::Struct(fields) if fields.is_empty() => Some(td.item_meta.name_path()),
+            TypeDeclKind::Struct(fields) if fields.is_empty() => {
+                Some(strip_crate_prefix(&td.item_meta.name_path()))
+            }
             _ => None,
         }
     }
@@ -13966,14 +14782,33 @@ fn tyref_fieldless_enum_def<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l TypeDe
         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
         TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
     }?;
-    let td = llbc.type_by_id(def_id)?;
-    match &td.kind {
-        TypeDeclKind::Enum(variants)
-            if !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty()) =>
-        {
-            Some(td)
-        }
+    llbc.type_by_id(def_id)
+        .filter(|td| type_decl_is_fieldless_enum(td))
+}
+
+/// The integer-comparison `BinOp` opname a derived `PartialEq` method on
+/// a fieldless enum folds to, or `None` for any other method leaf.  Only
+/// the two equality halves the `#[derive(PartialEq)]` expansion provides
+/// are recognized; ordering (`PartialOrd`) is a separate derive that no
+/// fieldless enum in the corpus compares by.
+fn fieldless_enum_cmp_binop(method: &str) -> Option<&'static str> {
+    match method {
+        "eq" => Some("eq"),
+        "ne" => Some("ne"),
         _ => None,
+    }
+}
+
+/// Whether a `TypeDecl` is a fieldless (C-like) enum: at least one
+/// variant, every variant carrying zero payload fields.  Such an enum is
+/// modelled by-value as its discriminant integer, so it has no
+/// `SomeInstance` at all.
+fn type_decl_is_fieldless_enum(td: &TypeDecl) -> bool {
+    match &td.kind {
+        TypeDeclKind::Enum(variants) => {
+            !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty())
+        }
+        _ => false,
     }
 }
 
@@ -14499,6 +15334,39 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
 fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let raw = node.as_object()?.get("RawPtr")?.as_array()?;
     adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)
+}
+
+/// Whether `ty` is a raw pointer onto a byte-sized integer literal —
+/// `*mut u8` / `*const u8` / the `i8` spellings.  This is the
+/// type-erased "opaque memory address" pointer: `llmemory.Address`
+/// upstream, the parameter type every heterogeneous-heap-block hook in
+/// `pyre_object::gc_hook` declares.  A pointee-typed raw pointer
+/// (`*mut PyFrame`, `*mut *mut PyObject`) and a wider primitive array
+/// head (`*mut i64`) are all excluded — only the byte pointee carries
+/// the "no pointee type at all" contract.
+fn tyref_is_raw_byte_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) = tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| n.as_object()?.get("RawPtr")?.as_array()?.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+    else {
+        return false;
+    };
+    let Some(lit) = pointee.as_object().and_then(|o| o.get("Literal")) else {
+        return false;
+    };
+    // The literal-type schema splits `{"UInt": "U8"}` / `{"Int": "I8"}`
+    // across the two integer keys, plus the older `{"Integer": …}`
+    // spelling some .ullbc artefacts still carry.
+    let Some(lit_obj) = lit.as_object() else {
+        return false;
+    };
+    ["UInt", "Int", "Integer"].into_iter().any(|key| {
+        matches!(
+            lit_obj.get(key).and_then(serde_json::Value::as_str),
+            Some("U8" | "I8")
+        )
+    })
 }
 
 /// Whether `ty` is a `*mut PyObjectRef` / `*const PyObjectRef`
@@ -18829,9 +19697,9 @@ mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
         DecodedConst, cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_const_generic_to_string,
-        charon_type_value_to_ast_string, decode_literal,
+        charon_type_value_to_ast_string, decode_literal, tyref_is_raw_byte_ptr,
     };
-    use majit_charon_reader::Llbc;
+    use majit_charon_reader::{Llbc, ullbc::TyRef};
 
     #[test]
     fn decode_scalar_i128_and_u128_preserves_full_width() {
@@ -21411,6 +22279,40 @@ mod tests {
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!({"Scalar": []})));
     }
 
+    /// Only a byte pointee spells the type-erased address; a pointee-typed
+    /// raw pointer and a wider primitive array head must stay narrows /
+    /// aliases, since erasing those would drop a pointee class the
+    /// annotator still needs.
+    #[test]
+    fn raw_byte_ptr_recognizes_only_the_byte_pointee() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let ptr_to = |pointee: serde_json::Value| {
+            TyRef::Other(serde_json::json!({ "RawPtr": [pointee, "Mut"] }))
+        };
+        for pointee in ["U8", "I8"] {
+            assert!(
+                tyref_is_raw_byte_ptr(
+                    &ptr_to(serde_json::json!({"Literal": {"UInt": pointee}})),
+                    &llbc
+                ),
+                "*mut {pointee} is the erased address pointer"
+            );
+        }
+        assert!(!tyref_is_raw_byte_ptr(
+            &ptr_to(serde_json::json!({"Literal": {"Int": "I64"}})),
+            &llbc
+        ));
+        assert!(!tyref_is_raw_byte_ptr(
+            &ptr_to(serde_json::json!({"Adt": {"id": {"Builtin": "Str"}}})),
+            &llbc
+        ));
+        // A bare `u8` (no pointer around it) is not an address either.
+        assert!(!tyref_is_raw_byte_ptr(
+            &TyRef::Other(serde_json::json!({"Literal": {"UInt": "U8"}})),
+            &llbc
+        ));
+    }
+
     fn rows(spec: &[(&str, &str)]) -> Vec<(String, String)> {
         spec.iter()
             .map(|(n, t)| (n.to_string(), t.to_string()))
@@ -21949,6 +22851,209 @@ mod tests {
         );
     }
 
+    /// Real-LLBC anchor for the unsigned `saturating_sub` clamp diamond:
+    /// `generic_alias_class_getitem`'s arg-count error path computes
+    /// `args.len().saturating_sub(1)`.  After the `front::saturating_sub`
+    /// post-pass there must be no residual `["num","<Impl>","saturating_sub"]`
+    /// call and at least one `lt` guard + one `sub` (the `if a < b { 0 } else
+    /// { a - b }` diamond).  `#[ignore]`d (loads the ~440MB real LLBC); run with
+    /// `cargo test -p majit-translate --lib saturating_sub_generic_alias_real
+    /// -- --ignored`.
+    #[test]
+    #[ignore]
+    fn saturating_sub_generic_alias_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "generic_alias_class_getitem")
+            .expect("lower generic_alias_class_getitem");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "generic_alias_class_getitem: residual saturating_sub after the clamp-diamond rewrite"
+        );
+        let lt_guards = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lt"))
+            .count();
+        let subs = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub"))
+            .count();
+        assert!(
+            lt_guards >= 1 && subs >= 1,
+            "generic_alias_class_getitem: expected the a<b guard and the a-b subtraction \
+             (lt={lt_guards}, sub={subs})"
+        );
+    }
+
+    /// Real-LLBC anchor for the `Option::is_some_and` closure-select fold:
+    /// `is_mmap` is `type(obj).is_some_and(|tp| ptr::eq(tp.as_ptr(),
+    /// mmap_type()))`.  After the `option_closure_select` post-pass there must
+    /// be no residual `is_some_and` `Method` call, and block A must branch two
+    /// ways (the `Some`/`None` discriminant diamond).  `#[ignore]`d (loads the
+    /// ~440MB real LLBC); run with `cargo test -p majit-translate --lib
+    /// is_some_and_is_mmap_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn is_some_and_is_mmap_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "is_mmap").expect("lower is_mmap");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == "is_some_and"
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "is_mmap: residual is_some_and call after the closure-select rewrite"
+        );
+        let branching = graph.blocks.iter().filter(|b| b.exits.len() == 2).count();
+        assert!(
+            branching >= 1,
+            "is_mmap: expected the Some/None discriminant branch (a 2-exit block)"
+        );
+    }
+
+    /// Real-LLBC anchor for the `FixedObjectArray::set_ref` setarrayitem
+    /// collapse: `set_locals_w` (the shared STORE_FAST-family leaf) calls
+    /// `self.locals_cells_stack_w.set_ref(index, value)`.  After the
+    /// whole-method lift there must be no residual
+    /// `["object_array","<Impl>","set_ref"]` call and no residual
+    /// `items_mut_ptr` / write-barrier accessor from the method body, and at
+    /// least one native `ArrayWrite` (the `setarrayitem_gc`).  `#[ignore]`d
+    /// (loads the ~440MB real LLBC); run with `cargo test -p majit-translate
+    /// --lib set_ref_set_locals_w_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn set_ref_set_locals_w_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["object_array", "<Impl>", "set_ref"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "set_locals_w: residual set_ref call after the setarrayitem collapse"
+        );
+        let array_writes = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::ArrayWrite { .. }))
+            .count();
+        assert!(
+            array_writes >= 1,
+            "set_locals_w: expected at least one native ArrayWrite (setarrayitem_gc)"
+        );
+    }
+
+    /// Real-LLBC anchor for the `we_are_jitted()` → `ConstBool(true)` front
+    /// fold: `lookup_in_type_where` branches on `if not we_are_jitted()` and,
+    /// in the interpreter arm, calls `_cached_lookup_where_name`, whose body
+    /// reads the residual-only `METHOD_CACHE` static.  After the front fold the
+    /// interpreter arm is JIT-dead and the annotator prunes it, but the fold
+    /// itself already removes the `we_are_jitted` call and collapses its
+    /// two-way branch to the JIT arm's unconditional goto — so the lowered
+    /// graph carries no `we_are_jitted` call.  `#[ignore]`d (loads the ~440MB
+    /// real LLBC); run with `cargo test -p majit-translate --lib
+    /// we_are_jitted_lookup_in_type_where_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn we_are_jitted_lookup_in_type_where_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "lookup_in_type_where")
+            .expect("lower lookup_in_type_where");
+        let we_are_jitted_residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["jit", "we_are_jitted"])
+                )
+            })
+            .count();
+        assert_eq!(
+            we_are_jitted_residual, 0,
+            "lookup_in_type_where: residual we_are_jitted call after the front fold"
+        );
+        // The interpreter arm's `_cached_lookup_where_name` call (which reads
+        // the residual-only `METHOD_CACHE` static) is JIT-dead once
+        // `we_are_jitted()` folds to True.  The front fold collapses the branch
+        // to the JIT arm's unconditional goto, so the interpreter arm becomes
+        // unreachable and `simplify_lowered_graph`'s `clear_unreachable_blocks`
+        // empties its operations — no `_cached_lookup_where_name` call survives.
+        let cached_lookup_residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["baseobjspace", "_cached_lookup_where_name"])
+                )
+            })
+            .count();
+        assert_eq!(
+            cached_lookup_residual, 0,
+            "lookup_in_type_where: residual _cached_lookup_where_name (METHOD_CACHE reader) \
+             after the we_are_jitted fold pruned the interpreter arm"
+        );
+    }
+
     /// Real-LLBC anchor for the fieldless-enum `Debug` `format!` collapse:
     /// `call_intrinsic_1`'s unknown-intrinsic arm renders `func`
     /// (`IntrinsicFunction1`, a fieldless enum) with `{:?}`, which lowers to
@@ -22138,6 +23243,44 @@ mod tests {
         assert!(
             checked >= 1,
             "object_functionstr_type_name: expected a niche `ne` null-test switch block"
+        );
+    }
+
+    /// Anchor the fieldless-enum `PartialEq` fold to the real lowered IR of
+    /// `strategy_is` — `current.strategy_kind() == expected.strategy_kind()`
+    /// over the fieldless `StrategyKind`.  Both operands come back in the int
+    /// bank, so the derived `eq` must fold to `BinOp("eq")`; leaving it a
+    /// `Method` call blocks the annotator with `Cannot find attribute "eq" on
+    /// Integer`.  Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn fieldless_enum_eq_fold_real_strategy_is() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "pyre_object::dictmultiobject::strategy_is")
+            .expect("lower strategy_is");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "eq"
+                ))
+                .count(),
+            0,
+            "no residual `eq` Method call survives the fold"
+        );
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq"))
+                .count(),
+            1,
+            "the discriminant comparison lowers to one int `BinOp(eq)`"
         );
     }
 }

@@ -1253,10 +1253,12 @@ mod tests {
 
     #[test]
     fn w_islice_gc_descriptor_traces_source_iterator() {
-        assert_eq!(W_ISLICE_GC_PTR_OFFSETS.len(), 1);
         assert_eq!(
-            W_ISLICE_GC_PTR_OFFSETS[0],
-            std::mem::offset_of!(W_ISlice, iterable)
+            W_ISLICE_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_ISlice, ob.w_class),
+                std::mem::offset_of!(W_ISlice, iterable),
+            ]
         );
         assert_eq!(
             <W_ISlice as crate::lltype::GcType>::SIZE,
@@ -1266,10 +1268,12 @@ mod tests {
 
     #[test]
     fn w_batched_gc_descriptor_traces_source_iterator() {
-        assert_eq!(W_BATCHED_GC_PTR_OFFSETS.len(), 1);
         assert_eq!(
-            W_BATCHED_GC_PTR_OFFSETS[0],
-            std::mem::offset_of!(W_Batched, it)
+            W_BATCHED_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Batched, ob.w_class),
+                std::mem::offset_of!(W_Batched, it),
+            ]
         );
         assert_eq!(
             <W_Batched as crate::lltype::GcType>::SIZE,
@@ -1282,6 +1286,7 @@ mod tests {
         assert_eq!(
             W_PRODUCT_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_Product, ob.w_class),
                 std::mem::offset_of!(W_Product, gears),
                 std::mem::offset_of!(W_Product, indices),
                 std::mem::offset_of!(W_Product, lst),
@@ -1298,6 +1303,7 @@ mod tests {
         assert_eq!(
             W_COMBINATIONS_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_Combinations, ob.w_class),
                 std::mem::offset_of!(W_Combinations, pool_w),
                 std::mem::offset_of!(W_Combinations, indices),
                 std::mem::offset_of!(W_Combinations, last_result_w),
@@ -1314,6 +1320,7 @@ mod tests {
         assert_eq!(
             W_COMBINATIONS_WITH_REPLACEMENT_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_CombinationsWithReplacement, ob.w_class),
                 std::mem::offset_of!(W_CombinationsWithReplacement, pool_w),
                 std::mem::offset_of!(W_CombinationsWithReplacement, indices),
                 std::mem::offset_of!(W_CombinationsWithReplacement, last_result_w),
@@ -1330,6 +1337,7 @@ mod tests {
         assert_eq!(
             W_PERMUTATIONS_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_Permutations, ob.w_class),
                 std::mem::offset_of!(W_Permutations, pool_w),
                 std::mem::offset_of!(W_Permutations, indices),
                 std::mem::offset_of!(W_Permutations, cycles),
@@ -1346,6 +1354,7 @@ mod tests {
         assert_eq!(
             W_GROUPBY_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_GroupBy, ob.w_class),
                 std::mem::offset_of!(W_GroupBy, w_iterator),
                 std::mem::offset_of!(W_GroupBy, w_keyfunc),
                 std::mem::offset_of!(W_GroupBy, w_tgtkey),
@@ -1365,6 +1374,7 @@ mod tests {
         assert_eq!(
             W_GROUPBY_ITERATOR_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_GroupByIterator, ob.w_class),
                 std::mem::offset_of!(W_GroupByIterator, groupby),
                 std::mem::offset_of!(W_GroupByIterator, w_tgtkey),
             ]
@@ -1380,6 +1390,7 @@ mod tests {
         assert_eq!(
             W_TEE_DATAOBJECT_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_TeeChainedListNode, ob.w_class),
                 std::mem::offset_of!(W_TeeChainedListNode, w_next),
                 std::mem::offset_of!(W_TeeChainedListNode, w_obj),
             ]
@@ -1395,6 +1406,7 @@ mod tests {
         assert_eq!(
             W_TEE_ITERABLE_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_TeeIterable, ob.w_class),
                 std::mem::offset_of!(W_TeeIterable, w_iterator),
                 std::mem::offset_of!(W_TeeIterable, w_chained_list),
             ]
@@ -1407,13 +1419,17 @@ mod tests {
 
     #[test]
     fn w_compress_gc_descriptor_traces_both_iterator_fields() {
-        assert_eq!(W_COMPRESS_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(W_COMPRESS_GC_PTR_OFFSETS.len(), 3);
         assert_eq!(
             W_COMPRESS_GC_PTR_OFFSETS[0],
-            std::mem::offset_of!(W_Compress, w_data)
+            std::mem::offset_of!(W_Compress, ob.w_class)
         );
         assert_eq!(
             W_COMPRESS_GC_PTR_OFFSETS[1],
+            std::mem::offset_of!(W_Compress, w_data)
+        );
+        assert_eq!(
+            W_COMPRESS_GC_PTR_OFFSETS[2],
             std::mem::offset_of!(W_Compress, w_selectors)
         );
         assert_eq!(
@@ -1424,13 +1440,17 @@ mod tests {
 
     #[test]
     fn w_starmap_gc_descriptor_traces_function_and_iterator() {
-        assert_eq!(W_STARMAP_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(W_STARMAP_GC_PTR_OFFSETS.len(), 3);
         assert_eq!(
             W_STARMAP_GC_PTR_OFFSETS[0],
-            std::mem::offset_of!(W_StarMap, w_fun)
+            std::mem::offset_of!(W_StarMap, ob.w_class)
         );
         assert_eq!(
             W_STARMAP_GC_PTR_OFFSETS[1],
+            std::mem::offset_of!(W_StarMap, w_fun)
+        );
+        assert_eq!(
+            W_STARMAP_GC_PTR_OFFSETS[2],
             std::mem::offset_of!(W_StarMap, w_iterable)
         );
         assert_eq!(
@@ -1441,10 +1461,11 @@ mod tests {
 
     #[test]
     fn w_accumulate_gc_descriptor_traces_live_state() {
-        assert_eq!(W_ACCUMULATE_GC_PTR_OFFSETS.len(), 4);
+        assert_eq!(W_ACCUMULATE_GC_PTR_OFFSETS.len(), 5);
         assert_eq!(
             W_ACCUMULATE_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_Accumulate, ob.w_class),
                 std::mem::offset_of!(W_Accumulate, w_iterable),
                 std::mem::offset_of!(W_Accumulate, w_func),
                 std::mem::offset_of!(W_Accumulate, w_total),
@@ -1459,10 +1480,11 @@ mod tests {
 
     #[test]
     fn w_zip_longest_gc_descriptor_traces_iterators_and_fillvalue() {
-        assert_eq!(W_ZIP_LONGEST_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(W_ZIP_LONGEST_GC_PTR_OFFSETS.len(), 3);
         assert_eq!(
             W_ZIP_LONGEST_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_ZipLongest, ob.w_class),
                 std::mem::offset_of!(W_ZipLongest, w_iterators),
                 std::mem::offset_of!(W_ZipLongest, w_fillvalue),
             ]
@@ -1489,13 +1511,17 @@ mod tests {
     // the collector, and that the descriptor reflects the struct's size.
     #[test]
     fn w_cycle_gc_descriptor_traces_both_pointer_fields() {
-        assert_eq!(W_CYCLE_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(W_CYCLE_GC_PTR_OFFSETS.len(), 3);
         assert_eq!(
             W_CYCLE_GC_PTR_OFFSETS[0],
-            std::mem::offset_of!(W_Cycle, w_iterable)
+            std::mem::offset_of!(W_Cycle, ob.w_class)
         );
         assert_eq!(
             W_CYCLE_GC_PTR_OFFSETS[1],
+            std::mem::offset_of!(W_Cycle, w_iterable)
+        );
+        assert_eq!(
+            W_CYCLE_GC_PTR_OFFSETS[2],
             std::mem::offset_of!(W_Cycle, saved)
         );
         assert_eq!(
@@ -1512,13 +1538,17 @@ mod tests {
     // struct's size.
     #[test]
     fn w_chain_gc_descriptor_traces_both_pointer_fields() {
-        assert_eq!(W_CHAIN_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(W_CHAIN_GC_PTR_OFFSETS.len(), 3);
         assert_eq!(
             W_CHAIN_GC_PTR_OFFSETS[0],
-            std::mem::offset_of!(W_Chain, w_iterables)
+            std::mem::offset_of!(W_Chain, ob.w_class)
         );
         assert_eq!(
             W_CHAIN_GC_PTR_OFFSETS[1],
+            std::mem::offset_of!(W_Chain, w_iterables)
+        );
+        assert_eq!(
+            W_CHAIN_GC_PTR_OFFSETS[2],
             std::mem::offset_of!(W_Chain, w_it)
         );
         assert_eq!(

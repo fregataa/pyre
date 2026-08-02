@@ -709,6 +709,18 @@ pub enum PyreHelperKind {
     /// `store_global_value`).  Recognised for the same `IntMutableCell`
     /// in-place store fold as [`PyreHelperKind::StoreName`].
     StoreGlobal,
+    /// `bh_delete_name_fn(frame, w_name)` — the DELETE_NAME frame-receiver
+    /// helper (`pyopcode.py:869-880`, delegates to `delitem_str`).  Recognised
+    /// by the walker only to answer upstream's
+    /// `opimpl_jit_force_quasi_immutable` question (`pyjitpl.py:1094-1118`)
+    /// ahead of the call: a successful delete runs `mutated()`
+    /// (`celldict.py:106-126`), which assigns the `version?` quasi-immutable
+    /// field.  Pyre's write lives inside this residual, so the walker never
+    /// meets the rtyper operation and has to ask before executing.
+    DeleteName,
+    /// `bh_delete_global_fn(frame, w_name)` — the DELETE_GLOBAL twin of
+    /// [`PyreHelperKind::DeleteName`], recognised for the same reason.
+    DeleteGlobal,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
     /// the helper checks before use (a non-null receiver is prepended as
@@ -881,6 +893,15 @@ pub enum PyreHelperKind {
     /// access) to a traced inline exception construction the optimizer
     /// can virtualize; every other shape keeps the generic residual.
     DeleteAttr,
+    /// `jit_make_function_from_globals(globals, code)` — the MAKE_FUNCTION
+    /// residual (`lower_make_function_hlop_to_insn` →
+    /// `function.py:47-57 Function.__init__`).  Both Ref operands are baked
+    /// constants: the defining frame's globals object and the popped code
+    /// object.  The full-body walker recognises this tag to emit the
+    /// construction as `NewWithVtable` + the `SetfieldGc` set, so a `def`
+    /// inside a loop virtualizes away instead of allocating a `Function` per
+    /// iteration through an opaque residual.
+    MakeFunction,
 }
 
 impl EffectInfo {

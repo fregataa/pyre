@@ -25,24 +25,15 @@ pub fn make_function_from_code_obj_with_globals_obj(
     code_obj: PyObjectRef,
     w_globals: PyObjectRef,
 ) -> PyObjectRef {
-    let code_ptr = unsafe { w_code_get_ptr(code_obj) };
-    let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     // `function.py:51-53 __init__`:
     //   self.name = forcename or code.co_name
     //   self.qualname = qualname or self.name
     // so `name` is the bare `co_name` and `qualname` is the dotted
     // `co_qualname`.  `pyopcode.py:1457 MAKE_FUNCTION` then stamps the
     // qualified name from `codeobj.co_qualname`, which is why a later
-    // `__code__ = new_code` assignment does NOT change `__qualname__`.
-    let func = crate::function::function_new_with_closure(
-        code_obj as *const (),
-        code.obj_name.to_string(),
-        w_globals,
-        pyre_object::PY_NULL,
-    );
-    let qualname_obj = pyre_object::w_str_new(code.qualname.as_ref());
-    unsafe { crate::function::function_set_qualname(func, qualname_obj) };
-    func
+    // `__code__ = new_code` assignment does NOT change `__qualname__`.  Both
+    // are read straight off the code object, so neither allocates.
+    crate::function::function_new_from_code(code_obj, w_globals)
 }
 
 fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
@@ -1226,25 +1217,31 @@ pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
 pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObjectRef>, PyError> {
     // Fast path only for exact built-in sequence types. Subclasses and other
     // instances may define custom `__iter__` that must be honored.
-    let exact_sequence_len = unsafe {
+    // `ceval.c UNPACK_SEQUENCE` takes its length-aware fast path for an exact
+    // tuple or list only, and only there does a "too many" error name the
+    // source's total. A str is unpacked by the generic iterator loop, which
+    // stops one item past `count` and so has no total to report.
+    let (exact_sequence_len, reports_total) = unsafe {
         if pyre_object::is_exact_tuple(seq) {
-            Some(w_tuple_len(seq))
+            (Some(w_tuple_len(seq)), true)
         } else if pyre_object::is_exact_list(seq) {
-            Some(w_list_len(seq))
+            (Some(w_list_len(seq)), true)
         } else if pyre_object::is_exact_type(seq, &pyre_object::STR_TYPE) {
-            Some(w_str_len(seq))
+            (Some(w_str_len(seq)), false)
         } else {
-            None
+            (None, false)
         }
     };
     if let Some(len) = exact_sequence_len {
         if len != count {
             // `baseobjspace.py:1041-1053 _unpackiterable_known_length_jitlook`
             // raises ValueError on length mismatch.
-            let msg = if len > count {
-                format!("too many values to unpack (expected {count})")
-            } else {
+            let msg = if len < count {
                 format!("not enough values to unpack (expected {count}, got {len})")
+            } else if reports_total {
+                format!("too many values to unpack (expected {count}, got {len})")
+            } else {
+                format!("too many values to unpack (expected {count})")
             };
             return Err(PyError::value_error(msg));
         }
@@ -1255,9 +1252,10 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     // UNPACK_SEQUENCE wraps the whole `fixedview_unroll` (iter + known-length
     // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
     let non_iterable = || {
-        PyError::type_error(format!("cannot unpack non-iterable {} object", unsafe {
-            pyre_object::type_name_of(seq)
-        }))
+        PyError::type_error(format!(
+            "cannot unpack non-iterable {} object",
+            crate::baseobjspace::object_functionstr_type_name(seq)
+        ))
     };
     let iter = match crate::baseobjspace::iter(seq) {
         Ok(it) => it,
@@ -1316,7 +1314,7 @@ pub fn unpack_ex_slots(
                 Err(e) if e.kind == PyErrorKind::TypeError => {
                     return Err(PyError::type_error(format!(
                         "cannot unpack non-iterable {} object",
-                        pyre_object::type_name_of(value)
+                        crate::baseobjspace::object_functionstr_type_name(value)
                     )));
                 }
                 Err(e) => return Err(e),
@@ -1362,7 +1360,7 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
-        unsafe { pyre_object::type_name_of(iter) }
+        crate::baseobjspace::object_functionstr_type_name(iter)
     )))
 }
 

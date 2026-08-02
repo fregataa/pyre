@@ -835,12 +835,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     }
                 {
                     majit_ir::resumedata::encode_branch_orgpc(ctx.live_before_jit_pc, flavor_true)
-                } else if marker.is_some()
-                    && ctx.live_before_jit_pc != usize::MAX
+                } else if ctx.live_before_jit_pc != usize::MAX
                     && matches!(
                         ctx.trace_ctx.last_guard_opcode(),
                         Some(OpCode::GuardValue | OpCode::GuardClass)
                     )
+                    && unsafe {
+                        (&*sym.jitcode())
+                            .payload
+                            .jitcode
+                            .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live())
+                    }
                 {
                     ctx.live_before_jit_pc as i32
                 } else {
@@ -1264,11 +1269,12 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         if let Some((_opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
         {
             // Only a positively-resolved (non-null) shadow value is a faithful
-            // stack slot.  The live vstack/color sources above already emit
-            // every genuine null-or-self sentinel they can resolve
-            // (`concrete_ref_for_opref` yields an explicit null Ref for a
-            // PUSH_NULL box).  A slot that reaches this shadow fallback with a
-            // NULL Ref is one the walk could not resolve — e.g. an
+            // stack slot.  The live vstack/color sources above emit a genuine
+            // null-or-self sentinel only where they hold a box for the slot at
+            // all — the `PUSH_NULL` position has none, which is what the
+            // `call_null_or_self_slot` pass below exists to cover.  A slot that
+            // reaches this shadow fallback with a NULL Ref is one the walk could
+            // not resolve — e.g. an
             // unmaterialized `LOAD_CONST` operand whose concrete value was
             // never mirrored — not a real null.  Leaving it ABSENT makes the
             // outer-call flush validation decline, so the legacy replay
@@ -1279,7 +1285,44 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             }
         }
     }
+    // The `null_or_self` operand a `PUSH_NULL` leaves under a `CALL` is the one
+    // stack slot NO source above can speak for: nothing pushes a value there,
+    // so the walk holds no box and no live color for it, and the shadow's NULL
+    // is the same NULL an unmirrored slot reads back as. It therefore stays
+    // absent and declines the outer-call flush — on a slot whose correct value
+    // is exactly that null. The CALL's own operand layout names it without
+    // guessing: `[callable, null_or_self, arg0 .. arg_{argc-1}]` ends at
+    // `stack_end`, so the sentinel sits `argc + 1` below it, right under the
+    // arguments and right above the callable.
+    if let Some(slot) = call_null_or_self_slot(caller_sym, call_jitcode_pc, stack_end)
+        && slot >= nlocals
+        && !overrides.iter().any(|&(present, _)| present == slot)
+    {
+        overrides.push((slot, std::ptr::null_mut::<u8>() as pyre_object::PyObjectRef));
+    }
     overrides
+}
+
+/// Absolute frame slot holding the `null_or_self` operand of the `CALL` whose
+/// JitCode coordinate is `call_jitcode_pc`, for a caller whose operand stack
+/// ends at `stack_end`. `None` when that coordinate does not invert to a plain
+/// `CALL` — every other resume shape keeps the conservative decline.
+fn call_null_or_self_slot<Sym: WalkSym>(
+    caller_sym: &Sym,
+    call_jitcode_pc: usize,
+    stack_end: usize,
+) -> Option<usize> {
+    let jc = unsafe { caller_sym.jitcode().as_ref()? };
+    let code = unsafe { (jc.payload.code_ptr as *const pyre_interpreter::CodeObject).as_ref()? };
+    let py_pc =
+        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
+            as usize;
+    let (pyre_interpreter::Instruction::Call { argc }, op_arg) =
+        pyre_interpreter::decode_instruction_at(code, py_pc)?
+    else {
+        return None;
+    };
+    stack_end.checked_sub(argc.get(op_arg) as usize + 1)
 }
 
 fn capture_inline_parent_blackhole<Sym: WalkSym>(
@@ -2011,8 +2054,30 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         Some(g) => g as i32,
         None if after_residual_call => callee_pjc
             .after_residual_marker_for_jitcode_pc(callee_op_pc)
+            .or_else(|| {
+                // Fallback only, for the same reason as the single-frame path:
+                // the sticky cursor names this frame's op only while no other
+                // residual has passed, so it may not displace the twin.
+                (ctx.live_after_jit_pc != usize::MAX
+                    && callee_pjc
+                        .jitcode
+                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
+                .then_some(ctx.live_after_jit_pc)
+            })
             .map(|m| m as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+        // No `-live-` BEFORE anchor arm here, unlike the single-frame path.
+        // The marker below is `callee_op_pc`'s codewrite-time twin: the
+        // coordinate whose liveness window the boxes this frame is about to
+        // collect were emitted against. `ctx.live_before_jit_pc` is merely
+        // another `-live-` byte the walk stepped over, and passing
+        // `can_decode_live_vars` only says its window decodes, not that it is
+        // the one those boxes belong to. Carrying it makes
+        // `collect_callee_active_boxes` size the section from one coordinate
+        // while reading the values out of the sub-walk registers at another.
+        // The single-frame path can substitute the anchor because it re-reads
+        // the owning frame's vable shadow at the carried coordinate; the callee
+        // sub-walk owns no shadow to re-read.
         None => callee_pjc
             .resume_marker_for_jitcode_pc(callee_op_pc)
             .map(|m| m as i32)
@@ -2130,9 +2195,56 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             }
         }
     }
+    // `MIFrame.registers_r` is the live color bank, but a reconstructed
+    // carrier frame also owns the semantic locals/stack image from which that
+    // bank was rebuilt.  A post-call liveness marker can conservatively carry
+    // a color whose current bank value is NONE (adjacent `-live-` union); map
+    // that color back to this callee's OWN frame slot and source the box from
+    // its frame-local shadow.  This is the inline-frame counterpart of
+    // `collect_outer_active_boxes`' virtualizable-slot recovery, and preserves
+    // the one-red-frame-per-MIFrame shape instead of falling back to the root.
+    let mut recovered_regs_r = ctx.registers_r.to_vec();
+    if recovered_regs_r.iter().any(|value| value.is_none()) && !callee_pjc.code_ptr.is_null() {
+        let code = unsafe { &*callee_pjc.code_ptr };
+        let (stack_base, _) = crate::state::callee_layout_for_call_assembler(code);
+        let maps =
+            crate::state::bridge_semantic_maps_from_pc(callee_jitcode_index, callee_jitcode_pc);
+        if let Some(shadow) = ctx.callee_shadow.as_ref() {
+            for (color, value) in recovered_regs_r.iter_mut().enumerate() {
+                if !value.is_none() {
+                    continue;
+                }
+                let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
+                    stack_base,
+                    maps.stack_depth_at_pc,
+                    &maps.pcdep_entries,
+                    color,
+                ) else {
+                    continue;
+                };
+                if let Some(&slot_value) = shadow.opref.get(&(slot as i64)) {
+                    *value = slot_value;
+                }
+            }
+        }
+        // A dense fallthrough marker can name the NEXT Python opcode's result
+        // color before that opcode has executed.  RPython's sparse stream has
+        // no opcode-entry marker at this seam; the translated Ref bank slot is
+        // still its empty/null value and the next opcode overwrites it before
+        // any read.  Admit exactly that metadata-proven result color as NULL;
+        // every other missing live color still declines below.
+        if after_residual_call {
+            let marker_result = usize::try_from(callee_jitcode_pc)
+                .ok()
+                .and_then(|coord| callee_pjc.result_color_trivia_for_jitcode_pc(coord))
+                .filter(|&color| color != u16::MAX);
+            let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+            seed_missing_fallthrough_result(&mut recovered_regs_r, marker_result, null_ref);
+        }
+    }
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
-        ctx.registers_r,
+        &recovered_regs_r,
         ctx.registers_f,
         callee_jitcode_index as u32,
         callee_op_pc,
@@ -2193,4 +2305,27 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             );
     }
     Ok(())
+}
+
+/// Seed only the not-yet-defined result color carried by pyre's dense
+/// fallthrough marker.  Returns whether a hole was filled.
+pub(crate) fn seed_missing_fallthrough_result(
+    registers_r: &mut [OpRef],
+    marker_result: Option<u16>,
+    null_ref: OpRef,
+) -> bool {
+    let Some(dst) = marker_result
+        .filter(|&color| color != u16::MAX)
+        .map(usize::from)
+    else {
+        return false;
+    };
+    let Some(slot) = registers_r.get_mut(dst) else {
+        return false;
+    };
+    if !slot.is_none() {
+        return false;
+    }
+    *slot = null_ref;
+    true
 }

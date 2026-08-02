@@ -956,8 +956,31 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// pre-invalidation equivalent.  A tuple's backing array has its own immutable
 /// descriptor and is read with `GetarrayitemGcPureR`.
 ///
-/// `field_descr_from_group` indexes positionally, so new fields append.
+/// The entries are in byte-offset order and each key is the struct's own field
+/// name, which is what makes the group's numbering agree with the analyzer's.
+/// `index_in_parent` is a field's slot number in the virtual
+/// (`virtualize.py:210 fielddescr.get_index()`) and its `PtrInfo._fields` key
+/// in the heap optimizer, so two fields sharing one number makes a read of
+/// either resolve to the other's cached value and a virtual keep only the
+/// later of the two stores.  Two things assign it: `descr.py:218-239` caches a
+/// FieldDescr per `(STRUCT, fieldname)` and a cache hit reports the analyzer's
+/// number, which counts the struct's own fields past the flattened header;
+/// a miss numbers the field by its position in this list.  Keeping the list in
+/// offset order — with the inherited `PyObject.w_class` last, since the
+/// analyzer's count does not include it — makes both answers the same one.
+/// Look fields up by offset (`function_field_descr`) so the accessors below
+/// cannot drift out of that order.
+///
+/// The census is COMPLETE — every pointer-shaped slot of `Function` is listed,
+/// not only the four the inline-call path reads.  `emit_make_function_inline`
+/// allocates a `Function` with `NewWithVtable`, and the nursery is not
+/// zero-filled: `rewrite.py:498-504 clear_gc_fields` emits the delayed NULL
+/// stores, and it walks exactly this group's `gc_fielddescrs`.  A pointer slot
+/// missing from the census would keep recycled nursery bytes and the collector
+/// would follow that word as a child reference.  `can_change_code` is a plain
+/// byte, so it gets no NULL store and the emit writes it explicitly.
 static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_interpreter::function as f;
     let field = |key, offset| {
         (
             key,
@@ -970,19 +993,65 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         )
     };
     build_object_descr_group_with_def_path(
-        pyre_interpreter::function::FUNCTION_OBJECT_SIZE,
+        f::FUNCTION_OBJECT_SIZE,
         FUNCTION_GC_TYPE_ID,
         &pyre_interpreter::FUNCTION_TYPE as *const _ as usize,
         &[
-            field("defs_w", pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET),
-            field("code", pyre_interpreter::function::FUNCTION_CODE_OFFSET),
-            field(
-                "w_func_globals",
-                pyre_interpreter::function::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
+            field("code", f::FUNCTION_CODE_OFFSET),
+            // `function.py:33 can_change_code = True`; `False` for the
+            // `FunctionWithFixedCode` / `BuiltinFunction` subclasses.  A plain
+            // byte, so `clear_gc_fields` leaves it alone and the value a
+            // materialized function reports comes from the emit's own store.
+            (
+                "can_change_code",
+                std::mem::offset_of!(pyre_interpreter::function::Function, can_change_code),
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
             ),
-            field(
-                "closure",
-                pyre_interpreter::function::FUNCTION_CLOSURE_OFFSET,
+            // `function.py:51 self.name = forcename or code.co_name` — a
+            // pointer to the name string's storage.  It is pointer-shaped and
+            // the runtime walker visits it, so it belongs in the census; the
+            // storage itself may be GC-managed (a mortal function's own box) or
+            // permanent (a builtin's `malloc_raw` box, or the code object's
+            // borrowed `co_name`), which the walker's managed-heap guard sorts
+            // out.
+            field("name", f::FUNCTION_NAME_OFFSET),
+            field("closure", f::FUNCTION_CLOSURE_OFFSET),
+            field("defs_w", f::FUNCTION_DEFS_W_OFFSET),
+            field("w_kw_defs", f::FUNCTION_W_KW_DEFS_OFFSET),
+            field("w_module", f::FUNCTION_W_MODULE_OFFSET),
+            field("w_func_globals_obj", f::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET),
+            field("w_builtins", f::FUNCTION_W_BUILTINS_OFFSET),
+            field("w_ann", f::FUNCTION_W_ANN_OFFSET),
+            field("w_annotate", f::FUNCTION_W_ANNOTATE_OFFSET),
+            field("w_func_dict", f::FUNCTION_W_FUNC_DICT_OFFSET),
+            field("w_typeparams", f::FUNCTION_W_TYPEPARAMS_OFFSET),
+            field("w_doc", f::FUNCTION_W_DOC_OFFSET),
+            field("w_qualname", f::FUNCTION_W_QUALNAME_OFFSET),
+            field("w_objclass", f::FUNCTION_W_OBJCLASS_OFFSET),
+            field("w_text_signature", f::FUNCTION_W_TEXT_SIGNATURE_OFFSET),
+            // `w_new_self` is absent from `FUNCTION_GC_PTR_OFFSETS` (it names a
+            // static-region type that is never relocated), but it is still a
+            // pointer slot an app-level `__self__` read dereferences, so it
+            // needs the census entry that gets it NULLed behind the allocation.
+            field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
+            field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
+            // The inline emit can escape a guard and be materialized, so the
+            // inherited Python class is a proper virtual field of this group —
+            // same reasoning as the `Method` / `W_ListObject` entries.  It sits
+            // last, outside the offset ordering, because the analyzer counts
+            // only the struct's own fields.
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
             ),
         ],
         "Function",
@@ -1247,6 +1316,17 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `BaseUserClassMapdict.storage` equivalent for native list
+            // subclasses with `__slots__`. Mutable and instance-owned.
+            (
+                "W_ListObject.w_slots",
+                std::mem::offset_of!(W_ListObject, w_slots),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_ListObject",
         "listobject::W_ListObject",
@@ -1293,6 +1373,17 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 8,
                 Type::Int,
                 true,
+                false,
+                false,
+            ),
+            // Mapdict's optional instance dictionary for tuple subclasses.
+            // Exact tuples leave this mutable GC slot null.
+            (
+                "W_TupleObject.w_dict",
+                std::mem::offset_of!(W_TupleObject, w_dict),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
                 false,
                 false,
             ),
@@ -2045,30 +2136,78 @@ pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
 }
 
+/// Resolve one [`FUNCTION_DESCR_GROUP`] field by byte offset, so the accessors
+/// below stay correct however the census is ordered.
+fn function_field_descr(offset: usize) -> DescrRef {
+    let parent = FUNCTION_DESCR_GROUP.size_descr.clone() as DescrRef;
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
+}
+
 /// Live `Function.defs_w` field used by the positional-default inline path.
 /// See [`FUNCTION_DESCR_GROUP`] for why this is deliberately mutable until
 /// pyre wires the upstream quasi-immutable invalidation hook.
 pub fn function_defs_w_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 0)
+    function_field_descr(pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET)
 }
 
 /// Live `Function.code` — the field `Function.getcode()` promotes
 /// (`function.py:95 jit.promote(self.code)`).  This is what identifies an
 /// inlined body, so the inline lever guards it instead of the function object.
 pub fn function_code_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 1)
+    function_field_descr(pyre_interpreter::function::FUNCTION_CODE_OFFSET)
 }
 
-/// Live `Function.w_func_globals` — the namespace an inlined callee's
+/// Live `Function.w_func_globals_obj` — the namespace an inlined callee's
 /// LOAD_GLOBAL folds against.
 pub fn function_w_globals_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 2)
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET)
 }
 
 /// Live `Function.closure` — the freevar cell tuple threaded into the inlined
 /// callee's own frame.
 pub fn function_closure_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 3)
+    function_field_descr(pyre_interpreter::function::FUNCTION_CLOSURE_OFFSET)
+}
+
+/// `function.py:51 self.name` — the pointer to the name string's storage.
+pub fn function_name_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_NAME_OFFSET)
+}
+
+/// `Function.w_builtins` — the builtin mapping resolved from the globals
+/// once at construction and then frozen (rebinding `globals['__builtins__']`
+/// afterwards does not change it).
+pub fn function_w_builtins_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_BUILTINS_OFFSET)
+}
+
+/// `function.py:54 self.qualname = qualname or self.name` — the wrapped
+/// qualified name stamped at construction from the code object.
+pub fn function_w_qualname_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_QUALNAME_OFFSET)
+}
+
+/// `function.py:33 can_change_code = True` — a plain byte, so a fresh
+/// allocation does not zero it and an emit must write it.
+pub fn function_can_change_code_descr() -> DescrRef {
+    function_field_descr(std::mem::offset_of!(
+        pyre_interpreter::function::Function,
+        can_change_code
+    ))
+}
+
+/// Inherited `PyObject.w_class` on a `Function` — the Python-level `function`
+/// class the constructor's header stamps.  Kept in the Function group (not the
+/// standalone `w_class_descr`) so an inline emit's store is a virtual field of
+/// the same size descr and materialization reproduces the header.
+pub fn function_header_w_class_descr() -> DescrRef {
+    function_field_descr(pyre_object::pyobject::W_CLASS_OFFSET)
+}
+
+/// Size descriptor for `Function` allocation via `NewWithVtable`
+/// (vtable = `&FUNCTION_TYPE`).
+pub fn w_function_size_descr() -> DescrRef {
+    FUNCTION_DESCR_GROUP.size_descr.clone()
 }
 
 pub fn dict_keys_version_descr() -> DescrRef {
@@ -2212,6 +2351,36 @@ static TYPE_VERSION_TAG_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
 
 pub fn type_version_tag_descr() -> DescrRef {
     TYPE_VERSION_TAG_FIELD_DESCR.clone()
+}
+
+/// `celldict.py:32 ModuleDictStrategy.version` — the module-namespace version
+/// tag (`u64`, 8 bytes, unsigned) on the strategy box.
+///
+/// Quasi-immutable, per `celldict.py:34 _immutable_fields_ = ["version?"]`,
+/// which is the same declaration `getdictvalue_no_unwrapping` promotes before
+/// its elidable lookup (`celldict.py:47-55`). The `LOAD_GLOBAL` / `STORE_GLOBAL`
+/// cell folds bake the slot's stored cell as a `ConstPtr` under a
+/// `QUASIIMMUT_FIELD` on this field: `_setitem_str_cell_known`
+/// (`celldict.py:80-90`) calls `mutated()` before every write that replaces the
+/// stored pointer, and an in-place cell write leaves the pointer alone, so the
+/// version is exactly the datum that proves the baked address still stands.
+///
+/// `offset_of!` rather than a literal because `ModuleDictStrategy` is not
+/// `repr(C)`.
+///
+/// One object per run, for the reason spelled out on
+/// [`TYPE_VERSION_TAG_FIELD_DESCR`].
+static MODULE_DICT_VERSION_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    make_quasi_immutable_field_descr(
+        core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
+        8,
+        Type::Int,
+        false,
+    )
+});
+
+pub fn module_dict_version_descr() -> DescrRef {
+    MODULE_DICT_VERSION_FIELD_DESCR.clone()
 }
 
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs:34-46`) — the instance
@@ -2374,6 +2543,10 @@ pub fn list_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 7)
 }
 
+pub fn list_w_slots_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 8)
+}
+
 /// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per
 /// `tupleobject.py:381` `_immutable_fields_ = ['wrappeditems[*]']`.
 /// Immutable. Length comes from `arraylen_gc(items_block,
@@ -2390,6 +2563,10 @@ pub fn tuple_w_class_descr() -> DescrRef {
 
 pub fn tuple_hash_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 2)
+}
+
+pub fn tuple_w_dict_descr() -> DescrRef {
+    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 3)
 }
 
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
@@ -3629,6 +3806,29 @@ mod tests {
     }
 
     #[test]
+    fn list_and_tuple_subclass_storage_is_cleared_by_allocation_descrs() {
+        let list_size = w_list_size_descr();
+        let list_gc_offsets: Vec<_> = list_size
+            .as_size_descr()
+            .unwrap()
+            .gc_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        assert!(list_gc_offsets.contains(&std::mem::offset_of!(W_ListObject, w_slots)));
+
+        let tuple_size = w_tuple_size_descr();
+        let tuple_gc_offsets: Vec<_> = tuple_size
+            .as_size_descr()
+            .unwrap()
+            .gc_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        assert!(tuple_gc_offsets.contains(&std::mem::offset_of!(W_TupleObject, w_dict)));
+    }
+
+    #[test]
     fn make_descr_from_bh_bridges_codewriter_box_payload_fields_to_group() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::BhDescr;
@@ -3798,6 +3998,7 @@ mod tests {
             itemsize: 16,
             len_offset: Some(0),
             type_id: 42,
+            gc_type_id: 0,
             item_type: Type::Ref,
             is_array_of_pointers: false,
             is_array_of_structs: true,
@@ -4481,6 +4682,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "strategy" => return list_strategy_descr(),
                     "length" => return list_length_descr(),
                     "items" => return list_items_descr(),
+                    "w_slots" => return list_w_slots_descr(),
                     _ => {}
                 }
             }
@@ -4497,6 +4699,9 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // RPython has only one FieldDescr identity for this field.
             if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
                 return items_block_capacity_descr();
+            }
+            if owner.as_str() == "W_TupleObject" && name.as_str() == "w_dict" {
+                return tuple_w_dict_descr();
             }
             if let Some(parent) = parent {
                 if parent.type_id != 0 {
@@ -4588,6 +4793,11 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             interior_fields,
             ..
         } => {
+            // Old serialized BhDescr values default `gc_type_id` to zero.
+            // Resolve that legacy structural identity through the GC cache
+            // before publishing a runtime descriptor, exactly as the
+            // blackhole/materialization paths do.
+            let resolved_gc_type_id = bh.resolve_gc_tid();
             let descr = if *is_array_of_structs {
                 // `descr.py:348-378 get_array_descr(gccache, ARRAY)`:
                 // the u64 `*type_id` from `BhDescr::Array` is the cache
@@ -4604,7 +4814,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     *base_size,
                     *itemsize,
                     *len_offset,
-                    *type_id as u32,
+                    resolved_gc_type_id,
                     *type_id,
                     *item_type,
                     interior_fields,
@@ -4620,8 +4830,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 make_array_descr_with_full_id(
                     *base_size,
                     *itemsize,
-                    // TODO: same u32 gc tid truncation.
-                    *type_id as u32,
+                    resolved_gc_type_id,
                     *len_offset,
                     *item_type,
                     *is_item_signed,

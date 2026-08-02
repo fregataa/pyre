@@ -28,14 +28,14 @@ pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 /// GC type id for the `W_ObjectObject.storage` block — the mapdict instance
 /// attribute-value array (`mapdict.py:910` `self.storage`, a
 /// `Ptr(GcArray(OBJECTPTR))`). Distinct from `PY_OBJECT_ARRAY_GC_TYPE_ID` (9,
-/// list/tuple items) because the mapdict storage is a MIXED array: most slots
-/// are boxed `PyObjectRef`, but a `firstunwrapped` `UnboxedPlainAttribute` slot
-/// holds a raw erased `*mut Vec<i64>` that must NOT be forwarded as an object.
-/// So this tid is registered as a GC **leaf** (`items_have_gc_ptrs=false`) — the
-/// collector does not walk the block's interior; the owning instance's
-/// `object_object_custom_trace` walks it instead, consulting the map to skip
-/// unboxed slots (`instance_walk_boxed_storage`). Registered at the tail of the
-/// tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`) so no hardcoded constant shifts.
+/// list/tuple items) so the block keeps its own identity even though every slot
+/// is now a reference: a boxed attribute's value, or an
+/// `UnboxedPlainAttribute`'s longlong list as a varsize leaf GcArray. The tid is
+/// registered as a GC **leaf** (`items_have_gc_ptrs=false`) — the collector does
+/// not walk the block's interior; the owning instance's
+/// `object_object_custom_trace` walks it (`instance_walk_boxed_storage`).
+/// Registered at the tail of the tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`)
+/// so no hardcoded constant shifts.
 pub const W_MAPDICT_STORAGE_GC_TYPE_ID: u32 = 55;
 
 /// The `(base_size, item_size, len_offset)` triple describing one varsize
@@ -232,37 +232,29 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 // Therefore its inputs and fresh result need the same shadow-stack publication
 // as nursery allocation.
 
-/// Allocate a fresh stable `ItemsBlock` holding `values`, tagged
-/// `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). Capacity is exactly `values.len()`
-/// (mapdict grows one attribute at a time, mapdict.py:942-959; the map is the
-/// length authority so no overallocation is needed). Every slot is written, so
-/// the block is safe to expose to the collector immediately. Falls back to the
-/// `std::alloc` [`alloc_items_block`] when no GC hook is installed (pure
-/// interpreter / early startup). A 0-length `values` yields a header-only block.
-pub unsafe fn alloc_instance_items_block(
-    values: &[PyObjectRef],
-    boxed_indices: &[usize],
-) -> *mut ItemsBlock {
-    let cap = values.len();
+/// Allocate a fresh stable `ItemsBlock` holding `values` in its first slots and
+/// NULL in the rest, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). The map is
+/// the length authority (mapdict.py:942-959), so `cap` is an allocation bound
+/// rather than a length; a live instance passes the larger of its current
+/// capacity and `values.len()` so the capacity never shrinks. Every slot is
+/// written, so the block is safe to expose to the collector immediately. Falls
+/// back to the `std::alloc` [`alloc_items_block`] when no GC hook is installed
+/// (pure interpreter / early startup). `cap` 0 yields a header-only block.
+pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> *mut ItemsBlock {
+    debug_assert!(cap >= values.len());
     let _roots = crate::gc_roots::push_roots();
-    let boxed_values: Vec<PyObjectRef> = boxed_indices.iter().map(|&i| values[i]).collect();
-    let values_base = crate::gc_roots::pin_roots(&boxed_values);
+    let values_base = crate::gc_roots::pin_roots(values);
     unsafe {
         let block = alloc_mapdict_storage_block(cap);
         crate::gc_roots::pin_root(block as PyObjectRef);
         let block =
-            crate::gc_roots::shadow_stack_get(values_base + boxed_values.len()) as *mut ItemsBlock;
+            crate::gc_roots::shadow_stack_get(values_base + values.len()) as *mut ItemsBlock;
         let base = items_block_items_base(block);
-        let mut boxed_cursor = 0;
         for i in 0..values.len() {
-            if boxed_cursor < boxed_indices.len() && boxed_indices[boxed_cursor] == i {
-                *base.add(i) = crate::gc_roots::shadow_stack_get(values_base + boxed_cursor);
-                boxed_cursor += 1;
-            } else {
-                // Erased unboxed `Vec<i64>` pointer: not a GCREF and therefore
-                // deliberately absent from the shadow stack.
-                *base.add(i) = values[i];
-            }
+            *base.add(i) = crate::gc_roots::shadow_stack_get(values_base + i);
+        }
+        for i in values.len()..cap {
+            *base.add(i) = PY_NULL;
         }
         block
     }
@@ -390,8 +382,13 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     crate::gc_roots::pin_root(block as PyObjectRef);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
-    for i in 0..len {
-        unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    if len > 0 {
+        // RPython's pop_roots reloads the livevars as one generated block.
+        // Enter TLS once for the whole contiguous item range instead of once
+        // per element; `base` names the freshly allocated block's initialized
+        // prefix and cannot alias the shadow stack.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base, len) };
+        crate::gc_roots::shadow_stack_copy_range(save, dst);
     }
     for i in len..cap {
         unsafe { *base.add(i) = PY_NULL };
@@ -490,8 +487,10 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     crate::gc_roots::pin_root(block as PyObjectRef);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
-    for i in 0..cap {
-        unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    if cap > 0 {
+        // Same block-shaped pop_roots reload as the list constructor above.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base, cap) };
+        crate::gc_roots::shadow_stack_copy_range(save, dst);
     }
     // The block may have landed in old-gen (nursery-full fallback) while its
     // elements are still young. That old→young edge is invisible to a minor
@@ -754,6 +753,18 @@ pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut Type
 }
 
 /// Fallible companion of [`alloc_typed_items_block_nursery`].
+///
+/// `ll_newlist` (rlist.py:324-329) allocates the items array and writes the
+/// length header; the items keep whatever the nursery held, because
+/// `malloc_zero_filled` is false for incminimark (incminimark.py:211). Callers
+/// that need `[0] * n` clear it themselves with
+/// [`typed_items_block_clear`], which is what `ll_alloc_and_set` does
+/// (rtyper/rlist.py:494-503); callers building a list display write every slot.
+///
+/// # Safety
+/// `tid` must name a registered array type with no destructor and no weakref
+/// flag — the `GcArray(Signed)` / `GcArray(Float)` bodies this serves. Every
+/// item the caller reads must be one it has written.
 pub unsafe fn try_alloc_typed_items_block_nursery(
     cap: usize,
     tid: u32,
@@ -761,31 +772,44 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
     let cap = cap.max(1);
     let layout = try_typed_items_block_layout(cap)?;
     if itemsblock_gc_enabled() {
-        match crate::gc_hook::try_gc_alloc(tid, layout.size()) {
+        // `GcArray(Signed)` / `GcArray(Float)` bodies: no finalizer, not a
+        // WEAKREF, so `gct_fv_gc_malloc` (`framework.py:820-838`) reaches
+        // `malloc_fast`.
+        match unsafe { crate::gc_hook::try_gc_alloc_fast(tid, layout.size()) } {
             Some(raw) if raw.is_null() => return None,
             Some(raw) => {
                 let block = raw as *mut TypedItemsBlock;
-                unsafe {
-                    (*block).capacity = cap;
-                    std::ptr::write_bytes(
-                        typed_items_block_items_base(block),
-                        0,
-                        cap * std::mem::size_of::<u64>(),
-                    );
-                }
+                unsafe { (*block).capacity = cap };
                 return Some(block);
             }
             None => {}
         }
     }
     unsafe {
-        let raw = alloc_zeroed(layout);
+        let raw = alloc(layout);
         if raw.is_null() {
             return None;
         }
         let block = raw as *mut TypedItemsBlock;
         (*block).capacity = cap;
         Some(block)
+    }
+}
+
+/// `rgc.ll_arrayclear(l.ll_items())` — zero every item of a freshly allocated
+/// block, the second half of `ll_alloc_and_set(LIST, count, 0)`
+/// (rtyper/rlist.py:494-503).
+///
+/// # Safety
+/// `block` must be a live items block.
+#[inline]
+pub unsafe fn typed_items_block_clear(block: *mut TypedItemsBlock) {
+    unsafe {
+        std::ptr::write_bytes(
+            typed_items_block_items_base(block),
+            0,
+            (*block).capacity * std::mem::size_of::<u64>(),
+        );
     }
 }
 
@@ -1005,18 +1029,23 @@ impl FixedObjectArray {
             return;
         }
         let _roots = crate::gc_roots::push_roots();
-        let root_base = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(self as *mut Self as PyObjectRef);
-        crate::gc_roots::pin_root(value);
-        let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
-        if crate::gc_hook::try_gc_owns_object(array as *mut u8) {
-            crate::gc_hook::try_gc_write_barrier(array as *mut u8);
-        }
-        // Both ownership lookup and the barrier may wait behind a foreign
-        // collection.  Reload the array as well as the value before the store:
-        // RPython's setarrayitem_gc keeps both live across the barrier.
-        let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
-        let value = crate::gc_roots::shadow_stack_get(root_base + 1);
+        let root_base = _roots.base();
+        _roots.pin_root(self as *mut Self as PyObjectRef);
+        _roots.pin_root(value);
+        let array = _roots.get(root_base) as *mut Self;
+        // Every mutable FixedObjectArray has a real header word: managed frame
+        // locals carry the collector's header, while the StdAlloc snapshot
+        // fallback is deliberately prefixed with a zeroed one
+        // (`alloc_fixed_array_with_header`).  This is therefore the ordinary
+        // RPython `setarrayitem_gc` shape: test the header flag directly and
+        // enter the membership-free slow path only when it is set.  The zeroed
+        // fallback header makes the same call a no-op without an arena lookup.
+        crate::gc_hook::try_gc_write_barrier_managed(array as *mut u8);
+        // The barrier may wait behind a foreign collection. Reload the array
+        // as well as the value before the store: RPython's setarrayitem_gc
+        // keeps both live across the barrier.
+        let array = _roots.get(root_base) as *mut Self;
+        let value = _roots.get(root_base + 1);
         unsafe { (*array).items_mut_ptr().add(index).write(value) };
     }
 

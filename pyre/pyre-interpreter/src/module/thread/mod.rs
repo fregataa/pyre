@@ -345,6 +345,7 @@ pub(crate) fn after_fork_child() {
     pyre_object::listobject::list_locks_after_fork_child();
     pyre_object::setobject::set_locks_after_fork_child();
     pyre_object::interp_itertools::count_locks_after_fork_child();
+    pyre_object::typeobject::subclasses_locks_after_fork_child();
     crate::objspace::std::mapdict::after_fork_child();
     pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
     crate::module::_collections::deque_locks_after_fork_child();
@@ -616,7 +617,7 @@ mod lock_class {
         }
     }
 }
-use lock_class::W_Lock;
+pub use lock_class::W_Lock;
 
 mod rlock_class {
     use super::*;
@@ -844,7 +845,7 @@ mod rlock_class {
         }
     }
 }
-use rlock_class::W_RLock;
+pub use rlock_class::W_RLock;
 
 mod handle_class {
     use super::*;
@@ -966,7 +967,7 @@ mod handle_class {
         }
     }
 }
-use handle_class::W_ThreadHandle;
+pub use handle_class::W_ThreadHandle;
 
 impl W_ThreadHandle {
     fn start(&self, ident: i64) -> Result<(), crate::PyError> {
@@ -1455,7 +1456,17 @@ fn spawn_thread(
     /// during bootstrap leaves the starter spinning forever.
     struct BootstrapSignal(std::sync::Arc<Bootstrap>);
     impl BootstrapSignal {
+        /// The word carries the ident *and* two reserved states, so an ident
+        /// equal to either would be misread: `0` leaves the starter looping
+        /// and `START_FAILED` raises "can't start new thread" for a thread
+        /// that started. `current_ident` is the OS thread id — `gettid` on
+        /// Linux, `pthread_threadid_np` on Darwin — and neither issues those
+        /// two values, which is the invariant this pins.
         fn publish(&self, ident: i64) {
+            debug_assert!(
+                ident as usize != 0 && ident as usize != START_FAILED,
+                "thread ident collides with a reserved rendezvous state"
+            );
             self.0.word.store(ident as usize, Ordering::Release);
         }
         /// Preserve the diagnostic the starter raises.  `os_thread.py:145`
@@ -1482,16 +1493,19 @@ fn spawn_thread(
     });
     let worker_started = std::sync::Arc::clone(&started);
 
-    let mut builder = std::thread::Builder::new();
-    let stack_size = STACK_SIZE.load(Ordering::Relaxed);
-    if stack_size != 0 {
-        builder = builder.stack_size(stack_size);
-    }
+    let configured_stack_size = STACK_SIZE.load(Ordering::Relaxed);
+    let stack_size = if configured_stack_size == 0 {
+        crate::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE
+    } else {
+        configured_stack_size
+    };
+    let builder = std::thread::Builder::new().stack_size(stack_size);
     builder
         .spawn(move || {
             // First statement: from here on every exit path, panic included,
             // releases the starter.
             let bootstrap = BootstrapSignal(worker_started);
+            crate::stack_check::configure_current_thread_stack_size(stack_size);
             crate::call::enter_runtime_thread();
             // The parent holds these in its shadow stack until `started_tx`.
             // Copy them into this mutator's own shadow stack before any

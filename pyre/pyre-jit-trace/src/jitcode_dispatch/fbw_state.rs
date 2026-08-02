@@ -355,6 +355,8 @@ pub(crate) fn fbw_store_journal_reset() {
     // gh#467: reset the executed-effect odometer and any stale
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
+    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
+    FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
@@ -1012,6 +1014,37 @@ pub(crate) fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
 }
 
+/// Latch the resume coordinate + operand-stack mirror for an
+/// `ABORT_FORCE_QUASIIMMUT` abort (see [`FBW_QMUT_ABORT_STACK`]).
+pub(crate) fn fbw_qmut_abort_stack_latch(py_pc: usize, stack: Vec<OpRef>) {
+    FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = Some((py_pc, stack)));
+}
+
+/// Take the latch above.  `None` when the abort could not offer a mirror (a
+/// sub-walk, a bridge walk, or an invalidated mirror), which leaves the flush
+/// leg to decline and the legacy replay to stand.
+pub(crate) fn fbw_qmut_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
+    FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take())
+}
+
+/// Record the executed-effect odometer as the walk enters Python opcode
+/// `py_pc` (see [`FBW_OPCODE_ENTRY_EFFECTS`]).
+pub(crate) fn fbw_note_opcode_entry_effects(py_pc: usize) {
+    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(Some((py_pc, fbw_executed_effect_count()))));
+}
+
+/// The odometer sampled on entry to `py_pc`, for a leg that resumes the
+/// interpreter there.  `None` — no sample, or one taken at a different opcode —
+/// leaves the rewind unproven, which [`walk_end_resume_provable`] declines.
+///
+/// [`walk_end_resume_provable`]: crate::trace::walk_end_resume_provable
+pub(crate) fn fbw_opcode_entry_effects_at(py_pc: usize) -> Option<usize> {
+    FBW_OPCODE_ENTRY_EFFECTS.with(|c| match c.get() {
+        Some((sampled_py_pc, effects)) if sampled_py_pc == py_pc => Some(effects),
+        _ => None,
+    })
+}
+
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).
 pub(crate) fn fbw_bump_executed_effect() {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(c.get() + 1));
@@ -1612,9 +1645,9 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
 /// the trace has finished, so the coordinate has to be published before it
 /// does.
 ///
-/// The store is the static-field shape `gen_store_back_in_vable` emits for
-/// this slot, so it reaches the frame on a compiled run; the shadow mirror
-/// keeps the walker's own virtualizable view in step with it.
+/// The store reaches the frame on a compiled run the way
+/// `gen_store_back_in_vable`'s does; the shadow mirror keeps the walker's own
+/// virtualizable view in step with it.
 pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode_position: usize,
@@ -1638,8 +1671,20 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
         return;
     };
     let value = ctx.trace_ctx.const_int(i64::from(py_pc));
-    ctx.trace_ctx
-        .vable_setfield_descr(vbox, value, info.static_field_descr(field_index));
+    // Record under the PARENT-STRUCT field descr, the resolution
+    // `vable_setfield` applies through `vable_static_record_descr`, not the
+    // vinfo's own `static_field_descrs[i]`.  `virtualizable.py:71` builds the
+    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so upstream's vinfo
+    // descr and the descr an ordinary `setfield_gc` on that field carries are
+    // the same object; pyre keeps the two numberings apart, so a store left on
+    // the vinfo descr reaches the optimizer as a location of its own.  A frame
+    // that catches gets `last_instr` written twice at one offset — the raise
+    // coordinate by the traceback node, the return coordinate here — and under
+    // two descrs neither store supersedes the other, so which one survives to
+    // the frame is decided by the order the deferred stores are flushed in
+    // rather than the order they were recorded in.
+    let descr = info.static_field_struct_descr(field_index);
+    ctx.trace_ctx.vable_setfield_descr(vbox, value, descr);
     crate::trace_opcode::mirror_vable_static_to_boxes(
         ctx.trace_ctx,
         "last_instr",

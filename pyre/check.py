@@ -169,25 +169,76 @@ def green(s):  return f"\033[32m{s}\033[0m"
 def dim(s):    return f"\033[2m{s}\033[0m"
 def bold(s):   return f"\033[1m{s}\033[0m"
 
-# ── Child-process user CPU time ──────────────────────────────────────
+# ── Child-process user CPU time and peak RSS ─────────────────────────
+
+# Peak RSS in MiB of the most recent `run_timed` child, or None when the run
+# timed out or the platform cannot report it. A single slot rather than a
+# return-tuple member: `run_timed`'s 4-tuple has many callers and only the
+# memory gate reads this. Runs are sequential, so the slot is unambiguous.
+_LAST_RUN_MAXRSS_MB = [None]
+
+
+def last_run_peak_rss_mb():
+    """Peak RSS (MiB) of the child `run_timed` most recently reaped."""
+    return _LAST_RUN_MAXRSS_MB[0]
+
+
 
 def _run_timed_unix(args, timeout_s, env=None):
-    import resource
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    try:
-        proc = subprocess.run(
-            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout_s, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return "", 0.0, 124, ""
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    utime = max(after.ru_utime - before.ru_utime, 0.0)
+    # `os.wait4` rather than `getrusage(RUSAGE_CHILDREN)` around
+    # `subprocess.run`: `ru_maxrss` on RUSAGE_CHILDREN is a running maximum
+    # over every reaped child, not a counter, so a before/after difference
+    # attributes nothing to this run. wait4 reports the rusage of this child
+    # alone, which is what a per-fixture memory gate needs. `ru_utime` comes
+    # from the same struct, so the timing path gains a per-child number too
+    # instead of a difference of process-wide totals.
+    #
+    # The child's pipes are replaced by temporary files: `communicate()` would
+    # reap the child itself and leave nothing for wait4, and draining pipes by
+    # hand risks the classic full-buffer deadlock.
+    import resource  # noqa: F401  (documents the rusage struct's origin)
+    import tempfile
+    import threading
+
+    timed_out = False
+
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(args, stdout=out_f, stderr=err_f, env=env)
+
+        def _kill():
+            nonlocal timed_out
+            timed_out = True
+            proc.kill()
+
+        timer = threading.Timer(timeout_s, _kill) if timeout_s else None
+        if timer is not None:
+            timer.start()
+        try:
+            _pid, status, usage = os.wait4(proc.pid, 0)
+        finally:
+            if timer is not None:
+                timer.cancel()
+        # Popen still believes the child is running; tell it otherwise so its
+        # finalizer neither waits nor warns.
+        proc.returncode = -(status & 0x7F) if status & 0x7F else (status >> 8)
+
+        if timed_out:
+            _LAST_RUN_MAXRSS_MB[0] = None
+            return "", 0.0, 124, ""
+
+        out_f.seek(0)
+        err_f.seek(0)
+        stdout_bytes = out_f.read()
+        stderr_bytes = err_f.read()
+
+    # ru_maxrss is kilobytes on Linux and bytes on macOS/BSD.
+    scale = 1024 * 1024 if sys.platform == "darwin" else 1024
+    _LAST_RUN_MAXRSS_MB[0] = usage.ru_maxrss / scale
     return (
-        proc.stdout.decode("utf-8", errors="replace"),
-        utime,
+        stdout_bytes.decode("utf-8", errors="replace"),
+        max(usage.ru_utime, 0.0),
         proc.returncode,
-        proc.stderr.decode("utf-8", errors="replace"),
+        stderr_bytes.decode("utf-8", errors="replace"),
     )
 
 
@@ -281,6 +332,8 @@ def run_timed(args, timeout_s=None, env=None):
     extras).
     """
     if sys.platform == "win32":
+        # No wait4 counterpart; the memory gate reads None and stays inert.
+        _LAST_RUN_MAXRSS_MB[0] = None
         out, t, rc, err = _run_timed_win32(args, timeout_s, env)
     else:
         out, t, rc, err = _run_timed_unix(args, timeout_s, env)
@@ -498,11 +551,12 @@ def _jit_stats_diff(saved, current, limit=6):
 # coverage gap that is tracked elsewhere — the synth fixtures below carry
 # `LoopBearingCalleeInlineUnsupported`, the walker's open gap on inlining a
 # loop-bearing callee. Either way the baseline pins the count those known
-# declines produce today and the gate fires on a rise, which means a loop that
-# used to compile has stopped compiling. The count-valued fields
-# (guard_failures, loops_compiled, bridges_compiled) are deliberately excluded:
-# they move in both directions under ordinary tuning and their absolute value is
-# not yet confirmed stable across runners, so they stay informational.
+# declines produce today and the gate fires on a rise, which means a loop the
+# tracer used to finish has stopped finishing. `bridges_compiled` stays out
+# entirely: it moves in both directions under ordinary tuning and neither
+# direction is a defect on its own. The other two count-valued counters each
+# have ONE defect direction and gate through their own tuple below —
+# `guard_failures` on a bounded rise, `loops_compiled` on any fall.
 #
 # `descr_set_absent`, `descr_set_ambiguous` and `descr_set_stale_absent` are the
 # descr-universe invariants. Upstream cannot reach any of the three —
@@ -522,6 +576,49 @@ JITSTATS_BADNESS_FIELDS = (
     "descr_set_ambiguous",
     "descr_set_stale_absent",
 )
+
+# Counters gated on a bounded RISE rather than on any rise at all: a fall is
+# free, and a rise fails only past `base + max(base // 4, 2)`.
+#
+# `guard_failures` counts every guard failure that re-enters the metainterp, so
+# it is the counter that moves when a compiled loop's guards start failing more
+# often — a cost `max-pypy-ratio` cannot see, because that ceiling is one
+# absolute number per fixture: recursion_memo_branch sits near 8.9x under a
+# limit of 20, so it absorbs a 2x regression and still passes. Narrowing
+# `nested_break_bridge_resume_hazard` so that fixture's `main` compiles moves
+# the counter 1757 -> 2613 (+49%) and measures slower, and no other gate here
+# notices: nothing aborts, so the badness floor holds, and the ratio keeps 2.2x
+# of slack.
+#
+# It is deterministic by construction, not by luck: a guard's counter hash comes
+# from `JitCounter.fetch_next_hash` (counter.py:142-150), a pure sequence with
+# no address or clock input, so the same program yields the same count. Measured
+# bit-stable run-to-run on one host. The +25% band and the +2 absolute allowance
+# are what cover cross-runner drift, which is NOT yet measured — they are sized
+# to stay well under the class above, so a real storm still fires. The absolute
+# term is for a fixture whose baseline is a handful of guards, where one more
+# guard is not yet a storm.
+JITSTATS_RISE_BOUNDED_FIELDS = ("guard_failures",)
+
+# Counters gated on any FALL below the baseline. `loops_compiled` closes the
+# blind spot the two tuples above leave open: a change that makes the tracer
+# stop admitting a frame at all — a widened `unsupported_jit_shape` predicate, a
+# pre-trace decline — aborts nothing (`loops_aborted` holds) and *lowers*
+# `guard_failures` (the compiled guards that used to fail are gone), so both
+# gates above read the loss as an improvement and the fixture goes green while
+# its hot loop runs interpreted.
+#
+# A fall is gated exactly, with no band, because this is the most stable counter
+# on the surface: across the 341 synthetic fixtures the dynasm and cranelift
+# baselines — two independent code generators — agree on `loops_compiled` for
+# 340 of them (99.7%), against 97.4% for `guard_failures`, which is why that one
+# needs a band and this one does not.
+#
+# A fall is not *always* a defect: two loops merging into one trace lowers the
+# count while raising coverage. That is the same bargain `loops_aborted` already
+# makes in the other direction — an intentional structural change re-records its
+# baseline, and the gate is what forces someone to look.
+JITSTATS_FALL_FIELDS = ("loops_compiled",)
 
 # What a committed `.jitstats` baseline is allowed to contain. `_jit_stats_snapshot`
 # merges every `[jit-stats]` line so the floor above cannot be disarmed by
@@ -550,21 +647,40 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 
 
 def _jit_stats_regression_floor(saved, current):
-    """Return a failure reason if any badness counter rose above its committed
-    baseline, else "". A rise means the JIT started aborting traces or hitting
-    internal compile panics it did not before — a defect on any platform. A
-    counter that falls (an improvement) or holds never gates, and a field
-    missing from either side is read as 0 so it cannot fire spuriously."""
+    """Return a failure reason if a gated counter rose above what its committed
+    baseline allows, else "". For JITSTATS_BADNESS_FIELDS the allowance is the
+    baseline itself: a rise means the JIT started aborting traces or hitting
+    internal compile panics it did not before — a defect on any platform.
+    JITSTATS_RISE_BOUNDED_FIELDS carries the band documented there, and
+    JITSTATS_FALL_FIELDS gates the opposite direction. A counter that moves the
+    way its group calls an improvement, or holds, never gates.
+
+    A field missing from either side is read as 0 for the badness counters,
+    whose healthy value IS 0, so they gate from the first run without
+    re-recording. The count-valued counters have no such healthy value, so a
+    baseline that does not name one is treated as not pinning it at all — a
+    baseline recorded before the field existed must not read as `0 -> 1757`,
+    and the wasm [jit-stats] line reports neither of them."""
     old_fields = _parse_jit_stats(saved)
     new_fields = _parse_jit_stats(current)
     regressions = []
-    for field in JITSTATS_BADNESS_FIELDS:
+    for field in (
+        JITSTATS_BADNESS_FIELDS + JITSTATS_RISE_BOUNDED_FIELDS + JITSTATS_FALL_FIELDS
+    ):
+        if field not in JITSTATS_BADNESS_FIELDS and field not in old_fields:
+            continue
         try:
             base = int(old_fields.get(field, 0))
             cur = int(new_fields.get(field, 0))
         except ValueError:
             continue
-        if cur > base:
+        if field in JITSTATS_RISE_BOUNDED_FIELDS:
+            regressed = cur > base + max(base // 4, 2)
+        elif field in JITSTATS_FALL_FIELDS:
+            regressed = cur < base
+        else:
+            regressed = cur > base
+        if regressed:
             regressions.append(f"{field} {base} -> {cur}")
     if regressions:
         return "jit-stats regression: " + ", ".join(regressions)
@@ -610,6 +726,38 @@ def synth_perf_gate(path):
             if ratio <= 0:
                 raise ValueError(f"synthetic performance gate must be positive in {path}")
             return ratio
+    return None
+
+
+def synth_rss_gate(path):
+    """Read an optional per-fixture peak-RSS ceiling from its header:
+        # pyre-check: max-rss-mb=200
+
+    A second axis beside `max-pypy-ratio`, not a replacement: the ratio gate
+    is blind to memory, so a change that trades retained bytes for speed
+    passes it while regressing badly. Frames are the standing example —
+    every interpreted call retains an old-gen frame, and nothing in this
+    harness has ever measured that.
+
+    Absent directive means no ceiling, so adding this gate cannot fail a
+    fixture that does not opt in. Read against native backends only, like
+    the ratio gate.
+    """
+    prefix = "# pyre-check: max-rss-mb="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            try:
+                limit = float(line[len(prefix):].strip())
+            except ValueError as e:
+                raise ValueError(f"invalid synthetic memory gate in {path}: {line.strip()}") from e
+            if limit <= 0:
+                raise ValueError(f"synthetic memory gate must be positive in {path}")
+            return limit
     return None
 
 
@@ -942,6 +1090,23 @@ class Check:
             )
             if floor:
                 return "fail", floor
+
+        # A benchmark with no committed baseline runs every gate above against
+        # nothing and prints PASS, so "never recorded" is indistinguishable from
+        # "recorded and clean" — which is how the floor came to cover 3 of 340
+        # synthetic fixtures without anyone noticing. Every benchmark that
+        # reaches here emitted a `[jit-stats]` line, so the baseline is always
+        # recordable; requiring it is what stops a newly added fixture from
+        # silently reopening that hole.
+        if (
+            self.args.snapshot_mode != "record"
+            and jitstats is not None
+            and not jitstats_path.exists()
+        ):
+            return "fail", (
+                f"no committed jit-stats baseline ({jitstats_path.name}) — record it with "
+                f"`pyre/check.py --snapshot --backend {backend}`"
+            )
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1298,7 +1463,7 @@ class Check:
     def _run_backend_bench(
         self, backend, name, script, timeout,
         vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
-        wasm_float_tol=False,
+        wasm_float_tol=False, max_rss_mb=None,
     ):
         pyre_bin = self._pyre(backend)
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
@@ -1309,6 +1474,8 @@ class Check:
         output, elapsed, code, stderr = run_timed(
             [pyre_bin, script], timeout_s=effective_timeout, env=pyre_env(),
         )
+        # Read before any gate re-runs the fixture and overwrites the slot.
+        peak_rss_mb = last_run_peak_rss_mb()
 
         panic_reason = _jit_panic_reason(stderr)
         if panic_reason:
@@ -1396,6 +1563,19 @@ class Check:
                 elapsed = checked_elapsed
                 t_pypy = checked_baseline
                 ratio = _ratio(elapsed, t_pypy)
+
+        # `# pyre-check: max-rss-mb=` — the axis the ratio gates cannot see.
+        # Checked after them so a fixture that is both slow and fat reports the
+        # slowness first, matching the existing gate order.
+        if max_rss_mb is not None and peak_rss_mb is not None and peak_rss_mb > max_rss_mb:
+            detail = f"peak RSS {peak_rss_mb:.0f}MB > {max_rss_mb:.0f}MB"
+            self._record(backend, False, name, detail)
+            print(f"{red('FATTER')}  pyre {detail}")
+            self._append_comparison(
+                backend, name, t_cpython, t_pypy,
+                fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+            )
+            return
 
         snap_status, snap_reason = self._apply_snapshot_gate(
             backend, name, script, output, stderr, elapsed,
@@ -1555,6 +1735,7 @@ class Check:
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         try:
             max_pypy_ratio = synth_perf_gate(path)
+            max_rss_mb = synth_rss_gate(path)
             skip_backends = synth_skip_backends(path)
         except ValueError as e:
             print(f"{red('ERROR')}: {e}")
@@ -1625,6 +1806,7 @@ class Check:
             self._run_backend_bench(
                 backend, name, path, timeout,
                 None, vs_pypy, t_cpython, t_pypy, pypy_output,
+                max_rss_mb=None if backend == "wasm" else max_rss_mb,
             )
 
     def run_synthetic_suite(self):

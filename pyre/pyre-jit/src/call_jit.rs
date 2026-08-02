@@ -417,7 +417,7 @@ extern "C" fn jit_call_user_function_from_frame(
     let frame = unsafe { &*(frame_ptr as *const PyFrame) };
     let args =
         unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, nargs as usize) };
-    // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
+    // Depth tracked by pyre_interpreter::call::PY_RECURSION_DEPTH (eval-loop entry).
     match pyre_interpreter::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
         Err(mut err) => {
@@ -1919,40 +1919,6 @@ fn jit_blackhole_resume_from_guard(
     None
 }
 
-/// RAII guard registering each slot of the `#326` rollback snapshot's
-/// `locals` copy as a GC root for the duration of `bh.run()`.  The snapshot
-/// is a plain `Vec<PyObjectRef>` holding raw object pointers; the collector
-/// is moving (incminimark nursery -> oldgen copying), so a minor collection
-/// during the forward run would relocate those objects and leave the Vec
-/// holding from-space pointers.  Registering each element slot makes the
-/// root walker forward them in place (`collector.rs` reads `*slot`, copies,
-/// writes back), so the abort arm restores the live pointers rather than
-/// stale ones.  Mirrors `LocalsRoot` / the callee-locals root in `call.rs`.
-struct VableRollbackRoots {
-    slots: Vec<*mut *mut u8>,
-}
-
-impl VableRollbackRoots {
-    fn register(base: *const PyObjectRef, len: usize) -> Self {
-        let mut slots = Vec::with_capacity(len);
-        for i in 0..len {
-            let slot = unsafe { base.add(i) } as *mut *mut u8;
-            if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
-                slots.push(slot);
-            }
-        }
-        Self { slots }
-    }
-}
-
-impl Drop for VableRollbackRoots {
-    fn drop(&mut self) {
-        for &slot in &self.slots {
-            pyre_object::gc_hook::try_gc_remove_root(slot);
-        }
-    }
-}
-
 /// RAII guard registering each `Ref`-typed slot of the resume `deadframe`
 /// copy as a GC root for the duration of `blackhole_from_resumedata`.
 ///
@@ -1965,7 +1931,7 @@ impl Drop for VableRollbackRoots {
 /// freed memory.  Resume *constants* are already forwarded by
 /// `rd_consts_root_walker_area`, but the box-sourced slots here are not.
 /// Registering each `Ref` element slot makes the root walker forward it in
-/// place, mirroring `VableRollbackRoots` (#326).
+/// place.
 ///
 /// Only `Ref`-typed slots are registered: `Int`/`Float` slots hold raw
 /// scalars (`decode_ref` boxes those lazily via `box_int`/`box_float`), and a
@@ -2110,13 +2076,18 @@ fn reject_non_exception_channel_value(
     site: &str,
     context: impl FnOnce() -> String,
 ) -> ! {
-    let tag = unsafe { pyre_object::interp_exceptions::w_exception_kind_byte(obj) };
-    // Report the raw header before touching anything reached *through* it: if
+    // Nothing has been read out of `obj` yet, and this function only runs for a
+    // value already known not to be a `W_BaseException` — a small integer or an
+    // address at the end of a mapping reaches here too, and every read below
+    // can fault. Emit the pointer first so that a fault still leaves evidence.
+    eprintln!("[jit][BUG] {site}: not a W_BaseException: obj={obj:p}");
+    // Then the raw header, before touching anything reached *through* it: if
     // `ob_type` is itself garbage the name lookup below faults, and then this
     // line is all the evidence there is.
+    let tag = unsafe { pyre_object::interp_exceptions::w_exception_kind_byte(obj) };
     let words = unsafe { std::slice::from_raw_parts(obj as *const u64, 4) };
     eprintln!(
-        "[jit][BUG] {site}: not a W_BaseException: obj={obj:p} tag_byte={tag} \
+        "[jit][BUG] {site}: obj={obj:p} tag_byte={tag} \
          words=[{:#018x} {:#018x} {:#018x} {:#018x}]",
         words[0], words[1], words[2], words[3],
     );
@@ -2246,7 +2217,7 @@ pub fn blackhole_resume_via_rd_numb(
     // live (to-space) pointer rather than a dangling from-space one.  The
     // `to_vec` uses the host allocator, so it cannot itself trigger a GC.
     let mut deadframe_buf: Vec<i64> = deadframe.to_vec();
-    let _deadframe_roots = ResumeDeadframeRoots::register(&mut deadframe_buf, deadframe_types);
+    let deadframe_roots = ResumeDeadframeRoots::register(&mut deadframe_buf, deadframe_types);
     let deadframe: &[i64] = &deadframe_buf;
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
@@ -2331,6 +2302,19 @@ pub fn blackhole_resume_via_rd_numb(
         }
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
     }
+    // Last read of `deadframe`.  `blackhole_from_resumedata` has copied every
+    // live value into the blackhole register banks, which the collector reaches
+    // through their own root source (`walk_bh_regs`), so the off-heap copy is
+    // dead from here on.  Release its roots BEFORE the forward run: `bh.run()`
+    // executes the whole remainder of the resumed frame — for a module-level
+    // frame that is the rest of the program — and every `Ref` cell left
+    // registered pins the object it happened to hold at the guard, whether or
+    // not the resumed code still uses it.  A `for v in gen(): break` leaves the
+    // abandoned generator in such a cell, so it is never collected and its
+    // `finally` never runs.  `blackhole.py:1782-1796 resume_in_blackhole` ends
+    // `deadframe`'s live range at `_prepare_resume_from_failure`, before
+    // `_run_forever`, for the same reason.
+    drop(deadframe_roots);
     // resume.py:1332-1343 builds the caller chain (`nextblackholeinterp`)
     // but does not set the virtualizable-info handle on each frame.  pyre
     // stores the vinfo per-`BlackholeInterpreter` (RPython reads it from
@@ -2439,46 +2423,22 @@ pub fn blackhole_resume_via_rd_numb(
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
     }
 
-    // #326 blackhole-continuation rollback snapshot.  The blackhole
-    // commits every STORE_FAST / operand push to the virtualizable heap
-    // frame as it runs forward (`setarrayitem_vable_*` /
-    // `setfield_vable_i`).  If it later aborts — an opcode pyre cannot
-    // translate emits `BC_ABORT_PERMANENT` — the deopt drops back to the
-    // plain interpreter, which re-runs from the guard's resume PC.  But
-    // the heap frame still carries the aborted run's partial forward
-    // mutations, so any side effect already committed before the abort is
-    // applied a second time.  Capture the live frame here, right after the
-    // resume restore put it at the guard snapshot and before `bh.run()`
-    // mutates it, so the abort arm can roll it back and the interpreter's
-    // re-run applies each side effect exactly once.
-    //
-    // The snapshot holds raw `PyObjectRef`s across `bh.run()`; the GC is a
-    // moving collector (#336), so a minor collection during the run could
-    // relocate these.  `VableRollbackRoots` below registers each `locals`
-    // slot with the root walker so the collector forwards them in place and
-    // the abort arm restores live pointers, not from-space ones.  Capture
-    // the snapshotted frame pointer too, so the abort arm can confirm the
-    // frame that aborted is the same one this state belongs to before
-    // restoring it.
-    let vable_rollback: Option<(*mut PyFrame, Vec<PyObjectRef>, usize, isize)> = {
-        let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-        if frame_ptr.is_null() {
-            None
-        } else {
-            let frame = unsafe { &*frame_ptr };
-            Some((
-                frame_ptr,
-                frame.locals_w().as_slice().to_vec(),
-                frame.valuestackdepth,
-                frame.last_instr,
-            ))
-        }
-    };
-    // Keep the snapshot's locals rooted for the whole forward run / abort
-    // window; dropped (roots removed) when this function returns.
-    let _vable_rollback_roots = vable_rollback
-        .as_ref()
-        .map(|(_, locals, _, _)| VableRollbackRoots::register(locals.as_ptr(), locals.len()));
+    // #326: no rollback snapshot is taken across `bh.run()`.  The blackhole
+    // commits every STORE_FAST / operand push to the virtualizable heap frame
+    // as it runs forward, and an abort used to restore that frame to the
+    // guard snapshot so the interpreter's re-run from the guard resume PC
+    // "applied each side effect exactly once".  That reasoning only covered
+    // frame-local state: a `print`, a heap store or a user frame the blackhole
+    // already executed has no undo, so rewinding re-applied every one of them
+    // (`x = [1,2]; <hot loop>; x.append(3); class C: pass` left `[1,2,3,3]`).
+    // The only abort that can reach the blackhole at runtime sits on a Python
+    // opcode boundary — `abort` is gated out of blackhole dispatch by
+    // `PyJitCode::has_abort_opcode`, leaving `abort_permanent` (a whole
+    // unsupported opcode) and the two declined-call rejections (whose call
+    // never ran) — so the frame the blackhole leaves behind is a valid resume
+    // point and the interpreter continues from it.  This is
+    // `convert_and_run_from_pyjitpl`'s shape (`blackhole.py:1799-1821`): each
+    // frame resumes at its own current pc, never rewound.
 
     // blackhole.py:1794-1795 resume_in_blackhole:
     //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
@@ -2624,34 +2584,6 @@ pub fn blackhole_resume_via_rd_numb(
             };
         }
         if !bh.got_exception && bh.aborted {
-            // #326: roll the virtualizable heap frame back to the guard
-            // snapshot captured before `bh.run()`, discarding this aborted
-            // run's partial forward mutations.  The interpreter resumes
-            // from the guard resume PC with the pre-blackhole frame state,
-            // so every side effect (the aborting opcode's included) is
-            // applied exactly once instead of twice.
-            if let Some((snap_frame_ptr, locals, vsd, last_instr)) = &vable_rollback {
-                let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-                // Roll back only when the frame that aborted is the same one
-                // the snapshot was captured from.  The `_run_forever` loop
-                // reassigns `bh` to a caller on callee return / exception
-                // propagation; a later abort then lands on the caller frame,
-                // whose valuestackdepth / last_instr would be clobbered with
-                // the callee's snapshot.  A per-frame snapshot for that
-                // multi-frame case is the #124 stack-snapshot epic; until
-                // then, skip rather than corrupt the caller frame.
-                if !frame_ptr.is_null() && frame_ptr == *snap_frame_ptr {
-                    let frame = unsafe { &mut *frame_ptr };
-                    let arr = frame.locals_w_mut().as_mut_slice();
-                    // The locals_cells_stack array length is fixed for a
-                    // frame's lifetime; restore it verbatim.
-                    if arr.len() == locals.len() {
-                        arr.copy_from_slice(locals);
-                    }
-                    frame.valuestackdepth = *vsd;
-                    frame.last_instr = *last_instr;
-                }
-            }
             if nbody_debug {
                 eprintln!(
                     "[nbody-debug] blackhole_resume_via_rd_numb failed: bh.aborted position={} last_opcode_position={}",
@@ -2694,7 +2626,22 @@ pub fn blackhole_resume_via_rd_numb(
             // A copy, not a probe: a ref register may hold a raw non-object
             // word (a force token, an erased unboxed buffer), so anything that
             // dereferences these belongs on the failure path only.
-            let bh_regs_r = bh.registers_r.clone();
+            //
+            // The copy has to be taken here because `release_bh_rd` below ends
+            // the borrow before the diagnostic closure runs, but it is only
+            // ever read when `exit_frame_exception_ref` rejects the value, so
+            // the same screen decides whether to pay for it. A move between
+            // here and the closure does not change the answer: the class of the
+            // propagating value is what is being screened.
+            let bh_regs_r = if unsafe {
+                pyre_object::interp_exceptions::w_exception_kind_checked(exc_value as PyObjectRef)
+            }
+            .is_none()
+            {
+                bh.registers_r.clone()
+            } else {
+                Vec::new()
+            };
             let bh_code_window: Vec<u8> = bh
                 .jitcode
                 .code
@@ -3093,6 +3040,12 @@ pub fn trace_and_compile_from_bridge(
     // would also be entered for forced-and-raised failures whose call result
     // is NULL — its result-class guard then dereferences NULL.
     if descr_arc.is_guard_forced() {
+        return BridgeResolution::ResumeBlackhole;
+    }
+    // compile.py:702-703 `must_compile() and not stack_almost_full()`: this is
+    // pyre's own guard-failure entry, so the diagnostic that suppresses bridge
+    // recording has to be read here as well as in the jitdriver's paths.
+    if majit_metainterp::no_bridge_enabled() {
         return BridgeResolution::ResumeBlackhole;
     }
     let Some((green_key, trace_id, fail_index)) = bridge_source_identity_from_descr(descr_arc)
@@ -5191,18 +5144,40 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // `self.get_builtin().getdictvalue(space, varname)` (`pyopcode.py:979`).
     // This residual stopped after the globals leg, so a builtin name reached
     // here as a bogus `NameError`.
-    if !parent_frame_ptr.is_null() {
-        let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
-        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
-            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
-            if !w_dict.is_null() {
-                match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
-                    Ok(Some(val)) => return val as i64,
-                    Ok(None) => {}
-                    Err(mut err) => {
-                        publish_residual_call_exception(err.to_exc_object() as i64);
-                        return 0;
-                    }
+    //
+    // A null frame is an anticipated input — the globals leg above already
+    // treats it as one — so the builtin namespace is resolved from the globals
+    // through `pick_builtin_obj_checked`, the same resolver whose result
+    // `frame.get_builtin()` caches. Reading `globals["__builtins__"]` raw is
+    // not equivalent: `exec`/`eval` plant the builtins *dict* rather than the
+    // module (3.14 `PyEval_GetBuiltins`), and the `is_module` test below would
+    // reject that spelling and report a bogus `NameError` for every builtin
+    // name seen by a function created under an exec'd namespace.
+    // `try_walker_load_global_cell_fold` declines the fold in that case and
+    // leaves the name to this residual, so the handling has to live here.
+    let w_builtin = if !parent_frame_ptr.is_null() {
+        unsafe { (*parent_frame_ptr).get_builtin() }
+    } else {
+        match pyre_interpreter::baseobjspace::pick_builtin_obj_checked(
+            w_globals,
+            pyre_interpreter::call::take_last_exec_ctx(),
+        ) {
+            Ok(w_builtin) => w_builtin,
+            Err(mut err) => {
+                publish_residual_call_exception(err.to_exc_object() as i64);
+                return 0;
+            }
+        }
+    };
+    if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        if !w_dict.is_null() {
+            match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
+                Ok(Some(val)) => return val as i64,
+                Ok(None) => {}
+                Err(mut err) => {
+                    publish_residual_call_exception(err.to_exc_object() as i64);
+                    return 0;
                 }
             }
         }
@@ -6003,10 +5978,8 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
             };
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,
-                Ok(_) => pyre_interpreter::PyError::type_error(
-                    "exceptions must derive from BaseException",
-                )
-                .to_exc_object(),
+                Ok(obj) => pyre_interpreter::error::exception_from_call_type_error(exc, obj)
+                    .to_exc_object(),
                 Err(mut err) => err.to_exc_object(),
             }
         } else {

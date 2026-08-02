@@ -6,7 +6,8 @@
 //! becomes `Ptr(GcArray(OBJECTPTR))`; the `[*]` annotation marks both
 //! the list and its contents as immutable so the JIT can hoist loads.
 //! pyre stores the array via `*mut ItemsBlock` (shared GcArray body
-//! layer with `W_ListObject`). Length comes directly from the
+//! layer with `W_ListObject`) and the content hash in `_hash_cache`.
+//! Length comes directly from the
 //! GcArray header — `arraylen_gc(wrappeditems)` on the JIT side and
 //! `items_block_capacity(wrappeditems)` on the host side.
 //! Python 3.14 adds `PyTupleObject.ob_hash`, initially `-1`, and caches the
@@ -54,7 +55,8 @@ pub const TUPLE_HASH_UNSET: i64 = -1;
 /// Python tuple object — array-backed default representation.
 ///
 /// Layout mirrors `pypy/objspace/std/tupleobject.py:376-390` after
-/// RPython translation: `{wrappeditems: Ptr(GcArray(OBJECTPTR))}`.
+/// RPython translation:
+/// `{wrappeditems: Ptr(GcArray(OBJECTPTR)), _hash_cache: Signed}`.
 /// `_immutable_fields_ = ['wrappeditems[*]']` is reflected via
 /// `immutable: true` on the `wrappeditems` field descr; the array
 /// items are loaded as `getfield_gc_pure_r` and the array length
@@ -70,6 +72,15 @@ pub struct W_TupleObject {
     /// `len(l.items)`); empty tuples carry a 0-cap header-only
     /// allocation (non-null pointer).
     pub wrappeditems: *mut ItemsBlock,
+    /// Mapdict's per-instance `dict` SPECIAL slot for a user subclass.
+    ///
+    /// PyPy's `user_setup` mixes mapdict storage into the concrete
+    /// user-subclass instance. Rust has one fixed payload layout, so the
+    /// optional slot lives on the canonical array-backed tuple object;
+    /// exact tuples leave it null. Tuple subclasses are deliberately rebuilt
+    /// with this layout in `tuple_descr_new`, never with an arity-2
+    /// specialised layout.
+    pub w_dict: PyObjectRef,
 }
 
 /// GC type id assigned to `W_TupleObject` at `JitDriver` init time.
@@ -139,6 +150,8 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
     if is_specialised_tuple_ii(obj) || is_specialised_tuple_ff(obj) {
         return;
     }
+    let tuple = obj as *mut W_TupleObject;
+    visitor(std::ptr::addr_of_mut!((*tuple).w_dict));
     // General `W_TupleObject`: forward each slot of the exact-size items block.
     if let Some((ptr, n)) = w_tuple_object_items_ptr_len(obj) {
         for i in 0..n {
@@ -232,6 +245,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                     },
                     hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     wrappeditems: std::ptr::null_mut(),
+                    w_dict: PY_NULL,
                 },
             );
         }
@@ -248,24 +262,26 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
     let relocated: Vec<PyObjectRef> = (0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
         .collect();
-    let items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
+    let mut items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
+    // `alloc_tuple_items_block_gc` roots the fresh block only inside its own
+    // `push_roots` frame, which it pops on return, so from here the block is a
+    // livevar of *this* frame across the barrier below. That barrier is a
+    // `gc_op`: it leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`) and
+    // roots only the object it is handed, so a foreign collector runs there
+    // with the block reachable from nowhere. Inert for a null or std::alloc
+    // block, as in `w_list_new_with_strategy`.
+    let block_root: Option<usize> = if items_block.is_null() {
+        None
+    } else {
+        let s = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(items_block as PyObjectRef);
+        Some(s)
+    };
     let raw = raw_slot
         .map(crate::gc_roots::shadow_stack_get)
         .unwrap_or(std::ptr::null_mut()) as *mut u8;
 
     if !raw.is_null() {
-        // The header went in before the root was published; only the items
-        // block is still outstanding.
-        unsafe {
-            std::ptr::write(
-                raw as *mut W_TupleObject,
-                W_TupleObject {
-                    ob_header: header,
-                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
-                    wrappeditems: items_block,
-                },
-            );
-        }
         // The tuple lives in old-gen (`try_gc_alloc_stable`); its items
         // may still be in the nursery. The element pointers are stored in
         // the off-GC `items_block`, so the implicit write barrier on the
@@ -274,14 +290,63 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         // custom-trace hook) and relocates any young element. Mirrors the
         // `write_barrier_from_array` an old list/tuple store would emit
         // (incminimark.py:1495).
-        crate::gc_hook::try_gc_write_barrier(raw);
+        //
+        // This runs BEFORE the store, against the null-items image published
+        // above: remembering an old object that holds no young pointer yet is
+        // the harmless direction. Storing first would leave the young block
+        // named by a slot no collection traces for the whole parking window —
+        // `remember_young_pointer` clears `GCFLAG_TRACK_YOUNG_PTRS` and queues
+        // the tuple only once it runs (incminimark.py:1519-1522), and a minor that
+        // lands inside that window reclaims the block and poisons the nursery
+        // under it, leaving `wrappeditems` dangling for good.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        // Re-read the block the barrier's park may have moved: the tuple is on
+        // the remembered set now, but its `wrappeditems` is still null, so no
+        // collection could have forwarded that slot for us.
+        if let Some(s) = block_root {
+            items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
+        }
+        // The header went in before the root was published; only the items
+        // block is still outstanding. Nothing below can collect, so the
+        // remembered tuple keeps the block from here on.
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_TupleObject,
+                W_TupleObject {
+                    ob_header: header,
+                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
+                    wrappeditems: items_block,
+                    w_dict: PY_NULL,
+                },
+            );
+        }
         return raw as PyObjectRef;
     }
     Box::into_raw(Box::new(W_TupleObject {
         ob_header: header,
         hash: AtomicI64::new(TUPLE_HASH_UNSET),
         wrappeditems: items_block,
+        w_dict: PY_NULL,
     })) as PyObjectRef
+}
+
+/// Read the mapdict `dict` SPECIAL slot of an array-backed tuple subclass.
+///
+/// # Safety
+/// `obj` must be a non-specialised `W_TupleObject`.
+#[inline]
+pub unsafe fn w_tuple_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_TupleObject)).w_dict }
+}
+
+/// Replace the mapdict `dict` SPECIAL slot of an array-backed tuple subclass.
+///
+/// # Safety
+/// `obj` must be a non-specialised `W_TupleObject`.
+#[inline]
+pub unsafe fn w_tuple_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe { (*(obj as *mut W_TupleObject)).w_dict = w_dict };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// CPython 3.14 `FT_ATOMIC_LOAD_SSIZE_RELAXED(v->ob_hash)`, generalized over
