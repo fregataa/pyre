@@ -805,6 +805,7 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
     let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
     let tuple = unsafe { &mut *tuple_ptr };
     f(&mut tuple.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut tuple.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
@@ -841,6 +842,7 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
     let list = unsafe { &mut *list_ptr };
     f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut list.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if list.strategy == pyre_object::listobject::ListStrategy::Object && !list.items.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
             // Phase L2: a GC-managed (moving) block is forwarded by handing the
@@ -1924,7 +1926,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `pytype_to_tid`, so this pre-registration wins over its
     // generic `object_subclass(sizeof(PyObject), parent_tid)`
     // default which would underallocate `W_BaseException`.
-    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::StopAsyncIteration as u8) {
+    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::EOFError as u8) {
         // Round-trip the byte through the enum so we don't depend
         // on unsafe transmute; every value in [0, UnboundLocalError]
         // is a valid `ExcKind` variant by construction.
@@ -1963,6 +1965,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             31 => pyre_object::interp_exceptions::ExcKind::BufferError,
             32 => pyre_object::interp_exceptions::ExcKind::UnboundLocalError,
             33 => pyre_object::interp_exceptions::ExcKind::StopAsyncIteration,
+            34 => pyre_object::interp_exceptions::ExcKind::EOFError,
             _ => unreachable!(),
         };
         let pytype_ptr =
@@ -3763,9 +3766,12 @@ fn install_gc_root_walkers() {
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.
-    // The GC-managed weakref box holds its referent and callback outside any
-    // traced field, so the boxes' inner slots need their own root area.
-    majit_gc::shadow_stack::register_extra_root_walker(weakref_box_inner_root_walker);
+
+    // GC-heap slots of the immortal, process-global `W_SRE_Pattern` store. The
+    // patterns are `malloc_typed`, so nothing traces into them; a compiled
+    // pattern outlives the thread that compiled it, so its owner is a global
+    // walker rather than a per-mutator area.
+    majit_gc::shadow_stack::register_extra_root_walker(sre_pattern_root_walker);
 }
 
 fn register_thread_root_areas() {
@@ -3809,8 +3815,8 @@ fn register_thread_root_areas() {
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
         );
         register(
-            sre_pattern_root_walker_area,
-            pyre_object::interp_sre::capture_sre_pattern_root_area(),
+            autoflusher_root_walker_area,
+            pyre_interpreter::module::_io::capture_autoflusher_root_area(),
         );
         register(
             jit_callee_frame_root_walker_area,
@@ -4520,12 +4526,12 @@ unsafe fn signal_handler_root_walker_area(
     }
 }
 
-unsafe fn sre_pattern_root_walker_area(
+unsafe fn autoflusher_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     unsafe {
-        pyre_object::interp_sre::walk_sre_pattern_roots_area(data, |slot| {
+        pyre_interpreter::module::_io::walk_autoflusher_roots_area(data, |slot| {
             visit_pyobject_root(slot, visitor);
         });
     }
@@ -4556,12 +4562,6 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
 #[cfg(not(target_arch = "wasm32"))]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
-}
-
-fn weakref_box_inner_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::weakref::walk_gc_weakref_box_inner_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }
@@ -7012,6 +7012,47 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     }
 }
 
+/// True when this frame's exception-table entry for the exit PC expects operand
+/// slots the compiled run never wrote back.
+///
+/// `setfield_vable_i(valuestackdepth)` and `setarrayitem_vable_r` are
+/// virtualizable operations: they update the trace's own boxes, and the real
+/// `PyFrame` fields are written only where the virtualizable is forced
+/// (`virtualizable.py:282-284`). The `exit_frame_with_exception` edge forces
+/// nothing, so on this path `valuestackdepth` and the operand slots still hold
+/// what the frame carried when it entered the JIT — for a function-entry run,
+/// an empty operand stack.
+///
+/// `handle_exception` pops down to the entry's depth (`pyopcode.py:155-156`)
+/// and can never restore slots that were never written, so an entry expecting a
+/// non-empty operand stack resumes short.
+///
+/// The entry that names such a stack from *inside* compiled code is the
+/// `lasti` one: it covers a handler body, and the slots it counts are the
+/// `prev_exc`/`exc` pair `PUSH_EXC_INFO` pushed there. Reaching it means the
+/// compiled run entered the handler and then raised out of it, so those pushes
+/// only ever existed as trace boxes — its `COPY n; POP_EXCEPT; RERAISE n`
+/// cleanup then underflows. A `try`-body entry counts slots the interpreter
+/// itself pushed before the JIT took the frame over, which are still in place.
+///
+/// Such a frame propagates instead — `warmspot.py:997-1005
+/// ExitFrameWithExceptionRef` re-raises out of the portal and never offers the
+/// exception to the frame's own table, so propagation is the orthodox half of
+/// the delivery below.
+fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
+    if frame.last_instr < 0 {
+        return false;
+    }
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let pc_bytes = (frame.last_instr as u32) * 2;
+    let Some((_target, depth, lasti)) =
+        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+    else {
+        return false;
+    };
+    lasti && frame.valuestackdepth < frame.nlocals() + frame.ncells() + depth as usize
+}
+
 /// warmspot.py:998-1005 `ExitFrameWithExceptionRef` delivery for a compiled-run
 /// exit that surfaced outside the eval loop (the `handle_jit_outcome` /
 /// compile-once path).  Offer the pending exception to `frame`'s exception
@@ -7031,6 +7072,9 @@ fn deliver_exit_frame_exception(
     mut err: pyre_interpreter::PyError,
 ) -> PyResult {
     let mut handler_instr = frame.next_instr();
+    if exit_frame_handler_needs_unwritten_stack(frame) {
+        return Err(err);
+    }
     if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut handler_instr) {
         frame.set_last_instr_from_next_instr(handler_instr);
         handle_jitexception(frame)
@@ -10668,19 +10712,39 @@ fn sync_virtualizable_after_guard_failure(
         // pyjitpl.py:3427-3429: reset token before synchronize_virtualizable().
         vinfo.reset_vable_token(frame_u8);
     }
-    let expected_total_without_identity = vinfo.num_static_extra_boxes
-        + (0..vinfo.array_fields.len())
-            .map(|array_index| unsafe {
-                vinfo.get_array_length(frame_u8.cast_const(), array_index)
+    let array_lengths: Vec<usize> = (0..vinfo.array_fields.len())
+        .map(|array_index| unsafe { vinfo.get_array_length(frame_u8.cast_const(), array_index) })
+        .collect();
+    let expected_total_without_identity =
+        vinfo.num_static_extra_boxes + array_lengths.iter().sum::<usize>();
+    if resolved_vable.len() != expected_total_without_identity + 1 {
+        // A length read out of a frame the reader did not actually restore is
+        // wild, not merely off by a slot, so name the pointer it came from and
+        // every field the sum walked: `statics + Σ lengths` alone cannot say
+        // which of the two sides is the wrong one.
+        let arrays: Vec<String> = vinfo
+            .array_fields
+            .iter()
+            .zip(&array_lengths)
+            .map(|(field, len)| {
+                let container =
+                    unsafe { *(frame_u8.cast_const().add(field.field_offset) as *const *const u8) };
+                format!(
+                    "{}@{}: container={container:?} len_off={} len={len}",
+                    field.name, field.field_offset, field.length_offset,
+                )
             })
-            .sum::<usize>();
-    assert_eq!(
-        resolved_vable.len(),
-        expected_total_without_identity + 1,
-        "rebuild_guard_fail_state: virtualizable box count mismatch (expected {}, got {})",
-        expected_total_without_identity + 1,
-        resolved_vable.len(),
-    );
+            .collect();
+        panic!(
+            "rebuild_guard_fail_state: virtualizable box count mismatch \
+             (expected {}, got {}); frame={frame_u8:?} statics={} arrays=[{}] vable={:?}",
+            expected_total_without_identity + 1,
+            resolved_vable.len(),
+            vinfo.num_static_extra_boxes,
+            arrays.join(", "),
+            resolved_vable,
+        );
+    }
 
     let mut boxes: Vec<i64> = Vec::with_capacity(expected_total_without_identity + 1);
     let mut cursor = 1;

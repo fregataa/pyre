@@ -8746,6 +8746,14 @@ impl CodeWriter {
                             // rebindable one.  Classes / modules are created at
                             // module load and are neither grown nor rebound, so
                             // const-folding them stays safe.
+                            //
+                            // Widening the register form to every jitcode costs
+                            // a `ForceToken` / `GuardNotForced` /
+                            // `GuardNoException` per global in a non-portal
+                            // body.  On `bench/synth/
+                            // exception_reraise_tb_depth_hot` that turns five
+                            // const-folded loads into five residual calls and
+                            // takes `guard_failures` from 1803 to 63769.
                             let result_value: super::flow::FlowValue = if is_true_portal {
                                 let ns_var = emit_graph_op_with_result(
                                     &mut graph,
@@ -9688,20 +9696,24 @@ impl CodeWriter {
                             // has a proper terminator (mirrors
                             // `flatten.py:189 make_exception_link`
                             // exception-edge shape).
-                            let symbolic_exc = current_state.stack.last().cloned();
-                            let exc_value = if matches!(
-                                symbolic_exc,
-                                Some(super::flow::FlowValue::Constant(ref constant))
-                                    if constant.value == super::flow::ConstantValue::None
-                            ) {
-                                // Handler entry can carry a null symbolic
-                                // placeholder while exception dispatch has
-                                // already installed the value in the semantic
-                                // frame slot. Read it before popvalue clears it.
-                                let exc_depth = current_depth.saturating_sub(1);
-                                let exc_slot = stack_base_absolute + exc_depth as usize;
-                                let exc_slot_value: super::flow::FlowValue =
-                                    super::flow::Constant::signed(exc_slot as i64).into();
+                            // pyframe.py:411-417 `popvalue_maybe_none` first
+                            // reads `locals_cells_stack_w[depth - 1]`, then
+                            // clears that exact slot.  Read the authoritative
+                            // vable slot here before `emit_popvalue_ref!`
+                            // records the clear, rather than reusing the
+                            // handler-entry shadow Variable.  In a
+                            // `COPY 3; POP_EXCEPT; RERAISE 1` cleanup the
+                            // shadow exception and boxed lasti can otherwise
+                            // coalesce to one colour; the raise edge then
+                            // receives the lasti integer even though the live
+                            // frame TOS still contains the exception.  PyPy's
+                            // direct `self.popvalue()` load makes that collapse
+                            // impossible.
+                            let exc_depth = current_depth.saturating_sub(1);
+                            let exc_slot = stack_base_absolute + exc_depth as usize;
+                            let exc_slot_value: super::flow::FlowValue =
+                                super::flow::Constant::signed(exc_slot as i64).into();
+                            let exc_value =
                                 super::flow::FlowValue::from(emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -9712,10 +9724,7 @@ impl CodeWriter {
                                     ),
                                     Kind::Ref,
                                     py_pc as i64,
-                                ))
-                            } else {
-                                symbolic_exc.unwrap_or_else(|| fresh_ref_value(&mut graph))
-                            };
+                                ));
                             let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
                             // RERAISE: pyre-only deviation from RPython
