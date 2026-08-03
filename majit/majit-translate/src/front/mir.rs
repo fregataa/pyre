@@ -1293,8 +1293,17 @@ fn tuple_field_value_type(type_name: &str) -> ValueType {
         // kind rather than collapsing into `Int` like the word-sized integers.
         "i128" => ValueType::Int128,
         "u128" => ValueType::UInt128,
-        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32"
-        | "u64" | "usize" => ValueType::Int,
+        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" => ValueType::Int,
+        // A `u*` element shells to an unsigned `SomeInteger`
+        // (`valuetype_to_someshell(Unsigned)`), so an `r_uint` tuple element
+        // reconciles with the FORCE_ATTRIBUTES seed instead of walling
+        // `r_uint ∪ int`. Same register kind as `Int` (`getkind` = 'int').
+        "u8" | "u16" | "u32" | "u64" | "usize" => ValueType::Unsigned,
+        // A str-family element shells to `SomeString`
+        // (`valuetype_to_someshell(Str)`) rather than the classdef-less
+        // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
+        // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
+        "String" | "str" | "Wtf8" | "Wtf8Buf" => ValueType::Str,
         _ => ValueType::Ref(None),
     }
 }
@@ -7176,15 +7185,15 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `RBigInt::digits{,_mut}` is Rust's view adapter around the
-                // RPython `_digits` GcArray:
-                // `slice::from_raw_parts(typed_items_base(_digits), capacity)`.
-                // The typed-items base call above already aliases the header
-                // pointer so the gcarray descr re-applies `base_size`; the
-                // resulting slice is therefore the same array value in the
-                // translated model. Fold only these two enclosing accessors,
-                // not arbitrary raw slices.
-                if args.len() == 2 && self.is_rbigint_digits_from_raw_parts(&reg) {
+                // `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice
+                // {,_mut}` are Rust view adapters around an `ItemsBlock` /
+                // typed-items GcArray:
+                // `slice::from_raw_parts(items_base(block), len)`.  The items-base
+                // call above already aliases the header pointer so the gcarray
+                // descr re-applies `base_size`; the resulting slice is therefore
+                // the same array value in the translated model. Fold only these
+                // enclosing accessors, not arbitrary raw slices.
+                if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -9498,12 +9507,26 @@ impl<'a> Lowering<'a> {
             && regular_call_is_ptr_add(reg, self.llbc)
     }
 
-    /// `slice::from_raw_parts{,_mut}` in `RBigInt::digits{,_mut}` only.
-    /// RPython stores `_digits` as the array itself; the Rust slice is a
-    /// zero-copy source adapter and aliases that same translated GcArray.
-    fn is_rbigint_digits_from_raw_parts(&self, reg: &RegularCall) -> bool {
+    /// `slice::from_raw_parts{,_mut}` inside a container's items-view adapter:
+    /// `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice{,_mut}`.
+    /// The base argument is an `items_block_items_base` / typed-items accessor,
+    /// already aliased to the block header (`graph_is_items_block_base_accessor`)
+    /// so the object/digit gcarray descr re-applies `base_size`; the resulting
+    /// slice is that same array value in the translated model.  Both back an
+    /// `ItemsBlock`, whose consumers index through a descr (the offset-mediated
+    /// case), so the receiver alias is sound.  Fold only these enclosing
+    /// accessors, not arbitrary raw slices.
+    fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
-            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
+            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut")
+            || self
+                .graph
+                .name
+                .ends_with("listobject::<Impl>::object_items_slice")
+            || self
+                .graph
+                .name
+                .ends_with("listobject::<Impl>::object_items_slice_mut"))
         {
             return false;
         }
@@ -15189,7 +15212,10 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// its `self.<capture>` reads would wall on.  RPython forbids closures.
 fn tyref_input_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let leaf = tyref_class_root(ty, llbc);
-    if leaf.as_deref() == Some("closure") {
+    if leaf
+        .as_deref()
+        .is_some_and(majit_charon_reader::ullbc::is_closure_leaf)
+    {
         adt_path_of_tyref(ty, llbc).or(leaf)
     } else {
         leaf
