@@ -220,9 +220,9 @@ pub use diag::*;
 /// the bytecode bytes + register-bank sizes for the fresh callee
 /// frame.
 ///
-/// Body is always `'static` — production wires the lookup to
-/// `crate::jitcode_runtime::all_jitcodes()` whose `Arc<JitCode>`
-/// entries live inside a `LazyLock<Vec<...>>` (`'static`); tests
+/// Body is always `'static` — production wires the lookup to the
+/// per-index runtime cache whose `Arc<JitCode>` entries live inside a
+/// leaked cell table; tests
 /// either use static byte arrays or `Box::leak` to surface
 /// `'static`. Constraining the body's lifetime simplifies
 /// `WalkContext`'s lifetime parameters — otherwise the closure's
@@ -259,16 +259,15 @@ pub struct SubJitCodeBody {
 /// jitcode_index, .. }` and looks up `ALL_JITCODES[idx]`. Walker
 /// inverts the dependency: the caller supplies the lookup so the
 /// walker stays decoupled from the runtime's all-jitcodes table
-/// (production passes a closure over `crate::jitcode_runtime::all_jitcodes()`,
+/// (production passes the lazy per-index runtime lookup,
 /// tests pass synthetic closures over a local fixture map).
 pub type SubJitCodeLookup = dyn Fn(usize) -> Option<SubJitCodeBody>;
 
 /// Build a [`SubJitCodeBody`] view over the build-time `ALL_JITCODES[idx]`
-/// entry (`crate::jitcode_runtime::all_jitcodes`). Returns `None` for an
+/// entry. Returns `None` for an
 /// out-of-range index.
 ///
-/// The all-jitcodes table is `Box::leak`'d at load
-/// (`jitcode_runtime::load_all_jitcodes`), so the borrowed `code` /
+/// The per-index cell table is `Box::leak`'d at initialization, so the borrowed `code` /
 /// `constants_*` slices are `'static` as [`SubJitCodeBody`] requires.
 ///
 /// This is the production sub-jitcode lookup shape — the shadow walker,
@@ -277,17 +276,15 @@ pub type SubJitCodeLookup = dyn Fn(usize) -> Option<SubJitCodeBody>;
 /// callee body through it. RPython parity: a `BhDescr::JitCode {
 /// jitcode_index }` operand resolves to `ALL_JITCODES[jitcode_index]`.
 pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
-    crate::jitcode_runtime::all_jitcodes()
-        .get(idx)
-        .map(|jc| SubJitCodeBody {
-            code: jc.code.as_slice(),
-            num_regs_r: jc.num_regs_r(),
-            num_regs_i: jc.num_regs_i(),
-            num_regs_f: jc.num_regs_f(),
-            constants_i: jc.constants_i.as_slice(),
-            constants_r: jc.constants_r.as_slice(),
-            constants_f: jc.constants_f.as_slice(),
-        })
+    crate::jitcode_runtime::get_jitcode_ref_by_index(idx).map(|jc| SubJitCodeBody {
+        code: jc.code.as_slice(),
+        num_regs_r: jc.num_regs_r(),
+        num_regs_i: jc.num_regs_i(),
+        num_regs_f: jc.num_regs_f(),
+        constants_i: jc.constants_i.as_slice(),
+        constants_r: jc.constants_r.as_slice(),
+        constants_f: jc.constants_f.as_slice(),
+    })
 }
 
 /// State the walker reads from / writes to while stepping. RPython
@@ -1684,7 +1681,7 @@ pub enum DispatchError {
     ExpectedJitCodeDescr { pc: usize, descr_index: usize },
     /// `inline_call_*`'s descr resolved to a `jitcode_index`, but the
     /// caller's `sub_jitcode_lookup` returned `None`. Production wires
-    /// the lookup to `crate::jitcode_runtime::all_jitcodes()`; tests
+    /// the lookup to the lazy runtime jitcode cache; tests
     /// build synthetic maps. A `None` return means the codewriter
     /// emitted an index past the runtime's jitcode table.
     SubJitCodeNotFound { pc: usize, jitcode_index: usize },
@@ -3733,7 +3730,7 @@ fn dispatch_switch_id<Sym: WalkSym>(
 /// * `descr_refs`, `sub_jitcode_lookup` — caller-provided, same
 ///   contract as direct `walk()` callers. Production callers wire
 ///   `crate::jitcode_runtime::all_descrs()` + a JitCode-resolving
-///   closure over `crate::jitcode_runtime::all_jitcodes()`.
+///   closure over the lazy runtime jitcode cache.
 ///
 /// `is_top_level` selects the outer-frame semantic:
 ///
@@ -4185,11 +4182,15 @@ fn bool_box_truth_lookup(boxed: OpRef) -> Option<OpRef> {
     })
 }
 
-/// Clear the [`BOOL_BOX_TRUTH`] map at the start of an authoritative walk so a
-/// prior aborted walk's entries never leak into the next one.  This is the
-/// reset boundary for the walk-local thread-local; it is called at the two FBW
-/// walk entry points (`trace.rs` `full_body_walk_trace` at walk start, and
-/// after `probe_walk_perfn_jitcode` discards its throwaway trace).
+/// Clear the [`BOOL_BOX_TRUTH`] map so a prior walk's entries never leak into
+/// the next one.  This is the reset boundary for the walk-local thread-local,
+/// and it is called wherever the ops a recorded key names stop existing: at
+/// walk start (`trace.rs` `full_body_walk_trace`, and the carrier drain), after
+/// `probe_walk_perfn_jitcode` discards its throwaway trace, and on every
+/// sub-walk rollback that follows `cut_trace` with a `heap_cache` reset.
+///
+/// A reset can only lose entries, never invent one, so a boundary placed too
+/// eagerly costs a fold and cannot mis-fold.
 pub fn bool_box_truth_reset() {
     BOOL_BOX_TRUTH.with(|m| m.borrow_mut().clear());
 }
@@ -5020,40 +5021,6 @@ struct InlineParentBlackhole {
     /// Float values have no concrete shadow bank; retain their OpRefs and
     /// resolve them at force time while the trace context is still live.
     float_values: Vec<(usize, OpRef)>,
-}
-
-/// Whether any frame the trace already models would catch an exception raised
-/// below it — i.e. whether a raise escaping the callee about to be inlined has
-/// to be routed back INTO the traced region.
-///
-/// Each paused caller on the framestack is asked whether its own pending CALL
-/// sits inside a try-block, the same `after_residual_call_resume` →
-/// `catch_exception/L` lookup [`decline_inline_caller_frame_for_catch_marker`]
-/// uses. Level 0's parent is the snapshot root, so the scan covers the root
-/// frame and every intermediate one; the innermost CALL needs no test here
-/// because a nested try-block CALL already declines multiframe on its own.
-///
-/// Unknown answers count as catching: a parent with no snapshot, an
-/// unresolvable jitcode, or a CALL with no recorded pc could all be hiding a
-/// handler, and admitting one wrongly costs a guard storm.
-pub(crate) fn inline_chain_catches_a_raise(session: &std::cell::RefCell<WalkSession>) -> bool {
-    session.borrow().framestack.iter().any(|frame| {
-        let Some(parent) = frame.parent.as_ref() else {
-            return true;
-        };
-        let Some(call_pc) = parent.call_jitcode_pc else {
-            return true;
-        };
-        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
-        else {
-            return true;
-        };
-        match pjc.after_residual_call_resume_for_jitcode_pc(call_pc) {
-            // No after-call resume marker: the CALL is not in a try-block.
-            None => false,
-            Some(resume) => try_catch_exception_at(pjc.jitcode.code.as_slice(), resume).is_some(),
-        }
-    })
 }
 
 /// The derivation flavor of a paused caller frame's Python resume pc.

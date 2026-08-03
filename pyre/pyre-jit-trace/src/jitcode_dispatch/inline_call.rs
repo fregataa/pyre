@@ -2365,32 +2365,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     }
 }
 
-/// Whether any level already on the inline stack is a recursion unroll — the
-/// snapshot root's own code re-entered, or one code appearing twice in the
-/// chain (a mutual cycle).
-///
-/// Such a chain's levels are suspended copies of the same frame, so an unwind
-/// through it is the shape `fbw_max_rec_unroll_depth` bounds rather than the
-/// straight-line chain `fbw_max_multiframe_depth` covers.
-fn inline_chain_unrolls_recursion<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    let root_code = if sym_ptr.is_null() {
-        0
-    } else {
-        unsafe {
-            pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode()).raw_code() as *const ())
-                as *const () as usize
-        }
-    };
-    let session = ctx.session.borrow();
-    session.framestack.iter().enumerate().any(|(i, frame)| {
-        frame.w_code == root_code
-            || session.framestack[..i]
-                .iter()
-                .any(|outer| outer.w_code == frame.w_code)
-    })
-}
-
 /// Read one of the callee function's `_immutable_fields_` slots live and pin
 /// the value this inline baked, replacing the box so later reads fold.
 ///
@@ -2509,6 +2483,24 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     } else {
         None
     };
+    // Does any incoming binding land a value the callee's register banks can
+    // hold unboxed?  Only the `is`-against-None scan below consults this; see
+    // its hazard-2 arm for why an int-specialized tested local is unsafe to
+    // inline.  A default is pushed above as a raw `Ref` without going through
+    // `ConcreteValue::from_pyobj`, so re-classify here rather than matching the
+    // variant alone — `def _read_from_buffer(self, size=-1)` reaches the scan
+    // with `size` as `Ref(<int object>)` and is exactly the shape that
+    // miscompiled.
+    let callee_binds_an_unboxed_local = callee_arg_concretes.iter().any(|c| {
+        let classified = match *c {
+            ConcreteValue::Ref(obj) => ConcreteValue::from_pyobj(obj),
+            other => other,
+        };
+        matches!(
+            classified,
+            ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_)
+        )
+    });
     // Vararg/over-arity calls still use the ordinary residual path. A closure
     // is admissible when it has freevars only: the existing cell objects can
     // be threaded into this callee's own frame exactly as
@@ -2963,30 +2955,24 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // callee without a handler retains its after-residual live anchor.
         return Ok(None);
     }
-    // A callee that raises inline needs the cross-frame bridge (gh#343 /
-    // gh#467) the drain cannot yet build, but only when the raise has to come
-    // back INTO the traced region — i.e. when some frame already on the
-    // framestack catches it.  Measured: admitting such a callee below an
-    // intermediate frame takes `guard_failures` from 1203 to 19654 and drops
-    // `bridges_compiled` from 6 to 2 on a caught-in-loop shape, because the
-    // guards it emits keep failing with no bridge to land on.
+    // A callee that raises inline needs the cross-frame bridge the carrier
+    // drain builds once a guard inside the compiled chain fails.  The drain
+    // walks the paused middle frames between the raising leaf and the root, so
+    // one intermediate frame may sit between the loop and the raise; a middle
+    // that CATCHES is still declined, which is what holds the cap here instead
+    // of letting a raising chain run to `fbw_max_multiframe_depth`.  A
+    // value-returning chain (no raise) inlines to the full depth either way.
     //
-    // When no modelled frame catches, the raise leaves the traced region
-    // entirely and takes the guard-exception exit, which needs no such bridge —
-    // `bench/synth/exception_escape_caller_frame_tb_node`'s `d_no_try` shape.
-    // A value-returning chain (no raise) inlines to the full depth either way.
-    //
-    // The lift is one level, not the full chain depth: the shape it unlocks is
-    // a single intermediate frame between the loop and the raise, and a chain
-    // whose levels are self-recursive unrolls keeps the recursion bound
-    // instead. The unwind out of such a chain crosses suspended copies of the
-    // same frame, which is what `fbw_max_rec_unroll_depth` bounds above;
-    // letting the raising leaf inline below one costs 1.9x on
-    // `bench/synth/selfrec_tail_exception_unwind`.
+    // Measured against one drain-complete binary, nine interleaved reps per
+    // arm: `bench/synth/exception_escape_caller_frame_tb_node` runs at 0.70x
+    // of the one-level cap, `bench/synth/gc_bug_bridge_flavor_traceback_names`
+    // at 1.02x and `bench/synth/selfrec_tail_exception_unwind` at 0.99x.  A
+    // third level regresses — `selfrec_tail_exception_unwind` takes
+    // `guard_failures` from 937 to 7408 — because the unwind then crosses two
+    // suspended copies of the same frame, the shape `fbw_max_rec_unroll_depth`
+    // bounds above.
     let effective_multiframe_depth = if contains_raise {
-        let bounded = crate::jitcode_dispatch::inline_chain_catches_a_raise(ctx.session)
-            || inline_chain_unrolls_recursion(ctx);
-        if bounded { 1 } else { 2 }
+        2
     } else {
         fbw_max_multiframe_depth()
     };
@@ -3476,8 +3462,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // helper aborted every retrace of the enclosing loop.  The guard whose
             // bridge the retrace was building therefore never got one and deopted
             // on every delivery.
-            if bound_method.is_none()
-                && (0..callee_code.instructions.len()).any(|pc| {
+            if bound_method.is_none() {
+                let liveness = crate::liveness::liveness_for(raw_callee_code);
+                let has_is_none_branch = (0..callee_code.instructions.len()).any(|pc| {
                     matches!(
                         pyre_interpreter::decode_instruction_at(callee_code, pc),
                         Some((
@@ -3485,13 +3472,55 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                                 | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
                             _
                         ))
+                    ) && (
+                        // Hazard 3 — the wasm backend cannot run the widened
+                        // shape at all, so it keeps the blanket decline.
+                        // Admitting a callee here traces into its body, and the
+                        // helper this widening exists for carries its own loop
+                        // (`while tb is not None:`), so the enclosing trace
+                        // closes with a CALL_ASSEMBLER into that loop.  Every
+                        // wasm trace is its own module and there is no
+                        // inter-module chaining, so the backend declines any
+                        // CALL_ASSEMBLER outright; that decline is the `Err`
+                        // arm of the compile step, so the enclosing loop is
+                        // aborted rather than merely left interpreted.
+                        // Measured `loops_aborted` 0 -> 3 on
+                        // `synth/exception_traceback_lineno_chain` and 0 -> 5
+                        // on `synth/exception_inline_callee_tb_frames`, each
+                        // ~5-9% slower than declining.  Drop this arm once the
+                        // backend can chain modules.
+                        cfg!(target_arch = "wasm32")
+                        // Hazard 1 — kept operands. A branch that leaves slots
+                        // on the value stack needs its guard resume to restore
+                        // them, and the inline sub-walk's mirror does not model
+                        // them, so the kept Ref reads NULL and
+                        // `walker_branch_guard` raises
+                        // BranchGuardUnrestorableKeptStackPermanent — a
+                        // permanent abort that discards the enclosing loop
+                        // trace.  `stack_depth_at` is the depth BEFORE the
+                        // instruction and the branch pops the tested value, so
+                        // `depth > 1` is exactly "a kept slot survives".  An
+                        // unreachable pc has no depth and cannot fire a guard.
+                        || liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
+                            // Hazard 2 — the tested operand itself.  When the
+                            // multiframe inline int-specializes the tested
+                            // local, the mid-body guard resume cannot source
+                            // that operand's Ref form from the callee register
+                            // banks (`collect_callee_active_boxes` reads a
+                            // stale/mismatched box), so the encoded liveness
+                            // stream disagrees with the decoder and the caller
+                            // frame is corrupted.  This is independent of kept
+                            // depth: a statement-level `if x is None:` reads
+                            // depth 1 and still carries it.
+                            || callee_binds_an_unboxed_local
                     )
-                })
-            {
-                if try_multiframe {
-                    return Ok(None);
+                });
+                if has_is_none_branch {
+                    if try_multiframe {
+                        return Ok(None);
+                    }
+                    break 'seed;
                 }
-                break 'seed;
             }
             let nlocals = callee_code.varnames.len();
             let ncells = pyre_interpreter::ncells(callee_code);
