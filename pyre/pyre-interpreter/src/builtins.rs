@@ -9381,7 +9381,7 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
     let obj = args[0];
     checkattrname(args[1])?;
-    match crate::baseobjspace::getattr(obj, args[1]) {
+    match crate::baseobjspace::lookup_attr(obj, args[1]) {
         Ok(_) => Ok(w_bool_from(true)),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(w_bool_from(false)),
         Err(e) => Err(e),
@@ -9413,8 +9413,14 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     checkattrname(args[1])?;
     // operation.py:58-64: the default replaces the error ONLY when a default
     // was supplied AND the error is an AttributeError; other errors (and the
-    // no-default case) propagate.
-    match crate::baseobjspace::getattr(obj, args[1]) {
+    // no-default case) propagate.  With a default the error never surfaces,
+    // so that arm runs suppressed (`_PyObject_LookupAttr`).
+    let lookup = if args.len() > 2 {
+        crate::baseobjspace::lookup_attr(obj, args[1])
+    } else {
+        crate::baseobjspace::getattr(obj, args[1])
+    };
+    match lookup {
         Ok(val) => Ok(val),
         Err(e) => {
             if args.len() > 2 && e.kind == crate::PyErrorKind::AttributeError {
