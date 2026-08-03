@@ -30,6 +30,9 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::Resume { .. }
         | Instruction::Cache
         | Instruction::NotTaken
+        // Pyre's END_FOR is a no-op; the following POP_ITER removes the
+        // iterator (codewriter.rs / pyopcode.rs).
+        | Instruction::EndFor
         | Instruction::ExtendedArg => VstackOpClass::PopOnlyOrSideStore,
 
         // Single value lands on the new TOS = the last Ref written.

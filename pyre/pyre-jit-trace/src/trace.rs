@@ -1189,13 +1189,10 @@ pub fn trace_bytecode<Sym: WalkSym>(
     }
     // Any path the walker did not trace above re-interprets without JIT for
     // this key. The location stays trace-eligible (no `DONT_TRACE_HERE`).
-    crate::jitcode_dispatch::census_record(if carrier.is_some() {
-        "Trait::CarrierAbort"
-    } else {
-        "Trait::DeclinedAbort"
-    });
+    crate::jitcode_dispatch::census_record("Trait::DeclinedAbort");
+    let action = TraceAction::Decline;
     finish_trace_namespace_dependency(meta);
-    (TraceAction::Abort, concrete_frame)
+    (action, concrete_frame)
 }
 
 /// Read-only walker-as-tracer diagnostic probe.
@@ -5134,7 +5131,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc}");
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
-        return TraceAction::Abort;
+        return TraceAction::Decline;
     }
     if loop_iterates_send_generator(cf_addr, start_pc) {
         crate::jitcode_dispatch::census_record("FullBodyWalk::SendGeneratorIterator");
@@ -5144,7 +5141,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             );
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
-        return TraceAction::Abort;
+        return TraceAction::Decline;
     }
     // Sibling defense to the above, transitively through inlined callees: a
     // non-journaled concrete store in the loop body followed by an
@@ -5162,7 +5159,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             );
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
-        return TraceAction::Abort;
+        return TraceAction::Decline;
     }
     // Register the initial merge point with typed input-arg boxes so the trace head
     // carries the portal's entry signature (`inputarg_types()`).  Without
@@ -5407,7 +5404,9 @@ fn full_body_walk_trace<Sym: WalkSym>(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
-            if ctx.is_bridge_trace && FBW_BRIDGE_DECLINED.with(|c| c.get()) {
+            if fbw_declined(crate::driver::make_green_key(w_code, start_pc))
+                || (ctx.is_bridge_trace && FBW_BRIDGE_DECLINED.with(|c| c.get()))
+            {
                 TraceAction::Decline
             } else {
                 TraceAction::Abort
