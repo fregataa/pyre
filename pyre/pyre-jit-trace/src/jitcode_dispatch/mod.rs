@@ -3858,6 +3858,18 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     {
         return Ok(false);
     }
+    // `pyframe.py:LOAD_GLOBAL` reads `self.get_w_globals()` from the live
+    // MIFrame.  A non-portal inline level has its own green pycode and thus
+    // its own constant `pycode.w_globals`; the metainterp-wide
+    // `virtualizable_boxes` still describes the portal/root frame and must not
+    // be used to guard this callee's namespace.  `inline_callee_consts` is the
+    // current inline frame's counterpart (also used by
+    // `try_resolve_inline_callee_static_field` above).  Checking that frame's
+    // identity here prevents a bridge-resumed callee from emitting
+    // `GUARD_VALUE(root.w_globals, callee.w_globals)`.
+    if let Some(consts) = ctx.inline_callee_consts {
+        return Ok(consts.w_globals == expected_globals as usize);
+    }
     let Some(w_globals_op) = ctx
         .trace_ctx
         .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
@@ -4896,10 +4908,12 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// alongside the already-explicit `after_residual_call`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GuardCaptureScope<'a> {
-    /// Request that a residual call's `GUARD_NO_EXCEPTION` route its resume
+    /// Request that a residual call's after-call guard route its resume
     /// through the call's OWN post-call `catch_exception` instead of the
-    /// generic post-call fallthrough. The snapshot helper only acts on this
-    /// when the call's CALL pc is directly covered by an enclosing
+    /// generic post-call fallthrough. This is derived automatically from the
+    /// guard opcode; scoped callers may also request it explicitly. The
+    /// snapshot helper only acts on this when the call's CALL pc is directly
+    /// covered by an enclosing
     /// exception-table handler: it then carries the CALL jitcode offset so a
     /// deopt resumes at the call's own catch. The blackhole's
     /// `handle_exception_in_frame` routes the raise to the enclosing handler
