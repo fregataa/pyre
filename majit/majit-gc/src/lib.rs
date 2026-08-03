@@ -21,6 +21,7 @@ pub mod minimarkpage;
 pub mod nursery;
 pub mod oldgen;
 pub mod rewrite;
+pub mod rgil;
 pub mod shadow_stack;
 pub mod trace;
 pub mod weakref;
@@ -581,13 +582,6 @@ pub trait GcAllocator: Send {
     /// Address of the published nursery_top slot that JIT code reads.
     fn nursery_top_addr(&self) -> usize;
 
-    /// Enable or disable JIT inline nursery allocation.
-    ///
-    /// Collectors without a published nursery fast path need no action.
-    fn set_inline_alloc_enabled(&mut self, enabled: bool) {
-        let _ = enabled;
-    }
-
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;
 
@@ -877,17 +871,16 @@ pub trait GcAllocator: Send {
 
 /// Forwarding handle to the process-global GC singleton via `gc_sync`.
 ///
-/// `&mut self` methods route through `gc_sync::gc_op` (mutex-guarded);
-/// `&self` read-only queries route through `gc_sync::gc_query_reentrant` so
-/// they stay correct when a collection-time extra-root walker re-enters the GC
-/// (ownership / type queries) while this thread already holds the `&mut` — a
-/// plain `gc_query` would re-lock the non-recursive `gc_mutex` (deadlock) or, on
-/// the fast path, form a second `&mut`. No raw pointer at this layer.
+/// `&mut self` methods route through `gc_sync::gc_op`; `&self` read-only
+/// queries route through `gc_sync::gc_query_reentrant` so they stay correct
+/// when a collection-time extra-root walker re-enters the GC (ownership / type
+/// queries) while this thread already holds the `&mut`, which a `&mut` path
+/// would alias. No raw pointer at this layer.
 ///
 /// # Thread safety
 ///
-/// All `&mut self` methods acquire `gc_sync::gc_mutex` internally.
-/// Concurrent calls from different threads serialise correctly.
+/// Exclusion comes from the GIL (`rgil`), which the caller holds for
+/// as long as it runs pyre code, so these methods take no lock of their own.
 /// Collection uses STW safepoint protocol (`gc_sync::request_stw`).
 /// See gh#396 for the full free-threading GC design.
 pub struct GcHandle;
@@ -1035,7 +1028,7 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.disable())
     }
     fn isenabled(&self) -> bool {
-        gc_sync::gc_query(|gc| gc.isenabled())
+        gc_sync::gc_query_reentrant(|gc| gc.isenabled())
     }
     fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
         gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))
@@ -1072,9 +1065,6 @@ impl GcAllocator for GcHandle {
     }
     fn nursery_top_addr(&self) -> usize {
         gc_sync::gc_query_reentrant(|gc| gc.nursery_top_addr())
-    }
-    fn set_inline_alloc_enabled(&mut self, enabled: bool) {
-        gc_sync::gc_op(|gc| gc.set_inline_alloc_enabled(enabled))
     }
     fn max_nursery_object_size(&self) -> usize {
         gc_sync::gc_query_reentrant(|gc| gc.max_nursery_object_size())

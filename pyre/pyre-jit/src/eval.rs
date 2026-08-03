@@ -1249,27 +1249,13 @@ type JitDriverPair = (
 );
 
 thread_local! {
-    /// Per-thread flag: this thread has registered with the gc_sync
-    /// mutator registry and installed the backend GC handle into the
-    /// backend's per-thread TLS box. The majit_gc set_active_* fn-ptrs and
-    /// pyre_object gc_hook cells are now process-global (#396), so they are
-    /// installed once (not gated by this flag); only the per-thread backend
-    /// box and mutator registration remain per-thread here.
+    /// Per-thread flag: this thread has installed the backend GC handle into
+    /// the backend's per-thread TLS box and registered its root areas. The
+    /// majit_gc set_active_* fn-ptrs and pyre_object gc_hook cells are now
+    /// process-global (#396), so they are installed once (not gated by this
+    /// flag). The mutator registration itself belongs to pyre-interpreter's
+    /// thread entry.
     static GC_TLS_INSTALLED: Cell<bool> = const { Cell::new(false) };
-
-    /// Initialized after shadow_stack::register_mutator has captured all four
-    /// root TLS slots. Its destructor therefore removes the registry entry
-    /// before those slots are destroyed, then removes the thread from RUNNING.
-    static GC_MUTATOR_REGISTRATION: GcMutatorRegistration = const { GcMutatorRegistration };
-}
-
-struct GcMutatorRegistration;
-
-impl Drop for GcMutatorRegistration {
-    fn drop(&mut self) {
-        majit_gc::shadow_stack::unregister_mutator();
-        majit_gc::gc_sync::unregister_thread();
-    }
 }
 
 fn write_subclass_ranges<I, F>(classptrs: I, mut range_for: F)
@@ -3906,12 +3892,7 @@ fn register_thread_root_areas() {
         register(forced_virtuals_root_walker_area, jit_driver);
         // The ephemeron half of the walker above, on the same `data` so the
         // prune reaches exactly the drivers the root walk reaches.
-        unsafe {
-            majit_gc::shadow_stack::register_mutator_pruner(
-                forced_virtuals_pruner_area,
-                jit_driver,
-            );
-        }
+        majit_gc::shadow_stack::register_mutator_pruner(forced_virtuals_pruner_area, jit_driver);
     }
 }
 
@@ -4022,22 +4003,24 @@ pub fn reset_gc_fresh_for_test() {
 /// `set_active_*` install.
 pub fn init_gc_subsystem() {
     build_gc_global();
-    // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
-    // translated prebuilt equivalent before any collector root walk rather
-    // than lazily manufacturing it from inside the walker.
-    pyre_object::rbigint::initialize_rbigint_parts_cache();
     pyre_interpreter::call::register_thread_entry_hook(|| {
         init_jit_hooks();
         init_gc_root_walkers();
     });
+    // The mutator registration and the GIL that comes with it belong to
+    // pyre-interpreter's thread entry, which the interpreter reaches on its own
+    // from every point pyre code is entered at.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
     if !GC_TLS_INSTALLED.with(|c| c.get()) {
-        majit_gc::gc_sync::register_thread();
-        majit_gc::shadow_stack::register_mutator();
         register_thread_root_areas();
-        GC_MUTATOR_REGISTRATION.with(|_| {});
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
     }
+    // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
+    // translated prebuilt equivalent before any collector root walk rather
+    // than lazily manufacturing it from inside the walker. After registration,
+    // because it allocates and so needs this thread to hold the GIL.
+    pyre_object::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
 }
 

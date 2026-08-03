@@ -42,10 +42,82 @@ static ACTIVE_HANDLES: Mutex<Vec<usize>> = parking_lot::const_mutex(Vec::new());
 static EXECUTION_CONTEXTS: LazyLock<Mutex<indexmap::IndexMap<i64, usize>>> =
     LazyLock::new(|| Mutex::new(indexmap::IndexMap::new()));
 
-/// A blocking host call leaves the free-threaded collector's RUNNING census.
-/// This is a GC safepoint transition only; pyre has no process GIL.
-pub(crate) fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
+pub mod gil;
+
+/// `rffi.aroundstate.before()`: drop the GIL and leave the collector's RUNNING
+/// census for the duration of a blocking host call.
+pub fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
     majit_gc::gc_sync::before_external_block()
+}
+
+thread_local! {
+    /// Set once this thread owns a mutator registration, so the entry below
+    /// stays a single thread-local read on every later entry.
+    static RUNTIME_THREAD_ENTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Armed after `shadow_stack::register_mutator` has captured this thread's
+    /// root slots, so the destructor removes the registry entry before those
+    /// slots are destroyed and only then gives the GIL back.
+    static RUNTIME_THREAD: RuntimeThread = const { RuntimeThread };
+}
+
+struct RuntimeThread;
+
+impl Drop for RuntimeThread {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::unregister_mutator();
+        majit_gc::gc_sync::unregister_thread();
+    }
+}
+
+/// `rgil.py:186-193 acquire_maybe_in_new_thread`: a thread that has not run
+/// pyre code before becomes a GC mutator and takes the GIL before it runs any.
+///
+/// Upstream reaches every RPython thread through `rpython_startup_code` or
+/// rffi's callback path, both of which acquire before the first RPython
+/// instruction (entrypoint.c:49,78). pyre is entered from Rust at several
+/// points instead — the launcher, a spawned Python thread, and the unit tests
+/// that drive the interpreter directly — so the acquire is idempotent per
+/// thread and each entry point names it. The registration is given back by
+/// `RUNTIME_THREAD`'s destructor when the thread exits, which is what lets a
+/// second thread run pyre code afterwards.
+#[inline]
+pub fn ensure_runtime_thread() {
+    if RUNTIME_THREAD_ENTERED.with(|entered| entered.get()) {
+        return;
+    }
+    enter_runtime_thread();
+}
+
+#[cold]
+fn enter_runtime_thread() {
+    RUNTIME_THREAD_ENTERED.with(|entered| entered.set(true));
+    majit_gc::gc_sync::register_thread();
+    majit_gc::shadow_stack::register_mutator();
+    RUNTIME_THREAD.with(|_| {});
+}
+
+/// Whether this thread already owns its mutator registration.
+///
+/// pyre-jit's GC bootstrap has per-thread work of its own to hang off the same
+/// registration, so it asks rather than keeping a second flag.
+pub fn runtime_thread_entered() -> bool {
+    RUNTIME_THREAD_ENTERED.with(|entered| entered.get())
+}
+
+/// `rffi.py:193-211 call_external_function`: release the GIL, run the external
+/// call, read `errno`, and only then take the GIL back.  The returned `i32` is
+/// the saved `errno`, meaningful exactly when the call reports failure.
+///
+/// The read belongs inside the released window because `_errno_after` runs
+/// ahead of `rgil.acquire()` (rffi.py:207-210).  Taking the GIL back can enter
+/// the stealer loop, whose mutex and condvar waits overwrite `errno`, so a
+/// caller reading it after the guard drops can see the wrong value.
+pub(crate) fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
+    let _blocked = before_external_block();
+    let result = f();
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    (result, errno)
 }
 
 pub fn set_finalizing() {
@@ -1302,6 +1374,9 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
             local.thread_is_stopping(ident);
         }
     }
+    // Last: nothing above runs bytecode, so nothing can reach the ticker this
+    // action is registered on after it is gone.
+    gil::shutdown(ec);
 }
 
 /// The calling thread's identity.
@@ -1413,6 +1488,8 @@ fn spawn_thread(
     if parent_ec.is_null() {
         return Err(crate::PyError::runtime_error("no execution context"));
     }
+    // os_thread.py:172 `start_new_thread` begins with `setup_threads(space)`.
+    gil::setup_threads(unsafe { &mut *(parent_ec as *mut crate::PyExecutionContext) });
 
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
@@ -1532,6 +1609,10 @@ fn spawn_thread(
             // first, matching OSThreadLocals.enter_thread() installing the
             // ExecutionContext before thread bootstrap invokes Python code.
             ec.install_user_del_action();
+            // Each mutator owns its ticker, so the GIL-releasing action has to
+            // be registered on this thread's own actionflag; without it a
+            // worker would hold the GIL until its next external call.
+            gil::initialize(&mut ec);
             let ident = current_ident();
             if has_handle {
                 let h = W_ThreadHandle::from_obj(handle_addr as PyObjectRef).unwrap();

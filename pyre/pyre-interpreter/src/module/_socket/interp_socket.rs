@@ -163,21 +163,83 @@ fn socket_converted_error(
     err
 }
 
-/// baseobjspace.py `writebuf_w` — the writable byte slice backing a
-/// scatter/gather buffer argument.  PyPy accepts any object exporting a
-/// writable buffer; pyre's writable byte stores are `bytearray` and a
-/// `memoryview` over one, so those are resolved here and anything else is
-/// rejected as `writebuf_w` does.
+/// One `space.acquire_writebuf` export held for the whole of a `recv_into`
+/// family call, the way `with rwbuffer:` keeps it across `c_recv`.
+///
+/// The syscall runs with the GIL released, so without the export another
+/// thread could resize the exporter and reallocate the storage the kernel is
+/// writing through; the count is what makes that resize raise instead.  The
+/// requested object and the concrete storage owner are both rooted, because
+/// the release in `Drop` has to name the owner after whatever Python ran in
+/// between.
 #[cfg(unix)]
-fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], crate::PyError> {
+struct SocketWritableBuffer {
+    _roots: pyre_object::gc_roots::RootScope,
+    owner_slot: usize,
+    held: bool,
+    address: *mut u8,
+    length: usize,
+}
+
+#[cfg(unix)]
+impl SocketWritableBuffer {
+    unsafe fn acquire(obj: pyre_object::PyObjectRef) -> Result<Self, crate::PyError> {
+        let roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let (data, owner) =
+            socket_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+        pyre_object::gc_roots::pin_root(owner);
+        let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
+        let held = crate::builtins::buffer_export_incref(owner);
+        Ok(Self {
+            _roots: roots,
+            owner_slot,
+            held,
+            address: data.as_mut_ptr(),
+            length: data.len(),
+        })
+    }
+
+    unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.address, self.length)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketWritableBuffer {
+    fn drop(&mut self) {
+        if self.held {
+            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+            unsafe { crate::builtins::buffer_export_decref(owner) };
+        }
+    }
+}
+
+/// baseobjspace.py `writebuf_w` — the writable byte slice backing a
+/// scatter/gather buffer argument, with the object the export count lives on.
+/// PyPy accepts any object exporting a writable buffer; pyre's writable byte
+/// stores are `bytearray` and a `memoryview` over one, so those are resolved
+/// here and anything else is rejected as `writebuf_w` does.
+#[cfg(unix)]
+fn socket_writebuf(
+    obj: pyre_object::PyObjectRef,
+) -> Result<(&'static mut [u8], pyre_object::PyObjectRef), crate::PyError> {
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
-        return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) });
+        return Ok((
+            unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) },
+            obj,
+        ));
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         // `space.writebuf_w` accepts any writable buffer exporter; an
         // `array.array` exposes its element bytes as one writable window
         // regardless of typecode (recv writes raw bytes into them).
-        return Ok(unsafe { pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice() });
+        return Ok((
+            unsafe { pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice() },
+            obj,
+        ));
     }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         // `space.buffer_w` rejects a released view before exposing its storage.
@@ -199,6 +261,10 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
             ));
         }
         let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
+        // The view itself carries the export, as it does for `readinto`. Its
+        // backing is already held by the view's own construction, so nothing
+        // can resize the storage underneath while this one is alive either.
+        let owner = obj;
         // A writable view's backing is a `bytearray` or an `array.array`; both
         // expose a mutable byte store.  Honour the view window: write only into
         // `[offset, offset+length)` of the backing storage (itself already the
@@ -215,7 +281,7 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
                 "memoryview buffer is no longer valid",
             ));
         }
-        return Ok(&mut full[off..off + len]);
+        return Ok((&mut full[off..off + len], owner));
     }
     Err(crate::PyError::type_error(
         "a writable bytes-like object is required",
@@ -1684,7 +1750,11 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 .as_ref()
                 .map(|c| c.as_ptr())
                 .unwrap_or(std::ptr::null());
-            let rc = unsafe { libc::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) };
+            // A name lookup goes to the resolver and can take seconds.
+            let rc = {
+                let _blocked = crate::module::thread::before_external_block();
+                unsafe { libc::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) }
+            };
             if rc != 0 {
                 let msg = unsafe {
                     std::ffi::CStr::from_ptr(libc::gai_strerror(rc))
@@ -1783,8 +1853,9 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 hints.ai_socktype = libc::SOCK_DGRAM;
                 hints.ai_flags = libc::AI_NUMERICHOST;
                 let mut res: *mut libc::addrinfo = std::ptr::null_mut();
-                let rc = unsafe {
-                    libc::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res)
+                let rc = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    unsafe { libc::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res) }
                 };
                 if rc != 0 {
                     let msg = unsafe {
@@ -1806,16 +1877,20 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 }
                 let mut host_buf = [0 as libc::c_char; libc::NI_MAXHOST as usize];
                 let mut serv_buf = [0 as libc::c_char; 32];
-                let nrc = unsafe {
-                    libc::getnameinfo(
-                        ai.ai_addr,
-                        ai.ai_addrlen,
-                        host_buf.as_mut_ptr(),
-                        host_buf.len() as libc::socklen_t,
-                        serv_buf.as_mut_ptr(),
-                        serv_buf.len() as libc::socklen_t,
-                        flags,
-                    )
+                // A reverse lookup goes to the resolver and can take seconds.
+                let nrc = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    unsafe {
+                        libc::getnameinfo(
+                            ai.ai_addr,
+                            ai.ai_addrlen,
+                            host_buf.as_mut_ptr(),
+                            host_buf.len() as libc::socklen_t,
+                            serv_buf.as_mut_ptr(),
+                            serv_buf.len() as libc::socklen_t,
+                            flags,
+                        )
+                    }
                 };
                 unsafe { libc::freeaddrinfo(head) };
                 if nrc != 0 {
@@ -2182,8 +2257,9 @@ fn pack_inet_addr(
             let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
             hints.ai_family = libc::AF_INET;
             let mut result: *mut libc::addrinfo = std::ptr::null_mut();
-            let rc = unsafe {
-                libc::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut result)
+            let rc = {
+                let _blocked = crate::module::thread::before_external_block();
+                unsafe { libc::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut result) }
             };
             if rc != 0 || result.is_null() {
                 return Err(crate::PyError::os_error(format!(
@@ -2656,15 +2732,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let cfd = loop {
-                    let r = unsafe {
+                    let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                         libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
-                    };
+                    });
                     if r >= 0 {
                         break r;
                     }
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::EINTR) {
-                        return Err(socket_io_err(err));
+                    if errno != libc::EINTR {
+                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -2700,15 +2775,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let cfd = loop {
-                    let r = unsafe {
+                    let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                         libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
-                    };
+                    });
                     if r >= 0 {
                         break r;
                     }
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::EINTR) {
-                        return Err(socket_io_err(err));
+                    if errno != libc::EINTR {
+                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -2741,15 +2815,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let (storage, slen) = pack_inet_addr(family, args[1])?;
                 loop {
-                    let r = unsafe {
+                    let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                         libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
-                    };
+                    });
                     if r == 0 {
                         break;
                     }
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::EINTR) {
-                        return Err(socket_io_err(err));
+                    if errno != libc::EINTR {
+                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -2780,13 +2853,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // `interp_socket.py:387-391` — retry while the call is
                 // interrupted (EINTR), otherwise return the errno.
                 let err = loop {
-                    let r = unsafe {
+                    let (r, e) = crate::module::thread::call_external_function(|| unsafe {
                         libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
-                    };
+                    });
                     if r == 0 {
                         break 0;
                     }
-                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     if e != libc::EINTR {
                         break e;
                     }
@@ -2825,15 +2897,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let result = (|| -> Result<isize, crate::PyError> {
                 let buf = buffer.as_bytes();
                 loop {
-                    let r = unsafe {
+                    let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                         libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
-                    };
+                    });
                     if r >= 0 {
                         return Ok(r);
                     }
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::EINTR) {
-                        return Err(socket_io_err(err));
+                    if errno != libc::EINTR {
+                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -2868,23 +2939,22 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let buf = buffer.as_bytes();
                 let mut off = 0usize;
                 while off < buf.len() {
-                    let n = unsafe {
+                    let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
                         libc::send(
                             fd,
                             buf[off..].as_ptr() as *const libc::c_void,
                             buf.len() - off,
                             flags,
                         )
-                    };
+                    });
                     if n < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::EINTR) {
+                        if errno == libc::EINTR {
                             // `rsocket.py:1132` signal_checker — deliver a
                             // pending signal, then retry the remaining bytes.
                             crate::module::signal::interp_signal::checksignals_now()?;
                             continue;
                         }
-                        return Err(socket_io_err(err));
+                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                     }
                     off += n as usize;
                 }
@@ -2923,13 +2993,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             };
             let mut buf = vec![0u8; n];
             let got = loop {
-                let r = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, n, flags) };
+                let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, n, flags)
+                });
                 if r >= 0 {
                     break r;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
+                if errno != libc::EINTR {
+                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -2974,7 +3045,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let (storage, slen) = pack_inet_addr(family, addr_obj)?;
                 loop {
-                    let r = unsafe {
+                    let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                         libc::sendto(
                             fd,
                             buf.as_ptr() as *const libc::c_void,
@@ -2983,13 +3054,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             &storage as *const _ as *const libc::sockaddr,
                             slen,
                         )
-                    };
+                    });
                     if r >= 0 {
                         return Ok(r);
                     }
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::EINTR) {
-                        return Err(socket_io_err(err));
+                    if errno != libc::EINTR {
+                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -3036,7 +3106,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             let got = loop {
-                let r = unsafe {
+                let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                     libc::recvfrom(
                         fd,
                         buf.as_mut_ptr() as *mut libc::c_void,
@@ -3045,13 +3115,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         &mut storage as *mut _ as *mut libc::sockaddr,
                         &mut slen,
                     )
-                };
+                });
                 if r >= 0 {
                     break r;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
+                if errno != libc::EINTR {
+                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3078,7 +3147,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let buf_obj = args[1];
-            let slot = socket_writebuf(buf_obj)?;
+            let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
+            let slot = unsafe { buffer.as_mut_slice() };
             let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
@@ -3114,15 +3184,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             };
             let fd = socket_fd(obj)?;
             let got = loop {
-                let r = unsafe {
+                let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                     libc::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
-                };
+                });
                 if r >= 0 {
                     break r;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
+                if errno != libc::EINTR {
+                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3144,7 +3213,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let buf_obj = args[1];
-            let slot = socket_writebuf(buf_obj)?;
+            let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
+            let slot = unsafe { buffer.as_mut_slice() };
             let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
@@ -3182,7 +3252,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             let got = loop {
-                let r = unsafe {
+                let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                     libc::recvfrom(
                         fd,
                         slot.as_mut_ptr() as *mut libc::c_void,
@@ -3191,13 +3261,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         &mut storage as *mut _ as *mut libc::sockaddr,
                         &mut slen,
                     )
-                };
+                });
                 if r >= 0 {
                     break r;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
+                if errno != libc::EINTR {
+                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3280,13 +3349,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                let r = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+                let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                    libc::recvmsg(fd, &mut msg, flags)
+                });
                 if r >= 0 {
                     break (r, msg.msg_flags);
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
+                if errno != libc::EINTR {
+                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3365,7 +3435,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     pyre_object::w_tuple_len(seq)
                 }
             };
-            let mut buffers: Vec<&'static mut [u8]> = Vec::with_capacity(nbufs);
+            let mut buffers: Vec<SocketWritableBuffer> = Vec::with_capacity(nbufs);
             for i in 0..nbufs {
                 let item = unsafe {
                     if is_list {
@@ -3375,7 +3445,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                 }
                 .ok_or_else(|| crate::PyError::type_error("recvmsg_into: buffer item missing"))?;
-                buffers.push(socket_writebuf(item)?);
+                buffers.push(unsafe { SocketWritableBuffer::acquire(item) }?);
             }
             let ancbufsize = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
@@ -3406,10 +3476,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = socket_fd(args[0])?;
 
             let mut iovs: Vec<libc::iovec> = buffers
-                .into_iter()
-                .map(|slice| libc::iovec {
+                .iter_mut()
+                .map(|buffer| {
+                    let slice = unsafe { buffer.as_mut_slice() };
+                    libc::iovec {
                     iov_base: slice.as_mut_ptr() as *mut libc::c_void,
                     iov_len: slice.len(),
+                    }
                 })
                 .collect();
             let mut control = vec![0u8; ancbufsize];
@@ -3424,13 +3497,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                let r = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+                let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                    libc::recvmsg(fd, &mut msg, flags)
+                });
                 if r >= 0 {
                     break (r, msg.msg_flags, msg.msg_controllen);
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
+                if errno != libc::EINTR {
+                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3640,13 +3714,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
 
             let sent = loop {
-                let r = unsafe { libc::sendmsg(fd, &msg, flags) };
+                let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                    libc::sendmsg(fd, &msg, flags)
+                });
                 if r >= 0 {
                     break r;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
+                if errno != libc::EINTR {
+                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
