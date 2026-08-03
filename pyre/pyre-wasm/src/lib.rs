@@ -348,6 +348,41 @@ pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
     majit_metainterp::mc_diag(i as usize)
 }
 
+/// Diagnostic-only: the full-body-walk decline census
+/// (`pyre_jit_trace::jitcode_dispatch::census_entries`), which names the
+/// `DispatchError` variant behind every aborted walk. The map is always
+/// populated; only its `[fbw-census]` print is gated on
+/// `PYRE_FBW_DEBUG_ABORT`, which a wasm guest can neither read nor print, so
+/// these three exports are the only channel that carries the attribution out.
+///
+/// The names are `&'static str` in guest memory: `..._name` returns
+/// `(ptr << 32) | len` for the host to slice out of the exported memory, and
+/// `..._count` returns that entry's tally. Both index the same sorted order as
+/// `census_entries`, which is stable for a given call — read the length first
+/// and do not interleave with anything that could record a new decline.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_fbw_census_len() -> u32 {
+    pyre_jit_trace::jitcode_dispatch::census_entries().len() as u32
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_fbw_census_name(i: u32) -> u64 {
+    match pyre_jit_trace::jitcode_dispatch::census_entries().get(i as usize) {
+        Some((name, _)) => ((name.as_ptr() as u64) << 32) | name.len() as u64,
+        None => 0,
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_fbw_census_count(i: u32) -> u64 {
+    pyre_jit_trace::jitcode_dispatch::census_entries()
+        .get(i as usize)
+        .map_or(0, |&(_, count)| count as u64)
+}
+
 /// Sign-stable JIT counters that read 0 in a healthy run, the same badness
 /// fields the native `[jit-stats]` line reports (`pyrex` maybe_print_jit_stats).
 /// A nonzero value means a trace aborted or an internal compile bug degraded
@@ -380,6 +415,35 @@ pub extern "C" fn pyre_jit_internal_compile_panics() -> u64 {
         .0
         .get_stats()
         .internal_compile_panics as u64
+}
+
+/// The rest of the native `[jit-stats]` line. These are not sign-stable, so
+/// each is gated on its own terms rather than against zero: `loops_compiled`
+/// fails on any FALL, `guard_failures` on a rise past a band, and
+/// `bridges_compiled` on neither direction, since it moves both ways under
+/// ordinary tuning.
+///
+/// They come out of the same `JitStats` the fields above read, and were simply
+/// never exported. Their absence was not neutral: a count-valued field missing
+/// from a recorded baseline is skipped silently, so a change that stopped
+/// compiling a loop altogether aborted nothing and *lowered* `guard_failures` —
+/// both remaining gates read the loss as an improvement.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_loops_compiled() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().loops_compiled as u64
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_bridges_compiled() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().bridges_compiled as u64
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_guard_failures() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().guard_failures as u64
 }
 
 /// The descr-universe invariants, the remaining `JITSTATS_BADNESS_FIELDS`. The

@@ -13,11 +13,24 @@
 //! curated set of host-neutral runtime syscalls (memory, signals, time, and I/O
 //! on the already-open marshalling fds 0/1/2) and TRAPs anything else to a
 //! SIGSYS handler that names the blocked syscall and exits — so
-//! `open`/`openat`/`socket`/`connect`/`execve`/`fork`/`clone`/`ptrace` and the
-//! rest of the host-affecting surface are simply unreachable. It is
+//! `open`/`openat`/`socket`/`connect`/`execve`/`ptrace` and the rest of the
+//! host-affecting surface are simply unreachable. It is
 //! installed in the child *after* interpreter startup (which legitimately opens
 //! files, allocates, seeds hashing, …) and *before* the first byte of untrusted
 //! code, so those startup syscalls run unfiltered while user code does not.
+//!
+//! `fork` is NOT among them, despite what this list used to claim. The JIT
+//! needs threads, so `clone`/`clone3` are allowlisted, and glibc builds `fork`
+//! out of `clone(SIGCHLD)` — a filter that admits thread creation by syscall
+//! number admits process creation with it. Telling the two apart means testing
+//! `CLONE_THREAD`, which classic BPF can do for `clone` (a register argument)
+//! but not for `clone3`, whose flags live in a struct behind a pointer the
+//! filter cannot dereference; forcing glibc down the `clone` path would mean
+//! answering `clone3` with `ENOSYS`. What a forked child gains is bounded: it
+//! inherits this filter, so it cannot `exec`, open a path, or reach the
+//! network, and it shares the marshalling fds with a controller that mediates
+//! every request. The reachable cost is a fork bomb and a second writer on the
+//! request pipe, not an escape.
 //!
 //! Over-listing a benign syscall here cannot widen the escape surface (every
 //! listed call is host-neutral); omitting one the runtime needs only
@@ -190,6 +203,18 @@ fn allowed_syscalls() -> Vec<u32> {
         libc::SYS_futex,
         libc::SYS_sched_yield,
         libc::SYS_sched_getaffinity,
+        // Which NUMA node the caller runs on. mimalloc stamps it on every new
+        // thread's TLD and on every arena it reserves (`mimalloc/src/init.c`
+        // `mi_tld_alloc`, `src/arena.c` `mi_arena_reserve`), and its
+        // `_mi_prim_numa_node` goes straight to the syscall rather than the
+        // vDSO. The lookup is skipped entirely while the cached node count is
+        // 1, so this is unreachable on a single-node machine and issued on
+        // every arena reservation on a multi-node one — which is why it can sit
+        // unnoticed until the sandbox runs on a two-socket host. The node count
+        // behind that cache is what `install_runtime_filter` primes; this entry
+        // covers the lookups that keep happening afterwards. Reads topology,
+        // changes nothing — the same standing as `sched_getaffinity` above.
+        libc::SYS_getcpu,
         libc::SYS_getrandom,
         libc::SYS_set_robust_list,
         libc::SYS_set_tid_address,
@@ -200,6 +225,9 @@ fn allowed_syscalls() -> Vec<u32> {
         // falls back to `clone`; allow both. A spawned thread inherits this same
         // filter, so it is confined identically — thread creation stays
         // host-neutral (its stack/sync syscalls are already listed above).
+        // Listing them by number also lets `fork` through, since glibc spells it
+        // `clone(SIGCHLD)`; see the module docs for why that is bounded and what
+        // separating the two would cost.
         libc::SYS_clone,
         libc::SYS_clone3,
         // Time (mostly served by the vDSO, but allow the syscall fallbacks).
@@ -209,7 +237,8 @@ fn allowed_syscalls() -> Vec<u32> {
         libc::SYS_nanosleep,
         libc::SYS_gettimeofday,
         // Process self-info (read-only) + own resource limits/usage + abort path
-        // + clean exit. tkill/tgkill only ever target this single-threaded child.
+        // + clean exit. tkill/tgkill reach only this process group's own threads,
+        // which are confined by the very filter they inherited.
         libc::SYS_getpid,
         libc::SYS_gettid,
         libc::SYS_getrusage,
@@ -295,6 +324,28 @@ pub fn install_runtime_filter() -> io::Result<()> {
         let t: libc::time_t = 0;
         let mut tm: libc::tm = core::mem::zeroed();
         libc::gmtime_r(&t, &mut tm);
+    }
+
+    // mimalloc defers its NUMA detection to the first thread it builds a TLD
+    // for. The main thread uses a static `tld_main` that never asks; only
+    // `mi_tld_alloc` stamps `tld->numa_node = _mi_os_numa_node()`, and the
+    // first such call counts the nodes by `access`ing
+    // `/sys/devices/system/node/nodeN` until one is missing
+    // (`mimalloc/src/init.c`, `src/prim/unix/prim.c`). That probe is a path
+    // lookup the filter refuses, so without this a sandboxed program that
+    // starts a thread — `_thread`, `threading` — takes SIGSYS inside the new
+    // thread, and the handler's `_exit` tears down the whole child. The count
+    // is a process-global cached once and never recomputed, so priming it here,
+    // while path lookups are still allowed, settles it for every later thread.
+    // The thread has to actually allocate: mimalloc builds a thread's TLD on
+    // its first allocation, so a primer that only starts and exits leaves the
+    // detection exactly where it was.
+    if let Ok(primer) = std::thread::Builder::new().spawn(|| {
+        let n = core::hint::black_box(64usize);
+        let v: Vec<u8> = Vec::with_capacity(n);
+        core::hint::black_box(&v);
+    }) {
+        let _ = primer.join();
     }
 
     // Install the SIGSYS handler before the filter so a denied syscall is
