@@ -223,7 +223,7 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
             return false;
         };
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+            if fbw_strict_diag_enabled() {
                 eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
             }
             return false;
@@ -244,7 +244,7 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
             && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
         {
-            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+            if fbw_strict_diag_enabled() {
                 eprintln!(
                     "[strict-reject] pc={} op={} (non-static vable)",
                     d.pc, d.opname
@@ -332,7 +332,7 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
             && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
         {
-            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+            if fbw_strict_diag_enabled() {
                 eprintln!(
                     "[strict-reject-mf] pc={} op={} base_reg={:?} frame_reg={callee_frame_reg} \
                      (non-static, foreign vable)",
@@ -573,7 +573,7 @@ pub(crate) fn collect_callee_active_boxes(
         carried_jitcode_pc,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
-    let diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
+    let diag = fbw_mf_diag_enabled();
     let read = |bank: &[OpRef], idx: u32, name: &str| -> Result<OpRef, DispatchError> {
         match bank.get(idx as usize).copied() {
             Some(v) if v != OpRef::NONE => Ok(v),
@@ -844,13 +844,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         match driver.get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types) {
             Some(token) => token,
             None => {
-                if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                if p2_diag_enabled() {
                     eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
                 }
                 return Ok(None);
             }
         };
-    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+    if p2_diag_enabled() {
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
 
@@ -1502,41 +1502,36 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     Some((args, concretes))
 }
 
-thread_local! {
-    /// Memo for [`callee_body_has_abort_permanent`], keyed by the stable
-    /// `CodeObject` pointer.  The answer is a static property of the callee's
-    /// assembled body, so it is computed once per code object instead of once
-    /// per inline attempt — the scan is O(body) and the callsite is reached on
-    /// every retrace of every caller.
-    ///
-    /// The raw address is a sound permanent key only because `w_code_new`
-    /// (`pycode.rs`) allocates every `PyCode` with `Box::into_raw` and nothing
-    /// frees it, so the address is unique for the process and never moves.
-    /// `eval.rs`'s `PyCode` registration names the change that would end that —
-    /// switching `w_code_new` to `try_gc_alloc_stable` — after which a
-    /// reclaimed address could return another code object's answer, and here
-    /// a stale `false` would admit an inline whose body does carry
-    /// `abort_permanent`.  Same invariant as `FBW_HAZARDOUS_INLINE_DENY`
-    /// (`fbw_state.rs`).
-    static CALLEE_ABORT_PERMANENT_SEEN: std::cell::RefCell<std::collections::BTreeMap<usize, bool>> =
-        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
-}
-
-/// Whether the callee's assembled body contains an `abort_permanent` marker.
+/// Body-shape verdicts for a callee's per-fn JitCode, decided once and kept on
+/// the payload ([`crate::pyjitcode::InlineBodyFacts`]).
 ///
-/// Same scan `loop_inlines_abort_permanent_callee` runs over a `SubJitCodeBody`
-/// (`trace.rs`), memoized here because this is the per-callsite path.
-fn callee_body_has_abort_permanent(w_code: *const (), body: &SubJitCodeBody) -> bool {
-    let key = w_code as usize;
-    if let Some(hit) = CALLEE_ABORT_PERMANENT_SEEN.with(|m| m.borrow().get(&key).copied()) {
-        return hit;
-    }
-    let hit =
-        crate::jitcode_runtime::decoded_ops(body.code).any(|op| op.opname == "abort_permanent");
-    CALLEE_ABORT_PERMANENT_SEEN.with(|m| {
-        m.borrow_mut().insert(key, hit);
-    });
-    hit
+/// Every predicate behind this decodes the whole callee body, and the inline
+/// recipes ask them per call site, on every trace that reaches the call — so
+/// answering them here is the difference between one scan per callee and one
+/// per call site. `None` when the code has no installed jitcode body or descr
+/// pool, which is the same condition the callers already decline on.
+fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::InlineBodyFacts> {
+    let body = crate::state::sub_jitcode_body_for_code(code)?;
+    let (descr_refs, _, _) = crate::state::sub_jitcode_descr_pool_for_code(code)?;
+    // Resolved after the two lookups above so that a code object without an
+    // installed body never caches a verdict computed from an absent one.
+    let pjc = crate::state::pyjitcode_for_code(code)?;
+    Some(
+        *pjc.inline_body_facts
+            .get_or_init(|| crate::pyjitcode::InlineBodyFacts {
+                contains_raise: callee_body_contains_raise(body.code),
+                has_abort_permanent: crate::jitcode_runtime::decoded_ops(body.code)
+                    .any(|op| op.opname == "abort_permanent"),
+                method_form_supported: method_form_callee_body_supported(body.code, descr_refs),
+                exc_override_straight_line: exception_string_override_straight_line(body.code),
+                exc_override_sample_safe: exception_string_override_sample_safe(
+                    body.code, descr_refs,
+                ),
+                exc_override_has_nested_call: exception_string_override_has_nested_call(
+                    body.code, descr_refs,
+                ),
+            }),
+    )
 }
 
 pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
@@ -1572,7 +1567,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     if pyre_helper != majit_ir::PyreHelperKind::CallFn && !is_call_kw && !is_call_function_ex {
         return Ok(None);
     }
-    if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+    if fbw_inline_diag_enabled() {
         eprintln!(
             "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={}",
             op.pc,
@@ -1587,7 +1582,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     // inline" and knowing why.
     macro_rules! decline {
         ($why:expr) => {{
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[inline-decline] pc={} why={}", op.pc, $why);
             }
             return Ok(None);
@@ -1656,7 +1651,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             unsafe { pyre_object::type_name_of(callable) }
         ));
     };
-    if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+    if fbw_inline_diag_enabled() {
         // Name the callee: a pc alone does not say which function a decline
         // cost, and one trace reaches several.
         let name = unsafe {
@@ -2590,7 +2585,15 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // Whole-body, like upstream's whole-graph test: a marker on a path this
     // trace happens not to take still costs only the inline if we decline,
     // where walking into it costs the whole loop, permanently.
-    if callee_body_has_abort_permanent(w_code, &body) {
+    //
+    // Decided once per callee and kept on its jitcode payload rather than
+    // re-scanned here on every call site that reaches this recipe.  `None`
+    // means no installed body or descr pool, which the pool fetch immediately
+    // below declines on regardless.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.has_abort_permanent {
         return Ok(None);
     }
     // The callee body resolves its `d`/`j` descr operands through its OWN
@@ -2732,9 +2735,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     }
     // An unbound method-form callee whose body reads `self.attr`.  Every entry
     // inlines one; the two declines below are what that reach costs.
-    let widened_method_form = method_form
-        && bound_method.is_none()
-        && !method_form_callee_body_supported(body.code, callee_descr_refs);
+    let widened_method_form =
+        method_form && bound_method.is_none() && !body_facts.method_form_supported;
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
     // Replaying a live-heap mutation would double it, so a Dirty body stays on
@@ -2794,7 +2796,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 foriter_dirty_bound
             }
         };
-        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        if fbw_inline_diag_enabled() {
             eprintln!(
                 "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} exact_numeric_args={} \
                  safety={safety:?} deferred_admit={foriter_deferred_admit}",
@@ -2829,8 +2831,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // every entry inlined before the widening -- 3.6x on
         // `for i in range(400000): t += b.bump(i)` over
         // `def bump(self, n): if n < 0: raise ValueError(n); return n + 1`.
-        if widened_method_form && callee_body_contains_raise(body.code) {
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        if widened_method_form && body_facts.contains_raise {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[inline-method-form] decline pc={}", op.pc);
             }
             return Ok(None);
@@ -2936,7 +2938,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         u16::MAX
     };
     let inline_depth = ctx.session.borrow().framestack.len();
-    let contains_raise = callee_body_contains_raise(body.code);
+    let contains_raise = body_facts.contains_raise;
     if contains_raise
         && !strict_inlinable
         && jitcode_has_exception_handler(body.code)
@@ -4662,7 +4664,12 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return Ok(None);
     };
-    if !exception_string_override_straight_line(body.code) {
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
         return Ok(None);
     }
     // A nested call in the override body (e.g. `return repr(self.args)`) is
@@ -4683,7 +4690,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         crate::state::sub_jitcode_body_for_code(w_code),
         crate::state::sub_jitcode_descr_pool_for_code(w_code),
     ) {
-        if exception_string_override_sample_safe(body.code, callee_descr_refs) {
+        if body_facts.exc_override_sample_safe {
             let sampled = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 pyre_interpreter::call::call_function_impl_result(method, &[concrete_receiver])
@@ -4802,14 +4809,19 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return Ok(None);
     };
-    if !exception_string_override_straight_line(body.code) {
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
         return Ok(None);
     }
     let Some((getter_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
     else {
         return Ok(None);
     };
-    if exception_string_override_has_nested_call(body.code, getter_descr_refs) {
+    if body_facts.exc_override_has_nested_call {
         return Ok(None);
     }
 
@@ -4899,14 +4911,19 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return Ok(None);
     };
-    if !exception_string_override_straight_line(body.code) {
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
         return Ok(None);
     }
     let Some((setter_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
     else {
         return Ok(None);
     };
-    if exception_string_override_has_nested_call(body.code, setter_descr_refs) {
+    if body_facts.exc_override_has_nested_call {
         return Ok(None);
     }
 
@@ -5015,7 +5032,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // reason line the only observable is the runtime.
     macro_rules! decline {
         ($why:expr) => {{
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[binop-inline-decline] pc={} why={}", op.pc, $why);
             }
             return Ok(None);
@@ -5137,7 +5154,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             ConcreteValue::Ref(obj)
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            if fbw_inline_diag_enabled() {
                 eprintln!(
                     "[binop-inline-abort] pc={} why={}.{dunder} returned NotImplemented",
                     op.pc,
