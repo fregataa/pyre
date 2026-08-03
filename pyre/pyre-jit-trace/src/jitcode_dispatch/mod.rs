@@ -2240,6 +2240,48 @@ impl DispatchError {
         }
     }
 
+    /// Whether this abort leaves the walk's MIFrame image COMPLETE — the walker
+    /// stopped because it cannot MODEL the next operation, not because a value
+    /// it needs is missing.
+    ///
+    /// Only the first family has an upstream counterpart.  Every RPython
+    /// `SwitchToBlackhole` is a stop-tracing DECISION taken with the registers
+    /// bound (`ABORT_TOO_LONG`, `ABORT_BRIDGE`, …), which is why
+    /// `_copy_data_from_miframe` (`blackhole.py:1713-1730`) copies the banks
+    /// unconditionally and has no failing path.  Pyre's walker resolves
+    /// registers, descrs and concretes lazily against the live trace context,
+    /// so a second family exists here that upstream has no analog for: the
+    /// abort IS the report that a value is unavailable
+    /// (`RegisterReadUnbound`, `*NotConcrete`, `*ArgUnbound`, a malformed
+    /// descr).  Converting one of those to a blackhole resumes execution on
+    /// exactly the hole the walker refused to read, so those keep the legacy
+    /// entry replay.
+    ///
+    /// An allow-list, not a deny-list: a class left out only forgoes the
+    /// handoff, while a class wrongly let in resumes on missing data.
+    pub(crate) fn leaves_complete_image(&self) -> bool {
+        matches!(
+            self,
+            Self::UndecodableOpcode { .. }
+                | Self::UnsupportedOpname { .. }
+                | Self::OrthodoxSubWalkTraceUnsupported { .. }
+                | Self::UnfoldableListAppendResidualUnsupported { .. }
+                | Self::MayForceNullRefArgUnsupported { .. }
+                | Self::InplaceContainerMutationUnsupported { .. }
+                | Self::NonStandardVableFinishPortalUnsupported { .. }
+                | Self::InlineCallArityMismatch { .. }
+                | Self::InlineCallIntArityMismatch { .. }
+                | Self::InlineCallFloatArityMismatch { .. }
+                // The direct counterpart of `pyjitpl.py:1116`
+                // `raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)`:
+                // taken with the registers bound, after `do_force_quasi_immutable`
+                // already ran.  Classified here for what it is; the general leg
+                // still steps aside for it, because it owns a narrower one that
+                // resumes AT the forcing opcode (`flush_qmut_abort_state`).
+                | Self::ForceQuasiImmutable { .. }
+        )
+    }
+
     /// Construct the callee-inline decline.  The
     /// `LoopBearingCalleeInlineUnsupported` variant is emitted from ~20 sites
     /// (multi-frame seed preconditions, snapshot capture, hazard scan), so
@@ -2495,7 +2537,53 @@ pub fn walk<Sym: WalkSym>(
     let mut pc = start_pc;
     loop {
         let opcode_position = pc;
-        let (outcome, next_pc) = step(code, pc, ctx)?;
+        let (outcome, next_pc) = match step(code, pc, ctx) {
+            Ok(stepped) => stepped,
+            Err(error) => {
+                // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing`
+                // parity.  Upstream has ONE abort path: every abort inside
+                // `_interpret` raises `SwitchToBlackhole`, and
+                // `blackhole.py:1799 convert_and_run_from_pyjitpl` FINISHES the
+                // frames the walk reached — it never returns to the caller and
+                // never replays the aborted region.  The walk executes
+                // residuals concretely, so replaying from the trace entry
+                // re-applies every effect it already committed.
+                //
+                // Only the `is_too_long()` arm below (and the bridge sub-walk,
+                // `bridge_subwalk.rs`) used to latch that image, which left
+                // every other `DispatchError` — the whole capability-gap family
+                // — aborting with no handoff at all.  Latch here instead, at
+                // the step that failed, so the class of the abort stops
+                // deciding whether the recovery exists.
+                //
+                // `latch_abort_blackhole` is fully gated: a non-authoritative
+                // walk, an incomplete register image, or an unsupported frame
+                // shape all decline and leave the legacy entry replay in place,
+                // so an unlatched abort is never worse than before.
+                //
+                // Kept in lockstep with the epilogue's own exclusions
+                // (`run_perfn_walk`, `WalkEndCommitLeg::WalkAbort`): the two
+                // gh#467 CALL-forward classes have a more precise recovery that
+                // resumes the OUTER frame at its CALL, so staging an image no
+                // consumer will take would only retain it to the next walk's
+                // reset.  `VableEscapedDuringResidualCall` needs no exclusion —
+                // it latches its narrower resume-marker image at force time,
+                // before the error unwinds here, so the guard below defers to it.
+                let carrier_owned = matches!(
+                    error,
+                    DispatchError::AbortPermanentMarkerReached { .. }
+                        | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+                );
+                // Kept in lockstep with the epilogue's own gate: an abort that
+                // reports a MISSING value cannot be converted, because the
+                // image it would hand the blackhole is the one that just
+                // failed to resolve ([`DispatchError::leaves_complete_image`]).
+                if error.leaves_complete_image() && !carrier_owned && !abort_blackhole_latched() {
+                    let _ = latch_abort_blackhole(ctx, error.stop_pc());
+                }
+                return Err(error);
+            }
+        };
         pc = next_pc;
         // pyjitpl.py:2865 `_interpret`: `blackhole_if_trace_too_long()` runs
         // after every `run_one_step()`. This loop is that loop's counterpart —
@@ -5883,6 +5971,17 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
         }
+        // The operand-stack image is resolved to concrete refs at latch time and
+        // then held plainly until the adopter publishes it, which is the same
+        // invisible-to-the-collector window as the Ref bank above.  The escape
+        // flush avoids the question by rooting its stack for the duration of the
+        // flush call (`push_resume_ref_roots`); this one outlives a single call,
+        // so it is forwarded here instead.
+        if let Some(mirror) = latched.mirror_stack.as_mut() {
+            for slot in mirror.slots.iter_mut() {
+                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+            }
+        }
     }
     let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
     if let Some(latched) = multi_frame_blackhole.as_mut() {
@@ -5893,6 +5992,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
+        }
+        // Same window as the single-frame arm above.
+        if let Some(mirror) = latched.mirror_stack.as_mut() {
+            for slot in mirror.slots.iter_mut() {
+                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+            }
         }
     }
     // The bridge/retrace iterator cursor journal holds a range iterator across
@@ -7759,20 +7864,51 @@ fn compare_box_provably_dead<Sym: WalkSym>(
     compare_pc: usize,
     dst_reg: u8,
 ) -> bool {
+    matches!(
+        classify_compare_box_use(ctx, compare_pc, dst_reg),
+        CompareBoxUse::FeedsBranchOnly { arms_dead: true }
+    )
+}
+
+/// What the forward JitCode lookahead found the compare's boxed Ref dst
+/// register used for.  Splitting conditions 1-3 (the *shape*) from condition 4
+/// (the arm liveness) lets the two consumers ask for what each needs:
+/// [`compare_box_provably_dead`] wants both, while the guarded-`newbool`
+/// emission wants only the shape.
+pub(crate) enum CompareBoxUse {
+    /// Conditions 1-3: exactly one op reads `dst_reg`, it is the
+    /// `is_true`-shaped residual, and the scan terminates at the
+    /// `goto_if_not` that reads its result.  The box therefore only ever
+    /// decides a branch.
+    FeedsBranchOnly {
+        /// Condition 4: `dst_reg`'s color is dead at BOTH branch arms.
+        arms_dead: bool,
+    },
+    /// Anything else — an escape to a local, an arithmetic use, a second
+    /// reader, register reuse, a kept-on-stack short-circuit, or no branch at
+    /// all.
+    Other,
+}
+
+fn classify_compare_box_use<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    compare_pc: usize,
+    dst_reg: u8,
+) -> CompareBoxUse {
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
-        return false;
+        return CompareBoxUse::Other;
     }
     // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
     // pointer live for the full-body walk, immutable layout fields only.
     let (code, jitcode_index, payload): (&[u8], i32, &crate::PyJitCode) = unsafe {
         let sym = &*full_body_sym;
         if sym.jitcode().is_null() {
-            return false;
+            return CompareBoxUse::Other;
         }
         let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
-            return false;
+            return CompareBoxUse::Other;
         }
         (
             jc.payload.jitcode.code.as_slice(),
@@ -7781,7 +7917,7 @@ fn compare_box_provably_dead<Sym: WalkSym>(
         )
     };
     let Some(start) = crate::jitcode_runtime::decode_op_at(code, compare_pc) else {
-        return false;
+        return CompareBoxUse::Other;
     };
     let mut pc = start.next_pc;
     let mut readers = 0u32;
@@ -7789,7 +7925,7 @@ fn compare_box_provably_dead<Sym: WalkSym>(
     let mut goto_if_not_pc: Option<usize> = None;
     for _ in 0..64 {
         let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
-            return false;
+            return CompareBoxUse::Other;
         };
         // Decode this op's operands, tracking reads/writes of dst_reg.
         let mut cursor = op.pc + 1;
@@ -7826,13 +7962,13 @@ fn compare_box_provably_dead<Sym: WalkSym>(
                     }
                     cursor += 1;
                 }
-                _ => return false,
+                _ => return CompareBoxUse::Other,
             }
         }
         if writes {
             // dst overwritten before/at a read — give up (the value we'd
             // elide is not the one this op produces; stay conservative).
-            return false;
+            return CompareBoxUse::Other;
         }
         if reads {
             readers += 1;
@@ -7844,19 +7980,19 @@ fn compare_box_provably_dead<Sym: WalkSym>(
             break;
         }
         if op.opname == "goto" || op.opname == "raise" || op.opname == "ref_return" {
-            return false;
+            return CompareBoxUse::Other;
         }
         pc = op.next_pc;
     }
-    // Conditions 1–3.
+    // Conditions 1-3.
     if readers != 1 || !reader_is_is_true {
-        return false;
+        return CompareBoxUse::Other;
     }
     let Some(gin_pc) = goto_if_not_pc else {
-        return false;
+        return CompareBoxUse::Other;
     };
     let Some(gin_op) = crate::jitcode_runtime::decode_op_at(code, gin_pc) else {
-        return false;
+        return CompareBoxUse::Other;
     };
     // Condition 4: `dst_reg`'s color must be dead at BOTH branch arms (the
     // POP_JUMP pops the tested bool regardless of direction, so the
@@ -7891,10 +8027,9 @@ fn compare_box_provably_dead<Sym: WalkSym>(
             crate::state::frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, marker as i32);
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
-    if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {
-        return false;
+    CompareBoxUse::FeedsBranchOnly {
+        arms_dead: !arm_dst_live(fallthrough_jc) && !arm_dst_live(target_jc),
     }
-    true
 }
 
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
