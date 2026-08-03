@@ -3652,6 +3652,25 @@ impl JitCodeBuilder {
                  expected RuntimeBhDescr::Call, got {other:?}"
             ),
         };
+        // The funcbox baked below is read back by `executor.rs`'s `Type::Float`
+        // arm through an `extern "C" fn(..) -> f64` ABI, i.e. out of the
+        // floating-point return register.  That is right for a raw callee
+        // address — `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)` — and
+        // wrong for a `_concrete` wrapper, which the helper policy attributes
+        // give an `-> i64` signature carrying `f64::to_bits`
+        // (`emit_helper_call_target_fn`, `majit-macros/src/lib.rs:605-614`).
+        // Only the `*_float_wrapped` call policies mint that divergence — for
+        // `jit_release_gil` it arrives via `_call_aroundstate_target_<name>`,
+        // whose first element is that same `_concrete` wrapper — and no crate
+        // declares one; assert the invariant here so the first declaration
+        // trips a build rather than silently stamping a float read out of the
+        // integer return register.
+        debug_assert_eq!(
+            target.trace_ptr, target.concrete_ptr,
+            "float residual call bakes concrete_ptr as its funcbox; a distinct \
+             concrete target is the i64-packing `_concrete` wrapper and would be \
+             read from the wrong return register"
+        );
         let concrete_ptr = target.concrete_ptr as i64;
         let effect_info =
             resolve_call_release_gil_target(effect_info, target.concrete_ptr, target.save_err);

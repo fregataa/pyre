@@ -8438,10 +8438,11 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 ///
 /// The C ABI returns `f64` in xmm0 / d0, so a float-returning callee cannot be
 /// reached through [`call_int_function`]'s `-> i64` transmute — that reads the
-/// integer return register.  Float *arguments* have the same problem in the
-/// other direction: they travel in the FP register file, so they are split out
-/// here and handed to [`bh_call_f_dispatch`], which is pyre's stand-in for the
-/// per-descr stub `descr.py:598-612 create_call_stub` generates upstream.
+/// integer return register. Float *arguments* have the same problem in the
+/// other direction: they travel in the FP register file, so the ordered C-ABI
+/// class sequence is handed to [`bh_call_f_dispatch`], which is pyre's
+/// stand-in for the per-descr stub `descr.py:574` / `descr.py:604-605
+/// create_call_stub` generates upstream.
 ///
 /// `args[i]` for a `Type::Float` slot carries the raw `f64::to_bits`, matching
 /// the `args_f` bank convention (`longlong` float storage).
@@ -8452,25 +8453,7 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// Neither can arrive here: this seam is fed by `descr.arg_types()`, and
 /// `CallDescr::arg_classes` (`majit-ir/src/descr.rs`) maps `Type` onto
 /// `'i'`/`'r'`/`'f'`/`'v'` exhaustively, so a `Type::Float` slot is always
-/// class `'f'`.  Teaching `Type` those classes must extend both sites.
-///
-/// # Panics
-/// `bh_call_f_dispatch` recovers the callee signature from the *bucketed*
-/// `(ints, floats)` arity, i.e. `fn(I × ints, F × floats)`.  Reordering an
-/// interleaved signature into that shape is ABI-preserving only where the
-/// integer and floating-point parameters are assigned from two independent
-/// register files in their own relative order (SysV, AAPCS).  The Microsoft
-/// x64 convention instead assigns the first four arguments *by position* —
-/// `fn(f64, i64)` takes xmm0/rdx where `fn(i64, f64)` takes rcx/xmm1 — so the
-/// reordering would put both arguments in the wrong register there.  An
-/// interleaved signature is therefore rejected rather than dispatched
-/// differently per target.  Upstream needs no such restriction because
-/// `descr.py:598-612 create_call_stub` generates a stub carrying the descr's
-/// real `arg_classes` signature; the convergence path for pyre is the libffi
-/// dispatch already recorded at `call_stub.rs` `dispatch_arity_body!`'s
-/// catch-all arm.  Every float-returning helper in the tree today is
-/// non-interleaved (`jit_bigint_to_f64_or_inf(ref) -> f64`,
-/// `jit_float_abs(f64) -> f64`, `jit_float_fmod(f64, f64) -> f64`).
+/// class `'f'`. Teaching `Type` those classes must extend both sites.
 pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
     // Where a backend cannot build a `call_indirect` whose type matches the
     // callee's real signature (wasm32), route through the host trampoline,
@@ -8478,25 +8461,73 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
     if let Some(hook) = majit_backend::call_stub::residual_host_call() {
         return f64::from_bits(hook(func_ptr as usize, args) as u64);
     }
-    let mut int_args: Vec<i64> = Vec::with_capacity(args.len());
-    let mut float_args: Vec<f64> = Vec::new();
-    for (i, &a) in args.iter().enumerate() {
-        match arg_types.get(i) {
-            Some(Type::Float) => float_args.push(f64::from_bits(a as u64)),
-            _ => {
-                assert!(
-                    float_args.is_empty(),
-                    "call_float_function: an integer/ref parameter after a float \
-                     one cannot be bucketed into `bh_call_f_dispatch`'s \
-                     `fn(I.., F..)` signature without changing which register \
-                     each argument lands in on a positional-slot ABI"
-                );
-                int_args.push(a);
-            }
-        }
-    }
+    let classes = arg_classes_from_types(args.len(), arg_types);
     unsafe {
-        majit_backend::call_stub::bh_call_f_dispatch(func_ptr as usize, &int_args, &float_args)
+        majit_backend::call_stub::bh_call_f_dispatch(
+            func_ptr as usize,
+            &classes[..args.len()],
+            args,
+        )
+    }
+}
+
+/// `descr.arg_types()` projected onto the ordered C-ABI class list the
+/// `bh_call_*_dispatch` table takes.
+///
+/// This is `descr.py:648-649`'s `arg_classes = map(map_type_to_argclass, ARGS)`
+/// collapsed onto the two register classes the table can express: `Int` and
+/// `Ref` both travel in an integer register, `Float` in a floating-point one
+/// (`descr.py:556-570 TYPE()`).
+///
+/// Returns the fixed-size buffer so the residual-call path stays
+/// allocation-free; callers slice it to `args.len()`.  A positional slot with
+/// no declared type is forwarded as a machine word, matching the untyped
+/// [`call_int_function`] / [`call_void_function`] seams.
+fn arg_classes_from_types(
+    args_len: usize,
+    arg_types: &[Type],
+) -> [majit_backend::call_stub::ArgClass; MAX_HOST_CALL_ARITY] {
+    assert!(
+        args_len <= MAX_HOST_CALL_ARITY,
+        "unsupported JitCode typed call arity {args_len} (max {MAX_HOST_CALL_ARITY})"
+    );
+    let mut classes = [majit_backend::call_stub::ArgClass::Int; MAX_HOST_CALL_ARITY];
+    for (i, slot) in classes.iter_mut().enumerate().take(args_len) {
+        *slot = match arg_types.get(i) {
+            Some(Type::Float) => majit_backend::call_stub::ArgClass::Float,
+            Some(Type::Int | Type::Ref) | None => majit_backend::call_stub::ArgClass::Int,
+            // `descr.py:566-567 TYPE('v')` is `lltype.Void`, which upstream
+            // never puts in `arg_classes` for a call it dispatches.
+            Some(Type::Void) => panic!("typed call: void argument class at slot {i}"),
+        };
+    }
+    classes
+}
+
+/// `bh_call_i` / `bh_call_r` parity (`llmodel.py:816`, `:818`) for callers that
+/// hold the `CallDescr`.
+///
+/// `executor.py:52-65` hands `descr` to `cpu.bh_call_i` and `cpu.bh_call_r`
+/// exactly as `:66-72` does to `cpu.bh_call_f`, so the generated stub's
+/// parameter types come from `arg_classes` on all three paths. An Int- or
+/// Ref-returning callee with a `Float` parameter therefore reads it from the
+/// floating-point register file, which [`call_int_function`]'s all-`i64`
+/// transmute cannot deliver.
+///
+/// [`call_int_function`] stays for the seams that genuinely hold no descr —
+/// `execute_varargs`'s portal runner and the CALL_ASSEMBLER family, whose
+/// entry wrapper is `extern "C" fn(..) -> i64` by construction.
+pub fn call_int_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> i64 {
+    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
+        return hook(func_ptr as usize, args);
+    }
+    let classes = arg_classes_from_types(args.len(), arg_types);
+    unsafe {
+        majit_backend::call_stub::bh_call_i_dispatch(
+            func_ptr as usize,
+            &classes[..args.len()],
+            args,
+        )
     }
 }
 
@@ -8726,24 +8757,25 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
     }
 }
 
-/// Void-call dispatcher for signatures carrying Float-bank arguments.  Args
-/// reach here packed into machine words, so a float argument holds its bits in
-/// an `i64` while the callee's C ABI expects it in a floating-point register;
-/// only `arg_types` still records which is which.  Shapes with no float
-/// argument, and the host-trampoline path (which reflects the callee's real
-/// signature and coerces each argument itself), defer to `call_void_function`.
+/// `bh_call_v` parity (`llmodel.py:834`) for callers that hold the `CallDescr`.
+///
+/// Args reach here packed into machine words, so a float argument holds its
+/// bits in an `i64` while the callee's C ABI expects it in a floating-point
+/// register; only `arg_types` still records which is which.  The
+/// host-trampoline path reflects the callee's real signature and coerces each
+/// argument itself, so it takes the positional list unchanged.
 pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) {
-    if majit_backend::call_stub::residual_host_call().is_some() || !arg_types.contains(&Type::Float)
-    {
+    if majit_backend::call_stub::residual_host_call().is_some() {
         call_void_function(func_ptr, args);
         return;
     }
-    match (args, arg_types) {
-        ([a0, a1, a2, a3], [Type::Ref, Type::Int, Type::Int, Type::Float]) => unsafe {
-            let func: extern "C" fn(i64, i64, i64, f64) = std::mem::transmute(func_ptr);
-            func(*a0, *a1, *a2, f64::from_bits(*a3 as u64));
-        },
-        _ => call_void_function(func_ptr, args),
+    let classes = arg_classes_from_types(args.len(), arg_types);
+    unsafe {
+        majit_backend::call_stub::bh_call_v_dispatch(
+            func_ptr as usize,
+            &classes[..args.len()],
+            args,
+        );
     }
 }
 
@@ -8913,6 +8945,33 @@ mod tests {
     use crate::jitcode::JitCodeBuilder;
     use crate::virtualizable::VirtualizableInfo;
     use majit_ir::Type;
+
+    extern "C" fn scale_f64(x: f64, k: i64) -> f64 {
+        x * k as f64
+    }
+
+    #[test]
+    fn interleaved_int_after_float_dispatches_in_declaration_order() {
+        let result = call_float_function(
+            scale_f64 as *const (),
+            &[2.5_f64.to_bits() as i64, 3],
+            &[Type::Float, Type::Int],
+        );
+        assert_eq!(result, 7.5, "scale_f64(2.5, 3) == 7.5");
+    }
+
+    #[test]
+    fn float_after_int_dispatches() {
+        extern "C" fn scale_swapped(k: i64, x: f64) -> f64 {
+            x * k as f64
+        }
+        let result = call_float_function(
+            scale_swapped as *const (),
+            &[3, 2.5_f64.to_bits() as i64],
+            &[Type::Int, Type::Float],
+        );
+        assert_eq!(result, 7.5, "scale_swapped(3, 2.5) == 7.5");
+    }
 
     #[derive(Default)]
     struct DummySym;
