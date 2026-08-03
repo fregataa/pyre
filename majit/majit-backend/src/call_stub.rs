@@ -13,6 +13,8 @@
 //! Microsoft x64 positional-slot convention and is also correct under SysV and
 //! AAPCS.
 
+use majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY;
+
 /// `descr.py:556-570 TYPE()` collapsed to the two C-ABI register classes the
 /// dispatch table can express: `'i'`, `'r'` and `'L'` (`lltype.Signed`,
 /// `llmemory.GCREF`, `lltype.SignedLongLong`) all pass in an integer register;
@@ -32,6 +34,14 @@ pub enum ArgClass {
 /// as `extern "C" fn(f64, i64)` rather than a class-blind
 /// `extern "C" fn(i64, f64)`. That preserves SysV/AAPCS register-file order
 /// and the Microsoft x64 positional argument slots alike.
+///
+/// Coverage: every ordered sequence up to 5 arguments, plus the all-`Int`
+/// sequences on to `MAX_HOST_CALL_ARITY`. The float-carrying bound is mirrored
+/// by `majit_translate::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`,
+/// which flags such a signature where the calldescr is built instead of at the
+/// deopt that first runs it; widening the arms here means raising it there in
+/// the same change (`majit-translate` cannot call into `majit-backend`, so the
+/// bound is stated on both sides rather than shared).
 macro_rules! dispatch_classes_body {
     ($func:ident, $classes:ident, $args:ident, $ret:ty) => {{
         type I = i64;
@@ -1105,6 +1115,47 @@ pub unsafe fn bh_call_f_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
     unsafe { dispatch_classes_body!(func, classes, args, f64) }
 }
 
+/// The ordered class sequence and matching positional argument list that
+/// [`collect_call_args`] hands to `bh_call_*_dispatch`.
+///
+/// Fixed-size so a residual call allocates nothing. `MAX_HOST_CALL_ARITY` is
+/// the same bound the dispatch table's all-`Int` arms stop at, so a signature
+/// that does not fit here has no arm either.
+pub struct CallArgs {
+    classes: [ArgClass; MAX_HOST_CALL_ARITY],
+    args: [i64; MAX_HOST_CALL_ARITY],
+    len: usize,
+}
+
+impl CallArgs {
+    fn with_arity(arity: usize) -> Self {
+        assert!(
+            arity <= MAX_HOST_CALL_ARITY,
+            "bh_call dispatch: {arity} arguments exceeds MAX_HOST_CALL_ARITY \
+             ({MAX_HOST_CALL_ARITY}); the dispatch table has no arm this wide"
+        );
+        Self {
+            classes: [ArgClass::Int; MAX_HOST_CALL_ARITY],
+            args: [0; MAX_HOST_CALL_ARITY],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, class: ArgClass, arg: i64) {
+        self.classes[self.len] = class;
+        self.args[self.len] = arg;
+        self.len += 1;
+    }
+
+    pub fn classes(&self) -> &[ArgClass] {
+        &self.classes[..self.len]
+    }
+
+    pub fn args(&self) -> &[i64] {
+        &self.args[..self.len]
+    }
+}
+
 /// Build the C-ABI class sequence and positional argument list from
 /// `args_i` / `args_r` / `args_f`, following `calldescr.arg_classes` order.
 ///
@@ -1139,12 +1190,16 @@ pub unsafe fn bh_call_f_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// Mirrors `rpython/jit/backend/llsupport/descr.py:616-620 verify_types`:
 /// the per-class counts in `arg_classes` must match the corresponding list
 /// length, and any unknown class is a codegen bug.
+///
+/// Returns a stack buffer rather than two `Vec`s: this runs on every residual
+/// call the blackhole makes, and upstream's generated stub reaches the callee
+/// with no intermediate collection at all.
 pub fn collect_call_args(
     arg_classes: &str,
     args_i: Option<&[i64]>,
     args_r: Option<&[i64]>,
     args_f: Option<&[i64]>,
-) -> (Vec<ArgClass>, Vec<i64>) {
+) -> CallArgs {
     // descr.py:616-620 verify_types parity: assert per-class counts.
     let count_i: usize = arg_classes
         .chars()
@@ -1171,26 +1226,31 @@ pub fn collect_call_args(
         "BhCallDescr.verify_types: arg_classes={arg_classes:?} has {count_f} float slots, args_f has {len_f}"
     );
 
-    let mut classes: Vec<ArgClass> = Vec::with_capacity(arg_classes.len());
-    let mut args: Vec<i64> = Vec::with_capacity(arg_classes.len());
+    let mut out = CallArgs::with_arity(count_i + count_r + count_f);
     let mut ii = 0usize;
     let mut ri = 0usize;
     let mut fi = 0usize;
     for c in arg_classes.chars() {
         match c {
             'i' => {
-                classes.push(ArgClass::Int);
-                args.push(args_i.expect("BhCallDescr.collect_call_args: args_i missing")[ii]);
+                out.push(
+                    ArgClass::Int,
+                    args_i.expect("BhCallDescr.collect_call_args: args_i missing")[ii],
+                );
                 ii += 1;
             }
             'r' => {
-                classes.push(ArgClass::Int);
-                args.push(args_r.expect("BhCallDescr.collect_call_args: args_r missing")[ri]);
+                out.push(
+                    ArgClass::Int,
+                    args_r.expect("BhCallDescr.collect_call_args: args_r missing")[ri],
+                );
                 ri += 1;
             }
             'f' => {
-                classes.push(ArgClass::Float);
-                args.push(args_f.expect("BhCallDescr.collect_call_args: args_f missing")[fi]);
+                out.push(
+                    ArgClass::Float,
+                    args_f.expect("BhCallDescr.collect_call_args: args_f missing")[fi],
+                );
                 fi += 1;
             }
             'L' => {
@@ -1198,8 +1258,10 @@ pub fn collect_call_args(
                 // (PyPy rewrites `c = 'f'` for the lookup); FUNC parameter
                 // type = `lltype.SignedLongLong` -> C `long long` ->
                 // 8-byte int dispatched in an integer register.
-                classes.push(ArgClass::Int);
-                args.push(args_f.expect("BhCallDescr.collect_call_args: args_f missing")[fi]);
+                out.push(
+                    ArgClass::Int,
+                    args_f.expect("BhCallDescr.collect_call_args: args_f missing")[fi],
+                );
                 fi += 1;
             }
             'S' => {
@@ -1223,7 +1285,7 @@ pub fn collect_call_args(
             ),
         }
     }
-    (classes, args)
+    out
 }
 
 /// Bucket `args_i` / `args_r` / `args_f` into a single positional list in
@@ -1299,8 +1361,8 @@ pub unsafe fn bh_call_i_by_classes(
         let args = collect_call_args_positional(arg_classes, args_i, args_r, args_f);
         return hook(func, &args);
     }
-    let (classes, args) = collect_call_args(arg_classes, args_i, args_r, args_f);
-    unsafe { bh_call_i_dispatch(func, &classes, &args) }
+    let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
+    unsafe { bh_call_i_dispatch(func, collected.classes(), collected.args()) }
 }
 
 /// f64-returning parallel of [`bh_call_i_by_classes`].
@@ -1319,8 +1381,8 @@ pub unsafe fn bh_call_f_by_classes(
         // The trampoline returns an f64 callee result as its raw bits.
         return f64::from_bits(hook(func, &args) as u64);
     }
-    let (classes, args) = collect_call_args(arg_classes, args_i, args_r, args_f);
-    unsafe { bh_call_f_dispatch(func, &classes, &args) }
+    let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
+    unsafe { bh_call_f_dispatch(func, collected.classes(), collected.args()) }
 }
 
 /// Result-discarding parallel of [`bh_call_i_by_classes`].
@@ -1339,8 +1401,8 @@ pub unsafe fn bh_call_v_by_classes(
         let _ = hook(func, &args);
         return;
     }
-    let (classes, args) = collect_call_args(arg_classes, args_i, args_r, args_f);
-    unsafe { bh_call_v_dispatch(func, &classes, &args) }
+    let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
+    unsafe { bh_call_v_dispatch(func, collected.classes(), collected.args()) }
 }
 
 /// A host-provided trampoline that performs a residual call by reflecting the
@@ -1428,5 +1490,62 @@ mod tests {
             )
         };
         assert_eq!(result, 321.0);
+    }
+
+    extern "C" fn four_ints_then_float(a: i64, b: i64, c: i64, d: i64, e: f64) -> i64 {
+        a + b * 10 + c * 100 + d * 1000 + e as i64 * 10000
+    }
+
+    /// The widest float-carrying sequence the table covers, and the bound
+    /// `majit_translate::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`
+    /// states on the descr-build side.
+    #[test]
+    fn call_stub_i_dispatches_a_float_in_the_last_covered_slot() {
+        let result = unsafe {
+            bh_call_i_dispatch(
+                four_ints_then_float as *const () as usize,
+                &[
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Float,
+                ],
+                &[1, 2, 3, 4, 5.0_f64.to_bits() as i64],
+            )
+        };
+        assert_eq!(result, 54321);
+    }
+
+    /// `collect_call_args` fills a fixed buffer, so a signature wider than the
+    /// dispatch table's widest arm is refused while collecting rather than
+    /// overrunning it.
+    #[test]
+    #[should_panic(expected = "exceeds MAX_HOST_CALL_ARITY")]
+    fn collect_call_args_refuses_more_arguments_than_the_table_covers() {
+        let too_many = MAX_HOST_CALL_ARITY + 1;
+        let args_i = vec![0_i64; too_many];
+        let _ = collect_call_args(&"i".repeat(too_many), Some(&args_i), None, None);
+    }
+
+    /// One argument past that bound the table has no arm, so the call is
+    /// refused instead of being placed against the wrong signature.
+    #[test]
+    #[should_panic(expected = "unsupported arg class sequence")]
+    fn call_stub_i_refuses_a_float_past_the_covered_width() {
+        unsafe {
+            bh_call_i_dispatch(
+                four_ints_then_float as *const () as usize,
+                &[
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Float,
+                ],
+                &[1, 2, 3, 4, 5, 6.0_f64.to_bits() as i64],
+            );
+        }
     }
 }
