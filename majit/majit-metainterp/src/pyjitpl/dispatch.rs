@@ -8432,6 +8432,74 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
     }
 }
 
+/// `bh_call_f` parity (`backend/model.py:270`, `llmodel.py:828`) for callers
+/// that hold their arguments in `descr.arg_types()` positional order rather
+/// than in the `args_i`/`args_r`/`args_f` banks the bytecode carries.
+///
+/// The C ABI returns `f64` in xmm0 / d0, so a float-returning callee cannot be
+/// reached through [`call_int_function`]'s `-> i64` transmute — that reads the
+/// integer return register.  Float *arguments* have the same problem in the
+/// other direction: they travel in the FP register file, so they are split out
+/// here and handed to [`bh_call_f_dispatch`], which is pyre's stand-in for the
+/// per-descr stub `descr.py:598-612 create_call_stub` generates upstream.
+///
+/// `args[i]` for a `Type::Float` slot carries the raw `f64::to_bits`, matching
+/// the `args_f` bank convention (`longlong` float storage).
+///
+/// `descr.py:545-569 process` also encodes `'L'` (SignedLongLong — integer
+/// register file) and `'S'` (SingleFloat — `f32`) argument classes, which the
+/// bank-fed [`majit_backend::call_stub::collect_call_args`] carries arms for.
+/// Neither can arrive here: this seam is fed by `descr.arg_types()`, and
+/// `CallDescr::arg_classes` (`majit-ir/src/descr.rs`) maps `Type` onto
+/// `'i'`/`'r'`/`'f'`/`'v'` exhaustively, so a `Type::Float` slot is always
+/// class `'f'`.  Teaching `Type` those classes must extend both sites.
+///
+/// # Panics
+/// `bh_call_f_dispatch` recovers the callee signature from the *bucketed*
+/// `(ints, floats)` arity, i.e. `fn(I × ints, F × floats)`.  Reordering an
+/// interleaved signature into that shape is ABI-preserving only where the
+/// integer and floating-point parameters are assigned from two independent
+/// register files in their own relative order (SysV, AAPCS).  The Microsoft
+/// x64 convention instead assigns the first four arguments *by position* —
+/// `fn(f64, i64)` takes xmm0/rdx where `fn(i64, f64)` takes rcx/xmm1 — so the
+/// reordering would put both arguments in the wrong register there.  An
+/// interleaved signature is therefore rejected rather than dispatched
+/// differently per target.  Upstream needs no such restriction because
+/// `descr.py:598-612 create_call_stub` generates a stub carrying the descr's
+/// real `arg_classes` signature; the convergence path for pyre is the libffi
+/// dispatch already recorded at `call_stub.rs` `dispatch_arity_body!`'s
+/// catch-all arm.  Every float-returning helper in the tree today is
+/// non-interleaved (`jit_bigint_to_f64_or_inf(ref) -> f64`,
+/// `jit_float_abs(f64) -> f64`, `jit_float_fmod(f64, f64) -> f64`).
+pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
+    // Where a backend cannot build a `call_indirect` whose type matches the
+    // callee's real signature (wasm32), route through the host trampoline,
+    // which reflects the signature and returns an f64 result as its raw bits.
+    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
+        return f64::from_bits(hook(func_ptr as usize, args) as u64);
+    }
+    let mut int_args: Vec<i64> = Vec::with_capacity(args.len());
+    let mut float_args: Vec<f64> = Vec::new();
+    for (i, &a) in args.iter().enumerate() {
+        match arg_types.get(i) {
+            Some(Type::Float) => float_args.push(f64::from_bits(a as u64)),
+            _ => {
+                assert!(
+                    float_args.is_empty(),
+                    "call_float_function: an integer/ref parameter after a float \
+                     one cannot be bucketed into `bh_call_f_dispatch`'s \
+                     `fn(I.., F..)` signature without changing which register \
+                     each argument lands in on a positional-slot ABI"
+                );
+                int_args.push(a);
+            }
+        }
+    }
+    unsafe {
+        majit_backend::call_stub::bh_call_f_dispatch(func_ptr as usize, &int_args, &float_args)
+    }
+}
+
 /// `bh_call_r` parity (`backend/model.py:268`, `blackhole.py:1113`).
 ///
 /// Pyre's GC ref is a `*const PyObject` carried as `i64` via the
