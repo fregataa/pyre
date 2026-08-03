@@ -6741,6 +6741,12 @@ impl CodeWriter {
         // switchover. `dispatch_op` in `assembler.rs:510` already routes
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
+        // The value stack as the opcode being walked was entered, refreshed per
+        // PC below and read by `emit_abort_permanent!`.  Declared out here
+        // rather than beside the refresh because a `macro_rules!` body resolves
+        // a non-parameter identifier in the macro's DEFINITION scope.
+        let mut pre_opcode_stack: Vec<super::flow::FlowValue> = Vec::new();
+
         macro_rules! emit_abort_permanent {
             // Straight-line form: the arm has modelled this opcode's stack
             // effect and the walk falls through to the next PC.  The block is
@@ -6750,14 +6756,46 @@ impl CodeWriter {
             }};
             // Terminal form: the marker ends this graph block.  Used by the
             // arms that `continue` out of the dispatch instead of completing
-            // their stack model — the `Call` nargs > 14 arm (which skips its
-            // `push_and_bump!`) and the `LoadFastCheck` unbound arm (which
-            // switches into a dedicated dead-end block that has no successor
-            // by construction).
+            // their stack model — the `Call` nargs > 14 arm (which bails
+            // before touching the operands, so nothing pushes the call result
+            // the fall-through PC expects) and the `LoadFastCheck` unbound arm
+            // (which switches into a dedicated dead-end block that has no
+            // successor by construction).
             ($py_pc:expr, closes_block) => {{
                 emit_abort_permanent!(@emit $py_pc, true)
             }};
             (@emit $py_pc:expr, $closes_block:expr) => {{
+                // Materialize the value stack the interpreter resumes on.
+                // `pyframe.py`'s `pushvalue` lowers every push to a
+                // `setarrayitem_vable_r` (`jtransform.py`'s
+                // `do_fixed_list_setitem`), but pyre's `push_and_bump!` keeps
+                // the pushed value in its SSA register and syncs only
+                // `valuestackdepth`, so a slot last written that way still
+                // reads PY_NULL out of the vable.  Every stack slot the
+                // resumed opcode reads has to be a real one, and the walk
+                // reaches the marker only on a run that is bailing, so nothing
+                // that keeps executing pays for these stores.
+                //
+                // The snapshot, not `current_state`: the marker resumes AT this
+                // opcode, and the arms model the opcode's stack effect before
+                // they bail, so `current_state` here is the state AFTER an
+                // opcode that has not run.
+                for (slot, value) in pre_opcode_stack.iter().enumerate() {
+                    let v_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed((stack_base_absolute + slot) as i64).into();
+                    record_graph_op(
+                        &current_block.block(),
+                        "setarrayitem_vable_r",
+                        vable_setarrayitem_ref_graph_args(
+                            frame_var.into(),
+                            v_idx.into(),
+                            value.clone().into(),
+                        ),
+                        None,
+                        ($py_pc) as i64,
+                    );
+                }
+                emit_vsd!(pre_opcode_stack.len(), $py_pc);
                 // Publish `last_instr` to the vable before the bail so the
                 // blackhole hands the interpreter the right resume
                 // coordinate.  The blackhole replays codewriter jitcode that
@@ -8206,6 +8244,14 @@ impl CodeWriter {
                     // entry. The per-push/per-pop emit_vsd! calls below mirror that.
                     // (The old single-entry flush is removed.)
 
+                    // Snapshot the entry stack for `emit_abort_permanent!`.  The
+                    // marker resumes the interpreter AT this opcode, so what it
+                    // has to hand back is the frame the opcode has not run yet —
+                    // and an arm that aborts has usually already modelled the
+                    // opcode's stack effect on `current_state`.
+                    pre_opcode_stack.clear();
+                    pre_opcode_stack.extend(current_state.stack.iter().cloned());
+
                     // RPython jtransform.py: rewrite_operation() dispatches per opname.
                     // Each match arm is the pyre equivalent of rewrite_op_*.
                     match instruction {
@@ -9079,6 +9125,24 @@ impl CodeWriter {
                         // Pop in reverse: args, null_or_self, callable.
                         Instruction::Call { argc } => {
                             let nargs = argc.get(op_arg) as usize;
+                            // No `call_fn_N` helper exists past nargs 14 (the
+                            // backend dispatch tops out at 16 i64 args =
+                            // callable + null_or_self + 14), so this opcode is
+                            // handed back to the interpreter.  Bail here,
+                            // ahead of the operand pops: `abort_permanent`
+                            // publishes `last_instr = py_pc - 1` and the
+                            // interpreter re-runs this CALL, which needs the
+                            // callable and its arguments still on the value
+                            // stack.  `emit_popvalue_ref!` nulls each slot it
+                            // pops and syncs the lowered `valuestackdepth`
+                            // into the vable, so a bail placed after them
+                            // resumes a wide call against an empty stack.
+                            // `closes_block`: nothing pushes the call result,
+                            // so the fall-through PC must not be walked.
+                            if nargs > 14 {
+                                emit_abort_permanent!(py_pc, closes_block);
+                                continue;
+                            }
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
                                 let _arg_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -9176,50 +9240,38 @@ impl CodeWriter {
 
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
-                            // extern "C" fn with that many i64 parameters.
-                            // nargs > 14 → abort_permanent (no matching helper;
-                            // the backend dispatch tops out at 16 i64 args =
-                            // callable + null_or_self + 14).
-                            let call_result_value = if nargs > 14 {
-                                fresh_ref_value(&mut graph)
-                            } else {
-                                // Graph-side `simple_call(callable,
-                                // null_or_self, args...)` carries the RPython
-                                // rewrite_call shape (jtransform.py:414 — no
-                                // frame arg).  The canonical driver's
-                                // `lower_simple_call_hlop_to_insn` arm lowers
-                                // it to `residual_call_r_r(
-                                // ConstInt(call_fn_<nargs>_idx),
-                                // ListR([Reg(callable), Reg(null_or_self),
-                                // Reg(arg0), ...]), Descr) → Reg(dst)` with
-                                // `CallFlavor::MayForce` (every `call_fn_N` is
-                                // bound MayForce).  The ABI matches upstream
-                                // `bhimpl_residual_call_r_r` (no frame); the
-                                // parent frame is resolved at runtime from the
-                                // execution context inside `bh_call_fn_impl`,
-                                // which also prepends a non-null null_or_self
-                                // as arg0 (eval.rs:3216-3226).
-                                let graph_call_args: Vec<super::flow::FlowValue> =
-                                    graph_arg_values_rev.iter().rev().cloned().collect();
-                                let result = emit_frontend_simple_call(
+                            // extern "C" fn with that many i64 parameters, and
+                            // the arities past 14 were already handed back to
+                            // the interpreter above.
+                            //
+                            // Graph-side `simple_call(callable, null_or_self,
+                            // args...)` carries the shape `jtransform.py`'s
+                            // `rewrite_call` produces — no frame arg.  The
+                            // canonical driver's
+                            // `lower_simple_call_hlop_to_insn` arm lowers it to
+                            // `residual_call_r_r(
+                            // ConstInt(call_fn_<nargs>_idx),
+                            // ListR([Reg(callable), Reg(null_or_self),
+                            // Reg(arg0), ...]), Descr) → Reg(dst)` with
+                            // `CallFlavor::MayForce` (every `call_fn_N` is
+                            // bound MayForce).  The ABI matches upstream
+                            // `bhimpl_residual_call_r_r` (no frame); the
+                            // parent frame is resolved at runtime from the
+                            // execution context inside `bh_call_fn_impl`,
+                            // which also prepends a non-null null_or_self
+                            // as arg0 (`eval.rs`).
+                            let graph_call_args: Vec<super::flow::FlowValue> =
+                                graph_arg_values_rev.iter().rev().cloned().collect();
+                            let call_result_value: super::flow::FlowValue =
+                                emit_frontend_simple_call(
                                     &mut graph,
                                     &current_block.block(),
                                     callable_value,
                                     null_or_self_value.into(),
                                     graph_call_args,
                                     py_pc as i64,
-                                );
-                                result.into()
-                            };
-                            if nargs > 14 {
-                                // `closes_block`: this arm skips the
-                                // `push_and_bump!` below, so its stack model is
-                                // incomplete and the fall-through must not be
-                                // walked.  Do not record the synthetic call
-                                // result or any later operation on the block.
-                                emit_abort_permanent!(py_pc, closes_block);
-                                continue;
-                            }
+                                )
+                                .into();
                             push_and_bump!(call_result_value, py_pc);
                         }
 

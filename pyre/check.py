@@ -102,12 +102,25 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # to <= 0 and blow up a ratio.
 #
 # The startup is a divisor for every short bench: the baseline's exec time is
-# `bench - startup`, so a startup sample that lands high collapses that
+# `bench - startup`, so a startup estimate that lands high collapses that
 # denominator and inflates every ratio computed against it.  A CI runner
 # measured pypy startup at 0.031s where the same job on the same platform had
 # measured 0.013s, and three unrelated benches failed their gates in that run
 # while their pyre exec times had gone *down*.  Five samples make the median
 # robust to two outliers instead of one.
+#
+# The estimator is the MEDIAN and not the minimum, even though the quantity is a
+# fixed per-process cost whose error sources are all one-sided — contention,
+# cache pressure and page faults only ever add user CPU.  The minimum does
+# recover that cost, but it recovers it for an *idle* machine, and it is
+# subtracted from bench runs that were not idle: under load a bench carries an
+# inflated startup inside it, and taking the unloaded minimum away leaves that
+# inflation behind in `exec`.  Pairing median with median cancels it; pairing an
+# idle minimum with a loaded bench does not.  Measured on one CI job, the
+# minimum came in 15ms under the median for dynasm and 13ms for cranelift, which
+# carried nine short benches whose baseline was pinned to EXEC_TIME_FLOOR_S over
+# their gates at once.  The estimate has to come from the same load conditions
+# as the run it is subtracted from.
 STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # A single slow sample is retried before failing a performance gate. Windows
@@ -1455,10 +1468,23 @@ class Check:
             ratio = "-"
         else:
             ratio = f"{float(exec_m) / float(exec_b):.1f}x"
-        return (
+        # A baseline sitting exactly on EXEC_TIME_FLOOR_S was clamped: the
+        # subtraction put it at or below the floor, so its execution time could
+        # not be separated from its own startup and the ratio computed against
+        # it is an artifact of the clamp rather than a measurement.  Say so on
+        # the line, because the printed denominator otherwise reads like one.
+        clamped = (
+            not self.args.no_startup_subtract
+            and exec_b not in (None, "-")
+            and float(exec_b) <= EXEC_TIME_FLOOR_S
+        )
+        detail = (
             f"exec {exec_m:.2f}s > {baseline} {exec_b:.2f}s  "
             f"ratio {ratio} > gate {float(limit):g}x"
         )
+        if clamped:
+            detail += f"  [{baseline} exec clamped to floor; ratio not a measurement]"
+        return detail
 
     def _run_backend_bench(
         self, backend, name, script, timeout,
