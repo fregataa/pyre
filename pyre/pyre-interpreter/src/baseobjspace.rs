@@ -4102,12 +4102,13 @@ pub fn not_(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     Ok(w_bool_from(!is_true(obj)?))
 }
 
-/// PyPy-compatible attribute lookup returning `None` when not found.
+/// PyPy-compatible attribute lookup returning `None` when not found.  Runs
+/// suppressed (`_PyObject_LookupAttr`) since the AttributeError is swallowed.
 pub fn findattr(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if unsafe { is_none(obj) } {
         return None;
     }
-    match getattr_str(obj, name) {
+    match getattr_str_impl(obj, name, true, true) {
         Ok(value) if value.is_null() => None,
         Ok(value) => Some(value),
         Err(err) => {
@@ -4129,7 +4130,7 @@ pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRe
     if unsafe { is_none(obj) } {
         return Ok(None);
     }
-    match getattr_str(obj, name) {
+    match getattr_str_impl(obj, name, true, true) {
         Ok(value) if value.is_null() => Ok(None),
         Ok(value) => Ok(Some(value)),
         Err(err) => {
@@ -5020,7 +5021,7 @@ pub fn delweakref(obj: PyObjectRef) {
 
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
-    getattr_str_impl(obj, name, true)
+    getattr_str_impl(obj, name, true, false)
 }
 
 /// Shared body of `space.getattr` and the bare `object.__getattribute__` slot.
@@ -5028,7 +5029,10 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `__getattr__` on miss (objspace.py:707 / descroperation.py:242), while the
 /// `object.__getattribute__` slot (`false`) raises straight away
 /// (descroperation.py:88) — the `__getattr__` fallback is space.getattr's job.
-fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
+/// `suppress` is `_PyObject_LookupAttr`'s flag: the caller swallows the
+/// AttributeError, so a terminal module miss skips the `__spec__` shadowing
+/// diagnosis that exists only to phrase the surfaced message.
+fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: bool) -> PyResult {
     // `pypy/interpreter/baseobjspace.py:1146-1162 getattr`:
     //
     //     def getattr(self, w_obj, w_name):
@@ -5444,7 +5448,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         Ok(Some(value)) => return Ok(value),
                         Ok(None) => {}
                         Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
-                            return module_getattr_fallback(obj, name, e);
+                            return module_getattr_fallback(obj, name, e, suppress);
                         }
                         Err(e) => return Err(e),
                     }
@@ -5462,7 +5466,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 match get(descr, obj, w_type) {
                     Ok(value) => return Ok(value.unwrap_or(descr)),
                     Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
-                        return module_getattr_fallback(obj, name, e);
+                        return module_getattr_fallback(obj, name, e, suppress);
                     }
                     Err(e) => return Err(e),
                 }
@@ -5695,7 +5699,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         if err.kind != PyErrorKind::AttributeError {
             return Err(err);
         }
-        return unsafe { module_getattr_fallback(obj, name, err) };
+        return unsafe { module_getattr_fallback(obj, name, err, suppress) };
     }
 
     let err = match object_getattr_miss(obj, name, call_getattr) {
@@ -5793,6 +5797,23 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     match name.as_str() {
         Ok(s) => getattr_str(obj, s),
+        Err(_) => unsafe { getattr_surrogate(obj, w_name, name) },
+    }
+}
+
+/// `_PyObject_LookupAttr` — the full `space.getattr` protocol for a caller
+/// about to swallow the AttributeError (`hasattr`, `getattr` with a default):
+/// a terminal module miss skips the `__spec__` shadowing diagnosis.
+pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            crate::type_methods::arg_type_name(w_name)
+        )));
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    match name.as_str() {
+        Ok(s) => getattr_str_impl(obj, s, true, true),
         Err(_) => unsafe { getattr_surrogate(obj, w_name, name) },
     }
 }
@@ -6259,7 +6280,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
     // Non-instance receiver (module, type, builtin object): the pure descriptor
     // protocol with no `__getattr__` fallback — that belongs to space.getattr,
     // not the bare object.__getattribute__ slot (descroperation.py:88).
-    getattr_str_impl(obj, name, false)
+    getattr_str_impl(obj, name, false, false)
 }
 
 /// module.py `Module.descr_getattribute` — run the object-default descriptor
@@ -6268,7 +6289,7 @@ pub(crate) fn module_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
     match object_getattribute(obj, name) {
         Ok(value) => Ok(value),
         Err(err) if err.kind == PyErrorKind::AttributeError => unsafe {
-            module_getattr_hook_or_err(obj, name, err, true)
+            module_getattr_hook_or_err(obj, name, err, true, false)
         },
         Err(err) => Err(err),
     }
@@ -6321,6 +6342,7 @@ unsafe fn module_getattr_hook_or_err(
     name: &str,
     err: PyError,
     call_getattr: bool,
+    suppress: bool,
 ) -> PyResult {
     if !call_getattr {
         return Err(err);
@@ -6333,6 +6355,12 @@ unsafe fn module_getattr_hook_or_err(
         if !mod_getattr.is_null() {
             return crate::call::call_function_impl_result(mod_getattr, &[w_str_new(name)]);
         }
+    }
+    // `module_getattro_impl` under `suppress`: the error is about to be
+    // swallowed, so skip the `__spec__` diagnosis below (its `has_location`
+    // property getter executes Python).
+    if suppress {
+        return Err(err);
     }
     // No module `__getattr__`: phrase the miss with the module's `__name__`
     // when it is a string, falling back to the bare form otherwise
@@ -6416,8 +6444,13 @@ unsafe fn module_getattr_hook_or_err(
 /// `try`/`except` so a directly-served `getattr(module, name)` routes a
 /// descriptor `__get__`'s AttributeError the same way an explicit
 /// `ModuleType.__getattribute__` call would.
-unsafe fn module_getattr_fallback(obj: PyObjectRef, name: &str, err: PyError) -> PyResult {
-    let err = match module_getattr_hook_or_err(obj, name, err, true) {
+unsafe fn module_getattr_fallback(
+    obj: PyObjectRef,
+    name: &str,
+    err: PyError,
+    suppress: bool,
+) -> PyResult {
+    let err = match module_getattr_hook_or_err(obj, name, err, true, suppress) {
         Ok(value) => return Ok(value),
         Err(e) if e.kind == PyErrorKind::AttributeError => e,
         Err(e) => return Err(e),
@@ -12548,7 +12581,7 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
             if unsafe { is_instance(w_obj) } {
                 return Ok(default);
             }
-            match getattr_str_impl(w_obj, "__length_hint__", false) {
+            match getattr_str_impl(w_obj, "__length_hint__", false, false) {
                 Ok(m) => crate::call::call_function_impl_result(m, &[]),
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
                 Err(e) => Err(e),
@@ -13522,7 +13555,7 @@ unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
     } else if is_instance(w_iterator) {
         false
     } else {
-        getattr_str_impl(w_iterator, "__next__", false).is_ok()
+        getattr_str_impl(w_iterator, "__next__", false, false).is_ok()
     };
     if has_next {
         Ok(w_iterator)
