@@ -5725,16 +5725,21 @@ impl<M: Clone> MetaInterp<M> {
                 .expect("compile_loop: no active trace ctx");
             let outer = ctx.green_key;
             let cut_inner = ctx.cut_inner_green_key;
-            // compile.py:269-270: cross-loop cut → store under inner loop's
-            // jitcell_token. RPython: jitcell_token = cross_loop.jitcell_token.
-            (cut_inner.unwrap_or(outer), cut_inner)
+            // pyjitpl.py:3005 / :3183-3189: the key is
+            // `original_boxes[:num_green_args]`, i.e. the greens of the
+            // merge point that closed the trace.  A bridge may start from a
+            // guard in the origin loop and close at a different merge point,
+            // so the origin key is only the fallback for traces that did not
+            // close on a merge point.  If older traces lack typed close
+            // greens, preserve the existing cross-loop-cut inner key path.
+            let closed = ctx.close_green_key_hash();
+            (closed.or(cut_inner).unwrap_or(outer), cut_inner)
         };
 
         // pyjitpl.py:3185-3189: has_compiled_targets(ptoken) →
         // raise SwitchToBlackhole(ABORT_BAD_LOOP).  The key is the one the
         // loop would be stored under — `original_boxes[:num_green_args]`,
-        // the greens of the merge point that was closed at, which for a
-        // cross-loop cut is the inner loop's key, not the trace's own.
+        // the greens of the merge point that was closed at.
         if self.has_compiled_targets(green_key) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -8894,6 +8899,15 @@ impl<M: Clone> MetaInterp<M> {
         // the typed variant tag), so no raw-u32 type side-table
         // propagation is needed for either pooled constants or
         // inputargs.
+        //
+        // optimizer.py:34 `self.inputargs` — the run needs the trace's own
+        // InputArg list, not just its length.  Without it a guard snapshot
+        // naming an inputarg no op in the body consumes reaches
+        // `store_final_boxes_in_guard` with nothing to bind it to
+        // (`_number_boxes` → `Operand::from_opref` on a position-only ref).
+        // Same seeding as the no-unroll retry inside `compile_loop`.
+        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
 
         let (
             mut snapshot_map,

@@ -1543,6 +1543,68 @@ where
         }
     }
 
+    /// pyjitpl.py:1622 `MIFrame._create_segmented_trace_and_blackhole`,
+    /// recording half.
+    ///
+    /// ```python
+    /// metainterp.generate_guard(rop.GUARD_ALWAYS_FAILS)
+    /// ...
+    /// metainterp.history.record1(rop.FINISH, exception_box, None, descr=token)
+    /// ```
+    ///
+    /// The trace is close enough to `trace_limit` that aborting it would
+    /// waste the whole recording, so it is terminated here instead: an
+    /// always-failing guard takes every execution back to the interpreter,
+    /// and the FINISH behind it exists only to give the segment a
+    /// terminator.  The compile half — `compile_simple_loop` plus
+    /// `attach_procedure_to_interp` (pyjitpl.py:1658-1663) — needs the
+    /// `MetaInterp` the walker does not hold, so it runs in the
+    /// [`TraceAction::SegmentedLoop`] arm of the driver.
+    ///
+    /// `compile_simple_loop` puts a LABEL at the segment's entry, which is
+    /// what lets a later trace close back into it; without it the segmented
+    /// loop could never be completed (pyjitpl.py:1641-1643).
+    fn create_segmented_trace(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        mp_opcode_pc: usize,
+        mp_green_pc: Option<i64>,
+    ) -> TraceAction {
+        // pyjitpl.py:1626 `generate_guard(rop.GUARD_ALWAYS_FAILS)`.  The
+        // resume position is the merge-point op, whose preceding `-live-`
+        // marker names the boxes the blackhole resumes with — the same
+        // `(pc, after_residual_call=false)` pair the GUARD_FUTURE_CONDITION
+        // emitted at loop close uses.
+        self.record_state_guard(
+            ctx,
+            sym,
+            OpCode::GuardAlwaysFails,
+            &[],
+            mp_opcode_pc,
+            /* after_residual_call */ false,
+        );
+        // pyjitpl.py:1633-1637: an unreachable FINISH carrying the
+        // AssertionError typeptr and `exit_frame_with_exception_descr_ref`.
+        // Pyre's FINISH takes neither — `record_finish` records the op with
+        // its result operand alone — and the op is unreachable behind a
+        // guard that always fails, so the operand is a placeholder.
+        let exception_box = ctx.const_int(0);
+        ctx.record_finish(exception_box, majit_ir::Type::Int);
+        // pyjitpl.py:1671-1673: "we now need to blackhole back to the
+        // interpreter instead of jumping to some existing code, because we
+        // are at a really arbitrary place here."  Under single-pass tracing
+        // the walk already RAN everything it recorded, so the interpreter
+        // must resume at this merge point's own green pc rather than at the
+        // one it was left holding — the same handoff the abort path
+        // publishes (`jitdriver.rs` `TraceAction::Abort` arm).  Without it
+        // the walked iterations are executed a second time.
+        ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
+        ctx.walk_final_reds = Vec::new();
+        // pyjitpl.py:1673 `raise SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`.
+        TraceAction::SegmentedLoop
+    }
+
     /// Resolve the box operand for a vable opcode. The canonical
     /// bytecode (Stage 3a-3c) carries the live struct register as the
     /// leading `r` operand — pyjitpl.py:1166-1170
@@ -4850,6 +4912,37 @@ where
                 // A seen>=0 (or `no_loop_header` auto-stamped) depth>0 merge
                 // point falls through into the close protocol at the else-branch
                 // cut below (pyjitpl.py:1579-1602).
+                // pyjitpl.py:1617-1620 `debug_merge_point`, the tail of the
+                // method every `jit_merge_point` runs through:
+                //
+                //     if (metainterp.force_finish_trace and
+                //             (metainterp.history.length() >
+                //              warmrunnerstate.trace_limit * 0.8)):
+                //         self._create_segmented_trace_and_blackhole()
+                //
+                // A green key that already overflowed once carries
+                // JC_FORCE_FINISH (set by `prepare_trace_segmenting`,
+                // pyjitpl.py:2820).  Its next attempt must not overflow
+                // again: closing the trace as a segment here — strictly
+                // before `_interpret`'s 1.0x `blackhole_if_trace_too_long`
+                // (pyjitpl.py:2861-2867) can be reached — is what stops the
+                // key from retracing forever.  The check belongs at a merge
+                // point and nowhere else: the guard this records resumes
+                // through the `-live-` marker that precedes every
+                // `jit_merge_point` op, which an arbitrary mid-walk position
+                // has no counterpart for.
+                if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
+                    // pyjitpl.py:1639-1640 `if metainterp.current_merge_points
+                    // and isinstance(metainterp.resumekey,
+                    // ResumeFromInterpDescr):` — the loop arm.  A bridge takes
+                    // upstream's `compile_trace(resumekey)` else-arm instead,
+                    // which is not ported; it keeps aborting, as before.
+                    let is_loop_trace = ctx.current_merge_points_first_greenkey().is_some()
+                        && ctx.resumekey_original_loop_token().is_none();
+                    if is_loop_trace {
+                        return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
+                    }
+                }
                 // pyjitpl.py:1547 `jitdriver_sd =
                 // self.metainterp.staticdata.jitdrivers_sd[jdindex]` reads the
                 // owning driver's `no_loop_header`.  Upstream this is the same
@@ -4961,17 +5054,29 @@ where
                         // merge point, and — once `retrace_needed` has armed
                         // `partial_trace` — a close storm that leaves no room
                         // for the one extra iteration a retrace has to trace.
-                        let has_targets = ctx
-                            .compiled_key_for_greens_fn
-                            .as_ref()
-                            .and_then(|f| {
-                                f(&(
-                                    mp_green_ints.clone(),
-                                    mp_green_refs.clone(),
-                                    mp_green_floats.clone(),
-                                ))
-                            })
-                            .is_some();
+                        //
+                        // The key must be the one the INTERPRETER enters by:
+                        // `get_procedure_token` is `jit_cell_at_key(greenkey)`,
+                        // and `compile_loop` attaches the token to that same
+                        // cell, so upstream cannot own a compiled loop the
+                        // interpreter cannot reach and this predicate is always
+                        // false for a key being traced for the first time —
+                        // which is what makes :1554-1555 `return` the guard
+                        // against closing a trace on its own first merge point.
+                        // A lookup keyed on anything else (e.g. scanning a side
+                        // table for a loop whose header greens happen to match)
+                        // can answer yes for a loop stored under a key nothing
+                        // enters, auto-stamp here, and close with nothing but
+                        // the green-promotion ops recorded.
+                        let mp_greens = (
+                            mp_green_ints.clone(),
+                            mp_green_refs.clone(),
+                            mp_green_floats.clone(),
+                        );
+                        let has_targets = mp_green_pc
+                            .and_then(|pc| ctx.merge_point_green_key_hash(pc, &mp_greens))
+                            .zip(ctx.has_compiled_targets_fn.as_ref())
+                            .is_some_and(|(key, f)| f(key));
                         depth_zero && has_targets
                     };
                     if should_auto_stamp {
@@ -5187,6 +5292,54 @@ where
                                 "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
                             );
                         }
+                        // pyjitpl.py:3005 `get_procedure_token(greenboxes)` —
+                        // the greens of the merge point just reached.
+                        let close_greens = (
+                            mp_green_ints.clone(),
+                            mp_green_refs.clone(),
+                            mp_green_floats.clone(),
+                        );
+                        ctx.close_greens = Some(close_greens.clone());
+                        ctx.close_green_pc = mp_green_pc;
+                        if ctx.is_bridge_trace {
+                            // pyjitpl.py:3001-3060: a guard-origin bridge
+                            // first consults the procedure token for the
+                            // merge point just reached.  If none has compiled
+                            // targets, it does NOT close on the first visit;
+                            // it falls through to the current_merge_points
+                            // scan, appends first visits, and only closes on a
+                            // repeated same-greenkey merge point.
+                            let already_compiled_here = ctx
+                                .close_green_key_hash()
+                                .zip(ctx.has_compiled_targets_fn.as_ref())
+                                .is_some_and(|(key, f)| f(key));
+                            let close_key = ctx.close_green_key_hash().unwrap_or(ctx.green_key);
+                            if !already_compiled_here
+                                && !ctx.has_merge_point_at(close_key, ctx.header_pc)
+                            {
+                                let vable_boxes =
+                                    ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
+                                let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
+                                    Some(mut boxes) => {
+                                        ctx.remove_consts_and_duplicates(&mut boxes);
+                                        boxes
+                                            .into_iter()
+                                            .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
+                                            .collect()
+                                    }
+                                    None => live_arg_boxes.clone(),
+                                };
+                                if crate::mptrace_enabled() {
+                                    eprintln!(
+                                        "@@@MPTRACE bridge-add-mp key={close_key} header_pc={} num_ops={}",
+                                        ctx.header_pc,
+                                        ctx.num_ops(),
+                                    );
+                                }
+                                ctx.add_merge_point(close_key, original_boxes, ctx.header_pc);
+                                return TraceAction::Continue;
+                            }
+                        }
                         if capture_walk_reds {
                             // Single-pass: stash the resume-aligned close pc (the
                             // interpreter green pc, NOT the JitCode op cursor) so
@@ -5198,13 +5351,6 @@ where
                             ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
                             ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                         }
-                        // pyjitpl.py:3005 `get_procedure_token(greenboxes)` —
-                        // the greens of the merge point just reached.
-                        ctx.close_greens = Some((
-                            mp_green_ints.clone(),
-                            mp_green_refs.clone(),
-                            mp_green_floats.clone(),
-                        ));
                         // GUARD_FUTURE_CONDITION already emitted unconditionally at
                         // the reached_loop_header entry above (pyjitpl.py:2993).
                         return TraceAction::CloseLoop;
@@ -5232,8 +5378,6 @@ where
                     if inner_close {
                         if let Some(pc) = mp_green_pc {
                             let header_pc = ctx.header_pc;
-                            let inner_key =
-                                crate::green_key_from_code_ptr(ctx.green_key_raw.0, pc as usize);
                             // pyjitpl.py:3001-3007, which runs BEFORE the
                             // `current_merge_points` scan:
                             //
@@ -5313,17 +5457,57 @@ where
                                 mp_green_refs.clone(),
                                 mp_green_floats.clone(),
                             );
+                            let Some(inner_key) = ctx.merge_point_green_key_hash(pc, &mp_greens)
+                            else {
+                                return TraceAction::Continue;
+                            };
                             let already_compiled_here = ctx
-                                .compiled_key_for_greens_fn
+                                .has_compiled_targets_fn
                                 .as_ref()
-                                .and_then(|f| f(&mp_greens));
-                            if let Some(ptoken_key) = already_compiled_here {
-                                if crate::majit_log_enabled() {
-                                    eprintln!(
-                                        "[jit] merge point pc={pc} already has compiled loop \
-                                         key={ptoken_key} — declining the cross-loop cut \
-                                         (pyjitpl.py:3005)"
-                                    );
+                                .is_some_and(|f| f(inner_key));
+                            if already_compiled_here {
+                                // pyjitpl.py:3004-3007 — the merge point just reached already owns a
+                                // procedure token, so upstream JUMPs into it rather than deriving a second
+                                // copy of that loop by cutting this trace.  `compile_trace` raises on
+                                // success (`raise_if_successful`, pyjitpl.py:3119-3123), which is why the
+                                // `current_merge_points` scan below is never reached in that case.
+                                //
+                                // The dispatcher holds no `&mut MetaInterp`, so the attempt is published to
+                                // the driver: `close_jump_into_key` names the token, `close_greens` /
+                                // `close_green_pc` name the greens it is keyed by (pyjitpl.py:3005
+                                // `get_procedure_token(greenboxes)` reads the greens of the merge point just
+                                // reached, not the trace-start header's).
+                                //
+                                // A key whose attempt already ran and did not compile keeps today's
+                                // behaviour — decline and keep tracing.  Re-attempting would re-run the
+                                // optimizer over a growing trace-so-far for a deterministic decline; the
+                                // same latch (`TraceCtx::declined_cross_loop_closes`) guards the equivalent
+                                // site in the other frontend.
+                                if ctx.cross_loop_close_declined(inner_key) {
+                                    if crate::majit_log_enabled() {
+                                        eprintln!(
+                                            "[jit] merge point pc={pc} already has compiled loop \
+                                             key={inner_key} — declining the cross-loop cut \
+                                             (pyjitpl.py:3005)"
+                                        );
+                                    }
+                                } else {
+                                    ctx.close_greens = Some(mp_greens.clone());
+                                    ctx.close_green_pc = Some(pc);
+                                    ctx.close_jump_into_key = Some(inner_key);
+                                    if capture_walk_reds {
+                                        ctx.walk_final_pc = Some(pc as usize);
+                                        ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                                    }
+                                    if crate::majit_log_enabled() {
+                                        eprintln!(
+                                            "[jit] merge point pc={pc} has compiled loop key={inner_key} \
+                                             — compile_trace JUMP (pyjitpl.py:3005)"
+                                        );
+                                    }
+                                    // GUARD_FUTURE_CONDITION was already emitted unconditionally at the
+                                    // reached_loop_header entry above (pyjitpl.py:2993).
+                                    return TraceAction::CloseLoop;
                                 }
                             } else if ctx.has_merge_point_at(inner_key, header_pc) {
                                 if crate::jitdriver::spdiag_enabled() {
@@ -5357,6 +5541,7 @@ where
                                     mp_green_refs.clone(),
                                     mp_green_floats.clone(),
                                 ));
+                                ctx.close_green_pc = Some(pc);
                                 if capture_walk_reds {
                                     // Single-pass: resume at the inner loop's
                                     // interpreter green pc (the loop variable the

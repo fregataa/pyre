@@ -23,7 +23,7 @@ use crate::heapcache::HeapCache;
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
 use indexmap::IndexMap;
-use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
 
@@ -327,6 +327,16 @@ pub struct TraceCtx {
     /// from.  Set by both close paths; `None` when the trace did not close on
     /// a merge point.
     pub(crate) close_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
+    /// The int pc green that belongs to [`Self::close_greens`].  The structured
+    /// `can_enter_jit` key prepends the back-edge target before the declared
+    /// greens, so reconstructing the interpreter-entered key for a close needs
+    /// this target in addition to the merge-point green tuple.
+    pub(crate) close_green_pc: Option<i64>,
+    /// pyjitpl.py:3005-3007 `compile_trace(live_arg_boxes, ptoken)`: the procedure
+    /// token key of the merge point the trace just reached, set when that merge point
+    /// already has compiled targets.  A close carrying this JUMPs into the existing
+    /// loop instead of compiling a new one, and is read-and-cleared by the driver.
+    pub(crate) close_jump_into_key: Option<u64>,
     /// pyjitpl.py:2979 reached_loop_header parity: callback to check
     /// has_compiled_targets(ptoken) for a given green key. Bridge traces
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
@@ -1468,6 +1478,8 @@ impl TraceCtx {
             }],
             header_greens: None,
             close_greens: None,
+            close_green_pc: None,
+            close_jump_into_key: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1552,6 +1564,8 @@ impl TraceCtx {
             }],
             header_greens: None,
             close_greens: None,
+            close_green_pc: None,
+            close_jump_into_key: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1948,6 +1962,12 @@ impl TraceCtx {
         }
     }
 
+    /// See [`TraceCtx::close_jump_into_key`].  Read-and-clear: the answer is only
+    /// meaningful to the close that just set it.
+    pub fn take_close_jump_into_key(&mut self) -> Option<u64> {
+        self.close_jump_into_key.take()
+    }
+
     /// Mark that the current back-edge was reached inside an inline callee
     /// frame and must not be unrolled (opimpl_jit_merge_point
     /// portal_call_depth>0). The trace step drains this via
@@ -2038,6 +2058,69 @@ impl TraceCtx {
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()
+    }
+
+    /// pyjitpl.py:3183-3189: `compile_loop` keys the JitCell by
+    /// `original_boxes[:num_green_args]`, i.e. the greens captured at the
+    /// merge point that closed the trace.
+    pub fn close_green_key_hash(&self) -> Option<u64> {
+        let greens = self.close_greens.as_ref()?;
+        let pc = self.close_green_pc?;
+        self.merge_point_green_key_hash(pc, greens)
+    }
+
+    /// pyjitpl.py:1553 / :3005 `get_procedure_token(greenboxes)` analog: the
+    /// jitcell key the INTERPRETER would enter by for these greens.  The
+    /// grouping is per JitCode register bank; rebuild the declared green order
+    /// before hashing so this matches warmstate.py:584-593 `JitCell.get_uhash`.
+    pub fn merge_point_green_key_hash(
+        &self,
+        pc: i64,
+        greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
+    ) -> Option<u64> {
+        let (ints, refs, floats) = greens;
+        let spec = if let Some(key) = self.green_key_values.as_ref() {
+            debug_assert_eq!(
+                key.types.first().copied(),
+                Some(GreenType::Int),
+                "structured green key must start with the prepended target pc",
+            );
+            key.types.get(1..)?.to_vec()
+        } else {
+            self.driver_descriptor
+                .as_ref()
+                .map(|d| d.green_args_spec())?
+        };
+
+        let mut values = Vec::with_capacity(spec.len() + 1);
+        let mut types = Vec::with_capacity(spec.len() + 1);
+        values.push(pc);
+        types.push(GreenType::Int);
+        let mut int_i = 0;
+        let mut ref_i = 0;
+        let mut float_i = 0;
+        for tp in &spec {
+            let value = match tp {
+                GreenType::Int | GreenType::Void => {
+                    let value = *ints.get(int_i)?;
+                    int_i += 1;
+                    value
+                }
+                GreenType::Ref | GreenType::Str | GreenType::Unicode => {
+                    let value = *refs.get(ref_i)?;
+                    ref_i += 1;
+                    value
+                }
+                GreenType::Float => {
+                    let value = *floats.get(float_i)?;
+                    float_i += 1;
+                    value
+                }
+            };
+            values.push(value);
+        }
+        types.extend(spec);
+        Some(crate::green_key_hash_typed(&values, &types))
     }
 
     /// Set the structured green key values.
