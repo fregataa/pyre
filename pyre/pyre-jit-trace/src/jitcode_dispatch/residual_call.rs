@@ -37,6 +37,11 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static ACTIVE_FRAME_ESCAPE_STACK: std::cell::RefCell<Option<Vec<OpRef>>> =
         const { std::cell::RefCell::new(None) };
+    /// Step-0 attribution probe: classification of the most recent matched
+    /// escape, read at the force site to attribute the token clear (and hence
+    /// the abort) to the portal or the published-callee disjunct.
+    static LAST_ESCAPE_WAS_CALLEE_ONLY: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
     static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<(usize, EscapeResumeKind)>> =
         const { std::cell::Cell::new(None) };
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
@@ -955,12 +960,18 @@ impl LiveLastInstrGuard {
     /// sub-walk's pc is in the callee's code (the same reason `escape_stack`
     /// declines to latch a sub-walk's mirror), and writing it onto the outer
     /// frame strands that frame's replay on a stack depth it never had.
-    fn enter(live_frame: usize, py_pc: u32) -> Option<Self> {
+    fn enter(live_frame: usize, py_pc: u32, inline_py_pc: Option<u32>) -> Option<Self> {
         let inline = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
-        let frame = if inline.is_null() {
-            live_frame as *mut pyre_interpreter::PyFrame
-        } else {
-            inline
+        // The frame and the pc have to name the same code.  Retargeting the
+        // frame to the callee while keeping the outer walk's `vstack_cur_pypc`
+        // publishes a pc from the CALLER's code onto the callee's frame — and
+        // for a sub-walk that mirror is never advanced (`vstack_valid` is
+        // false), so the published value is a constant 0 and a frame reader
+        // inside the callee reports the function's first line.
+        let (frame, py_pc) = match (inline.is_null(), inline_py_pc) {
+            (false, Some(callee_pc)) => (inline, callee_pc),
+            (false, None) => (inline, py_pc),
+            (true, _) => (live_frame as *mut pyre_interpreter::PyFrame, py_pc),
         };
         if frame.is_null() {
             return None;
@@ -1156,6 +1167,19 @@ impl Drop for ActiveFrameEscapeGuard {
 /// committed only when the state flush succeeds (a merge point with cached
 /// depth); a directly matched frame that cannot flush still escaped and must
 /// be forced, so for it the two signals are decoupled.
+/// Step-0 attribution probe: consume the classification recorded by the most
+/// recent matched escape and tally which disjunct owns this token clear.
+pub fn attribute_last_escape_force() {
+    if let Some(callee_only) = LAST_ESCAPE_WAS_CALLEE_ONLY.with(|c| c.take()) {
+        use crate::trace::fbw_diag;
+        fbw_diag::bump(if callee_only {
+            fbw_diag::ESCAPE_FORCE_BY_CALLEE_ONLY
+        } else {
+            fbw_diag::ESCAPE_FORCE_BY_PORTAL
+        });
+    }
+}
+
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
     // `executioncontext.py:104-106 leave` — a frame handed to application code
     // keeps a reference to its caller, so escaping the concrete frame an inline
@@ -1176,7 +1200,25 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
     });
     ACTIVE_FRAME_ESCAPE.with(|slot| {
         if let Some((expected, py_pc)) = slot.get()
-            && (expected == frame as usize || escaped_published)
+            && {
+                let escaped_portal = expected == frame as usize;
+                if escaped_portal || escaped_published {
+                    use crate::trace::fbw_diag;
+                    match (escaped_portal, escaped_published) {
+                        (true, false) => fbw_diag::bump(fbw_diag::ESCAPE_PORTAL_ONLY),
+                        (false, true) => fbw_diag::bump(fbw_diag::ESCAPE_PUBLISHED_CALLEE_ONLY),
+                        (true, true) => {
+                            fbw_diag::bump(fbw_diag::ESCAPE_PORTAL_AND_PUBLISHED_CALLEE)
+                        }
+                        (false, false) => {}
+                    }
+                    LAST_ESCAPE_WAS_CALLEE_ONLY
+                        .with(|c| c.set(Some(!escaped_portal && escaped_published)));
+                    true
+                } else {
+                    false
+                }
+            }
         {
             // Force #2+ within this residual (`enter` resets the committed pc
             // per residual): the live frame is already heap-authoritative
@@ -1221,12 +1263,17 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             // write_boxes` has no decline) — otherwise the callee reads an
             // array of nulls.  That write claims no resume pc, and the undo
             // stays armed so the legacy replay re-enters the pre-flush frame.
-            // A directly matched frame escaped whether or not the flush
-            // committed, so the two signals stay decoupled.  A redirected one
-            // is reported only once the resume pc is committed: forcing
-            // without it would raise an escape the walk can only answer by
-            // replaying from entry, double-applying this residual's body.
-            return flushed || expected == frame as usize;
+            //
+            // Upstream reports the escape from the vable token state alone,
+            // independent of any resume-image write.  See
+            // `virtualizable.py:231-255` (`tracing_after_residual_call` /
+            // `force_now`), `virtualizable.py:311-330` (token states),
+            // `virtualref.py:157-167` (vref'd inlined callee), and
+            // `pyjitpl.py:3373-3390` (unconditional ABORT_ESCAPE).  Runtime
+            // forcing also resets the token before writing fields
+            // (`resume.py:1405-1408`).  Therefore a matched guard reports the
+            // escape even when the flush declined.
+            return true;
         }
         false
     })
@@ -2569,6 +2616,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     } else {
         unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() }
     };
+    // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
+    // the outer walk's mirror and a sub-walk never advances it.
+    let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -2765,7 +2815,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // `executioncontext.py:85 enter` for the inlined callee this residual
         // runs inside of.
         let _frame_chain = ResidualFrameChainGuard::enter();
-        let _last_instr = LiveLastInstrGuard::enter(live_frame, ctx.vstack_cur_pypc);
+        let _last_instr =
+            LiveLastInstrGuard::enter(live_frame, ctx.vstack_cur_pypc, inline_callee_pc);
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
@@ -2815,6 +2866,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
         if forced {
+            disarm_folded_inline_callee_after_escape(ctx, op_pc)?;
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[force-shape] helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
@@ -3495,13 +3547,132 @@ pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
 }
 
+/// The python pc `jit_pc` names in the inline callee's OWN code, or `None`
+/// when this walk is not inside an inline callee.  A callee `jit_pc` has no
+/// meaning in the outer jitcode's py_pc tables, so every consumer that writes
+/// a pc onto the callee's frame has to go through the callee's own metadata.
+fn inline_callee_py_pc<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, jit_pc: usize) -> Option<u32> {
+    let consts = ctx.inline_callee_consts?;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
+        &pjc.metadata,
+        jit_pc,
+    ))
+}
+
 /// Convenience wrapper for [`walker_vable_and_vrefs_before_residual_call`].
 /// Kept as a thin pass-through so the dispatcher call sites stay
 /// readable; collapses to direct `walker_*` once the dispatchers
 /// inline.
+fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
+    let Some(consts) = ctx.inline_callee_consts else {
+        return;
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
+        return;
+    };
+    let frame_reg = pjc.metadata.portal_frame_reg as usize;
+    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+        return;
+    };
+    if callee_frame == OpRef::NONE {
+        return;
+    }
+
+    let callee_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc);
+    let last_instr = ctx.trace_ctx.const_int(callee_py_pc as i64);
+    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
+    let last_instr_idx = last_instr_descr.index();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_frame, last_instr],
+        last_instr_descr,
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
+}
+
+fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    let Some(consts) = ctx.inline_callee_consts else {
+        return Ok(());
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
+        return Ok(());
+    };
+    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        return Ok(());
+    };
+    if shadow.fold_frame_reg == u16::MAX || shadow.frame_box == OpRef::NONE {
+        return Ok(());
+    }
+    let frame_reg = pjc.metadata.portal_frame_reg as usize;
+    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+        return Ok(());
+    };
+    if callee_frame != shadow.frame_box {
+        return Ok(());
+    }
+    let Some(info) = ctx.trace_ctx.virtualizable_info() else {
+        return Ok(());
+    };
+    let Some(fdescr) = info.array_field_descrs().first().cloned() else {
+        return Ok(());
+    };
+    let Some(adescr) = info.array_descrs.first().cloned() else {
+        return Ok(());
+    };
+    let mut slots: Vec<(i64, OpRef, Value)> = shadow
+        .opref
+        .iter()
+        .filter_map(|(&slot, &value)| {
+            (slot >= 0).then(|| {
+                let concrete = shadow
+                    .concrete
+                    .get(&slot)
+                    .filter(|entry| entry.frame_reg == shadow.fold_frame_reg)
+                    .map(|entry| entry.value)
+                    .or_else(|| ctx.trace_ctx.concrete_of_opref(value))
+                    .unwrap_or(Value::Void);
+                (slot, value, concrete)
+            })
+        })
+        .collect();
+    slots.sort_by_key(|(slot, _, _)| *slot);
+
+    for (slot, value, concrete) in slots {
+        let index = ctx.trace_ctx.const_int(slot);
+        let guards_before = ctx.trace_ctx.num_guards();
+        ctx.trace_ctx.vable_setarrayitem_indexed(
+            pc,
+            callee_frame,
+            index,
+            slot,
+            fdescr.clone(),
+            adescr.clone(),
+            value,
+            concrete,
+        );
+        walker_capture_inline_nonstandard_vable_guard(ctx, pc, guards_before)?;
+    }
+    if let Some(shadow) = ctx.callee_shadow.as_mut()
+        && shadow.frame_box == callee_frame
+    {
+        shadow.fold_frame_reg = u16::MAX;
+    }
+    Ok(())
+}
+
 pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
 ) {
+    maybe_record_inline_callee_last_instr(ctx, jit_pc);
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 
@@ -4714,7 +4885,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
         // split rationale.
         if emit_guard_not_forced {
-            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
         }
 
         // pyjitpl.py:2669-2682 `execute_and_record_varargs`; may-force
@@ -5756,7 +5927,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // See `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.
         if emit_guard_not_forced {
-            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
         }
 
         if matches!(
@@ -5988,7 +6159,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // See `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.
         if emit_guard_not_forced {
-            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
         }
 
         if matches!(

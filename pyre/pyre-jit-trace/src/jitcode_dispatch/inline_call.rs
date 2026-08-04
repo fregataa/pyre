@@ -910,7 +910,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
-    maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
 
     // pyjitpl.py `execute_and_record_varargs(CALL_MAY_FORCE_R)`:
     // the forces branch EXECUTES the call during tracing —
@@ -1155,7 +1155,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
-    maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
 
     // `direct_assembler_call` (`pyjitpl.py`) records the CALL_ASSEMBLER with
     // exactly the target jitdriver's red args — `assert len(args) ==
@@ -4014,6 +4014,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF / frame reg
         // unresolved).
         if callee_portal_frame_reg != u16::MAX {
+            {
+                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                shadow.concrete_frame = concrete_callee_frame as usize;
+                shadow.frame_box = sub_wc.registers_r[callee_portal_frame_reg as usize];
+            }
             if !try_multiframe {
                 sub_wc.callee_shadow.as_mut().unwrap().fold_frame_reg = callee_portal_frame_reg;
             }
