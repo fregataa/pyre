@@ -2514,16 +2514,33 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     };
     let boxed = match unbox_type {
         pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
-            let raw = crate::helpers::emit_trace_call_int_typed(
-                ctx.trace_ctx,
-                crate::helpers::jit_mapdict_unboxed_read_raw as *const (),
-                &[obj, storageindex_const, listindex_const],
-                &[
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Int,
-                    majit_ir::Type::Int,
-                ],
-            );
+            // A trace-allocated receiver reads inline so the heap cache folds
+            // the chain and the instance stays virtual (a residual Ref arg
+            // would force it); an escaped receiver keeps the residual.
+            let raw = if ctx.trace_ctx.heap_cache().is_unescaped(obj) {
+                let block = crate::state::opimpl_getfield_gc_r(
+                    ctx.trace_ctx,
+                    obj,
+                    crate::descr::object_storage_descr(),
+                );
+                let slot = crate::state::trace_mapdict_storage_getitem(
+                    ctx.trace_ctx,
+                    block,
+                    storageindex_const,
+                );
+                crate::state::trace_int_block_getitem_value(ctx.trace_ctx, slot, listindex_const)
+            } else {
+                crate::helpers::emit_trace_call_int_typed(
+                    ctx.trace_ctx,
+                    crate::helpers::jit_mapdict_unboxed_read_raw as *const (),
+                    &[obj, storageindex_const, listindex_const],
+                    &[
+                        majit_ir::Type::Ref,
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Int,
+                    ],
+                )
+            };
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Int(live));
             let boxed = walker_box_int(ctx, op_pc, raw, live)?;
@@ -2962,6 +2979,36 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// How the add-transition fold pins the stored value's type, resolved before
+/// any guard is emitted so a decline falls cleanly to the residual.
+enum StoreAttrAddValuePin {
+    Boxed,
+    /// Fresh unboxed int slot; `Some` pins a heap operand's canonical
+    /// `w_class`, `None` means tagged (the unbox's tag guard is the pin).
+    UnboxedInt(Option<pyre_object::PyObjectRef>),
+}
+
+/// `None` (unpinnable `w_class`, or a float pick) keeps the residual.
+fn store_attr_add_value_pin(
+    add: &pyre_interpreter::objspace::std::mapdict::StoreAttrAdd,
+    concrete_value: pyre_object::PyObjectRef,
+) -> Option<StoreAttrAddValuePin> {
+    match add.unbox_type {
+        None => Some(StoreAttrAddValuePin::Boxed),
+        Some(pyre_interpreter::objspace::std::mapdict::UnboxType::Int) => {
+            if pyre_object::tagged_int::CAN_BE_TAGGED
+                && unsafe { pyre_object::tagged_int::is_tagged_int(concrete_value) }
+            {
+                return Some(StoreAttrAddValuePin::UnboxedInt(None));
+            }
+            unsafe { walker_exact_builtin_class(concrete_value) }
+                .map(|canonical| StoreAttrAddValuePin::UnboxedInt(Some(canonical)))
+        }
+        // `store_attr_add_fast_path` never resolves a float pick; defensive.
+        Some(pyre_interpreter::objspace::std::mapdict::UnboxType::Float) => None,
+    }
+}
+
 pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3254,6 +3301,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 concrete_value,
             )
         }
+        && let Some(value_pin) = store_attr_add_value_pin(&add, concrete_value)
     {
         walker_guard_mapdict_instance_shape(
             ctx,
@@ -3265,13 +3313,34 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             add.map,
         )?;
         let new_map_const = ctx.trace_ctx.const_int(add.new_map as i64);
-        crate::helpers::emit_mapdict_add_attr_inline(
-            ctx.trace_ctx,
-            obj,
-            add.storageindex,
-            new_map_const,
-            value,
-        );
+        match value_pin {
+            StoreAttrAddValuePin::Boxed => {
+                crate::helpers::emit_mapdict_add_attr_inline(
+                    ctx.trace_ctx,
+                    obj,
+                    add.storageindex,
+                    new_map_const,
+                    value,
+                );
+            }
+            StoreAttrAddValuePin::UnboxedInt(canonical) => {
+                // Only an exactly-`int` runtime value may unbox: the tag
+                // guard pins a tagged operand, the `w_class` pin a heap one
+                // (a subclass shares `W_IntObject`'s `ob_type`).
+                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
+                if let Some(canonical) = canonical {
+                    walker_guard_exact_w_class(ctx, op_pc, value, canonical)?;
+                }
+                crate::helpers::emit_mapdict_add_unboxed_attr_inline(
+                    ctx.trace_ctx,
+                    obj,
+                    add.storageindex,
+                    new_map_const,
+                    raw,
+                );
+            }
+        }
         // The walk is the authoritative execution path, so apply the resolved
         // transition now; the emitted operations reproduce it in compiled code.
         unsafe {

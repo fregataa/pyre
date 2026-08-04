@@ -755,6 +755,29 @@ pub fn emit_mapdict_add_attr_inline(
     }
 }
 
+/// Unboxed twin of [`emit_mapdict_add_attr_inline`]: the fresh-slot unboxed
+/// int attribute stores a one-element longlong list — the same int GcArray
+/// `erase_unboxed` allocates — in the new slot, emitted inline so
+/// OptVirtualize removes it with the instance when nothing escapes.
+pub fn emit_mapdict_add_unboxed_attr_inline(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    old_len: usize,
+    new_map: OpRef,
+    raw: OpRef,
+) {
+    let one = ctx.const_int(1);
+    let list_block = ctx.record_op_with_descr(
+        OpCode::NewArray,
+        &[one],
+        crate::state::int_gcarray_descr(),
+    );
+    ctx.heap_cache_mut().new_array(list_block, one, true);
+    let zero = ctx.const_int(0);
+    crate::state::trace_int_block_setitem_value(ctx, list_block, zero, raw);
+    emit_mapdict_add_attr_inline(ctx, obj, old_len, new_map, list_block);
+}
+
 /// Emit inline Object-strategy `W_ListObject` creation as traced
 /// `NewArrayClear` + `SetarrayitemGc` + `NewWithVtable` + `SetfieldGc`
 /// ops the optimizer can virtualize when the list never escapes — instead
