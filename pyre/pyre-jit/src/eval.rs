@@ -6406,6 +6406,17 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
 /// exit-frame traceback recording preserves its traceback exactly. `LOAD_ATTR`
 /// is admitted because a mid-body abort from its method call follows the same
 /// exact-resume path rather than dropping the remainder of the iteration.
+///
+/// `SET_ADD` and `MAP_ADD` — the set/dict comprehension accumulators — are
+/// admitted on the same footing, because upstream spells them as operations this
+/// body scan already admits and gives them no accumulator status of their own:
+/// `pyopcode.py:1515 SET_ADD` is `space.call_method(w_set, 'add', w_value)`, the
+/// `LOAD_ATTR` + `CALL` pair above, and `pyopcode.py:1525 MAP_ADD` is
+/// `space.setitem(w_dict, w_key, w_value)`, i.e. `STORE_SUBSCR`. Neither is
+/// folded here — the codewriter lowers both to a void `residual_call_r_v`
+/// (`bh_set_add_fn` / `bh_map_add_fn`), so they carry exactly the body-effect
+/// accounting of the residual they are, and a mid-body abort resumes through the
+/// same `try_commit_midbody_abort` path as the store family.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -6506,6 +6517,10 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::DeleteSubscr
                             | I::DeleteAttr { .. }
                             | I::LoadName { .. }
+                            // `call_method(set, 'add', v)` / `setitem(d, k, v)`
+                            // spelled as one opcode; void residuals, not folds.
+                            | I::SetAdd { .. }
+                            | I::MapAdd { .. }
                     )
                     || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
                 if !permitted {
@@ -6663,7 +6678,12 @@ fn nested_break_bridge_resume_hazard(code: &pyre_interpreter::CodeObject) -> boo
             continue;
         };
         let mut inner_header = None;
-        for header_pc in target..pop_pc {
+        // `target` is the ENCLOSING loop's own `FOR_ITER`. Scanning from it
+        // would name that header as the "inner" loop whenever the body has no
+        // nested one, turning every single-level loop whose body ends in a
+        // statement-result `POP_TOP` into a nested break. The inner loop starts
+        // strictly after the enclosing header.
+        for header_pc in (target + 1)..pop_pc {
             if matches!(
                 pyre_interpreter::decode_instruction_at(code, header_pc),
                 Some((pyre_interpreter::Instruction::ForIter { .. }, _))
@@ -12162,6 +12182,22 @@ mod tests {
 
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn nested_break_hazard_ignores_single_level_loop_with_secondary_edge_guard() {
+        // One loop, no nested one: the `or` emits a POP_JUMP_IF_TRUE and the
+        // statement-result `sink(p)` emits the POP_TOP that precedes the
+        // backedge. Naming the enclosing FOR_ITER as the inner header would
+        // read this as a nested break.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(rows, pred, sink):\n    for p in rows:\n        if pred(p) or pred(p):\n            sink(p)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        assert!(!nested_break_bridge_resume_hazard(&code));
     }
 
     #[test]

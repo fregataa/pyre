@@ -141,7 +141,12 @@ fn deque_len(self_obj: PyObjectRef) -> i64 {
 /// `PY_NULL` link. The stripe is reentrant, so the `store`/`append_right`
 /// nesting below costs nothing.
 fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let Some(deque) = W_Deque::from_obj(self_obj) else {
         return vec![];
     };
@@ -164,15 +169,34 @@ fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
 /// Held across the whole replacement, not per `append_right`, so no other
 /// thread observes the intermediate empty chain.
 fn store(self_obj: PyObjectRef, items: Vec<PyObjectRef>) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    // `append_right` allocates, so any of the appends below can collect and
+    // move the entries `items` still names. They are livevars for the whole
+    // replacement, not just `self_obj`. Publish both slices before the single
+    // normalize: `pin_root` would normalize `self_obj` while the entries are
+    // not yet on the stack, and that query is itself a safepoint.
+    let root_base = pyre_object::gc_roots::publish_roots(&[self_obj]);
+    let items_base = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(root_base, 1 + items.len());
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    // Reentrant: the two callees take the same stripe.
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     clear_blocks(self_obj);
-    for item in items {
+    for i in 0..items.len() {
+        let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
         append_right(self_obj, item);
     }
 }
 
 fn clear_blocks(self_obj: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let new_block = deque_block::new(PY_NULL, PY_NULL);
     let deque = W_Deque::from_obj(self_obj).expect("deque");
     deque.leftblock = new_block;

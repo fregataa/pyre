@@ -16,7 +16,10 @@ pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eva
 pub use frame::{MIFrame, MIFrameStack};
 
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
@@ -31,6 +34,8 @@ pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 use majit_ir::operand::Operand;
+
+static RD_CONSTS_WALK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
@@ -1786,16 +1791,18 @@ impl<M: Clone> MetaInterp<M> {
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
-            visited: &mut indexmap::IndexSet<usize>,
+            generation: u64,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let Some(pool) = pool else { return };
-            let identity = Arc::as_ptr(pool) as usize;
-            // A set, not a scanned list: this runs once per exit layout of
-            // every trace of every compiled loop, so the number of pools it
-            // sees grows with the compiled code, and a linear membership scan
-            // would make one walk quadratic in that count.
-            if !visited.insert(identity) {
+            // Each pool records the generation of the walk that last visited
+            // it, so a pool reached twice in one walk is visited once without
+            // a visit set.  The counter is process-global because
+            // `register_thread_root_areas` registers this walker per mutator:
+            // per-`MetaInterp` counters would advance independently and
+            // collide, and a collision skips a pool whose slots then never
+            // reach the visitor.
+            if !pool.mark_visited_generation(generation) {
                 return;
             }
             // SAFETY: pyre is single-threaded and the minor-collection
@@ -1809,13 +1816,13 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let mut visited = indexmap::IndexSet::new();
+        let generation = RD_CONSTS_WALK_GENERATION.fetch_add(1, Ordering::Relaxed);
         for entry in self.compiled_loops.values_mut() {
             for trace in entry.traces.values_mut() {
                 for layout in trace.exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                        &mut visited,
+                        generation,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -1823,12 +1830,12 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), &mut visited, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
                 }
                 for layout in trace.terminal_exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                        &mut visited,
+                        generation,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -1836,7 +1843,7 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), &mut visited, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
                 }
             }
             for tt in entry.front_target_tokens.iter_mut() {
@@ -2063,6 +2070,7 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         self.stats.guard_failures += 1;
+        crate::guard_census_record(green_key, fail_index);
         self.warm_state.log_guard_failure(fail_index);
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, fail_index, 0);
@@ -9358,8 +9366,8 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         live_values: &[Value],
-    ) -> Option<RawCompileResult<'_, M>> {
-        let compiled = self.compiled_loops.get(&green_key)?;
+    ) -> Option<RawCompileResult<M>> {
+        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         // warmstate.py:398 `loop_token = cell.get_procedure_token()`:
         // execution must use the cell's current, invalidation-filtered token.
         // `compiled_loops` is a metadata index and can still retain a weak
@@ -9375,8 +9383,18 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
 
-        let trace_layout =
-            Self::trace_for_exit(compiled, trace_id).and_then(|(trace_id, trace)| {
+        // Re-read the entry rather than holding the pre-run borrow across
+        // `execute_token_raw`: compiled code re-enters the driver through
+        // residual calls (`eval.rs:4393` mints a second `&mut JitDriverPair`
+        // from the `JIT_DRIVER` cell), and that re-entry can recompile or
+        // drop this green key, so the pre-run `&CompiledEntry` is not
+        // guaranteed to still point at a live entry.  A bridge compiled
+        // during the run is only visible through the fresh lookup.
+        let trace_layout = self
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
+            .and_then(|(trace_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
             });
         let exit_layout = result
@@ -9458,12 +9476,11 @@ impl<M: Clone> MetaInterp<M> {
             ovf_flag: false,
         };
         let descr_arc = result.descr_arc.clone();
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
 
         Some(RawCompileResult {
             values: result.outputs,
             typed_values: result.typed_outputs,
-            meta: &compiled.meta,
+            meta,
             fail_index,
             trace_id,
             descr_arc,
@@ -9485,8 +9502,8 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         live_values: &[i64],
-    ) -> Option<CompileResult<'_, M>> {
-        let compiled = self.compiled_loops.get(&green_key)?;
+    ) -> Option<CompileResult<M>> {
+        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         // warmstate.py:398: the JitCell is the canonical current-token
         // owner and filters invalidated predecessors.
         let token = self.warm_state.get_procedure_token(green_key)?;
@@ -9528,7 +9545,6 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let exit_arity = exit_types.len();
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
         // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) with `trace_id == 0`
         // and `fail_index == u32::MAX`; they carry no per-trace exit
@@ -9551,7 +9567,10 @@ impl<M: Clone> MetaInterp<M> {
                 storage: None,
             }
         } else {
-            Self::trace_for_exit(compiled, trace_id)
+            // Fresh, fallible lookup — see `run_compiled_raw_detailed_with_values`.
+            self.compiled_loops
+                .get(&green_key)
+                .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
                 .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
                 .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
                 .and_then(|(owning_key, resolved_id, trace)| {
@@ -9574,7 +9593,12 @@ impl<M: Clone> MetaInterp<M> {
                     force_token_slots,
                     recovery_layout: None,
                     resume_layout: None,
-                    storage: None,
+                    // The green-key index no longer holds this trace, but the
+                    // failing descr still carries the resume payload it was
+                    // compiled with (`compile.py:849 get_resumestorage`), so a
+                    // blackhole resume off this layout stays possible.
+                    storage: crate::resume::ResumeStorage::from_fail_descr(descr)
+                        .map(std::sync::Arc::new),
                 })
         };
         // RPython: deadframe has ALL jitframe slots accessible.
@@ -9625,7 +9649,7 @@ impl<M: Clone> MetaInterp<M> {
         Some(CompileResult {
             values,
             typed_values,
-            meta: &compiled.meta,
+            meta,
             fail_index,
             trace_id,
             descr_arc,
@@ -9643,7 +9667,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         live_values: &[Value],
-    ) -> Option<CompileResult<'_, M>> {
+    ) -> Option<CompileResult<M>> {
         self.run_compiled_detailed_with_values_at_dispatch_key(green_key, live_values, 0)
     }
 
@@ -9657,8 +9681,8 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
         dispatch_key: u32,
-    ) -> Option<CompileResult<'_, M>> {
-        let compiled = self.compiled_loops.get(&green_key)?;
+    ) -> Option<CompileResult<M>> {
+        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         // warmstate.py:398: execute the token returned by the JitCell, not
         // the compiled-metadata index's possibly retired predecessor.
         let token = self.warm_state.get_procedure_token(green_key)?;
@@ -9698,7 +9722,12 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let exit_arity = exit_types.len();
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
+        // Fresh lookup, and fallible: the run can re-enter the driver through
+        // a residual call and drop this green key (`jitdriver.rs:4361`
+        // `remove_compiled_loop` on the unrecoverable-resume path), in which
+        // case the exit falls through to the `rd_loop_token` lookup and then
+        // to the synthesized default layout below.
+        let compiled = self.compiled_loops.get(&green_key);
         // FINISH descrs (singletons) have `trace_id == 0`; skip the
         // trace lookup and synthesize the default layout per
         // `run_compiled_detailed`.
@@ -9718,7 +9747,8 @@ impl<M: Clone> MetaInterp<M> {
                 storage: None,
             }
         } else {
-            Self::trace_for_exit(compiled, trace_id)
+            compiled
+                .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
                 .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
                 .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
                 .and_then(|(owning_key, resolved_id, trace)| {
@@ -9741,7 +9771,12 @@ impl<M: Clone> MetaInterp<M> {
                     force_token_slots,
                     recovery_layout: None,
                     resume_layout: None,
-                    storage: None,
+                    // The green-key index no longer holds this trace, but the
+                    // failing descr still carries the resume payload it was
+                    // compiled with (`compile.py:849 get_resumestorage`), so a
+                    // blackhole resume off this layout stays possible.
+                    storage: crate::resume::ResumeStorage::from_fail_descr(descr)
+                        .map(std::sync::Arc::new),
                 })
         };
         // RPython: deadframe has ALL jitframe slots accessible.
@@ -9792,7 +9827,7 @@ impl<M: Clone> MetaInterp<M> {
         Some(CompileResult {
             values,
             typed_values,
-            meta: &compiled.meta,
+            meta,
             fail_index,
             trace_id,
             descr_arc,
