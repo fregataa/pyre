@@ -4795,10 +4795,32 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
 /// ops after that merge point and before the loop's final back-edge, so neither
 /// a prologue-only marker (e.g. `COPY_FREE_VARS` ahead of a clean hot loop) nor
 /// a post-loop marker over-declines the loop.  A loop covered by an exception
-/// handler keeps the full-tail scan so a post-loop
-/// `abort_permanent` (e.g. the `DELETE_FAST` cleanup for `except X as e`)
-/// still declines it, because compiled-loop delivery of an uncaught raise to
-/// the handler is not yet supported.
+/// handler keeps the full-tail scan so a post-loop `abort_permanent` still
+/// declines it, because compiled-loop delivery of an uncaught raise to the
+/// handler is not yet supported.
+///
+/// The scan exempts one marker class: `LOAD_FAST_CHECK`'s null arm.  The
+/// decline above is a refusal over an *unported* opcode, whose arm bails
+/// without modelling the stack effect the walk then keeps interpreting.
+/// `LOAD_FAST_CHECK` is ported: the codewriter splits it on `ptr_nonzero`,
+/// compiles the bound arm normally, and sends the null arm to a dead-end block.
+/// A walk that finds the local bound takes the bound arm and never sees the
+/// marker; a walk that finds it unbound reaches the marker with the seeding
+/// intact and declines reactively, the ordinary path.  Neither leaves the loop
+/// guard mis-seeded, so the static refusal has nothing to prevent.
+///
+/// The widened `loop_in_try` tail is where this bites: putting the loop inside
+/// a `try` is itself what makes the tail read a loop variable through
+/// `LOAD_FAST_CHECK` rather than `LOAD_FAST` — the raise can reach the handler
+/// before the loop assigns the slot, so the slot is only conditionally bound on
+/// the join — and declining over that marker meant the widening's own predicate
+/// manufactured the marker it tripped on.
+///
+/// The owning opcode comes from `abort_permanent_py_pc_by_jit_pc`, the exact
+/// marker inverse, NOT from `py_floor_by_jit_pc`: the null arm's block is
+/// emitted after the whole body, and the floor table keys each Python PC to its
+/// FIRST jitcode offset, so it attributes that late block to whichever opcode
+/// last opened a segment.
 fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
@@ -4822,10 +4844,10 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     };
 
     let mut back_edge_end: Option<usize> = None;
-    let mut first_abort_permanent = None;
+    let mut abort_permanent_pcs: Vec<usize> = Vec::new();
     for op in crate::jitcode_runtime::decoded_ops(code).filter(|op| op.pc > merge_point) {
-        if op.opname == "abort_permanent" && first_abort_permanent.is_none() {
-            first_abort_permanent = Some(op.pc);
+        if op.opname == "abort_permanent" {
+            abort_permanent_pcs.push(op.pc);
         }
         if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
             let target = u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
@@ -4844,12 +4866,80 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     }
     .is_some();
 
-    let scan_end = if loop_in_try || std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some() {
+    // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the `loop_in_try` widening
+    // entirely, the counterpart of `PYRE_FBW_LOOPBODY_SCAN_FULL`, so the whole
+    // carve-out stays measurable without a rebuild.
+    let scan_end = if !std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some()
+        && (loop_in_try || std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some())
+    {
         code.len()
     } else {
         back_edge_end.unwrap_or(code.len())
     };
-    first_abort_permanent.filter(|pc| *pc < scan_end)
+    abort_permanent_pcs
+        .into_iter()
+        .filter(|pc| *pc < scan_end)
+        .find(|pc| !marker_is_load_fast_check_null_arm(w_code, &pjc, *pc))
+}
+
+/// The Python PC and decoded opcode that emitted the `abort_permanent` at
+/// `marker_jit_pc`, via the exact `abort_permanent_py_pc_by_jit_pc` inverse.
+///
+/// `None` whenever the owning opcode cannot be named — a jitcode whose metadata
+/// carries no marker inverse (skeleton / fixture), or a `marker_jit_pc` that is
+/// not a marker at all.  Every caller treats that as "keep declining", the
+/// conservative direction.
+fn abort_permanent_owner(
+    w_code: *const (),
+    pjc: &crate::pyjitcode::PyJitCodePayload,
+    marker_jit_pc: usize,
+) -> Option<(usize, pyre_interpreter::Instruction)> {
+    let table = &pjc.metadata.abort_permanent_py_pc_by_jit_pc;
+    let idx = table
+        .binary_search_by_key(&(marker_jit_pc as u32), |&(off, _)| off)
+        .ok()?;
+    let py_pc = table[idx].1 as usize;
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const CodeObject
+    };
+    if raw_code.is_null() {
+        return None;
+    }
+    let (instr, _) = pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, py_pc)?;
+    Some((py_pc, instr))
+}
+
+/// True when the `abort_permanent` at `marker_jit_pc` is the dead-end arm
+/// `LOAD_FAST_CHECK` emits for a conditionally-bound slot (`codewriter.rs`
+/// `Instruction::LoadFastCheck`, the `emit_abort_permanent!(py_pc,
+/// closes_block)` leg).
+fn marker_is_load_fast_check_null_arm(
+    w_code: *const (),
+    pjc: &crate::pyjitcode::PyJitCodePayload,
+    marker_jit_pc: usize,
+) -> bool {
+    matches!(
+        abort_permanent_owner(w_code, pjc, marker_jit_pc),
+        Some((_, pyre_interpreter::Instruction::LoadFastCheck { .. }))
+    )
+}
+
+/// `"py_pc=47 LoadFastCheck"` for the `PYRE_FBW_DEBUG_ABORT` line, or
+/// `"owner=?"` when the inverse cannot name it.
+///
+/// A bare jitcode offset does not say which opcode declined the frame, and the
+/// floor/block-head tables answer a different question (they key a *resume*
+/// coordinate, and a marker in a block emitted after the body floors to
+/// whichever PC last opened a segment).  Naming it here is what turns a
+/// `loops_aborted` row into an opcode to port.
+fn describe_abort_permanent_owner(w_code: *const (), marker_jit_pc: usize) -> String {
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
+        return "owner=?".to_string();
+    };
+    match abort_permanent_owner(w_code, &pjc, marker_jit_pc) {
+        Some((py_pc, instr)) => format!("py_pc={py_pc} {instr:?}"),
+        None => "owner=?".to_string(),
+    }
 }
 
 struct CalleeAbortPermanentHit {
@@ -5302,7 +5392,8 @@ fn full_body_walk_trace<Sym: WalkSym>(
         // invisible to the census.
         crate::jitcode_dispatch::census_record("FullBodyWalk::LoopBodyAbortPermanent");
         if std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some() {
-            eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc}");
+            let owner = describe_abort_permanent_owner(w_code, abort_pc);
+            eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc} {owner}");
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Decline;
