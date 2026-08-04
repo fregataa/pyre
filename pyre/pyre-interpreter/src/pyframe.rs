@@ -788,7 +788,7 @@ impl FrameBox {
         qualname: Option<&str>,
     ) -> crate::PyResult {
         self.fix_array_ptrs();
-        let register_final = !self.code().exceptiontable.is_empty();
+        let register_final = code_yields_inside_try(self.code());
         let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
         let _origin_roots = pyre_object::gc_roots::push_roots();
         let coroutine_origin_slot = if is_coroutine {
@@ -862,14 +862,44 @@ impl FrameBox {
         // generator.py:24-27: every Coroutine needs its `_finalize_` hook for
         // the never-awaited warning. Ordinary generators only need one when
         // collection must unwind a suspended `finally`/`with` body. Upstream
-        // uses `CO_YIELD_INSIDE_TRY` for that second arm; the external
-        // compiler does not expose it, so `register_final` is the existing
-        // exception-table approximation for non-coroutines only.
+        // uses `CO_YIELD_INSIDE_TRY` for that second arm. RustPython's
+        // compiler does not expose the flag, so `register_final` reconstructs
+        // exactly that question from its Python 3.14 exception table.
         if is_coroutine || register_final {
             crate::executioncontext::register_finalizer(generator);
         }
         Ok(generator)
     }
+}
+
+/// PyPy `astcompiler/codegen.py:2825-2826` / `generator.py:24-27`:
+/// reconstruct `CO_YIELD_INSIDE_TRY` for RustPython code objects.
+///
+/// Python 3.14 wraps every generator body in a depth-zero, `lasti` exception
+/// entry which only converts an escaping `StopIteration`; that synthetic
+/// entry must not make every generator finalizable. Entries emitted for an
+/// actual `try` around a yield either omit `lasti` at depth zero (`try`) or
+/// carry a non-zero unwind depth (`with`). `lookup_exceptiontable` selects the
+/// innermost entry, matching the compiler's `has_yield_inside_try` question.
+fn code_yields_inside_try(code: &CodeObject) -> bool {
+    let mut index = 0;
+    while index < code.instructions.len() {
+        if matches!(
+            code.instructions[index].op,
+            crate::bytecode::Instruction::YieldValue { .. }
+        ) {
+            let offset = (index * 2) as u32;
+            if let Some((_target, depth, lasti)) =
+                crate::pycode::lookup_exceptiontable(&code.exceptiontable, offset)
+            {
+                if depth != 0 || !lasti {
+                    return true;
+                }
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Capture `coroutine.cr_origin` from the visible caller chain.
@@ -3340,7 +3370,26 @@ impl PyFrame {
     /// pyframe.py:861-863 get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
-        offset2lineno(self.code(), self.last_instr) as isize
+        // A malformed replacement linetable is decoded by the compiler-core
+        // marshal reader as repeated zero-width positions on the first line.
+        // CPython reports ``frame.f_lineno is None`` for that table rather
+        // than manufacturing the code object's first line number.
+        let locations = &self.code().locations;
+        if !locations.is_empty()
+            && locations.iter().all(|(start, end)| {
+                start.character_offset.get() == 1 && end.character_offset.get() == 1
+            })
+        {
+            return -1;
+        }
+        // CPython exposes ``None`` when a code object's line table has no
+        // usable entry for the current instruction.  Ruff's decoded
+        // zero-line entries reach us as line 0; preserve the frame getter's
+        // existing -1 sentinel instead of leaking that implementation value.
+        match offset2lineno(self.code(), self.last_instr) {
+            0 => -1,
+            lineno => lineno as isize,
+        }
     }
 
     /// pyframe.py:660-671 fget_f_lineno
@@ -4339,6 +4388,43 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
 #[cfg(test)]
 mod tests {
     use super::load_const_from_code;
+
+    fn nested_code_yields_inside_try(source: &str) -> bool {
+        let outer = crate::compile_exec(source).expect("compile");
+        let code = super::code_constants(&outer)
+            .iter()
+            .find_map(|constant| match constant {
+                crate::bytecode::ConstantData::Code { code } => Some(code.as_ref()),
+                _ => None,
+            })
+            .expect("nested function code");
+        super::code_yields_inside_try(code)
+    }
+
+    #[test]
+    fn generator_finalizer_flag_ignores_python314_stopiteration_wrapper() {
+        assert!(!nested_code_yields_inside_try(
+            "def items():\n    yield 1\n"
+        ));
+    }
+
+    #[test]
+    fn generator_finalizer_flag_finds_yield_inside_try_or_with() {
+        assert!(nested_code_yields_inside_try(
+            "def items(cm):\n    try:\n        yield 1\n    finally:\n        pass\n",
+        ));
+
+        assert!(nested_code_yields_inside_try(
+            "def items(cm):\n    with cm:\n        yield 1\n"
+        ));
+    }
+
+    #[test]
+    fn generator_finalizer_flag_ignores_yield_after_try() {
+        assert!(!nested_code_yields_inside_try(
+            "def items():\n    try:\n        pass\n    finally:\n        pass\n    yield 1\n",
+        ));
+    }
 
     #[test]
     fn load_const_from_code_returns_ellipsis_singleton() {

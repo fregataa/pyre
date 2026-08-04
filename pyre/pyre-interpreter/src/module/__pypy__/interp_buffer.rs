@@ -8,7 +8,264 @@ use pyre_object::PyObjectRef;
 
 use crate::PyError;
 
-#[crate::pyre_class("__pypy__.PickleBuffer")]
+/// `interp_buffer.newmemoryview` — construct a formatted N-D view over an
+/// existing memoryview.  This is an internal PyPy helper, not the public
+/// `memoryview.cast`: structured format strings are accepted verbatim.
+pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 5 {
+        return Err(PyError::type_error(format!(
+            "newmemoryview() takes at most 5 arguments ({} given)",
+            positional.len()
+        )));
+    }
+    let kw = |name: &str| -> Option<PyObjectRef> {
+        kwargs.and_then(|dict| unsafe { pyre_object::w_dict_getitem_str(dict, name) })
+    };
+    let arg = |index: usize, name: &str| -> Result<Option<PyObjectRef>, PyError> {
+        if let Some(&value) = positional.get(index) {
+            if kw(name).is_some() {
+                return Err(PyError::type_error(format!(
+                    "newmemoryview() got multiple values for argument '{name}'"
+                )));
+            }
+            return Ok(Some(value));
+        }
+        Ok(kw(name))
+    };
+    if let Some(dict) = kwargs {
+        for (key, _) in unsafe { pyre_object::w_dict_items(dict) } {
+            let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(key) }) else {
+                continue;
+            };
+            if name == "__pyre_kw__" {
+                continue;
+            }
+            if !matches!(name, "buf" | "itemsize" | "format" | "shape" | "strides") {
+                return Err(PyError::type_error(format!(
+                    "newmemoryview() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+    }
+    let w_obj = arg(0, "buf")?
+        .ok_or_else(|| PyError::type_error("newmemoryview() missing required argument 'buf'"))?;
+    let itemsize_obj = arg(1, "itemsize")?.ok_or_else(|| {
+        PyError::type_error("newmemoryview() missing required argument 'itemsize'")
+    })?;
+    let fmt_obj = arg(2, "format")?
+        .ok_or_else(|| PyError::type_error("newmemoryview() missing required argument 'format'"))?;
+    // `if w_shape` / `if w_strides` are RPython reference tests, not truth
+    // tests: only an omitted argument selects the derive-it path.  An empty
+    // sequence still counts as supplied, and so does an explicit `None`, which
+    // then fails in `dimensions` with "'NoneType' object is not iterable".
+    let shape_arg = arg(3, "shape")?;
+    let strides_arg = arg(4, "strides")?;
+    let has_shape = shape_arg.is_some();
+    let has_strides = strides_arg.is_some();
+    let shape_obj = shape_arg.unwrap_or_else(pyre_object::w_none);
+    let strides_obj = strides_arg.unwrap_or_else(pyre_object::w_none);
+    let _roots = pyre_object::gc_roots::push_roots();
+    // One batch publish rather than five `pin_root`s: the first pin's forwarding
+    // query is itself a safepoint, so the four raw locals behind it would be
+    // read after a foreign collection could already have moved them.
+    let sp =
+        pyre_object::gc_roots::pin_roots(&[w_obj, itemsize_obj, fmt_obj, shape_obj, strides_obj]);
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+    if !unsafe { pyre_object::memoryview::is_w_memoryview(w_obj) } {
+        return Err(PyError::value_error("memoryview expected"));
+    }
+    unsafe { crate::builtins::memoryview_check_released(w_obj)? };
+    let itemsize = crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 1))?;
+    let fmt_obj = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+    if !unsafe { pyre_object::is_str(fmt_obj) } {
+        return Err(PyError::type_error("format must be a string"));
+    }
+    let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) }.to_string();
+    let shape_obj = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+    let shape = if has_shape {
+        dimensions(shape_obj)?
+    } else {
+        Vec::new()
+    };
+    let strides_obj = pyre_object::gc_roots::shadow_stack_get(sp + 4);
+    let strides = if has_strides {
+        dimensions(strides_obj)?
+    } else {
+        Vec::new()
+    };
+    if !has_shape && has_strides && strides.len() != 1 {
+        return Err(PyError::value_error(
+            "strides must have a single value if shape not provided",
+        ));
+    }
+    if has_shape && has_strides && shape.len() != strides.len() {
+        // The reference raises before its shape accumulator is filled, so the
+        // diagnostic names an empty shape rather than the supplied one.
+        return Err(PyError::value_error(format!(
+            "shape [] does not match strides {strides:?}"
+        )));
+    }
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+    // `lgt` is the source's own length — for an N-D view that is the outermost
+    // dimension, not the element count — and the byte extent every check below
+    // compares against follows from it.
+    let lgt = crate::baseobjspace::len_w(w_obj)?;
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+    let old_size = unsafe { pyre_object::memoryview::w_memoryview_itemsize(w_obj) };
+    let nbytes = lgt.saturating_mul(old_size);
+    let shape = if !has_shape {
+        if itemsize == 0 {
+            return Err(PyError::value_error("cannot guess shape when itemsize==0"));
+        }
+        if nbytes % itemsize != 0 {
+            return Err(PyError::value_error(format!(
+                "itemsize {itemsize} does not match obj len/itemsize {lgt}/{old_size}"
+            )));
+        }
+        vec![nbytes / itemsize]
+    } else {
+        shape
+    };
+    if shape.len() > 64 {
+        return Err(PyError::value_error(
+            "number of dimensions must not exceed 64",
+        ));
+    }
+    let strides = if !has_strides {
+        let mut result = vec![itemsize; shape.len()];
+        for i in (0..shape.len().saturating_sub(1)).rev() {
+            result[i] = result[i + 1].saturating_mul(shape[i + 1]);
+        }
+        result
+    } else {
+        if strides.len() != shape.len() {
+            return Err(PyError::value_error(format!(
+                "shape {shape:?} does not match strides {strides:?}"
+            )));
+        }
+        strides
+    };
+    if has_strides {
+        // PyPy's `FormatBufferViewND` validates the covered byte extent from
+        // strides (a strided view may expose fewer elements than its source).
+        let mut span = 1i64;
+        for i in (0..shape.len()).rev() {
+            if span != 0 && strides[i] % span != 0 {
+                return Err(PyError::value_error(
+                    "strides does not match shape, itemsize",
+                ));
+            }
+            let step = if span == 0 { 0 } else { strides[i] / span };
+            span = span
+                .checked_mul(shape[i])
+                .and_then(|v| v.checked_mul(step))
+                .ok_or_else(|| PyError::value_error("shape exceeds buffer size"))?;
+        }
+        if span != nbytes {
+            return Err(PyError::value_error(format!(
+                "shape * strides / itemsize {shape:?} * {strides:?} / {itemsize} \
+                 does not match obj data {lgt} * {old_size}"
+            )));
+        }
+    } else {
+        let mut product = 1i64;
+        for &dim in &shape {
+            product = product
+                .checked_mul(dim)
+                .ok_or_else(|| PyError::value_error("shape exceeds buffer size"))?;
+        }
+        if product.saturating_mul(itemsize) != nbytes {
+            return Err(PyError::value_error(format!(
+                "shape/itemsize {shape:?}/{itemsize} does not match obj len/itemsize {lgt}/{old_size}"
+            )));
+        }
+    }
+    if nbytes > 0 {
+        for (&stride, &dim) in strides.iter().zip(&shape) {
+            if stride.saturating_mul(dim) > nbytes {
+                return Err(PyError::value_error(format!(
+                    "shape {shape:?} and strides {strides:?} exceed object size {nbytes}"
+                )));
+            }
+        }
+    }
+    Ok(unsafe {
+        crate::builtins::w_memoryview_new_formatted_nd(w_obj, &fmt, itemsize, &shape, &strides)
+    })
+}
+
+fn dimensions(obj: PyObjectRef) -> Result<Vec<i64>, PyError> {
+    let items = crate::baseobjspace::unpackiterable(obj, -1)?;
+    // Converting one element runs its `__index__`, which allocates and can
+    // relocate every element still sitting in this plain `Vec`.  Publish the
+    // whole batch first and read each one back through its root slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&items);
+    let mut values = Vec::with_capacity(items.len());
+    for index in 0..items.len() {
+        values.push(crate::baseobjspace::int_w(
+            pyre_object::gc_roots::shadow_stack_get(base + index),
+        )?);
+    }
+    Ok(values)
+}
+
+/// `pypy/module/__pypy__/interp_buffer.py:W_Bufferable`.
+///
+/// This is deliberately a zero-payload, subclassable type.  PyPy's base
+/// implementation forwards to a subclass's `__buffer__`; the exact base
+/// instance is an error, so accidentally using the helper without an
+/// override is diagnosed instead of recursing forever.
+pub mod bufferable_impl {
+    use super::*;
+
+    #[crate::pyre_class("__pypy__.Bufferable")]
+    #[derive(Default)]
+    pub struct W_Bufferable {}
+
+    #[crate::pyre_methods(doc = "Base class for objects implementing the buffer protocol.")]
+    impl W_Bufferable {
+        /// `generic_new_descr(W_Bufferable)` accepts and ignores constructor
+        /// arguments, while preserving a user-defined subtype on the instance.
+        #[staticmethod]
+        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+            let _ = args;
+            let base = type_object();
+            crate::typedef::check_user_subclass(base, cls)?;
+            let obj = W_Bufferable::allocate_stable(W_Bufferable {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+            });
+            crate::typedef::tag_subclass_instance(obj, cls);
+            Ok(obj)
+        }
+
+        /// PyPy `W_Bufferable.descr_buffer`: subclasses provide the actual
+        /// exporter and return a memoryview; the base class itself is abstract.
+        fn __buffer__(&self, w_flags: PyObjectRef) -> Result<PyObjectRef, PyError> {
+            let self_obj = self as *const W_Bufferable as PyObjectRef;
+            let self_type = crate::typedef::r#type(self_obj)
+                .map(|p| p.as_ptr())
+                .unwrap_or(pyre_object::PY_NULL);
+            if std::ptr::eq(self_type, type_object()) {
+                return Err(PyError::value_error("override __buffer__ in a subclass"));
+            }
+            let method = crate::baseobjspace::getattr_str(self_obj, "__buffer__")?;
+            let result = crate::baseobjspace::call_function(method, &[w_flags]);
+            if result.is_null() {
+                Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| PyError::runtime_error("__buffer__ call failed")))
+            } else {
+                Ok(result)
+            }
+        }
+    }
+}
+
+#[crate::pyre_class("pickle.PickleBuffer")]
 pub struct W_PickleBuffer {
     /// The wrapped buffer-supporting object, or `None` after `release()`.
     w_obj: PyObjectRef,
@@ -38,9 +295,10 @@ impl W_PickleBuffer {
         // __init__ phase.
         let (w_buffer, release_memoryview, w_release_exporter) = acquire_pickle_buffer(w_obj)?;
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_buffer);
-        pyre_object::gc_roots::pin_root(w_release_exporter);
+        // Both operands are Rust-stack copies out of `acquire_pickle_buffer`, so
+        // they have to become visible in one publish: pinning the first alone
+        // opens a safepoint the second copy would not survive.
+        let sp = pyre_object::gc_roots::pin_roots(&[w_buffer, w_release_exporter]);
         // `allocate` may collect; store the post-collection exporter rather
         // than the stale Rust-stack copy.
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
@@ -93,6 +351,19 @@ impl W_PickleBuffer {
         // Normalize to the raw byte layout via `cast('B')` so an `array('i')`
         // or other non-`'B'` source still yields a byte view.
         crate::module::_pickle::call_meth(mv, "cast", &[pyre_object::unicodeobject::w_str_new("B")])
+    }
+
+    /// PEP 688 exporter slot exposed by CPython 3.14's `pickle.PickleBuffer`.
+    /// Returning the normalized raw view keeps the wrapper's acquired export
+    /// alive until the PickleBuffer itself is released.
+    fn __buffer__(&self, _flags: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        self.raw()
+    }
+
+    /// The view passed to this callback owns only its temporary carrier; the
+    /// PickleBuffer's own export remains active until `release()` or finalise.
+    fn __release_buffer__(&mut self, _view: PyObjectRef) -> Result<(), PyError> {
+        Ok(())
     }
 
     /// `release()` — drop the reference to the underlying buffer.
@@ -301,6 +572,69 @@ pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
         return crate::baseobjspace::is_true(w);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newmemoryview;
+
+    #[test]
+    fn formatted_memoryview_keeps_shape_strides_and_format() {
+        crate::typedef::init_typeobjects();
+        let source = pyre_object::w_bytearray_new(12);
+        let view = crate::builtins::w_memoryview_new(source).unwrap();
+        let shape = pyre_object::w_list_new(vec![pyre_object::w_int_new(6)]);
+        let strides = pyre_object::w_list_new(vec![pyre_object::w_int_new(2)]);
+        let result = newmemoryview(&[
+            view,
+            pyre_object::w_int_new(1),
+            pyre_object::w_str_new("T{B:x}"),
+            shape,
+            strides,
+        ])
+        .unwrap();
+        unsafe {
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_shape(result),
+                vec![6]
+            );
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_strides(result),
+                vec![2]
+            );
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_format_str(result),
+                "T{B:x}"
+            );
+            assert_eq!(pyre_object::memoryview::w_memoryview_itemsize(result), 1);
+        }
+    }
+
+    #[test]
+    fn empty_formatted_memoryview_accepts_zero_itemsize_with_shape() {
+        crate::typedef::init_typeobjects();
+        let source = pyre_object::w_bytearray_new(0);
+        let view = crate::builtins::w_memoryview_new(source).unwrap();
+        let shape = pyre_object::w_tuple_new(vec![pyre_object::w_int_new(42)]);
+        let result = newmemoryview(&[
+            view,
+            pyre_object::w_int_new(0),
+            pyre_object::w_str_new("B"),
+            shape,
+        ])
+        .unwrap();
+        unsafe {
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_shape(result),
+                vec![42]
+            );
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_strides(result),
+                vec![0]
+            );
+            assert_eq!(pyre_object::memoryview::w_memoryview_length(result), 0);
+        }
+    }
 }
 
 /// The `memoryview` builtin type via the live execution context.

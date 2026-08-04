@@ -1385,13 +1385,23 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
 /// payload (`weakref.ref` and friends, whose class holds the `__call__`), and
 /// an instance of a user-defined class — including one deriving from a builtin
 /// type, where `class C(int)` carries its `__call__` on the type just as a
-/// plain `class C` does.
+/// plain `class C` does.  `space.lookup` applies equally to interp-level
+/// `W_Root` payloads whose `TypeDef` publishes a call slot, so the accelerator
+/// key wrapper is admitted here as well.
 fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, PyError> {
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
     let w_type = w_type.as_ptr();
-    if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) } {
+    // Most fixed-layout builtin payloads are deliberately not generic
+    // instances.  The accelerator key wrapper is the exception: its
+    // TypeDef publishes `__call__`, so admit that one payload explicitly while
+    // retaining the old guard for all other internal objects (which avoids
+    // treating bootstrap implementation objects as recursive callables).
+    let key_wrapper = crate::module::_functools::W_KeyWrapper::from_obj(callable).is_some();
+    if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) }
+        && !key_wrapper
+    {
         return Ok(None);
     }
     let Some(call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") }) else {
@@ -2778,22 +2788,23 @@ pub fn call_with_kwargs(
         // keywords: FunctionType has `kwdefaults=...`, CPython 3.14 exposes
         // `memoryview(object=...)`, and the deque iterator constructors accept
         // (and ignore) `index=...`.  Route them through `__new__`.
-        let accepts_keywords_despite_nonbase = std::ptr::eq(
-            current_type(),
-            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::module::_collections::deque_iter::public_type(),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::module::_collections::deque_rev_iter::public_type(),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::module::_contextvars::context_var_type(),
-        );
+        let accepts_keywords_despite_nonbase =
+            std::ptr::eq(
+                current_type(),
+                crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+            ) || std::ptr::eq(
+                current_type(),
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            ) || std::ptr::eq(
+                current_type(),
+                crate::module::_collections::deque_iter::public_type(),
+            ) || std::ptr::eq(
+                current_type(),
+                crate::module::_collections::deque_rev_iter::public_type(),
+            ) || std::ptr::eq(
+                current_type(),
+                crate::module::_contextvars::context_var_type(),
+            ) || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }
@@ -4275,16 +4286,6 @@ fn build_class_inner(
             })
     };
 
-    // typeobject.c type_new: every class carries `__doc__` (None when the
-    // body has no docstring) so instances inherit it through the type MRO.
-    // The compiler only stores `__doc__` when a docstring is present.  Skip
-    // the default when `__doc__` is a declared slot — a class variable would
-    // collide with the member descriptor (typing._SpecialForm).
-    {
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        crate::builtins::type_new_set_doc(class_ns)?;
-    }
-
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     // PyPy: typeobject.py — if not bases_w: bases_w = [space.w_object]
@@ -4423,6 +4424,13 @@ fn build_class_inner(
         // type.__new__ must not be repaired or overwritten here.
         result
     } else {
+        // typeobject.py:1554 `ensure_common_attributes` belongs to type
+        // construction, not to `__build_class__` namespace preparation.  A
+        // custom non-type metaclass must observe the compiler-produced
+        // namespace without an invented `__doc__` key; the default shortcut
+        // performs type.__new__'s step here before copying the type dict.
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        crate::builtins::type_new_set_doc(class_ns)?;
         // No metaclass observes the namespace on the default path, so
         // consume the explicit class cells here (type_new_classcell leaves
         // them out of the class `__dict__`); the captured `classcell` is
@@ -5134,6 +5142,13 @@ pub unsafe fn create_all_slots(
         }
 
         // typeobject.py:1199-1204: layout computation
+        // `__dict_data__` is pyre's internal dict-subclass payload slot, not
+        // a Python-visible `__slots__` entry and therefore not part of
+        // CPython's `tp_basicsize` accounting.
+        let visible_newslots = newslotnames
+            .iter()
+            .filter(|name| name.as_str() != "__dict_data__")
+            .count() as u32;
         let nslots = base_nslots + newslotnames.len() as u32;
         let typedef = if base_layout.is_null() {
             &pyre_object::pyobject::INSTANCE_TYPE as *const _
@@ -5159,6 +5174,11 @@ pub unsafe fn create_all_slots(
             })
         };
         pyre_object::w_type_set_layout(w_type, layout);
+        pyre_object::typeobject::w_type_finish_heap_abi_layout(
+            w_type,
+            w_bestbase,
+            visible_newslots,
+        );
         Ok(())
     }
 }

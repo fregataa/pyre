@@ -575,6 +575,23 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     }
 }
 
+/// PyPy `PyCode` is a normal GC object whose `w_globals`, constants and
+/// mapdict cache entries are traced with the wrapper.  Pyre keeps those
+/// variable-sized cache vectors in Rust allocations, so the fixed-offset
+/// tracer cannot see through them; reuse the interpreter's raw-code walker for
+/// the complete field shape.
+unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let code = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pycode::PyCode) };
+    f(&mut code.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_code_roots(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut adapter,
+        )
+    };
+}
+
 /// Custom trace for `PyTraceback` (`pytraceback.py:17 PyTraceback`).
 ///
 /// PyPy's `PyTraceback.frame` is a normal `PyFrame` W_Root, so its
@@ -2307,18 +2324,18 @@ fn build_gc() -> Box<MiniMarkGC> {
     // guard below.  This keeps the net register-call count up to
     // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
     // registration here, one fewer from the loop), so no downstream
-    // hardcoded tid shifts.  PyCode is allocated with `malloc_typed`, and its
-    // registered TypeInfo has empty `gc_ptr_offsets`, so its own trace is inert.
-    // Its one movable GCREF slot, `w_globals`
-    // (the cached globals dict object — movable for `exec`/custom-globals
-    // dicts), is instead forwarded as a root by
-    // `pyre_interpreter::eval::walk_raw_code_roots`, reached through
-    // `walk_raw_function_roots` (`func.code`) and the frame root walk
-    // (`frame.pycode`).
-    let w_code_tid = gc.register_type(TypeInfo::object_subclass(
-        std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
-        object_tid,
-    ));
+    // hardcoded tid shifts. `w_code_new` allocates the wrapper in stable
+    // oldgen. Its Rust-owned cache vectors require the custom walk, and their
+    // allocations are released with the wrapper just as PyPy's list fields
+    // are reclaimed with its `PyCode`.
+    let w_code_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
+            object_tid,
+            pycode_object_custom_trace,
+        )
+        .with_destructor_fn(pyre_interpreter::pycode::pycode_destructor),
+    );
     debug_assert_eq!(w_code_tid, pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -3378,6 +3395,32 @@ fn build_gc() -> Box<MiniMarkGC> {
             descriptor.ptr_offsets,
         );
     }
+    // `_functools.keyobject`: the comparator and wrapped object are both
+    // managed edges.  Keep this AUTO-ID payload at the absolute tail so adding
+    // the accelerator type does not renumber any established GC id.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_functools::W_KeyWrapper
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // `unicodedata.UCD` and `__pypy__.Bufferable`: `allocate_stable` types with
+    // no inline object payload, so the header `w_class` — which a Python
+    // subclass instance points at a managed heap type — is the only edge their
+    // marker forwards.  Appended after the accelerator so no established
+    // AUTO-ID moves.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::unicodedata::W_UCD
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
@@ -3816,6 +3859,9 @@ fn install_gc_root_walkers() {
     // about to sweep.
     majit_gc::shadow_stack::register_ephemeron_pruner(
         pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
+    );
+    majit_gc::shadow_stack::register_ephemeron_marker(
+        pyre_interpreter::objspace::std::mapdict::mark_live_weakref_entries,
     );
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
@@ -4546,7 +4592,10 @@ unsafe fn jitcode_constants_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
+    unsafe {
+        pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor);
+        pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor);
+    }
 }
 
 unsafe fn fbw_store_journal_root_walker_area(
@@ -8703,6 +8752,13 @@ fn compile_and_run_once(
         deliver_inflight_foriter_item(frame_root.frame());
         match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
             Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+                // The synchronous walker/blackhole consumed the lowered
+                // `*_return` and hands its concrete value directly to the
+                // portal (the no-replay path below).  Preserve
+                // `PyFrame.finish_value`'s preceding lifecycle transition on
+                // the live red frame; the tracing snapshot is not the object
+                // `sys._getframe()` exposed through the frame chain.
+                frame_root.frame().set_frame_finished_execution(true);
                 let result = match cv {
                     pyre_jit_trace::state::ConcreteValue::Null => w_none(),
                     other => other.to_pyobj(),
@@ -9325,6 +9381,12 @@ fn handle_jit_outcome(
                     value as usize
                 );
             }
+            // pyjitpl.py `handle_possible_exception` parity: reaching a
+            // normal FINISH proves every residual exception raised inside
+            // this compiled frame was caught.  Its pyre TLS/backend carriers
+            // must not escape into a blackhole caller and turn this successful
+            // return into a raise.
+            crate::call_jit::clear_residual_call_exception();
             JitAction::Return(Ok(value))
         }
         DetailedDriverRunOutcome::Jump {

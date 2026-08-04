@@ -3,7 +3,9 @@
 pub use rustpython_compiler::CompileError;
 pub use rustpython_compiler::CompileOpts;
 pub use rustpython_compiler::Mode;
+pub use rustpython_compiler::codegen;
 pub use rustpython_compiler::compile as rp_compile;
+pub use rustpython_compiler::parser;
 pub use rustpython_compiler_core::bytecode::{
     self, BinaryOperator, CodeFlags, CodeObject, ComparisonOperator, ConstantData, Instruction,
     MakeFunctionFlags, OpArg, OpArgState, SpecialMethod,
@@ -176,11 +178,15 @@ pub fn decode_source_bytes(
                     .filter(|&&b| b == b'\n')
                     .count()
                     + 1;
+                let (file_context, location_suffix) = if filename == "<string>" {
+                    (String::new(), format!(" ({filename}, line {line})"))
+                } else {
+                    (format!(" in file {filename}"), String::new())
+                };
                 Err(crate::PyError::syntax_error(format!(
-                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}' \
+                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}'{file_context} \
                      on line {line}, but no encoding declared; \
-                     see https://peps.python.org/pep-0263/ for details \
-                     ({filename}, line {line})"
+                     see https://peps.python.org/pep-0263/ for details{location_suffix}"
                 )))
             }
         }
@@ -188,13 +194,16 @@ pub fn decode_source_bytes(
         let encoding = encoding.as_deref().unwrap();
         let decoded =
             crate::typedef::decode_bytes_to_wtf8(source, encoding, "strict").map_err(|exc| {
-                if exc.kind == crate::PyErrorKind::LookupError {
-                    crate::PyError::syntax_error(format!(
-                        "unknown encoding for '{filename}': {encoding}"
-                    ))
-                } else {
-                    exc
-                }
+                // `pyparse.py:130-139` — a declared codec that does not exist
+                // and one that rejects the bytes are both the tokenizer's
+                // SyntaxError; the decoder's own text becomes the message and
+                // anything else propagates untouched.
+                let message = match exc.kind {
+                    crate::PyErrorKind::LookupError => format!("unknown encoding: {encoding}"),
+                    crate::PyErrorKind::UnicodeDecodeError => exc.message_text(),
+                    _ => return exc,
+                };
+                crate::PyError::syntax_error_located(message, filename, 0, 0, 0, 0, None)
             })?;
         Ok(decoded.to_string_lossy().into_owned())
     }

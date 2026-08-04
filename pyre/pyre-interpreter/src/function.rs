@@ -2094,12 +2094,36 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
                 "{name}() requires a code object with {closure_len} free vars, not {freevars_len}"
             )));
         }
+        // CPython 3.14 `func_set_code`: changing between a plain function,
+        // generator, coroutine, and async generator remains permitted for
+        // compatibility, but warns because the callable's result protocol
+        // changes underneath existing references.
+        let old_code = &*(get_pycode(obj) as *const crate::CodeObject);
+        let kind_mask = crate::CodeFlags::GENERATOR
+            | crate::CodeFlags::COROUTINE
+            | crate::CodeFlags::ASYNC_GENERATOR;
+        // `warn_deprecation` runs the app-level warnings machinery and
+        // `function_get_doc` realizes the docstring; both allocate, so publish
+        // the two operands and read them back from their root slots rather
+        // than storing through a pre-move address.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, w_code]);
+        if old_code.flags.intersection(kind_mask).bits()
+            != (*raw_code).flags.intersection(kind_mask).bits()
+        {
+            crate::warn::warn_deprecation(
+                "Assigning a code object of non-matching type is deprecated (e.g., from a generator to a plain function)",
+            )?;
+        }
         // function.py:538 self.fget_func_doc(space) — see test_issue1293.
         // Resolves the OLD code's docstring into `w_doc` *before* the
         // pointer flip so the cached value reflects the function's
         // original docstring, not the new code's first const.
-        let _ = function_get_doc(obj);
-        function_set_func_code(obj, w_code as *const ());
+        let _ = function_get_doc(pyre_object::gc_roots::shadow_stack_get(base));
+        function_set_func_code(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1) as *const (),
+        );
         Ok(())
     }
 }
@@ -2742,6 +2766,20 @@ pub unsafe fn descr_method_getattribute(
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
         return Err(crate::PyError::type_error("attribute name must be string"));
     };
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    // PyPy's Method.descr_method_getattribute delegates every miss to the
+    // wrapped function, so an inherited object.__subclasshook__ keeps the
+    // defining qualname.  CPython 3.14 exposes object.__subclasshook__ and
+    // object.__init_subclass__ as METH_CLASS builtins: their bound-method
+    // qualname uses the class they are currently bound to (`type` / `int` /
+    // ...), while the definitions still remain absent from those type dicts.
+    // Preserve that selected 3.14 delta without changing ordinary Python
+    // classmethods, whose qualname continues to name the defining class.
+    if name == "__qualname__" {
+        if let Some(qualname) = unsafe { method_class_bound_qualname(obj)? } {
+            return Ok(qualname);
+        }
+    }
     // function.py:604-614 — method attributes win, except `__doc__`;
     // an AttributeError falls back to the wrapped function.
     if name != "__doc__" {
@@ -2751,8 +2789,36 @@ pub unsafe fn descr_method_getattribute(
             Err(err) => return Err(err),
         }
     }
-    let function = unsafe { pyre_object::w_method_get_func(obj) };
     crate::baseobjspace::getattr_str(function, name)
+}
+
+/// Python 3.14's dynamic qualname for the two METH_CLASS methods inherited
+/// from `object`; `None` for every ordinary bound method.
+pub unsafe fn method_class_bound_qualname(
+    obj: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    if !unsafe { pyre_object::is_type(instance) } {
+        return Ok(None);
+    }
+    let function_qualname = unsafe { function_get_qualname(function) };
+    let inherited_name = if function_qualname == "object.__subclasshook__" {
+        "__subclasshook__"
+    } else if function_qualname == "object.__init_subclass__" {
+        "__init_subclass__"
+    } else {
+        return Ok(None);
+    };
+    let owner_qualname = crate::baseobjspace::getattr_str(instance, "__qualname__")?;
+    let Some(owner_qualname) = (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) }) else {
+        return Err(crate::PyError::type_error(
+            "type.__qualname__ is not a unicode object",
+        ));
+    };
+    Ok(Some(pyre_object::w_str_new(&format!(
+        "{owner_qualname}.{inherited_name}"
+    ))))
 }
 
 #[inline]

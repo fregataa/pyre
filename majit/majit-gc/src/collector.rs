@@ -1521,6 +1521,16 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
+        if crate::gc_lifetime_log_enabled() {
+            // Pairs with `[gc][free]`: whether a dangling reference names an
+            // object freed after the referrer was born, or one already dead
+            // when the referrer took it, decides between a missed marking edge
+            // and a stale cached pointer, and the free line alone cannot say.
+            eprintln!(
+                "[gc][alloc] addr={obj_addr:#x} type_id={type_id} kind=oldgen state={:?}",
+                self.gc_state
+            );
+        }
         if (type_id as usize) < self.types.len() {
             let info = self.types.get(type_id);
             // A destructor-bearing object that never passes through the
@@ -2203,6 +2213,12 @@ impl MiniMarkGC {
             }
         };
         let new_obj_addr = new_header_ptr as usize + GcHeader::SIZE;
+        if crate::gc_lifetime_log_enabled() {
+            eprintln!(
+                "[gc][alloc] addr={new_obj_addr:#x} type_id={type_id} kind=promotion state={:?}",
+                self.gc_state
+            );
+        }
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
 
@@ -2445,7 +2461,7 @@ impl MiniMarkGC {
         self.gc_state = GcState::Marking;
     }
 
-    fn seed_major_root(&mut self, gcref: GcRef) {
+    fn seed_major_root(&mut self, gcref: GcRef, site: &str) {
         // `incminimark.py:2739-2753 _collect_obj` performs NO probe on the root
         // word — the type system guarantees every `Ptr(GcStruct)` reaching
         // `_collect_ref_stk` is a real GC object, so the only tests are non-null
@@ -2469,6 +2485,11 @@ impl MiniMarkGC {
             return;
         }
         let hdr = unsafe { header_of(gcref.0) };
+        // A root pointing at freed or recycled memory decodes to a garbage
+        // `type_id`. Without this check the address reaches the gray stack and
+        // only fails once `mark_object` pops it, by which time the walker that
+        // supplied it is no longer on the stack; `site` names that walker.
+        self.validate_type_id(unsafe { (*hdr).type_id() }, gcref.0, site);
         // SAFETY: header_of returns a raw pointer; keep each access
         // short-lived to avoid creating overlapping exclusive borrows.
         let newly_marked = unsafe {
@@ -2545,6 +2566,16 @@ impl MiniMarkGC {
     /// `gc.enumerate_all_roots` includes live registered finalizers, whereas
     /// major marking must leave those objects to the finalization-order pass.
     fn enumerate_root_walker_values(&self) -> Vec<GcRef> {
+        self.enumerate_labeled_root_walker_values()
+            .into_iter()
+            .map(|(gcref, _)| gcref)
+            .collect()
+    }
+
+    /// [`Self::enumerate_root_walker_values`] with each value tagged by the
+    /// walker that produced it, so a root carrying a freed address can be
+    /// attributed to its source rather than to the marking loop that pops it.
+    fn enumerate_labeled_root_walker_values(&self) -> Vec<(GcRef, &'static str)> {
         // incminimark.py:2717 collect_roots: root_walker.walk_roots()
         // walks the same root sets as minor collection.
         let mut result = Vec::new();
@@ -2553,12 +2584,12 @@ impl MiniMarkGC {
         // the walk only reads, so the copy would be one allocation and one pass
         // over every registered root per collection for nothing.
         for &root_ptr in &self.roots.roots {
-            result.push(unsafe { *root_ptr });
+            result.push((unsafe { *root_ptr }, "registered_root"));
         }
 
         let walk_all_mutators = crate::gc_sync::mutators_quiesced();
         let mut visit_shadow_root = |gcref: &mut GcRef| {
-            result.push(*gcref);
+            result.push((*gcref, "shadow_stack_root"));
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
@@ -2571,11 +2602,11 @@ impl MiniMarkGC {
                 crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
                     let field_ref = unsafe { *slot_ptr };
                     if !field_ref.is_null() {
-                        result.push(field_ref);
+                        result.push((field_ref, "jitframe_slot"));
                     }
                 });
             } else {
-                result.push(*gcref);
+                result.push((*gcref, "jf_root"));
             }
         };
         if walk_all_mutators {
@@ -2585,7 +2616,7 @@ impl MiniMarkGC {
         }
 
         let mut visit_bh_root = |gcref: &mut GcRef| {
-            result.push(*gcref);
+            result.push((*gcref, "blackhole_register"));
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
@@ -2597,7 +2628,7 @@ impl MiniMarkGC {
         // minor-collection path for why the in-flight virtuals_cache /
         // registers_r slices must be seeded as roots.
         let mut visit_resume_root = |gcref: &mut GcRef| {
-            result.push(*gcref);
+            result.push((*gcref, "resume_ref_root"));
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
@@ -2606,7 +2637,7 @@ impl MiniMarkGC {
         }
 
         let mut visit_extra_area = |gcref: &mut GcRef| {
-            result.push(*gcref);
+            result.push((*gcref, "extra_area"));
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
@@ -2615,11 +2646,11 @@ impl MiniMarkGC {
         }
 
         crate::walk_active_extra_roots(&mut |gcref| {
-            result.push(*gcref);
+            result.push((*gcref, "active_extra_root"));
         });
 
         crate::shadow_stack::walk_extra_roots(|gcref| {
-            result.push(*gcref);
+            result.push((*gcref, "extra_root"));
         });
         result
     }
@@ -2668,7 +2699,7 @@ impl MiniMarkGC {
         for addr in prebuilt {
             self.seed_prebuilt_root(addr);
         }
-        let mut roots = self.enumerate_root_walker_values();
+        let mut roots = self.enumerate_labeled_root_walker_values();
         // Objects already moved to a death queue remain ordinary roots until
         // app-level code pops them. Registered live finalizers are deliberately
         // absent here; incminimark's finalization-order pass decides whether
@@ -2677,10 +2708,10 @@ impl MiniMarkGC {
             self.finalizer_handlers
                 .iter()
                 .flat_map(|handler| handler.deque.iter().copied())
-                .map(GcRef),
+                .map(|addr| (GcRef(addr), "finalizer_death_queue")),
         );
-        for gcref in roots {
-            self.seed_major_root(gcref);
+        for (gcref, site) in roots {
+            self.seed_major_root(gcref, site);
         }
     }
 
@@ -2893,7 +2924,7 @@ impl MiniMarkGC {
             self.seed_prebuilt_root(addr);
         }
         crate::shadow_stack::walk_extra_roots(|gcref| {
-            self.seed_major_root(*gcref);
+            self.seed_major_root(*gcref, "rescan_extra_root");
         });
         let pending: Vec<usize> = self
             .finalizer_handlers
@@ -2901,7 +2932,7 @@ impl MiniMarkGC {
             .flat_map(|handler| handler.deque.iter().copied())
             .collect();
         for addr in pending {
-            self.seed_major_root(GcRef(addr));
+            self.seed_major_root(GcRef(addr), "rescan_finalizer_death_queue");
         }
         while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
             self.mark_object(obj_addr);
@@ -3034,6 +3065,23 @@ impl MiniMarkGC {
         Some(GcHeader::SIZE + payload_size)
     }
 
+    /// Which generation an address falls in.
+    ///
+    /// A corrupt child separates into two unrelated defects depending on the
+    /// answer: an old-gen holder naming a nursery child is a store that never
+    /// reached the remembered set, while an old-gen child is a sweep that
+    /// reclaimed a still-referenced object. The panic reports both ends so the
+    /// two are never confused.
+    fn describe_generation(&self, addr: usize) -> &'static str {
+        if self.nursery.contains(addr) {
+            "nursery"
+        } else if self.oldgen.contains(addr) {
+            "oldgen"
+        } else {
+            "outside"
+        }
+    }
+
     /// Which object actually owns `slot_addr`.
     ///
     /// A `custom_trace` may hand the collector slots that live outside the
@@ -3110,6 +3158,7 @@ impl MiniMarkGC {
                      holder_offset={:?} site={} holder_words={:#x?} \
                      child_vtable_type_id={:?} child_words={:#x?} \
                      holder_tid_and_flags={:#x} holder_in_remembered={} \
+                     child_gen={} holder_gen={} \
                      enclosing={} gc_state={:?} minors={} majors={}",
                     type_id,
                     addr,
@@ -3123,6 +3172,8 @@ impl MiniMarkGC {
                     child_words,
                     holder_hdr.tid_and_flags,
                     self.remembered_set.contains(&holder_addr),
+                    self.describe_generation(addr),
+                    self.describe_generation(holder_addr),
                     self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
                     self.gc_state,
                     self.minor_collections,
@@ -3300,11 +3351,48 @@ impl MiniMarkGC {
             if regray {
                 self.incr_state.gray_stack.push(gcref.0);
             } else {
-                self.seed_major_root(gcref);
+                self.seed_major_root(gcref, "marking_regray_root");
             }
         }
         while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
             self.mark_object(obj_addr);
+        }
+    }
+
+    /// Mark conditional side-table edges to a fixed point.
+    ///
+    /// RPython sees an object's weakref lifeline as an ordinary field: marking
+    /// the owner immediately marks the lifeline. Pyre's temporary carrier for
+    /// builtin layouts is address-keyed, so it reports the same edges here,
+    /// after ordinary marking has established which owners survived. A newly
+    /// marked value may itself make another owner live, hence the fixed point.
+    fn mark_ephemeron_values_to_fixed_point(&mut self) {
+        loop {
+            let mut classify_owner = |owner: usize| -> Option<usize> {
+                if owner == 0 || !self.oldgen.contains(owner) {
+                    return Some(owner);
+                }
+                let hdr = unsafe { header_of(owner) };
+                unsafe { (*hdr).has_flag(flags::VISITED) }.then_some(owner)
+            };
+            let roots = crate::shadow_stack::mark_ephemeron_tables(&mut classify_owner);
+            for root in roots {
+                self.seed_major_root(root, "ephemeron_table_root");
+            }
+            // Progress is what this drain itself marked: `objects_marked` is
+            // owned by `incremental_mark_step` and never moves here, so reading
+            // it would end the walk after one pass and leave the second owner's
+            // value unmarked while pruning keeps its now-live entry.  Seeding
+            // an already-VISITED root pushes nothing, so an empty drain is
+            // exactly "no owner became live in this pass".
+            let mut drained = 0usize;
+            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+                self.mark_object(obj_addr);
+                drained += 1;
+            }
+            if drained == 0 {
+                break;
+            }
         }
     }
 
@@ -3325,6 +3413,7 @@ impl MiniMarkGC {
         // after the cycle's initial snapshot.  Rescan and trace them before
         // finalizers, weakrefs, and sweep inspect VISITED.
         self.rescan_major_nonstack_roots_and_drain();
+        self.mark_ephemeron_values_to_fixed_point();
         // incminimark.py:2961-2965 (and :2495-2499) — clear weak
         // pointers to dying objects before the sweep frees them. The
         // VISITED bit on every old-gen object is still meaningful at
@@ -3642,11 +3731,21 @@ impl MiniMarkGC {
 
             // `_recursively_bump_finalization_state_from_1_to_2`: enqueue the
             // root in normal marking and visit its complete object graph.
-            self.seed_major_root(GcRef(obj_addr));
+            self.seed_major_root(GcRef(obj_addr), "finalization_ordering_root");
             while let Some(addr) = self.incr_state.gray_stack.pop() {
                 self.mark_object(addr);
             }
         }
+
+        // Resurrecting a finalizer's object graph marks owners that the
+        // caller's ephemeron pass had already written off, and an
+        // address-keyed side table is not reached by the tracing that just
+        // marked them — `_recursively_bump_finalization_state_from_1_to_2`
+        // reaches a lifeline only because upstream stores it in an ordinary
+        // field. Re-establish those edges here: `prune_ephemeron_tables` reads
+        // the same VISITED bits below and would otherwise keep an entry whose
+        // value nothing marked, leaving the table pointing into swept memory.
+        self.mark_ephemeron_values_to_fixed_point();
 
         // PyPy clears weakrefs while queued objects are in state 2.
         if !self.old_objects_with_weakrefs.is_empty() {

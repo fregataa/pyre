@@ -3,9 +3,9 @@
 //! Real implementation backed by the runtime-independent
 //! `rustpython-unicode` crate.  The module-level functions read the latest
 //! bundled database; `unicodedata.ucd_3_2_0` reads the Unicode 3.2.0 view
-//! (used by `stringprep`).  `name` / `lookup` / `normalize` / `is_normalized`
-//! are version-independent, matching the crate, so the 3.2.0 instance shares
-//! those callables with the module.
+//! (used by `stringprep`).  `lookup` / `normalize` / `is_normalized` are
+//! version-independent, matching the crate, so the 3.2.0 instance shares those
+//! callables with the module.
 //!
 //! Signatures and error types/messages follow CPython 3.14.
 //!
@@ -103,17 +103,14 @@ fn char_and_default(
     Ok((cp, args.get(1).copied()))
 }
 
-// Version-sensitive queries: the module-level `fn` uses `MODERN`, the
-// `*_old` twin (bound onto `ucd_3_2_0`) uses `LEGACY`.
+// Version-sensitive queries select `MODERN` for module functions and
+// `LEGACY` for the `ucd_3_2_0` instance.
 
 fn category_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new(db.category(one_char("category", args)?)))
 }
 fn category(args: &[PyObjectRef]) -> PyResult {
     category_impl(&MODERN, args)
-}
-fn category_old(args: &[PyObjectRef]) -> PyResult {
-    category_impl(&LEGACY, args)
 }
 
 fn bidirectional_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
@@ -124,9 +121,6 @@ fn bidirectional_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 fn bidirectional(args: &[PyObjectRef]) -> PyResult {
     bidirectional_impl(&MODERN, args)
 }
-fn bidirectional_old(args: &[PyObjectRef]) -> PyResult {
-    bidirectional_impl(&LEGACY, args)
-}
 
 fn east_asian_width_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new(
@@ -136,9 +130,6 @@ fn east_asian_width_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 fn east_asian_width(args: &[PyObjectRef]) -> PyResult {
     east_asian_width_impl(&MODERN, args)
 }
-fn east_asian_width_old(args: &[PyObjectRef]) -> PyResult {
-    east_asian_width_impl(&LEGACY, args)
-}
 
 fn combining_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_int_new(db.combining(one_char("combining", args)?) as i64))
@@ -146,18 +137,12 @@ fn combining_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 fn combining(args: &[PyObjectRef]) -> PyResult {
     combining_impl(&MODERN, args)
 }
-fn combining_old(args: &[PyObjectRef]) -> PyResult {
-    combining_impl(&LEGACY, args)
-}
 
 fn mirrored_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_int_new(db.mirrored(one_char("mirrored", args)?) as i64))
 }
 fn mirrored(args: &[PyObjectRef]) -> PyResult {
     mirrored_impl(&MODERN, args)
-}
-fn mirrored_old(args: &[PyObjectRef]) -> PyResult {
-    mirrored_impl(&LEGACY, args)
 }
 
 fn decomposition_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
@@ -167,9 +152,6 @@ fn decomposition_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 }
 fn decomposition(args: &[PyObjectRef]) -> PyResult {
     decomposition_impl(&MODERN, args)
-}
-fn decomposition_old(args: &[PyObjectRef]) -> PyResult {
-    decomposition_impl(&LEGACY, args)
 }
 
 fn digit_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
@@ -182,9 +164,6 @@ fn digit_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 fn digit(args: &[PyObjectRef]) -> PyResult {
     digit_impl(&MODERN, args)
 }
-fn digit_old(args: &[PyObjectRef]) -> PyResult {
-    digit_impl(&LEGACY, args)
-}
 
 fn decimal_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("decimal", args)?;
@@ -195,9 +174,6 @@ fn decimal_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 }
 fn decimal(args: &[PyObjectRef]) -> PyResult {
     decimal_impl(&MODERN, args)
-}
-fn decimal_old(args: &[PyObjectRef]) -> PyResult {
-    decimal_impl(&LEGACY, args)
 }
 
 fn numeric_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
@@ -210,21 +186,29 @@ fn numeric_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 fn numeric(args: &[PyObjectRef]) -> PyResult {
     numeric_impl(&MODERN, args)
 }
-fn numeric_old(args: &[PyObjectRef]) -> PyResult {
-    numeric_impl(&LEGACY, args)
-}
 
-// Version-independent queries: `name` / `lookup` / `normalize` /
-// `is_normalized` do not depend on the database version, so the 3.2.0 instance
-// binds the same callables.
+/// Short general-category name of an unassigned code point.
+const UNASSIGNED_CATEGORY: &str = "Cn";
 
-fn name(args: &[PyObjectRef]) -> PyResult {
+fn name_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("name", args)?;
-    if let Some(name) = cp.to_char().and_then(ucd_core::character_name) {
+    // A view has no name for a code point its own release leaves unassigned,
+    // so the version's general category gates the name table: `ucd_3_2_0.name`
+    // rejects characters assigned after Unicode 3.2.0.
+    if db.category(cp) != UNASSIGNED_CATEGORY
+        && let Some(name) = cp.to_char().and_then(ucd_core::character_name)
+    {
         return Ok(w_str_new(&name));
     }
     default.ok_or_else(|| PyError::value_error("no such name"))
 }
+fn name(args: &[PyObjectRef]) -> PyResult {
+    name_impl(&MODERN, args)
+}
+
+// Version-independent queries: `lookup` / `normalize` / `is_normalized` do not
+// depend on the database version, so the 3.2.0 instance binds the same
+// callables.
 
 fn lookup(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
@@ -302,6 +286,100 @@ fn is_normalized(args: &[PyObjectRef]) -> PyResult {
     Ok(w_bool_from(ucd_core::is_normalized(form, text)))
 }
 
+/// PyPy `interp_ucd.py:UCD` — a Unicode database view whose methods are
+/// descriptors on the type, rather than entries in an instance dictionary.
+#[crate::pyre_class("unicodedata.UCD")]
+pub struct W_UCD {
+    legacy: bool,
+}
+
+#[inline]
+fn ucd_method_args(args: &[PyObjectRef]) -> &[PyObjectRef] {
+    args.get(1..).unwrap_or(&[])
+}
+
+#[crate::pyre_methods(doc = "Unicode character database.")]
+impl W_UCD {
+    fn category(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        category_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn bidirectional(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        bidirectional_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn east_asian_width(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        east_asian_width_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn combining(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        combining_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn mirrored(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        mirrored_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn decomposition(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        decomposition_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn digit(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        digit_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn decimal(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        decimal_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn numeric(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        numeric_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn name(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        name_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
+    }
+    fn lookup(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        lookup(ucd_method_args(args))
+    }
+    fn normalize(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        normalize(ucd_method_args(args))
+    }
+    fn is_normalized(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+        is_normalized(ucd_method_args(args))
+    }
+
+    #[getter]
+    fn unidata_version(&self) -> PyObjectRef {
+        if self.legacy {
+            w_str_new("3.2.0")
+        } else {
+            w_str_new(&ucd_core::unicode_version())
+        }
+    }
+}
+
 crate::py_module! {
     "unicodedata",
     interpleveldefs: {
@@ -325,33 +403,80 @@ crate::py_module! {
     extra_init: |ns| {
         // `unicodedata.ucd_3_2_0` — a `UCD` instance pinned to the Unicode
         // 3.2.0 database (used by `stringprep`).  Version-sensitive queries
-        // bind their `*_old` twins (which read `Ucd::new(false)`);
-        // name/lookup/normalize/is_normalized share the module callables.
-        // Functions live in the instance __dict__, so attribute access
-        // returns them unbound — `ucd_3_2_0.category(ch)` dispatches with the
-        // single `ch` argument, exactly like `category(ch)`.
-        let ucd_ty = crate::typedef::make_builtin_type("UCD", |_| {});
-        unsafe { typeobject::w_type_set_hasdict(ucd_ty, true) };
-        let ucd = w_instance_new(ucd_ty);
-        let d = crate::baseobjspace::getdict_native(ucd);
-        let bind = |name: &'static str, func: crate::gateway::BuiltinCodeFn| {
-            let f = crate::gateway::make_module_builtin_function(name, func);
-            unsafe { w_dict_setitem_str(d, name, f) };
-        };
-        bind("category", category_old);
-        bind("bidirectional", bidirectional_old);
-        bind("east_asian_width", east_asian_width_old);
-        bind("combining", combining_old);
-        bind("mirrored", mirrored_old);
-        bind("decomposition", decomposition_old);
-        bind("digit", digit_old);
-        bind("decimal", decimal_old);
-        bind("numeric", numeric_old);
-        bind("name", name);
-        bind("lookup", lookup);
-        bind("normalize", normalize);
-        bind("is_normalized", is_normalized);
-        unsafe { w_dict_setitem_str(d, "unidata_version", w_str_new("3.2.0")) };
+        // the typed UCD instance selects `Ucd::new(false)` while
+        // lookup/normalize/is_normalized share version-independent
+        // implementations with the module callables.
+        // Install the TypeDef before allocation so the generated allocator
+        // can stamp the canonical Python class in `w_class`.
+        let ucd_type = type_object();
+        // `interp_ucd.py:311 UCD.typedef` declares no `__new__`, so the two
+        // database instances the module exports are the only ones that exist;
+        // reaching generic allocation would hand back a `UCD` with no
+        // database at all.
+        unsafe { pyre_object::w_type_set_disallow_instantiation(ucd_type) };
+        let ucd = W_UCD::allocate_stable(W_UCD {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            legacy: true,
+        });
+        // Installing the module attribute can allocate; keep the freshly
+        // allocated instance rooted until the namespace owns it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(ucd);
+        let ucd = pyre_object::gc_roots::shadow_stack_get(
+            pyre_object::gc_roots::shadow_stack_len() - 1,
+        );
         crate::module_ns_store(ns, "ucd_3_2_0", ucd);
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ucd_legacy_instance_uses_typed_descriptors() {
+        crate::typedef::init_typeobjects();
+        let _ = type_object();
+        let obj = W_UCD::allocate_stable(W_UCD {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            legacy: true,
+        });
+        let category = W_UCD::from_obj(obj)
+            .expect("typed UCD instance")
+            .category(&[obj, w_str_new("A")])
+            .expect("category");
+        assert_eq!(unsafe { w_str_get_wtf8(category) }.to_string(), "Lu");
+        assert_eq!(
+            unsafe { w_str_get_wtf8(W_UCD::from_obj(obj).unwrap().unidata_version()) }.to_string(),
+            "3.2.0"
+        );
+    }
+
+    #[test]
+    fn ucd_legacy_name_rejects_later_assignments() {
+        crate::typedef::init_typeobjects();
+        let _ = type_object();
+        let obj = W_UCD::allocate_stable(W_UCD {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            legacy: true,
+        });
+        // U+0221 was assigned in Unicode 4.0, so the 3.2.0 view has no name
+        // for it while the latest view does.
+        let ucd = W_UCD::from_obj(obj).expect("typed UCD instance");
+        assert!(ucd.name(&[obj, w_str_new("\u{221}")]).is_err());
+        let modern = name(&[w_str_new("\u{221}")]).expect("name");
+        assert_eq!(
+            unsafe { w_str_get_wtf8(modern) }.to_string(),
+            "LATIN SMALL LETTER D WITH CURL"
+        );
+    }
 }

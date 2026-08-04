@@ -414,6 +414,10 @@ fn enable_callbacks(self_lifeline: PyObjectRef) {
         ATTR_HAS_CALLBACKS,
         pyre_object::w_bool_from(true),
     );
+    // interp__weakref.py:107 — the lifeline, not its referent, owns the
+    // finalizer. This preserves the collector's ordering for referents that
+    // are themselves part of cyclic trash.
+    crate::executioncontext::register_finalizer(self_lifeline);
 }
 
 /// pypy/module/_weakref/interp__weakref.py:60-77 get_or_make_weakref
@@ -460,7 +464,9 @@ pub fn get_or_make_weakref(
         w_ref
     } else {
         // subclass: cannot cache
-        W_Weakref_new(w_subtype, w_obj, PY_NULL)
+        let w_ref = W_Weakref_new(w_subtype, w_obj, PY_NULL);
+        append_wref_to(self_lifeline, w_ref);
+        w_ref
     }
 }
 
@@ -734,9 +740,15 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// ```
 pub fn descr__init__weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // args[0] = self, args[1] = w_obj, args[2] = w_callable (optional)
-    if args.len() > 3 {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 3 {
         return Err(PyError::type_error(
             "__init__ expected at most 2 arguments".to_string(),
+        ));
+    }
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(PyError::type_error(
+            "ref() does not take keyword arguments".to_string(),
         ));
     }
     Ok(pyre_object::w_none())
@@ -945,13 +957,6 @@ pub fn getlifeline(w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
     let lifeline = weakref_lifeline_new();
     crate::baseobjspace::setweakref(w_obj, lifeline)?;
-    // RPython's collector invalidates every rweakref when its target dies.
-    // pyre routes the equivalent lifeline clear through the shared finalizer
-    // queue, including for refs/proxies without callbacks. This is the one
-    // registration that does not sit in the target's constructor, so it can
-    // land on an object some constructor already registered; the queue drops
-    // the repeat.
-    crate::executioncontext::register_finalizer(w_obj);
     Ok(lifeline)
 }
 
@@ -981,91 +986,51 @@ fn lifeline_refs(lifeline: PyObjectRef) -> Vec<PyObjectRef> {
 }
 
 /// `WeakrefLifeline._finalize_` (interp__weakref.py:131-153), invoked
-/// from pyre's shared finalizer queue when the referent becomes unreachable.
+/// from pyre's shared finalizer queue when the lifeline becomes unreachable.
 pub fn finalize_weakrefs(w_obj: PyObjectRef) {
-    // The finalizer deque entry was the owner's last root.  A callback may
-    // allocate and recursively drain this same queue, so keep the complete
-    // lifeline traversal in the moving collector's shadow stack instead of a
-    // Rust Vec of raw PyObjectRef values.
+    let is_lifeline = crate::typedef::r#type(w_obj)
+        .is_some_and(|tp| std::ptr::eq(tp.as_ptr(), weakref_lifeline_type()));
+    if !is_lifeline {
+        return;
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_obj);
-    let owner = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    let Some(lifeline) = crate::baseobjspace::getweakref(owner()) else {
-        return;
-    };
-    pyre_object::gc_roots::pin_root(lifeline);
-    let lifeline_root = root_base + 1;
-    let current_lifeline = || pyre_object::gc_roots::shadow_stack_get(lifeline_root);
 
-    // WeakrefLifeline._finalize_ takes `items` and clears
-    // `self.other_refs_weak` before the first callback.  Detach pyre's owner
-    // slot at the same point so a nested finalizer drain cannot process this
-    // lifeline twice.
-    let others = read_attr(current_lifeline(), ATTR_OTHER_REFS_WEAK);
-    let others_root = if others.is_null() {
-        None
-    } else {
-        let index = pyre_object::gc_roots::shadow_stack_len();
+    // RPython's local `items` list is GC-transformed together with every
+    // element. A Rust Vec only holds copied raw pointers, so retain the same
+    // collection in shadow-stack slots while reads below can allocate.
+    let mut ref_slots = Vec::new();
+    let others = read_attr(w_obj, ATTR_OTHER_REFS_WEAK);
+    if !others.is_null() {
+        let others_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(others);
-        Some(index)
-    };
-    write_attr(
-        current_lifeline(),
-        ATTR_OTHER_REFS_WEAK,
-        pyre_object::w_none(),
-    );
-    crate::baseobjspace::delweakref(owner());
-
-    // Store shadow-stack indices, not object addresses: every read after an
-    // allocation observes the collector-updated pointer.
-    let mut refs = Vec::new();
-    for name in [ATTR_CACHED_WEAKREF, ATTR_CACHED_PROXY] {
-        let weak = read_attr(current_lifeline(), name);
-        let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
-        if !w_ref.is_null() {
-            let index = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(w_ref);
-            refs.push((index, false));
-        }
-    }
-    if let Some(others_root) = others_root {
-        let current_others = || pyre_object::gc_roots::shadow_stack_get(others_root);
-        let length = unsafe { pyre_object::w_list_len(current_others()) };
+        let length = unsafe {
+            pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(others_slot))
+        };
         for i in 0..length {
-            let Some(weak) = (unsafe { pyre_object::w_list_getitem(current_others(), i as i64) })
-            else {
+            let Some(weak) = (unsafe {
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(others_slot),
+                    i as i64,
+                )
+            }) else {
                 continue;
             };
             let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
             if !w_ref.is_null() {
-                let index = pyre_object::gc_roots::shadow_stack_len();
+                let slot = pyre_object::gc_roots::shadow_stack_len();
                 pyre_object::gc_roots::pin_root(w_ref);
-                refs.push((index, true));
+                ref_slots.push(slot);
             }
         }
     }
-
-    // `clear_all_weakrefs` / rweakref invalidation must be visible before a
-    // callback runs: every callback observes `ref() is None`.
-    for &(index, _) in &refs {
-        let w_ref = pyre_object::gc_roots::shadow_stack_get(index);
-        let target = read_attr(w_ref, ATTR_W_OBJ_WEAK);
-        unsafe { pyre_object::weakref::w_gc_weakref_box_clear(target) };
-        write_attr(
-            pyre_object::gc_roots::shadow_stack_get(index),
-            ATTR_W_OBJ_WEAK,
-            pyre_object::w_none(),
-        );
-    }
-
-    // PyPy runs `other_refs_weak` in reverse creation order. Cached refs and
-    // proxies have no callback and therefore need only the clearing above.
-    for &(index, has_callback) in refs.iter().rev() {
-        if !has_callback {
-            continue;
-        }
-        let w_ref = pyre_object::gc_roots::shadow_stack_get(index);
+    // interp__weakref.py:143-145 — detach the shrink-list before callbacks,
+    // then activate surviving weakrefs in reverse creation order. The GC's
+    // rweakref pass has already invalidated each dead referent.
+    write_attr(w_obj, ATTR_OTHER_REFS_WEAK, pyre_object::w_none());
+    for &slot in ref_slots.iter().rev() {
+        let w_ref = pyre_object::gc_roots::shadow_stack_get(slot);
         let w_callable = read_attr(w_ref, ATTR_W_CALLABLE);
         if w_callable.is_null() {
             continue;
@@ -1073,7 +1038,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
         let _call_roots = pyre_object::gc_roots::push_roots();
         let call_base = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_callable);
-        let current_ref = || pyre_object::gc_roots::shadow_stack_get(index);
+        let current_ref = || pyre_object::gc_roots::shadow_stack_get(slot);
         let current_callable = || pyre_object::gc_roots::shadow_stack_get(call_base);
         if let Err(error) =
             crate::call::call_function_impl_result(current_callable(), &[current_ref()])
@@ -1143,7 +1108,12 @@ fn descr__new__weakref_typecall(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
             "ref() takes at least 1 argument".to_string(),
         ));
     }
-    descr__new__weakref(args[0], &args[1..])
+    // PyPy's trailing `__args__` captures keywords separately: __new__ uses
+    // only its positional `w_obj` / `w_callable` slots, while __init__ below
+    // is responsible for rejecting keywords on the exact builtin type. Do
+    // not mistake pyre's flat keyword-marker dict for the callback object.
+    let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    descr__new__weakref(args[0], positional)
 }
 
 /// pypy/module/_weakref/interp__weakref.py:283-295 getweakrefcount
@@ -1216,7 +1186,10 @@ pub fn proxy_descr__hash__(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
 pub fn callable_proxy_descr__call__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_self = args[0];
     let w_obj = force(w_self)?;
-    crate::call::call_function_impl_result(w_obj, &args[1..])
+    // `space.call_args(w_obj, __args__)` preserves both positional and keyword
+    // arguments. Re-split pyre's flat builtin kwargs marker before forwarding
+    // so the marker dict cannot leak into the referent as a positional value.
+    crate::builtins::call_forwarding_args(w_obj, &args[1..])
 }
 
 /// pypy/module/_weakref/interp__weakref.py:329-337 proxy
@@ -1447,31 +1420,65 @@ proxy_binary!(proxy_or, crate::baseobjspace::or_);
 proxy_binary_reflected!(proxy_ror, crate::baseobjspace::or_);
 proxy_binary!(proxy_xor, crate::baseobjspace::xor);
 proxy_binary_reflected!(proxy_rxor, crate::baseobjspace::xor);
+proxy_binary!(proxy_matmul, crate::baseobjspace::matmul);
+proxy_binary_reflected!(proxy_rmatmul, crate::baseobjspace::matmul);
 
 // Inplace ops — interp__weakref.py:367-369. PyPy forces every operand
-// (`forcing_count = arity`) and dispatches to `space.inplace_X`. pyre
-// has no separate `inplace_` space ops; the regular forward op is the
-// closest equivalent and matches the runtime fall-back PyPy uses for
-// any type without an in-place specialization.
-proxy_binary!(proxy_iadd, crate::baseobjspace::add);
-proxy_binary!(proxy_isub, crate::baseobjspace::sub);
-proxy_binary!(proxy_imul, crate::baseobjspace::mul);
-proxy_binary!(proxy_itruediv, crate::baseobjspace::truediv);
-proxy_binary!(proxy_ifloordiv, crate::baseobjspace::floordiv);
-proxy_binary!(proxy_imod, crate::baseobjspace::mod_);
-proxy_binary!(proxy_ipow, crate::baseobjspace::pow);
-proxy_binary!(proxy_ilshift, crate::baseobjspace::lshift);
-proxy_binary!(proxy_irshift, crate::baseobjspace::rshift);
-proxy_binary!(proxy_iand, crate::baseobjspace::and_);
-proxy_binary!(proxy_ior, crate::baseobjspace::or_);
-proxy_binary!(proxy_ixor, crate::baseobjspace::xor);
+// (`forcing_count = arity`) and dispatches to `space.inplace_X`. In pyre the
+// equivalent space operation is `opcode_ops::binary_value`: it tries the
+// `__i*__` slot first and only then falls back to the ordinary binary op.
+macro_rules! proxy_inplace {
+    ($name:ident, $op:ident) => {
+        pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+            let w_obj0 = force(args[0])?;
+            let w_obj1 = force(args[1])?;
+            crate::opcode_ops::binary_value(w_obj0, w_obj1, crate::bytecode::BinaryOperator::$op)
+        }
+    };
+}
+
+proxy_inplace!(proxy_iadd, InplaceAdd);
+proxy_inplace!(proxy_isub, InplaceSubtract);
+proxy_inplace!(proxy_imul, InplaceMultiply);
+proxy_inplace!(proxy_itruediv, InplaceTrueDivide);
+proxy_inplace!(proxy_ifloordiv, InplaceFloorDivide);
+proxy_inplace!(proxy_imod, InplaceRemainder);
+proxy_inplace!(proxy_ipow, InplacePower);
+proxy_inplace!(proxy_ilshift, InplaceLshift);
+proxy_inplace!(proxy_irshift, InplaceRshift);
+proxy_inplace!(proxy_iand, InplaceAnd);
+proxy_inplace!(proxy_ior, InplaceOr);
+proxy_inplace!(proxy_ixor, InplaceXor);
+proxy_inplace!(proxy_imatmul, InplaceMatrixMultiply);
 
 // 1-arg unary ops with a direct pyre space op.
 proxy_unary!(proxy_len, crate::baseobjspace::len);
 proxy_unary!(proxy_neg, crate::baseobjspace::neg);
 proxy_unary!(proxy_invert, crate::baseobjspace::invert);
 proxy_unary!(proxy_iter, crate::baseobjspace::iter);
-proxy_unary!(proxy_next, crate::baseobjspace::next);
+
+// interp__weakref.py:398-414 — these three operations are explicit rather
+// than generated from ObjSpace.MethodTable. In particular, __next__ has a
+// proxy-specific error when the live referent is not an iterator.
+pub fn proxy_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__bytes__", &[])
+}
+
+pub fn proxy_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__reversed__", &[])
+}
+
+pub fn proxy_next(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    if unsafe { crate::baseobjspace::lookup(w_obj0, "__next__") }.is_none() {
+        return Err(PyError::type_error(
+            "Weakref proxy referenced a non-iterator".to_string(),
+        ));
+    }
+    crate::baseobjspace::next(w_obj0)
+}
 
 // 1-arg unary ops without a direct space op — fall through to the
 // equivalent dunder so the proxy still delegates to the referent.
@@ -1848,6 +1855,20 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
             make_builtin_function_with_arity("__rxor__", proxy_rxor, 2),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__matmul__",
+            make_builtin_function_with_arity("__matmul__", proxy_matmul, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rmatmul__",
+            make_builtin_function_with_arity("__rmatmul__", proxy_rmatmul, 2),
+        )
+    };
     // baseobjspace.py:2159 divmod row — forward + reflected.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1947,6 +1968,13 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
             ns,
             "__ixor__",
             make_builtin_function_with_arity("__ixor__", proxy_ixor, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__imatmul__",
+            make_builtin_function_with_arity("__imatmul__", proxy_imatmul, 2),
         )
     };
 
@@ -2096,6 +2124,20 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
             ns,
             "__next__",
             make_builtin_function_with_arity("__next__", proxy_next, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__bytes__",
+            make_builtin_function_with_arity("__bytes__", proxy_bytes, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reversed__",
+            make_builtin_function_with_arity("__reversed__", proxy_reversed, 1),
         )
     };
     unsafe {
@@ -2331,7 +2373,7 @@ mod tests {
     /// pypy/interpreter/baseobjspace.py:2159 — divmod must register
     /// both `__divmod__` and `__rdivmod__`.
     #[test]
-    fn test_proxy_typedef_dict_includes_metaclass_and_divmod_rows() {
+    fn test_proxy_typedef_dict_includes_all_explicit_rows() {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let weakproxy = proxy_type();
@@ -2342,6 +2384,11 @@ mod tests {
                 assert!(crate::baseobjspace::lookup_in_type(tp, "__subclasscheck__").is_some());
                 assert!(crate::baseobjspace::lookup_in_type(tp, "__divmod__").is_some());
                 assert!(crate::baseobjspace::lookup_in_type(tp, "__rdivmod__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__matmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__rmatmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__imatmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__bytes__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__reversed__").is_some());
             }
         }
     }

@@ -3,11 +3,109 @@
 //!
 //! `cmp_to_key` follows the stdlib fallback structurally: each invocation
 //! creates a lexical `K`, capturing `mycmp` instead of exposing it on K.
+//! `W_KeyWrapper` below carries the `keyobject` payload shape but is not what
+//! `cmp_to_key` hands out — its `__call__` is generated positional-only, while
+//! `keyobject` takes `obj` by keyword and reports `(obj)` to `inspect`.
 //! `partial` follows PyPy's `lib_pypy/_functools.py`: its public state is
 //! exposed through read-only properties backed by private slots. Placeholder
 //! argument merging follows the Python 3.14 `functools.py` implementation.
 
 use pyre_object::*;
+
+/// `_functoolsmodule.c keyobject`.  The object returned by `cmp_to_key` is
+/// itself the one-argument key factory; calling it produces another wrapper
+/// carrying the value to compare.  Keeping both references on the payload
+/// mirrors `keyobject.cmp` / `keyobject.object` and, unlike an app-level
+/// function, leaves the module callable descriptor-neutral when a user stores
+/// it on a class.
+#[crate::pyre_class("functools.KeyWrapper")]
+pub struct W_KeyWrapper {
+    cmp: PyObjectRef,
+    object: PyObjectRef,
+}
+
+fn key_wrapper_new(cmp: PyObjectRef, object: PyObjectRef) -> PyObjectRef {
+    // The factory is called directly (rather than through `type.__call__`),
+    // so force the TypeDef/typed-layout binding before allocating its payload.
+    let _ = type_object();
+    let _roots = pyre_object::gc_roots::push_roots();
+    // Publish both livevars before the first forwarding query: `pin_root` can
+    // park behind another thread's collection, which would leave the operand
+    // still held in a Rust local naming a pre-move address.
+    let slot = pyre_object::gc_roots::pin_roots(&[cmp, object]);
+    W_KeyWrapper::allocate_stable(W_KeyWrapper {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        cmp: pyre_object::gc_roots::shadow_stack_get(slot),
+        object: pyre_object::gc_roots::shadow_stack_get(slot + 1),
+    })
+}
+
+fn key_wrapper_compare(
+    this: &W_KeyWrapper,
+    other: PyObjectRef,
+    op: crate::baseobjspace::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(other) = W_KeyWrapper::from_obj(other) else {
+        return Err(crate::PyError::type_error(
+            "other argument must be K instance",
+        ));
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    // `this` and `other` name payloads in the managed heap, so every operand
+    // has to reach the shadow stack before the first forwarding query.
+    let slot = pyre_object::gc_roots::pin_roots(&[this.cmp, this.object, other.object]);
+    let result = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(slot + 1),
+            pyre_object::gc_roots::shadow_stack_get(slot + 2),
+        ],
+    )?;
+    pyre_object::gc_roots::pin_root(result);
+    // Build the comparison operand first: a custom numeric result makes
+    // `w_int_new` allocate, and reading the result slot before that would leave
+    // the argument naming a pre-move address.
+    let w_zero = w_int_new(0);
+    crate::baseobjspace::compare(
+        pyre_object::gc_roots::shadow_stack_get(slot + 3),
+        w_zero,
+        op,
+    )
+}
+
+#[crate::pyre_methods(unhashable)]
+impl W_KeyWrapper {
+    fn __call__(&self, obj: PyObjectRef) -> PyObjectRef {
+        key_wrapper_new(self.cmp, obj)
+    }
+
+    #[getter]
+    fn obj(&self) -> PyObjectRef {
+        self.object
+    }
+
+    fn __lt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Lt)
+    }
+    fn __le__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Le)
+    }
+    fn __eq__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Eq)
+    }
+    fn __ne__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Ne)
+    }
+    fn __gt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Gt)
+    }
+    fn __ge__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        key_wrapper_compare(self, other, crate::baseobjspace::CompareOp::Ge)
+    }
+}
 
 /// PyPy `module/_functools/interp_functools.py:reduce`.
 ///
@@ -45,13 +143,24 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     }
 
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in &effective {
-        pyre_object::gc_roots::pin_root(arg);
-    }
+    // Publish every operand before the first forwarding query: a `pin_root`
+    // per argument can park behind another thread's collection, leaving the
+    // ones still in `effective` naming pre-move addresses.
+    let base = pyre_object::gc_roots::pin_roots(&effective);
     let function_slot = base;
     let sequence_slot = base + 1;
-    let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sequence_slot))?;
+    // `_functoolsmodule.c:reduce` reports the failed second argument itself
+    // rather than letting the iteration protocol's own message surface.
+    let w_iter =
+        match crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sequence_slot)) {
+            Ok(w_iter) => w_iter,
+            Err(err) if err.kind == crate::PyErrorKind::TypeError => {
+                return Err(crate::PyError::type_error(
+                    "reduce() arg 2 must support iteration",
+                ));
+            }
+            Err(err) => return Err(err),
+        };
     pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
@@ -128,32 +237,6 @@ from operator import itemgetter as _partial_itemgetter
 from reprlib import recursive_repr as _partial_recursive_repr
 from types import GenericAlias as _PartialGenericAlias
 from types import MethodType as _PartialMethodType
-
-
-def cmp_to_key(mycmp):
-    class K(object):
-        __slots__ = ['obj']
-        def __init__(self, obj):
-            self.obj = obj
-        def __lt__(self, other):
-            return mycmp(self.obj, other.obj) < 0
-        def __gt__(self, other):
-            return mycmp(self.obj, other.obj) > 0
-        def __eq__(self, other):
-            return mycmp(self.obj, other.obj) == 0
-        def __le__(self, other):
-            return mycmp(self.obj, other.obj) <= 0
-        def __ge__(self, other):
-            return mycmp(self.obj, other.obj) >= 0
-        __hash__ = None
-    return K
-
-# `_functools.cmp_to_key` is an interp-level builtin in CPython.  Unlike an
-# app-level function, it therefore does not acquire an instance when a caller
-# stores it on a class (the CPython functools tests do exactly that).  A
-# callable staticmethod preserves the app-level implementation while giving
-# the exported object the same non-binding descriptor behavior.
-cmp_to_key = staticmethod(cmp_to_key)
 
 
 def _placeholder_immutable(name):
@@ -374,6 +457,32 @@ class partial:
 
 
 partial.__module__ = "functools"
+
+
+def cmp_to_key(mycmp):
+    class K(object):
+        __slots__ = ['obj']
+        def __init__(self, obj):
+            self.obj = obj
+        def __lt__(self, other):
+            return mycmp(self.obj, other.obj) < 0
+        def __gt__(self, other):
+            return mycmp(self.obj, other.obj) > 0
+        def __eq__(self, other):
+            return mycmp(self.obj, other.obj) == 0
+        def __le__(self, other):
+            return mycmp(self.obj, other.obj) <= 0
+        def __ge__(self, other):
+            return mycmp(self.obj, other.obj) >= 0
+        __hash__ = None
+    return K
+
+# `_functools.cmp_to_key` is an interp-level builtin in CPython.  Unlike an
+# app-level function, it therefore does not acquire an instance when a caller
+# stores it on a class (the CPython functools tests do exactly that).  A
+# callable staticmethod preserves the app-level implementation while giving
+# the exported object the same non-binding descriptor behavior.
+cmp_to_key = staticmethod(cmp_to_key)
 "# => ["cmp_to_key", "partial", "Placeholder", "_PlaceholderType"],
     },
     functions: {

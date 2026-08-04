@@ -108,8 +108,9 @@ pub trait SourceProvider {
     fn is_file(&self, path: &Path) -> bool;
     /// True when `path` names a directory.
     fn is_dir(&self, path: &Path) -> bool;
-    /// Read the whole file at `path` as UTF-8 source.
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    /// Read the whole file at `path` as raw bytes.  Source files carry a BOM
+    /// or a PEP 263 cookie, so decoding belongs to the caller, not here.
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>>;
 }
 
 #[cfg(feature = "host_env")]
@@ -148,8 +149,22 @@ fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
 /// uses this so it honours the same jail as the import machinery instead of
 /// reaching `std::fs` for a guest-controlled path.
 #[cfg(feature = "host_env")]
+pub fn read_source_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    with_source_provider(|p| p.read_to_bytes(path))
+}
+
+/// [`read_source_bytes`] decoded as plain UTF-8, for callers that hold a
+/// text file rather than Python source.  Source readers decode through
+/// `decode_source_bytes` instead so the BOM and the PEP 263 cookie apply.
+#[cfg(feature = "host_env")]
 pub fn read_source_to_string(path: &Path) -> std::io::Result<String> {
-    with_source_provider(|p| p.read_to_string(path))
+    let bytes = read_source_bytes(path)?;
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 #[cfg(all(
@@ -194,8 +209,8 @@ impl SourceProvider for HostFsProvider {
     fn is_dir(&self, path: &Path) -> bool {
         path.is_dir()
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-        host_fs::read_to_string(path)
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        host_fs::read(path)
     }
 }
 
@@ -225,7 +240,7 @@ impl SourceProvider for SeamSourceProvider {
     fn is_dir(&self, path: &Path) -> bool {
         Self::stat_mode(path).is_some_and(|m| m & libc::S_IFMT as u32 == libc::S_IFDIR as u32)
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         use std::os::unix::ffi::OsStrExt;
         fn to_io(e: crate::host_seam::SeamError) -> std::io::Error {
             match e {
@@ -247,8 +262,7 @@ impl SourceProvider for SeamSourceProvider {
             }
         }
         let _ = crate::host_seam::ops::close(fd);
-        String::from_utf8(data)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "source not utf-8"))
+        Ok(data)
     }
 }
 
@@ -265,7 +279,7 @@ impl SourceProvider for NullSourceProvider {
     fn is_dir(&self, _path: &Path) -> bool {
         false
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("no source provider installed: {}", path.display()),
@@ -348,9 +362,9 @@ impl SourceProvider for VfsProvider {
     fn is_dir(&self, path: &Path) -> bool {
         matches!(self.map.get(path), Some(VfsEntry::Dir))
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         match self.map.get(path) {
-            Some(VfsEntry::File(src)) => Ok(src.to_string()),
+            Some(VfsEntry::File(src)) => Ok(src.as_bytes().to_vec()),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("not in embedded stdlib: {}", path.display()),
@@ -377,6 +391,19 @@ pub fn mount_embedded_stdlib(mount: &Path) {
 // foreign STW root walks well-defined.
 static SYS_MODULES: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Every `Module` ever bound by [`set_sys_module`], keyed by address.
+///
+/// A builtin module is allocated immortal (`w_module_new_aliasing_dict` ->
+/// `malloc_typed`), so the collector never traces it and its `w_dict` is
+/// reachable only through [`walk_module_dicts_gc`].  Keying that walk on the
+/// name→module map alone loses the dict the moment a second module takes the
+/// name — `del sys.modules['_functools']` followed by a fresh `import`
+/// mints a new module, and the collection after that frees the first
+/// module's dict while Python still holds the module.  The module itself is
+/// immortal and can never be freed, so its dict has to stay valid for as
+/// long; entries are added and never removed.
+static MODULE_DICT_ROOTS: LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "host_env")]
 static SYS_PATH: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -477,7 +504,12 @@ pub fn builtin_module_names() -> Vec<&'static str> {
         .unwrap()
         .keys()
         .copied()
-        .filter(|name| !name.contains('.'))
+        // Frozen importlib's BuiltinImporter consults this tuple before
+        // invoking pyre's dotted-module hook.  Keep the PyPy package
+        // submodules advertised so `from __pypy__ import bufferable` (and
+        // the existing builders module) can reach their registered Mixed
+        // Module initializers; unrelated dotted aliases remain internal.
+        .filter(|name| !name.contains('.') || name.starts_with("__pypy__."))
         .collect();
     names.sort_unstable();
     names
@@ -582,6 +614,7 @@ pub fn install_builtin_modules() {
     // pickle.py imports (identity_dict + builders.BytesBuilder).
     pyre_install_module!("__pypy__" => crate::module::__pypy__::init);
     pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
+    pyre_install_module!("__pypy__.bufferable" => crate::module::__pypy__::bufferable::init);
 
     // pypyjit — runtime JIT-parameter control (`set_param`).
     pyre_install_module!("pypyjit" => crate::module::pypyjit::init);
@@ -1443,16 +1476,14 @@ pub fn add_sys_path_0() {
 /// and the `&str` argument matches `lookup_exc_class`.
 #[majit_macros::dont_look_inside]
 pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
-    // Consult the Python-visible sys.modules dict first so that user code
-    // writing `sys.modules['foo'] = mod` is immediately visible to imports.
-    // PyPy: importing.py check_sys_modules reads space.sys.get('modules').
+    // Once installed, the Python-visible dict is the sole semantic module
+    // cache.  PyPy's `check_sys_modules` reads `space.sys.get('modules')` and
+    // a deleted key is genuinely absent; the process-owned registry below is
+    // only the bootstrap owner/root used before that dict exists.
     let dict = sys_modules_dict();
     if !dict.is_null() {
-        if let Some(m) = unsafe { pyre_object::w_dict_getitem_str(dict, name) } {
-            if !m.is_null() && !unsafe { pyre_object::is_none(m) } {
-                return Some(m);
-            }
-        }
+        return unsafe { pyre_object::w_dict_getitem_str(dict, name) }
+            .filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) });
     }
     sys_modules_registry_get(name)
 }
@@ -1502,8 +1533,7 @@ fn sys_modules_blocks(name: &str) -> bool {
     }
 }
 
-/// Look up a loaded module by name in `sys.modules` (Python-visible dict
-/// first, then the interpreter cache). Mirrors `check_sys_modules`.
+/// Look up a loaded module by name through [`check_sys_modules`].
 pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
@@ -1538,6 +1568,7 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     // A new module joins the `walk_module_dicts_gc` root set; its dict
     // may hold young values — rescan on the next minor collection.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    MODULE_DICT_ROOTS.lock().unwrap().insert(module as usize);
     SYS_MODULES
         .lock()
         .unwrap()
@@ -1568,7 +1599,11 @@ pub fn remove_sys_module(name: &str) {
     }
 }
 
-/// GC root walk over every loaded module's dict storage.
+/// GC root walk over every bound module's dict storage.
+///
+/// The walk is keyed on [`MODULE_DICT_ROOTS`], not on the live name→module
+/// map: a module that lost its name to a later import is still immortal and
+/// still reachable from Python, so its dict must keep being marked.
 ///
 /// Modules (`malloc_typed`) are Box-immortal, while their non-moving
 /// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_dict` field
@@ -1587,18 +1622,25 @@ pub fn remove_sys_module(name: &str) {
 /// `visitor` must tolerate being called on every movable module-dict
 /// value slot reachable here.
 pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    {
-        for &module in SYS_MODULES.lock().unwrap().values() {
-            let module = module as PyObjectRef;
-            if module.is_null() || !unsafe { pyre_object::is_module(module) } {
-                continue;
-            }
-            unsafe {
-                let module = &mut *(module as *mut pyre_object::module::Module);
-                visitor(&mut module.w_dict);
-                let w_dict = module.w_dict;
-                pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
-            }
+    unsafe { walk_bound_module_dicts(visitor) };
+}
+
+/// The shared body of the two module-dict root walks.
+///
+/// # Safety
+/// `visitor` must tolerate being called on every movable module-dict value
+/// slot reachable here.
+unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    for &module in MODULE_DICT_ROOTS.lock().unwrap().iter() {
+        let module = module as PyObjectRef;
+        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+            continue;
+        }
+        unsafe {
+            let module = &mut *(module as *mut pyre_object::module::Module);
+            visitor(&mut module.w_dict);
+            let w_dict = module.w_dict;
+            pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
         }
     }
 }
@@ -1654,18 +1696,7 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
     // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
     // mutator, so the process-global cache cannot be semantically mutated
     // while this walk holds its native lock.
-    for &module in SYS_MODULES.lock().unwrap().values() {
-        let module = module as PyObjectRef;
-        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
-            continue;
-        }
-        unsafe {
-            let module = &mut *(module as *mut pyre_object::module::Module);
-            visitor(&mut module.w_dict);
-            let w_dict = module.w_dict;
-            pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
-        }
-    }
+    unsafe { walk_bound_module_dicts(visitor) };
     let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if !dict.is_null() {
         visitor(&mut dict);
@@ -2331,7 +2362,7 @@ fn load_source_module(
     package_dir: Option<&Path>,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let source = with_source_provider(|p| p.read_to_string(pathname)).map_err(|e| {
+    let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
         crate::PyError::new(
             crate::PyErrorKind::ImportError,
             format!("cannot read '{}': {e}", pathname.display()),
@@ -2339,6 +2370,9 @@ fn load_source_module(
     })?;
 
     let pathname_str = pathname.to_string_lossy();
+    // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
+    // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+    let source = crate::compile::decode_source_bytes(&bytes, &pathname_str, false)?;
 
     let _root = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources are imported by the native importer
@@ -2493,7 +2527,7 @@ fn load_source_module(
     // the module back out of sys.modules rather than reusing the local: the
     // body just executed arbitrary code, and a collection in there relocates
     // a young module while only the dict entry is updated.
-    if modulename == "importlib._bootstrap" {
+    if modulename == "importlib._bootstrap" && importlib_bootstrap_needs_install() {
         if let Some(loaded) = check_sys_modules(modulename) {
             if let Err(e) = install_importlib_bootstrap(loaded, execution_context) {
                 // Unwind the partial install: `dunder_import` routes through
@@ -2513,6 +2547,23 @@ fn load_source_module(
     }
 
     Ok(module)
+}
+
+/// PyPy installs the importlib bootstrap once while constructing the object
+/// space.  A later source-copy import (the 3.14 importlib tests deliberately
+/// remove its module names) executes the source but must not append a second
+/// BuiltinImporter/FrozenImporter/PathFinder set to the interpreter state.
+#[cfg(feature = "host_env")]
+fn importlib_bootstrap_needs_install() -> bool {
+    let Some(sys) = get_interpreter_sys_module() else {
+        return true;
+    };
+    !crate::baseobjspace::findattr_result(sys, "_pyre_importlib_bootstrap_installed")
+        .ok()
+        .flatten()
+        .is_some_and(|value| unsafe {
+            pyre_object::is_bool(value) && pyre_object::w_bool_get_value(value)
+        })
 }
 
 /// Wire a freshly executed `importlib._bootstrap` into this interpreter.
@@ -2598,6 +2649,11 @@ fn install_importlib_bootstrap(
             pyre_object::w_list_insert(w_path_hooks, 0, shadow_stack_get(zipimporter_slot));
         }
     }
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(sys_slot),
+        "_pyre_importlib_bootstrap_installed",
+        pyre_object::w_bool_from(true),
+    )?;
     Ok(())
 }
 
@@ -2641,6 +2697,18 @@ fn set_frozen_alias_metadata(
         shadow_stack_get(module_slot),
         "__spec__",
         shadow_stack_get(spec_slot),
+    )?;
+    // `FrozenImporter._fix_up_module` consumes this when a fresh source copy
+    // of importlib repairs the already-loaded essential frozen aliases.
+    let origname = match name {
+        "_frozen_importlib" => "importlib._bootstrap",
+        "_frozen_importlib_external" => "importlib._bootstrap_external",
+        _ => name,
+    };
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(module_slot),
+        "__origname__",
+        pyre_object::w_str_new(origname),
     )?;
     Ok(())
 }
@@ -2825,6 +2893,18 @@ fn absolute_import(
         _ => None,
     };
     if let Some(target) = frozen_target {
+        // `sys.modules[name] = None` is an explicit import block.  In
+        // particular, `test.support.import_helper.import_fresh_module` uses
+        // it to force importlib's source bootstrap: the failed frozen import
+        // is what selects the `except ImportError` arm that calls
+        // `_bootstrap._setup(sys, _imp)`.  Do not turn that sentinel back
+        // into the source module through the frozen-name alias.
+        if sys_modules_blocks(modulename) {
+            return Err(crate::PyError::module_not_found_with_name(
+                format!("import of {modulename} halted; None in sys.modules"),
+                modulename,
+            ));
+        }
         if let Some(cached) = check_sys_modules(modulename) {
             return Ok(cached);
         }

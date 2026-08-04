@@ -156,6 +156,28 @@ fn objects_in_repr(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// Box-immortal, so the entry roots the type for the lifetime of the process.
 const CANONICAL_IDENTITY_DICT_KEY: &str = "@objects_in_repr_identity_dict";
 
+/// `interp_magic.py:280-290 write_unraisable` — turn the supplied exception
+/// value back into an OperationError and report it through `sys.unraisablehook`.
+fn write_unraisable(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let where_desc = crate::baseobjspace::str_utf8_w(args[0])?;
+    // `OperationError(space.type(w_exc), w_exc)` accepts any object, so the
+    // exception tag cannot be read unconditionally: it lives past the header
+    // of a `W_BaseException`, and a plain instance is smaller than that.
+    // Classify first, and fall back to the kind a bare `BaseException` maps to.
+    let mut error = match unsafe {
+        pyre_object::interp_exceptions::w_exception_kind_checked(args[1])
+    } {
+        Some(_) => unsafe { crate::PyError::from_exc_object(args[1]) },
+        None => {
+            let mut error = crate::PyError::new(crate::PyErrorKind::RuntimeError, String::new());
+            error.exc_object = args[1];
+            error
+        }
+    };
+    error.write_unraisable(pyre_object::w_none(), &where_desc, args[2]);
+    Ok(pyre_object::w_none())
+}
+
 crate::py_module! {
     "__pypy__",
     // `PickleBuffer` wraps a bytes-like object for proto-5 out-of-band
@@ -173,6 +195,8 @@ crate::py_module! {
         "reversed_dict" / 1 = reversed_dict,
         "move_to_end" / * = move_to_end,
         "objects_in_repr" / 0 = objects_in_repr,
+        "write_unraisable" / 3 = write_unraisable,
+        "newmemoryview" / * = interp_buffer::newmemoryview,
     },
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`
@@ -196,6 +220,17 @@ pub mod builders {
         // frames into; StringBuilder is its text analogue.
         appleveldefs: {
             "builders_app.py" => ["BytesBuilder", "StringBuilder"],
+        }
+    }
+}
+
+/// `__pypy__.bufferable` — PyPy keeps `bufferable` in a submodule rather
+/// than exporting the class directly from `__pypy__`.
+pub mod bufferable {
+    crate::py_module! {
+        "__pypy__.bufferable",
+        interpleveldefs: {
+            "bufferable" => crate::module::__pypy__::interp_buffer::bufferable_impl::type_object(),
         }
     }
 }

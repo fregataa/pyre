@@ -521,8 +521,8 @@ pub enum PyErrorKind {
     UnicodeTranslateError,
     /// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` —
     /// raised by `compile`/`exec`/`eval`/`ast.parse` on malformed source.
-    /// Identity-only port (dedicated PyErrorKind / ExcKind / PyType); the
-    /// `msg`/`filename`/`lineno`/`offset`/`text` slots are TODO.
+    /// Its location and message fields live in the flattened
+    /// `W_BaseException` layout and mirror `W_SyntaxError`'s `w_*` slots.
     SyntaxError,
     /// Raised when a buffer-related operation cannot proceed, e.g.
     /// `PyByteArray_Resize` resizing a `bytearray` whose storage backs a
@@ -600,7 +600,7 @@ impl PyError {
     /// materialised.  `args` becomes `(msg, (filename, lineno, offset,
     /// text, end_lineno, end_offset))`, the shape
     /// `interp_exceptions.py:836 W_SyntaxError.descr_init` stores and
-    /// `syntax_error_attr` / `descr_str` read from.  `text` is the
+    /// the dedicated `W_SyntaxError` slots and `args_w` both receive. `text` is the
     /// offending source line (`None` → `text` reads back as `None`).
     #[allow(clippy::too_many_arguments)]
     pub fn syntax_error_located(
@@ -619,6 +619,7 @@ impl PyError {
         // the unrooted exception before `w_exception_set_args` writes it.
         let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new(ExcKind::SyntaxError, &message);
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(exc);
         // Build the `(filename, lineno, offset, text, end_lineno, end_offset)`
         // details tuple element by element. Each is pinned as it is created and
@@ -631,16 +632,43 @@ impl PyError {
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
         let offset_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
+        pyre_object::gc_roots::pin_root(wrap_pos(offset));
         let text_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(match text {
             Some(t) => pyre_object::w_str_new(t),
             None => pyre_object::w_none(),
         });
         let end_lineno_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_lineno));
+        pyre_object::gc_roots::pin_root(wrap_pos(end_lineno));
         let end_offset_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_offset));
+        pyre_object::gc_roots::pin_root(wrap_pos(end_offset));
+        let rooted_exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_filename(
+                rooted_exc,
+                pyre_object::gc_roots::shadow_stack_get(filename_slot),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_lineno(
+                rooted_exc,
+                pyre_object::gc_roots::shadow_stack_get(lineno_slot),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_offset(
+                rooted_exc,
+                pyre_object::gc_roots::shadow_stack_get(offset_slot),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_text(
+                rooted_exc,
+                pyre_object::gc_roots::shadow_stack_get(text_slot),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
+                rooted_exc,
+                pyre_object::gc_roots::shadow_stack_get(end_lineno_slot),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
+                rooted_exc,
+                pyre_object::gc_roots::shadow_stack_get(end_offset_slot),
+            );
+        }
         let details = pyre_object::w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(filename_slot),
             pyre_object::gc_roots::shadow_stack_get(lineno_slot),
@@ -654,8 +682,19 @@ impl PyError {
         let details_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(details);
         let w_msg = pyre_object::w_str_new(&message);
-        let details = pyre_object::gc_roots::shadow_stack_get(details_slot);
-        let args_list = pyre_object::w_list_new(vec![w_msg, details]);
+        let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_msg);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_msg(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                pyre_object::gc_roots::shadow_stack_get(msg_slot),
+            );
+        }
+        let args_list = pyre_object::w_list_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(msg_slot),
+            pyre_object::gc_roots::shadow_stack_get(details_slot),
+        ]);
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         PyError {
             kind: PyErrorKind::SyntaxError,
@@ -730,7 +769,11 @@ impl PyError {
         ]);
         self.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
         unsafe {
-            pyre_object::interp_exceptions::w_exception_set_args(self.exc_object, rebuilt_args)
+            pyre_object::interp_exceptions::w_exception_set_args(self.exc_object, rebuilt_args);
+            pyre_object::interp_exceptions::w_exception_set_syntax_filename(
+                self.exc_object,
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            );
         };
     }
 
@@ -1226,6 +1269,13 @@ impl PyError {
                 let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
                 unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc, msg) };
             }
+            // `W_SyntaxError.descr_init` likewise stores `args_w[0]` in its
+            // dedicated `w_msg` field.  Internal parser/codegen errors use
+            // this raw-message path, so mirror that store here.
+            if self.kind == PyErrorKind::SyntaxError {
+                let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
+                unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_msg(exc, msg) };
+            }
         }
         // Stamp the deferred `name` / `obj` context onto the freshly
         // materialised NameError / AttributeError instance, the lazy
@@ -1572,6 +1622,17 @@ impl PyError {
     }
 }
 
+/// `error.py:4-7 wrap_pos` — a zero position means "unknown" and reads back as
+/// `None`; every other value keeps its integer.  `lineno` deliberately skips
+/// this: a location-less parser error still reports line 0.
+fn wrap_pos(num: i64) -> PyObjectRef {
+    if num == 0 {
+        pyre_object::w_none()
+    } else {
+        pyre_object::w_int_new(num)
+    }
+}
+
 fn unraisable_hook_args_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
@@ -1744,13 +1805,20 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
     if let Some(text) = str_of(attr("text")) {
         let raw = text.trim_end_matches(['\n', '\r']);
         let shown = raw.trim_start();
-        let lead = raw.len() - shown.len();
+        let lead_bytes = raw.len() - shown.len();
+        let lead = raw[..lead_bytes].chars().count();
         writeln!(writer, "    {shown}")?;
-        if let Some(offset) = int_of(attr("offset")) {
-            let start_col = (offset.max(1) as usize) - 1;
+        if let Some(offset) = int_of(attr("offset")).filter(|&offset| offset > 0) {
+            // Traceback formatting treats the stored columns as display
+            // columns and clamps malformed constructor-supplied offsets to
+            // the displayed line.  Offsets at or below zero suppress the
+            // marker entirely.
+            let displayed_len = raw.chars().count();
+            let display_col = |offset: i64| ((offset as usize) - 1).min(displayed_len);
+            let start_col = display_col(offset);
             let end_col = int_of(attr("end_offset"))
                 .filter(|&e| e >= offset)
-                .map_or(start_col, |e| (e as usize) - 1);
+                .map_or(start_col, display_col);
             let caret_start = start_col.saturating_sub(lead);
             let caret_len = end_col.saturating_sub(start_col).max(1);
             let mut caret = String::from("    ");
@@ -2892,8 +2960,11 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
         // On wasm32 the provider is the embedder's — the host-FS bridge for the
         // native-host build, `NullSourceProvider` in a browser — so the same
         // call renders the offending line wherever one is actually reachable.
-        let content =
-            crate::importing::read_source_to_string(std::path::Path::new(filename)).ok()?;
+        let bytes = crate::importing::read_source_bytes(std::path::Path::new(filename)).ok()?;
+        // `linecache` opens with `tokenize.open`, so the BOM and the PEP 263
+        // cookie decide the encoding; a plain UTF-8 read drops the whole line
+        // for a file declaring anything else.
+        let content = crate::compile::decode_source_bytes(&bytes, filename, false).ok()?;
         content
             .lines()
             .nth((lineno - 1) as usize)

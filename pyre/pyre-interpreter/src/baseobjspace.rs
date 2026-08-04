@@ -450,58 +450,29 @@ fn exc_blocking_written(obj: PyObjectRef) -> bool {
     unsafe { isinstance_w(obj, blocking) }
 }
 
-/// `interp_exceptions.py:1357-1424 W_SyntaxError.descr_init` parses the
-/// constructor arguments into `msg` (`args_w[0]`) and, when a second
-/// argument is supplied, a `(filename, lineno, offset, text[, end_lineno,
-/// end_offset])` details tuple, exposing each piece as a
-/// `readwrite_attrproperty_w` slot whose class default is `None`.  Pyre
-/// keeps no dedicated SyntaxError slots, so an explicit `e.lineno = ...`
-/// write lands in the hasdict instance dict: read it first so the write
-/// wins, then derive the construct-time value from `args_w`, and finally
-/// fall back to the `None` class default.
+/// `interp_exceptions.py:827-834 W_SyntaxError` direct slot reader.
+///
+/// PyPy's `descr_init` writes the eight `w_*` fields before forwarding the
+/// original positional arguments to `W_BaseException.descr_init`; reads do
+/// not reconstruct them from `args_w` or the instance dictionary.
 pub(crate) fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
-    let w_dict = getdict_backing_native(obj);
-    if !w_dict.is_null() {
-        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-            return v;
-        }
-    }
-    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-    let n = unsafe { pyre_object::w_tuple_len(args) };
-    if name == "msg" {
-        if n >= 1 {
-            if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
-                return v;
+    let value = unsafe {
+        match name {
+            "msg" => pyre_object::interp_exceptions::w_exception_get_syntax_msg(obj),
+            "filename" => pyre_object::interp_exceptions::w_exception_get_syntax_filename(obj),
+            "lineno" => pyre_object::interp_exceptions::w_exception_get_syntax_lineno(obj),
+            "offset" => pyre_object::interp_exceptions::w_exception_get_syntax_offset(obj),
+            "text" => pyre_object::interp_exceptions::w_exception_get_syntax_text(obj),
+            "end_lineno" => pyre_object::interp_exceptions::w_exception_get_syntax_end_lineno(obj),
+            "end_offset" => pyre_object::interp_exceptions::w_exception_get_syntax_end_offset(obj),
+            "print_file_and_line" => {
+                pyre_object::interp_exceptions::w_exception_get_syntax_print_file_and_line(obj)
             }
+            "_metadata" => pyre_object::interp_exceptions::w_exception_get_syntax_metadata(obj),
+            _ => PY_NULL,
         }
-        return w_none();
-    }
-    // `print_file_and_line` is a vestigial slot with no derivation.
-    if name == "print_file_and_line" {
-        return w_none();
-    }
-    // The location attributes derive from the `args_w[1]` details tuple.
-    if n == 2 {
-        if let Some(details) = unsafe { pyre_object::w_tuple_getitem(args, 1) } {
-            if unsafe { pyre_object::is_tuple(details) } {
-                let dn = unsafe { pyre_object::w_tuple_len(details) };
-                let idx: usize = match name {
-                    "filename" => 0,
-                    "lineno" => 1,
-                    "offset" => 2,
-                    "text" => 3,
-                    "end_lineno" => 4,
-                    _ => 5, // "end_offset"
-                };
-                if idx < dn {
-                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(details, idx as i64) } {
-                        return v;
-                    }
-                }
-            }
-        }
-    }
-    w_none()
+    };
+    if value.is_null() { w_none() } else { value }
 }
 
 /// pypy/interpreter/baseobjspace.py:1370-1371 `exception_issubclass_w`.
@@ -1307,6 +1278,67 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
 /// A missing `__set_name__` is a no-op.  When the call raises, the original
 /// exception is re-raised with an `"Error calling __set_name__ ..."` note
 /// attached (PEP 678), mirroring `_PyErr_FormatNote`.
+fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
+    // CPython 3.14 `_PyException_AddNote` writes the exception's `__notes__`
+    // list directly.  It does not dispatch through a Python override of
+    // `add_note`; this is interpreter bookkeeping, not a method call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc = error.to_exc_object();
+    pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let note = w_str_new(text);
+    pyre_object::gc_roots::pin_root(note);
+    let note_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let rooted_exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(rooted_exc) };
+    pyre_object::gc_roots::pin_root(dict);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let notes = match unsafe {
+        w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            "__notes__",
+        )
+    } {
+        Some(notes) if unsafe { isinstance_list_w(notes) } => notes,
+        Some(_) => {
+            let mut note_error = PyError::type_error("Cannot add note: __notes__ is not a list");
+            let note_exc = note_error.to_exc_object();
+            pyre_object::gc_roots::pin_root(note_exc);
+            let note_exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            crate::error::chain_context(
+                pyre_object::gc_roots::shadow_stack_get(note_exc_slot),
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            );
+            note_error.exc_object = pyre_object::gc_roots::shadow_stack_get(note_exc_slot);
+            return Err(note_error);
+        }
+        None => {
+            let notes = w_list_new(Vec::new());
+            pyre_object::gc_roots::pin_root(notes);
+            let notes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    "__notes__",
+                    pyre_object::gc_roots::shadow_stack_get(notes_slot),
+                );
+            }
+            pyre_object::gc_roots::shadow_stack_get(notes_slot)
+        }
+    };
+    pyre_object::gc_roots::pin_root(notes);
+    let notes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    unsafe {
+        w_list_append(
+            pyre_object::gc_roots::shadow_stack_get(notes_slot),
+            pyre_object::gc_roots::shadow_stack_get(note_slot),
+        );
+    }
+    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    Ok(())
+}
+
 pub(crate) unsafe fn set_name(
     w_owner: PyObjectRef,
     w_name: PyObjectRef,
@@ -1332,26 +1364,21 @@ pub(crate) unsafe fn set_name(
         )
     } {
         Ok(_) => Ok(()),
-        Err(e) => {
-            if !e.exc_object.is_null() {
-                let name_repr = if unsafe { is_str(w_name) } {
-                    crate::display::format_wtf8_repr(unsafe { w_str_get_wtf8(w_name) })
-                } else {
-                    String::new()
-                };
-                let val_type_name =
-                    unsafe { pyre_object::w_type_get_name(w_valtype.as_ptr()) }.to_string();
-                let owner_name = unsafe { pyre_object::w_type_get_name(w_owner) }.to_string();
-                let note = w_str_new(&format!(
+        Err(mut e) => {
+            let name_repr = if unsafe { is_str(w_name) } {
+                crate::display::format_wtf8_repr(unsafe { w_str_get_wtf8(w_name) })
+            } else {
+                String::new()
+            };
+            let val_type_name =
+                unsafe { pyre_object::w_type_get_name(w_valtype.as_ptr()) }.to_string();
+            let owner_name = unsafe { pyre_object::w_type_get_name(w_owner) }.to_string();
+            add_internal_exception_note(
+                &mut e,
+                &format!(
                     "Error calling __set_name__ on '{val_type_name}' instance {name_repr} in '{owner_name}'"
-                ));
-                if let Ok(add) = getattr_str(e.exc_object, "add_note") {
-                    // add_note is best-effort: a failure to attach the note must
-                    // not mask the original __set_name__ exception `e`, which is
-                    // re-raised below.
-                    if let Err(_e) = crate::call::call_function_impl_result(add, &[note]) {}
-                }
-            }
+                ),
+            )?;
             Err(e)
         }
     }
@@ -1820,7 +1847,12 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // Python 3.9+ generic subscript: cls[X] → cls.__class_getitem__(X)
     // (`descroperation.py:366` getattr lookup).
     if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
-        return get_and_call_function(method, obj, obj, &[index]);
+        // PyPy's generic lookup treats an explicit None as disabling the
+        // inherited subscription hook.  Other non-callable values still
+        // reach the call and raise their ordinary not-callable TypeError.
+        if !pyre_object::is_none(method) {
+            return get_and_call_function(method, obj, obj, &[index]);
+        }
     }
     // abstract.py descr_getitem — a class that defines neither a metaclass
     // __getitem__ nor __class_getitem__ is not subscriptable.
@@ -3951,6 +3983,12 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // (`float2longlong`), so `0.0 is -0.0` is false and a NaN is its
         // own identity. `float` subclasses (`user_overridden_class`) keep
         // pointer identity — the exact-type gate excludes them.
+        //
+        // This has to stay in step with `function::immutable_unique_id`, which
+        // derives `id()` from the same bits, and with `FloatListStrategy`,
+        // which unboxes and reboxes list elements: pointer identity here would
+        // make `a is b` false while `id(a) == id(b)` stayed true, and would
+        // make `[a][0] is a` false.
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::FLOAT_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::FLOAT_TYPE)
         {
@@ -4812,6 +4850,15 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
         let lifeline = unsafe { pyre_object::memoryview::w_memoryview_getweakref(obj) };
         return (!lifeline.is_null()).then_some(lifeline);
     }
+    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            let lifeline = unsafe { pyre_object::interp_exceptions::w_exception_getweakref(obj) };
+            return (!lifeline.is_null()).then_some(lifeline);
+        }
+        return None;
+    }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
         if crate::typedef::r#type(obj)
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
@@ -4860,6 +4907,14 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, weakreflifeline) };
         return Ok(());
+    }
+    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, weakreflifeline) };
+            return Ok(());
+        }
     }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
         if crate::typedef::r#type(obj)
@@ -4915,6 +4970,14 @@ pub fn delweakref(obj: PyObjectRef) {
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, PY_NULL) };
         return;
+    }
+    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, PY_NULL) };
+            return;
+        }
     }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
         if crate::typedef::r#type(obj)
@@ -5070,35 +5133,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             // `object.__getattribute__` when the post-starttype MRO has no
             // match.  This is how the proxy's own getsets (`__self__`,
             // `__thisclass__`, ...) remain visible.
-        }
-    }
-
-    // Generator/coroutine methods — PyPy: generator.py GeneratorIterator
-    //
-    // Return W_Method(func, gen) so the generator is passed as args[0].
-    unsafe {
-        if pyre_object::generator::is_generator(obj) {
-            let (sname, func, arity): (&str, fn(&[PyObjectRef]) -> PyResult, Option<u16>) =
-                match name {
-                    "send" => ("send", generator_send_method, Some(2)),
-                    "throw" => ("throw", generator_throw_method, None),
-                    "close" => ("close", generator_close_method, Some(1)),
-                    "__next__" => ("__next__", generator_next_method, Some(1)),
-                    "__iter__" => ("__iter__", iter_self_method, Some(1)),
-                    _ => ("", generator_next_method, None), // sentinel — won't match
-                };
-            if !sname.is_empty() {
-                let func_obj = if let Some(a) = arity {
-                    crate::make_builtin_function_with_arity(sname, func, a)
-                } else {
-                    crate::make_builtin_function(sname, func)
-                };
-                return Ok(pyre_object::w_method_new(
-                    func_obj,
-                    obj,
-                    pyre_object::PY_NULL,
-                ));
-            }
         }
     }
 
@@ -5480,6 +5514,17 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         .map(|t| lookup_in_type_where(t.as_ptr(), name).is_some())
                         .unwrap_or(false);
                     if !on_method_type {
+                        // Keep the CPython-3.14 METH_CLASS qualname delta in
+                        // Method.descr_method_getattribute's single forwarding
+                        // implementation.  The fast path here otherwise
+                        // bypasses that method entirely.
+                        if name == "__qualname__" {
+                            if let Some(qualname) =
+                                crate::function::method_class_bound_qualname(obj)?
+                            {
+                                return Ok(qualname);
+                            }
+                        }
                         let func = pyre_object::function::w_method_get_func(obj);
                         if !func.is_null() {
                             return getattr_str(func, name);
@@ -6532,6 +6577,50 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
     Ok(w_none())
 }
 
+/// CPython 3.14 `type_get___annotate__`: the compiler-facing
+/// `__annotate_func__` slot is exposed as `__annotate__` on heap types.
+/// Static types have no slot and raise AttributeError rather than returning
+/// None.  A class-body `__annotate__` entry is an ordinary own-class value
+/// and takes precedence over the compiler-facing slot.
+pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::attribute_error(format!(
+            "type object '{}' has no attribute '__annotate__'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    if let Some(value) = crate::type_dict_lookup(obj, "__annotate__") {
+        return Ok(value);
+    }
+    Ok(crate::type_dict_lookup(obj, "__annotate_func__").unwrap_or_else(w_none))
+}
+
+/// CPython 3.14 `type_get_type_params` / `type_set_type_params`: parameters
+/// belong to the receiver type itself, are never inherited, and default to
+/// the empty tuple.  Unlike function type parameters, the class slot accepts
+/// any object; the compiler normally stores a tuple.
+pub(crate) fn type_get_type_params(obj: PyObjectRef) -> PyResult {
+    if unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        if let Some(value) = crate::type_dict_lookup(obj, "__type_params__") {
+            return Ok(value);
+        }
+    }
+    Ok(w_tuple_new(vec![]))
+}
+
+pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::type_error(format!(
+            "cannot set '__type_params__' attribute of immutable type '{}'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    crate::type_dict_store(obj, "__type_params__", value);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    unsafe { mutated(obj, Some("__type_params__")) };
+    Ok(w_none())
+}
+
 pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
         return Err(PyError::type_error(format!(
@@ -6619,6 +6708,13 @@ pub(crate) fn type_del_doc(obj: PyObjectRef) -> PyResult {
 /// declares, so the caller continues its own lookup.
 pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
+        "__dict__" => {
+            // interp_exceptions.py:293 BaseException.typedef installs
+            // `GetSetProperty(descr_get_dict, descr_set_dict)`.  Every
+            // exception owns a writable instance dict, allocated eagerly by
+            // pyre's flattened W_BaseException layout.
+            return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
+        }
         "__traceback__" => {
             // `interp_exceptions.py:196-201 W_BaseException.descr_gettraceback`
             // returns the `w_traceback` slot stamped by
@@ -6663,13 +6759,16 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
             if let Some(base_group) = crate::builtins::lookup_exc_class("BaseExceptionGroup")
                 && isinstance(obj, base_group)?
             {
-                let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
-                let key = if name == "message" {
-                    "__pyre_exception_group_message"
-                } else {
-                    "__pyre_exception_group_exceptions"
+                // `interp_group.py:71-72` — both are `interp_attrproperty_w`
+                // slots on the instance, not instance-dictionary entries.
+                let value = unsafe {
+                    if name == "message" {
+                        pyre_object::interp_exceptions::w_exception_get_group_message(obj)
+                    } else {
+                        pyre_object::interp_exceptions::w_exception_get_group_exceptions(obj)
+                    }
                 };
-                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, key) } {
+                if !value.is_null() {
                     return Ok(value);
                 }
             }
@@ -6807,8 +6906,8 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 }
                 return Ok(w_none());
             }
-            // `W_SyntaxError` also exposes `filename`, derived from its
-            // `(filename, lineno, ...)` details tuple (`filename2` is OSError-only).
+            // `W_SyntaxError` also exposes its dedicated `w_filename` slot
+            // (`filename2` is OSError-only).
             if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError && name == "filename" {
                 return Ok(syntax_error_attr(obj, name));
             }
@@ -6973,9 +7072,8 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
         }
-        // `W_SyntaxError` location attributes, derived from the
-        // `(filename, lineno, offset, text[, end_lineno, end_offset])`
-        // details tuple; `print_file_and_line` is a vestigial slot.
+        // `W_SyntaxError` location attributes, read from its dedicated
+        // `w_*` fields; `print_file_and_line` is a vestigial slot.
         // `filename` / `msg` are handled by the shared arms above.
         "lineno" | "offset" | "text" | "end_lineno" | "end_offset" | "print_file_and_line" => {
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
@@ -7187,30 +7285,21 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 return type_get_annotations(obj);
             }
             if name == "__type_params__" {
-                // CPython 3.14 type_get_type_params: PEP 695 parameters are
-                // owned by the class itself and every other type, including
-                // static `object`, exposes an empty tuple.  Do not inherit a
-                // base class's parameters through the MRO.
-                if let Some(value) = crate::type_dict_lookup(obj, "__type_params__") {
-                    return Ok(value);
-                }
-                return Ok(w_tuple_new(vec![]));
+                return type_get_type_params(obj);
             }
             // PEP 649: `__annotate__` and `__annotate_func__` are the
             // same slot. Bytecode stores it as `__annotate_func__` in the
             // class dict; user code reads it as `__annotate__`. Forward
             // either name to the other, matching CPython's mapping in
             // typeobject.c type_get___annotate__.
-            if name == "__annotate__" || name == "__annotate_func__" {
+            if name == "__annotate__" {
+                return type_get_annotate(obj);
+            }
+            if name == "__annotate_func__" {
                 if let Some(v) = crate::type_dict_lookup(obj, name) {
                     return Ok(v);
                 }
-                let alt = if name == "__annotate__" {
-                    "__annotate_func__"
-                } else {
-                    "__annotate__"
-                };
-                if let Some(v) = crate::type_dict_lookup(obj, alt) {
+                if let Some(v) = crate::type_dict_lookup(obj, "__annotate__") {
                     return Ok(v);
                 }
                 return Ok(w_none());
@@ -10848,11 +10937,9 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
         }
         _ => {}
     }
-    // `W_SyntaxError`'s writable location slots.  `syntax_error_attr` reads
-    // the instance dict before deriving from the `(filename, lineno, offset,
-    // text[, end_lineno, end_offset])` details tuple, so the store lands
-    // there; the `msg` / `filename` arms above belong to other kinds and fall
-    // through to here.
+    // `interp_exceptions.py:964-982 W_SyntaxError.typedef` writable
+    // `readwrite_attrproperty_w` slots.  These are real `W_SyntaxError`
+    // fields, not instance-dict entries.
     if matches!(
         name,
         "msg"
@@ -10865,8 +10952,31 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
             | "print_file_and_line"
     ) && unsafe { pyre_object::w_exception_get_kind(obj) }
         == pyre_object::interp_exceptions::ExcKind::SyntaxError
-        && setdictvalue(obj, name, value)?
     {
+        unsafe {
+            match name {
+                "msg" => pyre_object::interp_exceptions::w_exception_set_syntax_msg(obj, value),
+                "filename" => {
+                    pyre_object::interp_exceptions::w_exception_set_syntax_filename(obj, value)
+                }
+                "lineno" => {
+                    pyre_object::interp_exceptions::w_exception_set_syntax_lineno(obj, value)
+                }
+                "offset" => {
+                    pyre_object::interp_exceptions::w_exception_set_syntax_offset(obj, value)
+                }
+                "text" => pyre_object::interp_exceptions::w_exception_set_syntax_text(obj, value),
+                "end_lineno" => {
+                    pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(obj, value)
+                }
+                "end_offset" => {
+                    pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(obj, value)
+                }
+                _ => pyre_object::interp_exceptions::w_exception_set_syntax_print_file_and_line(
+                    obj, value,
+                ),
+            }
+        };
         return Ok(w_none());
     }
     Ok(pyre_object::PY_NULL)
@@ -11110,6 +11220,47 @@ fn is_exception_typedef_getset(descr: PyObjectRef) -> bool {
     !fget.is_null() && std::ptr::eq(fget, crate::builtins::exception_getset_fget_obj())
 }
 
+/// The member-descriptor half of [`is_exception_typedef_getset`].
+///
+/// `Objects/exceptions.c` declares `errno` / `strerror` / `filename` /
+/// `filename2` / `code` / `name` / `obj` and the `UnicodeError` fields as
+/// `PyMemberDef` entries, so the class dict holds a `W_MemberDescr` for them
+/// rather than a getset.  `direct_member_get` reads exactly the slot accessor
+/// the fold reads and only diverges where the stored slot is NULL — which the
+/// fold declines anyway — so a lookup landing on the canonical member *is* the
+/// slot, and folding past it keeps the same value.  The kind is matched against
+/// the selected slot, so a member for a different field still declines.
+fn is_exception_typedef_member(descr: PyObjectRef, slot: ExceptionAttrSlot) -> bool {
+    if descr.is_null() || !unsafe { pyre_object::is_member(descr) } {
+        return false;
+    }
+    let kind = unsafe { pyre_object::w_member_get_direct_kind(descr) };
+    match slot {
+        ExceptionAttrSlot::Errno => kind == pyre_object::MEMBER_OS_ERROR_ERRNO,
+        ExceptionAttrSlot::Strerror => kind == pyre_object::MEMBER_OS_ERROR_STRERROR,
+        ExceptionAttrSlot::Filename => kind == pyre_object::MEMBER_OS_ERROR_FILENAME,
+        ExceptionAttrSlot::Filename2 => kind == pyre_object::MEMBER_OS_ERROR_FILENAME2,
+        ExceptionAttrSlot::Code => kind == pyre_object::MEMBER_SYSTEM_EXIT_CODE,
+        ExceptionAttrSlot::Name => matches!(
+            kind,
+            pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME
+                | pyre_object::MEMBER_NAME_ERROR_NAME
+                | pyre_object::MEMBER_IMPORT_ERROR_NAME
+        ),
+        ExceptionAttrSlot::AttrObj => kind == pyre_object::MEMBER_ATTRIBUTE_ERROR_OBJ,
+        ExceptionAttrSlot::UnicodeObject => kind == pyre_object::MEMBER_UNICODE_ERROR_OBJECT,
+        ExceptionAttrSlot::UnicodeStart => kind == pyre_object::MEMBER_UNICODE_ERROR_START,
+        ExceptionAttrSlot::UnicodeEnd => kind == pyre_object::MEMBER_UNICODE_ERROR_END,
+        ExceptionAttrSlot::UnicodeReason => kind == pyre_object::MEMBER_UNICODE_ERROR_REASON,
+        ExceptionAttrSlot::UnicodeEncoding => kind == pyre_object::MEMBER_UNICODE_ERROR_ENCODING,
+        // `args` / `__context__` / `__cause__` / `__traceback__` stay getsets.
+        ExceptionAttrSlot::Args
+        | ExceptionAttrSlot::Context
+        | ExceptionAttrSlot::Cause
+        | ExceptionAttrSlot::Traceback => false,
+    }
+}
+
 /// Ingredients for the full-body walker's mirror of the typed exception-slot
 /// attribute arms.  This helper deliberately lives beside `getattr_str_impl`
 /// and `object_setattr`, whose branch order it audits.
@@ -11289,6 +11440,12 @@ pub unsafe fn exception_attr_slot_fold(
         return None;
     }
     let w_type = crate::typedef::r#type(obj)?;
+    // mapdict.py:1495-1499 `LOAD_ATTR_slowpath` — a custom `__getattribute__`
+    // handles the access and never reaches the descriptor, so no slot read is
+    // equivalent to it.
+    if unsafe { getattribute_if_not_from_object(w_type.as_ptr()) }.is_some() {
+        return None;
+    }
     // Any hit other than the class's own `interp_exceptions.py` typedef
     // getset precedes the slot; that one *is* the slot, reached through
     // `exception_attr_get`, so folding past it keeps the same value.  The
@@ -11296,6 +11453,7 @@ pub unsafe fn exception_attr_slot_fold(
     // mutations.
     if let Some(descr) = unsafe { lookup_in_type_where(w_type.as_ptr(), name) }
         && !is_exception_typedef_getset(descr)
+        && !is_exception_typedef_member(descr, slot)
     {
         return None;
     }
@@ -11441,10 +11599,11 @@ pub(crate) fn raiseattrerror(
     if w_descr.is_some() {
         let tp_name = unsafe {
             match crate::typedef::r#type(obj) {
-                // Python 3.14 `PyUnicode_FromFormat("%T")` calls
-                // `PyType_GetFullyQualifiedName`, which uses
-                // `<module>.<qualname>` for heap types.
-                Some(tp) => type_repr_qualified_name(tp.as_ptr()),
+                // CPython 3.14's generic set-attribute error uses
+                // `Py_TYPE(obj)->tp_name`, just like PyPy's `%T` here.  This
+                // deliberately differs from an empty member descriptor's
+                // read error, which uses the fully-qualified heap-type name.
+                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
                 None => (*(*obj).ob_type).name.to_string(),
             }
         };
@@ -11460,7 +11619,7 @@ pub(crate) fn raiseattrerror(
             format!("type object '{}'", pyre_object::w_type_get_name(obj))
         } else {
             let tp_name = match crate::typedef::r#type(obj) {
-                Some(tp) => type_repr_qualified_name(tp.as_ptr()),
+                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
                 None => (*(*obj).ob_type).name.to_string(),
             };
             format!("'{}' object", tp_name)
@@ -11564,6 +11723,10 @@ unsafe fn exception_deletable_slot(obj: PyObjectRef, name: &str) -> bool {
 /// `PY_NULL` means the name is not one this exception kind declares.
 pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
+        "__dict__" => {
+            // Python 3.14 BaseException.__dict__ exposes no delete operation.
+            return Err(PyError::type_error("cannot delete __dict__"));
+        }
         "args" | "__cause__" | "__context__" | "__traceback__" => {
             return Err(PyError::type_error(format!("{name} may not be deleted")));
         }
@@ -11591,6 +11754,9 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    if unsafe { pyre_object::function::is_method(obj) } && name == "__class__" {
+        return Err(PyError::type_error("can't delete __class__ attribute"));
+    }
     // descroperation.py:131-140 descr__delattr__: a data descriptor's
     // `__delete__` takes priority over the namespace delete. PyPy walks
     // `space.type(obj)`, so the lookup must run for any object whose type
@@ -13929,8 +14095,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(item);
                 }
             }
-            // `listreviter_next` only parks the -1 sentinel; the source list
-            // stays referenced so `__setstate__` can restart the descent.
+            // CPython 3.14 keeps `w_seq` after exhaustion so an explicit
+            // `__setstate__` can revive the iterator.  The exhausted cursor
+            // alone selects the empty-list form in `__reduce__`; clearing
+            // the source here would incorrectly make state restoration a
+            // no-op.
             pyre_object::w_list_reverse_iter_set_index(obj, -1);
             return Err(PyError::stop_iteration());
         }
@@ -15360,7 +15529,18 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     for &item in &items {
                         pyre_object::gc_roots::pin_root(item);
                     }
-                    Ok(pyre_object::w_tuple_new(items))
+                    // PyPy's `space.newtuple(items)` may select the `_ii` or
+                    // `_ff` value-backed arity-2 representation because its
+                    // object space gives plain numeric objects value identity.
+                    // Python 3.14 requires `zip` to retain the exact objects
+                    // returned by its input iterators.  Pyre uses pointer
+                    // identity, so keep the two references in the otherwise
+                    // equivalent inline `_oo` representation.
+                    if items.len() == 2 {
+                        Ok(pyre_object::w_specialised_tuple_oo_new(items[0], items[1]))
+                    } else {
+                        Ok(pyre_object::w_tuple_new(items))
+                    }
                 }
                 None => Err(PyError::stop_iteration()),
             };

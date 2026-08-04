@@ -272,6 +272,110 @@ pub const MEMBER_COMPLEX_IMAG: u32 = MEMBER_DIRECT_FLAG | 7;
 /// receiver instead of reading one fixed offset.
 pub const MEMBER_DESCR_OBJCLASS: u32 = MEMBER_DIRECT_FLAG | 8;
 pub const MEMBER_DESCR_NAME: u32 = MEMBER_DIRECT_FLAG | 9;
+/// CPython 3.14 `BaseExceptionGroup_members`: the immutable constructor
+/// message and tuple of nested exceptions.
+pub const MEMBER_EXCEPTION_GROUP_MESSAGE: u32 = MEMBER_DIRECT_FLAG | 10;
+pub const MEMBER_EXCEPTION_GROUP_EXCEPTIONS: u32 = MEMBER_DIRECT_FLAG | 11;
+/// CPython 3.14 `SyntaxError_members._metadata`, a writable private slot.
+pub const MEMBER_SYNTAX_ERROR_METADATA: u32 = MEMBER_DIRECT_FLAG | 12;
+/// CPython 3.14 `StopIteration.value`, backed by PyPy's `w_value` field.
+pub const MEMBER_STOP_ITERATION_VALUE: u32 = MEMBER_DIRECT_FLAG | 13;
+/// CPython 3.14 `BaseException.__suppress_context__` boolean member.
+pub const MEMBER_EXCEPTION_SUPPRESS_CONTEXT: u32 = MEMBER_DIRECT_FLAG | 14;
+/// CPython 3.14 `AttributeError_members.name`, backed by PyPy's `w_name`.
+pub const MEMBER_ATTRIBUTE_ERROR_NAME: u32 = MEMBER_DIRECT_FLAG | 15;
+/// CPython 3.14 `AttributeError_members.obj`, backed by PyPy's `w_obj`.
+pub const MEMBER_ATTRIBUTE_ERROR_OBJ: u32 = MEMBER_DIRECT_FLAG | 16;
+/// CPython 3.14 `NameError_members.name`, backed by PyPy's `w_name`.
+pub const MEMBER_NAME_ERROR_NAME: u32 = MEMBER_DIRECT_FLAG | 17;
+/// CPython 3.14 `ImportError_members.msg`, backed by PyPy's `w_msg`.
+pub const MEMBER_IMPORT_ERROR_MSG: u32 = MEMBER_DIRECT_FLAG | 18;
+/// CPython 3.14 `ImportError_members.name`, backed by PyPy's `w_name`.
+pub const MEMBER_IMPORT_ERROR_NAME: u32 = MEMBER_DIRECT_FLAG | 19;
+/// CPython 3.14 `ImportError_members.name_from`, a pyre-flattened PyPy field.
+pub const MEMBER_IMPORT_ERROR_NAME_FROM: u32 = MEMBER_DIRECT_FLAG | 20;
+/// CPython 3.14 `ImportError_members.path`, backed by PyPy's `w_path`.
+pub const MEMBER_IMPORT_ERROR_PATH: u32 = MEMBER_DIRECT_FLAG | 21;
+/// CPython 3.14 `OSError_members.errno`, backed by PyPy's `w_errno`.
+pub const MEMBER_OS_ERROR_ERRNO: u32 = MEMBER_DIRECT_FLAG | 22;
+/// CPython 3.14 `OSError_members.strerror`, backed by PyPy's `w_strerror`.
+pub const MEMBER_OS_ERROR_STRERROR: u32 = MEMBER_DIRECT_FLAG | 23;
+/// CPython 3.14 `OSError_members.filename`, backed by PyPy's `w_filename`.
+pub const MEMBER_OS_ERROR_FILENAME: u32 = MEMBER_DIRECT_FLAG | 24;
+/// CPython 3.14 `OSError_members.filename2`, backed by PyPy's `w_filename2`.
+pub const MEMBER_OS_ERROR_FILENAME2: u32 = MEMBER_DIRECT_FLAG | 25;
+/// CPython 3.14 `SystemExit_members.code`, backed by PyPy's `w_code`.
+pub const MEMBER_SYSTEM_EXIT_CODE: u32 = MEMBER_DIRECT_FLAG | 26;
+/// CPython 3.14 `SyntaxError_members.msg`, backed by PyPy's `w_msg`.
+pub const MEMBER_SYNTAX_ERROR_MSG: u32 = MEMBER_DIRECT_FLAG | 27;
+/// CPython 3.14 `SyntaxError_members.filename`, backed by PyPy's `w_filename`.
+pub const MEMBER_SYNTAX_ERROR_FILENAME: u32 = MEMBER_DIRECT_FLAG | 28;
+/// CPython 3.14 `SyntaxError_members.lineno`, backed by PyPy's `w_lineno`.
+pub const MEMBER_SYNTAX_ERROR_LINENO: u32 = MEMBER_DIRECT_FLAG | 29;
+/// CPython 3.14 `SyntaxError_members.offset`, backed by PyPy's `w_offset`.
+pub const MEMBER_SYNTAX_ERROR_OFFSET: u32 = MEMBER_DIRECT_FLAG | 30;
+/// CPython 3.14 `SyntaxError_members.text`, backed by PyPy's `w_text`.
+pub const MEMBER_SYNTAX_ERROR_TEXT: u32 = MEMBER_DIRECT_FLAG | 31;
+/// CPython 3.14 `SyntaxError_members.end_lineno`, backed by PyPy's field.
+pub const MEMBER_SYNTAX_ERROR_END_LINENO: u32 = MEMBER_DIRECT_FLAG | 32;
+/// CPython 3.14 `SyntaxError_members.end_offset`, backed by PyPy's field.
+pub const MEMBER_SYNTAX_ERROR_END_OFFSET: u32 = MEMBER_DIRECT_FLAG | 33;
+/// CPython 3.14 `SyntaxError_members.print_file_and_line`, backed by PyPy's field.
+pub const MEMBER_SYNTAX_ERROR_PRINT_FILE_AND_LINE: u32 = MEMBER_DIRECT_FLAG | 34;
+/// CPython 3.14 Unicode*Error `encoding`, backed by PyPy's `w_encoding`.
+pub const MEMBER_UNICODE_ERROR_ENCODING: u32 = MEMBER_DIRECT_FLAG | 35;
+/// CPython 3.14 Unicode*Error `object`, backed by PyPy's `w_object`.
+pub const MEMBER_UNICODE_ERROR_OBJECT: u32 = MEMBER_DIRECT_FLAG | 36;
+/// CPython 3.14 Unicode*Error `start`, backed by PyPy's `w_start`.
+pub const MEMBER_UNICODE_ERROR_START: u32 = MEMBER_DIRECT_FLAG | 37;
+/// CPython 3.14 Unicode*Error `end`, backed by PyPy's `w_end`.
+pub const MEMBER_UNICODE_ERROR_END: u32 = MEMBER_DIRECT_FLAG | 38;
+/// CPython 3.14 Unicode*Error `reason`, backed by PyPy's `w_reason`.
+pub const MEMBER_UNICODE_ERROR_REASON: u32 = MEMBER_DIRECT_FLAG | 39;
+/// CPython 3.14 `staticmethod_members`: both `__func__` and `__wrapped__`
+/// expose PyPy's `StaticMethod.w_function` field read-only.
+pub const MEMBER_STATICMETHOD_FUNCTION: u32 = MEMBER_DIRECT_FLAG | 40;
+/// CPython 3.14 `classmethod_members`: both `__func__` and `__wrapped__`
+/// expose PyPy's `ClassMethod.w_function` field read-only.
+pub const MEMBER_CLASSMETHOD_FUNCTION: u32 = MEMBER_DIRECT_FLAG | 41;
+/// CPython 3.14 `property_members.fget`, backed by PyPy's `w_fget` field.
+pub const MEMBER_PROPERTY_FGET: u32 = MEMBER_DIRECT_FLAG | 42;
+/// CPython 3.14 `property_members.fset`, backed by PyPy's `w_fset` field.
+pub const MEMBER_PROPERTY_FSET: u32 = MEMBER_DIRECT_FLAG | 43;
+/// CPython 3.14 `property_members.fdel`, backed by PyPy's `w_fdel` field.
+pub const MEMBER_PROPERTY_FDEL: u32 = MEMBER_DIRECT_FLAG | 44;
+/// CPython 3.14 `property_members.__doc__`, the writable `w_doc` field.
+pub const MEMBER_PROPERTY_DOC: u32 = MEMBER_DIRECT_FLAG | 45;
+/// CPython 3.14 `range_members.start`, backed by PyPy's `w_start` field.
+pub const MEMBER_RANGE_START: u32 = MEMBER_DIRECT_FLAG | 46;
+/// CPython 3.14 `range_members.stop`, backed by PyPy's `w_stop` field.
+pub const MEMBER_RANGE_STOP: u32 = MEMBER_DIRECT_FLAG | 47;
+/// CPython 3.14 `range_members.step`, backed by PyPy's `w_step` field.
+pub const MEMBER_RANGE_STEP: u32 = MEMBER_DIRECT_FLAG | 48;
+/// CPython 3.14 `slice_members.start`, backed by PyPy's `w_start` field.
+pub const MEMBER_SLICE_START: u32 = MEMBER_DIRECT_FLAG | 49;
+/// CPython 3.14 `slice_members.stop`, backed by PyPy's `w_stop` field.
+pub const MEMBER_SLICE_STOP: u32 = MEMBER_DIRECT_FLAG | 50;
+/// CPython 3.14 `slice_members.step`, backed by PyPy's `w_step` field.
+pub const MEMBER_SLICE_STEP: u32 = MEMBER_DIRECT_FLAG | 51;
+/// CPython 3.14 `super_members.__thisclass__`, backed by PyPy's `w_starttype`.
+pub const MEMBER_SUPER_THISCLASS: u32 = MEMBER_DIRECT_FLAG | 52;
+/// CPython 3.14 `super_members.__self__`, backed by PyPy's `w_self`.
+pub const MEMBER_SUPER_SELF: u32 = MEMBER_DIRECT_FLAG | 53;
+/// CPython 3.14 `super_members.__self_class__`, backed by PyPy's `w_objtype`.
+pub const MEMBER_SUPER_SELF_CLASS: u32 = MEMBER_DIRECT_FLAG | 54;
+/// CPython 3.14 `type_members.__flags__`, computed from PyPy's type flags.
+pub const MEMBER_TYPE_FLAGS: u32 = MEMBER_DIRECT_FLAG | 55;
+/// CPython 3.14 `type_members.__base__`, backed by PyPy's best-base lookup.
+pub const MEMBER_TYPE_BASE: u32 = MEMBER_DIRECT_FLAG | 56;
+/// CPython 3.14 `type_members.__basicsize__`.
+pub const MEMBER_TYPE_BASICSIZE: u32 = MEMBER_DIRECT_FLAG | 57;
+/// CPython 3.14 `type_members.__itemsize__`.
+pub const MEMBER_TYPE_ITEMSIZE: u32 = MEMBER_DIRECT_FLAG | 58;
+/// CPython 3.14 `type_members.__weakrefoffset__`.
+pub const MEMBER_TYPE_WEAKREFOFFSET: u32 = MEMBER_DIRECT_FLAG | 59;
+/// CPython 3.14 `type_members.__dictoffset__`.
+pub const MEMBER_TYPE_DICTOFFSET: u32 = MEMBER_DIRECT_FLAG | 60;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

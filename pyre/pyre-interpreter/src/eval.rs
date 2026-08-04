@@ -242,9 +242,8 @@ unsafe fn walk_raw_function_roots(
         }
         let func = &mut *(value as *mut crate::function::Function);
         visitor(&mut *(&mut func.code as *mut *const () as *mut majit_ir::GcRef));
-        // The code object caches its own globals dict (`PyCode.w_globals`),
-        // a movable dict for custom-globals functions; the code is Box-immortal
-        // so the standard tracer never recurses into it.
+        // The code object caches its own globals dict (`PyCode.w_globals`).
+        // Reuse the same walk for managed custom tracing and bootstrap code.
         walk_raw_code_roots(func.code as PyObjectRef, visitor);
         visitor(&mut *(&mut func.closure as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.defs_w as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -267,14 +266,10 @@ unsafe fn walk_raw_function_roots(
     }
 }
 
-/// Forward a Box-immortal `PyCode`'s cached globals dict object and realized
-/// `co_consts_w` entries. Module globals are `malloc_typed`-immortal,
-/// but `exec`/`eval` with a plain dict (or a function built with custom
-/// globals) caches a `try_gc_alloc` movable dict here, which a minor collection
-/// relocates.  The code object itself is Box-immortal, so the standard tracer
-/// never recurses into it; visit the slot as a root the same way
-/// `walk_raw_function_roots` forwards `w_func_globals_obj`.  No-op for non-code
-/// values and inert when the cached dict is non-moving.
+/// Forward a `PyCode`'s cached globals, realized constants, qualname and
+/// mapdict-method entries. This is both the managed wrapper's custom trace and
+/// the explicit walk for bootstrap wrappers outside the collector. No-op for
+/// non-code values.
 pub unsafe fn walk_raw_code_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -291,8 +286,8 @@ pub unsafe fn walk_raw_code_roots(
             let identity = value as usize;
             // PyPy's GC traces the PyCode constant list transitively and its
             // mark state prevents revisiting shared/cyclic nodes. PyCode
-            // wrappers are outside pyre's collector, so mirror that small
-            // identity set directly while walking their constant graph.
+            // wrappers may be reached recursively without a collector mark
+            // check, so mirror that small identity set while walking constants.
             if visited.contains(&identity) {
                 return;
             }
@@ -300,8 +295,7 @@ pub unsafe fn walk_raw_code_roots(
             let code = &mut *(value as *mut crate::pycode::PyCode);
             visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
             // The realized `co_qualname` is an ordinary movable string object
-            // shared by every function built from this code; the wrapper is
-            // Box-immortal, so only this raw-root walker forwards it.
+            // shared by every function built from this code.
             visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
             // `co_name` is realized and retained the same way.
             visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -313,10 +307,21 @@ pub unsafe fn walk_raw_code_roots(
                     }
                     visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
                     slot.store(child, std::sync::atomic::Ordering::Release);
-                    // A code wrapper is Box-immortal and therefore not traced
-                    // by the collector. Recurse through nested co_consts_w,
-                    // matching PyPy's transitively traced PyCode list.
+                    // Recurse through nested co_consts_w, matching PyPy's
+                    // transitively traced PyCode list.
                     walk(child, visitor, visited);
+                }
+            }
+            // mapdict.py:1418 CacheEntry.w_method is the cache's sole GC
+            // reference.  PyPy traces it as part of the live PyCode; do the
+            // same here now that managed code wrappers reach this walker from
+            // their custom trace (the registry walk remains for bootstrap
+            // prebuilt wrappers).
+            if !code.mapdict_caches.is_null() {
+                for entry in (&mut *code.mapdict_caches).iter_mut().flatten() {
+                    visitor(
+                        &mut *(&mut entry.w_method as *mut PyObjectRef as *mut majit_ir::GcRef),
+                    );
                 }
             }
         }
@@ -512,6 +517,40 @@ unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut
             walk_raw_function_roots(d.fget, visitor);
             walk_raw_function_roots(d.fset, visitor);
             walk_raw_function_roots(d.fdel, visitor);
+        }
+    }
+}
+
+/// Mark the GC-reachable children of the function a `staticmethod` /
+/// `classmethod` wraps.  A builtin type dict binds the wrapper, not the
+/// function, so `walk_raw_function_roots` applied to the dict value stops at
+/// the wrapper and never descends to `w_function`.  That function is
+/// Box-immortal — it never moves and so is never traced — while the metadata
+/// `TypeCache.build` stamps onto it (`w_qualname`, `w_objclass`) and its
+/// lazily allocated `w_func_dict` are ordinary young objects.  Without this
+/// walk a minor collection leaves those slots pointing into vacated nursery
+/// memory (`str.maketrans`, `dict.fromkeys`).  No-op for other values.
+unsafe fn walk_raw_wrapped_function_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        // Positive predicates (see `walk_raw_getset_roots`): `!is_staticmethod`
+        // over a cross-crate bool is `UnaryNotUnknownOperand` to the annotator.
+        if pyre_object::function::is_staticmethod(value) {
+            walk_raw_function_roots(
+                pyre_object::function::w_staticmethod_get_func(value),
+                visitor,
+            );
+        }
+        if pyre_object::function::is_classmethod(value) {
+            walk_raw_function_roots(
+                pyre_object::function::w_classmethod_get_func(value),
+                visitor,
+            );
         }
     }
 }
@@ -921,11 +960,7 @@ pub unsafe fn walk_pyframe_roots_area(
                 // pyframe.py:102 `self.pycode` — the running code object.
                 // Visited as a root so a code object reachable only via
                 // `frame.pycode` (e.g. `exec`'d code with no owning
-                // Function) stays alive once code objects become
-                // GC-managed.  While code objects remain Box-immortal the
-                // visitor's `is_nursery_object_start` /
-                // `is_managed_heap_object` guard short-circuits, so this is
-                // inert today.
+                // Function) stays alive now that code objects are GC-managed.
                 let pycode_slot = &mut (*(frame)).pycode as *mut *const ();
                 visitor(&mut *(pycode_slot as *mut majit_ir::GcRef));
                 // Forward the running code object's cached globals dict.  For
@@ -1072,6 +1107,7 @@ pub unsafe fn walk_pyframe_roots_area(
                     // functions must be marked reachable here or the getter
                     // dangles after a collection.
                     walk_raw_getset_roots(*slot, visitor);
+                    walk_raw_wrapped_function_roots(*slot, visitor);
                 };
                 crate::importing::walk_import_roots_area(area.import_roots, &mut forward);
                 // The `_mapdict_caches` LOAD_METHOD `w_method` slots
@@ -1219,6 +1255,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);
             walk_raw_getset_roots(*slot, visitor);
+            walk_raw_wrapped_function_roots(*slot, visitor);
         };
         crate::baseobjspace::walk_method_cache_gc(&mut forward_cache);
     }
@@ -1231,7 +1268,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         return;
     }
     // PyPy's GC reaches standalone code objects through the ordinary object
-    // graph. Pyre's Box-immortal wrappers need the equivalent process-global
+    // graph. Pyre's bootstrap wrappers need the equivalent process-global
     // owner before walking module/type caches below.
     crate::pycode::walk_prebuilt_code_roots(visitor);
     unsafe {
@@ -1239,6 +1276,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);
             walk_raw_getset_roots(*slot, visitor);
+            walk_raw_wrapped_function_roots(*slot, visitor);
         };
         walk_builtin_type_dicts_gc(&mut forward);
         // interp_codecs.CodecState is `space.fromcache(CodecState)` in PyPy:
@@ -1464,11 +1502,13 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // `__context__` and `__cause__`/`__suppress_context__` writes land
     // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
-    // A running generator swaps its suspended exception into this flat EC
-    // slot before entering the frame.  Keep the hot raise path on the same
-    // residual leaf as PyPy's live frame state; walking the outer generator
-    // chain here would expose the virtualizable frame during tracing.
-    crate::error::chain_context(exc, get_current_exception());
+    // `ExecutionContext.sys_exc_info()` is the logical handled-exception
+    // view: when a generator is resumed from inside its caller's `except`,
+    // `push_gen_or_coroutine` parks that caller exception on the generator
+    // chain.  It must still become the context of a new exception raised by
+    // the generator. `get_sys_exception` is residual, so this does not expose
+    // the virtualizable frame to the tracer.
+    crate::error::chain_context(exc, get_sys_exception());
     if let Some(cause_obj) = cause {
         if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
             // `interp_exceptions.py:166-174 descr_setcause` — writes
@@ -1585,6 +1625,35 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
 /// (pyopcode.py:144-145 `except OperationError as e: operr = e`); the
 /// caller's `Err(err)` propagation then surfaces the replacement.
 pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut usize) -> bool {
+    handle_exception_with_context(frame, err, next_instr, ContextSource::GeneratorChain)
+}
+
+/// Where the implicit `__context__` of `err` comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ContextSource {
+    /// `executioncontext.py:219-233 sys_exc_info` — the logical handled
+    /// exception, walking to the generator that parked one. An exception the
+    /// frame itself produces is raised while the caller's handler is live, so
+    /// it takes that handler's exception.
+    GeneratorChain,
+    /// The flat EC slot alone, for an exception *thrown into* a resumed
+    /// generator. `push_gen_or_coroutine` has already swapped the generator's
+    /// own handled exception into the slot; the caller's belongs to the caller,
+    /// which merely delivered this exception rather than raising it under a
+    /// live handler. A generator holding none of its own therefore keeps a null
+    /// context.
+    ResumedFrameOnly,
+}
+
+/// [`handle_exception`] with an explicit context source
+/// (`pyframe.py:303-306` records the context of a thrown-in
+/// `SApplicationException` before the handler search).
+pub fn handle_exception_with_context(
+    frame: &mut PyFrame,
+    err: &mut PyError,
+    next_instr: &mut usize,
+    context_source: ContextSource,
+) -> bool {
     // Internal control-flow / corruption markers are not real Python
     // exceptions and must never be dispatched via bytecode handlers.
     if err.kind == crate::PyErrorKind::GeneratorReturn
@@ -1632,9 +1701,39 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     }
     // Implicit __context__ chaining: any exception raised while another is being
     // handled records that active exception as its __context__, not only an
-    // explicit `raise`.  Recorded once (skipped when a __context__ is already
-    // stamped), so it lands at the frame where the exception first surfaces.
-    crate::error::chain_context(err.exc_object, get_current_exception());
+    // explicit `raise`.
+    //
+    // `error.py:410-420 record_context` records it once and then marks the
+    // OperationError, so the frames the SAME error merely unwinds through never
+    // re-derive it.  That marking is load-bearing whenever the recorded answer
+    // was "no context": a null `__context__` does not distinguish an error that
+    // recorded none from one not yet recorded, and an outer frame handling
+    // something of its own would hand it that instead.  Pyre's witness for the
+    // unmarked state is the application traceback, which
+    // `record_application_traceback` stamps for this frame below and which is
+    // therefore still empty on exactly the frame where the error first
+    // surfaces.
+    //
+    // A thrown-in exception starts a *new* error over an exception object that
+    // already carries a traceback from wherever it was first raised, so it is
+    // unmarked at the delivery frame no matter what that object holds.
+    let record_context = match context_source {
+        ContextSource::GeneratorChain => {
+            !err.exc_object.is_null()
+                && unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_traceback(err.exc_object)
+                }
+                .is_null()
+        }
+        ContextSource::ResumedFrameOnly => true,
+    };
+    if record_context {
+        let active = match context_source {
+            ContextSource::GeneratorChain => get_sys_exception(),
+            ContextSource::ResumedFrameOnly => get_current_exception(),
+        };
+        crate::error::chain_context(err.exc_object, active);
+    }
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
             // The materialized exception is old-gen managed but lives only in the
@@ -1867,7 +1966,12 @@ pub(crate) fn eval_frame_plain_with_resume(
             FrameResume::Yielded(value) => return Ok(value),
             FrameResume::Dispatch(Some(mut err)) => {
                 let mut next_instr = frame.next_instr();
-                if !handle_exception(frame, &mut err, &mut next_instr) {
+                if !handle_exception_with_context(
+                    frame,
+                    &mut err,
+                    &mut next_instr,
+                    ContextSource::ResumedFrameOnly,
+                ) {
                     return Err(err);
                 }
                 frame.last_instr = next_instr as isize - 1;
@@ -1913,7 +2017,12 @@ pub(crate) fn eval_frame_plain_with_resume(
                 }
                 FrameResume::Dispatch(Some(mut err)) => {
                     let mut next_instr = frame.next_instr();
-                    if !handle_exception(frame, &mut err, &mut next_instr) {
+                    if !handle_exception_with_context(
+                        frame,
+                        &mut err,
+                        &mut next_instr,
+                        ContextSource::ResumedFrameOnly,
+                    ) {
                         return Err(err);
                     }
                     frame.last_instr = next_instr as isize - 1;
