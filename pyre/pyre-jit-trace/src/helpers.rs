@@ -767,11 +767,8 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
     raw: OpRef,
 ) {
     let one = ctx.const_int(1);
-    let list_block = ctx.record_op_with_descr(
-        OpCode::NewArray,
-        &[one],
-        crate::state::int_gcarray_descr(),
-    );
+    let list_block =
+        ctx.record_op_with_descr(OpCode::NewArray, &[one], crate::state::int_gcarray_descr());
     ctx.heap_cache_mut().new_array(list_block, one, true);
     let zero = ctx.const_int(0);
     crate::state::trace_int_block_setitem_value(ctx, list_block, zero, raw);
