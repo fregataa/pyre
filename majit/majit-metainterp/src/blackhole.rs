@@ -3970,7 +3970,7 @@ mod tests {
 
         /// The two `fnaddr` classifiers agree with the walker's gate.
         ///
-        /// `residual_call.rs:1117` declines a funcptr with any bit ≥ 47 set;
+        /// A symbolic hash carries the `SYMBOLIC_FNADDR_BASE` high-16-bit tag;
         /// `0` is upstream's "no address" spelling (`jitcode.py:14`) and is a
         /// no-op — not a decline — for `residual_call`, whose backend
         /// `bh_call_*` returns `0`/null for it.
@@ -3980,12 +3980,17 @@ mod tests {
             assert!(!super::is_symbolic_fnaddr(real));
             assert!(super::is_callable_fnaddr(real));
 
-            // `symbolic_fnaddr_for_path` is a `DefaultHasher` finish() cast to
-            // i64, so its high bits are set with overwhelming probability; the
-            // gate's contract is the bit-47 test, not the hash function.
-            let symbolic = 0x1234_5678_9abc_def0_u64 as i64;
+            let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64
+                | 0x1234_5678_9abc_i64;
             assert!(super::is_symbolic_fnaddr(symbolic));
             assert!(!super::is_callable_fnaddr(symbolic));
+
+            // aarch64 Linux 48-bit-VA funcptrs set bit 47 (PIE base 0xaaab…,
+            // mmap 0xffff…); they are real addresses, not symbolic hashes.
+            for real_high in [0x0000_ffff_7122_b9c0_i64, 0x0000_aaab_1234_5678_i64] {
+                assert!(!super::is_symbolic_fnaddr(real_high));
+                assert!(super::is_callable_fnaddr(real_high));
+            }
 
             assert!(!super::is_symbolic_fnaddr(0));
             assert!(!super::is_callable_fnaddr(0));
@@ -7525,6 +7530,29 @@ fn reject_symbolic_residual_call(bh: &mut BlackholeInterpreter, func: i64) -> Di
 }
 
 // residual_call_irf_*
+
+/// `MAJIT_BH_NULL_ARG`: report a null ref argument about to be handed to a
+/// residual call, with the jitcode coordinate, before the callee can
+/// dereference it.  Some ABIs pass a legitimate null sentinel (e.g. the
+/// CallFn `null_or_self` slot), so this reports rather than aborts.
+fn bh_null_arg_report(bh: &BlackholeInterpreter, ar: &[i64], position: usize) {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_NULL_ARG").is_some()) {
+        return;
+    }
+    if ar.iter().any(|&a| a == 0) {
+        eprintln!(
+            "[bh-null-arg] jitcode={} position={} last_opcode_position={} \
+             entry_position={} args_r={:?}",
+            bh.jitcode.name(),
+            position,
+            bh.last_opcode_position,
+            bh.entry_position,
+            ar,
+        );
+    }
+}
+
 fn handler_residual_call_irf_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7540,6 +7568,7 @@ fn handler_residual_call_irf_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1244-1246 → bhimpl_residual_call_irf_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_i(func, &ai, &ar, &af, &calldescr);
@@ -7564,6 +7593,7 @@ fn handler_residual_call_irf_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1247-1249 → bhimpl_residual_call_irf_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_r(func, &ai, &ar, &af, &calldescr);
@@ -7588,6 +7618,7 @@ fn handler_residual_call_irf_f(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1250-1252 → bhimpl_residual_call_irf_f.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_f(func, &ai, &ar, &af, &calldescr);
@@ -7611,6 +7642,7 @@ fn handler_residual_call_irf_v(
     let (af, p) = read_list_f(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1253-1255 routes through bhimpl_residual_call_irf_v
     // which forwards to cpu.bh_call_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -7635,6 +7667,7 @@ fn handler_residual_call_ir_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1234-1236 → bhimpl_residual_call_ir_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_i(func, &ai, &ar, &calldescr);
@@ -7658,6 +7691,7 @@ fn handler_residual_call_ir_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1237-1239 → bhimpl_residual_call_ir_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr);
@@ -7680,6 +7714,7 @@ fn handler_residual_call_ir_v(
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1240-1242 → bhimpl_residual_call_ir_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_ir_v(func, &ai, &ar, &calldescr);
@@ -7702,6 +7737,7 @@ fn handler_residual_call_r_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1225-1226 → bhimpl_residual_call_r_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_i(func, &ar, &calldescr);
@@ -7724,6 +7760,7 @@ fn handler_residual_call_r_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1227-1229 → bhimpl_residual_call_r_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr);
@@ -7745,6 +7782,7 @@ fn handler_residual_call_r_v(
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1230-1232 → bhimpl_residual_call_r_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_r_v(func, &ar, &calldescr);
@@ -10628,14 +10666,15 @@ fn read_inline_call_jitcode(
 /// did not publish through `jit_trace_fnaddrs()`; `patch_constants_i_fnaddrs`
 /// is keyed on the build-time address, so a hash is never rebound.
 ///
-/// User-space code addresses occupy the canonical low half on every target pyre
-/// builds for, so the top bits separate the two. This is the same discriminator
-/// the walker's residual-call path already uses to decline a symbolic funcptr —
-/// `(func_ptr as u64) >> 47 != 0` → `ResidualDecline::Symbolic`
-/// (`jitcode_dispatch/residual_call.rs:1117`).
+/// Symbolic hashes carry the `SYMBOLIC_FNADDR_BASE` high-16-bit tag stamped
+/// at generation, which no real user-space funcptr can carry on any target
+/// pyre builds for (aarch64 Linux maps code with bit 47 set, so a bit-range
+/// heuristic would misclassify every real funcptr there).  Same discriminator
+/// the walker's residual-call path uses to decline a symbolic funcptr →
+/// `ResidualDecline::Symbolic`.
 #[inline]
 pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
-    (fnaddr as u64) >> 47 != 0
+    majit_translate::codewriter::call::is_symbolic_fnaddr(fnaddr)
 }
 
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.
