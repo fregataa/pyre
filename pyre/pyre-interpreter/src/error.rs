@@ -2688,7 +2688,7 @@ fn write_traceback_chain_from_tb<W: Write>(
     let _roots = pyre_object::gc_roots::push_roots();
     // `StackSummary.format` dedup state: the previous frame's identity and how
     // many consecutive frames have carried it.
-    let mut last: Option<(String, i64, String)> = None;
+    let mut last: Option<(Vec<u8>, i64, String)> = None;
     let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2701,14 +2701,14 @@ fn write_traceback_chain_from_tb<W: Write>(
         let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) };
         let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(current_tb) };
         let (filename, funcname, location) = if w_code.is_null() {
-            (String::from("<unknown>"), String::from("<unknown>"), None)
+            (b"<unknown>".to_vec(), String::from("<unknown>"), None)
         } else {
             // `w_code` is a GC-rooted `PyCode` pointer captured
             // at `record_application_traceback` time; the inner
             // `CodeObject` lives as long as `w_code` is reachable.
             let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
             if code_obj.is_null() {
-                (String::from("<unknown>"), String::from("<unknown>"), None)
+                (b"<unknown>".to_vec(), String::from("<unknown>"), None)
             } else {
                 let code = unsafe { &*code_obj };
                 let location = usize::try_from(lasti)
@@ -2723,7 +2723,7 @@ fn write_traceback_chain_from_tb<W: Write>(
                         )
                     });
                 (
-                    code.source_path.to_string(),
+                    unsafe { crate::pycode::code_filename_bytes(w_code) },
                     code.obj_name.to_string(),
                     location,
                 )
@@ -2742,11 +2742,12 @@ fn write_traceback_chain_from_tb<W: Write>(
             continue;
         }
         let (filename, lineno, funcname) = key;
-        writeln!(
-            writer,
-            "  File \"{}\", line {}, in {}",
-            filename, lineno, funcname
-        )?;
+        // The filesystem bytes, not their WTF-8 decoding: a lone surrogate has
+        // no UTF-8 spelling either way, and the byte form is the one that
+        // still names the file to whatever reads the stream.
+        writer.write_all(b"  File \"")?;
+        writer.write_all(&filename)?;
+        writeln!(writer, "\", line {lineno}, in {funcname}")?;
         // `FrameSummary._set_lines` collects every line the failing
         // instruction spans, so a statement written across several lines (a
         // class body, a multi-line call) shows all of them, dedented by the
@@ -2948,10 +2949,26 @@ fn traceback_anchors(raw_line: &str, start_col: usize, end_col: usize) -> Option
 /// Open `filename` and return its `lineno`-th line (1-indexed).  Returns
 /// `None` for synthetic / unreadable sources — matches PyPy's silent
 /// `linecache.getline` fallback at `error.py:150`.
-fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
-    if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
+///
+/// The name arrives as the filesystem bytes the code object carries, because
+/// `linecache.getline` is handed `co_filename` itself: a path spelling a byte
+/// with no UTF-8 form still has to open the file it names, which the lossy
+/// spelling no longer does.
+fn read_source_line(filename: &[u8], lineno: i64) -> Option<String> {
+    if lineno <= 0 || filename.is_empty() || filename.first() == Some(&b'<') {
         return None;
     }
+    #[cfg(all(feature = "host_env", unix))]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::Path::new(std::ffi::OsStr::from_bytes(filename))
+    };
+    // Elsewhere the platform has no bytes spelling of a path, so a name that is
+    // not valid UTF-8 simply does not resolve.
+    #[cfg(all(feature = "host_env", not(unix)))]
+    let lossy = String::from_utf8_lossy(filename);
+    #[cfg(all(feature = "host_env", not(unix)))]
+    let path = std::path::Path::new(lossy.as_ref());
     #[cfg(feature = "host_env")]
     {
         // Read through the import machinery's source provider, not std::fs:
@@ -2960,11 +2977,15 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
         // On wasm32 the provider is the embedder's — the host-FS bridge for the
         // native-host build, `NullSourceProvider` in a browser — so the same
         // call renders the offending line wherever one is actually reachable.
-        let bytes = crate::importing::read_source_bytes(std::path::Path::new(filename)).ok()?;
+        let bytes = crate::importing::read_source_bytes(path).ok()?;
         // `linecache` opens with `tokenize.open`, so the BOM and the PEP 263
         // cookie decide the encoding; a plain UTF-8 read drops the whole line
-        // for a file declaring anything else.
-        let content = crate::compile::decode_source_bytes(&bytes, filename, false).ok()?;
+        // for a file declaring anything else.  The name reaches the decode only
+        // to report a failure this caller discards, so the lossy spelling of a
+        // path with no UTF-8 form is enough there.
+        let content =
+            crate::compile::decode_source_bytes(&bytes, &String::from_utf8_lossy(filename), false)
+                .ok()?;
         content
             .lines()
             .nth((lineno - 1) as usize)
