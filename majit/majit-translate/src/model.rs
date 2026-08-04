@@ -2869,6 +2869,7 @@ pub fn fuse_boxing_alloc(
     struct Site {
         block: usize,
         op: usize,
+        aggregate: crate::flowspace::model::Variable,
         result: crate::flowspace::model::Variable,
         owner: String,
         vtable: i64,
@@ -2962,6 +2963,7 @@ pub fn fuse_boxing_alloc(
             sites.push(Site {
                 block: bi,
                 op: oi,
+                aggregate: agg.clone(),
                 result: result.clone(),
                 owner,
                 vtable,
@@ -2971,6 +2973,7 @@ pub fn fuse_boxing_alloc(
     }
 
     let fused = sites.len();
+    let fused_aggregates: Vec<_> = sites.iter().map(|site| site.aggregate.clone()).collect();
     // Rewrite in reverse (block, op) order so the per-site `insert` does not
     // shift the indices of not-yet-processed sites in the same block.
     for site in sites.into_iter().rev() {
@@ -2999,7 +3002,136 @@ pub fn fuse_boxing_alloc(
             );
         }
     }
+    sink_fused_boxing_aggregates_at_raw_writes(graph, &fused_aggregates);
     fused
+}
+
+/// Rematerialize a fused boxing aggregate only at a raw `ptr::write` use.
+///
+/// `gc_interp`'s stable-allocation arm writes the original by-value Rust
+/// aggregate into memory, while the ordinary arm passes that same aggregate
+/// to `lltype::malloc_typed`.  After the latter is lowered to
+/// `NewWithVtable`, leaving the shared aggregate in the dominator would make
+/// its synthetic constructors execute on the ordinary JIT path even though
+/// only the GC-interpreter arm still reads it.  RPython's
+/// `remove_simple_mallocs` performs the equivalent escape-sensitive motion:
+/// keep the materialization at the escaping store, and let the dead-variable
+/// sweep remove it from paths on which it does not escape.
+///
+/// A rename map is the direct equivalent of RPython's per-clone variable
+/// mapping: it preserves the nested header/outer-object shape without a
+/// side-table that survives this local graph rewrite.
+fn sink_fused_boxing_aggregates_at_raw_writes(
+    graph: &mut FunctionGraph,
+    aggregates: &[crate::flowspace::model::Variable],
+) -> usize {
+    use crate::flowspace::model::Variable;
+    use std::collections::{HashMap, HashSet};
+
+    let is_ctor = |op: &SpaceOperation| {
+        matches!(
+            op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            }
+        )
+    };
+    let is_raw_write = |kind: &OpKind| {
+        matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+            if args.len() == 2
+                && segments.iter().map(String::as_str).eq(["core", "ptr", "write"]))
+    };
+
+    let mut sinks = Vec::new();
+    for aggregate in aggregates {
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                if is_raw_write(&op.kind)
+                    && matches!(&op.kind, OpKind::Call { args, .. } if &args[1] == aggregate)
+                {
+                    sinks.push((bi, oi, aggregate.clone()));
+                }
+            }
+        }
+    }
+    sinks.sort_by_key(|(bi, oi, _)| (*bi, *oi));
+
+    let mut moved = 0;
+    for (bi, oi, aggregate) in sinks.into_iter().rev() {
+        // Include the outer aggregate plus nested aggregate values stored into
+        // it (notably `PyObject ob_header`).  Scalar payloads and type-pointer
+        // casts remain ordinary operands and are threaded to the sink by the
+        // existing SSA-to-SSI repair pass.
+        let mut allocs = HashSet::from([aggregate.clone()]);
+        loop {
+            let mut added = false;
+            for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+                let OpKind::FieldWrite { base, value, .. } = &op.kind else {
+                    continue;
+                };
+                if !allocs.contains(base) {
+                    continue;
+                }
+                let Some(value) = value.as_variable() else {
+                    continue;
+                };
+                let produced_by_ctor =
+                    graph
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.operations)
+                        .any(|candidate| {
+                            candidate.result.as_ref() == Some(value) && is_ctor(candidate)
+                        });
+                if produced_by_ctor && allocs.insert(value.clone()) {
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        let template: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                op.result
+                    .as_ref()
+                    .is_some_and(|result| allocs.contains(result) && is_ctor(op))
+                    || matches!(&op.kind, OpKind::FieldWrite { base, .. } if allocs.contains(base))
+            })
+            .cloned()
+            .collect();
+        if template.is_empty() {
+            continue;
+        }
+
+        let mut renaming = HashMap::new();
+        for alloc in &allocs {
+            let mut fresh = Variable::new();
+            fresh.rename_from(alloc);
+            renaming.insert(alloc.clone(), fresh);
+        }
+        let remap = |var: &Variable| renaming.get(var).cloned().unwrap_or_else(|| var.clone());
+        let cloned: Vec<_> = template
+            .iter()
+            .map(|op| SpaceOperation {
+                result: op.result.as_ref().map(&remap),
+                kind: crate::inline::remap_op_kind(&op.kind, &remap),
+            })
+            .collect();
+
+        let block = &mut graph.blocks[bi];
+        if let OpKind::Call { args, .. } = &mut block.operations[oi].kind {
+            args[1] = remap(&aggregate);
+        }
+        moved += cloned.len();
+        block.operations.splice(oi..oi, cloned);
+    }
+    moved
 }
 
 /// Re-thread op operands the boxing lowering left referenced across a block
@@ -3015,18 +3147,16 @@ pub fn fuse_boxing_alloc(
 /// (`flowspace_adapter::function_graph_to_flowspace`) requires — every
 /// referenced operand defined as a block inputarg or op result.
 ///
-/// An operand is threaded only when its definition is reachable from the use
-/// block through a chain of single-predecessor blocks — i.e. the definition
-/// dominates the use along a strictly linear path, exactly the shape the
-/// boxing cluster's `alloc → cast → cast → return` chain has.  This is the
-/// precondition under which [`FunctionGraph::ensure_variable_at_block`] threads
-/// cleanly: with one predecessor at every step, every path into the use block
-/// passes through the definition, so no predecessor edge is left unable to
-/// supply the value.  An operand reaching a join or loop block (multiple
-/// predecessors), or one with no upstream definition at all, is left untouched
-/// — the adapter still Skips that graph, and the no-definition panic is never
-/// reached.  Graphs with no cross-block-undefined operand collect no work and
-/// stay byte-identical.
+/// An operand is threaded only when it is available on every predecessor path
+/// into the use block.  This is the same condition `SSA_to_SSI` enforces while
+/// adding one inputarg to every block and one argument to every incoming link
+/// (`rpython/translator/backendopt/ssa.py:171-190`).  Diamond joins are valid
+/// when the definition dominates the split; a value defined in only one arm,
+/// or one with no upstream definition, is left untouched so the adapter can
+/// Skip the malformed graph.  Back edges provisionally satisfy the recursive
+/// check, but a separate ancestor-definition check prevents a source-less SCC
+/// from manufacturing a definition.  Graphs with no cross-block-undefined
+/// operand collect no work and stay byte-identical.
 pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     use crate::flowspace::model::Variable;
     use std::collections::{HashMap, HashSet};
@@ -3039,33 +3169,53 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         }
     }
 
-    // `var` is defined in a block reachable from `block` by walking
-    // single-predecessor edges only.  Mirrors the success condition of
-    // `ensure_variable_at_block` for a linear predecessor chain.
-    fn defined_via_single_pred_chain(
+    fn ancestor_has_definition(
         graph: &FunctionGraph,
         preds: &HashMap<BlockId, Vec<BlockId>>,
         block: BlockId,
         var: &Variable,
+        seen: &mut HashSet<BlockId>,
     ) -> bool {
-        let mut cur = block;
-        let mut seen: HashSet<BlockId> = HashSet::new();
-        loop {
-            if !seen.insert(cur) {
-                return false;
-            }
-            let Some(ps) = preds.get(&cur) else {
-                return false;
-            };
-            if ps.len() != 1 {
-                return false;
-            }
-            let p = ps[0];
-            if graph.variable_defined_in_block(p, var) {
-                return true;
-            }
-            cur = p;
+        if !seen.insert(block) {
+            return false;
         }
+        graph.variable_defined_in_block(block, var)
+            || preds.get(&block).is_some_and(|ps| {
+                ps.iter()
+                    .any(|&pred| ancestor_has_definition(graph, preds, pred, var, seen))
+            })
+    }
+
+    fn available_on_every_predecessor_path(
+        graph: &FunctionGraph,
+        preds: &HashMap<BlockId, Vec<BlockId>>,
+        block: BlockId,
+        var: &Variable,
+        visiting: &mut HashSet<BlockId>,
+        memo: &mut HashMap<BlockId, bool>,
+    ) -> bool {
+        if graph.variable_defined_in_block(block, var) {
+            return true;
+        }
+        if let Some(&known) = memo.get(&block) {
+            return known;
+        }
+        // `ensure_variable_at_block` installs the target inputarg before
+        // following a back edge.  Treat the same in-progress cycle as
+        // available here; an acyclic entry path still has to reach a real
+        // definition, and `ancestor_has_definition` rejects a source-less SCC.
+        if !visiting.insert(block) {
+            return true;
+        }
+        let available = preds.get(&block).is_some_and(|ps| {
+            !ps.is_empty()
+                && ps.iter().all(|&pred| {
+                    available_on_every_predecessor_path(graph, preds, pred, var, visiting, memo)
+                })
+        });
+        visiting.remove(&block);
+        memo.insert(block, available);
+        available
     }
 
     let mut work: Vec<(BlockId, Variable)> = Vec::new();
@@ -3075,9 +3225,20 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         }
         for op in &block.operations {
             for var in crate::inline::op_variable_refs(&op.kind) {
-                if !graph.variable_defined_in_block(block.id, &var)
-                    && defined_via_single_pred_chain(graph, &preds, block.id, &var)
-                {
+                if graph.variable_defined_in_block(block.id, &var) {
+                    continue;
+                }
+                let has_definition =
+                    ancestor_has_definition(graph, &preds, block.id, &var, &mut HashSet::new());
+                let available = available_on_every_predecessor_path(
+                    graph,
+                    &preds,
+                    block.id,
+                    &var,
+                    &mut HashSet::new(),
+                    &mut HashMap::new(),
+                );
+                if has_definition && available {
                     work.push((block.id, var));
                 }
             }
@@ -8010,6 +8171,129 @@ mod tests {
             1,
             "header → body_tail link args extended (body_tail demands v)",
         );
+    }
+
+    #[test]
+    fn thread_undefined_op_operand_across_diamond_when_definition_dominates_split() {
+        let mut graph = FunctionGraph::new("thread_operand_diamond");
+        let entry = graph.startblock;
+        let left = graph.create_block();
+        let right = graph.create_block();
+        let join = graph.create_block();
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "value".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, left, vec![], right, vec![]);
+        graph.set_goto(left, join, vec![]);
+        graph.set_goto(right, join, vec![]);
+        let base = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Box"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("Box".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: FieldDescriptor {
+                    name: "payload".into(),
+                    owner_root: Some("Box".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Float,
+            },
+        });
+
+        thread_undefined_op_operands(&mut graph);
+
+        for block in [left, right, join] {
+            assert!(
+                graph.block(block).inputargs.contains(&value),
+                "dominating value is threaded through {block:?}",
+            );
+        }
+        assert!(graph.block(entry).exits.iter().all(|link| {
+            link.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == &value))
+        }));
+    }
+
+    #[test]
+    fn thread_undefined_op_operand_declines_value_defined_in_one_diamond_arm() {
+        let mut graph = FunctionGraph::new("thread_operand_partial_diamond");
+        let entry = graph.startblock;
+        let left = graph.create_block();
+        let right = graph.create_block();
+        let join = graph.create_block();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, left, vec![], right, vec![]);
+        let value = graph
+            .push_op_var(
+                left,
+                OpKind::Input {
+                    name: "left_only".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(left, join, vec![]);
+        graph.set_goto(right, join, vec![]);
+        let result = graph.alloc_value_var();
+        graph.block_mut(join).operations.push(SpaceOperation {
+            result: Some(result),
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: value.clone(),
+                result_ty: ValueType::Float,
+            },
+        });
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert!(
+            !graph.block(join).inputargs.contains(&value),
+            "one-arm definition must not be invented at the join",
+        );
+        assert!(graph.block(right).inputargs.is_empty());
     }
 
     /// `framestate.py:50-51 getvariables` walks `locals + flatten(stack) +

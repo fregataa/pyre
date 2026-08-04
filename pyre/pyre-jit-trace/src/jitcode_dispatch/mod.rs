@@ -468,10 +468,10 @@ pub struct WalkSession {
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
     /// when the callee sub-walk returns.
     pub framestack: Vec<InlineFrame>,
-    /// Whether the terminating permanent abort fired inside an inline
-    /// sub-walk. Its `op.pc` is then a callee coordinate with no meaning in
-    /// the outer snapshot root's py_pc→jitcode translation, so abort-point
-    /// flushing must decline after the sub-walk unwinds.
+    /// Whether an abort fired inside an inline sub-walk. Its `op.pc` is then a
+    /// callee coordinate with no meaning in an enclosing frame's JitCode, so
+    /// neither abort-point flushing nor a later caller-level blackhole latch
+    /// may consume it after the sub-walk unwinds.
     pub abort_in_subwalk: bool,
     /// Blackhole `tmpreg_r`/`tmpreg_i`/`tmpreg_f` (`blackhole.py`):
     /// the single-slot scratch that `insert_renamings` (`flatten.py`)
@@ -514,6 +514,24 @@ impl Default for WalkSession {
             recording_jitcode_index: -1,
             recording_opcode_position: 0,
         }
+    }
+}
+
+impl WalkSession {
+    /// Claim an abort coordinate for the frame whose `walk()` observed it.
+    ///
+    /// The first inline sub-walk to see the error owns its `pc` and may build
+    /// a multi-frame blackhole image from that coordinate. If that build
+    /// declines, enclosing `walk()` calls see the same `DispatchError`, but
+    /// its `pc` is still in the innermost JitCode. Returning `false` there
+    /// prevents a caller from pairing the callee coordinate with its own
+    /// frame — RPython keeps both on the same `MIFrame` throughout unwind.
+    pub(crate) fn claim_abort_coordinate(&mut self, inline_subwalk: bool) -> bool {
+        let claimed_by_deeper_frame = self.abort_in_subwalk;
+        if inline_subwalk {
+            self.abort_in_subwalk = true;
+        }
+        !claimed_by_deeper_frame
     }
 }
 
@@ -2634,6 +2652,15 @@ pub fn walk<Sym: WalkSym>(
                 // reset.  `VableEscapedDuringResidualCall` needs no exclusion —
                 // it latches its narrower resume-marker image at force time,
                 // before the error unwinds here, so the guard below defers to it.
+                // Do not consume the session's one-shot coordinate claim for
+                // a transparent helper: its opcode coordinate is not a Python
+                // resume coordinate, and the enclosing Python walk must still
+                // be able to claim and latch the propagated abort.
+                let coordinate_belongs_to_this_frame = !ctx.fbw_mode.transparent_helper_subwalk
+                    && ctx
+                        .session
+                        .borrow_mut()
+                        .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk);
                 let carrier_owned = matches!(
                     error,
                     DispatchError::AbortPermanentMarkerReached { .. }
@@ -2643,7 +2670,20 @@ pub fn walk<Sym: WalkSym>(
                 // reports a MISSING value cannot be converted, because the
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
-                if error.leaves_complete_image() && !carrier_owned && !abort_blackhole_latched() {
+                //
+                // A translated builtin gateway is not an MIFrame.  Let its
+                // error unwind to the enclosing Python walk, where the same
+                // latch is built from that frame's own register banks.  If we
+                // latch here, `build_multi_frame_miframe` appends the helper's
+                // r0 args-slice as though it were a Python red frame and the
+                // blackhole resume loses per-frame identity.  This is the
+                // abort counterpart of the transparent-helper guard snapshot
+                // and trace-limit handling below.
+                if coordinate_belongs_to_this_frame
+                    && error.leaves_complete_image()
+                    && !carrier_owned
+                    && !abort_blackhole_latched()
+                {
                     let _ = latch_abort_blackhole(ctx, error.stop_pc());
                 }
                 return Err(error);
@@ -2680,7 +2720,16 @@ pub fn walk<Sym: WalkSym>(
         // fallback because replay would apply an irreversible effect twice.
         // The remaining overshoot is tallied so an unsupported multi-frame
         // shape cannot silently become unbounded.
-        if ctx.trace_ctx.is_too_long() {
+        // A translated builtin gateway is transparent to the Python MIFrame
+        // stack and has no blackhole entry point of its own.  Its bytecode is
+        // one implementation detail of the enclosing Python CALL step, so do
+        // not split the trace in the middle of it: doing so would have to pair
+        // helper registers (r0 is commonly an args slice) with a Python
+        // JitCode's red-frame register.  Finish the helper and let the
+        // enclosing Python `walk()` perform this same post-step limit check at
+        // its real per-frame coordinate, matching RPython's one-red-frame
+        // ownership.
+        if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
             // frame transition: in particular, `SubRaise` may enter this
@@ -7100,7 +7149,6 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
         ctx.trace_ctx,
         obj,
         type_addr,
-        crate::descr::ob_type_descr(),
         intval_descr,
     ))
 }
@@ -7193,7 +7241,6 @@ fn walker_unbox_float<Sym: WalkSym>(
         ctx.trace_ctx,
         obj,
         float_type_addr,
-        crate::descr::ob_type_descr(),
         crate::descr::float_floatval_descr(),
     ))
 }
@@ -9749,6 +9796,7 @@ fn handle<Sym: WalkSym>(
         // vtable word, so nothing is known about its class.
         "new/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
+            let concrete = ctx.trace_ctx.execute_new_allocation(&descr, false);
             // pyjitpl.py:624-629 `execute_new`.
             ctx.trace_ctx
                 .profiler()
@@ -9759,7 +9807,16 @@ fn handle<Sym: WalkSym>(
             let resbox = ctx.trace_ctx.record_op_with_descr(OpCode::New, &[], descr);
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             let dst = code[op.pc + 3] as usize;
-            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            if let Some(value) = concrete {
+                ctx.trace_ctx.set_opref_concrete(resbox, value);
+            }
+            let concrete = match concrete {
+                Some(Value::Ref(majit_ir::GcRef(ptr))) => {
+                    ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
+                }
+                _ => ConcreteValue::Null,
+            };
+            write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // RPython `pyjitpl.py opimpl_new_with_vtable` delegates straight to
@@ -9774,6 +9831,15 @@ fn handle<Sym: WalkSym>(
         // `new_with_vtable` pushes the descr u16 then the result reg).
         "new_with_vtable/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
+            let concrete = ctx.trace_ctx.execute_new_allocation(&descr, true);
+            if let Some(Value::Ref(majit_ir::GcRef(ptr))) = concrete
+                && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
+            {
+                unsafe {
+                    (*(ptr as *mut pyre_object::PyObject)).w_class =
+                        w_class as pyre_object::PyObjectRef;
+                }
+            }
             // `class_now_known` takes the vtable address: pyre tracks the
             // concrete class pointer where upstream only raises HF_KNOWN_CLASS.
             let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
@@ -9795,11 +9861,16 @@ fn handle<Sym: WalkSym>(
                     .class_now_known(resbox, class);
             }
             let dst = code[op.pc + 3] as usize;
-            // No recording-time concrete: the walk never allocated a real
-            // object, so readers of the result decline instead of consuming a
-            // stale value — the posture `new_array_clear` keeps whenever it
-            // cannot materialize a backing block.
-            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            if let Some(value) = concrete {
+                ctx.trace_ctx.set_opref_concrete(resbox, value);
+            }
+            let concrete = match concrete {
+                Some(Value::Ref(majit_ir::GcRef(ptr))) => {
+                    ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
+                }
+                _ => ConcreteValue::Null,
+            };
+            write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // RPython `pyjitpl.py opimpl_new_array_clear` —

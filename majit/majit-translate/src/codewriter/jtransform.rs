@@ -338,6 +338,37 @@ enum JitMarkerKey {
 /// JitDriver receiver types whose `jit_merge_point`/`can_enter_jit`/`loop_header` markers are recognized; each becomes its own portal via `portal_jd_index`.
 const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &["PyPyJitDriver", "UnpackIterableJitDriver"];
 
+/// The null-pointer builtins `HostEnv::bootstrap` registers
+/// (`flowspace/model.rs`), spelled as `HostObject::qualname`.
+const NULL_PTR_BUILTIN_QUALNAMES: &[&str] = &[
+    "core.ptr.null",
+    "core.ptr.null_mut",
+    "std.ptr.null",
+    "std.ptr.null_mut",
+];
+
+/// Whether a 0-arg `FunctionPath` call names one of those builtins.
+///
+/// A guest const-global defined as `std::ptr::null_mut()` is bound to the SAME
+/// `HostObject` as the spelled-out call (`flowspace/model.rs` binds the attr to
+/// `core.ptr.null_mut` rather than minting a second callable), which is how
+/// `flowspace_adapter`'s Branch 3b types the two identically. The surviving
+/// model graph still carries whichever path the source spelled, so resolve it
+/// through that same registry instead of listing the guest's spellings here —
+/// the alias keeps one owner, and no guest name is repeated in the codewriter.
+fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
+    let Some((leaf, module_path)) = segments.split_last() else {
+        return false;
+    };
+    if module_path.is_empty() {
+        return false;
+    }
+    crate::flowspace::model::HOST_ENV
+        .import_module(&module_path.join("."))
+        .and_then(|module| module.module_get(leaf))
+        .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
+}
+
 fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
     let CallTarget::Method {
         name,
@@ -519,6 +550,60 @@ fn autodetect_jit_markers_redvars(
         (kind_rank, variable.id())
     });
     reds_v
+}
+
+/// Read the rich graph's declared unsigned type for a value while production
+/// jtransform still consumes that graph instead of the rtyper-specialized
+/// flowspace graph. This is the signedness half of RPython's
+/// `Variable.concretetype == lltype.Unsigned`; JIT register kinds intentionally
+/// collapse Signed/Unsigned to `'i'`, so `get_value_kind_var` cannot answer it.
+fn variable_has_declared_unsigned_type(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            if op.result.as_ref() != Some(variable) {
+                return false;
+            }
+            matches!(
+                &op.kind,
+                OpKind::Input {
+                    ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::FieldRead {
+                    ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::VableFieldRead {
+                    ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::ArrayRead {
+                    item_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::InteriorFieldRead {
+                    item_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::VableArrayRead {
+                    item_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::Call {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::IndirectCall {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::BinOp {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::UnaryOp {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                }
+            )
+        })
 }
 
 impl<'a> Transformer<'a> {
@@ -1795,13 +1880,13 @@ impl<'a> Transformer<'a> {
             // runtime helpers reproduce the same IEEE-754 mantissa
             // decomposition so runtime and const-fold agree.
             //
-            // Coverage: today these arms are unreachable from pyre
-            // source — no producer emits the `cast_uint_to_float` /
-            // `cast_float_to_uint` opnames in practice, so these
-            // const-fold + residual-helper arms stay dormant.  The
-            // wiring is staged for the eventual producer flip;
-            // unsigned parameter classification lives in the MIR
-            // front-end (`front::mir`).
+            // The rich-graph compatibility path in
+            // `rewrite_op_direct_call` projects `float(r_uint)` onto this
+            // low-level opname, matching the real rtyper's
+            // `IntegerRepr.rtype_float` conversion.  Once production
+            // jtransform consumes the already-rtyped flowspace graph, that
+            // projection disappears and this arm receives the rtyper op
+            // directly.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -2826,6 +2911,34 @@ impl<'a> Transformer<'a> {
             "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
              before reaching rewrite_op_direct_call",
         );
+        // RPython `IntegerRepr.rtype_float` (`rint.py:144-147`) converts an
+        // Unsigned input to Float, emitting `cast_uint_to_float`; jtransform
+        // then applies `_do_builtin_call` (`jtransform.py:587`) and reaches
+        // `support.py:274 _ll_1_cast_uint_to_float`.
+        //
+        // Production still feeds jtransform the rich MIR graph while the
+        // real rtyper specializes an ephemeral flowspace graph (see
+        // `jtransform_shadow.rs`).  Project this one source-level
+        // `float(r_uint)` call to the exact low-level op the rtyper produced,
+        // then dispatch through the ordinary rewrite arm above.  This keeps
+        // the helper address/effect descriptor and unsigned rounding on the
+        // upstream path; it is removed when jtransform consumes the rtyped
+        // graph directly.
+        if matches!(target, CallTarget::FunctionPath { segments } if segments == &["float"])
+            && args.len() == 1
+            && matches!(result_ty, ValueType::Float)
+            && variable_has_declared_unsigned_type(graph, &args[0])
+        {
+            let cast_op = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::UnaryOp {
+                    op: "cast_uint_to_float".into(),
+                    operand: args[0].clone(),
+                    result_ty: ValueType::Float,
+                },
+            };
+            return self.rewrite_operation(&cast_op, graph_name, graph);
+        }
         // RPython `jtransform.py:1658-1663 rewrite_op_jit_marker`:
         // marker calls never reach `guess_call_kind` — they dispatch straight
         // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
@@ -2973,13 +3086,7 @@ impl<'a> Transformer<'a> {
         if let CallTarget::FunctionPath { segments } = target
             && args.is_empty()
             && matches!(result_ty, ValueType::Ref(_))
-            && matches!(
-                segments.as_slice(),
-                [owner, ptr, leaf]
-                    if matches!(owner.as_str(), "core" | "std")
-                        && ptr == "ptr"
-                        && matches!(leaf.as_str(), "null" | "null_mut")
-            )
+            && resolves_to_null_ptr_builtin(segments)
         {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
@@ -7717,6 +7824,49 @@ mod tests {
     }
 
     #[test]
+    fn float_of_unsigned_projects_to_registered_cast_helper() {
+        let mut cc = crate::call::CallControl::new();
+        cc.register_macro_helper_trace_fnaddr("majit_metainterp::cast_uint_to_float", 0x1234);
+        let mut graph = FunctionGraph::new("cast_uint_to_float_test");
+        let arg = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arg".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["float"]),
+                    args: vec![arg],
+                    result_ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert!(
+            transformed
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ConstInt(0x1234)))
+        );
+    }
+
+    #[test]
     fn transform_graph_uses_explicit_call_effect_overrides() {
         // RPython: residual calls always produce residual_call_*, regardless
         // of effect. The effect is only in the calldescr (descriptor).
@@ -9073,32 +9223,37 @@ mod tests {
 
     #[test]
     fn ptr_null_builtin_rewrites_to_null_ref_constant() {
-        let config = GraphTransformConfig::default();
-        let mut graph = FunctionGraph::new("ptr_null_constant");
-        let entry = graph.startblock;
-        let result_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::function_path(["core", "ptr", "null_mut"]),
-                    args: vec![],
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .unwrap();
-        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
-        graph.set_return(entry, Some(result_var.clone()));
+        for path in [
+            vec!["core", "ptr", "null_mut"],
+            vec!["pyre_object", "pyobject", "PY_NULL"],
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut graph = FunctionGraph::new("ptr_null_constant");
+            let entry = graph.startblock;
+            let result_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(path),
+                        args: vec![],
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap();
+            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+            graph.set_return(entry, Some(result_var.clone()));
 
-        let result = transform_graph(&graph, &config);
-        let folded = result
-            .graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .find(|op| op.result.as_ref() == Some(&result_var))
-            .expect("null result must survive as a constant definition");
-        assert!(matches!(folded.kind, OpKind::ConstRefNull));
+            let result = transform_graph(&graph, &config);
+            let folded = result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|op| op.result.as_ref() == Some(&result_var))
+                .expect("null result must survive as a constant definition");
+            assert!(matches!(folded.kind, OpKind::ConstRefNull));
+        }
     }
 
     /// `rtuple.py:153-169 TupleRepr.newtuple`: a non-empty tuple lowers to

@@ -1950,6 +1950,30 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     semantic_slot_for_reg_color(nlocals, stack_only, pcdep_entries, 1, reg)
 }
 
+/// Every live semantic Ref slot owned by one post-regalloc color at this PC.
+/// A COPY/short-circuit shape may deliberately map the same MIFrame register
+/// to more than one semantic stack slot; rebuilding pyre's slot-indexed frame
+/// mirror must fan that single register value out to all of them.
+pub(crate) fn semantic_ref_slots_for_reg_color(
+    nlocals: usize,
+    stack_only: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    reg: usize,
+) -> Vec<usize> {
+    let mut slots = Vec::new();
+    for &(bank, color, slot) in pcdep_entries {
+        if bank != 1 || color as usize != reg {
+            continue;
+        }
+        let slot = slot as usize;
+        let live = slot < nlocals || slot - nlocals < stack_only;
+        if live && slots.last().copied() != Some(slot) {
+            slots.push(slot);
+        }
+    }
+    slots
+}
+
 /// Per-PC `(bank, color, slot)` map inversion: given a register bank and
 /// color, return the semantic `locals_cells_stack_w` slot it maps to at the
 /// current PC. Prefer stack slots over locals (stack_match.or(local_match)).
@@ -2524,6 +2548,7 @@ pub trait WalkSym {
     fn registers_f_mut(&mut self) -> &mut Vec<OpRef>;
     fn nlocals(&self) -> usize;
     fn valuestackdepth(&self) -> usize;
+    fn set_valuestackdepth(&mut self, value: usize);
     fn jitcode(&self) -> *const JitCode;
     fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext;
     /// Interpreter-frame snapshot the authoritative walker steps concretely.
@@ -2626,6 +2651,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn valuestackdepth(&self) -> usize {
         self.valuestackdepth
+    }
+
+    #[inline]
+    fn set_valuestackdepth(&mut self, value: usize) {
+        self.valuestackdepth = value;
     }
 
     #[inline]
@@ -3627,13 +3657,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
             .heap_cache_mut()
             .class_now_known(obj, type_addr);
     }
-    crate::trace_unbox_int(
-        frame.ctx_mut(),
-        obj,
-        type_addr,
-        crate::descr::ob_type_descr(),
-        intval_descr,
-    )
+    crate::trace_unbox_int(frame.ctx_mut(), obj, type_addr, intval_descr)
 }
 
 /// Unbox a `W_LongObject` (whose BigInt fits in i64) into a raw i64 OpRef.
@@ -3717,7 +3741,6 @@ pub(crate) fn trace_unbox_float_with_resume<F: crate::walker_frame_ops::WalkerFr
         frame.ctx_mut(),
         obj,
         float_type_addr,
-        crate::descr::ob_type_descr(),
         crate::descr::float_floatval_descr(),
     )
 }
@@ -7503,27 +7526,33 @@ fn reconstruct_inline_recipe(
         let mut stream_slots: Vec<(usize, usize)> = Vec::new();
         let mut stream_covered = vec![false; valuestackdepth];
         for (pos, &color) in reg_indices.ref_.iter().enumerate() {
-            if color == pframe_reg || color == pec_reg {
-                continue;
-            }
-            let Some(slot) = semantic_ref_slot_for_reg_color(
+            let slots = semantic_ref_slots_for_reg_color(
                 nlocals,
                 stack_only,
                 &maps.pcdep_entries,
                 color as usize,
-            ) else {
-                continue;
-            };
-            // The pending call result is delivered by `make_result_of_lastop`,
-            // not from resumedata, so its slot stays unwritten here.
-            if slot >= valuestackdepth
-                || Some(slot) == pending_result_abs_slot
-                || stream_covered[slot]
-            {
+            );
+            if slots.is_empty() {
+                // A portal red is a scratch value only when this per-PC map
+                // gives its color no semantic owner.  The entry-time frame/ec
+                // colors may be reused for live operands at arbitrary resume
+                // PCs; in that case the resume stream is authoritative and
+                // must overlay the callee's own frame image below.
                 continue;
             }
-            stream_covered[slot] = true;
-            stream_slots.push((pos, slot));
+            for slot in slots {
+                // The pending call result is delivered by
+                // `make_result_of_lastop`, not from resumedata, so its slot
+                // stays unwritten here.
+                if slot >= valuestackdepth
+                    || Some(slot) == pending_result_abs_slot
+                    || stream_covered[slot]
+                {
+                    continue;
+                }
+                stream_covered[slot] = true;
+                stream_slots.push((pos, slot));
+            }
         }
         if !stream_slots.is_empty() {
             crate::jitcode_dispatch::census_record("P2Recipe::StreamSlotOverImage");
@@ -11237,10 +11266,9 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData, Instruction};
     use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{Mode, compile_exec, compile_source};
-    use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
-    use pyre_object::pyobject::{INT_TYPE, LIST_TYPE, PyType, is_list};
+    use pyre_object::pyobject::{INT_TYPE, PyType, is_list};
     use std::cell::{Cell, UnsafeCell};
 
     #[test]
@@ -11820,6 +11848,22 @@ mod tests {
     }
 
     #[test]
+    fn semantic_ref_slots_fan_out_a_copied_live_stack_color() {
+        // JUMP_IF_FALSE_OR_POP/COPY can keep the same MIFrame register in two
+        // semantic stack positions.  A slot-indexed reconstructed frame must
+        // restore both positions from that one resume-stream value.
+        assert_eq!(
+            semantic_ref_slots_for_reg_color(
+                2,
+                2,
+                &[(1, 0, 0), (1, 4, 2), (1, 4, 3), (1, 5, 4)],
+                4,
+            ),
+            vec![2, 3],
+        );
+    }
+
+    #[test]
     fn semantic_ref_slot_falls_back_to_local_color_map() {
         // Color 1 is owned only by local slot 1 (the sole live operand-stack
         // slot carries color 3), so the inverse falls through to the local.
@@ -12275,18 +12319,6 @@ mod tests {
             matches!(instruction, Instruction::ListAppend { .. })
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
-    }
-
-    #[test]
-    fn test_trace_ob_type_descr_uses_immutable_header_field_descr() {
-        let descr = crate::descr::ob_type_descr();
-        let field = descr
-            .as_field_descr()
-            .expect("ob_type descr must be a field descr");
-        assert_eq!(field.offset(), OB_TYPE_OFFSET);
-        assert_eq!(field.field_type(), Type::Int);
-        assert!(descr.is_always_pure());
-        assert!(field.is_immutable());
     }
 
     #[test]
@@ -12879,10 +12911,6 @@ mod tests {
             descr: None,
             type_id: 0,
             fields: vec![
-                (
-                    crate::descr::ob_type_descr().index(),
-                    MaterializedValue::Value(&LIST_TYPE as *const PyType as usize as i64),
-                ),
                 (
                     crate::descr::list_length_descr().index(),
                     MaterializedValue::Value(2),
