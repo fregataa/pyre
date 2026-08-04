@@ -674,6 +674,22 @@ fn box_code_constant_inheriting_filename(code: &crate::CodeObject, parent: &PyCo
     obj
 }
 
+/// Attach the filesystem bytes a whole compilation unit was named with.
+///
+/// `compiling.py:13 filename='fsencode'` names the unit, not one object, so
+/// the nested constants this code object still holds unrealized take the same
+/// spelling when they are boxed. That is the difference from `pycode.py:431`,
+/// whose constructor and `replace` filenames rename only the object being
+/// built and leave every nested constant on the name it compiled under.
+pub(crate) unsafe fn set_compilation_unit_filename_bytes(
+    w_code: PyObjectRef,
+    bytes: Option<Vec<u8>>,
+) {
+    let inherits = bytes.is_some();
+    unsafe { set_filename_bytes(w_code, bytes) };
+    unsafe { (*(w_code as *mut PyCode)).filename_inherits_to_nested = inherits };
+}
+
 /// Replace the owned raw filename allocation. Code wrappers are immortal, so
 /// this is also the only point that retires an earlier spelling after a second
 /// `_fix_co_filename` call.
@@ -1150,11 +1166,17 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 
 pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "__repr__")? };
-    let line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
-    Ok(w_str_new(&format!(
-        "<code object {} at {obj:p}, file \"{}\", line {line}>",
-        code.obj_name, code.source_path,
-    )))
+    // pycode.py:570-572 represents the internal zero sentinel as line -1.
+    let raw_line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
+    let line = if raw_line == 0 { -1 } else { raw_line };
+    let mut repr = rustpython_wtf8::Wtf8Buf::from_string(format!(
+        "<code object {} at {obj:p}, file \"",
+        code.obj_name,
+    ));
+    let filename = crate::gateway::fsdecode_filename_wtf8(&unsafe { code_filename_bytes(obj) });
+    repr.push_wtf8(&filename);
+    repr.push_str(&format!("\", line {line}>"));
+    Ok(pyre_object::w_str_from_wtf8_managed(repr))
 }
 
 pub unsafe fn code_sizeof(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1540,7 +1562,16 @@ unsafe fn read_code_filename(
         return Err(crate::PyError::type_error(format!("{field} must be a str")));
     }
     let bytes = crate::gateway::fsencode_bytes_w(v)?;
-    Ok(match String::from_utf8(bytes) {
+    Ok(split_code_filename_bytes(bytes, fallback))
+}
+
+/// Split the authoritative filesystem bytes from the compiler dependency's
+/// UTF-8-only `source_path` spelling (`objspace.py:438 newfilename`).
+pub(crate) fn split_code_filename_bytes(
+    bytes: Vec<u8>,
+    fallback: Option<&str>,
+) -> (String, Option<Vec<u8>>) {
+    match String::from_utf8(bytes) {
         Ok(source_path) => (source_path, None),
         Err(error) => {
             let bytes = error.into_bytes();
@@ -1549,7 +1580,7 @@ unsafe fn read_code_filename(
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             (source_path, Some(bytes))
         }
-    })
+    }
 }
 
 /// A `tuple[str]` `co_*` field (names / varnames / freevars / cellvars).
