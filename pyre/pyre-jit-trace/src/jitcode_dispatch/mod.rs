@@ -3107,8 +3107,11 @@ fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahea
         //   assert arg1 == 1
         //   cintf.jit_rvmprof_code(arg1, arg2)
         // Walker surfaces the operand byte indices for the caller to
-        // decide whether to symbolically record (today: drop, mirroring
-        // RPython's non-record direct cintf call).
+        // decide whether to symbolically record. The `cintf` call itself
+        // belongs to the frame-popping loop, which is
+        // `MetaInterp::finishframe_exception` and does perform it; firing
+        // it from here would mark an enter/leave on a lookahead that pops
+        // nothing.
         let arg1_reg = code[next.pc + 1];
         let arg2_reg = code[next.pc + 2];
         return FinishframeLookahead::RvmprofCode { arg1_reg, arg2_reg };
@@ -3120,9 +3123,10 @@ fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahea
 /// `try_catch_exception_at(...) -> Option<target>` shape used by
 /// existing callers. Returns `Some(target)` only on the
 /// `CatchTarget` arm; `RvmprofCode` and `NoMatch` collapse to `None`
-/// (both cases continue unwinding from the caller's POV — the
-/// instrumentation side effect is dropped today, matching RPython's
-/// non-trace-recorded `cintf` call).
+/// (both cases continue unwinding from the caller's POV). This is a
+/// lookahead predicate, not a frame-popping loop, so it carries no
+/// `jit_rvmprof_code` side effect — `MetaInterp::finishframe_exception`
+/// is the loop that decodes `rvmprof_code` and calls it.
 pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
     match finishframe_lookahead_at(code, position) {
         FinishframeLookahead::CatchTarget(target) => Some(target),
@@ -3133,11 +3137,26 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
 /// Exception-edge bridge: route an exception-guard bridge
 /// (GUARD_NO_EXCEPTION / GUARD_EXCEPTION) resume to the in-frame `except`
 /// handler instead of declining to the blackhole (`call_jit.rs` pending-exc
-/// decline). Native backends run the exception-edge bridge unconditionally.
-/// The wasm guest's abort-replay exception class (#727) is still open, so it
-/// stays off there.
+/// decline). Every backend runs it.
+///
+/// It was off on wasm because the bridge it produced deopted again on its own
+/// entry GUARD_EXCEPTION, so the guard failure just moved one chain link deeper
+/// on every raising iteration and the chain grew one link per `trace_eagerness`
+/// cycle without bound (47 / 97 / 197 bridges at 10k / 20k / 40k iterations of
+/// `type_name_surrogate_reject`, with `guard_failures` byte-identical to the
+/// declining arm). Two pointer-width reads were the cause: the expected class
+/// was read as an i64 out of the exception's one-word `typeptr`, so on a 32-bit
+/// target it carried the adjacent header word in its high half and could never
+/// equal the pending-exception cell, which `jit_exc_raise` publishes at pointer
+/// width. With both reads narrowed and the wasm backend's SAVE_EXCEPTION /
+/// SAVE_EXC_CLASS / RESTORE_EXCEPTION lowered instead of skipped, the wasm
+/// counters land on the native ones: `type_name_surrogate_reject` 9464 -> 202
+/// guard failures against dynasm's 201, `inline_subwalk_property_mutates`
+/// 23748 -> 613 against 611, `handler_reraise_second_exc` and
+/// `named_reraise_sibling_hot` exactly on dynasm's 804 and 1712, and
+/// `loops_aborted` 1 -> 0 on all of them.
 pub fn exc_edge_bridge_enabled() -> bool {
-    cfg!(not(target_arch = "wasm32"))
+    true
 }
 
 /// `PYRE_CARRIER_EXC_RESUME=1` enables the multi-frame (carrier) exception
