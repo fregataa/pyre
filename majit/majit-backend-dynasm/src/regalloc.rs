@@ -768,26 +768,48 @@ pub struct RegisterManager {
 
 /// Resolve a constant `OpRef` to its `i64` bit pattern.
 ///
+/// Every caller is an operand slot that RPython reads with `.getint()` —
+/// a GC_LOAD offset (aarch64/regalloc.py:535), a GC_LOAD_INDEXED scale
+/// (:566), an itemsize (:568). Upstream can spell those as bare `getint()`
+/// calls because the rewrite pass guarantees the slot holds a `ConstInt`
+/// before the backend ever sees the op (rewrite.py:199-205 builds every one
+/// of them out of `ConstInt(...)`).
+///
 /// Inline-Const variants (history.py:227/268/314 `ConstXxx.value`) carry the
-/// value directly. The legacy pool-indexed variants (`ConstInt(u32)` etc.)
-/// must be present in the optimizer's `constants` snapshot. A legacy const
-/// absent from `constants` means the optimizer producer never seeded it —
-/// `ConstInt.value` is always present in RPython, so the backend must never
-/// silently substitute `0`, which would miscompile the constant as zero.
-/// Panic at the parity hole instead, matching the Cranelift backend's
+/// value directly. The legacy pool-indexed variants must be present in the
+/// optimizer's `constants` snapshot. Either way the backend must never
+/// silently substitute `0`, which would miscompile the constant as zero, so
+/// this panics at the parity hole instead — matching the Cranelift backend's
 /// `missing_legacy_constant`.
+///
+/// The two failures it separates are different bugs and want different fixes:
+/// a *constant-namespace* raw that is missing means the producer never seeded
+/// the pool, while a *body* OpRef arriving at all means the slot was filled
+/// with a runtime value — an op that should have been lowered upstream of the
+/// backend and was not. `#[track_caller]` reports which slot, because the
+/// `consider_*` body is the only thing that identifies the op.
+#[track_caller]
 fn const_bits_or_panic(v: OpRef, constants: &indexmap::IndexMap<u32, i64>, where_: &str) -> i64 {
     if let Some(bits) = v.inline_const_bits() {
         return bits;
     }
-    constants.get(&v.raw()).copied().unwrap_or_else(|| {
-        panic!(
-            "dynasm {where_}: legacy pool-indexed const OpRef (raw={}) is absent \
-             from the constants snapshot — the optimizer producer must seed it \
-             (or mint an inline Const) instead of the backend baking 0. RPython \
-             ConstInt.value (history.py:227) is always present.",
-            v.raw()
-        )
+    let caller = std::panic::Location::caller();
+    let raw = v.raw();
+    constants.get(&raw).copied().unwrap_or_else(|| {
+        let diagnosis = if OpRef::raw_is_constant(raw) {
+            "legacy pool-indexed const absent from the constants snapshot — the \
+             optimizer producer must seed it (or mint an inline Const) instead of \
+             the backend baking 0; RPython ConstInt.value (history.py:227) is \
+             always present"
+        } else {
+            "a BODY OpRef, not a constant at all — this operand slot is one \
+             RPython reads with `.getint()`, so a runtime value reaching it means \
+             the op was never lowered. Upstream guarantees the slot by rewriting \
+             before assembly (aarch64/regalloc.py:188 -> gc.py:109-112), e.g. \
+             RAW_LOAD_I becomes GC_LOAD_INDEXED_I with ConstInt scale/offset/size \
+             (rewrite.py:228-232)"
+        };
+        panic!("dynasm {where_} at {caller}: {v:?} (raw={raw}) is {diagnosis}.")
     })
 }
 
@@ -2361,6 +2383,7 @@ impl<'a> RegAlloc<'a> {
     /// CONST_BIT tag preserved) — see `convert_to_imm` at regalloc.rs
     /// line 1475 and the fail-args handling at line 2079. This helper
     /// must use the same key convention.
+    #[track_caller]
     pub(crate) fn const_value(&self, v: OpRef) -> i64 {
         const_bits_or_panic(v, &self.constants, "const_value")
     }
@@ -2383,6 +2406,24 @@ impl<'a> RegAlloc<'a> {
                 output.push(RegAllocOp::Skip);
                 continue;
             }
+
+            // aarch64/assembler.py:1191-1195 `_walk_operations`: an
+            // `INT_*_OVF` op publishes its overflow answer in the condition
+            // flags, and the guard that reads them is `operations[i + 1]`.
+            // Anything emitted in between overwrites NZCV, so the guard would
+            // branch on the wrong comparison. Upstream asserts the adjacency
+            // rather than tolerating it; so do we — `compile_loop` catches the
+            // panic and declines the trace, which beats a silent wrong answer.
+            assert!(
+                !op.opcode.is_ovf()
+                    || matches!(
+                        operations.get(i + 1).map(|n| n.opcode),
+                        Some(OpCode::GuardOverflow) | Some(OpCode::GuardNoOverflow)
+                    ),
+                "{:?} at {i} is not followed by GUARD_[NO_]OVERFLOW (got {:?})",
+                op.opcode,
+                operations.get(i + 1).map(|n| n.opcode),
+            );
 
             // x86/regalloc.py:390 dispatch to consider_* method.
             // The dynasm backend now enters through the j2-style lowered
@@ -2896,9 +2937,14 @@ impl<'a> RegAlloc<'a> {
             OpCode::CastFloatToInt if !args.is_empty() => {
                 self.consider_cast_float_to_int_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
             }
-            OpCode::ConvertFloatBytesToLonglong
-            | OpCode::ConvertLonglongBytesToFloat
-            | OpCode::CastPtrToInt
+            // Same bank split as the non-j2 arm — see the citation there.
+            OpCode::ConvertFloatBytesToLonglong if !args.is_empty() => {
+                self.consider_cast_float_to_int_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+            }
+            OpCode::ConvertLonglongBytesToFloat if !args.is_empty() => {
+                self.consider_cast_int_to_float_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+            }
+            OpCode::CastPtrToInt
             | OpCode::CastIntToPtr
             | OpCode::CastOpaquePtr
             | OpCode::SameAsI
@@ -3109,8 +3155,21 @@ impl<'a> RegAlloc<'a> {
             OpCode::CastFloatToSinglefloat | OpCode::CastSinglefloatToFloat => {
                 self.consider_float_unary(op, i, output);
             }
-            OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
-                self.consider_same_as(op, i, output);
+            // aarch64/regalloc.py:515-516 aliases both converts to the same
+            // `prepare_unary` (:456-462) as `prepare_op_cast_float_to_int` /
+            // `prepare_op_cast_int_to_float` (:502-503): the argument is read
+            // through the manager owning the ARGUMENT's type and the result is
+            // allocated through the manager owning the OP's type. x86 spells
+            // the same split out at x86/regalloc.py:719-727 / :730-738
+            // (`xrm.make_sure_var_in_reg` + `rm.force_allocate_reg`, and the
+            // mirror image). These ops REINTERPRET the bits across the two
+            // register files, so `consider_same_as` — which reads the argument
+            // out of the RESULT's bank — reads the wrong register file.
+            OpCode::ConvertFloatBytesToLonglong => {
+                self.consider_cast_float_to_int(op, i, output);
+            }
+            OpCode::ConvertLonglongBytesToFloat => {
+                self.consider_cast_int_to_float(op, i, output);
             }
             OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
                 self.consider_same_as(op, i, output);
@@ -6312,6 +6371,59 @@ mod tests {
             "deopt-only failarg should be captured from a register: {:?}",
             faillocs
         );
+    }
+
+    /// Build `[IntMulOvf -> i2, <optional interposed IntGt>, GuardNoOverflow,
+    /// Finish(i2)]` and walk it. The `Finish` use keeps the OVF result live so
+    /// the dead-op skip does not swallow the OVF op before the adjacency check.
+    fn walk_ovf_trace(interpose_comparison: bool) {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let i2 = OpRef::int_op(2);
+        let i3 = OpRef::int_op(3);
+
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, i0.raw()),
+            InputArg::from_type(Type::Int, i1.raw()),
+        ];
+
+        let mul_ovf = Op::new(OpCode::IntMulOvf, &[rb(i0), rb(i1)]);
+        mul_ovf.pos.set(i2);
+        let guard = Op::new(OpCode::GuardNoOverflow, &[]);
+        guard.pos.set(OpRef::int_op(4));
+        guard.setfailargs(vec![rb(i2)].into());
+        let finish = Op::new(OpCode::Finish, &[rb(i2)]);
+        finish.pos.set(OpRef::int_op(5));
+        finish.setfailargs(vec![].into());
+        finish.set_fail_arg_types(vec![]);
+
+        let mut ops = vec![mul_ovf];
+        if interpose_comparison {
+            let gt = Op::new(OpCode::IntGt, &[rb(i0), rb(i1)]);
+            gt.pos.set(i3);
+            ops.push(gt);
+        }
+        ops.push(guard);
+        ops.push(finish);
+
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        ra.walk_operations();
+    }
+
+    /// aarch64/assembler.py:1191-1195: the OVF op's answer lives in NZCV, so
+    /// its guard must be `operations[i + 1]`. Adjacent is accepted.
+    #[test]
+    fn test_ovf_op_adjacent_to_its_guard_walks() {
+        walk_ovf_trace(false);
+    }
+
+    /// ...and an op emitted between them — which overwrites NZCV — is rejected
+    /// rather than silently compiled into a guard on the wrong comparison.
+    #[test]
+    #[should_panic(expected = "is not followed by GUARD_[NO_]OVERFLOW")]
+    fn test_ovf_op_separated_from_its_guard_is_rejected() {
+        walk_ovf_trace(true);
     }
 
     #[test]
