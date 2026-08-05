@@ -2444,8 +2444,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         if args.is_empty() {
             return Err(crate::PyError::type_error("stat() missing argument"));
         }
-        let path = crate::gateway::fsencode_path_w(args[0]).map_err(|_| {
-            crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
+        // Only a wrong *type* is re-reported under `stat`'s own wording; the
+        // embedded-null ValueError and the surrogate UnicodeEncodeError say
+        // what actually went wrong and have to reach the caller as themselves.
+        // `os.stat('\ud800')` is a `UnicodeEncodeError`, not a `TypeError`.
+        let path = crate::gateway::fsencode_path_w(args[0]).map_err(|err| {
+            if matches!(err.kind, crate::error::PyErrorKind::TypeError) {
+                crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
+            } else {
+                err
+            }
         })?;
         #[cfg(feature = "sandbox")]
         {
@@ -2576,10 +2584,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn dir_entry_fspath(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         crate::baseobjspace::getattr_str(args[0], "path")
     }
+    /// `posixmodule.c DirEntry_repr` — `"<DirEntry %R>"`, so the name is
+    /// rendered by its own `repr`.  That keeps `os.scandir(b'.')`'s bytes
+    /// name spelled `b'…'` and lets a name whose bytes have no UTF-8 form
+    /// keep the lone surrogate `fs_name_obj` decoded it to.
     fn dir_entry_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let name = crate::baseobjspace::getattr_str(args[0], "name")?;
-        let name = unsafe { pyre_object::w_str_get_value(name) };
-        Ok(pyre_object::w_str_new(&format!("<DirEntry {name:?}>")))
+        let mut out = rustpython_wtf8::Wtf8Buf::new();
+        out.push_str("<DirEntry ");
+        out.push_wtf8(&unsafe { crate::py_repr_wtf8(name)? });
+        out.push_str(">");
+        Ok(pyre_object::w_str_from_wtf8(out))
     }
     fn dir_entry_type() -> PyObjectRef {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

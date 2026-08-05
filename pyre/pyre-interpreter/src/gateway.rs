@@ -1672,3 +1672,37 @@ pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError
     }
     Ok(out)
 }
+
+/// The host `PathBuf` a `str` names, taking the filesystem encoding.
+///
+/// A name that came back from `readdir` carries the surrogate escapes
+/// [`fsdecode_filename_bytes`] produced, and those have no `&str` spelling —
+/// building the path with `w_str_get_value` aborts the process. Route through
+/// [`fsencode`] so the escapes fold back to the original bytes and the path
+/// names the same file it was read from.
+///
+/// A str the filesystem encoding cannot spell raises rather than resolving to
+/// some other path: `sys.path.insert(0, '\ud800')` followed by an import
+/// answers `UnicodeEncodeError: surrogates not allowed`, and dropping the entry
+/// instead would search on and report the wrong failure.
+pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Result<std::path::PathBuf, crate::PyError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = fsencode(obj)?;
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            bytes,
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        // No byte spelling on this platform, so the host API receives the text
+        // itself and a surrogate has nowhere to go: `str_utf8_w` reports it as
+        // an encoding error. Encoding to bytes and decoding them back lossily
+        // would substitute U+FFFD, which addresses a different name and makes
+        // distinct entries alias onto one another.
+        Ok(std::path::PathBuf::from(crate::baseobjspace::str_utf8_w(
+            obj,
+        )?))
+    }
+}
