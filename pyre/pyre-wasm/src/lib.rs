@@ -516,13 +516,17 @@ thread_local! {
     /// compiles as `<string>` and a traceback can name neither the file nor
     /// the offending line.
     static SCRIPT_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// `-P` / PYTHONSAFEPATH, which suppresses the `sys.path[0]` entry. The
-    /// guest has no environment, so the embedder passes the resolved flag in
-    /// through `pyre_set_safe_path` rather than the variable being read here.
-    /// Only the native-host binding seeds that entry — the browser build has no
-    /// filesystem to seed it from.
+    /// The `PYTHON*` and locale variables the launcher options resolve
+    /// against (`launch_env::LAUNCH_ENV_NAMES`). wasm32's `std::env` is
+    /// permanently empty, so `-P`, `-O`, PYTHONWARNINGS and the rest would every
+    /// one of them read as unset here; the embedder passes over whatever its own
+    /// environment carries and `run_python_impl` folds them the way the native
+    /// launcher does. Only the native-host binding seeds this — the browser has
+    /// no environment to seed it from.
+    /// Values are raw bytes: `_Py_GetEnv` tests presence on the undecoded
+    /// bytes, so a `PYTHONSAFEPATH` the host cannot decode is still set.
     #[cfg(feature = "wasm-host")]
-    static SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LAUNCH_ENV: RefCell<Vec<(String, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
@@ -554,6 +558,39 @@ fn run_python_impl(source: &str) -> String {
     // object-keyed dict, not only after the first JIT-traced bytecode
     // (`dict_eq_hook::missing_hash_hook` fails fast otherwise).
     pyre_jit::eval::init_jit_hooks();
+    // Resolve the launcher options before the first `import sys`, as
+    // `pyrex real_main` does. There is no command line here, so every option
+    // starts at its default and only the environment the embedder handed over
+    // folds in — which is why the table has to be installed first.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+    {
+        use pyre_interpreter::launch_env::{self, LaunchFlags};
+        launch_env::set_launch_env(LAUNCH_ENV.with(|e| e.borrow().clone()));
+        match launch_env::finalize(LaunchFlags::default()) {
+            Ok(flags) => {
+                pyre_interpreter::importing::set_no_site(flags.no_site);
+                pyre_interpreter::importing::set_runtime_flags(&flags);
+            }
+            Err(e) => {
+                // `preconfig_init_utf8_mode` is fatal before the interpreter
+                // exists; the guest cannot exit a process, so it reports the
+                // same banner on fd 2 and returns the same status.
+                install_wasm_print_hook();
+                OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
+                ERR_BUF.with(|buf| buf.borrow_mut().clear());
+                pyre_interpreter::host_seam::emit_stderr(
+                    format!(
+                        "Fatal Python error: preconfig_init_utf8_mode: {}\n\
+                         Python runtime state: preinitializing\n\n",
+                        e.0
+                    )
+                    .as_bytes(),
+                );
+                EXIT_CODE.with(|c| c.set(1));
+                return String::new();
+            }
+        }
+    }
     pyre_interpreter::importing::install_builtin_modules();
     // Give the import machinery a source of module bytes. The browser has no
     // filesystem, so the web build serves the embedded stdlib closure from an
@@ -569,7 +606,7 @@ fn run_python_impl(source: &str) -> String {
         // (safe_path) suppresses it entirely, as it does natively.
         if let Some(dir) = SCRIPT_PATH
             .with(|p| p.borrow().clone())
-            .filter(|_| !SAFE_PATH.with(|f| f.get()))
+            .filter(|_| !pyre_interpreter::importing::safe_path_flag())
             .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
         {
             pyre_interpreter::importing::add_sys_path(&dir);
@@ -720,7 +757,9 @@ pub fn run_python(source: &str) -> String {
 ///      and `pyre_exit_code()` → the status to exit with.
 ///
 /// `pyre_set_script_path(ptr, len)` may precede step 2 to name the file the
-/// source came from.
+/// source came from, and `pyre_set_launch_env(ptr, len)` to supply the
+/// environment the launcher options resolve against — the guest has none of
+/// its own.
 #[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
@@ -810,13 +849,62 @@ mod host_abi {
         super::SCRIPT_PATH.with(|p| *p.borrow_mut() = path);
     }
 
+    /// Supply the `PYTHON*` and locale variables the launcher options resolve
+    /// against, as NUL-separated `NAME=VALUE` records. The guest's environment
+    /// is permanently empty, so without this every one of them reads as unset
+    /// and `sys.flags` reports the defaults no matter what the host was run
+    /// with. `pyre_launch_env_names` lists the names worth sending; anything
+    /// else is carried but never read. A record without `=`, or with an empty
+    /// or non-UTF-8 name, is dropped.
+    ///
+    /// The blob is read as bytes, not text: a VALUE that is not valid UTF-8 is
+    /// carried through undecoded, because `_Py_GetEnv` tests presence on the
+    /// raw bytes and `PYTHONSAFEPATH` is set by any nonempty value whether or
+    /// not it decodes. Names are ASCII by construction.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_set_launch_env(ptr: *const u8, len: usize) {
+        let Some(blob) = guest_bytes(ptr, len) else {
+            return;
+        };
+        let entries = blob
+            .split(|&b| b == 0)
+            .filter_map(|record| {
+                let eq = record.iter().position(|&b| b == b'=')?;
+                let name = std::str::from_utf8(&record[..eq]).ok()?;
+                (!name.is_empty()).then(|| (name.to_string(), record[eq + 1..].to_vec()))
+            })
+            .collect();
+        super::LAUNCH_ENV.with(|e| *e.borrow_mut() = entries);
+    }
+
+    /// The names [`pyre_set_launch_env`] is worth being given, as NUL-separated
+    /// records in a buffer the host must free with `pyre_dealloc`. Returned so
+    /// a host does not have to keep its own copy of the list in step with the
+    /// interpreter's.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_launch_env_names() -> u64 {
+        pack_into_guest(
+            pyre_interpreter::launch_env::LAUNCH_ENV_NAMES
+                .join("\0")
+                .into_bytes(),
+        )
+    }
+
     /// Set `-P` / PYTHONSAFEPATH for the next `pyre_run_python`, suppressing the
-    /// `sys.path[0]` entry `pyre_set_script_path` would otherwise seed. Passed in
-    /// rather than read from the environment because the guest's is permanently
-    /// empty, so the flag would silently read as unset there.
+    /// `sys.path[0]` entry `pyre_set_script_path` would otherwise seed. Kept for
+    /// a host predating [`pyre_set_launch_env`], which carries the same flag
+    /// along with the rest of the block; the two write the same entry, but
+    /// `pyre_set_launch_env` replaces the whole table, so a host calling both
+    /// must call this one second.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_set_safe_path(enabled: u32) {
-        super::SAFE_PATH.with(|f| f.set(enabled != 0));
+        super::LAUNCH_ENV.with(|e| {
+            let mut entries = e.borrow_mut();
+            entries.retain(|(name, _)| name != "PYTHONSAFEPATH");
+            if enabled != 0 {
+                entries.push(("PYTHONSAFEPATH".to_string(), b"1".to_vec()));
+            }
+        });
     }
 
     /// Copy `[ptr, ptr+len)` out of linear memory as UTF-8. The embedder
@@ -824,14 +912,22 @@ mod host_abi {
     /// (`None`) before a slice is formed rather than being undefined
     /// behaviour; an empty buffer reads as the empty string.
     fn guest_str(ptr: *const u8, len: usize) -> Option<String> {
+        guest_bytes(ptr, len).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Copy `[ptr, ptr+len)` out of linear memory undecoded, for a caller whose
+    /// payload is not text. Same bounds contract as [`guest_str`]: the embedder
+    /// supplies the pair raw, so a range escaping linear memory is rejected
+    /// (`None`) before a slice is formed rather than being undefined behaviour;
+    /// an empty buffer reads as an empty slice.
+    fn guest_bytes(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
         if ptr.is_null() || len == 0 {
-            return Some(String::new());
+            return Some(Vec::new());
         }
         let mem_bytes = core::arch::wasm32::memory_size(0).saturating_mul(65536);
         match (ptr as usize).checked_add(len) {
             Some(end) if end <= mem_bytes => {
-                let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-                Some(String::from_utf8_lossy(bytes).into_owned())
+                Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
             }
             _ => None,
         }
