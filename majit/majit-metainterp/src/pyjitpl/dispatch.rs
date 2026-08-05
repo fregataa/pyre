@@ -1556,14 +1556,18 @@ where
     /// waste the whole recording, so it is terminated here instead: an
     /// always-failing guard takes every execution back to the interpreter,
     /// and the FINISH behind it exists only to give the segment a
-    /// terminator.  The compile half — `compile_simple_loop` plus
-    /// `attach_procedure_to_interp` (pyjitpl.py:1658-1663) — needs the
-    /// `MetaInterp` the walker does not hold, so it runs in the
-    /// [`TraceAction::SegmentedLoop`] arm of the driver.
+    /// terminator.  The compile half needs the `MetaInterp` the walker
+    /// does not hold, so it runs in the driver, in one of the two arms
+    /// upstream branches to at pyjitpl.py:1639:
     ///
-    /// `compile_simple_loop` puts a LABEL at the segment's entry, which is
-    /// what lets a later trace close back into it; without it the segmented
-    /// loop could never be completed (pyjitpl.py:1641-1643).
+    /// * [`TraceAction::SegmentedLoop`] — `compile_simple_loop` plus
+    ///   `attach_procedure_to_interp` (pyjitpl.py:1658-1663).
+    ///   `compile_simple_loop` puts a LABEL at the segment's entry, which
+    ///   is what lets a later trace close back into it; without it the
+    ///   segmented loop could never be completed (pyjitpl.py:1641-1643).
+    /// * [`TraceAction::SegmentedBridge`] — `compile_trace(metainterp,
+    ///   resumekey, [exception_box])` with the `target_token is not token`
+    ///   give-up (pyjitpl.py:1665-1668).
     fn create_segmented_trace(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1584,13 +1588,44 @@ where
             mp_opcode_pc,
             /* after_residual_call */ false,
         );
-        // pyjitpl.py:1633-1637: an unreachable FINISH carrying the
-        // AssertionError typeptr and `exit_frame_with_exception_descr_ref`.
-        // Pyre's FINISH takes neither — `record_finish` records the op with
-        // its result operand alone — and the op is unreachable behind a
-        // guard that always fails, so the operand is a placeholder.
+        // pyjitpl.py:1633-1636 `exception_box = ConstInt(ptr2int(
+        // llexception.typeptr))` — the AssertionError type pointer the
+        // unreachable FINISH escapes with.  The op sits behind a guard that
+        // always fails, so pyre records the placeholder `ConstInt(0)`
+        // instead of resolving a type pointer for a value nothing reads.
+        // Both arms below take this same box, as upstream does.
         let exception_box = ctx.const_int(0);
-        ctx.record_finish(exception_box, majit_ir::Type::Int);
+        // pyjitpl.py:1639-1640 `if (metainterp.current_merge_points and
+        // isinstance(metainterp.resumekey, compile.ResumeFromInterpDescr)):`
+        // — a trace that owns a merge point and entered from the
+        // interpreter becomes a segmented loop; anything else (a
+        // guard-origin bridge) takes the else-arm.
+        let is_loop_trace = ctx.current_merge_points_first_greenkey().is_some()
+            && ctx.resumekey_original_loop_token().is_none();
+        // pyjitpl.py:1637 `history.record1(rop.FINISH, exception_box, None,
+        // descr=token)`, recorded before the branch and seen by both arms.
+        // The loop arm keeps it here, where `record_finish` writes the op
+        // with its operand alone.  The bridge arm leaves it to
+        // `compile_finish_from_active_session`, which is the port of
+        // pyjitpl.py:1666 `compile_trace(metainterp, resumekey,
+        // [exception_box])` and records the same FINISH through
+        // `recorder.finish(finish_args, finish_descr)` — carrying
+        // `sd.exit_frame_with_exception_descr_ref`, the descr upstream's
+        // `target_token is not token` test compares against.  Recording it
+        // here as well would give that trace two terminators.
+        //
+        // The loop arm's FINISH therefore still carries no descr, which is
+        // the one place this stays short of pyjitpl.py:1637.  The slot is
+        // there (`Op::setdescr`, and `Trace::record_op_with_descr` behind
+        // `recorder.finish`); what is missing is a `record_finish` that
+        // takes one.  Left alone here because the loop arm reaches the
+        // backend through `compile_simple_loop`, where a FINISH that starts
+        // reporting `is_exception_exit` changes exit dispatch for a segment
+        // that compiles today — a change to make with its own measurement,
+        // not alongside the bridge arm's first one.
+        if is_loop_trace {
+            ctx.record_finish(exception_box, majit_ir::Type::Int);
+        }
         // pyjitpl.py:1671-1673: "we now need to blackhole back to the
         // interpreter instead of jumping to some existing code, because we
         // are at a really arbitrary place here."  Under single-pass tracing
@@ -1602,7 +1637,11 @@ where
         ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
         ctx.walk_final_reds = Vec::new();
         // pyjitpl.py:1673 `raise SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`.
-        TraceAction::SegmentedLoop
+        if is_loop_trace {
+            TraceAction::SegmentedLoop
+        } else {
+            TraceAction::SegmentedBridge { exception_box }
+        }
     }
 
     /// Resolve the box operand for a vable opcode. The canonical
@@ -4932,16 +4971,12 @@ where
                 // `jit_merge_point` op, which an arbitrary mid-walk position
                 // has no counterpart for.
                 if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
-                    // pyjitpl.py:1639-1640 `if metainterp.current_merge_points
-                    // and isinstance(metainterp.resumekey,
-                    // ResumeFromInterpDescr):` — the loop arm.  A bridge takes
-                    // upstream's `compile_trace(resumekey)` else-arm instead,
-                    // which is not ported; it keeps aborting, as before.
-                    let is_loop_trace = ctx.current_merge_points_first_greenkey().is_some()
-                        && ctx.resumekey_original_loop_token().is_none();
-                    if is_loop_trace {
-                        return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
-                    }
+                    // The loop-vs-bridge split lives inside
+                    // `create_segmented_trace`, where upstream keeps it
+                    // (pyjitpl.py:1639) — the check reached here segments
+                    // whatever trace it is in, exactly as
+                    // `_create_segmented_trace_and_blackhole` does.
+                    return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
                 }
                 // pyjitpl.py:1547 `jitdriver_sd =
                 // self.metainterp.staticdata.jitdrivers_sd[jdindex]` reads the
@@ -5394,51 +5429,49 @@ where
                             // `original_boxes[:num_green_args]` — the INNER
                             // greenkey (pyjitpl.py:3183-3187).
                             //
-                            // Pyre's cut cannot do that attach: it stores under
-                            // `cut_inner_green_key`, and the only key derivable
-                            // here is `green_key_from_code_ptr(green_key_raw.0,
-                            // pc)` with `JitState::code_ptr()` defaulting to 0 —
-                            // not the driver's `GreenKey::hash_u64`. So cutting
-                            // at a merge point that already holds a compiled loop
-                            // would replace reachable code with code stored where
-                            // nothing enters. Decline the cut and keep tracing;
-                            // the trace then closes at its own header with this
-                            // loop's body inlined, which is what it does at trip
-                            // counts too low to reach the merge point twice.
+                            // The JUMP is what the `already_compiled_here` arm
+                            // below performs: it publishes the token key and
+                            // returns `CloseLoop`, and the driver runs
+                            // `close_bridge` (guard origin) or
+                            // `compile_trace_from_interp` (interp origin).
                             //
-                            // The JUMP-into-ptoken half of :3001-3007 is not
-                            // implemented here.  It is not blocked on missing
-                            // machinery — that was tried and measured:
-                            // publishing the token key plus `close_greens` and
-                            // returning `CloseLoop` reaches `close_bridge` for a
-                            // guard origin and `compile_trace_from_interp`
-                            // (through `compile_trace_entry_data`, which needs
-                            // `header_pc == 0`) for an interp origin, and both
-                            // land.  cel's `nested_list_loop_varying_trip_count`
-                            // then keeps its results and loses its 4 aborts, but
-                            // its `spread 0..32` deopts go 959 → 1763 over 4000
-                            // rows and 1275 → 2601 over 16000: the residual
-                            // per-row tail worsens ~2.6x.  Jumping in ends the
-                            // trace at the inner loop, where the ordinary close
-                            // covered the whole outer iteration, and the exit
-                            // guards that shape leaves behind do not converge.
-                            // Routing the closing JUMP's target tokens off the
-                            // token it enters instead of off the bridge origin
-                            // (`unroll.py:196-197 cell_token = jump_op.getdescr()`
-                            // — pyre's `compile_bridge` hands `optimize_bridge`
-                            // the ORIGIN loop's `front_target_tokens`) recovers
-                            // only 7% of that, so the gap is elsewhere.
+                            // It is sound only because the key this arm derives
+                            // is the one the interpreter ENTERS by.  While the
+                            // key was `green_key_from_code_ptr(green_key_raw.0,
+                            // pc)` — `JitState::code_ptr()` defaulting to 0, not
+                            // the driver's `GreenKey::hash_u64` — a compiled loop
+                            // could sit under a key nothing enters, and jumping
+                            // into it was measured as a logo miscompile (992635
+                            // against 996310) and a SIGSEGV.  The four
+                            // procedure-token consults now share
+                            // `merge_point_green_key_hash`, so a loop is stored
+                            // under the key it is reached by and the jump lands
+                            // in code the interpreter can also enter.
                             //
-                            // Two consequences of declining, both narrower than
-                            // upstream:
-                            //   * upstream reaches the `current_merge_points`
-                            //     scan whenever `compile_trace` does NOT raise;
-                            //     this arm returns to neither the scan nor the
-                            //     `append` (:3058-3060), so the merge point is
-                            //     never registered at all while a compiled loop
-                            //     sits at those greens.
-                            //   * upstream's is a JUMP into reachable code; ours
-                            //     re-traces that loop's body inline.
+                            // ⚠ The earlier measurement against this lever —
+                            // cel's `nested_list_loop_varying_trip_count` keeping
+                            // its results and losing its 4 aborts while `spread
+                            // 0..32` deopts went 959 → 1763 over 4000 rows and
+                            // 1275 → 2601 over 16000 — was taken BEFORE that key
+                            // unification, i.e. against jumps into loops filed
+                            // under keys nothing enters.  It does not carry over
+                            // and must be re-measured before being cited again.
+                            // Same for the note that routing the closing JUMP's
+                            // target tokens off the token it enters rather than
+                            // off the bridge origin (`unroll.py:196-197
+                            // cell_token = jump_op.getdescr()` — pyre's
+                            // `compile_bridge` hands `optimize_bridge` the ORIGIN
+                            // loop's `front_target_tokens`) recovered only 7%.
+                            //
+                            // One consequence of a DECLINED attempt is still
+                            // narrower than upstream: upstream reaches the
+                            // `current_merge_points` scan whenever `compile_trace`
+                            // does not raise, while a declined attempt here
+                            // returns to neither the scan nor the `append`
+                            // (:3058-3060), so the merge point goes unregistered
+                            // while a compiled loop sits at those greens.  Kept
+                            // deliberately — it is exactly the pre-JUMP behaviour,
+                            // so the lever has a clean A/B.
                             //
                             // The token lookup below is unconditional, where
                             // upstream guards it with `if not self.partial_trace:`
