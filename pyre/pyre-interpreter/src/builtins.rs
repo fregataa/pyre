@@ -4053,6 +4053,24 @@ pub fn is_builtin_repr_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the canonical builtin `hash` function object; the
+/// walker's user-`__hash__` inline keys on this identity.
+pub fn is_builtin_hash_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            builtin_hash as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
