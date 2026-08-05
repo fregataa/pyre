@@ -532,6 +532,96 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     );
 }
 
+#[test]
+fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![null; slot_count];
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let fdescr = info.array_pointer_field_descr(0);
+    let adescr = info.array_descrs[0].clone();
+    let flat_base = info.num_static_extra_boxes;
+    assert!((0..=slot_count).all(|i| !tc.virtualizable_slot_stored_live_null(i)));
+
+    let index0 = tc.const_int(0);
+    let const_null = tc.const_null();
+    let ops_before = tc.num_ops();
+    assert!(tc.vable_setarrayitem_indexed(
+        0,
+        vable,
+        index0,
+        0,
+        fdescr.clone(),
+        adescr.clone(),
+        const_null,
+        null,
+        true,
+    ));
+    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(
+        (0..=slot_count)
+            .filter(|&i| i != flat_base)
+            .all(|i| !tc.virtualizable_slot_stored_live_null(i))
+    );
+    assert_eq!(
+        tc.virtualizable_entry_at(flat_base).map(|entry| entry.0),
+        Some(const_null)
+    );
+    assert!(const_null.is_constant());
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the side-table marker records no op"
+    );
+
+    assert!(tc.vable_setarrayitem_indexed(
+        0,
+        vable,
+        index0,
+        0,
+        fdescr.clone(),
+        adescr.clone(),
+        const_null,
+        null,
+        false,
+    ));
+    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
+
+    let index1 = tc.const_int(1);
+    let non_null = tc.const_ref(2);
+    assert!(tc.vable_setarrayitem_indexed(
+        0,
+        vable,
+        index1,
+        1,
+        fdescr.clone(),
+        adescr.clone(),
+        non_null,
+        Value::Ref(majit_ir::GcRef(2)),
+        true,
+    ));
+    assert!(!tc.virtualizable_slot_stored_live_null(flat_base + 1));
+
+    assert!(
+        tc.vable_setarrayitem_indexed(0, vable, index0, 0, fdescr, adescr, const_null, null, true,)
+    );
+    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    tc.set_virtualizable_entry_at(flat_base, const_null, null);
+    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
+}
+
 /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the
 /// box register is unseeded (`OpRef::NONE`) rather than feed
 /// `u32::MAX` into the heapcache flag vector (a 16 GiB resize).
@@ -10556,6 +10646,7 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
         pending_inline_frame: None,
         residual_call_pc: None,
         loop_close_marker_jit_pc: None,
+        close_merge_point_vsd: None,
         orgpc: 0,
         concrete_frame_addr: 0,
         pre_opcode_registers_r: None,
@@ -10639,6 +10730,7 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
         pending_inline_frame: None,
         residual_call_pc: None,
         loop_close_marker_jit_pc: None,
+        close_merge_point_vsd: None,
         orgpc: 0,
         concrete_frame_addr: 0,
         pre_opcode_registers_r: None,
@@ -10726,6 +10818,7 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
         pending_inline_frame: None,
         residual_call_pc: None,
         loop_close_marker_jit_pc: None,
+        close_merge_point_vsd: None,
         orgpc: 0,
         concrete_frame_addr: 0,
         pre_opcode_registers_r: None,

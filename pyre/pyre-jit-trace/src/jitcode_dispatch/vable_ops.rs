@@ -74,6 +74,24 @@ pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
     }
 }
 
+/// A push writes at the current `valuestackdepth`; a pop/clear decrements its
+/// target index first and updates `valuestackdepth` afterward.  This ordering is
+/// emitted by `emit_pushvalue_ref_const!` / `emit_popvalue_ref!` and lets the
+/// generic vable-store handler distinguish a live NULL push from clearing a
+/// dead slot without weakening flush validation. pyjitpl.py:1193,1245
+/// `virtualizable_boxes[index] = valuebox` stores one Box carrying both identity
+/// and concrete value, so it needs no separate marker; pyre keeps the halves
+/// apart and marks the shadow slot beside the trace instead.
+fn vable_store_is_stack_push<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, index: i64) -> bool {
+    let depth_index = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name("valuestackdepth"));
+    depth_index
+        .and_then(|idx| ctx.trace_ctx.virtualizable_entry_at(idx))
+        .is_some_and(|(_, value)| matches!(value, Value::Int(depth) if depth == index))
+}
+
 /// `getfield_vable_<i|r|f>/rd>X` handler. Operand layout `rd>X`:
 /// 1B r-reg(vable_box) + 2B descr(field) + 1B X-dst.
 ///
@@ -705,6 +723,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let concrete =
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
             .unwrap_or(Value::Void);
+    let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
     let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx.vable_setarrayitem_indexed(
         op.pc,
@@ -715,6 +734,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         adescr,
         value,
         concrete,
+        is_stack_push,
     );
     if index_value >= 0
         && let Some(frame) = current_inline_vable_target(ctx, vable)
