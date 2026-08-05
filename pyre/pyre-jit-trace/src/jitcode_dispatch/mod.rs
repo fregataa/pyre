@@ -535,6 +535,23 @@ impl WalkSession {
     }
 }
 
+/// Apply a walk-time concrete `record_application_traceback` with the undo log
+/// armed.
+///
+/// The authoritative walk attaches this iteration's node to the LIVE exception
+/// while it records, so a walk that does not commit has left a node the
+/// interpreter's replay then records again.  On a freshly raised exception that
+/// is invisible — the replay builds a new object and the discarded one is
+/// unreachable — but a raise that re-uses one exception object accumulates both
+/// deliveries, and the handler reads the whole chain twice over.
+/// `fbw_store_journal_rollback` splices the journaled link back out; the commit
+/// path keeps it, because a committed walk's node IS this iteration's.
+fn journaled_concrete_traceback_attach(exc_ptr: pyre_object::PyObjectRef, attach: impl FnOnce()) {
+    let previous_head = crate::jitcode_dispatch::fbw_traceback_journal_head(exc_ptr);
+    attach();
+    crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(exc_ptr, previous_head);
+}
+
 fn record_top_level_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
@@ -557,12 +574,14 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
         (session.recording_frame_ptr, session.recording_jitcode_index)
     };
     if execute_concrete {
-        majit_metainterp::record_application_traceback_for_recording(
-            exc_ptr as usize as i64,
-            frame_ptr as i64,
-            jitcode_index,
-            opcode_position as i32,
-        );
+        journaled_concrete_traceback_attach(exc_ptr, || {
+            majit_metainterp::record_application_traceback_for_recording(
+                exc_ptr as usize as i64,
+                frame_ptr as i64,
+                jitcode_index,
+                opcode_position as i32,
+            );
+        });
     }
     let hook = majit_metainterp::record_application_traceback_hook_address();
     let frame = crate::state::pyjitcode_for_jitcode_index(jitcode_index)
@@ -620,11 +639,13 @@ fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
     }
     let hook = majit_metainterp::record_discarded_level_traceback_hook_address();
     for &(w_code, py_pc) in levels.iter().rev() {
-        majit_metainterp::record_discarded_level_traceback_for_recording(
-            exc_ptr as usize as i64,
-            w_code as i64,
-            py_pc as i64,
-        );
+        journaled_concrete_traceback_attach(exc_ptr, || {
+            majit_metainterp::record_discarded_level_traceback_for_recording(
+                exc_ptr as usize as i64,
+                w_code as i64,
+                py_pc as i64,
+            );
+        });
         if hook.is_null() || exc.is_none() {
             continue;
         }
@@ -704,7 +725,7 @@ fn record_inline_application_traceback<Sym: WalkSym>(
         .and_then(|py_pc| {
             concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc))
         });
-        match node_frame {
+        journaled_concrete_traceback_attach(exc_ptr, || match node_frame {
             Some((frame_ptr, py_pc)) => {
                 // `dispatch_bytecode` (pyopcode.py) writes `self.last_instr`
                 // before every opcode so a frame read while it runs answers for
@@ -736,7 +757,7 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                 consts.jitcode_index,
                 opcode_position as i32,
             ),
-        }
+        });
     }
     let hook = majit_metainterp::record_inline_application_traceback_hook_address();
     if emit_runtime && !hook.is_null() && !exc.is_none() {
@@ -921,6 +942,23 @@ fn traceback_node_site<Sym: WalkSym>(
         .get(jitcode.metadata.portal_frame_reg as usize)
         .copied()
         .unwrap_or(OpRef::NONE);
+    // Storing this box into the node's `frame` field lets the traceback
+    // outlive the frame, so folded inline-callee locals have to reach the
+    // array first.  A `STORE_FAST` on the callee's own fresh frame is folded
+    // to an SSA register and emits no array store; without replaying that fold,
+    // the escaping frame carries only its seeded parameters and every
+    // `tb_frame.f_locals` consumer loses the callee's non-parameter locals.
+    // Upstream needs no replay because `STORE_FAST` writes
+    // `locals_cells_stack_w` itself and virtualization removes the store while
+    // the frame stays virtual (`pypy/interpreter/pyframe.py`,
+    // `rpython/jit/metainterp/virtualizable.py`).  Declining on `Err` leaves
+    // the node to the opaque fabricating hook, the same disposition both
+    // callers already take for an unresolved frame.
+    if !frame.is_none()
+        && residual_call::disarm_folded_inline_callee_after_escape(ctx, opcode_position).is_err()
+    {
+        return None;
+    }
     Some(TracebackNodeSite {
         frame,
         w_code,
@@ -2881,6 +2919,30 @@ pub fn walk<Sym: WalkSym>(
                     // raise coordinate out of `frame.last_instr`.  Compiled
                     // code never wrote that field, so publish it here.
                     fbw_publish_exit_last_instr(ctx, recording_opcode_position);
+                    // `pyjitpl.py:3261 compile_exit_frame_with_exception` opens
+                    // with `store_token_in_vable()`, exactly as
+                    // `compile_done_with_this_frame` does — both frame exits
+                    // settle the token, and this one did not.  Every residual
+                    // call arms it (`walker_vable_and_vrefs_before_residual_call`
+                    // records FORCE_TOKEN + SETFIELD_GC through
+                    // `token_field_descr`), so an exit that leaves it armed
+                    // leaves the frame naming a jitframe the backend is about to
+                    // free in `execute_token`, and the next
+                    // `is_force_token_armed` walks `jf_forward` off freed
+                    // memory.
+                    //
+                    // Settle it the way the value/void arms do — store back,
+                    // which zeroes the token slot — rather than by arming it
+                    // like upstream.  Upstream can leave the token live because
+                    // its FORCE_TOKEN is the heap-allocated GC `JITFRAME`
+                    // (`jitframe.py` `lltype.malloc(JITFRAME, ...)`); pyre's is
+                    // the machine frame pointer (`mov Rq(r), rbp` / `mov X(r),
+                    // x29`), which stops being addressable the moment compiled
+                    // code returns.  `gen_store_back_in_vable` sets
+                    // `forced_virtualizable`, which is the same early-out
+                    // `store_token_in_vable` takes on `vbox is
+                    // self.forced_virtualizable`.
+                    fbw_force_virtualizable_before_return(ctx);
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms

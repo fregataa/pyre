@@ -3274,7 +3274,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         PYTRACEBACK_W_CODE_OFFSET, PYTRACEBACK_W_NEXT_OFFSET,
     };
 
-    build_object_descr_group_with_def_path(
+    let group = build_object_descr_group_with_def_path(
         PYTRACEBACK_OBJECT_SIZE,
         PYTRACEBACK_GC_TYPE_ID,
         &PYTRACEBACK_TYPE as *const _ as usize,
@@ -3336,7 +3336,13 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         ],
         "",
         "",
-    )
+    );
+    // `w_pytraceback_new` allocates traceback nodes non-moving because raw
+    // `*mut PyTraceback` readers and the exception `w_traceback` chain keep
+    // bare pointers. A nursery allocation would move the node at the next
+    // minor collection while those copies retain its old address.
+    group.size_descr.set_non_moving(true);
+    group
 });
 
 pub fn pytraceback_size_descr() -> DescrRef {
@@ -3648,6 +3654,36 @@ mod tests {
                 .iter()
                 .any(|fd| fd.offset() == W_CLASS_OFFSET),
             "malloc_zero_filled=False requires the inherited PyObject.w_class edge"
+        );
+    }
+
+    #[test]
+    fn jit_emitted_raw_pointer_objects_are_non_moving() {
+        let traceback_descr = pytraceback_size_descr();
+        let traceback_size = traceback_descr
+            .as_size_descr()
+            .expect("PyTraceback SizeDescr");
+        assert!(
+            traceback_size.non_moving(),
+            "raw traceback pointers are not rewritten when a minor collection moves an object"
+        );
+
+        let instance_descr = w_object_object_size_descr();
+        let instance_size = instance_descr
+            .as_size_descr()
+            .expect("W_ObjectObject SizeDescr");
+        assert!(
+            instance_size.non_moving(),
+            "raw instance pointers can survive across allocation without being rooted"
+        );
+
+        let storage_descr = crate::state::mapdict_storage_gcarray_descr();
+        let storage_array = storage_descr
+            .as_array_descr()
+            .expect("mapdict storage ArrayDescr");
+        assert!(
+            storage_array.non_moving(),
+            "the mapdict custom tracer marks raw storage pointers but cannot rewrite them"
         );
     }
 
