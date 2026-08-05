@@ -7565,9 +7565,14 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // ── Known non-raising ops (canraise = ()) ─────────────────
         // RPython LL: getfield_gc, setfield_gc → cannot raise
         OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
-        // `malloc` can only raise MemoryError; with `ignore_memoryerror`
-        // it is treated as non-raising (canraise = (MemoryError,)).
-        OpKind::New { .. } | OpKind::NewWithVtable { .. } => RaiseClass::MemoryErrorOnly,
+        // `malloc` / `malloc_varsize` can only raise MemoryError; with
+        // `ignore_memoryerror` it is treated as non-raising
+        // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
+        // varsize allocation, same class.
+        OpKind::New { .. }
+        | OpKind::NewWithVtable { .. }
+        | OpKind::NewArrayClear { .. }
+        | OpKind::NewListClear { .. } => RaiseClass::MemoryErrorOnly,
         // RPython LL: getarrayitem_gc, setarrayitem_gc, arraylen_gc → cannot raise
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } | OpKind::ArrayLen { .. } => {
             RaiseClass::No
@@ -9529,6 +9534,54 @@ mod tests {
         assert_eq!(known_sizes["C"], 8, "C: single i64");
         assert_eq!(known_sizes["B"], 16, "B: C(8) + i64(8)");
         assert_eq!(known_sizes["A"], 24, "A: B(16) + i64(8)");
+    }
+
+    #[test]
+    fn rtyper_synthesised_list_struct_resolves_its_field_descrs() {
+        // The rtyper synthesises `GcStruct("list", ("length", Signed),
+        // ("items", Ptr(GcArray(ITEM))))` (`translator/rtyper/rlist.rs:1112`).
+        // `lib.rs` registers the {length, items} shape into `struct_fields`
+        // before `set_struct_fields`; mirror that injection here.  The
+        // heuristic accumulation over two word-sized fields must land
+        // length@0, items@8, struct size 16.
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "list".to_string(),
+            vec![
+                ("length".to_string(), "i64".to_string()),
+                ("items".to_string(), "&()".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+
+        let length = cc
+            .fielddescrof(0, "list", None, "length")
+            .expect("list.length descr resolves");
+        assert_eq!(
+            length
+                .as_field_descr()
+                .expect("length is a field descr")
+                .offset(),
+            0,
+            "length is the first field",
+        );
+        let items = cc
+            .fielddescrof(1, "list", None, "items")
+            .expect("list.items descr resolves");
+        assert_eq!(
+            items
+                .as_field_descr()
+                .expect("items is a field descr")
+                .offset(),
+            8,
+            "items follows the 8-byte length word",
+        );
+        assert_eq!(
+            compute_struct_size(&cc, "list"),
+            16,
+            "two word-sized fields → 16-byte struct",
+        );
     }
 
     #[test]

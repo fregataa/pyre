@@ -4076,6 +4076,81 @@ impl<'a> Transformer<'a> {
                     }],
                 )
             }
+            // `do_fixed_newlist_clear` (jtransform.py:1858-1863):
+            //   v_length = self._get_initial_newlist_length(op, args)
+            //   return SpaceOperation('new_array_clear', [v_length, arraydescr],
+            //                         op.result)
+            // `_ll_alloc_and_clear` (rlist.py:522-528, `@jit.oopspec(
+            // "newlist_clear(count)")`) reaches here through
+            // `_handle_list_call`; the `count` arg is the initial length.
+            // `_get_initial_newlist_length` (jtransform.py:1835-1842):
+            // `args[0]` when present, else the constant 0 — pyre carries the
+            // materialised `count` Variable, so a `newlist_clear(count)`
+            // callsite always supplies `args[0]`.  The cleared list holds GC
+            // pointers, so the arraydescr's item type is `Ref` — the exact
+            // shape that makes `do_fixed_newlist` select `new_array_clear`
+            // over `new_array` (jtransform.py:1851-1855).
+            "newlist_clear" => {
+                let length = args.first()?.clone();
+                // Fork on the result's list layout, mirroring upstream's
+                // `LIST = op.result.concretetype.TO; resizable =
+                // isinstance(LIST, lltype.GcStruct)` split in
+                // `_handle_list_call` (jtransform.py:1762-1785):
+                // `do_resizable_newlist_clear` (jtransform.py:1938) allocates
+                // the `"list"` header struct plus a cleared items array,
+                // `do_fixed_newlist_clear` (jtransform.py:1858) emits a bare
+                // cleared array.  `item_ty` / `array_type_id` are recovered
+                // from the result element lltype in BOTH cases — never
+                // hardcoded — so a non-pointer element list is not GC-traced
+                // as a pointer array, and a resized result carries the struct
+                // header instead of a bare array (C1).
+                let (detail, kind) = match newlist_clear_shape(op.result.as_ref()) {
+                    NewlistClearShape::Resized {
+                        item_ty,
+                        array_type_id,
+                    } => (
+                        "newlist_clear → newlist_clear(count, arraydescr) \
+                         [resized list header]",
+                        OpKind::NewListClear {
+                            length,
+                            item_ty,
+                            array_type_id,
+                        },
+                    ),
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                    } => (
+                        "newlist_clear → new_array_clear(count, arraydescr) \
+                         [fixed array]",
+                        OpKind::NewArrayClear {
+                            length,
+                            item_ty,
+                            array_type_id,
+                        },
+                    ),
+                    // OBJECTPTR / None fallback: the pre-fork behavior, kept
+                    // until N7 rewrites `_handle_list_call`'s tests with typed
+                    // results.  A generic `OBJECTPTR` result (e.g. a test that
+                    // stamped `alloc_value_var_with_type(GcRef)`) or a missing
+                    // concretetype hits this arm.
+                    NewlistClearShape::Fallback => (
+                        "newlist_clear → new_array_clear(count, arraydescr)",
+                        OpKind::NewArrayClear {
+                            length,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                        },
+                    ),
+                };
+                (
+                    detail,
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind,
+                    }],
+                )
+            }
             "list.obj_setitem" => {
                 let l = args.first()?.clone();
                 let index = args.get(1)?.clone();
@@ -5848,6 +5923,24 @@ fn remap_op(
         OpKind::NewList { args } => OpKind::NewList {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
+        OpKind::NewArrayClear {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewArrayClear {
+            length: remap_value(length, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
+        OpKind::NewListClear {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewListClear {
+            length: remap_value(length, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::GetSlice { args } => OpKind::GetSlice {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
@@ -6429,6 +6522,108 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
         "rpy_unicode" => StrOrUniKind::Unicode,
         "rpy_bytearray" => StrOrUniKind::ByteArray,
         _ => StrOrUniKind::Other,
+    }
+}
+
+/// The result-layout fork `_handle_list_call`'s `"newlist_clear"` arm
+/// selects between, mirroring upstream's `LIST = op.result.concretetype.TO;
+/// resizable = isinstance(LIST, lltype.GcStruct)` split
+/// (`jtransform.py:1762-1785`).  `item_ty` / `array_type_id` are recovered
+/// from the result element lltype in the `Resized` / `Fixed` cases (C1: the
+/// pre-fork arm hardcoded `Ref(None)` / `None`, so a non-pointer element
+/// list was GC-traced as a pointer array and a resized result emitted a
+/// bare array with no struct header); `Fallback` keeps the pre-fork shape
+/// for an untyped-or-`OBJECTPTR` result (pending N7's typed-result tests).
+enum NewlistClearShape {
+    /// Result is `Ptr(GcStruct("list", {length, items}))` — the resized
+    /// list header.  `do_resizable_newlist_clear` (jtransform.py:1938).
+    Resized {
+        item_ty: ValueType,
+        array_type_id: Option<String>,
+    },
+    /// Result is `Ptr(Array(ITEM))` — a bare fixed-size cleared array.
+    /// `do_fixed_newlist_clear` (jtransform.py:1858).
+    Fixed {
+        item_ty: ValueType,
+        array_type_id: Option<String>,
+    },
+    /// No concretetype, or a pointee that is neither the `"list"` struct
+    /// nor an array (a generic `OBJECTPTR` from an untyped test).
+    Fallback,
+}
+
+/// Classify a `newlist_clear` result Variable by its pointee list layout,
+/// recovering the items-array element `ValueType` (C1: never hardcoded)
+/// from the result lltype.
+///
+/// The element lltype → `ValueType` path is `getkind` (`model::getkind`,
+/// the canonical `LowLevelType → kind` projection) → `ConcreteType` →
+/// `ValueType`, matching `Transformer::get_value_type`'s kind-collapsed
+/// mapping (Char/Bool/Signed → `Int`, gc `Ptr` → `Ref`).
+///
+/// `array_type_id` is the ITEMS ARRAY identity string
+/// (`cpu.arraydescrof(ARRAY)` cache key).  It is a Rust-type spelling
+/// produced by the MIR front-end and is not recoverable from an rtyped
+/// lltype here, so it is `None`; `arraydescrof(item_ty, None, Some(0), cc)`
+/// derives a correct-width descr from `item_ty` alone — both the
+/// `CallControl` path (`arraydescrof_concrete`'s `elem_ref == None` branch)
+/// and the codewriter-less `assembler::arraydescrof` fallback key itemsize
+/// and pointer-ness off `item_ty` when `array_type_id` is absent (pointer
+/// elements stride by the target word, int/float by 8; the flag follows the
+/// item type).
+fn newlist_clear_shape(result: Option<&crate::flowspace::model::Variable>) -> NewlistClearShape {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
+    fn resolve(target: PtrTarget) -> Option<LowLevelType> {
+        match target {
+            PtrTarget::ForwardReference(fwd) => fwd.resolved(),
+            other => Some(LowLevelType::from(other)),
+        }
+    }
+
+    // Element `LowLevelType` → `ValueType`, collapsed through `getkind`'s
+    // kind space.  `getkind` never returns `Void`/`Unknown` for a real
+    // array element (it panics on the unsupported longlonglong / longfloat
+    // / interiorptr shapes), so those arms are defensive and land on the
+    // GC-pointer default.
+    fn element_value_type(elem: &LowLevelType) -> ValueType {
+        use crate::codewriter::type_state::ConcreteType;
+        match crate::model::getkind(elem) {
+            ConcreteType::Signed => ValueType::Int,
+            ConcreteType::Float => ValueType::Float,
+            ConcreteType::GcRef | ConcreteType::Void | ConcreteType::Unknown => {
+                ValueType::Ref(None)
+            }
+        }
+    }
+
+    let Some(LowLevelType::Ptr(ptr)) = result.and_then(|v| v.concretetype()) else {
+        return NewlistClearShape::Fallback;
+    };
+    let Some(pointee) = resolve(ptr.TO) else {
+        return NewlistClearShape::Fallback;
+    };
+    match pointee {
+        // Resized layout: the `"list"` GcStruct header.  Its `items` field
+        // is `Ptr(GcArray(ITEM))`; walk struct → `items` → array → OF.
+        LowLevelType::Struct(s) if s._name == "list" => {
+            let Some(LowLevelType::Ptr(items_ptr)) = s._flds.get("items") else {
+                return NewlistClearShape::Fallback;
+            };
+            let Some(LowLevelType::Array(a)) = resolve(items_ptr.TO.clone()) else {
+                return NewlistClearShape::Fallback;
+            };
+            NewlistClearShape::Resized {
+                item_ty: element_value_type(&a.OF),
+                array_type_id: None,
+            }
+        }
+        // Fixed layout: the pointee is the items array directly.
+        LowLevelType::Array(a) => NewlistClearShape::Fixed {
+            item_ty: element_value_type(&a.OF),
+            array_type_id: None,
+        },
+        _ => NewlistClearShape::Fallback,
     }
 }
 
@@ -10752,6 +10947,361 @@ mod tests {
             other => panic!("expected FieldRead, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// Fallback arm: a `newlist_clear` result with no recoverable list
+    /// layout — a generic `OBJECTPTR` (`Ptr(GcStruct("object"))`) or a
+    /// missing concretetype — is neither the `"list"` header struct nor an
+    /// items array, so `newlist_clear_shape` returns `Fallback` and the arm
+    /// emits a conservative `new_array_clear(count, arraydescr)` with a
+    /// GC-pointer element (`Ref(None)`) and no array identity.  This input
+    /// does not occur in a real translation (the rtyper stamps the list
+    /// type on the `_ll_alloc_and_clear` result); it is only reachable from
+    /// synthetic graphs that leave the result untyped.  The recovered-shape
+    /// arms are covered by
+    /// `handle_list_call_newlist_clear_resized_lowers_to_newlist_clear` and
+    /// `handle_list_call_newlist_clear_fixed_recovers_int_item_ty`.
+    #[test]
+    fn handle_list_call_newlist_clear_untyped_result_falls_back_to_ref_array() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_clear");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist_clear",
+                &op,
+                &[count.clone()],
+                &mut graph,
+                "newlist_clear",
+            )
+            .expect("newlist_clear must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(array_type_id, &None);
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// C1 fork, resized layout: a result typed
+    /// `Ptr(GcStruct("list", {length, items: Ptr(GcArray(Signed))}))` — the
+    /// resized `ListRepr` shape (`do_resizable_newlist_clear`,
+    /// jtransform.py:1938) — lowers to `NewListClear` (the struct-header
+    /// compound op) with `item_ty` recovered from the items array element
+    /// (`Signed` → `Int`), NOT the pre-fork bare `new_array_clear`.
+    #[test]
+    fn handle_list_call_newlist_clear_resized_lowers_to_newlist_clear() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        // upstream `GcStruct("list", ("length", Signed), ("items",
+        // Ptr(GcArray(ITEM))))` with ITEM = Signed (an int-element list).
+        let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let list_struct = Struct::gc(
+            "list",
+            vec![
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items_ptr),
+            ],
+        );
+        let list_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(list_struct),
+        }));
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_clear_resized");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = variable_with_lltype("l", list_ptr);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist_clear",
+                &op,
+                &[count.clone()],
+                &mut graph,
+                "newlist_clear_resized",
+            )
+            .expect("newlist_clear must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewListClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(
+                    matches!(item_ty, ValueType::Int),
+                    "int-element list items array must recover ValueType::Int, got {item_ty:?}"
+                );
+                assert_eq!(array_type_id, &None);
+            }
+            other => panic!("expected NewListClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// C1 fork, fixed layout: a result typed `Ptr(GcArray(Signed))` — the
+    /// fixed `FixedSizeListRepr` shape (`do_fixed_newlist_clear`,
+    /// jtransform.py:1858) — lowers to `NewArrayClear` with `item_ty`
+    /// recovered from the array element (`Signed` → `Int`), proving the C1
+    /// element-type recovery: the pre-fork arm hardcoded `Ref(None)`, which
+    /// would GC-trace int slots as pointers.
+    #[test]
+    fn handle_list_call_newlist_clear_fixed_recovers_int_item_ty() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let array_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_clear_fixed");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = variable_with_lltype("a", array_ptr);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist_clear",
+                &op,
+                &[count.clone()],
+                &mut graph,
+                "newlist_clear_fixed",
+            )
+            .expect("newlist_clear must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(
+                    matches!(item_ty, ValueType::Int),
+                    "int-element fixed array must recover ValueType::Int (NOT Ref(None)), \
+                     got {item_ty:?}"
+                );
+                assert_eq!(array_type_id, &None);
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// End-to-end rendezvous: a minted throwaway helper graph is given the
+    /// `newlist_clear(count)` oopspec via [`CallControl::mark_oopspec`]
+    /// (the same field [`CallControl::get_oopspec`] reads at
+    /// `handle_builtin_call`), so a call to it classifies `Builtin` and
+    /// dispatches through `_handle_list_call` to `new_array_clear`.  This
+    /// locks the T2↔T3 contract: `mark_oopspec(path, "newlist_clear(count)")`
+    /// is exactly what T3 must attach to the minted `_ll_alloc_and_clear`
+    /// graph for it to lower instead of residualizing.
+    #[test]
+    fn marked_newlist_clear_oopspec_dispatches_call_to_new_array_clear() {
+        let path = crate::parse::CallPath::from_segments(["_ll_alloc_and_clear"]);
+        let target = CallTarget::function_path(["_ll_alloc_and_clear"]);
+
+        let mut cc = crate::call::CallControl::new();
+        // The spec STRING form the codewriter reader parses: bare name
+        // before `(`, so the dispatch keys on `newlist_clear`.
+        cc.mark_oopspec(path, "newlist_clear(count)".to_string());
+
+        let mut graph = FunctionGraph::new("caller");
+        let count = graph.alloc_value_var();
+        let result = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&count, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target,
+                args: vec![count.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result.clone());
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let new_array_clear = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                // The GcRef result stamps a generic OBJECTPTR (not a
+                // `"list"` struct), so the fork lands on Fallback →
+                // NewArrayClear, never NewListClear.
+                OpKind::NewArrayClear { length, .. } => Some(length.clone()),
+                _ => None,
+            })
+            .expect("marked newlist_clear must lower to new_array_clear");
+        assert_eq!(new_array_clear, count);
+    }
+
+    /// T3 end-to-end: the rtyper mints the `_ll_alloc_and_set` family (whose
+    /// clear sub-helper is named `_ll_alloc_and_clear` for the resized layout
+    /// and `_ll_fixed_alloc_and_clear` for the fixed layout), and `lib.rs`
+    /// attaches the `newlist_clear(count)` oopspec under BOTH single-segment
+    /// paths.  A `direct_call` to the resized `_ll_alloc_and_clear` funcptr
+    /// therefore resolves to that path and lowers to `new_array_clear` — this
+    /// locks that the path `lib.rs` registers is exactly the one the minted
+    /// graph's name produces.
+    #[test]
+    fn t3_ll_alloc_and_clear_oopspec_registration_lowers_to_new_array_clear() {
+        // Exactly the registration `lib.rs` performs beside the jit.* specs.
+        let mut cc = crate::call::CallControl::new();
+        cc.mark_oopspec(
+            crate::parse::CallPath::from_segments(["_ll_alloc_and_clear"]),
+            "newlist_clear(count)".to_string(),
+        );
+
+        let mut graph = FunctionGraph::new("caller");
+        let count = graph.alloc_value_var();
+        let result = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&count, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["_ll_alloc_and_clear"]),
+                args: vec![count.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result.clone());
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let lowered = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                // GcRef result → generic OBJECTPTR → Fallback → NewArrayClear.
+                OpKind::NewArrayClear { length, .. } => Some(length.clone()),
+                _ => None,
+            })
+            .expect("minted _ll_alloc_and_clear must lower to new_array_clear");
+        assert_eq!(lowered, count);
+    }
+
+    /// The fixed layout mints its clear sub-helper as `_ll_fixed_alloc_and_clear`
+    /// (per `alloc_and_set_sub_names`), so `lib.rs` must register the
+    /// `newlist_clear(count)` oopspec on that path too.  A `direct_call` to a
+    /// `_ll_fixed_alloc_and_clear` funcptr must lower to `new_array_clear`,
+    /// exactly like the resized `_ll_alloc_and_clear` — locking that both
+    /// per-layout clear names carry the spec.
+    #[test]
+    fn t3_ll_fixed_alloc_and_clear_oopspec_registration_lowers_to_new_array_clear() {
+        // Both leaf paths `lib.rs` registers beside the jit.* specs.
+        let mut cc = crate::call::CallControl::new();
+        for clear_name in ["_ll_alloc_and_clear", "_ll_fixed_alloc_and_clear"] {
+            cc.mark_oopspec(
+                crate::parse::CallPath::from_segments([clear_name]),
+                "newlist_clear(count)".to_string(),
+            );
+        }
+
+        let mut graph = FunctionGraph::new("caller");
+        let count = graph.alloc_value_var();
+        let result = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&count, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["_ll_fixed_alloc_and_clear"]),
+                args: vec![count.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result.clone());
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let lowered = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                // GcRef result → generic OBJECTPTR → Fallback → NewArrayClear.
+                OpKind::NewArrayClear { length, .. } => Some(length.clone()),
+                _ => None,
+            })
+            .expect("minted _ll_fixed_alloc_and_clear must lower to new_array_clear");
+        assert_eq!(lowered, count);
     }
 
     /// `list.int_getitem(l, i)` lowers to `getfield_gc_r(l,

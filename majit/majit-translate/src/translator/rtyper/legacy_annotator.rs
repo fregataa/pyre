@@ -287,6 +287,12 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::New { owner } => ValueType::Ref(Some(owner.clone())),
         OpKind::NewWithVtable { owner, .. } => ValueType::Ref(Some(owner.clone())),
+        // `new_array_clear` yields a `Ref` to the freshly allocated,
+        // zero-cleared items array (`Ptr(GcArray(OBJECTPTR))`).
+        OpKind::NewArrayClear { .. } => ValueType::Ref(None),
+        // `newlist_clear` yields a `Ref` to the freshly allocated
+        // resizable-list `GcStruct` header (the `"list"` struct).
+        OpKind::NewListClear { .. } => ValueType::Ref(None),
         OpKind::ArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::ArrayLen { .. } => ValueType::Int,
         OpKind::ArrayWrite { .. } => ValueType::Void,

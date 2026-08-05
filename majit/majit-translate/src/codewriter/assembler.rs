@@ -1613,6 +1613,142 @@ impl Assembler {
                 let key = format!("new/{argcodes}");
                 state.code[startposition] = self.get_opnum(&key);
             }
+            // RPython `new_array_clear(v_length, arraydescr)` — the cleared
+            // fixed-size array allocation `do_fixed_newlist_clear` emits
+            // (`jtransform.py:1858-1863`).  `bhimpl_new_array_clear`
+            // (`blackhole.py:1311-1313`, `@arguments("cpu", "i", "d",
+            // returns="r")`) gives the canonical key `new_array_clear/id>r`:
+            // length (Int) + arraydescr + ref result.  The arraydescr is the
+            // same `arraydescrof(item_ty, array_type_id, len_offset=Some(0))`
+            // shape `ArrayRead`/`ArrayWrite` mint for the length-prefixed
+            // items block.
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(length, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "new_array_clear length must be int-kind, got {kc:?}",
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.emit_ready_descr(arraydescrof(
+                    item_ty,
+                    array_type_id,
+                    Some(0),
+                    callcontrol,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let result = op
+                    .result
+                    .as_ref()
+                    .expect("new_array_clear must produce a result");
+                let (reg, kind) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert_eq!(
+                    kind, 'r',
+                    "new_array_clear result must use the ref register bank"
+                );
+                state.code.push(reg);
+                argcodes.push('>');
+                argcodes.push('r');
+                let key = format!("new_array_clear/{argcodes}");
+                state.code[startposition] = self.get_opnum(&key);
+            }
+            // `newlist_clear/idddd>r` (`handler_newlist_clear`,
+            // blackhole.rs) lowers the resizable-list allocation
+            // `do_resizable_newlist` emits (blackhole.py:1173-1180): a
+            // `list` GcStruct header wrapping a cleared items array.  The
+            // handler reads length (Int) then FOUR descriptors in this
+            // order — structdescr, lengthdescr, itemsdescr, arraydescr —
+            // then the ref result.  The four descrs must be pushed in that
+            // exact read order or the handler misreads them.  The list
+            // header (`GcStruct("list", ("length", Signed), ("items",
+            // Ptr(GcArray(ITEM))))`) is resizable and carries no vtable, so
+            // its Size descr takes vtable 0.
+            OpKind::NewListClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(length, regallocs);
+                assert_eq!(kc, 'i', "newlist_clear length must be int-kind, got {kc:?}",);
+                state.code.push(reg);
+                argcodes.push(kc);
+                // structdescr: the `list` header Size descr.  Mirror the
+                // `OpKind::New` arm — a resizable list header has no vtable.
+                let spec = bh_size_spec_from_callcontrol(
+                    callcontrol.expect("newlist_clear assembly requires a CallControl"),
+                    "list",
+                )
+                .unwrap_or_else(|| {
+                    panic!("newlist_clear: no struct layout registered for owner \"list\"")
+                });
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
+                    size: spec.size,
+                    type_id: spec.type_id,
+                    vtable: 0,
+                    owner: String::new(),
+                    all_fielddescrs: spec.all_fielddescrs,
+                    is_gc_managed: spec.is_gc_managed,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // lengthdescr: fielddescr for `list.length` (Signed word).
+                // Mirror the `FieldWrite` arm's fielddescr interning — the
+                // local free `fielddescrof` builds the `BhDescr::Field`,
+                // resolving the offset off the registered `list` layout.
+                let length_field =
+                    crate::model::FieldDescriptor::new("length", Some("list".to_string()));
+                let descr_idx = self.emit_ready_descr(fielddescrof(
+                    &length_field,
+                    &crate::model::ValueType::Int,
+                    callcontrol,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // itemsdescr: fielddescr for `list.items` (Ptr to array).
+                let items_field =
+                    crate::model::FieldDescriptor::new("items", Some("list".to_string()));
+                let descr_idx = self.emit_ready_descr(fielddescrof(
+                    &items_field,
+                    &crate::model::ValueType::Ref(None),
+                    callcontrol,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // arraydescr: the length-prefixed items block, identical to
+                // the `NewArrayClear` arm.
+                let descr_idx = self.emit_ready_descr(arraydescrof(
+                    item_ty,
+                    array_type_id,
+                    Some(0),
+                    callcontrol,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let result = op
+                    .result
+                    .as_ref()
+                    .expect("newlist_clear must produce a result");
+                let (reg, kind) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert_eq!(
+                    kind, 'r',
+                    "newlist_clear result must use the ref register bank"
+                );
+                state.code.push(reg);
+                argcodes.push('>');
+                argcodes.push('r');
+                let key = format!("newlist_clear/{argcodes}");
+                state.code[startposition] = self.get_opnum(&key);
+            }
             // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
             // tracer oracle (`box_trace.rs trace_box_float`): a `new_with_vtable`
             // carrying ONLY a size descriptor and a fresh ref-kind result, no
@@ -2640,6 +2776,8 @@ impl Assembler {
                 OpKind::GetSlice { .. } => "GetSlice",
                 OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
+                OpKind::NewArrayClear { .. } => "NewArrayClear",
+                OpKind::NewListClear { .. } => "NewListClear",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
             }
@@ -4171,6 +4309,13 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
         OpKind::New { .. } => "new".into(),
         OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
+        // `NewArrayClear` (`new_array_clear/id>r`) and `NewListClear`
+        // (`newlist_clear/idddd>r`) both carry descriptor operands and are
+        // encoded by their dedicated `encode_op` arms, never the
+        // descriptor-less default path that calls this helper — these arms
+        // exist only to keep the opname map exhaustive.
+        OpKind::NewArrayClear { .. } => "new_array_clear".into(),
+        OpKind::NewListClear { .. } => "newlist_clear".into(),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {
             format!("getarrayitem_gc_{}", value_type_to_kind(item_ty))
@@ -5264,6 +5409,66 @@ mod tests {
         assert_eq!(op_kind_to_opname(&header), "loop_header");
     }
 
+    /// `OpKind::NewListClear` (`opimpl_newlist_clear`, pyjitpl.py:792-798)
+    /// carries the same `{length, item_ty, array_type_id}` shape as
+    /// `NewArrayClear`.  Its length operand must survive the inline var
+    /// remap while the descriptor fields (`item_ty`/`array_type_id`) copy
+    /// through unchanged, and it must map to the opname `newlist_clear`.
+    #[test]
+    fn newlist_clear_survives_remap_and_names() {
+        use crate::flowspace::model::Variable;
+        use crate::model::{OpKind, ValueType};
+
+        let length = Variable::new();
+        let remapped_length = Variable::new();
+        // The remapped length must be a *distinct* SSA var so the assert
+        // proves the length field was rewritten, not merely preserved.
+        assert_ne!(length, remapped_length);
+
+        // `array_type_id` is the ITEMS ARRAY identity (`cpu.arraydescrof(
+        // ARRAY)`), not the enclosing struct name — use a plausible array id.
+        let kind = OpKind::NewListClear {
+            length: length.clone(),
+            item_ty: ValueType::Ref(None),
+            array_type_id: Some("list_items".to_string()),
+        };
+
+        // Run it through the inline var remap: length is rewritten via the
+        // closure, the descriptor fields clone through unchanged.
+        let remapped_length_c = remapped_length.clone();
+        let length_c = length.clone();
+        let remap = move |v: &Variable| {
+            if *v == length_c {
+                remapped_length_c.clone()
+            } else {
+                v.clone()
+            }
+        };
+        let remapped = crate::inline::remap_op_kind(&kind, &remap);
+        match &remapped {
+            OpKind::NewListClear {
+                length: l,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(*l, remapped_length, "length must be rewritten by remap");
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(array_type_id.as_deref(), Some("list_items"));
+            }
+            other => panic!("expected NewListClear, got {other:?}"),
+        }
+
+        // Only the length is an SSA operand; the descrs are not values.
+        let refs = crate::inline::op_variable_refs(&kind);
+        assert_eq!(refs, vec![length.clone()]);
+
+        // Allocation is never pure — CSE must not coalesce two of them.
+        assert!(!crate::inline::is_pure_op(&kind));
+
+        // opname map: `newlist_clear`.
+        assert_eq!(op_kind_to_opname(&kind), "newlist_clear");
+    }
+
     #[test]
     fn assemble_basic() {
         let mut flat = SSARepr {
@@ -5571,6 +5776,120 @@ mod tests {
             "expected Field descrs for `value` + `mutate_value`, got {:?}",
             field_descr_names
         );
+    }
+
+    /// `OpKind::NewListClear` assembles to the wired `newlist_clear/idddd>r`
+    /// opcode: length (Int) + four descriptors (structdescr, lengthdescr,
+    /// itemsdescr, arraydescr) + ref result.  The `list` GcStruct header
+    /// layout (`length@0`, `items@8`) is registered on the CallControl so
+    /// the struct/field descrs resolve, and the four descr slots must be
+    /// interned in exactly that read order (`handler_newlist_clear`,
+    /// blackhole.rs).
+    #[test]
+    fn assembles_newlist_clear_with_four_descrs_in_read_order() {
+        use crate::call::CallControl;
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        // Mirror `rtyper_synthesised_list_struct_resolves_its_field_descrs`
+        // (call.rs): register the rtyper-synthesised `GcStruct("list",
+        // ("length", Signed), ("items", Ptr(GcArray(ITEM))))` shape so the
+        // structdescr and the `length`/`items` fielddescrs resolve.
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "list".to_string(),
+            vec![
+                ("length".to_string(), "i64".to_string()),
+                ("items".to_string(), "&[i64]".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+
+        let mut graph = FunctionGraph::new("newlist_clear_graph");
+        let length_var = push_input_var(&mut graph, "n", ValueType::Int);
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::NewListClear {
+                    length: length_var.clone(),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("list_items".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(
+            &length_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &result_var,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut rewritten = transformer.transform(&graph).graph;
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+
+        // The key must be exactly `newlist_clear/idddd>r` — four `d` descr
+        // slots in the length/struct-length-items-array order.  Any drift
+        // (wrong descr count) would mint a different dynamic opname.
+        assert!(
+            asm.insns.contains_key("newlist_clear/idddd>r"),
+            "expected key newlist_clear/idddd>r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+
+        // Four descrs interned in read order: Size (struct) → Field
+        // (length) → Field (items) → Array (items block).
+        let descrs = asm.snapshot_descrs();
+        let list_size = descrs.iter().position(
+            |d| matches!(d, crate::jitcode::BhDescr::Size { vtable, .. } if *vtable == 0),
+        );
+        assert!(
+            list_size.is_some(),
+            "expected a vtable-0 Size descr for the list header, got {descrs:?}"
+        );
+        let length_pos = descrs.iter().position(
+            |d| matches!(d, crate::jitcode::BhDescr::Field { name, .. } if name == "length"),
+        );
+        let items_pos = descrs.iter().position(
+            |d| matches!(d, crate::jitcode::BhDescr::Field { name, .. } if name == "items"),
+        );
+        let array_pos = descrs
+            .iter()
+            .position(|d| matches!(d, crate::jitcode::BhDescr::Array { .. }));
+        let (length_pos, items_pos, array_pos) = (
+            length_pos.expect("length fielddescr interned"),
+            items_pos.expect("items fielddescr interned"),
+            array_pos.expect("array descr interned"),
+        );
+        assert!(
+            list_size.unwrap() < length_pos && length_pos < items_pos && items_pos < array_pos,
+            "descrs must intern in struct/length/items/array order, got {descrs:?}"
+        );
+
+        // The `list` header layout resolved off the registered struct:
+        // length@0 (Signed word) and items@8 (pointer to the array block).
+        let field_at = |name: &str| {
+            descrs.iter().find_map(|d| match d {
+                crate::jitcode::BhDescr::Field {
+                    name: n, offset, ..
+                } if n == name => Some(*offset),
+                _ => None,
+            })
+        };
+        assert_eq!(field_at("length"), Some(0), "length is the first word");
+        assert_eq!(field_at("items"), Some(8), "items follows the length word");
     }
 
     #[test]

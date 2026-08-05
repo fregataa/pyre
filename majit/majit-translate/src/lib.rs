@@ -812,7 +812,7 @@ fn analyze_pipeline_from_module_paths(
     // `scripts/extract-llbc.py`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
     mark_phase!("known_statics + struct_field_attrs populated");
-    let program = build_semantic_program_via_active_frontend(
+    let mut program = build_semantic_program_via_active_frontend(
         module_paths,
         static_addrs,
         explicit_llbc_paths,
@@ -874,6 +874,36 @@ fn analyze_pipeline_from_module_paths(
             program.exact_layouts.len(),
         )
     });
+    // The rtyper synthesises a resizable-list `GcStruct("list", ("length",
+    // Signed), ("items", Ptr(GcArray(ITEM))), hints={'list': True})`
+    // (`translator/rtyper/rlist.rs:1112-1124`).  Because it is synthesised by
+    // the rtyper — not a Rust source type Charon extracts — it never appears
+    // in `program.struct_fields`, so `fielddescrof`/`compute_struct_size`
+    // return None/0 for owner "list" and any `new(descr)` keyed on it would
+    // trip the `bh_size_spec_from_callcontrol().unwrap_or_else(panic!)` in
+    // `codewriter/assembler.rs:1595`.  Register the {length, items} shape here,
+    // before both the `set_struct_fields` snapshot (:1076 below) and the
+    // `struct_layouts` loop (:1140 below), so both see it.  Offsets accumulate
+    // by field order via `get_type_flag`: `i64`→(Signed,8) and a leading-`&`
+    // spelling→(Pointer,Ref,8), giving length@0, items@8, struct size 16 — the
+    // natural word-sized GcStruct layout the backend's `build_ll_newlist`
+    // malloc uses (length-first, items-second, both word-sized;
+    // `rlist.rs:3444-3479`).  `.entry().or_insert_with` leaves a real "list"
+    // entry untouched if one ever exists.  The `items` type is a bare pointer
+    // spelling: the field only has to classify as `(Pointer, Ref, word)`, and
+    // the real element type is inert here — it lives on the op's `item_ty`
+    // (the `new_array_clear` / `newlist_clear` arraydescr), never in this
+    // struct layout, since the resized list header is element-uniform.
+    program
+        .struct_fields
+        .fields
+        .entry("list".to_string())
+        .or_insert_with(|| {
+            vec![
+                ("length".to_string(), "i64".to_string()),
+                ("items".to_string(), "&()".to_string()),
+            ]
+        });
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     // `(trait_leaf, trait_qualified, method_name, owner, return_type,
@@ -1803,6 +1833,23 @@ fn analyze_pipeline_from_module_paths(
         ] {
             call_control.mark_oopspec(path, spec.to_string());
         }
+    }
+    // rlist.py:522 — `@jit.oopspec("newlist_clear(count)")` on
+    // `_ll_alloc_and_clear`.  The helper graph is minted by the rtyper
+    // (`rtype_alloc_and_set`), so there is no source-level `#[oopspec]`
+    // attribute for the walker above to harvest.  Attach the spec here,
+    // keyed on the minted graph's NAME — the codewriter derives the
+    // CallPath from the funcptr's graph name (`target_to_path`), so a
+    // `direct_call` to the clear helper lowers to `new_array_clear`
+    // instead of residualizing.  `alloc_and_set_sub_names` mints a
+    // per-layout clear helper (`_ll_alloc_and_clear` resized,
+    // `_ll_fixed_alloc_and_clear` fixed) so the `(name, args, ret)` helper
+    // cache stays disjoint; both names must carry the spec.
+    for clear_name in ["_ll_alloc_and_clear", "_ll_fixed_alloc_and_clear"] {
+        call_control.mark_oopspec(
+            parse::CallPath::from_segments([clear_name]),
+            "newlist_clear(count)".to_string(),
+        );
     }
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
