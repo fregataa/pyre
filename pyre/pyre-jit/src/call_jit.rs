@@ -3222,7 +3222,28 @@ pub fn trace_and_compile_from_bridge(
         return BridgeResolution::ResumeBlackhole;
     };
     let is_multiframe_resume = num_resume_frames > 1;
-    frame.set_last_instr_from_next_instr(resume_pc);
+    // `resume_pc` addresses the INNERMOST resumed section, so for a
+    // multi-frame guard it is a pc in an inlined callee's own code object.
+    // It only addresses THIS frame while that section belongs to this
+    // frame's code — the same condition the paired valuestackdepth
+    // correction already applies before handing the coordinate back.
+    // The routing below is meant to keep such a resume off the live frame,
+    // but every arm after this point can still return `ResumeBlackhole`, and
+    // the blackhole itself refuses a jitcode carrying an abort opcode or a pc
+    // whose liveness it cannot decode. On that path the interpreter resumes
+    // this frame, so a foreign pc left in `last_instr` would step a code
+    // object the frame does not run. Keep the vable-derived position instead.
+    let frame_code = jit_state_local.pycode_as_usize();
+    let foreign_innermost =
+        is_multiframe_resume && resume_coords.last().map(|&(code, _)| code) != Some(frame_code);
+    if foreign_innermost {
+        pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+            frame_code,
+            "Resume::ForeignInnermostLastInstr",
+        );
+    } else {
+        frame.set_last_instr_from_next_instr(resume_pc);
+    }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
@@ -4925,6 +4946,57 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
                     frame.descr_repr(),
                 );
             }
+        }
+    }
+    // A materialized bound Method normally reaches the generic callable
+    // dispatcher, which unwraps it, allocates a receiver-prefixed argument
+    // vector, and dispatches the underlying Function a second time.  The
+    // method fields are immutable, so an exact fixed-arity BuiltinCode can
+    // take the same gateway call directly.  Keep every signature-dependent
+    // shape on the generic path: only a natural arity in the fixed range with
+    // an exact argument count is equivalent to the positional fast path.
+    let rooted_callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let rooted_null_or_self = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let bound_builtin = unsafe {
+        if !rooted_null_or_self.is_null() && pyre_interpreter::is_function(rooted_callable) {
+            Some((rooted_callable, rooted_null_or_self))
+        } else if rooted_null_or_self.is_null() && pyre_object::is_method(rooted_callable) {
+            let function = pyre_object::w_method_get_func(rooted_callable);
+            let receiver = pyre_object::w_method_get_self(rooted_callable);
+            (!function.is_null() && !receiver.is_null()).then_some((function, receiver))
+        } else {
+            None
+        }
+    };
+    if let Some((function, receiver)) = bound_builtin {
+        let code = unsafe { pyre_interpreter::getcode(function) } as PyObjectRef;
+        let positional_count = args.len() + 1;
+        let exact_fixed_arity = !code.is_null()
+            && unsafe { pyre_interpreter::is_builtin_code(code) }
+            && positional_count <= 4
+            && unsafe { pyre_interpreter::builtin_code_get_fast_natural_arity(code) as usize }
+                == positional_count;
+        if exact_fixed_arity {
+            pyre_object::gc_roots::pin_root(code);
+            pyre_object::gc_roots::pin_root(receiver);
+            let code_slot = root_base + 2 + args.len();
+            let receiver_slot = code_slot + 1;
+            let mut call_args = [pyre_object::PY_NULL; 4];
+            call_args[0] = pyre_object::gc_roots::shadow_stack_get(receiver_slot);
+            for (index, slot) in call_args[1..positional_count].iter_mut().enumerate() {
+                *slot = pyre_object::gc_roots::shadow_stack_get(root_base + 2 + index);
+            }
+            let code = pyre_object::gc_roots::shadow_stack_get(code_slot);
+            return match unsafe {
+                pyre_interpreter::builtin_code_call(code, &call_args[..positional_count])
+            } {
+                Ok(result) if !result.is_null() => result as i64,
+                Ok(_) => 0,
+                Err(mut err) => {
+                    publish_residual_call_exception(err.to_exc_object() as i64);
+                    0
+                }
+            };
         }
     }
     // llmodel.py:822 bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
