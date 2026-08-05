@@ -24,6 +24,10 @@ name: codex-review-run
 #   - the report is scrubbed of the credential before it is posted;
 #   - fork PRs wait for a maintainer to approve the `codex-review` environment.
 #
+# A pending commit status is announced outside the approval gate because a
+# `workflow_run` run is invisible on the PR. Without it, a fork PR's wait for
+# a maintainer to approve the environment would be silent.
+#
 # This workflow only fires once it is on the default branch — `workflow_run`
 # never triggers from a PR branch.
 
@@ -47,6 +51,34 @@ permissions:
   statuses: write
 
 jobs:
+  announce:
+    name: Announce the queued review
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Announce the pending review on the PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IS_FORK: ${{ github.event.workflow_run.head_repository.full_name != github.repository }}
+        with:
+          script: |
+            const isFork = process.env.IS_FORK === 'true';
+            const description = isFork
+              ? 'Waiting for a maintainer to approve the codex-review environment — Review deployments on this run'
+              : 'Queued';
+            // This context must stay identical to the review job's context, or
+            // the PR would show two statuses instead of one updated status.
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'pending',
+              context: 'Codex parity review',
+              target_url: process.env.RUN_URL,
+              description,
+            });
+
   approve:
     name: Approve fork review
     # A fork PR is code nobody has read yet. Gate it on a maintainer approving
@@ -410,13 +442,14 @@ jobs:
             }
 
       - name: Report the outcome as a commit status
-        if: ${{ always() && steps.pr.outputs.skip == 'false' }}
+        if: ${{ always() }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           JOB_STATUS: ${{ job.status }}
           REVIEWED: ${{ steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false' }}
+          SKIP: ${{ steps.pr.outputs.skip }}
         with:
           script: |
             // `workflow_run` runs are not attached to the PR's check suite, so
@@ -424,13 +457,23 @@ jobs:
             // skipped review previously passed for green.
             const ok = process.env.JOB_STATUS === 'success';
             const reviewed = process.env.REVIEWED === 'true';
+            const skipped = process.env.SKIP === 'true';
+            const state = ok ? 'success' : 'failure';
+            let description;
+            if (!ok) {
+              description = 'The review job failed; see the logs';
+            } else if (skipped) {
+              description = 'No PR metadata for this run; there was nothing to review';
+            } else if (reviewed) {
+              description = 'Review posted as a PR comment';
+            } else {
+              description = 'Nothing to review — see the PR comment';
+            }
             await github.rest.repos.createCommitStatus({
               ...context.repo,
               sha: process.env.HEAD_SHA,
-              state: ok ? 'success' : 'failure',
+              state,
               context: 'Codex parity review',
               target_url: process.env.RUN_URL,
-              description: ok
-                ? (reviewed ? 'Review posted as a PR comment' : 'Nothing to review — see the PR comment')
-                : 'The review job failed; see the logs',
+              description,
             });

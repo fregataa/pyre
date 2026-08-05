@@ -1708,6 +1708,10 @@ pub struct StoreAttrAdd {
     /// `new_map.storageindex`, which is also `map.storage_needed()`: the
     /// transition appends exactly one slot, and the value lands in it.
     pub storageindex: usize,
+    /// `Some` for a fresh-slot unboxed transition: the new slot holds a
+    /// one-element longlong list. Only `Int` today; a float pick stays on
+    /// the residual.
+    pub unbox_type: Option<UnboxType>,
 }
 
 /// Resolve the `map -> PlainAttribute` transition that a STORE_ATTR adding a
@@ -1720,10 +1724,12 @@ pub struct StoreAttrAdd {
 /// Declines anything the plain grow-by-one shape does not cover, so the caller
 /// can fall back to the general residual: an attribute already in the map (the
 /// [`store_attr_boxed_fast_path`] / [`store_attr_unboxed_fast_path`] cases), a
-/// value that would take an unboxed slot, a terminator that routes the write
-/// elsewhere, the `_reorder_and_add` case (mapdict.py:204-258), the
-/// `LIMIT_MAP_ATTRIBUTES` devolve, and a storage block the collector does not
-/// own (whose replacement the interpreter would have to free).
+/// value that would take an unboxed float slot or a shared unboxed slot, a
+/// terminator that routes the write elsewhere, the `_reorder_and_add` case
+/// (mapdict.py:204-258), the `LIMIT_MAP_ATTRIBUTES` devolve, and a storage
+/// block the collector does not own (whose replacement the interpreter would
+/// have to free).  A fresh-slot unboxed int add resolves with `unbox_type =
+/// Some(Int)` and grows storage by one exactly like the boxed add.
 ///
 /// Resolving interns the transition through `_find_branch_to_move_into`, which
 /// `add_attr` would do anyway on this very store; it is idempotent and the
@@ -1781,9 +1787,10 @@ pub unsafe fn store_attr_add_fast_path(
     if attrkind == DICT && term.kind != TerminatorKind::Dict {
         return None;
     }
-    // Only the boxed shape is emittable: an unboxed slot holds an erased
-    // longlong list the trace has no way to build (mapdict.py:629-646).
-    if unsafe { pick_unbox_type(map, w_value) }.is_some() {
+    // The int unboxed shape is emittable — the trace builds the same int
+    // GcArray `erase_unboxed` allocates; a float pick stays on the residual.
+    let unbox = unsafe { pick_unbox_type(map, w_value) };
+    if unbox == Some(UnboxType::Float) {
         return None;
     }
     // The emitted transition copies the live slots into the wider block with
@@ -1793,18 +1800,32 @@ pub unsafe fn store_attr_add_fast_path(
     // mapdict.py:170-193 — `number_to_readd != 0` is `_reorder_and_add`, which
     // pops and re-adds intermediate attributes.
     let (number_to_readd, holder) =
-        unsafe { find_branch_to_move_into(map, attrname, attrkind, None) };
+        unsafe { find_branch_to_move_into(map, attrname, attrkind, unbox) };
     if number_to_readd != 0 {
         return None;
     }
-    let new_map = unsafe { holder_pick_attr(holder, None) };
+    let new_map = unsafe { holder_pick_attr(holder, unbox) };
     if !unsafe { (*new_map).is_plain() } {
         return None;
     }
     let p = unsafe { (*new_map).as_plain() };
-    if p.unboxed.is_some() || !std::ptr::eq(p.back, map) {
+    if !std::ptr::eq(p.back, map) {
         return None;
     }
+    let unbox_type = match &p.unboxed {
+        // A cached boxed transition serves an unboxable value too; the write
+        // stays boxed.
+        None => None,
+        // Only the fresh-slot shape grows storage by one; a shared-slot add
+        // rewrites an existing slot's list in place.
+        Some(u) => {
+            if !u.firstunwrapped || u.listindex != 0 {
+                return None;
+            }
+            debug_assert_eq!(Some(u.typ), unbox);
+            Some(u.typ)
+        }
+    };
     // mapdict.py:317-323 — a DICT add that reaches the attribute limit devolves
     // the instance's `__dict__` into a text-strategy dict.
     if attrkind == DICT && unsafe { (*new_map).num_attributes() } >= LIMIT_MAP_ATTRIBUTES {
@@ -1840,6 +1861,7 @@ pub unsafe fn store_attr_add_fast_path(
         map,
         new_map,
         storageindex: p.storageindex,
+        unbox_type,
     })
 }
 
@@ -1860,7 +1882,16 @@ pub unsafe fn store_attr_add_commit(
     debug_assert!(std::ptr::eq(inst._get_mapdict_map(), resolved.map));
     // mapdict.py:449-459 with `storage_needed() > _mapdict_storage_length()`,
     // which `store_attr_add_fast_path` proved by construction.
-    inst._set_mapdict_increase_storage1(resolved.new_map, w_value);
+    match resolved.unbox_type {
+        None => inst._set_mapdict_increase_storage1(resolved.new_map, w_value),
+        // `switch_map_and_write_increase_storage1`'s `firstunwrapped` arm: a
+        // fresh one-element longlong list occupies the new slot.
+        Some(typ) => {
+            let val = unsafe { unbox_value(typ, w_value) };
+            let unboxed = erase_unboxed(&[val]);
+            inst._set_mapdict_increase_storage1(resolved.new_map, unboxed);
+        }
+    }
 }
 
 /// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` for a
