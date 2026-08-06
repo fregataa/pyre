@@ -83,12 +83,8 @@ interact [--tmp DIR] [--lib DIR] [--timeout SECS] [--heapsize N] [--log FILE] [-
 /// Drain the parser's remaining raw arguments to become `sys.argv[1:]`.
 /// `-c`, `-m`, and a script path each terminate option parsing, so anything
 /// after them belongs to the program rather than the launcher.
-fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<String>, lexopt::Error> {
-    let mut rest = Vec::new();
-    for raw in parser.raw_args()? {
-        rest.push(raw.string()?);
-    }
-    Ok(rest)
+fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<std::ffi::OsString>, lexopt::Error> {
+    Ok(parser.raw_args()?.collect())
 }
 
 /// Emit the `preconfig_init_utf8_mode` fatal error for an invalid PYTHONUTF8 /
@@ -110,7 +106,9 @@ fn finalize_flags(flags: LaunchFlags) -> LaunchFlags {
     }
 }
 
-fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), lexopt::Error> {
+fn parse_args(
+    binary_name: &str,
+) -> Result<(RunMode, LaunchFlags, Vec<std::ffi::OsString>), lexopt::Error> {
     let mut parser = lexopt::Parser::from_env();
     let mut flags = LaunchFlags::default();
 
@@ -141,12 +139,16 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                 flags.safe_path = true;
             }
             Short('X') => {
-                let option = parser.value()?.string()?;
-                match option.as_str() {
-                    "dev" => flags.dev_mode = true,
-                    "utf8" | "utf8=1" => flags.utf8_mode = Some(1),
-                    "utf8=0" => flags.utf8_mode = Some(0),
-                    _ if option.starts_with("utf8=") => {
+                // The value reaches `sys._xoptions` in the host's own
+                // spelling, so it is kept as an `OsString`; only the options
+                // pyre acts on are matched, and every one of those is ASCII,
+                // so a value with no UTF-8 form simply cannot be one of them.
+                let option: std::ffi::OsString = parser.value()?;
+                match option.to_str() {
+                    Some("dev") => flags.dev_mode = true,
+                    Some("utf8") | Some("utf8=1") => flags.utf8_mode = Some(1),
+                    Some("utf8=0") => flags.utf8_mode = Some(0),
+                    Some(value) if value.starts_with("utf8=") => {
                         fatal_utf8_config_error("invalid -X utf8 option value")
                     }
                     _ => {}
@@ -158,7 +160,7 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
             // the option/value in launcher parsing lets stdlib subprocesses
             // reach their command or module.
             Short('W') => {
-                flags.warnoptions.push(parser.value()?.string()?);
+                flags.warnoptions.push(parser.value()?);
             }
             // `-O` / `-OO` raise the optimization level; each occurrence counts
             // (app_main.py `optimize`). PYTHONOPTIMIZE folds in during finalize.
@@ -285,7 +287,14 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
             Long("verbose") => verbose = true,
             Value(exe) => {
                 let exe = exe.string()?;
-                let args = drain_args(parser)?;
+                // The controller's arguments are its own, not a Python
+                // program's: they are rendered into the child's command line
+                // as text, so one with no UTF-8 form is reported here rather
+                // than carried the way `sys.argv` carries it.
+                let args = drain_args(parser)?
+                    .into_iter()
+                    .map(|arg| arg.into_string().map_err(lexopt::Error::NonUnicodeValue))
+                    .collect::<Result<Vec<String>, _>>()?;
                 return Ok(RunMode::Interact {
                     exe,
                     args,
@@ -492,7 +501,7 @@ fn real_main(binary_name: &str) {
     // pypy/interpreter/app_main.py `entry_point`: preserve the executable and
     // every original launcher argument before command-line parsing rewrites
     // them into the run mode and `sys.argv`.
-    importing::set_sys_orig_argv(std::env::args().collect());
+    importing::set_sys_orig_argv(std::env::args_os().collect());
     let (mode, flags, args) = match parse_args(binary_name) {
         Ok(v) => v,
         Err(e) => {
@@ -568,7 +577,7 @@ fn real_main(binary_name: &str) {
             // origins against.
             let cwd = sys_path_cwd();
             importing::init_sys_path(&cwd, "");
-            let mut argv = vec!["-c".to_string()];
+            let mut argv = vec![std::ffi::OsString::from("-c")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
             run_source(&cmd, Mode::Exec, "<string>", no_site);
@@ -581,7 +590,7 @@ fn real_main(binary_name: &str) {
             // module's resolved origin via `_run_module_as_main`).
             let cwd = sys_path_cwd();
             importing::init_sys_path(&cwd, &cwd.to_string_lossy());
-            let mut argv = vec![module.clone()];
+            let mut argv = vec![std::ffi::OsString::from(&module)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
             run_module(&module, no_site);
@@ -632,7 +641,7 @@ fn real_main(binary_name: &str) {
             };
             importing::init_sys_path(&script_dir, &script_dir.to_string_lossy());
             // sys.argv[0] is the script path; remaining values go to argv[1:].
-            let mut argv = vec![path.clone()];
+            let mut argv = vec![std::ffi::OsString::from(&path)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
             // CPython compiles a script with the same absolute path exposed
@@ -658,7 +667,7 @@ fn real_main(binary_name: &str) {
             importing::init_sys_path(&cwd, "");
             // `sys.argv` is `['']` with no script argument and `['-', …]` for
             // an explicit dash.
-            let mut argv = vec![argv0];
+            let mut argv = vec![std::ffi::OsString::from(argv0)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
             if stdin_is_interactive(inspect) {
