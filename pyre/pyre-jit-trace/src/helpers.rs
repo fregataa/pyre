@@ -316,6 +316,27 @@ pub extern "C" fn jit_mapdict_unboxed_read_raw(
     }
 }
 
+/// `normalize_hash_digest` as a JIT residual: normalize a boxed `__hash__`
+/// digest to the machine hash, raising for a non-integer.  On error the
+/// exception enters both channels for the trailing `GuardNoException`.
+pub extern "C" fn jit_hash_normalize_digest(digest: i64) -> i64 {
+    match pyre_interpreter::builtins::normalize_hash_digest(digest as PyObjectRef) {
+        Ok(h) => h,
+        Err(mut err) => {
+            let exc = err.to_exc_object() as i64;
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc));
+            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+            majit_backend_cranelift::jit_exc_raise(exc);
+            #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
+            majit_backend_dynasm::jit_exc_raise(exc);
+            #[cfg(target_arch = "wasm32")]
+            majit_backend_wasm::jit_exc_raise(exc);
+            let _ = exc;
+            0
+        }
+    }
+}
+
 /// Float-bank counterpart of [`jit_mapdict_unboxed_read_raw`].  Unboxed float
 /// storage already contains the value's IEEE-754 bit pattern, so this helper
 /// performs the raw read and reconstructs the float (mapdict.py:577-584).

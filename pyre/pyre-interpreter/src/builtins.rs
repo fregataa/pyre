@@ -11765,6 +11765,12 @@ fn hash_call_normalize(
     w_type: PyObjectRef,
 ) -> Result<i64, crate::PyError> {
     let r = unsafe { crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]) }?;
+    normalize_hash_digest(r)
+}
+
+/// The result arms of [`hash_call_normalize`], shared with the JIT's digest
+/// residual: accept `bool`/`int`/`long`, reject other types, map `-1` to `-2`.
+pub fn normalize_hash_digest(r: PyObjectRef) -> Result<i64, crate::PyError> {
     let h = unsafe {
         if is_bool(r) {
             pyre_object::w_bool_get_value(r) as i64
