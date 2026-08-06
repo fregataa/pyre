@@ -3198,15 +3198,44 @@ pub(crate) fn note_root_trace_too_long(
     }
 }
 
+/// Stage `reason` as the abort the walker is returning, so the single
+/// `aborted_tracing` that follows counts it under that counter instead of the
+/// `Generic` catch-all.
+///
+/// Naming the reason is pure accounting: the abort itself travels in the
+/// `DispatchError` the caller returns and does not consult this slot. A
+/// skeleton walk has no driver to stage onto, so it skips the note instead of
+/// panicking in `callbacks::get`.
+fn stage_walker_abort_reason(reason: i32) {
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return;
+    };
+    driver.meta_interp_mut().stage_abort_reason(reason);
+}
+
 /// Name `Counters.ABORT_FORCE_QUASIIMMUT` as the reason for the abort the
 /// walker is returning (`pyjitpl.py:1116`), so the single `aborted_tracing`
 /// that follows counts it under `profiler.abort_force_quasiimmut` instead of
 /// the `Generic` catch-all.
 pub(crate) fn note_force_quasi_immut_abort() {
-    let (driver, _) = crate::driver::driver_pair();
-    driver
-        .meta_interp_mut()
-        .stage_abort_reason(majit_metainterp::counters::ABORT_FORCE_QUASIIMMUT);
+    stage_walker_abort_reason(majit_metainterp::counters::ABORT_FORCE_QUASIIMMUT);
+}
+
+/// Name `Counters.ABORT_ESCAPE` as the reason for the abort the walker returns
+/// when `tracing_after_residual_call` reports the virtualizable was forced
+/// (`pyjitpl.py:3389-3390` raises `SwitchToBlackhole(Counters.ABORT_ESCAPE)`
+/// there).  Without this the reason ladder falls through to
+/// `AbortReason::Generic`, whose `as_int()` is `ABORT_BRIDGE` — so the escape
+/// lands in the bucket `jitprof.rs ABORT_COUNTER_KINDS` labels
+/// `bridge_or_generic`, and the tally reads as bridge activity that never
+/// happened.
+///
+/// `raising_exception` does not travel this channel: pyre computes it from the
+/// residual's own `exec_result` (`residual_call.rs`), where the escape's `Err`
+/// arm already sets it, so upstream's hardcoded `True` needs no counterpart
+/// here.
+pub(crate) fn note_vable_escape_abort() {
+    stage_walker_abort_reason(majit_metainterp::counters::ABORT_ESCAPE);
 }
 
 pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {

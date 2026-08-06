@@ -3225,6 +3225,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             {
                 (cb.drain_backend_jit_exc)();
             }
+            crate::state::note_vable_escape_abort();
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }
@@ -4966,6 +4967,23 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
+    // frame: model `fast2locals`' fastlocals reads as `getarrayitem_vable_r`
+    // plus a non-forcing dict-build chain — the shape the meta-tracer produces
+    // upstream, where `pyframe.py:539 fast2locals` is `@jit.unroll_safe` and
+    // therefore looked into.  This arm runs BEFORE
+    // `try_execute_residual_call_via_executor` arms the vable token protocol,
+    // which is the point: the opaque residual is what turns the locals-read
+    // barrier into `VableEscapedDuringResidualCall`.  Any non-matching shape
+    // falls through to the generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_locals(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
