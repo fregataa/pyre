@@ -5071,6 +5071,205 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     Ok(Some(inlined))
 }
 
+/// Machine-int digest of a `__hash__` result: a tagged immediate or an exact
+/// heap `W_IntObject`; bool/long take `hash_call_normalize`'s other arms.
+fn walker_machine_int_value(obj: pyre_object::PyObjectRef) -> Option<i64> {
+    if obj.is_null() {
+        return None;
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return Some(pyre_object::tagged_int::untag_int(obj));
+    }
+    unsafe {
+        if pyre_object::is_int(obj) && !pyre_object::is_bool(obj) && !pyre_object::is_long(obj) {
+            Some(pyre_object::w_int_get_value(obj))
+        } else {
+            None
+        }
+    }
+}
+
+/// `hash(x)` over a user instance — the hash sibling of
+/// [`try_walker_inline_exception_string_override`]: pin the receiver class,
+/// inline the resolved `__hash__` body in place of the opaque call residual,
+/// then emit `hash_call_normalize`'s digest check and `-1 -> -2` map as int
+/// ops.  Declines to the residual before any IR is emitted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let Some(concrete_callable) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if walker_concrete_ref_object(ctx, r_args[1]).is_some() {
+        return Ok(None);
+    }
+    let Some(concrete_receiver) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return Ok(None);
+    };
+    if !pyre_interpreter::builtins::is_builtin_hash_function(concrete_callable) {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_instance(concrete_receiver) } {
+        return Ok(None);
+    }
+    let w_type = unsafe { pyre_object::w_instance_get_type(concrete_receiver) };
+    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        return Ok(None);
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+    let Some(method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__hash__") })
+    else {
+        return Ok(None);
+    };
+    // `__hash__ = None` raises in the residual; a non-Python `__hash__`
+    // has no body to walk.
+    if unsafe { pyre_object::is_none(method) } {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+    if crate::state::sub_jitcode_body_for_code(w_code).is_none()
+        || crate::state::sub_jitcode_descr_pool_for_code(w_code).is_none()
+    {
+        return Ok(None);
+    }
+    // No pre-sampling: `hash_w` calls `__hash__` exactly once, so the digest
+    // is checked after the single authoritative sub-walk run instead.
+    let effect_free = body_facts.exc_override_sample_safe;
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_receiver),
+    ];
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        r_args[0],
+        concrete_callable,
+        arg_concretes,
+        vec![r_args[2]],
+        vec![ConcreteValue::Ref(concrete_receiver)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((r_args[2], concrete_receiver, w_type, version_tag)),
+        None,
+        false,
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        let result = ctx.registers_r[dst];
+        let concrete_result = walker_concrete_ref_object(ctx, result);
+        let live = concrete_result.and_then(walker_machine_int_value);
+        // The inline unbox is guard-free only against a known-class or
+        // trace-built box; a live post-body guard on a side-effecting body
+        // would re-run its effects on failure, so those shapes — and every
+        // bool/long digest — take the fallible normalize residual instead.
+        let inline_unbox = live.is_some()
+            && (effect_free
+                || ctx.trace_ctx.heap_cache().is_class_known(result)
+                || ctx.trace_ctx.heap_cache().is_unescaped(result));
+        let (norm, live_norm) = if inline_unbox {
+            let live = live.unwrap();
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let raw = walker_unbox_int(ctx, op.pc, result, int_type_addr)?;
+            // `hash_call_normalize`'s `-1 -> -2` map as `raw - (raw == -1)`.
+            let neg1 = ctx.trace_ctx.const_int(-1);
+            let is_neg1 = ctx.trace_ctx.record_op(OpCode::IntEq, &[raw, neg1]);
+            ctx.trace_ctx
+                .set_opref_concrete(is_neg1, majit_ir::Value::Int((live == -1) as i64));
+            let norm = ctx.trace_ctx.record_op(OpCode::IntSub, &[raw, is_neg1]);
+            let live_norm = if live == -1 { -2 } else { live };
+            ctx.trace_ctx
+                .set_opref_concrete(norm, majit_ir::Value::Int(live_norm));
+            (norm, live_norm)
+        } else {
+            let Some(concrete_result) = concrete_result else {
+                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            };
+            let raw = crate::helpers::emit_trace_call_int_typed(
+                ctx.trace_ctx,
+                crate::helpers::jit_hash_normalize_digest as *const (),
+                &[result],
+                &[majit_ir::Type::Ref],
+            );
+            match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
+                Ok(live_norm) => {
+                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+                    ctx.trace_ctx
+                        .set_opref_concrete(raw, majit_ir::Value::Int(live_norm));
+                    (raw, live_norm)
+                }
+                // A raising digest completes the recording the way the
+                // generic raising residual does: publish the exception,
+                // pin it with GuardException, surface SubRaise.
+                Err(mut err) => {
+                    let exc = err.to_exc_object();
+                    fbw_count_executed_residual(true, true);
+                    ctx.last_exc_value_concrete = ConcreteValue::Ref(exc);
+                    ctx.fbw_mode.class_of_last_exc_is_const = false;
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
+                    walker_record_guard_exception(ctx, op.pc);
+                    let exc_box = ctx
+                        .last_exc_value
+                        .expect("guard_exception seeds last_exc_value");
+                    return Ok(Some((
+                        DispatchOutcome::SubRaise {
+                            exc: exc_box,
+                            exc_concrete: ConcreteValue::Ref(exc),
+                        },
+                        op.next_pc,
+                    )));
+                }
+            }
+        };
+        let boxed = walker_box_int(ctx, op.pc, norm, live_norm)?;
+        let live_ptr = pyre_object::w_int_new(live_norm) as i64;
+        ctx.trace_ctx
+            .set_opref_concrete(boxed, box_int_concrete(live_norm, live_ptr));
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    }
+    Ok(Some(inlined))
+}
+
 /// Inline a `property` getter read (`obj.value`) after the plain-attribute
 /// mapdict fold declines because the attribute is a data descriptor.  PyPy
 /// traces *through* `space.getattr` → `property.__get__` →

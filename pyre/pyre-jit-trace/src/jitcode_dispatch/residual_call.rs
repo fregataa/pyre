@@ -4495,6 +4495,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         )? {
             return Ok(inlined);
         }
+        // hash(x) over a user instance: inline __hash__ plus normalization.
+        if let Some(inlined) =
+            try_walker_inline_hash_builtin(ctx, op, code, funcptr, &r_args, call_descr, dst)?
+        {
+            return Ok(inlined);
+        }
         // A class is not a `Function`, so the user-call route above declined it.
         if let Some(inlined) =
             try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
