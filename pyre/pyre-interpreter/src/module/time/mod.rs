@@ -21,27 +21,6 @@ crate::py_module! {
             pyre_object::w_str_new("UTC"),
         ]),
     },
-    // PyPy: pypy/module/time/app_time.py:26-34.  Keep strptime at app
-    // level and delegate to the shared CPython `_strptime` module.
-    inline_app: {
-        r#"
-def strptime(string, format="%a %b %d %H:%M:%S %Y"):
-    import _strptime
-    return _strptime._strptime_time(string, format)
-
-def get_clock_info(name):
-    # PyPy app_time.py:36-44.  `types.SimpleNamespace` is the concrete type of
-    # sys.implementation in pyre's stdlib bootstrap.
-    import sys, time
-    info = type(sys.implementation)()
-    info.implementation = ""
-    info.monotonic = False
-    info.adjustable = False
-    info.resolution = 1.0
-    time._get_time_info(name, info)
-    return info
-"# => ["strptime", "get_clock_info"],
-    },
     functions: {
         "time"         / 0 = t::time,
         "time_ns"      / 0 = t::time_ns,
@@ -59,6 +38,11 @@ def get_clock_info(name):
         "mktime"       / 1 = t::mktime,
         "asctime"      / * = t::asctime,
         "ctime"        / * = t::ctime,
+        // `strptime`/`get_clock_info` are `app_time.py` app-level functions,
+        // demoted here to non-binding module builtins: stored on a class they
+        // do not bind, and they take positional arguments only.
+        "strptime"     / * = t::strptime,
+        "get_clock_info" / * = t::get_clock_info,
     },
     extra_init: |ns| {
         // POSIX clock identifiers + clock_gettime / clock_getres
