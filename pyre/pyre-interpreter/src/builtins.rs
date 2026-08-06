@@ -5848,11 +5848,10 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
 /// A 2..=5 positional-argument call fills the `errno` / `strerror` /
 /// `filename` / `filename2` slots; when a filename is present it is
 /// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
-/// 652) for pickle / repr compatibility.  The winerror argument (idx 3,
-/// Windows-only) and the `BlockingIOError.written` special-case are not
-/// modelled.  `kind` is `OSError` for the base type and `FileNotFoundError`
-/// for that dedicated kind; every other OSError subclass routes here as
-/// `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
+/// 652) for pickle / repr compatibility.  The `BlockingIOError.written`
+/// special-case is not modelled.  `kind` is `OSError` for the base type and
+/// `FileNotFoundError` for that dedicated kind; every other OSError subclass
+/// routes here as `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
 fn os_error_build(
     kind: pyre_object::interp_exceptions::ExcKind,
     args: &[PyObjectRef],
@@ -5895,6 +5894,131 @@ fn exc_is_blocking_io_error(exc: PyObjectRef) -> bool {
     )
 }
 
+/// `rwin32.py:285-306 build_winerror_to_errno` — the static Win32 code to
+/// POSIX errno map, from CPython's `PC/errmap.h`.  A code the table does not
+/// name takes `DEFAULT_WIN32_ERRNO`.
+#[cfg(windows)]
+const WINERROR_TO_ERRNO: &[(i64, i64)] = &[
+    (2, 2),
+    (3, 2),
+    (4, 24),
+    (5, 13),
+    (6, 9),
+    (7, 12),
+    (8, 12),
+    (9, 12),
+    (10, 7),
+    (11, 8),
+    (15, 2),
+    (16, 13),
+    (17, 18),
+    (18, 2),
+    (19, 13),
+    (20, 13),
+    (21, 13),
+    (22, 13),
+    (23, 13),
+    (24, 13),
+    (25, 13),
+    (26, 13),
+    (27, 13),
+    (28, 13),
+    (29, 13),
+    (30, 13),
+    (31, 13),
+    (32, 13),
+    (33, 13),
+    (34, 13),
+    (35, 13),
+    (36, 13),
+    (53, 2),
+    (65, 13),
+    (67, 2),
+    (80, 17),
+    (82, 13),
+    (83, 13),
+    (89, 11),
+    (108, 13),
+    (109, 32),
+    (112, 28),
+    (114, 9),
+    (128, 10),
+    (129, 10),
+    (130, 9),
+    (132, 13),
+    (145, 41),
+    (158, 13),
+    (161, 2),
+    (164, 11),
+    (167, 13),
+    (183, 17),
+    (188, 8),
+    (189, 8),
+    (190, 8),
+    (191, 8),
+    (192, 8),
+    (193, 8),
+    (194, 8),
+    (195, 8),
+    (196, 8),
+    (197, 8),
+    (198, 8),
+    (199, 8),
+    (200, 8),
+    (201, 8),
+    (202, 8),
+    (206, 2),
+    (215, 11),
+    (232, 32),
+    (267, 20),
+    (1816, 12),
+];
+
+/// `rwin32.py:306` — `errno.EINVAL` for a Win32 code the map does not name.
+#[cfg(windows)]
+const DEFAULT_WIN32_ERRNO: i64 = 22;
+
+/// `_parse_init_args` (`interp_exceptions.py:565-578`): an *integer* fourth
+/// argument decides `errno`, and the errno actually passed is ignored.  A
+/// fourth argument of any other shape (including `None`) is kept as the
+/// `winerror` attribute and leaves `errno` alone, which is what
+/// `str(e)` then reports as `[WinError <that object>]`.
+#[cfg(windows)]
+fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
+    if !unsafe { pyre_object::is_int(w_winerror) } {
+        return None;
+    }
+    Some(winerror_to_errno(unsafe {
+        pyre_object::w_int_get_value(w_winerror)
+    }))
+}
+
+/// The POSIX errno a Win32 error code maps to.
+#[cfg(windows)]
+pub(crate) fn winerror_to_errno(code: i64) -> i64 {
+    WINERROR_TO_ERRNO
+        .iter()
+        .find(|&&(win, _)| win == code)
+        .map_or(DEFAULT_WIN32_ERRNO, |&(_, posix)| posix)
+}
+
+/// The `errno` a 2..=5 argument call settles on: the first argument, unless a
+/// Windows error code in the fourth replaced it.  `descr_new` picks the
+/// errno-specific subclass from this value, and `_init_error` stores it, so
+/// both read the same parse.
+fn os_error_parsed_errno(args: &[PyObjectRef]) -> Option<PyObjectRef> {
+    if !(2..=5).contains(&args.len()) {
+        return None;
+    }
+    #[cfg(windows)]
+    if let Some(w_winerror) = args.get(3).copied() {
+        if let Some(errno) = winerror_derived_errno(w_winerror) {
+            return Some(pyre_object::w_int_new(errno));
+        }
+    }
+    Some(args[0])
+}
+
 /// `_parse_init_args` + `_init_error` slot assignment shared by `__new__`
 /// (after the kind-aware allocation and `w_class` retag) and `__init__`
 /// (re-stamping an already-allocated `self`).  Sets `args_w` and, for a 2..=5
@@ -5904,36 +6028,41 @@ fn exc_is_blocking_io_error(exc: PyObjectRef) -> bool {
 /// see the resolved class.
 fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
     use pyre_object::interp_exceptions;
-    let args_list = pyre_object::interp_exceptions::w_exception_args_new(args.to_vec());
-    unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
-    // `_parse_init_args`: only a 2..=5 argument call carries
-    // errno/strerror (and optionally filename/filename2).
-    let n = args.len();
-    if (2..=5).contains(&n) {
+    // `_parse_init_args`: only a 2..=5 argument call carries errno/strerror
+    // (and optionally filename/filename2); outside that range every argument
+    // stays in `args_w` and no slot is filled.
+    let mut args_w = args.to_vec();
+    if let Some(w_errno) = os_error_parsed_errno(args) {
+        // The parse also decides the errno the args tuple carries, so
+        // `e.args[0]` and `e.errno` agree even where a Windows error code in
+        // the fourth argument replaced the one that was passed.
+        args_w[0] = w_errno;
         unsafe {
-            interp_exceptions::w_exception_set_errno(exc, args[0]);
+            interp_exceptions::w_exception_set_errno(exc, w_errno);
             interp_exceptions::w_exception_set_strerror(exc, args[1]);
-            // idx 2 = filename, idx 3 = winerror (ignored off Windows),
+            #[cfg(windows)]
+            if let Some(w_winerror) = args.get(3).copied() {
+                interp_exceptions::w_exception_set_winerror(exc, w_winerror);
+            }
+            // idx 2 = filename, idx 3 = winerror (unread off Windows),
             // idx 4 = filename2.
             let w_filename = args.get(2).copied().filter(|&f| !pyre_object::is_none(f));
-            if let Some(fname) = w_filename {
-                // `_init_error` line 636-643: for an exact `BlockingIOError`, a
-                // numeric third argument is `characters_written`, not a
-                // filename — it stays in `args_w` and the tuple is not trimmed.
-                if exc_is_blocking_io_error(exc) && pyre_object::is_int(fname) {
-                    return;
-                }
+            // `_init_error` line 636-643: for an exact `BlockingIOError`, a
+            // numeric third argument is `characters_written`, not a filename —
+            // it stays in `args_w` and the tuple is not trimmed.
+            let written = |f| exc_is_blocking_io_error(exc) && pyre_object::is_int(f);
+            if let Some(fname) = w_filename.filter(|&f| !written(f)) {
                 interp_exceptions::w_exception_set_filename(exc, fname);
                 if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
                     interp_exceptions::w_exception_set_filename2(exc, f2);
                 }
                 // `_init_error`: filename is removed from the args tuple.
-                let rebind =
-                    pyre_object::interp_exceptions::w_exception_args_new(vec![args[0], args[1]]);
-                interp_exceptions::w_exception_set_args(exc, rebind);
+                args_w = vec![w_errno, args[1]];
             }
         }
     }
+    let args_list = interp_exceptions::w_exception_args_new(args_w);
+    unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
 }
 
 /// `ESHUTDOWN` is a POSIX errno absent from the MSVC CRT, so the
@@ -6028,6 +6157,43 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
     Some(name)
 }
 
+/// Run a C runtime descriptor call (`close`, `read`, `lseek`, …).
+///
+/// On Windows the MSVC invalid parameter handler is silenced around it
+/// (`_Py_BEGIN_SUPPRESS_IPH`): its default action on a bad descriptor is to
+/// abort the process, where the call is supposed to return -1 and set `EBADF`.
+/// The verdict is then `crt_errno`, never `GetLastError` — the latter describes
+/// whichever Win32 call the runtime made last, not this one.
+/// The call is made for the caller: it is a C runtime entry point taking
+/// arguments the caller has already checked, and silencing the handler is a
+/// thread-local store the runtime itself offers for the purpose.
+macro_rules! crt_call {
+    ($call:expr) => {{
+        #[cfg(all(windows, feature = "host_env"))]
+        #[allow(unused_unsafe)]
+        let ret = unsafe { rustpython_host_env::suppress_iph!($call) };
+        #[cfg(not(all(windows, feature = "host_env")))]
+        #[allow(unused_unsafe)]
+        let ret = unsafe { $call };
+        ret
+    }};
+}
+pub(crate) use crt_call;
+
+/// The errno the last C runtime call reported.
+pub(crate) fn crt_errno() -> i32 {
+    #[cfg(all(windows, feature = "host_env"))]
+    {
+        rustpython_host_env::os::get_errno()
+    }
+    // Off Windows the two are the same table, and a Windows build without the
+    // host_env seam has no `_get_errno` to read.
+    #[cfg(not(all(windows, feature = "host_env")))]
+    {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+}
+
 /// The POSIX errno for a `std::io::Error`, so the errno-specific OSError
 /// subclass (`os_error_errno_subclass`) and the `.errno` slot stay consistent
 /// across platforms.  On Windows `raw_os_error()` reports a Win32 error code
@@ -6063,12 +6229,16 @@ pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
 }
 
 /// `_parse_init_args` yields an errno only for a 2..=5 argument call whose
-/// first argument is an int; map that errno to its OSError subclass name.
+/// first argument is an int; map that errno to its OSError subclass name. A
+/// Windows error code in the fourth argument has already replaced that errno
+/// (`os_error_parsed_errno`), so `OSError(22, 'm', 'f', 5)` lands on the
+/// subclass its *derived* `EACCES` names rather than the one it was passed.
 fn os_error_errno_subclass_for(args: &[PyObjectRef]) -> Option<&'static str> {
-    if !(2..=5).contains(&args.len()) || !unsafe { pyre_object::is_int(args[0]) } {
+    let w_errno = os_error_parsed_errno(args)?;
+    if !unsafe { pyre_object::is_int(w_errno) } {
         return None;
     }
-    os_error_errno_subclass(unsafe { pyre_object::w_int_get_value(args[0]) })
+    os_error_errno_subclass(unsafe { pyre_object::w_int_get_value(w_errno) })
 }
 
 /// `W_OSError._use_init` (`interp_exceptions.py:531-549`): the slots are
@@ -7358,7 +7528,7 @@ fn make_exc_type_with_init(
                 }
             }
             if name == "OSError" {
-                for (member_name, kind, doc) in [
+                const OS_ERROR_MEMBERS: &[(&str, u32, &str)] = &[
                     (
                         "errno",
                         pyre_object::MEMBER_OS_ERROR_ERRNO,
@@ -7379,7 +7549,18 @@ fn make_exc_type_with_init(
                         pyre_object::MEMBER_OS_ERROR_FILENAME2,
                         "second exception filename",
                     ),
-                ] {
+                ];
+                // `interp_exceptions.py:723-728` installs this one only where
+                // the platform has a Windows error code to hold.
+                #[cfg(windows)]
+                const WINERROR_MEMBER: &[(&str, u32, &str)] = &[(
+                    "winerror",
+                    pyre_object::MEMBER_OS_ERROR_WINERROR,
+                    "Win32 exception code",
+                )];
+                #[cfg(not(windows))]
+                const WINERROR_MEMBER: &[(&str, u32, &str)] = &[];
+                for &(member_name, kind, doc) in OS_ERROR_MEMBERS.iter().chain(WINERROR_MEMBER) {
                     unsafe {
                         pyre_object::w_dict_setitem_str_no_proxy(
                             ns,
@@ -10576,6 +10757,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     )?;
     // `compiling.py:12-13 unwrap_spec(filename='fsencode', mode='text')`.
     let filename_bytes = crate::gateway::fsencode_bytes_w(filename_obj)?;
+    // The code object spells its filename as `newfilename` does
+    // (`objspace.py:438`), i.e. the filesystem decode of these bytes. Take that
+    // decode here, where the caller that supplied the bytes is still on the
+    // stack: under `surrogatepass` a byte that begins no UTF-8 sequence has no
+    // spelling, and reporting it at the first `co_filename` read instead would
+    // blame whoever came to look at the code object.
+    crate::gateway::fsdecode_filename_checked(&filename_bytes)?;
     let (filename, filename_bytes) = crate::pycode::split_code_filename_bytes(filename_bytes, None);
     let mode = crate::baseobjspace::text_w(mode_obj)?;
     // flags / dont_inherit / optimize are positional-or-keyword ints
@@ -13352,7 +13540,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         {
                             #[cfg(not(feature = "sandbox"))]
                             return Ok(w_bool_from(
-                                unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } >= 0,
+                                crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR)) >= 0,
                             ));
                             #[cfg(feature = "sandbox")]
                             return Ok(w_bool_from(
@@ -13414,9 +13602,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     {
                         #[cfg(not(feature = "sandbox"))]
                         let pos = {
-                            let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
+                            let pos = crt_call!(libc::lseek(fd, offset as libc::off_t, whence));
                             if pos < 0 {
-                                return Err(fd_io_err(std::io::Error::last_os_error()));
+                                return Err(fd_errno_err(crt_errno()));
                             }
                             pos
                         };
@@ -13461,9 +13649,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         {
                             #[cfg(not(feature = "sandbox"))]
                             let pos = {
-                                let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+                                let pos = crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR));
                                 if pos < 0 {
-                                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                                    return Err(fd_errno_err(crt_errno()));
                                 }
                                 pos
                             };
@@ -13774,8 +13962,8 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             {
                 #[cfg(not(feature = "sandbox"))]
-                if unsafe { libc::lseek(fd, 0, libc::SEEK_END) } < 0 {
-                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                if crt_call!(libc::lseek(fd, 0, libc::SEEK_END)) < 0 {
+                    return Err(fd_errno_err(crt_errno()));
                 }
                 #[cfg(feature = "sandbox")]
                 crate::host_seam::ops::lseek(fd, 0, libc::SEEK_END)
@@ -14082,8 +14270,8 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(fd) = file_get_fd(self_obj) {
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
-                return Err(fd_io_err(std::io::Error::last_os_error()));
+            if crt_call!(libc::ftruncate(fd, size as libc::off_t)) < 0 {
+                return Err(fd_errno_err(crt_errno()));
             }
             return Ok(index);
         }
@@ -14118,7 +14306,7 @@ fn file_method_isatty(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     };
     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     {
-        return Ok(w_bool_from(unsafe { libc::isatty(fd) } != 0));
+        return Ok(w_bool_from(crt_call!(libc::isatty(fd)) != 0));
     }
     #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
     {
@@ -14303,6 +14491,12 @@ fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> Result<PyObjectRef, 
 
 fn fd_io_err(e: std::io::Error) -> crate::PyError {
     crate::PyError::os_error_with_errno(io_error_posix_errno(&e, 5), e.to_string())
+}
+
+/// [`fd_io_err`] for a C runtime call, whose verdict is already an errno.
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+fn fd_errno_err(errno: i32) -> crate::PyError {
+    crate::PyError::os_error_with_errno(errno, "")
 }
 
 fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -14571,12 +14765,8 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 not(feature = "sandbox")
             ))]
             // SAFETY: close(2) on the file object's own fd.
-            if unsafe { libc::close(fd) } < 0 {
-                let e = std::io::Error::last_os_error();
-                return Err(crate::PyError::os_error_with_errno(
-                    io_error_posix_errno(&e, 0),
-                    format!("close: {e}"),
-                ));
+            if crt_call!(libc::close(fd)) < 0 {
+                return Err(crate::PyError::os_error_with_errno(crt_errno(), "close"));
             }
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
             crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
