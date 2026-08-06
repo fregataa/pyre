@@ -3445,6 +3445,31 @@ pub unsafe fn w_dict_getitem_wtf8(
     }
 }
 
+/// Fallible sibling of [`w_dict_getitem_wtf8`].
+///
+/// The probe compares against whatever the bucket holds, so a stored
+/// non-string key whose hash collides with `key` can reach a user `__eq__`
+/// that raises.  The unchecked spelling reports that as a miss; this one
+/// surfaces it, and the caller recovers the concrete exception from the
+/// interpreter-side error slot.
+///
+/// Routes through [`w_dict_lookup_checked`] rather than draining the flag
+/// after [`w_dict_getitem_wtf8`]: the strategy leaf
+/// (`w_dict_lookup_object_strategy`) is itself
+/// `..._checked(..).unwrap_or(None)`, so it has already taken the flag by the
+/// time the unchecked spelling returns and a post-hoc `take_dict_key_error`
+/// always reads `false`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_getitem_wtf8_checked(
+    obj: PyObjectRef,
+    key: &rustpython_wtf8::Wtf8,
+) -> Result<Option<PyObjectRef>, DictKeyError> {
+    let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+    w_dict_lookup_checked(obj, w_key)
+}
+
 /// WTF-8 keyed equivalent of `space.setitem_str` — `setitem_str` is itself
 /// a fast path of `space.setitem`, so a key that is valid UTF-8 takes the
 /// str fast path (keeping an ASCII/Unicode dict on its strategy) and a
