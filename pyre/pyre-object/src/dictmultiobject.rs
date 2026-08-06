@@ -1261,6 +1261,30 @@ pub fn w_dict_new() -> PyObjectRef {
     )
 }
 
+pub type MakeInstanceDictHookFn = fn() -> PyObjectRef;
+
+majit_gc::global_hook!(static MAKE_INSTANCE_DICT_HOOK: MakeInstanceDictHookFn);
+
+pub fn register_make_instance_dict_hook(hook: MakeInstanceDictHookFn) {
+    MAKE_INSTANCE_DICT_HOOK.set(Some(hook));
+}
+
+pub fn clear_make_instance_dict_hook() {
+    MAKE_INSTANCE_DICT_HOOK.set(None);
+}
+
+/// `dictmultiobject.py:56-73` `space.newdict(instance=True)`.
+///
+/// The interpreter installs the mapdict factory once its hooks are available.
+/// The plain-dict fallback keeps pyre-object-only users working before that
+/// initialization.
+pub fn w_dict_new_instance() -> PyObjectRef {
+    match MAKE_INSTANCE_DICT_HOOK.get() {
+        Some(factory) => factory(),
+        None => w_dict_new(),
+    }
+}
+
 /// `dictmultiobject.py:77-80 allocate_and_init_instance` kwargs
 /// branch — `strategy = space.fromcache(EmptyKwargsDictStrategy)`.
 /// Function-call sites that build a `**kwargs` dict route through
@@ -4112,6 +4136,18 @@ pub unsafe fn w_dict_nth_item(
     w_dict_get_strategy(obj).nth_item(obj, index)
 }
 
+/// Read only the value at iteration position `index`.
+///
+/// `dictmultiobject.py:1095-1098` reads the typed storage value without
+/// wrapping its key.
+///
+/// # Safety
+/// `obj` must be a valid `W_DictObject` PyObjectRef.
+pub unsafe fn w_dict_nth_value(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    lock_dict_refs!(_dict_guard, obj);
+    w_dict_get_strategy(obj).nth_value(obj, index)
+}
+
 /// Return the `index`-th key together with the hash stored in an exact dict's
 /// object-shaped table.
 ///
@@ -4195,6 +4231,83 @@ pub unsafe fn w_dict_lookup_int_strategy(
     let entries = w_dict_int_storage(obj);
     let k = crate::listobject::plain_int_w(key);
     entries.get(&k).copied()
+}
+
+/// Return the insertion-order index selected by an int-strategy lookup.
+///
+/// Residualise the native table probe for the same reason as
+/// [`w_dict_lookup_int_strategy`] (`rdict.py:576`).
+///
+/// # Safety
+/// Same as [`w_dict_lookup_int_strategy`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    w_dict_int_storage(obj).get_index_of(&crate::listobject::plain_int_w(key))
+}
+
+/// Return the live value selected by an int-strategy lookup.
+///
+/// Residualise the native table probe for the same reason as
+/// [`w_dict_lookup_int_strategy`] (`rdict.py:576`). The index lookup and value
+/// read share one dict lock so the insertion-order index cannot be invalidated
+/// between the two operations.
+///
+/// # Safety
+/// Same as [`w_dict_lookup_int_strategy`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_lookup_or_null_int_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    let index = w_dict_index_of_int_strategy(obj, key)?;
+    w_dict_nth_value(obj, index)
+}
+
+/// Return the insertion-order index selected by a Unicode-strategy lookup.
+///
+/// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
+/// string probe.  The trace-time caller declines when `w_str_get_value_opt`
+/// or the raw hash hook is unavailable, so this helper has no allocating
+/// object-key fallback.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on
+/// [`crate::dictmultiobject::UNICODE_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_index_of_unicode_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<usize> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    if !crate::is_exact_type(key, &crate::STR_TYPE) {
+        return None;
+    }
+    let key = crate::w_str_get_value_opt(key)?;
+    let hash = crate::dict_eq_hook::try_hash_str(key.as_bytes())?;
+    crate::dict_eq_hook::take_eq_error();
+    let dict = &*(obj as *const W_DictObject);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    dict_entries_index_of_str_hashed(entries, hash, key)
+}
+
+/// Return the live value selected by a Unicode-strategy lookup.
+///
+/// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
+/// string probe. The index lookup and value read share one dict lock so the
+/// insertion-order index cannot be invalidated between the two operations.
+///
+/// # Safety
+/// Same as [`w_dict_index_of_unicode_strategy`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    let index = w_dict_index_of_unicode_strategy(obj, key)?;
+    w_dict_nth_value(obj, index)
 }
 
 /// Internal helper: `IntDictStrategy::delitem` body —
@@ -5247,6 +5360,15 @@ pub trait DictStrategy {
         self.items(w_dict).into_iter().nth(index)
     }
 
+    /// Read the value at iteration position `index` without requiring a
+    /// separately materialised key (`dictmultiobject.py:1095-1098`).
+    ///
+    /// # Safety
+    /// `w_dict` must be a valid PyObjectRef.
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        self.nth_item(w_dict, index).map(|(_, value)| value)
+    }
+
     /// `dictmultiobject.py:624-634 DictStrategy.pop` — remove and
     /// return the value for `w_key`.  Returns `Ok(value)` on hit,
     /// `Ok(w_default)` on miss when a default is provided, or
@@ -6284,6 +6406,13 @@ impl DictStrategy for BytesDictStrategy {
         crate::dictmultiobject::w_dict_nth_item_bytes_strategy(w_dict, index)
     }
 
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        lock_dict_refs!(_dict_guard, w_dict);
+        crate::dictmultiobject::w_dict_bytes_storage(w_dict)
+            .get_index(index)
+            .map(|(_, &value)| value)
+    }
+
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_dict_clear_bytes_strategy(w_dict);
     }
@@ -6660,6 +6789,13 @@ impl DictStrategy for IntDictStrategy {
         index: usize,
     ) -> Option<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_dict_nth_item_int_strategy(w_dict, index)
+    }
+
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        lock_dict_refs!(_dict_guard, w_dict);
+        crate::dictmultiobject::w_dict_int_storage(w_dict)
+            .get_index(index)
+            .map(|(_, &value)| value)
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
