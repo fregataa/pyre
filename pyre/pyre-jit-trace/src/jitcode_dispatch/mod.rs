@@ -574,6 +574,11 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
         (session.recording_frame_ptr, session.recording_jitcode_index)
     };
     if execute_concrete {
+        // Attaching the live frame to a traceback escapes the virtualizable, so
+        // publish the walk's locals first.  `virtualizable.py:101-138
+        // write_boxes` makes that write unconditional, and `pyopcode.py:148`
+        // performs it before attaching the application traceback.
+        crate::state::flush_locals_region_to_frame(ctx.trace_ctx, frame_ptr);
         journaled_concrete_traceback_attach(exc_ptr, || {
             majit_metainterp::record_application_traceback_for_recording(
                 exc_ptr as usize as i64,
@@ -723,10 +728,13 @@ fn record_inline_application_traceback<Sym: WalkSym>(
             opcode_position as i32,
         )
         .and_then(|py_pc| {
-            concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc))
+            let frame_reg = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?
+                .metadata
+                .portal_frame_reg;
+            concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc, frame_reg))
         });
         journaled_concrete_traceback_attach(exc_ptr, || match node_frame {
-            Some((frame_ptr, py_pc)) => {
+            Some((frame_ptr, py_pc, frame_reg)) => {
                 // `dispatch_bytecode` (pyopcode.py) writes `self.last_instr`
                 // before every opcode so a frame read while it runs answers for
                 // the instruction executing.  The recording walk does not make
@@ -743,6 +751,12 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                 unsafe {
                     (*frame_ptr).last_instr = py_pc as isize;
                 }
+                // Attaching the live frame to a traceback escapes the
+                // virtualizable, so publish this callee's walk-time locals
+                // first.  `virtualizable.py:101-138 write_boxes` makes that
+                // write unconditional before `pyopcode.py:148` attaches the
+                // application traceback.
+                flush_callee_locals_region_to_frame(ctx, frame_ptr, frame_reg);
                 majit_metainterp::record_application_traceback_for_recording(
                     exc_ptr as usize as i64,
                     frame_ptr as i64,
@@ -791,6 +805,87 @@ fn concrete_portal_frame<Sym: WalkSym>(
         return None;
     };
     (!frame.is_null()).then_some(frame as *mut pyre_interpreter::PyFrame)
+}
+
+/// Whether `shadow` can reproduce every locals slot of a frame reached through
+/// `frame_reg`.
+///
+/// `virtualizable.py:101-138 write_boxes` writes every locals-array element
+/// because `virtualizable_boxes` is total. This shadow is sparse instead, so an
+/// absent slot carries two meanings and only one of them may be skipped:
+///
+/// * absent from BOTH maps — this walk never wrote the slot, so the frame still
+///   holds the value `write_boxes` would have written back.
+/// * present in `opref` but not in `concrete` — the walk DID write the slot with
+///   no concrete half ([`CalleeLocalsShadow::set_concrete`] drops a
+///   `Value::Void`), so the frame's value is stale and unreconstructable.
+///
+/// `Value::Void` and `GcRef::NO_CONCRETE` are the "no concrete half" sentinels,
+/// not a NULL local: writing one back would store `PY_NULL` or an untraceable
+/// word over the slot the walk holds in a register. Only entries recorded
+/// through `frame_reg` describe this frame.
+fn callee_locals_region_is_publishable(
+    shadow: &CalleeLocalsShadow,
+    nlocals: usize,
+    frame_reg: u16,
+) -> bool {
+    (0..nlocals as i64).all(|slot| match shadow.concrete.get(&slot) {
+        Some(concrete) => {
+            concrete.frame_reg == frame_reg
+                && !matches!(concrete.value, Value::Void)
+                && !matches!(concrete.value, Value::Ref(r) if r == majit_ir::GcRef::NO_CONCRETE)
+        }
+        None => !shadow.opref.contains_key(&slot),
+    })
+}
+
+/// [`crate::state::flush_locals_region_to_frame`]'s twin for an inlined level.
+///
+/// The top-level frame's slots come from the seeded `virtualizable_boxes`; a
+/// fresh inlined callee has no seeded frame and owns [`CalleeLocalsShadow`]
+/// instead, so the escape write reads the locals region out of that shadow.
+/// `frame_reg` is the level's portal frame register, and only entries written
+/// through it belong to `frame`.
+fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frame: *mut pyre_interpreter::PyFrame,
+    frame_reg: u16,
+) -> bool {
+    if frame.is_null() {
+        return false;
+    }
+    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        return false;
+    };
+    let Some(nlocals) = crate::state::concrete_nlocals(frame as usize) else {
+        return false;
+    };
+    // Validation pass first: it allocates nothing, so a decline leaves the
+    // frame untouched (same all-or-nothing discipline as the top-level twin).
+    if !callee_locals_region_is_publishable(shadow, nlocals, frame_reg) {
+        return false;
+    }
+    let frame_ptr = frame as *const u8;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
+        return false;
+    }
+    for abs in 0..nlocals {
+        let Some(concrete) = shadow.concrete.get(&(abs as i64)) else {
+            continue;
+        };
+        let boxed = crate::state::boxed_slot_value_for_type(Type::Ref, &concrete.value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+        // Boxing an Int/Float slot allocates, and each minor collection
+        // consumes the array's remembered-set entry, so re-arm per store.
+        crate::state::frame_array_write_barrier(frame as *mut u8, arr_ptr);
+    }
+    true
 }
 
 /// Publish `PyFrame.frame_finished_execution = True` on the current
