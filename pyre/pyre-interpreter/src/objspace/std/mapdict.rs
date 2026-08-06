@@ -11,11 +11,13 @@
 use crate::PyError;
 use parking_lot::ReentrantMutex;
 use pyre_object::PyObjectRef;
+use pyre_object::quasiimmut::QuasiImmutField;
 
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, LazyLock, Mutex};
 
 // PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
 // free-threaded, so use narrow address-striped reentrant locks around the same
@@ -173,14 +175,17 @@ pub enum TerminatorKind {
 pub struct Terminator {
     /// mapdict.py:307 `w_cls`.
     pub w_cls: PyObjectRef,
-    /// mapdict.py:308 `allow_unboxing` — declared quasi-immutable upstream and
-    /// cleared when an unboxed attribute is reassigned a differently-typed
-    /// value (mapdict.py:685). Pyre installs no quasi-immutable watcher here;
-    /// as with the `Function` fields documented in `descr.rs`, it keeps the
-    /// field live/mutable and pairs each read with a `GuardValue` on the
-    /// instance map in `walker_guard_mapdict_instance_shape`, so a map-node
-    /// change deopts before a stale value can be folded.
+    /// mapdict.py:305 `_immutable_fields_` declares `allow_unboxing?`;
+    /// mapdict.py:308 `allow_unboxing` permits unboxed attributes until a
+    /// differently-typed reassignment freezes them off. [`Self::set_allow_unboxing`]
+    /// invalidates watchers before changing it.
     pub allow_unboxing: Cell<bool>,
+    /// The hidden watcher field implementing mapdict.py:305
+    /// `_immutable_fields_ = [..., 'allow_unboxing?']`. The owner is a
+    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
+    /// `Drop` is unreachable and its inner box is reclaimed only through
+    /// [`QuasiImmutField::invalidate`].
+    pub allow_unboxing_watchers: QuasiImmutField,
     /// Which Terminator subclass this is.
     pub kind: TerminatorKind,
     /// mapdict.py:360 `DictTerminator.devolved_dict_terminator` (null unless
@@ -193,6 +198,94 @@ pub struct Terminator {
     /// mapdict.py:53 `AbstractAttribute.terminator` — a Terminator points to
     /// itself.
     pub terminator: MapRef,
+}
+
+impl Terminator {
+    /// Change mapdict.py:308 `allow_unboxing`, invalidating any constant-folded
+    /// reads first.
+    ///
+    /// The value-change return is a required pyre addition: the unguarded
+    /// writes in mapdict.py `PlainAttribute._direct_write` and
+    /// `CachedAttributeHolder.pick_attr` can repeatedly write `False`, and a
+    /// re-armed watcher must not retrace without bound. The `is_installed()`
+    /// fast path is quasiimmut.py:38-41 `invalidation`'s null test and remains
+    /// outside the sweep so the common case is lock-free. Notification must
+    /// precede the store: rclass.py:1010-1012 `hook_setfield` emits
+    /// `jit_force_quasi_immutable` before `setfield`, as do celldict.rs
+    /// `mutated` and typeobject.rs `w_type_set_version_tag`.
+    pub fn set_allow_unboxing(&self, v: bool) {
+        if self.allow_unboxing.get() == v {
+            return;
+        }
+        if self.allow_unboxing_watchers.is_installed() {
+            unsafe {
+                pyre_object::quasiimmut::sweep_quasi_immut_field(&self.allow_unboxing_watchers)
+            };
+        }
+        self.allow_unboxing.set(v);
+    }
+
+    pub fn register_allow_unboxing_watcher(&self, flag: &Arc<AtomicBool>) {
+        self.allow_unboxing_watchers.register_loop_token(flag);
+    }
+
+    pub fn install_allow_unboxing_watcher(&self) {
+        self.allow_unboxing_watchers.ensure_installed();
+    }
+
+    pub fn allow_unboxing_qmut_installed(&self) -> bool {
+        self.allow_unboxing_watchers.is_installed()
+    }
+
+    pub fn force_allow_unboxing_qmut(&self) {
+        self.allow_unboxing_watchers.invalidate();
+    }
+}
+
+/// Register a loop against a Terminator's `allow_unboxing?` field.
+///
+/// # Safety
+/// `terminator` must be null or point at a live owner.
+pub unsafe fn terminator_register_allow_unboxing_watcher(
+    terminator: *const Terminator,
+    flag: &Arc<AtomicBool>,
+) {
+    if terminator.is_null() {
+        return;
+    }
+    unsafe { (*terminator).register_allow_unboxing_watcher(flag) };
+}
+
+/// Install a Terminator's `allow_unboxing?` watcher without registering a loop.
+///
+/// # Safety
+/// `terminator` must be null or point at a live owner.
+pub unsafe fn terminator_install_allow_unboxing_watcher(terminator: *const Terminator) {
+    if terminator.is_null() {
+        return;
+    }
+    unsafe { (*terminator).install_allow_unboxing_watcher() };
+}
+
+/// Whether a Terminator's `allow_unboxing?` watcher is installed.
+///
+/// # Safety
+/// `terminator` must be null or point at a live owner.
+pub unsafe fn terminator_allow_unboxing_qmut_installed(terminator: *const Terminator) -> bool {
+    !terminator.is_null() && unsafe { (*terminator).allow_unboxing_qmut_installed() }
+}
+
+/// Force a Terminator's `allow_unboxing?` qmut directly. This is the tracer's
+/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
+/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
+///
+/// # Safety
+/// `terminator` must be null or point at a live owner.
+pub unsafe fn terminator_force_allow_unboxing_qmut(terminator: *const Terminator) {
+    if terminator.is_null() {
+        return;
+    }
+    unsafe { (*terminator).force_allow_unboxing_qmut() };
 }
 
 /// The unbox type of an `UnboxedPlainAttribute` (mapdict.py:534/547,
@@ -237,11 +330,17 @@ pub struct PlainAttribute {
     pub num_attributes: usize,
     /// mapdict.py:429 `back`.
     pub back: MapRef,
-    /// mapdict.py:430 `ever_mutated` — declared quasi-immutable upstream; pyre
-    /// installs no watcher and uses the per-read instance-map `GuardValue`
-    /// described on `Terminator::allow_unboxing` (the `descr.rs` `Function`
-    /// precedent).
+    /// mapdict.py:421 `_immutable_fields_` declares `ever_mutated?`;
+    /// mapdict.py:430 `ever_mutated` records whether this attribute has ever
+    /// been overwritten or deleted. [`Self::set_ever_mutated`] invalidates
+    /// watchers before changing it.
     pub ever_mutated: Cell<bool>,
+    /// The hidden watcher field implementing mapdict.py:421
+    /// `_immutable_fields_ = [..., 'ever_mutated?', ...]`. The owner is a
+    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
+    /// `Drop` is unreachable and its inner box is reclaimed only through
+    /// [`QuasiImmutField::invalidate`].
+    pub ever_mutated_watchers: QuasiImmutField,
     /// mapdict.py:431 `order`.
     pub order: usize,
     /// mapdict.py:47 `AbstractAttribute.cache_attrs` — the per-node transition
@@ -252,6 +351,86 @@ pub struct PlainAttribute {
     /// `Some` for an `UnboxedPlainAttribute` (mapdict.py:532); `None` for a
     /// plain boxed attribute.
     pub unboxed: Option<UnboxedExtra>,
+}
+
+impl PlainAttribute {
+    /// Change mapdict.py:430 `ever_mutated` using the ordering, fast path, and
+    /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
+    pub fn set_ever_mutated(&self, v: bool) {
+        if self.ever_mutated.get() == v {
+            return;
+        }
+        if self.ever_mutated_watchers.is_installed() {
+            unsafe {
+                pyre_object::quasiimmut::sweep_quasi_immut_field(&self.ever_mutated_watchers)
+            };
+        }
+        self.ever_mutated.set(v);
+    }
+
+    pub fn register_ever_mutated_watcher(&self, flag: &Arc<AtomicBool>) {
+        self.ever_mutated_watchers.register_loop_token(flag);
+    }
+
+    pub fn install_ever_mutated_watcher(&self) {
+        self.ever_mutated_watchers.ensure_installed();
+    }
+
+    pub fn ever_mutated_qmut_installed(&self) -> bool {
+        self.ever_mutated_watchers.is_installed()
+    }
+
+    pub fn force_ever_mutated_qmut(&self) {
+        self.ever_mutated_watchers.invalidate();
+    }
+}
+
+/// Register a loop against a PlainAttribute's `ever_mutated?` field.
+///
+/// # Safety
+/// `attribute` must be null or point at a live owner.
+pub unsafe fn plain_attribute_register_ever_mutated_watcher(
+    attribute: *const PlainAttribute,
+    flag: &Arc<AtomicBool>,
+) {
+    if attribute.is_null() {
+        return;
+    }
+    unsafe { (*attribute).register_ever_mutated_watcher(flag) };
+}
+
+/// Install a PlainAttribute's `ever_mutated?` watcher without registering a loop.
+///
+/// # Safety
+/// `attribute` must be null or point at a live owner.
+pub unsafe fn plain_attribute_install_ever_mutated_watcher(attribute: *const PlainAttribute) {
+    if attribute.is_null() {
+        return;
+    }
+    unsafe { (*attribute).install_ever_mutated_watcher() };
+}
+
+/// Whether a PlainAttribute's `ever_mutated?` watcher is installed.
+///
+/// # Safety
+/// `attribute` must be null or point at a live owner.
+pub unsafe fn plain_attribute_ever_mutated_qmut_installed(
+    attribute: *const PlainAttribute,
+) -> bool {
+    !attribute.is_null() && unsafe { (*attribute).ever_mutated_qmut_installed() }
+}
+
+/// Force a PlainAttribute's `ever_mutated?` qmut directly. This is the tracer's
+/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
+/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
+///
+/// # Safety
+/// `attribute` must be null or point at a live owner.
+pub unsafe fn plain_attribute_force_ever_mutated_qmut(attribute: *const PlainAttribute) {
+    if attribute.is_null() {
+        return;
+    }
+    unsafe { (*attribute).force_ever_mutated_qmut() };
 }
 
 /// mapdict.py:45 `AbstractAttribute` plus its two concrete subclasses.
@@ -271,6 +450,7 @@ pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
     let raw = Box::into_raw(Box::new(MapNode::Terminator(Terminator {
         w_cls,
         allow_unboxing: Cell::new(true),
+        allow_unboxing_watchers: QuasiImmutField::new(),
         kind,
         devolved_dict_terminator: Cell::new(std::ptr::null()),
         cache_attrs: Mutex::new(HashMap::new()),
@@ -720,6 +900,7 @@ pub unsafe fn new_plain_attribute(
         num_attributes: back_node.num_attributes() + 1,
         back,
         ever_mutated: Cell::new(false),
+        ever_mutated_watchers: QuasiImmutField::new(),
         order,
         cache_attrs: Mutex::new(HashMap::new()),
         terminator: back_node.terminator(),
@@ -772,6 +953,7 @@ pub unsafe fn new_unboxed_plain_attribute(
         num_attributes: back_node.num_attributes() + 1,
         back,
         ever_mutated: Cell::new(false),
+        ever_mutated_watchers: QuasiImmutField::new(),
         order,
         cache_attrs: Mutex::new(HashMap::new()),
         terminator: back_node.terminator(),
@@ -1584,16 +1766,15 @@ pub unsafe fn load_attr_unboxed_fast_path(
 /// caller separately proves that the incoming value has the slot's unbox
 /// type before performing the in-place write (mapdict.py:615-619).
 ///
-/// Resolving marks the attribute `ever_mutated`, as `STORE_ATTR_caching` does
-/// before `_direct_write` (mapdict.py:1635-1637): the write the caller folds
-/// out of the trace must not leave the attribute looking unmutated.
+/// The resolved attribute node is returned so the caller can mark it
+/// `ever_mutated` once it has committed to folding the write out of the trace.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
 pub unsafe fn store_attr_unboxed_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, MapRef, usize, usize, UnboxType)> {
+) -> Option<(PyObjectRef, u64, MapRef, usize, usize, UnboxType, MapRef)> {
     if name == "__class__" {
         return None;
     }
@@ -1632,11 +1813,15 @@ pub unsafe fn store_attr_unboxed_fast_path(
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     let u = p.unboxed.as_ref()?;
-    // mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`.
-    if !p.ever_mutated.get() {
-        p.ever_mutated.set(true);
-    }
-    Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ))
+    Some((
+        w_type,
+        version_tag,
+        map,
+        p.storageindex,
+        u.listindex,
+        u.typ,
+        attr,
+    ))
 }
 
 /// Resolve an existing boxed plain slot through the STORE_ATTR caching gates.
@@ -1644,15 +1829,15 @@ pub unsafe fn store_attr_unboxed_fast_path(
 /// needs only the guarded map and storage index for the direct write
 /// (mapdict.py:446-447).
 ///
-/// Marks `ever_mutated` on the resolved attribute for the same reason as
-/// [`store_attr_unboxed_fast_path`].
+/// The resolved attribute node is returned so the caller can mark it
+/// `ever_mutated` once it has committed to folding the write out of the trace.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
 pub unsafe fn store_attr_boxed_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, MapRef, usize)> {
+) -> Option<(PyObjectRef, u64, MapRef, usize, MapRef)> {
     if name == "__class__" {
         return None;
     }
@@ -1693,11 +1878,17 @@ pub unsafe fn store_attr_boxed_fast_path(
     if p.unboxed.is_some() {
         return None;
     }
-    // mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`.
-    if !p.ever_mutated.get() {
-        p.ever_mutated.set(true);
-    }
-    Some((w_type, version_tag, map, p.storageindex))
+    Some((w_type, version_tag, map, p.storageindex, attr))
+}
+
+/// mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`
+/// — performed by the caller once it has committed to folding the store
+/// out of the trace, so a declined resolution mutates nothing.
+///
+/// # Safety
+/// `attr` must point at a live `PlainAttribute` map node.
+pub unsafe fn mark_attr_ever_mutated(attr: MapRef) {
+    unsafe { (*attr).as_plain() }.set_ever_mutated(true);
 }
 
 /// The map transition an attribute-adding STORE_ATTR takes, resolved without
@@ -1709,6 +1900,8 @@ pub struct StoreAttrAdd {
     pub version_tag: u64,
     /// The instance's current map, which the caller guards.
     pub map: MapRef,
+    /// The cached transition holder whose `typ` and `attr` the resolution read.
+    pub holder: *const CachedAttributeHolder,
     /// The `PlainAttribute` the instance's map becomes — a direct child of
     /// `map`, so the transition is `map -> new_map` with no reordering.
     pub new_map: MapRef,
@@ -1719,6 +1912,11 @@ pub struct StoreAttrAdd {
     /// one-element longlong list. Only `Int` today; a float pick stays on
     /// the residual.
     pub unbox_type: Option<UnboxType>,
+    /// The value returned by `pick_unbox_type`. This is distinct from
+    /// `unbox_type`, which is `None` when a cached boxed transition serves an
+    /// unboxable value. `picked_unbox.is_some()` means the pick read the
+    /// terminator's `allow_unboxing` flag as true.
+    pub picked_unbox: Option<UnboxType>,
 }
 
 /// Resolve the `map -> PlainAttribute` transition that a STORE_ATTR adding a
@@ -1866,9 +2064,11 @@ pub unsafe fn store_attr_add_fast_path(
         w_type,
         version_tag,
         map,
+        holder,
         new_map,
         storageindex: p.storageindex,
         unbox_type,
+        picked_unbox: unbox,
     })
 }
 
@@ -1997,9 +2197,7 @@ pub unsafe fn store_attr_caching(
                 let attr = e.cached_attr;
                 let p = unsafe { (*attr).as_plain() };
                 // mapdict.py:1582-1583 `if not attr.ever_mutated: attr.ever_mutated = True`.
-                if !p.ever_mutated.get() {
-                    p.ever_mutated.set(true);
-                }
+                p.set_ever_mutated(true);
                 // mapdict.py:1584 `attr._direct_write(w_obj, w_value)`.
                 let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                 unsafe { plain_direct_write(attr, inst, w_value) };
@@ -2126,9 +2324,7 @@ unsafe fn store_attr_slowpath(
                                 let p = unsafe { (*attr).as_plain() };
                                 // mapdict.py:1632-1633
                                 // `if not attr.ever_mutated: ...`.
-                                if !p.ever_mutated.get() {
-                                    p.ever_mutated.set(true);
-                                }
+                                p.set_ever_mutated(true);
                                 // mapdict.py:1634 `attr._direct_write(...)`.
                                 let inst =
                                     unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
@@ -2729,9 +2925,11 @@ unsafe fn value_has_unbox_type(typ: UnboxType, w_value: PyObjectRef) -> bool {
 }
 
 /// mapdict.py:437-444 `PlainAttribute._direct_read` / `_prim_direct_read` /
-/// `_pure_direct_read` (identical bodies; the `@jit.elidable` `_pure_direct_read`
-/// variant is applied when the read is JIT-wired). `unerase_item` is identity.
-/// For an `UnboxedPlainAttribute` this is mapdict.py:592-612.
+/// `_pure_direct_read` have identical bodies; the `@jit.elidable`
+/// `_pure_direct_read` variant is applied when the read is JIT-wired.
+/// `unerase_item` is identity. For an `UnboxedPlainAttribute`,
+/// mapdict.py:592-612 gives `_direct_read` the allow-unboxing conversion tail;
+/// pyre places that tail in `maybe_migrate_to_boxed`.
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute` map node.
@@ -2785,9 +2983,7 @@ pub unsafe fn plain_direct_write<O: MapdictObject>(
                 // mapdict.py:620-627 — type change. Freeze unboxing for the
                 // terminator, then convert the instance to boxed storage and
                 // rewrite `(name, attrkind)` through the now-boxed map.
-                unsafe { (*p.terminator).as_terminator() }
-                    .allow_unboxing
-                    .set(false);
+                unsafe { (*p.terminator).as_terminator() }.set_allow_unboxing(false);
                 let name = p.name.clone();
                 let attrkind = p.attrkind;
                 unsafe { convert_to_boxed_and_write(obj, &name, attrkind, w_value) };
@@ -2835,8 +3031,10 @@ pub unsafe fn node_read<O: MapdictObject>(
 ) -> Option<PyObjectRef> {
     match unsafe { find_map_attr(self_node, name, attrkind) } {
         // The `jit.isconstant(attr) and jit.isconstant(obj) and not
-        // attr.ever_mutated` guard selects `_pure_direct_read`; both variants
-        // have the same body (mapdict.py:60-65).
+        // attr.ever_mutated` guard selects `_pure_direct_read`
+        // (mapdict.py:60-65). The PlainAttribute variants have the same body;
+        // UnboxedPlainAttribute._direct_read's conversion tail lives in
+        // `maybe_migrate_to_boxed`.
         Some(attr) => Some(unsafe { plain_direct_read(attr, obj) }),
         None => unsafe { terminator_read((*self_node).terminator(), obj, name, attrkind) },
     }
@@ -2974,11 +3172,7 @@ unsafe fn node_delete<O: MapdictObject>(
         if attrkind == p.attrkind && &*p.name == name {
             // mapdict.py:462-466 — attribute found; drop it by rebuilding from
             // `back` (which excludes this node).
-            if p.ever_mutated.get() {
-                // already mutated
-            } else {
-                p.ever_mutated.set(true);
-            }
+            p.set_ever_mutated(true);
             return Some(unsafe { node_copy(p.back, obj) });
         }
         // mapdict.py:467-470 — recurse, then re-add this surviving attribute.
@@ -3136,16 +3330,176 @@ unsafe fn materialize_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
 pub struct CachedAttributeHolder {
     /// mapdict.py:670 `order` (= number of prior children of `back`).
     pub order: usize,
-    /// mapdict.py:675 `attr` — the cached child map, declared quasi-immutable
-    /// upstream; pyre installs no watcher and uses the per-read instance-map
-    /// `GuardValue` described on `Terminator::allow_unboxing` (the `descr.rs`
-    /// `Function` precedent).
+    /// mapdict.py:669 `_immutable_fields_` declares `attr?`; mapdict.py:675
+    /// `attr` is the cached child map. [`Self::set_attr`] invalidates watchers
+    /// before changing it.
     pub attr: Cell<MapRef>,
-    /// mapdict.py:676 `typ` — the unbox type (`None` = boxed), declared
-    /// quasi-immutable upstream; pyre installs no watcher and uses the per-read
-    /// instance-map `GuardValue` described on `Terminator::allow_unboxing` (the
-    /// `descr.rs` `Function` precedent).
+    /// The hidden watcher field implementing mapdict.py:669
+    /// `_immutable_fields_ = ['attr?', 'typ?']` for `attr?`. The owner is a
+    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
+    /// `Drop` is unreachable and its inner box is reclaimed only through
+    /// [`QuasiImmutField::invalidate`].
+    pub attr_watchers: QuasiImmutField,
+    /// mapdict.py:669 `_immutable_fields_` declares `typ?`; mapdict.py:676
+    /// `typ` is the unbox type (`None` means boxed). [`Self::set_typ`]
+    /// invalidates watchers before changing it.
     pub typ: Cell<Option<UnboxType>>,
+    /// The hidden watcher field implementing mapdict.py:669
+    /// `_immutable_fields_ = ['attr?', 'typ?']` for `typ?`. The owner is a
+    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
+    /// `Drop` is unreachable and its inner box is reclaimed only through
+    /// [`QuasiImmutField::invalidate`].
+    pub typ_watchers: QuasiImmutField,
+}
+
+impl CachedAttributeHolder {
+    /// Change mapdict.py:675 `attr` using the ordering, fast path, and
+    /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
+    pub fn set_attr(&self, a: MapRef) {
+        if self.attr.get() == a {
+            return;
+        }
+        if self.attr_watchers.is_installed() {
+            unsafe { pyre_object::quasiimmut::sweep_quasi_immut_field(&self.attr_watchers) };
+        }
+        self.attr.set(a);
+    }
+
+    /// Change mapdict.py:676 `typ` using the ordering, fast path, and
+    /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
+    pub fn set_typ(&self, t: Option<UnboxType>) {
+        if self.typ.get() == t {
+            return;
+        }
+        if self.typ_watchers.is_installed() {
+            unsafe { pyre_object::quasiimmut::sweep_quasi_immut_field(&self.typ_watchers) };
+        }
+        self.typ.set(t);
+    }
+
+    pub fn register_attr_watcher(&self, flag: &Arc<AtomicBool>) {
+        self.attr_watchers.register_loop_token(flag);
+    }
+
+    pub fn install_attr_watcher(&self) {
+        self.attr_watchers.ensure_installed();
+    }
+
+    pub fn attr_qmut_installed(&self) -> bool {
+        self.attr_watchers.is_installed()
+    }
+
+    pub fn force_attr_qmut(&self) {
+        self.attr_watchers.invalidate();
+    }
+
+    pub fn register_typ_watcher(&self, flag: &Arc<AtomicBool>) {
+        self.typ_watchers.register_loop_token(flag);
+    }
+
+    pub fn install_typ_watcher(&self) {
+        self.typ_watchers.ensure_installed();
+    }
+
+    pub fn typ_qmut_installed(&self) -> bool {
+        self.typ_watchers.is_installed()
+    }
+
+    pub fn force_typ_qmut(&self) {
+        self.typ_watchers.invalidate();
+    }
+}
+
+/// Register a loop against a CachedAttributeHolder's `attr?` field.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_register_attr_watcher(
+    holder: *const CachedAttributeHolder,
+    flag: &Arc<AtomicBool>,
+) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).register_attr_watcher(flag) };
+}
+
+/// Install a CachedAttributeHolder's `attr?` watcher without registering a loop.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_install_attr_watcher(holder: *const CachedAttributeHolder) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).install_attr_watcher() };
+}
+
+/// Whether a CachedAttributeHolder's `attr?` watcher is installed.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_attr_qmut_installed(holder: *const CachedAttributeHolder) -> bool {
+    !holder.is_null() && unsafe { (*holder).attr_qmut_installed() }
+}
+
+/// Force a CachedAttributeHolder's `attr?` qmut directly. This is the tracer's
+/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
+/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_force_attr_qmut(holder: *const CachedAttributeHolder) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).force_attr_qmut() };
+}
+
+/// Register a loop against a CachedAttributeHolder's `typ?` field.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_register_typ_watcher(
+    holder: *const CachedAttributeHolder,
+    flag: &Arc<AtomicBool>,
+) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).register_typ_watcher(flag) };
+}
+
+/// Install a CachedAttributeHolder's `typ?` watcher without registering a loop.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_install_typ_watcher(holder: *const CachedAttributeHolder) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).install_typ_watcher() };
+}
+
+/// Whether a CachedAttributeHolder's `typ?` watcher is installed.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_typ_qmut_installed(holder: *const CachedAttributeHolder) -> bool {
+    !holder.is_null() && unsafe { (*holder).typ_qmut_installed() }
+}
+
+/// Force a CachedAttributeHolder's `typ?` qmut directly. This is the tracer's
+/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
+/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
+///
+/// # Safety
+/// `holder` must be null or point at a live owner.
+pub unsafe fn holder_force_typ_qmut(holder: *const CachedAttributeHolder) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).force_typ_qmut() };
 }
 
 /// mapdict.py:670-676 `CachedAttributeHolder.__init__`.
@@ -3166,7 +3520,9 @@ unsafe fn new_cached_attribute_holder(
     Box::into_raw(Box::new(CachedAttributeHolder {
         order,
         attr: Cell::new(attr),
+        attr_watchers: QuasiImmutField::new(),
         typ: Cell::new(unbox_type),
+        typ_watchers: QuasiImmutField::new(),
     }))
 }
 
@@ -3185,14 +3541,12 @@ unsafe fn holder_pick_attr(
     }
     // The cached attribute was unboxed but the new value has a different type;
     // invalidate unboxing for this terminator and re-box (mapdict.py:682-690).
-    h.typ.set(None);
+    h.set_typ(None);
     let attr = h.attr.get();
     let p = unsafe { (*attr).as_plain() };
-    unsafe { (*p.terminator).as_terminator() }
-        .allow_unboxing
-        .set(false);
+    unsafe { (*p.terminator).as_terminator() }.set_allow_unboxing(false);
     let new_attr = unsafe { new_plain_attribute(p.name.clone(), p.attrkind, p.back, h.order) };
-    h.attr.set(new_attr);
+    h.set_attr(new_attr);
     new_attr
 }
 
@@ -3268,6 +3622,168 @@ unsafe fn find_branch_to_move_into(
         current_order = p.order;
         current = p.back;
     }
+}
+
+/// Side-effect-free twin of mapdict.py:170-193
+/// `AbstractAttribute._find_branch_to_move_into` for the tracer's
+/// `opimpl_jit_force_quasi_immutable` predicate.
+///
+/// The ordinary resolver interns a missing transition through `get_new_attr`.
+/// This resolver instead returns `None` at exactly that point, making the
+/// caller decline rather than changing later `CachedAttributeHolder.order`
+/// assignments merely because a trace was attempted. Each `cache_attrs` lock
+/// is released before the chain walk continues; no `QuasiImmutField` lock may
+/// be taken while a `cache_attrs` mutex or an `INSTANCE_LOCKS` stripe is held.
+/// In particular, moving the force check inside `add_attr` would recursively
+/// take the non-reentrant `cache_attrs` mutex and deadlock.
+///
+/// # Safety
+/// `self_node` and its chain must point to live map nodes.
+unsafe fn find_branch_to_move_into_readonly(
+    self_node: MapRef,
+    name: &Wtf8,
+    attrkind: u16,
+    _unbox_type: Option<UnboxType>,
+) -> Option<(usize, *const CachedAttributeHolder)> {
+    let mut current_order = usize::MAX; // sys.maxint
+    let mut number_to_readd = 0usize;
+    let mut current = self_node;
+    loop {
+        let holder = {
+            let cache = unsafe { (*current).cache_attrs() }
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache
+                .iter()
+                .find(|((cached_name, cached_kind), _)| {
+                    cached_kind == &attrkind && &**cached_name == name
+                })
+                .map(|(_, &holder)| holder)
+        };
+        let reached_top = match holder {
+            None => true,
+            Some(h) => (unsafe { (*h).order }) > current_order,
+        };
+        if reached_top {
+            if !unsafe { (*current).is_plain() } {
+                // `find_branch_to_move_into` would call `get_new_attr` here.
+                return None;
+            }
+        } else {
+            return Some((number_to_readd, holder.unwrap()));
+        }
+        number_to_readd += 1;
+        let p = unsafe { (*current).as_plain() };
+        current_order = p.order;
+        current = p.back;
+    }
+}
+
+/// The first mapdict quasi-immutable field a write would change.
+#[derive(Clone, Copy)]
+pub enum MapdictQmutTarget {
+    PlainEverMutated(*const PlainAttribute),
+    TerminatorAllowUnboxing(*const Terminator),
+    HolderTyp(*const CachedAttributeHolder),
+    HolderAttr(*const CachedAttributeHolder),
+}
+
+/// Resolve STORE_ATTR's mapdict.py:1618-1627 attribute classification without
+/// applying the write. `bool` selects the `"slot"` attrname.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn classify_mapdict_write_attr(w_obj: PyObjectRef, name: &str) -> Option<(u16, bool)> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    Some(unsafe { classify_attr(w_type, w_descr, true) })
+}
+
+/// Return the first `?` field mapdict.py:68-75 `AbstractAttribute.write` would
+/// flip, without performing the write or interning a transition.
+///
+/// Watcher installation belongs to the tracer. This predicate never reads an
+/// `*_qmut_installed` flag and never holds a `cache_attrs` mutex or an
+/// `INSTANCE_LOCKS` stripe while a `QuasiImmutField` lock can be taken.
+///
+/// # Safety
+/// `w_obj` and `w_value` must be live objects.
+pub unsafe fn setattr_would_force_quasi_immut(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+    attrkind: u16,
+    w_value: PyObjectRef,
+) -> Option<MapdictQmutTarget> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    if let Some(attr) = unsafe { find_map_attr(map, name, attrkind) } {
+        let p = unsafe { (*attr).as_plain() };
+        if !p.ever_mutated.get() {
+            return Some(MapdictQmutTarget::PlainEverMutated(p));
+        }
+        if let Some(unboxed) = &p.unboxed {
+            let term = unsafe { (*p.terminator).as_terminator() };
+            if !unsafe { value_has_unbox_type(unboxed.typ, w_value) } && term.allow_unboxing.get() {
+                return Some(MapdictQmutTarget::TerminatorAllowUnboxing(term));
+            }
+        }
+        return None;
+    }
+
+    let term = unsafe { (*(*map).terminator()).as_terminator() };
+    if attrkind == DICT && term.kind != TerminatorKind::Dict {
+        return None;
+    }
+    let unbox_type = unsafe { pick_unbox_type(map, w_value) };
+    let (_, holder) =
+        unsafe { find_branch_to_move_into_readonly(map, name, attrkind, unbox_type) }?;
+    let typ = unsafe { (*holder).typ.get() };
+    if typ.is_some() && typ != unbox_type {
+        Some(MapdictQmutTarget::HolderTyp(holder))
+    } else {
+        None
+    }
+}
+
+/// Return the first `?` field mapdict.py:77-78 / 461-470 delete would flip,
+/// without applying the deletion.
+///
+/// The `PlainAttribute.delete` → `_copy_attr` → `add_attr` → `pick_attr`
+/// re-add chain (mapdict.py:461-470) is deliberately not modelled: simulating
+/// that rebuild side-effect-free is not tractable against the current
+/// `node_copy` / `add_attr` shape. The optimizer's
+/// `quasiimmut_field_still_valid` revalidation (heap.py:798-804, ported in
+/// majit-metainterp's `optimizeopt/heap.rs`) discards a loop whose recorded `?`
+/// value moved during tracing, so a missed force costs a wasted trace, never
+/// correctness. Watcher installation belongs to the tracer; this predicate
+/// reads no `*_qmut_installed` flag and takes no `QuasiImmutField` lock while a
+/// `cache_attrs` mutex or an `INSTANCE_LOCKS` stripe is held.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn delattr_would_force_quasi_immut(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+    attrkind: u16,
+) -> Option<MapdictQmutTarget> {
+    let mut current = unsafe { mapdict_map_or_null(w_obj) };
+    while !current.is_null() && unsafe { (*current).is_plain() } {
+        let p = unsafe { (*current).as_plain() };
+        if p.attrkind == attrkind && &*p.name == name {
+            return (!p.ever_mutated.get()).then_some(MapdictQmutTarget::PlainEverMutated(p));
+        }
+        current = p.back;
+    }
+    None
 }
 
 /// mapdict.py:195-202 `AbstractAttribute._pick_unbox_type`.
@@ -3490,11 +4006,7 @@ pub unsafe fn node_write<O: MapdictObject>(
         },
         Some(attr) => {
             let p = unsafe { (*attr).as_plain() };
-            if p.ever_mutated.get() {
-                // already mutated
-            } else {
-                p.ever_mutated.set(true);
-            }
+            p.set_ever_mutated(true);
             unsafe { plain_direct_write(attr, obj, w_value) };
             true
         }
@@ -4592,7 +5104,7 @@ mod tests {
     // PlainAttribute path and never type-inspect the (sentinel) value.
     unsafe fn boxed_dict_terminator() -> MapRef {
         let term = new_dict_terminator(std::ptr::null_mut());
-        unsafe { (*term).as_terminator() }.allow_unboxing.set(false);
+        unsafe { (*term).as_terminator() }.set_allow_unboxing(false);
         term
     }
 
@@ -5454,7 +5966,7 @@ mod tests {
             node_write(m, &mut obj, wn("x"), DICT, pyre_object::w_int_new(10));
             assert!((*obj.map).as_plain().unboxed.is_some());
             // the class becomes type-unstable: freeze unboxing for its terminator.
-            (*term).as_terminator().allow_unboxing.set(false);
+            (*term).as_terminator().set_allow_unboxing(false);
             // mapdict.py:592-598 — a read now lazily migrates obj to boxed storage.
             let m = obj._get_mapdict_map();
             maybe_migrate_to_boxed(m, &mut obj, wn("x"), DICT);
