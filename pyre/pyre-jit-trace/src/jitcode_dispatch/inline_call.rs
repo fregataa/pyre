@@ -1612,6 +1612,11 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
                     body.code, descr_refs,
                 ),
                 owns_loop_header: callee_body_owns_loop_header(body.code),
+                has_exception_table: unsafe {
+                    let raw = pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
+                        as *const pyre_interpreter::CodeObject;
+                    !raw.is_null() && !(&(*raw).exceptiontable).is_empty()
+                },
             }),
     )
 }
@@ -2955,11 +2960,20 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return Ok(None);
     }
-    // An unbound method-form callee whose body reads `self.attr`.  Every entry
-    // inlines one; the FOR_ITER deferred-admit decline below is what that reach
-    // still costs.
+    // An unbound method-form callee whose body reads `self.attr`.  FOR_ITER
+    // admits this widened surface only when the receiver is known not to be a
+    // type object: type-attribute reads can run through metatype descriptor
+    // dispatch and still reach the deferred abort path below.
     let widened_method_form =
         method_form && bound_method.is_none() && !body_facts.method_form_supported;
+    let widened_method_foriter_admissible = !widened_method_form
+        || callee_arg_concretes.first().is_some_and(|concrete| {
+            matches!(
+                concrete,
+                ConcreteValue::Ref(receiver)
+                    if !receiver.is_null() && !unsafe { pyre_object::is_type(*receiver) }
+            )
+        });
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
     // Replaying a live-heap mutation would double it, so a Dirty body stays on
@@ -2983,6 +2997,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             body.num_regs_r,
             body.constants_r,
             callee_descr_refs,
+            method_form,
         );
         let legacy_admit = match safety {
             CalleeReplaySafety::Clean => true,
@@ -2997,14 +3012,26 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // body is still admitted from there — it has nothing that can
                 // abort.
                 //
-                // A body that reads `self.attr` stays out as well.  Admitting
-                // one costs an abort that retires the enclosing loop before the
-                // deny takes effect -- `synth/type_metatype_method_call` went
-                // `loops_aborted` 0 -> 1 and `bridges_compiled` 47 -> 44 on the
-                // admission alone.  Declining here reaches the same residual
-                // call with the loop intact.
+                // A widened method-form body is admitted only after proving the
+                // receiver is not a type object.  The type receiver shape
+                // (`cls.__name__` through `type.__getattribute__`) reaches the
+                // deferred abort path, and that first abort retires the
+                // enclosing loop before the deny helps the next attempt.
+                // Declining it here reaches the same residual call with the
+                // loop intact.
+                //
+                // A callee with its own exception handler has protected-region
+                // state that must be restored at the callee's precise resume
+                // point.  If a deferred residual later aborts after a folded
+                // effect, caller-boundary replay can repeat the protected
+                // entry or skip the handler cleanup.  Keep handler-bearing
+                // bodies on the residual path unless this scan proves them
+                // clean.
                 foriter_deferred_admit = arg_class_guard.is_none()
-                    && !widened_method_form
+                    && widened_method_foriter_admissible
+                    && !body_facts.owns_loop_header
+                    && !pyre_interpreter::code_has_for_iter(callee_code)
+                    && !body_facts.has_exception_table
                     && !fbw_foriter_deferred_call_denied(callee_code_key);
                 foriter_deferred_admit
             }
@@ -3165,7 +3192,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // is the same one the single condition had.  Keeping the class lets the
     // decline census say which admission would widen it.
     let branchy_handler_safety =
-        if contains_raise && !strict_inlinable && jitcode_has_exception_handler(body.code) {
+        if contains_raise && !strict_inlinable && body_facts.has_exception_table {
             Some(fbw_callee_body_replay_safety(
                 body.code,
                 &exact_numeric_args,
@@ -3174,6 +3201,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 body.num_regs_r,
                 body.constants_r,
                 callee_descr_refs,
+                false,
             ))
         } else {
             None
@@ -5779,6 +5807,7 @@ pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
         body.num_regs_r,
         body.constants_r,
         callee_descr_refs,
+        false,
     );
     // `DeferredCall` is admitted alongside `Clean`, and the terminating `raise`
     // is what makes that necessary: `RaiseVarargs` classifies as a deferred
