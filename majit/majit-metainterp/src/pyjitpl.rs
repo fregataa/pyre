@@ -21,6 +21,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use crate::jitprof::Instant;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
@@ -6061,6 +6062,7 @@ impl<M: Clone> MetaInterp<M> {
             Vec<majit_ir::OpRc>,
             crate::optimizeopt::unroll::ExportedState,
         )> = None;
+        let optimize_start = Instant::now();
         let optimize_result = if no_unroll {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -6263,6 +6265,7 @@ impl<M: Clone> MetaInterp<M> {
                 optimized_ops
             }
         };
+        let opt_time = Instant::now().saturating_duration_since(optimize_start);
         let num_ops_after = optimized_ops.len();
         if crate::majit_log_enabled() {
             eprintln!(
@@ -6625,12 +6628,14 @@ impl<M: Clone> MetaInterp<M> {
                 compiled_ops.len()
             );
         }
+        let compile_start = Instant::now();
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_loop(&inputargs, &compiled_ops, &token)
             }))
         };
+        let compile_time = Instant::now().saturating_duration_since(compile_start);
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
@@ -6808,8 +6813,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     num_ops_before,
                     num_ops_after,
-                    std::time::Duration::ZERO,
-                    std::time::Duration::ZERO,
+                    opt_time,
+                    compile_time,
                 );
                 // warmstate.py:339-348 attach the same compiled token object.
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
@@ -7614,6 +7619,7 @@ impl<M: Clone> MetaInterp<M> {
         // the pre-peel arg set for slots the loop label rebinds.
         unroll_opt.emit_start_label = false;
 
+        let optimize_start = Instant::now();
         let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
             &trace_ops,
             &mut constants,
@@ -7634,6 +7640,7 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        let opt_time = Instant::now().saturating_duration_since(optimize_start);
         // compile.py:384-390: merge loop_info deps first, then deps carried
         // from the exported start_state.
         let mut quasi_immutable_deps = std::mem::take(&mut unroll_opt.quasi_immutable_deps);
@@ -7809,6 +7816,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_start = Instant::now();
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7820,6 +7828,7 @@ impl<M: Clone> MetaInterp<M> {
                 )
             }))
         };
+        let compile_time = Instant::now().saturating_duration_since(compile_start);
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(payload) => {
@@ -7974,8 +7983,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     num_ops_before,
                     num_combined_ops,
-                    std::time::Duration::ZERO,
-                    std::time::Duration::ZERO,
+                    opt_time,
+                    compile_time,
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
@@ -8569,6 +8578,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // InvalidLoop during optimization should abort the trace, not crash
         // the process. Matches compile_loop.
+        let optimize_start = Instant::now();
         let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
             // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
             // seeds identity directly from them.
@@ -8599,6 +8609,7 @@ impl<M: Clone> MetaInterp<M> {
                 return Err(SwitchToBlackhole::giveup());
             }
         };
+        let opt_time = Instant::now().saturating_duration_since(optimize_start);
         // RPython optimizer.py:552-556 (flush=True): Finish/Jump is sent
         // through passes inside propagate_all_forward and ends up in
         // new_operations naturally — no restoration needed.
@@ -8731,11 +8742,13 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_start = Instant::now();
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend
                 .compile_loop(&inputargs, &optimized_ops, &token)
         };
+        let compile_time = Instant::now().saturating_duration_since(compile_start);
         match compile_loop_result {
             Ok(_) => {
                 self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
@@ -8857,6 +8870,13 @@ impl<M: Clone> MetaInterp<M> {
                         },
                     );
                 }
+                self.warm_state.log_compile(
+                    green_key,
+                    num_ops_before,
+                    num_ops_after,
+                    opt_time,
+                    compile_time,
+                );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
                 // `cpu.tracker.total_compiled_loops` is bumped inside
@@ -8990,6 +9010,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
+        let optimize_start = Instant::now();
         let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
             // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
             &trace.ops,
@@ -9013,6 +9034,7 @@ impl<M: Clone> MetaInterp<M> {
                 return None;
             }
         };
+        let opt_time = Instant::now().saturating_duration_since(optimize_start);
 
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
@@ -9106,6 +9128,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_start = Instant::now();
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
@@ -9115,6 +9138,7 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
         };
+        let compile_time = Instant::now().saturating_duration_since(compile_start);
         match compile_loop_result {
             Ok(_) => {
                 self.assign_guard_hashes(token.as_ref());
@@ -9197,6 +9221,13 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens,
                         next_global_opref,
                     },
+                );
+                self.warm_state.log_compile(
+                    green_key,
+                    num_ops_before,
+                    num_ops_after,
+                    opt_time,
+                    compile_time,
                 );
                 self.stats.loops_compiled += 1;
                 // `cpu.tracker.total_compiled_loops` is bumped inside
@@ -11381,6 +11412,7 @@ impl<M: Clone> MetaInterp<M> {
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py:1245-1282).
         let retrace_limit = self.warm_state.retrace_limit();
+        let optimize_start = Instant::now();
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             optimizer.optimize_bridge(
@@ -11419,6 +11451,7 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        let opt_time = Instant::now().saturating_duration_since(optimize_start);
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
         // RPython-orthodox: unroll.py replay uses Const args directly;
@@ -11504,6 +11537,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_start = Instant::now();
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -11511,6 +11545,7 @@ impl<M: Clone> MetaInterp<M> {
                     .compile_loop(bridge_inputargs, &optimized_ops, &token)
             }))
         };
+        let compile_time = Instant::now().saturating_duration_since(compile_start);
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(payload) => {
@@ -11635,6 +11670,13 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens,
                         next_global_opref,
                     },
+                );
+                self.warm_state.log_compile(
+                    original_green_key,
+                    bridge_ops.len(),
+                    num_optimized_ops,
+                    opt_time,
+                    compile_time,
                 );
                 self.attach_procedure_with_redirect(original_green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
