@@ -3786,23 +3786,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                             _
                         ))
                     ) && (
-                        // Hazard 3 — the wasm backend cannot run the widened
-                        // shape at all, so it keeps the blanket decline.
-                        // Admitting a callee here traces into its body, and the
-                        // helper this widening exists for carries its own loop
-                        // (`while tb is not None:`), so the enclosing trace
-                        // closes with a CALL_ASSEMBLER into that loop.  Every
-                        // wasm trace is its own module and there is no
-                        // inter-module chaining, so the backend declines any
-                        // CALL_ASSEMBLER outright; that decline is the `Err`
-                        // arm of the compile step, so the enclosing loop is
-                        // aborted rather than merely left interpreted.
-                        // Measured `loops_aborted` 0 -> 3 on
-                        // `synth/exception_traceback_lineno_chain` and 0 -> 5
-                        // on `synth/exception_inline_callee_tb_frames`, each
-                        // ~5-9% slower than declining.  Drop this arm once the
-                        // backend can chain modules.
-                        cfg!(target_arch = "wasm32")
                         // Hazard 1 — kept operands. A branch that leaves slots
                         // on the value stack needs its guard resume to restore
                         // them, and the inline sub-walk's mirror does not model
@@ -3814,7 +3797,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         // instruction and the branch pops the tested value, so
                         // `depth > 1` is exactly "a kept slot survives".  An
                         // unreachable pc has no depth and cannot fire a guard.
-                        || liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
+                        liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
                             // Hazard 2 — the tested operand itself.  When the
                             // multiframe inline int-specializes the tested
                             // local, the mid-body guard resume cannot source
