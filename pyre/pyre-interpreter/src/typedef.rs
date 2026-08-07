@@ -293,7 +293,17 @@ pub fn init_typeobjects() {
 
         // type — PyPy: typeobject.py, bases=(object,)
         // type.__new__(metatype, name, bases, dict) creates new types
-        let type_type = new_typeobject_with_base("type", init_type_type, object_type);
+        // Layout = TYPE_TYPE because instances are W_TypeObject.  Sharing
+        // object's layout would make `object.layout.typedef is
+        // type.layout.typedef` hold, and `check_user_subclass` reads exactly
+        // that identity to refuse `object.__new__(type)` and
+        // `object.__new__(<metaclass>)`.
+        let type_type = new_typeobject_with_base_and_layout(
+            "type",
+            init_type_type,
+            object_type,
+            &TYPE_TYPE as *const PyType,
+        );
         // `type` is itself an immediate subclass of `object`; static type
         // construction does not pass through heaptype subclass registration,
         // so record this edge explicitly for `object.__subclasses__()`.
@@ -10784,15 +10794,21 @@ fn init_type_type(ns: PyObjectRef) {
     // `type.mro(cls)` — typeobject.c `mro_external` / `type.mro`: the method
     // form returns the MRO as a fresh list (the `__mro__` getset above
     // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
-    let mro_method = make_builtin_function("mro", |args| {
-        let cls = args[0];
-        // typeobject.py:1081-1084 `descr_mro` computes the default C3 MRO
-        // afresh. In particular this is callable from `Meta.mro()` while the
-        // nascent class has not installed its final MRO yet.
-        Ok(pyre_object::w_list_new(unsafe {
-            crate::baseobjspace::compute_default_mro(cls)
-        }))
-    });
+    // `mro()` takes its receiver and nothing else; the declared count is what
+    // rejects a surplus argument before the body indexes `args[0]`.
+    let mro_method = make_builtin_function_with_arity(
+        "mro",
+        |args| {
+            let cls = args[0];
+            // typeobject.py:1081-1084 `descr_mro` computes the default C3 MRO
+            // afresh. In particular this is callable from `Meta.mro()` while the
+            // nascent class has not installed its final MRO yet.
+            Ok(pyre_object::w_list_new(unsafe {
+                crate::baseobjspace::compute_default_mro(cls)
+            }))
+        },
+        1,
+    );
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "mro", mro_method) };
 
     // typeobject.py:1274-1275 `descr___prepare__` —
@@ -16610,9 +16626,66 @@ fn cmp_guard_tuple(b: PyObjectRef) -> bool {
 fn cmp_guard_bytes(b: PyObjectRef) -> bool {
     unsafe { pyre_object::bytesobject::is_bytes(b) }
 }
-fn cmp_guard_bytearray(b: PyObjectRef) -> bool {
-    unsafe { pyre_object::bytesobject::is_bytes_like(b) }
+/// `bytearrayobject.py:305 descr_eq` / `:355 _comparison_helper` — a bytearray
+/// compares by content against **any** `BUF_SIMPLE` exporter, not only against
+/// another bytes-like: the non-bytes-like operand goes to
+/// `space.acquire_py_buffer(w_other, space.BUF_SIMPLE)`, and only the TypeError
+/// that raises becomes `NotImplemented`.
+///
+/// `bytes` deliberately keeps the narrow [`cmp_guard_bytes`] test.  Its own
+/// comparisons never acquire a buffer, which is why
+/// `b'ab' == array.array('B', [97, 98])` is `False` while the bytearray
+/// spelling of it is `True`.
+fn bytearray_compare(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: crate::objspace::descroperation::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
+    // The bytes-like arms, and any receiver this slot was not meant for, keep
+    // the by-layout comparison.
+    if unsafe {
+        !pyre_object::bytesobject::is_bytes_like(a) || pyre_object::bytesobject::is_bytes_like(b)
+    } {
+        return crate::objspace::descroperation::compare_slot(a, b, op);
+    }
+    let buffer = match crate::baseobjspace::simple_buffer_bytes(b) {
+        Ok(Some(buffer)) => buffer,
+        Ok(None) => return Ok(pyre_object::w_not_implemented()),
+        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
+            return Ok(pyre_object::w_not_implemented());
+        }
+        Err(error) => return Err(error),
+    };
+    // `getdata()` is read after the acquisition: a `__buffer__` slot is
+    // app-level code and may have resized the receiver.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(a) }.to_vec();
+    // `_memcmp` over the common prefix, then the lengths decide — which is
+    // what a lexicographic slice comparison already is.
+    let ordering = data.as_slice().cmp(buffer.as_bytes());
+    buffer.release();
+    Ok(pyre_object::w_bool_from(
+        crate::objspace::descroperation::ordering_satisfies(ordering, op),
+    ))
 }
+
+macro_rules! bytearray_cmp_dunder {
+    ($name:ident, $op:ident) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
+            bytearray_compare(
+                args[0],
+                args[1],
+                crate::objspace::descroperation::CompareOp::$op,
+            )
+        }
+    };
+}
+bytearray_cmp_dunder!(bytearray_dunder_eq, Eq);
+bytearray_cmp_dunder!(bytearray_dunder_ne, Ne);
+bytearray_cmp_dunder!(bytearray_dunder_lt, Lt);
+bytearray_cmp_dunder!(bytearray_dunder_le, Le);
+bytearray_cmp_dunder!(bytearray_dunder_gt, Gt);
+bytearray_cmp_dunder!(bytearray_dunder_ge, Ge);
 
 macro_rules! cmp_dunder {
     ($name:ident, $op:ident, $guard:path) => {
@@ -16740,15 +16813,6 @@ cmp_dunder_set!(
     bytes_dunder_gt,
     bytes_dunder_ge,
     cmp_guard_bytes
-);
-cmp_dunder_set!(
-    bytearray_dunder_eq,
-    bytearray_dunder_ne,
-    bytearray_dunder_lt,
-    bytearray_dunder_le,
-    bytearray_dunder_gt,
-    bytearray_dunder_ge,
-    cmp_guard_bytearray
 );
 
 type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
@@ -16988,9 +17052,18 @@ fn init_int_type(ns: PyObjectRef) {
                     pos.get(2).is_some(),
                 )?;
                 if pos.len() > 3 {
+                    let given = pos.len() - 1;
+                    // `_PyArg_UnpackKeywords` names the total parameter count
+                    // once the call passes every parameter, and the positional
+                    // limit while it is only past the positional ones —
+                    // `signed` is keyword-only.
+                    let limit = if given > 3 {
+                        "at most 3 arguments"
+                    } else {
+                        "at most 2 positional arguments"
+                    };
                     return Err(crate::PyError::type_error(format!(
-                        "to_bytes() takes at most 2 positional arguments ({} given)",
-                        pos.len() - 1
+                        "to_bytes() takes {limit} ({given} given)"
                     )));
                 }
                 let owned_val;
@@ -17776,9 +17849,12 @@ fn init_float_type(ns: PyObjectRef) {
                 let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
                     unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
                 } else {
-                    return Err(crate::PyError::type_error(
-                        "fromhex() requires a string argument",
-                    ));
+                    // `@unwrap_spec(s='text')` — the operand is rejected by
+                    // `space.text_w`, which words it this way.
+                    return Err(crate::PyError::type_error(format!(
+                        "expected str, got {} object",
+                        crate::type_methods::arg_type_name(args[1])
+                    )));
                 };
                 // Delegate parsing to the shared hex-float reader, which rounds
                 // round-half-even over the full exponent range (subnormals down to
@@ -18557,6 +18633,12 @@ pub(crate) fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     if unsafe { pyre_object::w_type_is_abstract(cls) } {
         return Err(abstract_instantiation_error(cls));
     }
+    // `descr__new__` allocates through `allocate_instance(W_ObjectObject, ...)`
+    // (objspace.py:511), whose `check_user_subclass` is what refuses a type
+    // laid out by something other than `object` — `object.__new__(int)`, and a
+    // user subclass of one, which the bare allocator would leave without the
+    // fields its own methods then read.
+    check_user_subclass(w_object, cls)?;
     Ok(w_instance_new(cls))
 }
 
@@ -19287,8 +19369,10 @@ fn bytearray_descr_init_value(
         }
         // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
         // before trying the iterable path.  This includes Python 3.14's
-        // `__buffer__` slot, not only the native built-in exporters.
-        if let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(arg)? {
+        // `__buffer__` slot, not only the native built-in exporters.  The
+        // request is `BUF_FULL_RO`, so a strided source is copied out rather
+        // than refused.
+        if let Some(buffer) = crate::baseobjspace::full_ro_buffer_bytes(arg)? {
             let data = buffer.as_bytes().to_vec();
             buffer.release();
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data));
@@ -20104,11 +20188,15 @@ fn bytes_prefix_match(
     let result = (|| {
         let data = receiver.as_bytes();
         // `start > len(value)` collapses the window to None → no match.
-        let Some((start, end)) = bytes_idx_window(data.len(), bounds) else {
-            return Ok(false);
-        };
-        let window = &data[start..end];
+        // `_startswith`/`_endswith` reach that early-out only after
+        // `_op_val` has converted the operand, so the window being empty
+        // does not excuse a prefix of the wrong type.
+        let bounds = bytes_idx_window(data.len(), bounds);
         let test = |prefix: &[u8]| {
+            let Some((start, end)) = bounds else {
+                return false;
+            };
+            let window = &data[start..end];
             if forward {
                 window.starts_with(prefix)
             } else {
@@ -20262,14 +20350,7 @@ fn bytes_strip(
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let chars: Option<Vec<u8>> = match args.get(1) {
         Some(&a) if !a.is_null() && unsafe { !pyre_object::is_none(a) } => {
-            if let Some(src) = buffer_as_bytes_like(a)? {
-                Some(unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec())
-            } else {
-                return Err(crate::PyError::type_error(format!(
-                    "a bytes-like object is required, not '{}'",
-                    type_name_of(a)
-                )));
-            }
+            Some(require_bytes_like(a)?.to_vec())
         }
         _ => None,
     };
@@ -20353,10 +20434,31 @@ pub(crate) fn buffer_as_bytes_like(
     Ok(None)
 }
 
+/// `space.buffer_w(w_obj, space.BUF_SIMPLE)`'s contiguity requirement.
+///
+/// An operand a bytes method consumes as one byte run is refused when its
+/// export is strided; only the `BUF_FULL_RO` request the `bytes()` /
+/// `bytearray()` constructors make linearises such a source.
+pub(crate) fn require_contiguous_buffer(obj: PyObjectRef) -> Result<(), crate::PyError> {
+    unsafe {
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            crate::builtins::memoryview_check_released(obj)?;
+            if !crate::builtins::memoryview_contiguity(obj).0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Require `obj` to be a bytes-like object, returning its bytes; raises
 /// the CPython `a bytes-like object is required, not '<type>'` TypeError
 /// otherwise.  A memoryview is accepted through its backing buffer.
 fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError> {
+    require_contiguous_buffer(obj)?;
     match buffer_as_bytes_like(obj)? {
         Some(src) => Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) }),
         None => Err(crate::PyError::type_error(format!(
@@ -20686,6 +20788,7 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             if i > 0 {
                 out.extend_from_slice(sep);
             }
+            require_contiguous_buffer(item)?;
             let Some(src) = buffer_as_bytes_like(item)? else {
                 return Err(crate::PyError::type_error(format!(
                     "sequence item {i}: expected a bytes-like object, {} found",
@@ -20875,12 +20978,15 @@ fn bytes_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(pyre_object::w_bool_from(cased))
 }
 
-/// `stringmethods.py` justification fill char — defaults to space; a
-/// non-length-1 bytes-like raises `<method>() argument 2 must be a
-/// single character`.
+/// `stringmethods.py` justification fill char — a non-length-1 bytes-like
+/// raises `<method>() argument 2 must be a single character`.
+///
+/// `w_fillchar=WrappedDefault(' ')` supplies the space only for an *omitted*
+/// argument; a supplied `None` reaches `_op_val` like any other value and is
+/// refused there, so it must not be read as "absent" here.
 fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8, crate::PyError> {
     match args.get(idx) {
-        Some(&f) if !f.is_null() && unsafe { !pyre_object::is_none(f) } => {
+        Some(&f) if !f.is_null() => {
             let d = require_bytes_like(f)?;
             if d.len() != 1 {
                 return Err(crate::PyError::type_error(format!(
@@ -20895,7 +21001,7 @@ fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8,
 
 /// `stringmethods.py:descr_ljust` — left-justify within `width`.
 fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "ljust", 1)?;
+    crate::type_methods::arity_between(args, "ljust", 1, 2)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "ljust")?;
@@ -20911,7 +21017,7 @@ fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// `stringmethods.py:descr_rjust` — right-justify within `width`.
 fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "rjust", 1)?;
+    crate::type_methods::arity_between(args, "rjust", 1, 2)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "rjust")?;
@@ -20929,7 +21035,7 @@ fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// fill byte (for odd padding) follows PyPy's `d//2 + (d & width & 1)`
 /// left-offset.
 fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "center", 1)?;
+    crate::type_methods::arity_between(args, "center", 1, 2)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "center")?;
@@ -21109,19 +21215,14 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let table: Option<&[u8]> = unsafe {
         if pyre_object::is_none(table_obj) {
             None
-        } else if let Some(src) = buffer_as_bytes_like(table_obj)? {
-            let t = pyre_object::bytesobject::bytes_like_data(src);
+        } else {
+            let t = require_bytes_like(table_obj)?;
             if t.len() != 256 {
                 return Err(crate::PyError::value_error(
                     "translation table must be 256 characters long",
                 ));
             }
             Some(t)
-        } else {
-            return Err(crate::PyError::type_error(format!(
-                "a bytes-like object is required, not '{}'",
-                type_name_of(table_obj)
-            )));
         }
     };
     let delete_obj = positional
@@ -21130,15 +21231,8 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .or_else(|| crate::builtins::kwarg_get(kwargs, "delete"));
     let mut deleted = [false; 256];
     if let Some(d) = delete_obj {
-        if let Some(src) = buffer_as_bytes_like(d)? {
-            for &b in unsafe { pyre_object::bytesobject::bytes_like_data(src) } {
-                deleted[b as usize] = true;
-            }
-        } else {
-            return Err(crate::PyError::type_error(format!(
-                "a bytes-like object is required, not '{}'",
-                type_name_of(d)
-            )));
+        for &b in require_bytes_like(d)? {
+            deleted[b as usize] = true;
         }
     }
     let mut out = Vec::with_capacity(data.len());
@@ -21364,9 +21458,16 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `bytes` and `byteorder` are the only positional parameters; `signed`
     // is keyword-only, so a third positional is an error.
     if pos.len() > 3 {
+        let given = pos.len() - 1;
+        // `_PyArg_UnpackKeywords` — see `to_bytes`; `signed` is keyword-only,
+        // so the total is one past the positional limit.
+        let limit = if given > 3 {
+            "at most 3 arguments"
+        } else {
+            "at most 2 positional arguments"
+        };
         return Err(crate::PyError::type_error(format!(
-            "from_bytes() takes at most 2 positional arguments ({} given)",
-            pos.len() - 1
+            "from_bytes() takes {limit} ({given} given)"
         )));
     }
     // `bytes` and `byteorder` are positional-or-keyword; supplying one both
@@ -22160,18 +22261,20 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         .get(2)
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "errors"));
-    // unicodeobject.py:1669 — encoding/errors must be str (space.text_w)
+    // `get_encoding_and_errors` (unicodeobject.py) defaults only on the
+    // *omitted* argument; a supplied value — `None` included — goes through
+    // `space.text_w` and is refused unless it is a str.
     if let Some(enc) = w_encoding {
-        if !unsafe { pyre_object::is_str(enc) } && !unsafe { pyre_object::is_none(enc) } {
-            let tn = unsafe { pyre_object::type_name_of(enc) };
+        if !unsafe { pyre_object::is_str(enc) } {
+            let tn = crate::type_methods::clinic_arg_type_name(enc);
             return Err(crate::PyError::type_error(format!(
                 "decode() argument 'encoding' must be str, not {tn}",
             )));
         }
     }
     if let Some(err) = w_errors {
-        if !unsafe { pyre_object::is_str(err) } && !unsafe { pyre_object::is_none(err) } {
-            let tn = unsafe { pyre_object::type_name_of(err) };
+        if !unsafe { pyre_object::is_str(err) } {
+            let tn = crate::type_methods::clinic_arg_type_name(err);
             return Err(crate::PyError::type_error(format!(
                 "decode() argument 'errors' must be str, not {tn}",
             )));
@@ -22492,8 +22595,10 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
         // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
         // before trying the iterable path.  This includes Python 3.14's
-        // `__buffer__` slot, not only the native built-in exporters.
-        if let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(arg)? {
+        // `__buffer__` slot, not only the native built-in exporters.  The
+        // request is `BUF_FULL_RO`, so a strided source is copied out rather
+        // than refused.
+        if let Some(buffer) = crate::baseobjspace::full_ro_buffer_bytes(arg)? {
             let data = buffer.as_bytes().to_vec();
             buffer.release();
             return Ok(new_bytes_like(args[0], &data));
@@ -22666,7 +22771,7 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `bytearrayobject.py:descr_remove` — remove the first byte equal to
 /// `value`; ValueError when absent.
 fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "remove", 1)?;
+    crate::type_methods::arity_exact(args, "remove", 1)?;
     unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let b = bytearray_byte_arg(args[1])?;
     unsafe {
@@ -22688,6 +22793,14 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     crate::type_methods::arity_at_most(args, "pop", 1)?;
     unsafe {
         crate::builtins::bytearray_check_exports(args[0])?;
+        // `w_idx=WrappedDefault(-1)` supplies the default only for an omitted
+        // argument; a supplied `None` reaches `space.int_w` and is refused
+        // there.  That read precedes the empty-receiver check, and it can run
+        // user code, so it also has to precede taking the storage borrow.
+        let index = match args.get(1) {
+            Some(&a) if !a.is_null() => crate::builtins::space_index_w(a)?,
+            _ => -1,
+        };
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         let len = vec.len() as i64;
         if len == 0 {
@@ -22696,12 +22809,6 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 "pop from empty bytearray",
             ));
         }
-        let index = match args.get(1) {
-            Some(&a) if !a.is_null() && !pyre_object::is_none(a) => {
-                crate::builtins::space_index_w(a)?
-            }
-            _ => -1,
-        };
         let i = if index < 0 { index + len } else { index };
         if i < 0 || i >= len {
             return Err(crate::PyError::new(

@@ -1520,6 +1520,14 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["format", "shape"], "cast")?;
+    // `format` and `shape` are the whole signature; a third positional was
+    // being read past and dropped.
+    if positional.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "cast() takes at most 2 arguments ({} given)",
+            crate::type_methods::args_given(positional)
+        )));
+    }
     let mv = positional.first().copied().unwrap_or(w_none());
     let fmt_obj = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "format", "cast", 1)?
         .ok_or_else(|| {
@@ -1544,7 +1552,10 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // format check below (with the replacement character `Wtf8`'s `Display`
         // substitutes) the same way any other unsupported format is.
         let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) }.to_string();
-        let has_shape = shape_obj.is_some_and(|s| !pyre_object::is_none(s));
+        // `if w_shape:` tests the *slot*, not app-level truth: `w_shape=None`
+        // is the omitted argument, while a supplied `None` is an ordinary
+        // object that enters the branch and fails its list/tuple check.
+        let has_shape = shape_obj.is_some();
         let orig_ndim = w_memoryview_ndim(mv);
         // Casts are restricted to C-contiguous source views.
         if !memoryview_contiguity(mv).0 {
@@ -4914,17 +4925,79 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             return type_descr_new_with_metaclass(&pos[i..], w_metaclass, kwargs);
         }
     }
-    if pos.len() == 1 && unsafe { pyre_object::is_type(pos[0]) } {
-        return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
-    }
     if pos.len() == 1 {
-        return type_descr_new_without_metaclass(pos, kwargs);
+        // `type.__new__(metatype)` — no name, bases or namespace follows, so
+        // `arguments_w` is empty and the count is neither one nor three.  The
+        // arity is decided before `_precheck_for_new`, which is why a
+        // non-metatype is named here rather than refused as one.
+        return Err(crate::PyError::type_error(new_arity_message(pos[0])));
     }
     if pos.len() == 2 {
+        precheck_for_new(pos[0])?;
+        // typeobject.py:901-908 — the one-argument form belongs to `type`
+        // alone: `type(x)` reports the type of `x`, while `Metaclass(x)` is a
+        // class statement missing its bases and its namespace.
+        if !unsafe { std::ptr::eq(pos[0], crate::typedef::w_type()) } {
+            return Err(crate::PyError::type_error(new_arity_message(pos[0])));
+        }
         return type_descr_new_without_metaclass(&pos[1..], kwargs);
+    }
+    // `descr__new__` (typeobject.py:885) keys the one-vs-three form on the
+    // argument *count*, and `_check_new_args` is what names an argument of
+    // the wrong type.  The scan above keys on a str being present instead,
+    // so `type(1, (), {})` arrives here with its three arguments intact;
+    // hand that unambiguous `[metatype, name, bases, dict]` shape on so the
+    // name gets reported rather than the arity.
+    if pos.len() == 4 {
+        // Three arguments, so the count is settled and `_precheck_for_new`
+        // (typeobject.py:899) runs before either of them is read.
+        precheck_for_new(pos[0])?;
+        w_metaclass = pos[0];
+        return type_descr_new_with_metaclass(&pos[1..], w_metaclass, kwargs);
     }
     Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
 }
+/// typeobject.py:888-895 `descr__new__` — the wording for a `type.__new__`
+/// call whose argument count is neither one nor three.  `type` itself names
+/// both accepted counts; any other metatype names only the three-argument
+/// form, under the count upstream writes as a literal.
+fn new_arity_message(w_metatype: PyObjectRef) -> String {
+    if unsafe { std::ptr::eq(w_metatype, crate::typedef::w_type()) } {
+        return "type.__new__() takes 1 or 3 arguments".to_string();
+    }
+    let name = type_new_getname(w_metatype);
+    format!("{name}.__new__() takes exactly 3 arguments (1 given)")
+}
+
+/// typeobject.py:1001-1003 `_precheck_for_new` — the metatype must be a type
+/// before anything reads it as one.  It runs after the arity decision and
+/// before the one-argument form is resolved.
+fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::is_type(w_type) } {
+        Ok(())
+    } else {
+        let type_name = crate::baseobjspace::object_functionstr_type_name(w_type);
+        Err(crate::PyError::type_error(format!(
+            "X is not a type object ({type_name})"
+        )))
+    }
+}
+
+/// `W_Root.getname` (baseobjspace.py:90-94), the `%N` operand spelling: a type
+/// reports its own name, any other object reports its `__name__` attribute,
+/// and a failed lookup reports `?`.  The arity message reaches this with an
+/// unvalidated metatype, so it must not read one through the type layout.
+fn type_new_getname(w_obj: PyObjectRef) -> String {
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return unsafe { pyre_object::w_type_get_name(w_obj) }.to_string();
+    }
+    match crate::baseobjspace::getattr_str(w_obj, "__name__").and_then(crate::baseobjspace::utf8_w)
+    {
+        Ok(name) => name.to_string(),
+        Err(_) => "?".to_string(),
+    }
+}
+
 fn type_descr_new_without_metaclass(
     args: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
@@ -5068,7 +5141,7 @@ fn type_descr_new_with_metaclass(
         // arguments before attempting to copy or normalise any of them.
         if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 1 must be str, not {}",
+                "type() argument 1 must be string, not {}",
                 unsafe { pyre_object::type_name_of(name_obj) }
             )));
         }
@@ -6867,10 +6940,11 @@ fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `PyError::type_error`.
 fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 5 {
-        // first arg is `self`; PyPy reports argcount excluding `self`.
-        return Err(crate::PyError::type_error(
-            "function takes exactly 4 arguments",
-        ));
+        // first arg is `self`; the count reported excludes it.
+        return Err(crate::PyError::type_error(format!(
+            "function takes exactly 4 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
     }
     let w_self = args[0];
     let w_object = args[1];
@@ -6919,9 +6993,10 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
 /// `bytes` so reads of `e.object` round-trip as `bytes` per PyPy.
 fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 6 {
-        return Err(crate::PyError::type_error(
-            "function takes exactly 5 arguments",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "function takes exactly 5 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
     }
     let w_self = args[0];
     let w_encoding = args[1];
@@ -7011,9 +7086,10 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// `str` (`space.realutf8_w`).
 fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 6 {
-        return Err(crate::PyError::type_error(
-            "function takes exactly 5 arguments",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "function takes exactly 5 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
     }
     let w_self = args[0];
     let w_encoding = args[1];
@@ -8024,7 +8100,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if !unsafe { crate::baseobjspace::isinstance_str_w(message) } {
         let type_name = crate::baseobjspace::object_functionstr_type_name(message);
         return Err(crate::PyError::type_error(format!(
-            "argument 1 must be str, not {type_name}"
+            "BaseExceptionGroup.__new__() argument 1 must be str, not {type_name}"
         )));
     }
     let is_list_or_tuple = unsafe {
@@ -8864,7 +8940,17 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 "decoding to str: need a bytes-like object, {tn} found"
             )));
         };
-        let mut decode_args = vec![src, w_encoding.unwrap_or_else(w_none)];
+        // `descr_decode` reads an omitted encoding as utf-8
+        // (stringmethods.py:200-201).  This positional shape cannot skip the
+        // slot when `errors` follows it, so spell the default out: `decode`
+        // refuses a literal `None` there like any other non-str.  The default
+        // is a prebuilt: `w_str_new` is immortal, so wrapping it per call
+        // would leak one string for every `str(b, errors=...)`.
+        static DEFAULT_ENCODING: crate::warn::PrebuiltText = crate::warn::PrebuiltText::new();
+        let mut decode_args = vec![
+            src,
+            w_encoding.unwrap_or_else(|| DEFAULT_ENCODING.get("utf-8")),
+        ];
         if let Some(e) = w_errors {
             decode_args.push(e);
         }

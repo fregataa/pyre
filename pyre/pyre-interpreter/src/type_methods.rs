@@ -213,6 +213,19 @@ pub(crate) fn arity_at_most(
     Ok(())
 }
 
+/// TypeError for a method whose positional count after the receiver has to
+/// land in `min..=max` — the PyArg_UnpackTuple form with both bounds set
+/// (`bytes.center`, `bytes.ljust`).  Reports whichever bound the call missed.
+pub(crate) fn arity_between(
+    args: &[PyObjectRef],
+    name: &str,
+    min: usize,
+    max: usize,
+) -> Result<(), crate::PyError> {
+    arity_at_least(args, name, min)?;
+    arity_at_most(args, name, max)
+}
+
 /// TypeError for a method requiring exactly `n` positional arguments after
 /// the receiver, called with a different count — the PyArg_UnpackTuple
 /// min==max form "X expected N arguments, got M" (`list.insert`,
@@ -1362,6 +1375,12 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if pos.len() < 3 {
         return Err(crate::PyError::type_error(format!(
             "replace() takes at least 2 positional arguments ({} given)",
+            args_given(pos)
+        )));
+    }
+    if pos.len() > 4 {
+        return Err(crate::PyError::type_error(format!(
+            "replace() takes at most 3 arguments ({} given)",
             args_given(pos)
         )));
     }
@@ -2596,6 +2615,15 @@ pub fn format_value_dispatch_w(
 
 /// The type name of `obj` for a TypeError message — the `w_class` name
 /// for instances, else the storage type name.
+/// `_PyArg_BadArgument`'s rendering of a rejected argument: `None` names
+/// itself where every other value names its type.
+pub(crate) fn clinic_arg_type_name(obj: PyObjectRef) -> String {
+    if unsafe { pyre_object::is_none(obj) } {
+        return "None".to_string();
+    }
+    arg_type_name(obj)
+}
+
 pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
     if obj.is_null() {
         return "object".to_string();
@@ -5136,19 +5164,51 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_str_from_wtf8_managed(case::swapcase_wtf8(s)))
 }
 
-/// PyPy: unicodeobject.py descr_center
-/// Resolve the fillchar arg for `center`/`ljust`/`rjust`. Defaults to
-/// `' '` when missing; PyPy raises TypeError when the fill string is
-/// not exactly one character long (unicodeobject.py:1191-1194
-/// _convert_fillchar parity).
+/// Resolve the fillchar arg for `center`/`ljust`/`rjust`. Defaults to `' '`
+/// for an *omitted* argument (`w_fillchar=WrappedDefault(u' ')`); a supplied
+/// `None` is an ordinary value and is refused here like any other non-str.
+///
+/// The operand is converted by two different helpers, and each refuses in its
+/// own words. `descr_center` uses `space.utf8_w` (unicodeobject.py:1101),
+/// which takes a str and nothing else. `descr_ljust`/`descr_rjust` use
+/// `convert_arg_to_w_unicode` (unicodeobject.py:175-184): it declines `bytes`
+/// with the message reproduced below, and hands every other non-str to
+/// `decode_object`, which turns a buffer operand into a fill char rather than
+/// refusing it.
+///
+/// `decode_object` reports a failed conversion as `"decoding to str: %S"` over
+/// the buffer error (unicodeobject.py:1727-1739). apptest_unicode.py:1247-1252
+/// pins that in either of two wordings; the arm below is the one pypy prints,
+/// down to `None` rendering unquoted where a type name is quoted.
+///
+/// The decode itself is not imported — `ljust`/`rjust` refuse a
+/// bytearray/memoryview/array fill that upstream turns into a fill char, as
+/// they already did before this function grew a per-method message. So the
+/// three arms below reproduce upstream's message for every operand upstream
+/// also refuses, and a buffer operand takes the last arm as the one place the
+/// missing decode still shows.
+///
+/// A str of the wrong length is a separate refusal, and the one upstream
+/// words per method.
 fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::PyError> {
     if args.len() <= 2 {
         return Ok(CodePoint::from_char(' '));
     }
     if !unsafe { pyre_object::is_str(args[2]) } {
-        return Err(crate::PyError::type_error(format!(
-            "{method}() argument 2 must be a single character"
-        )));
+        let type_name = arg_type_name(args[2]);
+        let message = if method == "center" {
+            format!("expected str, got {type_name} object")
+        } else if unsafe { pyre_object::is_bytes(args[2]) } {
+            format!("Can't convert '{type_name}' object to str implicitly")
+        } else {
+            let operand = if unsafe { pyre_object::is_none(args[2]) } {
+                "None".to_string()
+            } else {
+                format!("'{type_name}'")
+            };
+            format!("decoding to str: a bytes-like object is required, not {operand}")
+        };
+        return Err(crate::PyError::type_error(message));
     }
     let raw = unsafe { w_str_get_wtf8(args[2]) };
     let mut iter = raw.code_points();
