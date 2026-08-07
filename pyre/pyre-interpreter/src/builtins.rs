@@ -4045,6 +4045,13 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the builtin `getattr` function object — a
+/// builtin-code function whose code wraps [`builtin_getattr`].  The JIT
+/// walker uses this to recognize a plain `getattr(type, name)` residual.
+pub fn is_builtin_getattr_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_getattr)
+}
+
 /// True iff `callable` is the builtin `locals` function object.
 ///
 /// The JIT walker uses this to recognize the `locals()` residual it can
@@ -4124,6 +4131,25 @@ pub fn is_builtin_hash_function(callable: PyObjectRef) -> bool {
         crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
             builtin_hash as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
+/// True iff `callable` is the canonical builtin `ord` function object.
+/// Keep the wrapped-code identity test beside `len` / `repr`: mutable builtin
+/// globals and user-visible function names are not specialization evidence.
+pub fn is_builtin_ord_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            builtin_ord as crate::gateway::BuiltinCodeFn,
         )
     }
 }
@@ -16556,6 +16582,17 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_ord_identity_uses_wrapped_code_not_display_name() {
+        crate::typedef::init_typeobjects();
+        let ord = make_module_builtin_function_with_arity("ord", builtin_ord, 1);
+        let renamed_ord = make_module_builtin_function_with_arity("ord", builtin_repr, 1);
+
+        assert!(is_builtin_ord_function(ord));
+        assert!(!is_builtin_ord_function(renamed_ord));
+        assert!(!is_builtin_ord_function(std::ptr::null_mut()));
+    }
 
     #[test]
     fn long_abs_reuses_nonnegative_rbigint_payload() {

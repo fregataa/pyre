@@ -4399,15 +4399,14 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     Some(nlocals + ncells)
 }
 
-/// Static operand-stack depth at `target_pc`, but only when it exceeds the
-/// depth `frame` still advertises — the depth a closing JUMP must not fall
-/// below when it retargets a merge point at a different bytecode offset.
+/// Static operand-stack depth at `target_pc` when it differs from the depth
+/// `frame` still advertises. A closing JUMP retargeted to a different bytecode
+/// offset must publish the merge point's own live depth.
 ///
 /// `None` means "keep reading the frame": the frame or its code object cannot
 /// answer, the code has no liveness entry for `target_pc`, the depth would
-/// overrun `locals_cells_stack_w`, or the frame already covers the merge
-/// point. Never narrows — see `close_loop_args_at` for why only the widening
-/// direction is a correction.
+/// overrun `locals_cells_stack_w`, or the frame is already at the merge
+/// point's depth.
 pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize) -> Option<usize> {
     let concrete = concrete_stack_depth(frame)?;
     let w_code = unsafe {
@@ -4419,7 +4418,7 @@ pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize)
     if concrete_frame_array_len(frame).is_none_or(|len| depth > len) {
         return None;
     }
-    (depth > concrete).then_some(depth)
+    (depth != concrete).then_some(depth)
 }
 
 /// Return the absolute valuestackdepth.
@@ -9555,24 +9554,6 @@ impl JitState for PyreJitState {
             return;
         }
 
-        // pyjitpl.py:3125-3165 `_prepare_exception_resumption` + `execute_ll_raised`:
-        // the exception grabbed at guard failure (`cpu.grab_exc_value`, threaded
-        // via `ctx.bridge_guard_exc`) becomes the bridge's standing exception.
-        // Seed `current_exc_value` here so `seed_bridge_standing_exception_from_current`
-        // below promotes it into `last_exc_value` / `last_exc_box` (the
-        // `dispatch_via_miframe` / carrier exc-edge precondition reads these).
-        // Without this seed the sym only sees `get_current_exception()`, which the
-        // blackhole has already cleared by carrier re-trace time.  Gated while the
-        // #343/#126 depth-2 exception-resume slice is validated.
-        if crate::jitcode_dispatch::carrier_exc_resume_enabled()
-            && ctx.bridge_source_is_exception_guard()
-        {
-            let guard_exc = ctx.bridge_guard_exc();
-            if guard_exc != 0 && sym.current_exc_value.is_null() {
-                sym.current_exc_value = guard_exc as pyre_object::PyObjectRef;
-            }
-        }
-
         // virtualizable.py:139 load_list_of_boxes parity: decode each
         // RebuiltValue in the resume stream into a typed Value. The type
         // is the fixed Box kind the encoder recorded at numbering time
@@ -13632,7 +13613,7 @@ mod tests {
     /// must recover that offset's own depth, or every operand-stack slot the
     /// header binds is force-nulled into the JUMP.
     #[test]
-    fn merge_point_stack_depth_recovers_a_deeper_header_and_never_narrows() {
+    fn merge_point_stack_depth_recovers_the_header_depth() {
         use pyre_interpreter::pyframe::PyFrame;
 
         ensure_test_callbacks();
@@ -13672,10 +13653,13 @@ mod tests {
             None,
         );
 
-        // Frame already deeper than the header's static depth: never narrow —
-        // dropping a slot would lose a value the JUMP must carry.
+        // Stale frame (resumed at a deeper offset), closing on the shallower
+        // header: slots above the header's static depth are dead capacity.
         frame.valuestackdepth = deep_vsd + 1;
-        assert_eq!(merge_point_stack_depth_to_recover(frame_ptr, deep_pc), None);
+        assert_eq!(
+            merge_point_stack_depth_to_recover(frame_ptr, deep_pc),
+            Some(deep_vsd),
+        );
 
         // An offset the code object has no liveness entry for keeps the frame.
         frame.valuestackdepth = base;

@@ -2231,6 +2231,57 @@ fn reject_non_exception_channel_value(
     );
 }
 
+/// `executioncontext.py:91-107 ExecutionContext.leave`'s frame-chain half, for a
+/// frame a blackhole resumed into and has now finished.
+///
+/// The profile-hook half (`if self.profilefunc: self._trace(frame,
+/// 'leaveframe', w_exitvalue)`) stays with the interpreter's own
+/// [`pyre_interpreter::PyExecutionContext::leave`], for the reason
+/// `walker_ec_leave` states: `is_being_profiled` is a portal-driver green, so a
+/// trace recorded with profiling off is only ever entered with profiling off,
+/// and the blackhole resuming out of it inherits that key.
+fn leave_resumed_blackhole_frame(
+    frame: &majit_metainterp::blackhole::BlackholeInterpreter,
+    got_exception: bool,
+) {
+    let frame_ptr = frame.virtualizable_ptr as *mut PyFrame;
+    if frame_ptr.is_null() {
+        return;
+    }
+    let ec = unsafe { (*frame_ptr).execution_context as *mut pyre_interpreter::PyExecutionContext };
+    if ec.is_null() {
+        return;
+    }
+    let frame_vref = unsafe { (*ec).topframeref };
+    if !std::ptr::eq(
+        pyre_interpreter::executioncontext::vref_referent(frame_vref),
+        frame_ptr,
+    ) {
+        return;
+    }
+    // executioncontext.py:91-107 `leave`: a guard-failure blackhole resumes
+    // inside a frame whose `enter` already ran in compiled code. Advancing to
+    // `nextblackholeinterp` therefore has to close that still-open scope. The
+    // resume-data frame chain itself is not the application frame chain, and
+    // releasing a BlackholeInterpreter does not restore `topframeref`.
+    //
+    // Nothing here forces a vref. The guard above already established that
+    // `frame_vref` resolves to this frame, so `leave`'s own `frame_vref()` has
+    // nothing left to materialize, and the caller is reached through
+    // `vref_referent` rather than `get_f_back`: this runs once the compiled
+    // frame is gone, and forcing a vref that was finished with the NULL form
+    // is exactly what `force_pyframe_vref` refuses.
+    unsafe {
+        (*ec).topframeref = (*frame_ptr).f_backref;
+        if (*frame_ptr).escaped() || got_exception {
+            let f_back = pyre_interpreter::executioncontext::vref_referent((*frame_ptr).f_backref);
+            if !f_back.is_null() {
+                (*f_back).mark_as_escaped();
+            }
+        }
+    }
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -2580,6 +2631,7 @@ pub fn blackhole_resume_via_rd_numb(
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
+            leave_resumed_blackhole_frame(&bh, true);
             release_bh_rd(bh);
             match next {
                 Some(caller) => {
@@ -2805,6 +2857,7 @@ pub fn blackhole_resume_via_rd_numb(
                     }
                 }
             }
+            leave_resumed_blackhole_frame(&bh, true);
             release_bh_rd(bh);
             // Re-read through the pin: the records above are allocation
             // points, so the pinned slot — not the stale local — is the live
@@ -2912,6 +2965,7 @@ pub fn blackhole_resume_via_rd_numb(
             BhReturnType::Float => caller_bh.setup_return_value_f(bh.get_tmpreg_f()),
             BhReturnType::Void => {}
         }
+        leave_resumed_blackhole_frame(&bh, false);
         release_bh_rd(bh);
         bh = caller_bh;
     }
@@ -3276,14 +3330,7 @@ pub fn trace_and_compile_from_bridge(
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.start_bridge_tracing(
-            descr_arc,
-            &mut jit_state,
-            &env,
-            raw_values,
-            resume_pc,
-            guard_exc,
-        )
+        driver.start_bridge_tracing(descr_arc, &mut jit_state, &env, raw_values, resume_pc)
     };
     if !started {
         if majit_metainterp::majit_log_enabled() {
