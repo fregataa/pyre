@@ -283,7 +283,8 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) };
-    let (implementation, monotonic, adjustable) = match name.as_str().unwrap_or_default() {
+    let name_str = name.as_str().unwrap_or_default();
+    let (implementation, monotonic, adjustable) = match name_str {
         "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
         "monotonic" | "perf_counter" => {
             #[cfg(target_os = "macos")]
@@ -296,13 +297,112 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             }
         }
         "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
+        // `interp_time.py:926` gates `thread_time` on HAS_THREAD_TIME; describe
+        // it only where the platform carries CLOCK_THREAD_CPUTIME_ID and the
+        // host clock is wired (the exact gate under which mod.rs registers the
+        // `thread_time` function), so the report never names a clock whose
+        // function is absent; otherwise fall through to the "unknown clock"
+        // ValueError.
+        #[cfg(all(
+            unix,
+            feature = "host_env",
+            not(any(
+                target_os = "illumos",
+                target_os = "netbsd",
+                target_os = "solaris",
+                target_os = "openbsd",
+                target_os = "redox",
+            ))
+        ))]
+        "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
         _ => return Err(crate::PyError::value_error("unknown clock")),
     };
     crate::baseobjspace::setattr_str(info, "implementation", w_str_new(implementation))?;
     crate::baseobjspace::setattr_str(info, "monotonic", w_bool_from(monotonic))?;
     crate::baseobjspace::setattr_str(info, "adjustable", w_bool_from(adjustable))?;
-    crate::baseobjspace::setattr_str(info, "resolution", floatobject::w_float_new(1.0e-9))?;
+    crate::baseobjspace::setattr_str(
+        info,
+        "resolution",
+        floatobject::w_float_new(get_clock_info_resolution(name_str)),
+    )?;
     Ok(w_none())
+}
+
+/// A clock `Duration` in seconds the way `_timespec_to_seconds` computes it —
+/// `sec + nsec * 1e-9`.  `Duration::as_secs_f64` divides the nanoseconds by 1e9
+/// instead, which rounds one ULP off from CPython for sub-microsecond ticks
+/// (`1000 * 1e-9` != `1000 / 1e9`), so `get_clock_info().resolution` and
+/// `clock_getres()` would otherwise disagree with the reference in the last bit.
+#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+fn clock_seconds_from_duration(d: std::time::Duration) -> f64 {
+    d.as_secs() as f64 + f64::from(d.subsec_nanos()) * 1e-9
+}
+
+/// Resolution of the mach clock backing `monotonic`/`perf_counter` on macOS:
+/// one `mach_absolute_time` tick is `numer/denom` nanoseconds
+/// (`_PyTime_GetMonotonicClockWithInfo` reports the same).  `clock_getres` is
+/// deliberately not used — `clock_getres(CLOCK_MONOTONIC)` reports the coarser
+/// system tick (1µs), not the finer timebase rate.  Dividing by the
+/// exactly-representable `1e9` (rather than multiplying by `1e-9`) reproduces
+/// the reference value bit-for-bit for a non-integer timebase like `125/3`.
+#[cfg(all(target_os = "macos", feature = "host_env"))]
+#[allow(deprecated)] // libc's mach_timebase_info fields moved to the `mach2` crate; one read is not worth a new dependency.
+fn mach_timebase_resolution_seconds() -> f64 {
+    let mut tb = ::libc::mach_timebase_info { numer: 0, denom: 0 };
+    // SAFETY: fills an owned, zeroed struct; the call has no other effect.
+    if unsafe { ::libc::mach_timebase_info(&mut tb) } == 0 && tb.denom != 0 {
+        return (f64::from(tb.numer) / f64::from(tb.denom)) / 1e9;
+    }
+    1.0e-9
+}
+
+/// The `resolution` value `time.get_clock_info(name)` reports.
+///
+/// `clock_getres(clk_id)` for every clock-backed source — `time`,
+/// `process_time`, `thread_time`, and `monotonic`/`perf_counter` off macOS —
+/// with a 1e-9 fallback when the clock is unreadable, mirroring the
+/// `_process_time_impl`/`_thread_time_impl` `clock_getres` paths.  On macOS
+/// `monotonic`/`perf_counter` run on `mach_absolute_time`, whose resolution is
+/// the timebase rate rather than `clock_getres(CLOCK_MONOTONIC)`.
+#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+fn get_clock_info_resolution(name: &str) -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(name, "monotonic" | "perf_counter") {
+            return mach_timebase_resolution_seconds();
+        }
+    }
+    let clk = match name {
+        "time" => host_time::ClockId::CLOCK_REALTIME,
+        "monotonic" | "perf_counter" => host_time::ClockId::CLOCK_MONOTONIC,
+        #[cfg(not(any(
+            target_os = "illumos",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "openbsd",
+            target_os = "wasi",
+        )))]
+        "process_time" => host_time::ClockId::CLOCK_PROCESS_CPUTIME_ID,
+        #[cfg(not(any(
+            target_os = "illumos",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "openbsd",
+            target_os = "redox",
+        )))]
+        "thread_time" => host_time::ClockId::CLOCK_THREAD_CPUTIME_ID,
+        _ => return 1.0e-9,
+    };
+    host_time::clock_getres(clk)
+        .map(clock_seconds_from_duration)
+        .unwrap_or(1.0e-9)
+}
+
+/// Without a host `clock_getres` (non-Unix, no `host_env`, or redox), report the
+/// nanosecond representation resolution every pyre clock carries internally.
+#[cfg(not(all(unix, feature = "host_env", not(target_os = "redox"))))]
+fn get_clock_info_resolution(_name: &str) -> f64 {
+    1.0e-9
 }
 
 /// Process CPU time (kernel + user) as nanoseconds.
@@ -358,6 +458,77 @@ pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     Ok(w_int_new(process_time_nanos()? as i64))
+}
+
+/// Thread CPU time (kernel + user) for the calling thread as nanoseconds.
+///
+/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` is the sole source, matching
+/// `_thread_time_impl`.  Unlike [`process_time_nanos`] there is no
+/// `getrusage`/`times` fallback: those report process-wide CPU time, not the
+/// calling thread's, so deriving thread time from them would be wrong.  An
+/// unreadable clock raises OSError rather than reporting a bogus value.
+///
+/// This reads the clock directly rather than through the `clock()` seam op
+/// (which is the process-CPU `ll_time_clock` analog): `_thread_time_impl` reads
+/// `c_clock_gettime` directly, `time.clock_gettime` already does the same, and
+/// `clock_gettime` is on the sandbox seccomp allowlist, so a sandbox build
+/// reads its own thread clock without a controller round-trip.
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+))]
+fn thread_time_nanos() -> Result<i128, crate::PyError> {
+    host_time::clock_gettime(host_time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .map(|d| d.as_nanos() as i128)
+        .map_err(|e| {
+            crate::PyError::os_error_with_errno(
+                e.raw_os_error().unwrap_or(0),
+                format!("clock_gettime: {e}"),
+            )
+        })
+}
+
+/// time.thread_time() → float
+///
+/// Thread time for profiling: sum of the kernel and user-space CPU time.
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+))]
+pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(floatobject::w_float_new(thread_time_nanos()? as f64 * 1e-9))
+}
+
+/// time.thread_time_ns() → int
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+))]
+pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(w_int_new(thread_time_nanos()? as i64))
 }
 
 /// time.clock_gettime(clk_id) → float seconds
@@ -504,7 +675,7 @@ pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             format!("clock_getres: {e}"),
         )
     })?;
-    Ok(floatobject::w_float_new(d.as_secs_f64()))
+    Ok(floatobject::w_float_new(clock_seconds_from_duration(d)))
 }
 
 // ── libc tm helpers ──────────────────────────────────────────────────

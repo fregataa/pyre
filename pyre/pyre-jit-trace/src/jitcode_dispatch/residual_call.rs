@@ -4810,6 +4810,54 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // #61: UNARY_POSITIVE `+int` identity fold.  The object-space `pos` on an
+    // exact int returns the operand unchanged, so a provably-int operand folds
+    // to the operand box itself behind a `GUARD_CLASS INT`, eliding the
+    // `CALL_MAY_FORCE` (and its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the
+    // generic residual emits.  A bool (`+True` is int `1`) / non-int operand
+    // declines to the generic leg so its `__pos__` still runs.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && ei.pyre_helper == majit_ir::PyreHelperKind::UnaryPositive
+        && try_walker_specialize_unary_positive_int(ctx, op.pc, r_args[0], dst, dst_bank)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // #61: UNARY_NEGATIVE `-int` fold.  `-x` is `0 - x`; the fold emits
+    // `IntSubOvf(0, x)` behind a `GUARD_CLASS INT` (reusing the binary-sub
+    // overflow discipline), eliding the `CALL_MAY_FORCE`.  A bool / subclass /
+    // non-int, and an `INT_MIN` value (whose negation is the `2**63` long),
+    // decline to the generic leg.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && ei.pyre_helper == majit_ir::PyreHelperKind::UnaryNegative
+        && try_walker_specialize_unary_negative_int(
+            ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
+        )?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // #61: UNARY_INVERT `~int` fold.  `~x` always fits an int, so the fold
+    // emits a plain `IntInvert` behind a `GUARD_CLASS INT` (no overflow guard),
+    // eliding the `CALL_MAY_FORCE`.  A bool / subclass / non-int operand
+    // declines to the generic leg.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && ei.pyre_helper == majit_ir::PyreHelperKind::UnaryInvert
+        && try_walker_specialize_unary_invert_int(
+            ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
+        )?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
     // in-bounds, type-matching) to the walker-native `setarrayitem_raw` form,
     // eliding the `CALL_MAY_FORCE` that would force the virtualizable every
