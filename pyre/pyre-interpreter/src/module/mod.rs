@@ -11,6 +11,8 @@ pub mod _abc;
 #[allow(non_snake_case)]
 pub mod _ast;
 #[allow(non_snake_case)]
+pub mod _bisect;
+#[allow(non_snake_case)]
 pub mod _blake2;
 #[allow(non_snake_case)]
 pub mod _codecs;
@@ -30,6 +32,8 @@ pub mod _hashlib;
 #[allow(non_snake_case)]
 pub mod _immutables_map;
 pub mod _io;
+#[allow(non_snake_case)]
+pub mod _json;
 #[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]

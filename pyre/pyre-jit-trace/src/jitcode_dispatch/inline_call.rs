@@ -3089,10 +3089,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
     // `typeobject.py descr_call` discards `__init__`'s result and returns the
-    // instance.  Pyre flattens that frame for constructor inlining, so a guard
-    // pause inside a branchy `__init__` would have no frame to reconstruct that
-    // discard.  Keep such constructors residual so replay re-enters the whole
-    // instantiation call at the caller boundary.
+    // instance.  Hold constructors to the strict straight-line path here;
+    // together with the `constructor_result.is_none()` term on `strict_seed`,
+    // this keeps `__init__` out of every resume chain.  No callee frame is
+    // seeded, so a guard in `__init__` resumes at the caller's CALL coordinate
+    // and re-runs the instantiation, making the result discard unnecessary to
+    // represent.
     if constructor_result.is_some() && !strict_inlinable {
         return Ok(None);
     }

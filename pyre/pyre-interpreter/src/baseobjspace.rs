@@ -9008,6 +9008,10 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
+    if let Ok(name) = name.as_str() {
+        return lookup_in_type_where(w_type, name);
+    }
+    // MethodCache is keyed on `&str`, so a non-UTF-8 name cannot use it.
     let cached = w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached.is_null() {
@@ -9414,10 +9418,35 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
         unsafe { lookup_in_type(w_type, name) }
     }
     .ok_or_else(|| {
-        crate::PyError::attribute_error(format!(
-            "'{}' object has no attribute '{}'",
+        // PyPy `pyopcode.py BEFORE_WITH` / `BEFORE_ASYNC_WITH` converts a
+        // missing special method into the protocol-level TypeError here,
+        // rather than leaking the AttributeError from an ordinary attribute
+        // lookup.  The message names the specific missing method and suggests
+        // the other protocol when both of its methods are present.
+        let asynchronous = matches!(name, "__aenter__" | "__aexit__");
+        let protocol = if asynchronous {
+            "asynchronous context manager protocol"
+        } else {
+            "context manager protocol"
+        };
+        let suggestion = if !w_type.is_null()
+            && name == "__exit__"
+            && unsafe { lookup_in_type(w_type, "__aenter__") }.is_some()
+            && unsafe { lookup_in_type(w_type, "__aexit__") }.is_some()
+        {
+            " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?"
+        } else if !w_type.is_null()
+            && name == "__aexit__"
+            && unsafe { lookup_in_type(w_type, "__enter__") }.is_some()
+            && unsafe { lookup_in_type(w_type, "__exit__") }.is_some()
+        {
+            " but it supports the context manager protocol. Did you mean to use 'with'?"
+        } else {
+            ""
+        };
+        crate::PyError::type_error(format!(
+            "'{}' object does not support the {protocol} (missed {name} method){suggestion}",
             object_functionstr_type_name(obj),
-            name,
         ))
     })?;
     let bound = unsafe { get(descr, obj, w_type) }?.unwrap_or(descr);

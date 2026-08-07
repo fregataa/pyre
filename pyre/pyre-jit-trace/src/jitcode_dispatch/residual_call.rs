@@ -3353,12 +3353,40 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // The inline abort-forward-flush gate snapshots this at the CALL and refuses
     // the forward flush if a callee sub-walk moved it — re-executing the CALL
     // would double the effect.
+    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
+    // alone would count it.  The slot it writes exists only to keep a
+    // propagating exception rooted for the collector — nothing reads it back as
+    // a value — and `push_exc_info` performs the same clear at the same point.
+    // An uncommitted walk therefore has nothing to undo and the region it
+    // hands back is not irreversible, which is the `is_idempotent_gc_barrier`
+    // category one line up.
+    let writes_gc_liveness_root_only = helper == majit_ir::PyreHelperKind::ClearInFlightException;
     if !provably_side_effect_free
         && !is_idempotent_gc_barrier
+        && !writes_gc_liveness_root_only
         && (writes_live_heap
             || heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before))
     {
+        // `committed=false effects>0` is the double-apply signature, but the
+        // odometer alone does not say WHICH residual made the region
+        // irreversible.  Name the bumping call the way the escape diagnostic
+        // names a forcing one.
+        if fbw_debug_abort_enabled() {
+            let name = pyre_interpreter::jit_trace_fnaddrs()
+                .iter()
+                .find(|(_, a)| *a == func_ptr as i64)
+                .map(|(n, _)| *n);
+            eprintln!(
+                "[fbw-effect] pc={op_pc} helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
+                 entered_frame={} fn={:?}/{:#x}",
+                call_descr.result_type(),
+                heap_write_odometer_before
+                    .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
+                name,
+                func_ptr as usize,
+            );
+        }
         fbw_bump_executed_effect();
     }
     match exec_result {
@@ -3480,20 +3508,19 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // emission) sees a non-null `last_exc_value` and routes
             // through the GuardException path.
             //
-            // `execute_residual_call` cleared `BH_LAST_EXC_VALUE` on read;
-            // restore it so the eval-loop walker-skip path
-            // (`eval.rs`) can detect the pending exception and
-            // route into the bytecode-interpreter's exception handler
-            // via `PyError::from_exc_object` — matching RPython's
-            // metainterp framestack scan after a raising residual call
-            // (`handle_possible_exception` + `finishframe_exception`).
+            // `execute_residual_call` consumes `BH_LAST_EXC_VALUE` when it
+            // returns this `Err`.  Do not republish it: RPython transfers the
+            // value into `MetaInterp.last_exc_value` exactly once, and the
+            // walker shadow below is that owner.  Do not republish the
+            // consumed value into TLS as well.  An
+            // uncaught raise is carried by the trace's exception FINISH; an
+            // aborted walk re-executes the live opcode.
             ctx.last_exc_value = Some(ctx.trace_ctx.const_ref(bh_exc));
             ctx.last_exc_value_concrete =
                 ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
             // `execute_raised(..., constant=False)`:
             // a residual exception has not had its class proven by a guard yet.
             ctx.fbw_mode.class_of_last_exc_is_const = false;
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(bh_exc));
             // `execute_raised` records the raise into `last_exc_value`
             // (above) only.  The shared `bh_*` residual helper also
             // published into the backend `_store_exception` cells

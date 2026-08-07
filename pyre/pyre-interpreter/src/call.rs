@@ -1553,13 +1553,13 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
     };
     let w_type = w_type.as_ptr();
     // Most fixed-layout builtin payloads are deliberately not generic
-    // instances.  The accelerator key wrapper is the exception: its
-    // TypeDef publishes `__call__`, so admit that one payload explicitly while
-    // retaining the old guard for all other internal objects (which avoids
-    // treating bootstrap implementation objects as recursive callables).
-    let key_wrapper = crate::module::_functools::W_KeyWrapper::from_obj(callable).is_some();
+    // instances.  Admit the accelerator payloads whose TypeDefs publish
+    // `__call__`, while retaining the guard for all other internal objects.
+    let typed_callable = crate::module::_functools::W_KeyWrapper::from_obj(callable).is_some()
+        || crate::module::_json::W_Scanner::from_obj(callable).is_some()
+        || crate::module::_json::W_Encoder::from_obj(callable).is_some();
     if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) }
-        && !key_wrapper
+        && !typed_callable
     {
         return Ok(None);
     }
@@ -5270,13 +5270,6 @@ pub unsafe fn create_all_slots(
         }
 
         // typeobject.py:1199-1204: layout computation
-        // `__dict_data__` is pyre's internal dict-subclass payload slot, not
-        // a Python-visible `__slots__` entry and therefore not part of
-        // CPython's `tp_basicsize` accounting.
-        let visible_newslots = newslotnames
-            .iter()
-            .filter(|name| name.as_str() != "__dict_data__")
-            .count() as u32;
         let nslots = base_nslots + newslotnames.len() as u32;
         let typedef = if base_layout.is_null() {
             &pyre_object::pyobject::INSTANCE_TYPE as *const _
@@ -5302,11 +5295,6 @@ pub unsafe fn create_all_slots(
             })
         };
         pyre_object::w_type_set_layout(w_type, layout);
-        pyre_object::typeobject::w_type_finish_heap_abi_layout(
-            w_type,
-            w_bestbase,
-            visible_newslots,
-        );
         Ok(())
     }
 }

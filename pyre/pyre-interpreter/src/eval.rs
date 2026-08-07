@@ -2330,25 +2330,7 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        let w_type = match crate::typedef::r#type(obj) {
-            Some(t) => t,
-            None => {
-                return Err(PyError::type_error(format!(
-                    "'{}' object does not support the context manager protocol",
-                    crate::baseobjspace::object_functionstr_type_name(obj)
-                )));
-            }
-        };
-        let descr = match unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) } {
-            Some(d) => d,
-            None => {
-                return Err(PyError::type_error(format!(
-                    "'{}' object does not support the context manager protocol",
-                    crate::baseobjspace::object_functionstr_type_name(obj)
-                )));
-            }
-        };
-        Ok(unsafe { crate::baseobjspace::get(descr, obj, w_type.as_ptr()) }?.unwrap_or(descr))
+        crate::baseobjspace::load_special_resolve(obj, name)
     }
 
     fn store_attr(
@@ -7778,6 +7760,29 @@ except AttributeError as exc:
             assert_eq!(
                 w_str_get_wtf8(value).as_str(),
                 Ok("'__main__.make_type.<locals>.X' object has no attribute 'a'")
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_slot_store_error_uses_short_type_name() {
+        let source = "\
+def make_type():
+    class X:
+        __slots__ = 'a'
+    return X
+X = make_type()
+try:
+    X().b = 1
+except AttributeError as exc:
+    result = str(exc)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("member slot store AttributeError regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert_eq!(
+                w_str_get_wtf8(value).as_str(),
+                Ok("'X' object has no attribute 'b' and no __dict__ for setting new attributes")
             );
         }
     }

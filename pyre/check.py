@@ -1140,6 +1140,26 @@ def synth_skip_backends(path):
     return ()
 
 
+def _synth_header_flag(path, directive, malformed):
+    """Read a valueless per-fixture header flag from the first 20 lines.
+
+    Shared by the two cpython opt-outs below, which differ only in the
+    directive they spell and what a malformed spelling is called. Not honored
+    below the 20-line window, which is the safe direction: the fixture simply
+    runs cpython too.
+    """
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if line.strip() == directive:
+                return True
+            if line.startswith(directive):
+                raise ValueError(f"{malformed} in {path}: {line.strip()}")
+    return False
+
+
 def synth_skip_cpython(path):
     """Read an optional per-fixture cpython opt-out from its header:
         # pyre-check: skip-cpython
@@ -1160,19 +1180,39 @@ def synth_skip_cpython(path):
     Not honored below the 20-line window, which is the safe direction: the
     fixture simply runs cpython too.
     """
-    marker = "# pyre-check: skip-cpython"
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if line.strip() == marker:
-                return True
-            if line.startswith(marker):
-                raise ValueError(
-                    f"synthetic cpython opt-out takes no value in {path}: {line.strip()}"
-                )
-    return False
+    return _synth_header_flag(
+        path,
+        "# pyre-check: skip-cpython",
+        "synthetic cpython opt-out takes no value",
+    )
+
+
+def synth_no_cpython(path):
+    """Read an optional per-fixture exemption from the reference oracle:
+        # pyre-check: no-cpython
+
+    A synthetic fixture is normally rejected outright when the reference and
+    pypy disagree, because a workload the two do not agree on cannot say
+    anything about pyre. That leaves a DELIBERATE divergence from the
+    reference untestable anywhere in the tree: a parity fixture has to pass
+    under the reference as well, and the vendored suite measures a divergence
+    as a regression rather than as coverage. So behaviour pyre takes from pypy
+    precisely because the reference does something else — `type.__basicsize__`
+    and its three siblings being absent, `__flags__` carrying pypy's six-bit
+    mask, `__sizeof__` not existing — had nowhere to be pinned.
+
+    This header names pypy as the fixture's only oracle: the reference is not
+    run, and the output is compared against pypy alone. It is only correct for
+    a fixture whose whole subject IS such a divergence; anything else wants
+    both references, and the disagreement it would otherwise report is the
+    point of that check. Follow the header with a comment naming the
+    divergence, so the exemption is reviewable next to the workload.
+    """
+    return _synth_header_flag(
+        path,
+        "# pyre-check: no-cpython",
+        "malformed reference-oracle exemption",
+    )
 
 
 def default_binary(backend):
@@ -2042,6 +2082,9 @@ class Check:
 
         ratio = _ratio(elapsed, t_pypy) if elapsed > 0 else "-"
 
+        # Ratio and memory failures do not invalidate the run's counters, so
+        # keep comparing or recording the jit-stats baseline after they fail.
+        failures = []
         retry_note = ""
         if vs_cpython and t_cpython not in (None, "-"):
             passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
@@ -2053,15 +2096,16 @@ class Check:
                     backend, "cpython", checked_elapsed, checked_baseline,
                     vs_cpython, bound,
                 )
-                self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
-                print(f"{red('SLOWER')}  pyre {detail}{suffix}")
-                self._append_comparison(
-                    backend, name, t_cpython, t_pypy,
-                    fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+                failures.append(
+                    (
+                        f"{red('SLOWER')}  pyre {detail}{suffix}",
+                        detail,
+                        fmt_time(f"{elapsed:.2f}"),
+                        f"({ratio} vs pypy)",
+                    )
                 )
-                return
-            if retry_note:
+            if passed and retry_note:
                 elapsed = checked_elapsed
                 ratio = _ratio(elapsed, t_pypy)
 
@@ -2076,52 +2120,75 @@ class Check:
                     backend, "pypy", checked_elapsed, checked_baseline,
                     vs_pypy, bound, minimum,
                 )
-                self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
                 label = "FASTER" if bound == "floor" else "SLOWER"
-                print(f"{red(label)}  pyre {detail}{suffix}")
-                self._append_comparison(
-                    backend, name, t_cpython, t_pypy,
-                    fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+                failures.append(
+                    (
+                        f"{red(label)}  pyre {detail}{suffix}",
+                        detail,
+                        fmt_time(f"{elapsed:.2f}"),
+                        f"({ratio} vs pypy)",
+                    )
                 )
-                return
-            if retry_note:
+            if passed and retry_note:
                 elapsed = checked_elapsed
                 t_pypy = checked_baseline
                 ratio = _ratio(elapsed, t_pypy)
 
         # `# pyre-check: max-rss-mb=` — the axis the ratio gates cannot see.
         # Checked after them so a fixture that is both slow and fat reports the
-        # slowness first, matching the existing gate order.
+        # slowness first, while still reporting both failures.
         if max_rss_mb is not None and peak_rss_mb is not None and peak_rss_mb > max_rss_mb:
             detail = f"peak RSS {peak_rss_mb:.0f}MB > {max_rss_mb:.0f}MB"
-            self._record(backend, False, name, detail)
-            print(f"{red('FATTER')}  pyre {detail}")
-            self._append_comparison(
-                backend, name, t_cpython, t_pypy,
-                fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+            failures.append(
+                (
+                    f"{red('FATTER')}  pyre {detail}",
+                    detail,
+                    fmt_time(f"{elapsed:.2f}"),
+                    f"({ratio} vs pypy)",
+                )
             )
-            return
 
         snap_status, snap_reason = self._apply_snapshot_gate(
             backend, name, script, output, stderr, elapsed, timeout,
         )
-        if snap_status == "unstable":
-            # Warned, not failed: the counter did not reproduce itself in this
-            # invocation, so there is nothing to gate on.
-            self._record(backend, True, name, f"{elapsed:.2f}s")
-            print(f"{yellow('UNSTABLE')}  {snap_reason}")
-            self._append_comparison(backend, name, t_cpython, t_pypy, "UNSTABLE")
+        if snap_status != "ok":
+            if snap_status == "unstable":
+                # Warned, not failed: the counter did not reproduce itself in
+                # this invocation, so there is nothing to gate on.
+                unstable_line = f"{yellow('UNSTABLE')}  {snap_reason}"
+            else:
+                # `improved` is still a failure; the label only tells the
+                # reader whether to investigate or just re-record.
+                label = "IMPROVED" if snap_status == "improved" else "SNAPDIFF"
+                paint = yellow if snap_status == "improved" else red
+                failures.append(
+                    (f"{paint(label)}  {snap_reason}", snap_reason, label, None)
+                )
+                unstable_line = None
+        else:
+            unstable_line = None
+
+        if failures:
+            self._record(
+                backend, False, name,
+                "; ".join(detail for _, detail, _, _ in failures),
+            )
+            for index, (line, _, _, _) in enumerate(failures):
+                print(f"{' ' * 14 if index else ''}{line}")
+            if unstable_line is not None:
+                print(f"{' ' * 14}{unstable_line}")
+            _, _, comparison_cell, comparison_note = failures[0]
+            self._append_comparison(
+                backend, name, t_cpython, t_pypy,
+                comparison_cell, comparison_note,
+            )
             return
 
-        if snap_status != "ok":
-            # `improved` is still a failure; the label only tells the reader
-            # whether to investigate or just re-record.
-            label = "IMPROVED" if snap_status == "improved" else "SNAPDIFF"
-            paint = yellow if snap_status == "improved" else red
-            self._record(backend, False, name, snap_reason)
-            print(f"{paint(label)}  {snap_reason}")
-            self._append_comparison(backend, name, t_cpython, t_pypy, label)
+        if unstable_line is not None:
+            self._record(backend, True, name, f"{elapsed:.2f}s")
+            print(unstable_line)
+            self._append_comparison(backend, name, t_cpython, t_pypy, "UNSTABLE")
             return
 
         self._record(backend, True, name, f"{elapsed:.2f}s")
@@ -2277,6 +2344,7 @@ class Check:
             max_rss_mb = synth_rss_gate(path)
             skip_backends = synth_skip_backends(path)
             skip_cpython = synth_skip_cpython(path)
+            no_cpython = synth_no_cpython(path)
         except ValueError as e:
             print(f"{red('ERROR')}: {e}")
             sys.exit(1)
@@ -2285,14 +2353,19 @@ class Check:
 
         sys.stdout.write(f"    {'cpython':<10s}")
         sys.stdout.flush()
-        if skip_cpython:
+        if skip_cpython or no_cpython:
             # `# pyre-check: skip-cpython` — the fixture is sized past what
             # cpython can usefully run, so running it would spend the whole
             # reference timeout to arrive at the same drop.
+            # `# pyre-check: no-cpython` — the fixture's subject is a place
+            # pyre follows pypy and the reference does something else, so the
+            # reference is not an oracle here. Same shape as the timeout arm
+            # below: `cpython_output = None` leaves pypy as the only baseline
+            # the backends are compared against.
             cpython_output = None
-            # As wide as the timeout spelling below, so the comparison table's
-            # cpython column lines up the same way for either kind of skip.
-            t_cpython = "skip (opt)"
+            # Spelled the same way as the timeout skip below, so the comparison
+            # table's cpython column reads the same for every kind of skip.
+            t_cpython = "skip (pypy oracle)" if no_cpython else "skip (opt)"
             print(dim(t_cpython))
             self.cpython_declared_skips.append(name)
         else:
@@ -2403,7 +2476,7 @@ class Check:
             names = ", ".join(self.cpython_declared_skips)
             print(
                 dim(
-                    f"cpython reference skipped (skip-cpython) "
+                    f"cpython reference skipped (header) "
                     f"for {len(self.cpython_declared_skips)}: {names}"
                 )
             )
