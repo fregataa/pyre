@@ -1811,6 +1811,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         has_closure,
         None,
         None,
+        true,
         false,
         None,
     )
@@ -2605,6 +2606,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     has_closure: bool,
     exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
     arg_class_guard: Option<ArgClassGuard>,
+    entry_is_call_boundary: bool,
     require_str_result: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -2963,14 +2965,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
                 // The deferred promise rests on the abort REWINDING to the
-                // enclosing CALL and re-executing it from scratch.  A binop
-                // dunder dispatch (the only entry carrying an
-                // `arg_class_guard`) reaches this lever from a `BINARY_OP`
-                // instead, and that opcode is not a call boundary the rewind
-                // can name: the flush resumes one operand short and the whole
-                // iteration's contribution is dropped, silently.  A `Clean`
-                // body is still admitted from there — it has nothing that can
-                // abort.
+                // enclosing CALL and re-executing it from scratch, so the
+                // entry has to be a boundary the rewind can name.  What
+                // decides that is the entry opcode's stack effect rather than
+                // whether it is spelled CALL: one that merely peeks its
+                // operands re-executes from the stack it already had.  A
+                // `BINARY_OP` or `COMPARE_OP` entry is not: the flush resumes
+                // one operand short and the whole iteration's contribution is
+                // dropped, silently — the subscript inline observed its index
+                // operand replaced by an unrelated live Ref.  Each caller
+                // states this directly in `entry_is_call_boundary`; the older
+                // `arg_class_guard.is_none()` proxy stood for the same
+                // property and rotted, because the `obj[key]` inline enters
+                // from `BINARY_OP` while passing no `arg_class_guard`.  A
+                // `Clean` body is still admitted from there — it has nothing
+                // that can abort.
                 //
                 // The widened method-form surface — an unbound callee whose
                 // body reads `self.attr` — was admitted here only once the
@@ -2993,7 +3002,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // entry or skip the handler cleanup.  Keep handler-bearing
                 // bodies on the residual path unless this scan proves them
                 // clean.
-                foriter_deferred_admit = arg_class_guard.is_none()
+                foriter_deferred_admit = entry_is_call_boundary
                     && !body_facts.owns_loop_header
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table
@@ -4996,6 +5005,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         has_closure,
         None,
         None,
+        true,
         // `__init__` bodies are `self.x = ...` stores; the sub-walk folds them
         // to slot writes on the fresh instance exactly as the property-setter
         // route folds its own.
@@ -5151,6 +5161,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         Some((r_args[2], concrete_receiver, w_class, version_tag)),
         None,
         true,
+        true,
         None,
     )?
     else {
@@ -5288,6 +5299,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         has_closure,
         Some((r_args[2], concrete_receiver, w_type, version_tag)),
         None,
+        true,
         false,
         None,
     )?
@@ -5473,6 +5485,9 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
+        // LOAD_ATTR is not a CALL either, but this entry is left admitted
+        // as it was: only the subscript one below has a witness.
+        true,
         // Getter bodies commonly read `self._slot` — a LOAD_ATTR the method-form
         // support gate would otherwise reject; the sub-walk folds it to a slot
         // read (same allowance the exception `__str__`/`__repr__` override uses).
@@ -5579,6 +5594,8 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
+        // STORE_ATTR, same standing as the getter above.
+        true,
         false,
         None,
     )
@@ -5686,6 +5703,10 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
+        // `obj[key]` enters from BINARY_OP, which the abort rewind cannot
+        // name.  This is the entry the retired `arg_class_guard.is_none()`
+        // proxy admitted by mistake.
+        false,
         false,
         None,
     )
@@ -5792,10 +5813,12 @@ pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
     // is what makes that necessary: `RaiseVarargs` classifies as a deferred
     // residual, so a cursor body that ends on one would otherwise never be
     // served.  The deferred promise holds here — a residual the lever cannot
-    // inline aborts before executing and denies the callee — and the one shape
-    // the shared FOR_ITER gate withholds it from, a `BINARY_OP` dunder entry
-    // carrying an `arg_class_guard`, cannot reach this route: the entry is a
-    // FOR_ITER whose only operand is the iterator.
+    // inline aborts before executing and denies the callee.  This route's own
+    // entry is a FOR_ITER, which is not a CALL, and it still passes
+    // `entry_is_call_boundary: true`: `opcode_for_iter` peeks its single
+    // iterator operand where `opcode_binary_op` pops both of its own, so the
+    // rewind re-executes this entry from the stack it already had and the
+    // boundary is nameable.
     if !matches!(
         replay_safety,
         CalleeReplaySafety::Clean | CalleeReplaySafety::DeferredCall
@@ -5877,6 +5900,9 @@ pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
         has_closure,
         Some((seq_op, seq, w_type, version_tag)),
         None,
+        // FOR_ITER, not a CALL, but a peeking entry the rewind can re-execute —
+        // the replay-safety note above states why that is what the gate asks.
+        true,
         false,
         None,
     );
@@ -6085,6 +6111,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         false,
+        false,
         None,
     )?
     else {
@@ -6239,6 +6266,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
+        false,
         false,
         None,
     )?
