@@ -2591,15 +2591,25 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = new_descr_class(args, "complex")?;
+    // complexobject.py descr__new__(space, w_complextype, w_real, w_imag=None)
+    // with `@unwrap_spec(w_real=WrappedDefault(0.0))` — one to three positionals
+    // counting the class.  The gateway rejects a surplus before any subtype
+    // __init__ can absorb it, so this check is unconditional.
+    let (value_positional, _) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    if value_positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "complex.__new__() takes from 1 to 3 positional arguments but {} were given",
+            value_positional.len() + 1
+        )));
+    }
     let value = crate::builtins::builtin_complex(&args[1..])?;
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
-        return Ok(value);
-    }
-    let complex_typeobj = gettypefor(&pyre_object::COMPLEX_TYPE);
-    if complex_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
-        return Ok(value);
-    }
-    // Subclass path — retag a fresh W_ComplexObject with the subclass.
+    // tp_new_wrapper (subclass_to_tag) rejects a non-type or non-subtype cls and
+    // returns None for base `complex`; a strict subclass retags a fresh
+    // W_ComplexObject so the tag never lands on a foreign layout.
+    let sub = match subclass_to_tag(cls, &pyre_object::COMPLEX_TYPE)? {
+        Some(sub) => sub,
+        None => return Ok(value),
+    };
     let (re, im) = unsafe {
         (
             pyre_object::w_complex_get_real(value),
@@ -2607,7 +2617,7 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )
     };
     let obj = pyre_object::complexobject::w_complex_subclass_new(re, im);
-    Ok(tag_subclass_instance(obj, cls))
+    Ok(tag_subclass_instance(obj, sub))
 }
 
 /// Build a builtin type's `__new__` entry.
@@ -3640,7 +3650,8 @@ fn subclass_to_tag(
     if !unsafe { pyre_object::is_type(cls) } {
         let base_name = unsafe { pyre_object::w_type_get_name(base_obj) };
         return Err(crate::PyError::type_error(format!(
-            "{base_name}.__new__(X): X is not a type object"
+            "{base_name}.__new__(X): X is not a type object ({})",
+            crate::type_methods::arg_type_name(cls)
         )));
     }
     if !unsafe { crate::baseobjspace::issubtype_w(cls, base_obj) } {
@@ -10180,12 +10191,24 @@ fn init_type_type(ns: PyObjectRef) {
     // `is_w(w_obj, w_type)` (`descroperation.py:362`).  The wiring lives in
     // `baseobjspace::getitem_type`, so `hasattr(type, "__class_getitem__")`
     // stays False to match.
-    // type.__init__ — no-op for now
+    // `typeobject.py:1028-1031 descr__init__` reads nothing; the class was
+    // already built by `__new__`.  All it does is settle the count, and it
+    // counts only the arguments behind the receiver, which is its own gateway
+    // parameter — so keywords never enter the total.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
+            make_builtin_function("__init__", |args| {
+                let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+                let behind_receiver = positional.len().saturating_sub(1);
+                if behind_receiver != 1 && behind_receiver != 3 {
+                    return Err(crate::PyError::type_error(
+                        "type.__init__() takes 1 or 3 arguments",
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            }),
         )
     };
     // CPython 3.14 typeobject.c slotdefs: type has its own native
