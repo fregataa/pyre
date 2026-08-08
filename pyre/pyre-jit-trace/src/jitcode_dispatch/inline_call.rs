@@ -1300,7 +1300,14 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     op: &DecodedOp,
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
-    let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
+    // The Ref list is NOT at a fixed offset: the method-form `CALL` helpers
+    // this leg latches for lower through the mixed `iIRd>r` shape, whose
+    // leading Int list shifts it (`dispatch_residual_call_iIRd_kind` reads it
+    // at `1 + i_width`).  Reading offset 1 there takes the Int list's register
+    // indices into the Ref bank — refs unrelated to the call, of a length that
+    // still passes the flush's depth check.
+    let ref_operand_offset = ref_var_list_operand_offset(code, op)?;
+    let fresh = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
     if fresh.is_empty() {
         return None;
     }
@@ -2865,13 +2872,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // body sub-walk reaches its own recursive CALL as a nested residual, which
     // `fbw_abort_nested_unjournaled_residual` declines on the self-recursive
     // hazard arm — an abort storm that folds the whole guard bridge back to
-    // residual.  The native `CALL_ASSEMBLER` self-recursion fold already exempts
-    // that decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to
-    // this admitted inline, whose recursive residual runs concretely at the
-    // pre-execute site (executed, so no replay double-apply).  Native only: the
-    // wasm always-portal path type-confuses the self-recursive inline
-    // (`setintbound: got Ref`), so it keeps the correct residual-fallback
-    // decline.
+    // residual.  The `CALL_ASSEMBLER` self-recursion fold already exempts that
+    // decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to this
+    // admitted inline, whose recursive residual runs concretely at the
+    // pre-execute site (executed, so no replay double-apply).
     let mut bridge_rec_root_selfrec = false;
     if ctx.trace_ctx.is_bridge_trace
         && args_all_builtin_integer
@@ -2911,12 +2915,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         if !safe_root_bridge {
             return Ok(None);
         }
-        bridge_rec_root_selfrec = cfg!(not(target_arch = "wasm32"))
-            && unsafe {
-                let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject;
-                !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
-            };
+        bridge_rec_root_selfrec = unsafe {
+            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject;
+            !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
+        };
     }
     // A callee `fbw_abort_nested_unjournaled_residual` already named on its
     // hazard arm residualizes from here on.  The hazard is a static property of
