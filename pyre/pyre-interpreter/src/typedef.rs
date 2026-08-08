@@ -2081,8 +2081,16 @@ unsafe fn retag_classmethod_descriptors(type_obj: PyObjectRef) {
 /// it those carry no owner and report their errors under the bare method name,
 /// where the namespace entry for the same method reports `type.name`.
 ///
+/// `dont_look_inside`: reads the prebuilt `method_owner` table's per-type
+/// `static OWNER` — a field-bearing frozen instance carrying a `fn` pointer,
+/// which the annotator cannot model as a prebuilt constant.  Making this a
+/// residual-call boundary keeps the receiver-owner setup opaque to the JIT
+/// so a lifting caller (`getattr_str_impl`'s bound-method assembly) is not
+/// dragged into the unmodellable static read.
+///
 /// # Safety
 /// `func` must be a valid, live function object.
+#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn stamp_builtin_owner(func: PyObjectRef, type_name: &str) {
     let Some(owner) = method_owner(type_name) else {
         return;
@@ -2629,6 +2637,19 @@ pub(crate) fn make_new_descr_with_signature(
     signature: crate::gateway::Signature,
 ) -> PyObjectRef {
     crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature)
+}
+
+/// [`make_new_descr`] optionally carrying a `Signature`: `Some` binds keyword
+/// arguments by name before the constructor runs; `None` (a variadic
+/// whole-args `__new__`) keeps the positional-only carrier.
+pub(crate) fn make_new_descr_maybe_sig(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    signature: Option<crate::gateway::Signature>,
+) -> PyObjectRef {
+    match signature {
+        Some(signature) => make_new_descr_with_signature(func, signature),
+        None => make_new_descr(func),
+    }
 }
 
 /// `typeobject.c tp_new_wrapper` — `__new__` takes the class to instantiate
