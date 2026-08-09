@@ -29,6 +29,19 @@ def raises(call, exc):
     raise AssertionError(f"{exc.__name__} was not raised")
 
 
+# A Windows FILETIME counts 100ns ticks, so a nanosecond that is not a multiple
+# of 100 is not a time that filesystem can hold; ext4 and APFS both store the
+# nanosecond itself. The negative range is not what differs — only how finely
+# it is kept — so the checks below round to what the host can hold rather than
+# skipping a platform.
+GRANULARITY_NS = 100 if sys.platform == "win32" else 1
+
+
+def storable(ns):
+    """`ns` as the filesystem under this test reads it back."""
+    return ns // GRANULARITY_NS * GRANULARITY_NS
+
+
 d = tempfile.mkdtemp()
 atexit.register(shutil.rmtree, d, ignore_errors=True)
 p = os.path.join(d, "f")
@@ -39,47 +52,84 @@ with open(p, "wb") as f:
 # The seconds are the floor of the value and the nanoseconds are what is left
 # above it, so -1ns is the last nanosecond of 1969 rather than a value with no
 # representation.
-#
-# Windows is left out of this block: a FILETIME counts 100ns ticks, so
-# ns=(-1, -1) is not a time that filesystem can hold (it reads -1 back as
-# -100), and the descriptor form below is not one Windows advertises. The
-# keyword `times` case after the block, which lands on whole seconds, is
-# written through SetFileTime everywhere.
-if sys.platform != "win32":
-    os.utime(p, ns=(-1, -1))
-    check(os.stat(p).st_mtime_ns == -1, f"utime(ns=(-1,-1)) -> {os.stat(p).st_mtime_ns}")
-    os.utime(p, ns=(-2_500_000_000, -2_500_000_000))
-    check(os.stat(p).st_mtime_ns == -2_500_000_000, "utime(ns) lost a negative second")
+os.utime(p, ns=(-1, -1))
+check(
+    os.stat(p).st_mtime_ns == storable(-1),
+    f"utime(ns=(-1,-1)) -> {os.stat(p).st_mtime_ns}",
+)
+os.utime(p, ns=(-2_500_000_000, -2_500_000_000))
+check(os.stat(p).st_mtime_ns == -2_500_000_000, "utime(ns) lost a negative second")
 
-    os.utime(p, (-1.5, -2.5))
-    check(
-        os.stat(p).st_mtime_ns == -2_500_000_000,
-        f"utime((-1.5,-2.5)) -> {os.stat(p).st_mtime_ns}",
-    )
-    check(os.stat(p).st_atime_ns == -1_500_000_000, "utime(times) lost the access time")
+os.utime(p, (-1.5, -2.5))
+check(
+    os.stat(p).st_mtime_ns == -2_500_000_000,
+    f"utime((-1.5,-2.5)) -> {os.stat(p).st_mtime_ns}",
+)
+check(os.stat(p).st_atime_ns == -1_500_000_000, "utime(times) lost the access time")
 
-    # The same through a descriptor, which is the form supports_fd advertises.
-    if os.utime in os.supports_fd:
-        fd = os.open(p, os.O_RDWR)
-        try:
-            os.utime(fd, ns=(-3_000_000_000, -4_000_000_000))
-            check(
-                os.stat(p).st_mtime_ns == -4_000_000_000,
-                "utime(fd, ns) lost a negative second",
-            )
-        finally:
-            os.close(fd)
+# The same through a descriptor, which is the form supports_fd advertises.
+if os.utime in os.supports_fd:
+    fd = os.open(p, os.O_RDWR)
+    try:
+        os.utime(fd, ns=(-3_000_000_000, -4_000_000_000))
+        check(
+            os.stat(p).st_mtime_ns == -4_000_000_000,
+            "utime(fd, ns) lost a negative second",
+        )
+    finally:
+        os.close(fd)
 
 # `times` is the one argument here that may be spelled either way — it sits
-# before the keyword-only marker. The pair is one the platform holds: Windows
-# refuses times before the epoch, for the reason given above.
-atime, mtime = (5.0, 6.0) if sys.platform == "win32" else (-5.0, -6.0)
-os.utime(p, times=(atime, mtime))
-check(
-    os.stat(p).st_mtime_ns == int(mtime) * 1_000_000_000,
-    f"utime(times=...) by keyword -> {os.stat(p).st_mtime_ns}",
-)
+# before the keyword-only marker.
+os.utime(p, times=(-5.0, -6.0))
+check(os.stat(p).st_mtime_ns == -6_000_000_000, "utime(times=...) by keyword")
 raises(lambda: os.utime(p, (1, 2), times=(3, 4)), TypeError)
+
+# ── what a second may be spelled as ───────────────────────────────────────
+# A value that is not a number is refused by type rather than by a failed
+# conversion, one no `time_t` can hold by overflow rather than by value, and
+# a NaN has no floor to take at all.
+e = raises(lambda: os.utime(p, ("a", "b")), TypeError)
+check(str(e) == "argument must be int or float, not str", str(e))
+e = raises(lambda: os.utime(p, (None, 1)), TypeError)
+check(str(e) == "argument must be int or float, not NoneType", str(e))
+for far in (1e30, float("inf"), 2**200, -(2**200)):
+    e = raises(lambda: os.utime(p, (far, 0)), OverflowError)
+    check(str(e) == "timestamp out of range for platform time_t", f"{far!r}: {e}")
+e = raises(lambda: os.utime(p, (float("nan"), 0.0)), ValueError)
+check(str(e) == "Invalid value NaN (not a number)", str(e))
+# `times` is the argument that also has a `None` spelling, and its message
+# names it; `ns` has no such form.
+e = raises(lambda: os.utime(p, (1,)), TypeError)
+check(str(e) == "utime: 'times' must be either a tuple of two ints or None", str(e))
+e = raises(lambda: os.utime(p, ns=(1,)), TypeError)
+check(str(e) == "utime: 'ns' must be a tuple of two ints", str(e))
+
+# `ns` is split with divmod before anything is narrowed, so a nanosecond count
+# too wide for a `time_t` is only refused when the SECOND it names is.
+os.utime(p, ns=(2**62, 2**62))
+check(os.stat(p).st_mtime_ns == storable(2**62), os.stat(p).st_mtime_ns)
+
+# Nanoseconds run out of an `int64` in 2262, and a file may carry a later time
+# than that — `st_mtime_ns` is the number it is rather than a wrap.
+#
+# Only a filesystem that reaches such a date can be asked about it, and by
+# construction that cannot be every one: an APFS timestamp IS an int64 of
+# nanoseconds, so 2262 is its ceiling too, and ext4 stores a 34-bit second and
+# stops in 2446. Both clamp what they are handed (some hosts refuse it), where
+# NTFS counts 100ns ticks to the year 30828. So the identity — the seconds in
+# nanoseconds, whatever second was stored — is what every platform is held to,
+# and the exact value only where the second survived the round trip.
+FAR = 8.8e11
+try:
+    os.utime(p, (FAR, FAR))
+except OSError:
+    pass
+else:
+    st = os.stat(p)
+    check(st.st_mtime_ns == int(st.st_mtime) * 1_000_000_000, st.st_mtime_ns)
+    if st.st_mtime == FAR:
+        check(st.st_mtime_ns == 880_000_000_000_000_000_000, st.st_mtime_ns)
 
 # Back to a time the rest of the file can be reasoned about.
 os.utime(p, ns=(1_000_000_000, 2_000_000_000))
@@ -89,20 +139,26 @@ os.utime(p, ns=(1_000_000_000, 2_000_000_000))
 # question — the terminal-only limits are not ones a regular file has. What no
 # answer may be is None: a host with no determinate value says so with -1.
 #
-# pathconf and pathconf_names are POSIX-only; Windows has neither, so the
-# section is skipped there rather than asked of a name that cannot answer.
-if sys.platform != "win32":
+# `pathconf` and the `pathconf_names` table it resolves through are a POSIX
+# surface; neither runtime carries them on Windows, so there is nothing to
+# compare there. `hasattr` rather than a platform list: what the section needs
+# is the name, not the platform.
+def limits(target):
+    for name in sorted(os.pathconf_names):
+        try:
+            limit = os.pathconf(target, name)
+        except OSError:
+            continue
+        check(isinstance(limit, int), f"pathconf({name!r}) answered {limit!r}")
+        check(limit >= -1, f"pathconf({name!r}) answered {limit}")
+        yield name, limit
 
-    def limits(target):
-        for name in sorted(os.pathconf_names):
-            try:
-                limit = os.pathconf(target, name)
-            except OSError:
-                continue
-            check(isinstance(limit, int), f"pathconf({name!r}) answered {limit!r}")
-            check(limit >= -1, f"pathconf({name!r}) answered {limit}")
-            yield name, limit
 
+check(
+    hasattr(os, "pathconf") == hasattr(os, "pathconf_names"),
+    "one of pathconf / pathconf_names is here without the other",
+)
+if hasattr(os, "pathconf"):
     answered = dict(limits(p))
     check(answered, "pathconf answered no name at all")
     check("PC_NAME_MAX" in answered, "pathconf refused PC_NAME_MAX on a regular file")

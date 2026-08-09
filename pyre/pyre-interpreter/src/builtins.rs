@@ -1723,7 +1723,10 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         "memory"
     };
-    Ok(w_str_new(&format!("<{label} at {mv:?}>")))
+    Ok(w_str_new(&format!(
+        "<{label} at {}>",
+        crate::display::repr_addr(mv as usize)
+    )))
 }
 
 /// Drop an mmap-backed view's export directly, bypassing any Python-callable
@@ -16279,7 +16282,7 @@ pub fn is_builtin_divmod_function(callable: PyObjectRef) -> bool {
 }
 
 /// `divmod(a, b)` — pypy/interpreter/baseobjspace.py divmod row.
-fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     if has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
