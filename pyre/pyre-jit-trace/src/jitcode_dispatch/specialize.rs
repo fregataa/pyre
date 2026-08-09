@@ -9632,6 +9632,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         "w_list_append_call_site",
         None,
         &[],
+        None,
     );
 
     // Swap in the call-site resume context + the callee's GLOBAL descr pool
@@ -9933,6 +9934,7 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         "w_list_pop_end_call_site",
         None,
         &[],
+        None,
     );
 
     let saved_entry = ctx.entry_py_pc;
