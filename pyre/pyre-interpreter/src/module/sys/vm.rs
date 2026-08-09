@@ -607,11 +607,10 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// a stub, so `frame.f_globals is globals()` holds and `f_back` chains lazily
 /// through `pyframe.py:767 GetSetProperty(PyFrame.fget_f_back)`.
 ///
-/// DEVIATION — the two VIRTUALIZABLE forces. The distinction matters: the vref
-/// force is common to both worlds and is not optional
-/// (`ExecutionContext::gettopframe_raw`), so `gettopframe_nohidden` is not
-/// "force-free" — it is free of the *virtualizable* force that
-/// `gettopframe` adds. Upstream takes neither of those, because
+/// DEVIATION — the VIRTUALIZABLE force on `current`. The vref force is common
+/// to both worlds and is not optional (`ExecutionContext::gettopframe_raw`), so
+/// `gettopframe_nohidden` is not "force-free" — it is free of the
+/// *virtualizable* force. Upstream takes neither, because
 /// `look_inside_iff(isconstant(depth))` traces a constant `depth` THROUGH, so
 /// the walk never becomes a residual call — and the frame it hands to app level
 /// materialises through the force `rvirtualizable.py:49-53 hook_access_field`
@@ -619,43 +618,51 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// `jtransform.py:2164-2172 rewrite_op_jit_force_virtualizable` deletes only in
 /// the graphs the codewriter looks inside.  Pyre has no such injection —
 /// `rclass.rs buildinstancerepr` declines a virtualizable `InstanceRepr`
-/// outright — so these two calls ARE that mechanism, relocated to one consumer.
-/// Pyre calls this residually, so both forces are load-bearing here:
-/// `gettopframe()` because a JIT-inlined callee has no frame of its own until a
-/// force materialises one — an unforced walk would start at the caller and then
-/// read `f_back` off a frame that never existed — and `force_frame` because app
-/// code is about to read `f_lineno` / `f_locals` off a frame whose
-/// virtualizable fields the JIT may still be holding.
+/// outright — so the `force_frame` below IS that mechanism, relocated to one
+/// consumer.
 ///
-/// The price is that each call trips `vable_after_residual_call` and aborts the
-/// trace, against `abort: vable escape: 0` and `forcings: 0` on the same
-/// fixtures under real pypy3.
+/// It is relocated onto the frame the injection would have fired for: the one
+/// this call RETURNS, whose `f_lineno` / `f_locals` app code is about to read.
+/// The walk itself needs no such force. It reads `hide()` (`pycode`, written at
+/// construction) and `f_backref` (not a virtualizable field at all), and a level
+/// the JIT kept virtual is materialised by the vref force
+/// `gettopframe_nohidden` already takes.
+///
+/// Which frame carries the force decides whether the caller's loop survives.
+/// `force_pyframe` (`pyre-jit/src/eval.rs`) clears the traced virtualizable's
+/// `TOKEN_TRACING_RESCALL` only for a frame `flush_active_frame_escape` matches
+/// — the portal itself, or the concrete frame an inline sub-walk published — and
+/// that clear is what `tracing_after_residual_call` reads as
+/// `VableEscapedDuringResidualCall`. Forcing the top of the stack regardless of
+/// `depth` therefore escaped the portal on every call, including the ones whose
+/// answer lies BELOW it; upstream escapes nothing there, because
+/// `pyjitpl.py:2159-2161 _do_jit_force_virtual` answers `topframeref` with
+/// `virtualizable_boxes[-1]` and never forces it. Measured over the `getframe_*`
+/// corpus: five fixtures that had never compiled a loop now compile one, and the
+/// two bridge fixtures read `guard_failures` 4114 → 201.
 ///
 /// `try_walker_specialize_sys_getframe`
 /// (`pyre-jit-trace/src/jitcode_dispatch/specialize.rs`) reproduces upstream's
 /// traced-through form for the one level it can resolve — depth 0 at the top
 /// walk level, where the answer IS the portal virtualizable — so those call
-/// sites reach neither this function nor its forces. Over the `getframe_*`
+/// sites reach neither this function nor its force. Over the `getframe_*`
 /// corpus that took `loops_aborted` 155 → 71 and `loops_compiled` 6 → 22.
 ///
-/// Every other shape still arrives here, and both forces stay load-bearing for
+/// Every other shape still arrives here, and the force stays load-bearing for
 /// it. A call site inside an INLINED callee is the one the arm must keep
 /// declining: that frame carries `last_instr = -1`
 /// (`pyre-jit-trace/src/helpers.rs`) with nothing updating it through the body,
 /// so folding it would compile a `_getframe().f_lineno` reporting the `def`
 /// line where the residual's force answers correctly today. The `*_declined`
-/// fixtures under `pyre/bench/synth` hold each folded shape's escape at a
-/// depth the arm refuses, so the machinery behind these forces keeps its
-/// coverage.
+/// fixtures under `pyre/bench/synth` hold each folded shape's escape at a read
+/// the arm does not cover — `_getframe(0).f_locals`, whose getset forces the
+/// portal on its own — so the machinery behind this force keeps its coverage.
 pub fn getframe(depth: i64) -> crate::PyResult {
     let ec = current_execution_context();
     let mut current = if ec.is_null() {
         std::ptr::null_mut()
     } else {
-        unsafe {
-            (*ec).gettopframe();
-            (*ec).gettopframe_nohidden()
-        }
+        unsafe { (*ec).gettopframe_nohidden() }
     };
     let mut remaining = depth;
     loop {
@@ -670,6 +677,12 @@ pub fn getframe(depth: i64) -> crate::PyResult {
     }
     unsafe { (*current).mark_as_escaped() };
     crate::executioncontext::force_frame(current);
+    // `vm.py:51 audit(space, "sys._getframe", [f])`.  Ordered after the force
+    // because a hook is app code that reads the frame it is handed, and the
+    // force is what makes those reads see the JIT's live virtualizable fields —
+    // upstream gets that ordering from the `hook_access_field` injection at
+    // each field read, which pyre has relocated to this one call site.
+    audit("sys._getframe", &[current as PyObjectRef])?;
     Ok(current as PyObjectRef)
 }
 
@@ -1230,10 +1243,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if ec.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            // Force the frame `topframeref` names before walking, for the same
-            // reason `sys._getframe` above does: a JIT-inlined callee has no
-            // frame until the force materialises one, so an unforced walk would
-            // start at the caller and report the caller's module.
+            // Force the frame `topframeref` names before walking.  Kept where
+            // [`getframe`] no longer has it: this walk takes no force on the
+            // frame it ENDS at and then reads that frame's `w_globals`, so
+            // whether the force belongs here at all is a separate question from
+            // the one settled above.
             let mut current = unsafe {
                 (*ec).gettopframe();
                 (*ec).gettopframe_nohidden()
@@ -2370,11 +2384,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // sys.audit — no-op
+    // `vm.py:473 audit` — `@unwrap_spec(event="text")`, so the event name is
+    // required and must be a str; everything after it is the argument tuple.
     module_ns_store(
         ns,
         "audit",
-        crate::make_builtin_function("audit", |_| Ok(w_none())),
+        crate::make_builtin_function("audit", sys_audit),
     );
     // sys._clear_type_descriptors(cls) — remove the descriptors owned by the
     // original class before `dataclasses._add_slots` copies its namespace into
@@ -2434,12 +2449,286 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `importlib._bootstrap_external.cache_from_source` reads it to compute the
     // bytecode path before `dont_write_bytecode` is consulted.
     module_ns_store(ns, "pycache_prefix", w_none());
-    // sys.addaudithook
+    // `vm.py:485 addaudithook`
     module_ns_store(
         ns,
         "addaudithook",
-        make_builtin_function_with_arity("addaudithook", |_| Ok(w_none()), 1),
+        make_builtin_function_with_arity("addaudithook", sys_addaudithook, 1),
     );
+    // `space.fromcache(AuditHolder)` — see [`audit_holder`] for why the holder
+    // is built here rather than on the first `addaudithook`.
+    audit_holder();
+}
+
+/// `pypy/module/sys/vm.py:438 AuditHolder`, which upstream reaches through
+/// `space.fromcache(AuditHolder)`.
+///
+/// pyre has no space object graph to hang a cache object off, so the holder is
+/// a process-global — the shape `_codecs`' `CodecState` already uses for a
+/// registry that belongs to the interpreter rather than to one mutator.  Its
+/// Python objects are handed to the collector by [`walk_audit_hooks_gc`].
+pub struct AuditHolder {
+    /// `vm.py:442 self.hooks_w = None` projected onto a byte at a fixed offset:
+    /// false while upstream's list is None, which is exactly the `vm.py:481`
+    /// early-out.  The projection exists because the JIT reads this field
+    /// through a descriptor, and `Box<[T]>` has no target-stable null spelling
+    /// — a wasm32 fat pointer is two 4-byte halves, not one 8-byte word.
+    pub hooks_armed: std::cell::Cell<bool>,
+    /// The hidden watcher field implementing `vm.py:439 _immutable_fields_ =
+    /// ['hooks_w?[:]']`.  The owner is a `Box::into_raw` leak that is never
+    /// freed, so [`pyre_object::quasiimmut::QuasiImmutField`]'s `Drop` is
+    /// unreachable and its inner box is reclaimed only through `invalidate`.
+    pub hooks_watchers: pyre_object::quasiimmut::QuasiImmutField,
+    /// A boxed slice rather than a `Vec` because `vm.py:502
+    /// debug.make_sure_not_resized` is the other half of that declaration:
+    /// [`sys_addaudithook`] replaces the list, never grows it in place.
+    hooks_w: Box<[pyre_object::PyObjectRef]>,
+}
+
+static AUDIT_HOOKS: std::sync::atomic::AtomicPtr<AuditHolder> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// `space.fromcache(AuditHolder)`.
+///
+/// Created eagerly, from [`register_module`], rather than on the first
+/// `addaudithook`: a trace recorded while no hook exists pins `hooks_w?` on
+/// this object, so the object has to exist before it does.  `fromcache` gives
+/// upstream the same guarantee for free.
+fn audit_holder() -> *mut AuditHolder {
+    loop {
+        let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+        if !holder.is_null() {
+            return holder;
+        }
+        let created = Box::into_raw(Box::new(AuditHolder {
+            hooks_armed: std::cell::Cell::new(false),
+            hooks_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+            hooks_w: Box::new([]),
+        }));
+        if AUDIT_HOOKS
+            .compare_exchange(
+                std::ptr::null_mut(),
+                created,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return created;
+        }
+        // Another thread published one first; drop ours and take theirs.
+        drop(unsafe { Box::from_raw(created) });
+    }
+}
+
+/// The holder a `QUASIIMMUT_FIELD` on `hooks_w?` hangs off, or null before
+/// `sys` is registered — the compiler declines the fold rather than pinning a
+/// field on nothing.
+pub fn audit_holder_ptr() -> *const AuditHolder {
+    AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Register a loop against the holder's `hooks_w?` field.
+///
+/// # Safety
+/// `holder` must be null or a live [`AuditHolder`].
+pub unsafe fn audit_holder_register_hooks_watcher(
+    holder: *const AuditHolder,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).hooks_watchers.register_loop_token(flag) };
+}
+
+/// Install the holder's `hooks_w?` watcher without registering a loop.
+///
+/// # Safety
+/// `holder` must be null or a live [`AuditHolder`].
+pub unsafe fn audit_holder_install_hooks_watcher(holder: *const AuditHolder) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).hooks_watchers.ensure_installed() };
+}
+
+/// Forward the installed hooks.  Upstream reaches them through the space's
+/// object graph; pyre holds them off-heap, so the collector has to be handed
+/// them — and unconditionally, not behind the prebuilt-roots bit: a hook is
+/// installed by running app code, so its callable is young when it lands.
+pub(crate) fn walk_audit_hooks_gc(visitor: &mut dyn FnMut(&mut pyre_object::PyObjectRef)) {
+    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+    if holder.is_null() {
+        return;
+    }
+    for slot in unsafe { (*holder).hooks_w.iter_mut() } {
+        visitor(slot);
+    }
+}
+
+/// `vm.py:447 AuditHolder.trigger_audit_events`.
+fn trigger_audit_events(
+    holder: &AuditHolder,
+    w_event: pyre_object::PyObjectRef,
+    args_w: &[pyre_object::PyObjectRef],
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_event);
+    // Before the tuple is built, not after: its allocation can collect, and the
+    // caller's arguments are reachable only through the borrowed slice.
+    for &w_arg in args_w {
+        pyre_object::gc_roots::pin_root(w_arg);
+    }
+    let w_args = pyre_object::tupleobject::w_tuple_new(args_w.to_vec());
+    pyre_object::gc_roots::pin_root(w_args);
+    // A hook may install another hook, and upstream's list is replaced rather
+    // than appended to, so an in-flight trigger keeps iterating the set it
+    // started with.  Snapshotting into pinned roots reproduces that and keeps
+    // every callable forwarded across the calls below.
+    let hooks_w = holder.hooks_w.clone();
+    for &w_hook in &hooks_w {
+        pyre_object::gc_roots::pin_root(w_hook);
+    }
+
+    let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
+    // don't trace audithooks by default
+    if !ec.is_null() {
+        unsafe { (*ec).is_tracing += 1 };
+    }
+    let mut result = Ok(());
+    for &w_hook in &hooks_w {
+        let cantrace = match crate::baseobjspace::findattr(w_hook, "__cantrace__") {
+            None => false,
+            Some(w_cantrace) => match crate::baseobjspace::is_true(w_cantrace) {
+                Ok(cantrace) => cantrace,
+                Err(err) => {
+                    result = Err(err);
+                    break;
+                }
+            },
+        };
+        if cantrace && !ec.is_null() {
+            unsafe { (*ec).is_tracing -= 1 };
+        }
+        let w_result = crate::baseobjspace::call_function(w_hook, &[w_event, w_args]);
+        if cantrace && !ec.is_null() {
+            unsafe { (*ec).is_tracing += 1 };
+        }
+        if w_result.is_null() {
+            result = Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("audit hook call failed")));
+            break;
+        }
+    }
+    if !ec.is_null() {
+        unsafe { (*ec).is_tracing -= 1 };
+    }
+    result
+}
+
+/// `vm.py:474 audit` with the event already wrapped, for callers that hold a
+/// `str` object rather than a Rust `&str`.
+pub fn audit_w(
+    w_event: pyre_object::PyObjectRef,
+    args_w: &[pyre_object::PyObjectRef],
+) -> Result<(), crate::PyError> {
+    if !audit_hooks_armed() {
+        return Ok(());
+    }
+    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+    trigger_audit_events(unsafe { &*holder }, w_event, args_w)
+}
+
+/// `vm.py:474 audit` — `space.audit(event, args_w)` for interpreter-level
+/// emitters.  Free when no hook is installed, which is what lets a caller on a
+/// hot path emit unconditionally.
+pub fn audit(event: &str, args_w: &[pyre_object::PyObjectRef]) -> Result<(), crate::PyError> {
+    if !audit_hooks_armed() {
+        return Ok(());
+    }
+    audit_w(w_str_new(event), args_w)
+}
+
+/// `vm.py:481 holder.hooks_w is None`, negated.  A JIT fold that answers a call
+/// without running the body it would have traced through needs this to decide
+/// whether the event it is eliding could be observed.
+pub fn audit_hooks_armed() -> bool {
+    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+    !holder.is_null() && unsafe { (*holder).hooks_armed.get() }
+}
+
+fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let Some(&w_event) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "audit() missing 1 required positional argument: 'event'",
+        ));
+    };
+    // `@unwrap_spec(event="text")`
+    if !unsafe { pyre_object::is_str(w_event) } {
+        return Err(crate::PyError::type_error(
+            "audit() argument 1 must be str, not other",
+        ));
+    }
+    audit_w(w_event, &args[1..])?;
+    Ok(w_none())
+}
+
+/// `vm.py:485 addaudithook`.  The hooks already installed get a say: a
+/// `RuntimeError` out of the `sys.addaudithook` event means the set refused the
+/// new hook, and it is dropped rather than added.  Anything else propagates.
+fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let Some(&w_hook) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "addaudithook() missing 1 required positional argument",
+        ));
+    };
+    if let Err(err) = audit("sys.addaudithook", &[]) {
+        if !error_is_runtime_error(&err) {
+            return Err(err);
+        }
+        return Ok(w_none());
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_hook);
+    let holder = audit_holder();
+    unsafe {
+        // `holder.hooks_w = holder.hooks_w + [w_hook]` — a fresh list, so a
+        // `trigger_audit_events` already iterating the old one keeps the set it
+        // started with.
+        let old = &(*holder).hooks_w;
+        let mut next = Vec::with_capacity(old.len() + 1);
+        next.extend_from_slice(old);
+        next.push(w_hook);
+        // Notification precedes the store, as `rclass.py:1010-1012
+        // hook_setfield` emits `jit_force_quasi_immutable` before `setfield`.
+        // The `is_installed()` fast path is `quasiimmut.py:38-41 invalidation`'s
+        // null test, so an unwatched install stays lock-free.
+        if (*holder).hooks_watchers.is_installed() {
+            pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).hooks_watchers);
+        }
+        (*holder).hooks_w = next.into_boxed_slice();
+        (*holder).hooks_armed.set(true);
+    }
+    Ok(w_none())
+}
+
+/// `e.match(space, space.w_RuntimeError)` for a `PyError` that may carry either
+/// an interpreter-level kind or a materialised exception object.
+fn error_is_runtime_error(err: &crate::PyError) -> bool {
+    // A hook may raise a RuntimeError SUBCLASS, so the interpreter-level kind
+    // alone is not the test; it is the fallback for an error that never
+    // materialised an exception object.
+    let w_runtime_error = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+        pyre_object::interp_exceptions::ExcKind::RuntimeError,
+    );
+    if !err.exc_object.is_null() && !w_runtime_error.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(err.exc_object);
+        pyre_object::gc_roots::pin_root(w_runtime_error);
+        return crate::baseobjspace::isinstance(err.exc_object, w_runtime_error).unwrap_or(false);
+    }
+    matches!(err.kind, crate::PyErrorKind::RuntimeError)
 }
 
 /// `sysmodule.c sys._clear_type_descriptors`: remove the instance-dict and weakref

@@ -61,6 +61,13 @@ const TERMINATOR_ALLOW_UNBOXING_INDEX: u32 = MAPDICT_DESCR_TAG;
 const PLAIN_ATTRIBUTE_EVER_MUTATED_INDEX: u32 = MAPDICT_DESCR_TAG | 1;
 const HOLDER_ATTR_INDEX: u32 = MAPDICT_DESCR_TAG | 2;
 const HOLDER_TYP_INDEX: u32 = MAPDICT_DESCR_TAG | 3;
+// `AuditHolder.hooks_armed` is the same kind of owner as the map nodes — not a
+// `PyObject`, and a `Cell<bool>` whose `stable_field_index` could collide with
+// theirs — so it takes the next index in this block rather than a tag of its
+// own: the other disjoint tags are already spoken for, `0x6000_0000` by
+// `object.typeptr` and `0x7000_0000` by the GC header's tid (`majit-ir`
+// `descr.rs`).
+const AUDIT_HOLDER_HOOKS_INDEX: u32 = MAPDICT_DESCR_TAG | 4;
 
 fn type_bits(tp: Type) -> u32 {
     match tp {
@@ -2843,6 +2850,38 @@ pub fn holder_typ_descr() -> DescrRef {
     HOLDER_TYP_FIELD_DESCR.clone()
 }
 
+/// `vm.py:439 AuditHolder._immutable_fields_ = ['hooks_w?[:]']` — whether any
+/// audit hook is installed.
+///
+/// The declaration is on the hook list itself; the field watched here is the
+/// byte `AuditHolder` projects it onto, because a `Box<[W_Root]>` has no
+/// target-stable null spelling.  That projection carries the whole datum a
+/// reader needs: `vm.py:481` tests only `hooks_w is None`, and the one fold
+/// that reads it (`try_walker_specialize_sys_getframe`) declines outright once
+/// a hook exists.
+///
+/// A reserved index and `QUASIIMMUT_FIELD`-only, for the reasons the map-node
+/// descrs above document.
+static AUDIT_HOLDER_HOOKS_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            AUDIT_HOLDER_HOOKS_INDEX,
+            core::mem::offset_of!(pyre_interpreter::module::sys::vm::AuditHolder, hooks_armed),
+            1,
+            Type::Int,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "AuditHolder.hooks_w".to_string(),
+            "hooks_w".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn audit_holder_hooks_descr() -> DescrRef {
+    AUDIT_HOLDER_HOOKS_FIELD_DESCR.clone()
+}
+
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs:34-46`) — the instance
 /// layout `[ob_type | w_class | map | storage]`.  Built with a parent SizeDescr
 /// (unlike a bare [`make_field_descr`]) so a `getfield_gc` on `map` / `storage`
@@ -3211,6 +3250,27 @@ static PYCODE_CO_FIRSTLINENO_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLo
 
 pub fn pycode_co_firstlineno_descr() -> DescrRef {
     PYCODE_CO_FIRSTLINENO_FIELD_DESCR.clone() as DescrRef
+}
+
+/// `PyCode.hidden_applevel` — the frame-hidden flag read by
+/// `PyFrame.hide()`.
+static PYCODE_HIDDEN_APPLEVEL_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
+        field_size: std::mem::size_of::<bool>(),
+        field_type: Type::Int,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "hidden_applevel",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_hidden_applevel_descr() -> DescrRef {
+    PYCODE_HIDDEN_APPLEVEL_FIELD_DESCR.clone() as DescrRef
 }
 
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
