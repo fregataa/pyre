@@ -413,6 +413,14 @@ pub struct CalleeLocalsShadow {
     /// `f_locals` or `sys._getframe` — and must not be folded away; the operand
     /// -stack region above `nlocals` is not reachable that way and still folds.
     pub frame_materialized: bool,
+    /// `CodeObject` of THIS inline level's frame.
+    ///
+    /// A `getarrayitem_vable_*` / `setarrayitem_vable_*` slot indexes the frame
+    /// the op names, and a Python pc reached inside a sub-walk indexes that
+    /// frame's bytecode — both are the callee's, not the outer portal frame the
+    /// `fbw_mode.snapshot_sym` describes.  Null when the level did not resolve
+    /// a callee code object.
+    pub code_ptr: *const pyre_interpreter::CodeObject,
 }
 
 impl Default for CalleeLocalsShadow {
@@ -424,6 +432,7 @@ impl Default for CalleeLocalsShadow {
             concrete_frame: 0,
             frame_box: OpRef::NONE,
             frame_materialized: false,
+            code_ptr: std::ptr::null(),
         }
     }
 }
@@ -5630,12 +5639,12 @@ enum InflightForiterBody {
     /// Legacy entry-PC fallback for a per-opcode walk or fixture with no
     /// full-body JitCode coordinate.
     Py(usize),
-    /// The outer Python JitCode identity and the `for_iter_next` residual's
-    /// own JitCode pc. The body fallthrough is derived only at a match point.
-    Jit {
-        outer_jitcode_index: u32,
-        op_pc: usize,
-    },
+    /// The `for_iter_next` residual's own JitCode pc plus the identity of the
+    /// JitCode that pc indexes — the inlined callee's inside a sub-walk, the
+    /// outer portal's otherwise.  The body fallthrough is derived only at a
+    /// match point.  Negative when the identity is unresolvable, which
+    /// `inflight_foriter_body_pc` reports as no coordinate at all.
+    Jit { jitcode_index: i32, op_pc: usize },
 }
 
 #[derive(Clone, Copy)]
