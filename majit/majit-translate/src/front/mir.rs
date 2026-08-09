@@ -2112,7 +2112,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
         }
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangeto_sites.is_empty() {
@@ -2414,7 +2414,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
+        simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
         // `format!`-chain expansion (#131): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -2459,7 +2459,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
         }
         Ok(())
     };
@@ -2552,12 +2552,33 @@ fn lower_unstructured_with_static_addrs_and_attrs(
 ///   (`removeassert.py:35-37` "now melt away the (hopefully) dead
 ///   operation that compute the condition").  Upstream leaves this to
 ///   the later backendopt sweep (`backendopt/all.py`); the model
-///   layer has no later sweep, so it runs here, gated on an actual
-///   removal to keep untouched graphs byte-identical.
+///   layer has no later sweep, so it runs here — see `sweep_dead_vars`
+///   below for when.
+///
+/// `sweep_dead_vars` selects which of the two call sites this is.  The
+/// end-of-lowering call passes `true` and runs `prune_dead_phis`
+/// unconditionally, as `all_passes` does.  The result-exc pre-pass passes
+/// `false`: `rewire_result_exc_call_sites` walks the `Result` diamond by
+/// following one `Variable` identity from link args into the target's
+/// inputargs, and a `Result` that is dead downstream is exactly what the
+/// sweep removes — the walk then fails the whole graph with "block N's exit
+/// does not carry the tracked value".  Measured: three `_io` `__init__`
+/// graphs stopped lowering, taking the `reader_reset_buf` /
+/// `writer_reset_buf` callees they queue with them.  The pre-pass is
+/// pyre-only and exists so the diamond matcher sees a pruned discriminant
+/// switch; keeping the sweep out of it leaves one sweep per graph, which is
+/// what upstream has.
 fn simplify_lowered_graph(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    sweep_dead_vars: bool,
 ) {
+    // Collapse the operation-less blocks the MIR lowering leaves behind.
+    // This is not the no-op `eliminate_empty_blocks`' own doc describes —
+    // that claim is about the AST front, whose tree-recursive `Expr::Match`
+    // / `Expr::If` lowering emits the post-collapse CFG directly.  This is
+    // the MIR front, and Charon MIR is full of empty blocks: measured over
+    // the LLBC corpus, the call rewires a link on 998 of 1255 graphs.
     crate::model::eliminate_empty_blocks(graph);
     // `eliminate_empty_blocks` (simplify.py:33-78) rewires each incoming
     // link past an operation-less block and leaves the bypassed block
@@ -2591,7 +2612,7 @@ fn simplify_lowered_graph(
     // graph has `fused == 0`, and the pass is conservative (fresh-alloc
     // producers + scoped store exemption) so it is a no-op on graphs with no
     // such remnants.  A removal leaves dangling threaded inputargs / link args
-    // the `prune_dead_phis` below reclaims, so fold its count into `dirty`.
+    // the `prune_dead_phis` below reclaims.
     dirty |= crate::model::prune_dead_boxing_remnants(graph) > 0;
     // Drop dead aggregate constructions (malloc + field stores whose
     // result is never read) before the dead-op sweep — `prune_dead_phis`
@@ -2610,9 +2631,52 @@ fn simplify_lowered_graph(
         crate::model::clear_unreachable_blocks(graph);
         dirty = true;
     }
-    if dirty {
+    // `transform_dead_op_vars` is the first entry in `all_passes`
+    // (simplify.py:1067) and `simplify_graph` (:1080-1086) applies every
+    // pass to every graph — there is no "only if something was removed"
+    // condition upstream.  The gate that used to stand here was written
+    // when the front made a single-predecessor block's inputargs the
+    // predecessor's own Variables, which left the sweep unable to tell a
+    // read in the predecessor from a read in the target; it removed
+    // little, so running it only after another pass had already changed
+    // something looked free.  Now that the entry framestate is copied
+    // (`flowcontext.py:466`) the sweep does real work on graphs no other
+    // pass touches — `_check_stack_index` threads the virtualizable array
+    // into a successor that never reads it, and nothing else in this
+    // sequence reports a removal for that graph.
+    if sweep_dead_vars || dirty {
         crate::model::prune_dead_phis(graph);
     }
+    // Collapse again, now that every dead-code sweep above has run.
+    //
+    // Upstream orders `all_passes` (simplify.py:1065-1078, applied in list
+    // order by `simplify_graph`, :1080-1086) as `transform_dead_op_vars`
+    // *then* `eliminate_empty_blocks`, so empty-block elimination observes
+    // the dead-op sweep's output.  The head call above runs before all of
+    // it, which inverts that.  A block emptied by one of the sweeps —
+    // `prune_dead_boxing_remnants` dropping the unit-`()` constructor from
+    // a return-forwarding block is the shape seen in practice — is
+    // otherwise never rewired past, and the values riding the link into it
+    // survive to the end of lowering as dead link args.
+    //
+    // Upstream has exactly *one* `eliminate_empty_blocks` in `all_passes`,
+    // so two calls is not upstream's shape.  It is the minimum that holds
+    // upstream's ordering property here, because pyre has dead-code passes
+    // with no upstream analogue (`fuse_boxing_alloc`,
+    // `prune_dead_boxing_remnants`, `remove_dead_aggregates`) on *both*
+    // sides of the collapse: the head call is load-bearing for the MIR
+    // front's own empty blocks, and one call cannot occupy both positions.
+    crate::model::eliminate_empty_blocks(graph);
+    // Mandatory, not redundant.  `eliminate_empty_blocks` rewires the
+    // incoming link past the block and leaves it orphaned, still carrying
+    // its inputargs; the model-layer passes scan `graph.blocks` directly
+    // rather than through upstream's `iterblocks()`, so those inputargs
+    // stay in view.  Measured counterexample: with the `clear` omitted,
+    // `set_locals_w`'s orphaned block kept the virtualizable array in its
+    // inputargs and `prune_dead_phis` did not launder it — the prune
+    // trimmed that orphan from 8 inputargs to 4 and the array was still
+    // among them.  Ordering the prune first does not remove the need.
+    crate::model::clear_unreachable_blocks(graph);
     // Re-thread boxing-cluster operands the dead-var sweeps above stripped out
     // of the `NewWithVtable`-chain blocks' inputargs.  Runs last so no later
     // pass can remove the threaded inputarg, restoring the adapter's per-block
@@ -3571,7 +3635,27 @@ impl<'a> Lowering<'a> {
                     .as_ref()
                     .map(PackedFrameState::unpack)
                 {
-                    None => ex.clone(),
+                    // First edge to reach `tmir` — `flowcontext.py:464-471
+                    // make_next_block`, whose whole body is `newstate =
+                    // state.copy()` before `SpamBlock(newstate)`.
+                    // `FrameState.copy` is "make a copy of this state in
+                    // which all Variables are fresh" (framestate.py:42), and
+                    // the freshness is what the flowspace shape rests on: a
+                    // block's inputargs are Variables *distinct* from the
+                    // link args feeding them, so per-Variable liveness can
+                    // tell "read in the predecessor" apart from "read in the
+                    // target".  Carrying `ex` through unchanged instead made
+                    // the target's inputargs literally the predecessor's
+                    // Variables — measured at 142598 of 153927 blocks — and
+                    // `prune_dead_phis` (`transform_dead_op_vars`) then kept
+                    // every link arg whose Variable happened to be read
+                    // anywhere in the predecessor, however dead it was in the
+                    // target.  Each slot is copied independently, so two
+                    // slots holding one Variable become two distinct
+                    // inputargs; `remove_duplicate_inputargs`
+                    // (`remove_identical_vars_SSA`) recombines the ones that
+                    // really are one phi column.
+                    None => ex.copy(&mut self.graph),
                     Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
                         LowerError::Unsupported(format!(
                             "framestate: union of predecessors failed at bb{tmir}"
@@ -4051,6 +4135,12 @@ impl<'a> Lowering<'a> {
             PlaceKind::Local(i) => Some(*i as usize),
             _ => None,
         };
+        // Container shape, captured before `inner` is consumed below —
+        // the write-side counterpart of the `resolve_place` Field arm.
+        let base_is_deref = matches!(
+            &inner.kind,
+            PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
+        );
         // RPython writeanalyze keys an array effect by the base box's
         // concrete ARRAY type (`op.args[0].concretetype`). Charon keeps the
         // same owner on the pre-projection Place, so preserve it before
@@ -4126,7 +4216,8 @@ impl<'a> Lowering<'a> {
                     let (field, ty) = match self.resolve_adt_field(field_payload) {
                         Some((owner_root, field_name, _field_ty, owner_id)) => (
                             FieldDescriptor::new(field_name, Some(owner_root))
-                                .with_owner_id(owner_id),
+                                .with_owner_id(owner_id)
+                                .with_base_is_deref(base_is_deref),
                             tyref_to_value_type(dest_ty, self.llbc),
                         ),
                         None => (
@@ -4473,7 +4564,10 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
+                let projection = matches!(&place.kind, PlaceKind::Projection(..));
+                let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
+                self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
             }
             // `RawPtr { place, ... }` — `&raw const x` / `&raw mut x`.
@@ -4481,7 +4575,10 @@ impl<'a> Lowering<'a> {
             // and references identically at the IR level (lifetime
             // tracking lives outside the JIT).
             Rvalue::RawPtr { place, .. } => {
+                let projection = matches!(&place.kind, PlaceKind::Projection(..));
+                let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
+                self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
             }
             // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
@@ -4793,6 +4890,8 @@ impl<'a> Lowering<'a> {
                                 name,
                                 owner_root: Some(result_ty_owner.clone()),
                                 owner_id: None,
+                                base_is_deref: None,
+                                taken_by_address: false,
                             },
                             value: crate::model::LinkArg::Value(value),
                             ty: ValueType::Ref(None),
@@ -4948,6 +5047,8 @@ impl<'a> Lowering<'a> {
                             name: "__discriminant".to_string(),
                             owner_root,
                             owner_id,
+                            base_is_deref: None,
+                            taken_by_address: false,
                         },
                         ty: ValueType::Int,
                         pure: true,
@@ -5139,6 +5240,62 @@ impl<'a> Lowering<'a> {
         Ok(var)
     }
 
+    /// Record that the `Variable` just resolved for a place is the
+    /// **address** of a field, not its value.
+    ///
+    /// The `Ref` / `RawPtr` arms alias the reference to its referent, so
+    /// `&raw mut (*p).f` leaves an ordinary `FieldRead` behind.  A
+    /// virtualizable field read is not kept as a value — the codewriter
+    /// records the array in `vable_array_vars` and drops the op — so the
+    /// address's consumer would be handed an undefined operand.  Flagging
+    /// the descriptor lets the codewriter decline the virtualizable path
+    /// for exactly this projection.
+    ///
+    /// Only the **outermost** projection is marked: it is the one whose
+    /// result is the Variable the address stands for.  An inner step of
+    /// `&(*p).a.b` is a genuine value read of `a` and keeps its lowering,
+    /// so a nested read of a virtualizable field is not collaterally
+    /// suppressed.
+    ///
+    /// Both guards are load-bearing, because a local's Variable *is* the
+    /// Variable of whatever op produced it:
+    ///
+    /// - `projection` — `&mut x` on a bare local resolves to that local's
+    ///   Variable with nothing emitted.  Matching on the last op's result
+    ///   alone would then mark the op that produced `x`, which may be an
+    ///   unrelated earlier field read.  Autoref makes this the common
+    ///   case, not a corner: `self.method()` on `&mut self` is a
+    ///   `Rvalue::Ref` over a local at every call site.
+    /// - `before` — a projection that emits nothing (a bare `Deref`, or a
+    ///   field the front resolves without a read) leaves the preceding op
+    ///   as `last`, with the same false-marking risk.
+    ///
+    /// A false mark here is not inert: on a virtualizable field it would
+    /// silently disable the protocol for a genuine access, which is the
+    /// failure the `Option` default on `base_is_deref` exists to prevent.
+    fn mark_place_address_of(
+        &mut self,
+        mir_bb: usize,
+        projection: bool,
+        before: usize,
+        v: &Variable,
+    ) {
+        if !projection {
+            return;
+        }
+        let bb_id = self.block_id[mir_bb];
+        let block = self.graph.block_mut(bb_id);
+        if block.operations.len() <= before {
+            return;
+        }
+        if let Some(op) = block.operations.last_mut()
+            && op.result.as_ref() == Some(v)
+            && let OpKind::FieldRead { field, .. } = &mut op.kind
+        {
+            field.taken_by_address = true;
+        }
+    }
+
     fn resolve_place(&mut self, mir_bb: usize, place: Place) -> Result<Variable, LowerError> {
         let place_ty = clone_tyref(&place.ty);
         match place.kind {
@@ -5208,6 +5365,15 @@ impl<'a> Lowering<'a> {
                         }
                         _ => None,
                     };
+                    // Whether the container was reached through a pointer.
+                    // Distinct from `narrow_root`, which is only `Some` for
+                    // a *raw-pointer* deref whose pointee class resolves —
+                    // a `&self` deref leaves it `None`, so it cannot stand
+                    // in for this test.
+                    let base_is_deref = matches!(
+                        &inner.kind,
+                        PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
+                    );
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let base = if let Some(root) = narrow_root {
@@ -5252,7 +5418,8 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::FieldRead {
                             base,
                             field: FieldDescriptor::new(field_name, Some(owner_root))
-                                .with_owner_id(owner_id),
+                                .with_owner_id(owner_id)
+                                .with_base_is_deref(base_is_deref),
                             ty,
                             pure: false,
                         },
@@ -7467,6 +7634,48 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `FixedObjectArray::len` reads the array's own length
+                // header, which is `arraylen_gc` — so emit `ArrayLen`
+                // rather than routing it through the `__len` call below.
+                //
+                // The receiver is the virtualizable array
+                // (`PyFrame.locals_cells_stack_w`), and the codewriter's
+                // virtualizable protocol requires it to be consumed by an
+                // array operation in its defining block.  A `__len` call
+                // passes it as a *call argument* instead, which reaches
+                // `jtransform`'s `handle_residual_call` and trips
+                // `_check_no_vable_array` ("a virtualizable array is passed
+                // around") — witnessed on `pyframe::<Impl>::_check_stack_index`,
+                // whose `locals_w!(self).len()` lowered to
+                // `FieldRead(locals_cells_stack_w)` feeding
+                // `Call(__len, [array])`.
+                //
+                // This completes the array-op family the front already
+                // applies to the same receiver: `is_object_array_set_ref_call`
+                // gives `set_ref` an `ArrayWrite`, and the workspace `Index`
+                // interception gives `index` / `index_mut` an
+                // `ArrayRead` / `ArrayWrite`.  The length-prefixed siblings
+                // `IntArray` / `FloatArray` are deliberately left on `__len`:
+                // neither is virtualizable, so neither has a reason to move,
+                // and the retarget is unmeasured for them.
+                if args.len() == 1 && self.is_object_array_len(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayLen {
+                            base: args[0].clone(),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `Vec::len` returns the container element
                 // count.  Emit the `__len` operation on the receiver — the
                 // rtyper routes it through the `len` op
@@ -7868,6 +8077,8 @@ impl<'a> Lowering<'a> {
                                 name: "__discriminant".to_string(),
                                 owner_root,
                                 owner_id,
+                                base_is_deref: None,
+                                taken_by_address: false,
                             },
                             ty: ValueType::Int,
                             pure: true,
@@ -10002,18 +10213,20 @@ impl<'a> Lowering<'a> {
     /// routing [`is_concrete_iter_constructor`] gives the container
     /// `iter`.
     ///
-    /// `FixedObjectArray::len` (`pyre-object/src/object_array.rs`) is the
-    /// `locals_cells_stack_w` `Ptr(GcArray(PyObjectRef))` accessor whose
-    /// body reads the `len` header prefix.  The receiver annotates to a
-    /// `SomeList` (GcArray model), so entering the body drives a
-    /// `getattr(SomeList, "len")` on the header field, which dead-ends at
-    /// `Cannot find attribute "len"` — the header prefix is the array's
-    /// length, read through the `len` op (`arraylen_gc`), not a user
-    /// attribute.  Recognising the call retargets it to `__len` so the
-    /// body is never entered, the same treatment `Vec::len` gets.  The
-    /// sibling length-prefixed containers `IntArray` / `FloatArray`
+    /// The length-prefixed containers `IntArray` / `FloatArray`
     /// (`pyre-object/src/int_array.rs` / `float_array.rs`) expose the same
-    /// inherent `len()` and get the identical retargeting.
+    /// inherent `len()` whose body reads the header prefix.  The receiver
+    /// annotates to a `SomeList` (GcArray model), so entering the body
+    /// drives a `getattr(SomeList, "len")` on the header field, which
+    /// dead-ends at `Cannot find attribute "len"` — the header prefix is
+    /// the array's length, read through the `len` op (`arraylen_gc`), not a
+    /// user attribute.  Recognising the call retargets it to `__len` so the
+    /// body is never entered.
+    ///
+    /// `FixedObjectArray::len` is *not* here: it goes to [`OpKind::ArrayLen`]
+    /// via [`Self::is_object_array_len`], because its receiver is the
+    /// virtualizable array and a `__len` call would pass that array as a
+    /// call argument.
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -10022,11 +10235,24 @@ impl<'a> Lowering<'a> {
             matches!(
                 fd.item_meta.name_path().as_str(),
                 "alloc::vec::<Impl>::len"
-                    | "pyre_object::object_array::<Impl>::len"
                     | "pyre_object::int_array::<Impl>::len"
                     | "pyre_object::float_array::<Impl>::len"
             )
         })
+    }
+
+    /// `FixedObjectArray::len` (`pyre-object/src/object_array.rs`) — the
+    /// `PyFrame.locals_cells_stack_w` `Ptr(GcArray(PyObjectRef))` accessor.
+    /// Its body reads the array's own length header, so the call *is*
+    /// `arraylen_gc`; see the `ArrayLen` emission site for why this one
+    /// cannot share `is_container_len`'s `__len` routing.
+    fn is_object_array_len(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::len")
     }
 
     fn is_slice_len(&self, reg: &RegularCall) -> bool {
@@ -12813,6 +13039,8 @@ impl<'a> Lowering<'a> {
                         name: name.to_string(),
                         owner_root: Some(field_owner.to_string()),
                         owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
                     },
                     value: LinkArg::Value(value),
                     ty: ValueType::Int,
@@ -20011,9 +20239,92 @@ mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
         DecodedConst, cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_const_generic_to_string,
-        charon_type_value_to_ast_string, decode_literal, tyref_is_raw_byte_ptr,
+        charon_type_value_to_ast_string, decode_literal, simplify_lowered_graph,
+        tyref_is_raw_byte_ptr,
     };
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
+
+    /// A block emptied *after* the head `eliminate_empty_blocks` must still
+    /// be rewired past, so the values riding the link into it do not survive
+    /// lowering as dead link args.
+    ///
+    /// Shape reproduced from `pyre_interpreter::pyframe::<Impl>::set_locals_w`:
+    /// the forwarding block holds one dead unit-`()` constructor, so it is
+    /// *not* empty when the head call runs; `prune_dead_boxing_remnants` /
+    /// `remove_dead_aggregates` drop that constructor, and the block is empty
+    /// only from then on.  The array the entry block writes to rides the link
+    /// into it, and `prune_dead_phis` cannot reclaim that link arg because the
+    /// forwarding block reuses the predecessor's `Variable` identities, so
+    /// per-variable liveness sees the array as read — by the predecessor's own
+    /// `ArrayWrite`.
+    #[test]
+    fn block_emptied_after_the_head_collapse_is_still_rewired_past() {
+        let unit_ctor = || OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor {
+                name: "Tuple".to_string(),
+                owner_path: Vec::new(),
+            },
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some("Tuple".to_string())),
+        };
+
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let array = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("array var");
+        let index = graph
+            .push_op_var(entry, OpKind::ConstInt(0), true)
+            .expect("index var");
+        let value = graph
+            .push_op_var(entry, OpKind::ConstInt(7), true)
+            .expect("value var");
+        // Side-effecting, so `prune_dead_phis` pins `array` in `read_vars`.
+        graph.push_op_var(
+            entry,
+            OpKind::ArrayWrite {
+                base: array.clone(),
+                index,
+                value: LinkArg::Value(value),
+                item_ty: ValueType::Int,
+                array_type_id: None,
+                nolength: false,
+            },
+            false,
+        );
+        // The dead unit-`()` value the entry block also builds.
+        graph.push_op_var(entry, unit_ctor(), true);
+
+        let forwarding = graph.create_block();
+        // The forwarding block reuses the predecessor's `Variable`, which is
+        // what defeats positional liveness in the real graph.
+        graph.block_mut(forwarding).inputargs = vec![array.clone()];
+        graph.push_op_var(forwarding, unit_ctor(), true);
+        graph.set_goto(entry, forwarding, vec![array.clone()]);
+        graph.set_return(forwarding, None);
+
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+
+        let entry_exit = &graph.block(entry).exits[0];
+        assert_eq!(
+            entry_exit.target, graph.returnblock,
+            "the emptied forwarding block must be rewired past"
+        );
+        assert!(
+            !entry_exit
+                .args
+                .iter()
+                .any(|arg| arg.as_variable() == Some(&array)),
+            "the array must not survive as a dead link arg: {:?}",
+            entry_exit.args
+        );
+        assert!(
+            graph.block(forwarding).inputargs.is_empty(),
+            "the orphaned block must be cleared, not left naming the array: {:?}",
+            graph.block(forwarding).inputargs
+        );
+    }
 
     #[test]
     fn decode_scalar_i128_and_u128_preserves_full_width() {

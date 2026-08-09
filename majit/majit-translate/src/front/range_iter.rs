@@ -388,6 +388,8 @@ mod tests {
                 name: name.to_string(),
                 owner_root: Some("core::ops::range::Range".to_string()),
                 owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
