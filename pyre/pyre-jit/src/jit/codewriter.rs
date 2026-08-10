@@ -1080,19 +1080,7 @@ fn derive_after_call_indices_from_sparse(
     n_pcs: usize,
 ) -> Vec<Option<usize>> {
     let mut out: Vec<Option<usize>> = vec![None; n_pcs];
-    let mut pc_pos: Vec<(usize, usize)> = ssarepr
-        .pc_first_insn_pos
-        .iter()
-        .filter(|&&(pc, _)| pc >= 0)
-        .map(|&(pc, pos)| (pos, pc as usize))
-        .collect();
-    pc_pos.sort_unstable();
-    let owner_pc = |q: usize| -> Option<usize> {
-        pc_pos
-            .partition_point(|&(pos, _)| pos <= q)
-            .checked_sub(1)
-            .map(|k| pc_pos[k].1)
-    };
+    let pc_pos = sparse_pc_owner_table(ssarepr);
     for (q, insn) in ssarepr.insns.iter().enumerate() {
         let is_catch = matches!(
             insn,
@@ -1104,13 +1092,31 @@ fn derive_after_call_indices_from_sparse(
         let Some(live_pos) = q.checked_sub(1).filter(|&i| ssarepr.insns[i].is_live()) else {
             continue;
         };
-        if let Some(pc) = owner_pc(live_pos) {
+        if let Some(pc) = sparse_owner_pc(&pc_pos, live_pos) {
             if pc < n_pcs {
                 out[pc] = Some(live_pos);
             }
         }
     }
     out
+}
+
+fn sparse_pc_owner_table(ssarepr: &super::flatten::SSARepr) -> Vec<(usize, usize)> {
+    let mut pc_pos: Vec<(usize, usize)> = ssarepr
+        .pc_first_insn_pos
+        .iter()
+        .filter(|&&(pc, _)| pc >= 0)
+        .map(|&(pc, pos)| (pos, pc as usize))
+        .collect();
+    pc_pos.sort_unstable();
+    pc_pos
+}
+
+fn sparse_owner_pc(pc_pos: &[(usize, usize)], q: usize) -> Option<usize> {
+    pc_pos
+        .partition_point(|&(pos, _)| pos <= q)
+        .checked_sub(1)
+        .map(|k| pc_pos[k].1)
 }
 
 fn fresh_variable_for_state(
@@ -4433,6 +4439,24 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
     groups
 }
 
+/// `PYRE_CATCH_LIVE_CENSUS`: when set to any value, count the silent drop-outs between
+/// `catch_exception` anchors and handler-live widening, so the remaining
+/// anchorless exception-table population can be measured directly.
+fn catch_live_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_CATCH_LIVE_CENSUS").is_some())
+}
+
+#[derive(Default)]
+struct CatchLiveCensus {
+    catch_sites: usize,
+    anchorless_redundant: usize,
+    anchorless_orphan: usize,
+    orphan_sites_missing: usize,
+    orphan_colors_missing: usize,
+    orphan_owner_remap_differs: usize,
+}
+
 /// Extra Ref colors a `-live-` marker must name because the PC it belongs to is
 /// covered by an exception-table entry: a raise there transfers to that entry's
 /// handler, so the handler's live-in has to survive the resume.
@@ -4452,12 +4476,17 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
 /// coordinate must name what the explicit catch edge reads.  Widening a
 /// `-live-` set is the conservative direction — the snapshot carries boxes the
 /// no-exception arm does not consume, which costs a slot and never mis-restores.
+/// Every anchorless `catch_exception` with no preceding `-live-` still widens
+/// from its own landing `TLabel`; an anchor at the same PC does not cover a
+/// second site because the per-PC anchor table keeps only one entry.  The owner
+/// PC is only how the marker index is located.
 ///
 /// Returns `marker insn index -> extra Ref colors`.
 fn catch_target_extra_ref_colors(
     ssarepr: &super::flatten::SSARepr,
     live_markers: &[usize],
     after_call_markers: &[Option<usize>],
+    first_insn_post_merge: &[Option<usize>],
     label2alive: &std::collections::HashMap<
         String,
         std::collections::HashSet<super::flatten::Register>,
@@ -4467,17 +4496,29 @@ fn catch_target_extra_ref_colors(
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     let mut out: std::collections::BTreeMap<usize, std::collections::BTreeSet<u16>> =
         std::collections::BTreeMap::new();
+    let census_enabled = catch_live_census_enabled();
     if code.exceptiontable.is_empty() {
+        if census_enabled {
+            eprintln!(
+                "[catch-live-census] code={} catch_sites=0 anchorless_sites=0 \
+                 anchorless_redundant=0 anchorless_orphan=0 covered_pcs=0 anchored_pcs=0 \
+                 widened_pcs=0 empty_refs_pcs=0 orphan_sites_missing=0 \
+                 orphan_colors_missing=0 orphan_owner_remap_differs=0",
+                code.obj_name
+            );
+        }
         return out;
     }
-    let catch_ref_colors = |anchor: usize| -> std::collections::BTreeSet<u16> {
-        let Some(super::flatten::Insn::Op { opname, args, .. }) = ssarepr.insns.get(anchor + 1)
-        else {
-            return std::collections::BTreeSet::new();
-        };
-        if opname != "catch_exception" {
-            return std::collections::BTreeSet::new();
-        }
+    let mut pc_pos: Vec<(usize, usize)> = first_insn_post_merge
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, entry)| entry.map(|pos| (pos, pc)))
+        .collect();
+    pc_pos.sort_unstable();
+    // Folded ties resolve to the higher PC; both candidates share the folded
+    // marker anyway, so widening lands on the same `out` key.
+    let pre_merge_pc_pos = census_enabled.then(|| sparse_pc_owner_table(ssarepr));
+    let catch_ref_colors_from_args = |args: &[SsaOperand]| -> std::collections::BTreeSet<u16> {
         args.iter()
             .filter_map(|op| match op {
                 SsaOperand::TLabel(label) => label2alive.get(&label.name),
@@ -4487,6 +4528,92 @@ fn catch_target_extra_ref_colors(
             .filter_map(|reg| (reg.kind == SsaKind::Ref).then_some(reg.index))
             .collect()
     };
+    let catch_ref_colors_at = |catch_idx: usize| -> std::collections::BTreeSet<u16> {
+        let Some(super::flatten::Insn::Op { opname, args, .. }) = ssarepr.insns.get(catch_idx)
+        else {
+            return std::collections::BTreeSet::new();
+        };
+        if opname != "catch_exception" {
+            return std::collections::BTreeSet::new();
+        }
+        catch_ref_colors_from_args(args)
+    };
+    let census = {
+        let mut census = CatchLiveCensus::default();
+        for (q, insn) in ssarepr.insns.iter().enumerate() {
+            let is_catch = matches!(
+                insn,
+                super::flatten::Insn::Op { opname, .. } if opname == "catch_exception"
+            );
+            if !is_catch {
+                continue;
+            }
+            if census_enabled {
+                census.catch_sites += 1;
+            }
+            if q.checked_sub(1)
+                .filter(|&i| ssarepr.insns[i].is_live())
+                .is_none()
+            {
+                let owner_pc = sparse_owner_pc(&pc_pos, q);
+                let has_anchor = owner_pc
+                    .and_then(|pc| after_call_markers.get(pc))
+                    .and_then(|entry| *entry)
+                    .is_some();
+                if has_anchor {
+                    if census_enabled {
+                        census.anchorless_redundant += 1;
+                    }
+                } else {
+                    if census_enabled {
+                        census.anchorless_orphan += 1;
+                    }
+                }
+                let landing_refs = catch_ref_colors_at(q);
+                let live_idx = owner_pc.and_then(|pc| live_markers.get(pc)).copied();
+                let mut missing_refs = std::collections::BTreeSet::new();
+                if let Some(live_idx) = live_idx {
+                    out.entry(live_idx)
+                        .or_default()
+                        .extend(landing_refs.iter().copied());
+                } else if census_enabled && !has_anchor {
+                    missing_refs = landing_refs.clone();
+                }
+                if census_enabled && !has_anchor {
+                    if !missing_refs.is_empty() {
+                        census.orphan_sites_missing += 1;
+                        census.orphan_colors_missing += missing_refs.len();
+                    }
+                    let pre_merge_owner_pc = pre_merge_pc_pos
+                        .as_ref()
+                        .and_then(|pre_merge_pc_pos| sparse_owner_pc(pre_merge_pc_pos, q));
+                    if pre_merge_owner_pc != owner_pc {
+                        census.orphan_owner_remap_differs += 1;
+                    }
+                    let owner = owner_pc
+                        .map(|pc| pc.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    let pre_merge_owner = pre_merge_owner_pc
+                        .map(|pc| pc.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    eprintln!(
+                        "[catch-live-orphan] code={} q={} owning_py_pc={} \
+                         pre_merge_owner_py_pc={} landing_ref_colors={:?} \
+                         missing_ref_colors={:?}",
+                        code.obj_name, q, owner, pre_merge_owner, landing_refs, missing_refs
+                    );
+                }
+            }
+        }
+        census
+    };
+    let anchorless_sites = census.anchorless_redundant + census.anchorless_orphan;
+    let mut covered_pcs = 0usize;
+    let mut anchored_pcs = 0usize;
+    let mut widened_pcs = 0usize;
+    let mut empty_refs_pcs = 0usize;
+    let catch_ref_colors =
+        |anchor: usize| -> std::collections::BTreeSet<u16> { catch_ref_colors_at(anchor + 1) };
     // `catch_exception` anchor -> label live-in, memoized: a try body of N PCs
     // can share one catch edge in the flattened stream.
     let mut anchor_refs: std::collections::HashMap<usize, std::collections::BTreeSet<u16>> =
@@ -4498,18 +4625,50 @@ fn catch_target_extra_ref_colors(
         else {
             continue;
         };
+        if census_enabled {
+            covered_pcs += 1;
+        }
         let Some(anchor) = after_call_markers.get(py).and_then(|entry| *entry) else {
             continue;
         };
+        if census_enabled {
+            anchored_pcs += 1;
+        }
         let refs = anchor_refs
             .entry(anchor)
             .or_insert_with(|| catch_ref_colors(anchor));
         if refs.is_empty() {
+            if census_enabled {
+                empty_refs_pcs += 1;
+            }
             continue;
+        }
+        if census_enabled {
+            widened_pcs += 1;
         }
         out.entry(live_markers[py])
             .or_default()
             .extend(refs.iter().copied());
+    }
+    if census_enabled {
+        eprintln!(
+            "[catch-live-census] code={} catch_sites={} anchorless_sites={} \
+             anchorless_redundant={} anchorless_orphan={} covered_pcs={} anchored_pcs={} \
+             widened_pcs={} empty_refs_pcs={} orphan_sites_missing={} \
+             orphan_colors_missing={} orphan_owner_remap_differs={}",
+            code.obj_name,
+            census.catch_sites,
+            anchorless_sites,
+            census.anchorless_redundant,
+            census.anchorless_orphan,
+            covered_pcs,
+            anchored_pcs,
+            widened_pcs,
+            empty_refs_pcs,
+            census.orphan_sites_missing,
+            census.orphan_colors_missing,
+            census.orphan_owner_remap_differs
+        );
     }
     out
 }
@@ -4666,6 +4825,7 @@ fn filter_liveness_in_place(
         ssarepr,
         &live_markers,
         &after_call_post_merge,
+        &first_insn_post_merge,
         &label2alive,
         code,
     );
@@ -15748,7 +15908,7 @@ mod tests {
         entry_inputargs, mergeblock, new_shadow_graph,
     };
     use crate::jit::assembler::ArcByPtr;
-    use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr};
+    use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr, TLabel};
     use crate::jit::flow::{
         Block, Constant, ConstantValue, ExitSwitch, FlowValue, FunctionGraph, Link,
         SpaceOperationArg, Variable, VariableId, c_last_exception,
@@ -16637,6 +16797,159 @@ mod tests {
             ints,
             std::collections::BTreeSet::from([3]),
             "Int bank must be untouched by the Ref-only filter",
+        );
+    }
+
+    /// Regression: before orphan widening, a `catch_exception` with no
+    /// preceding `-live-` contributed no handler Ref colors to the owner
+    /// PC's marker.
+    #[test]
+    fn catch_target_extra_ref_colors_widens_an_orphaned_catch_site() {
+        let code =
+            pyre_interpreter::compile_exec("try:\n    x = 1\nexcept Exception:\n    x = 2\n")
+                .expect("source must compile");
+        let py_pc = (0..code.instructions.len())
+            .find(|&pc| {
+                pyre_interpreter::pycode::lookup_exceptiontable(
+                    &code.exceptiontable,
+                    (pc * 2) as u32,
+                )
+                .is_some()
+            })
+            .expect("compiled try/except must have a covered pc");
+
+        let landing = "handler";
+        let mut ssarepr = SSARepr::new("orphan_catch");
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                1,
+            ))]));
+        ssarepr.insns.push(Insn::op(
+            "int_is_true",
+            vec![Operand::Register(Register::new(Kind::Int, 0))],
+        ));
+        ssarepr.insns.push(Insn::op(
+            "catch_exception",
+            vec![Operand::TLabel(TLabel::new(landing))],
+        ));
+        ssarepr.pc_first_insn_pos.push((py_pc as i64, 2));
+
+        let live_markers = vec![0; code.instructions.len()];
+        let after_call_markers = vec![None; code.instructions.len()];
+        let mut first_insn_post_merge = vec![None; code.instructions.len()];
+        first_insn_post_merge[py_pc] = Some(2);
+        let label2alive = std::collections::HashMap::from([(
+            landing.to_string(),
+            std::collections::HashSet::from([Register::new(Kind::Ref, 7)]),
+        )]);
+
+        let extra_refs = catch_target_extra_ref_colors(
+            &ssarepr,
+            &live_markers,
+            &after_call_markers,
+            &first_insn_post_merge,
+            &label2alive,
+            &code,
+        );
+
+        assert_eq!(
+            extra_refs.get(&0),
+            Some(&std::collections::BTreeSet::from([7])),
+        );
+    }
+
+    /// Regression: this fails if the orphan owner table is built from
+    /// pre-merge positions instead of the caller's post-merge remap.
+    #[test]
+    fn catch_target_extra_ref_colors_uses_post_merge_owner_positions() {
+        let code =
+            pyre_interpreter::compile_exec("try:\n    x = 1\nexcept Exception:\n    x = 2\n")
+                .expect("source must compile");
+        assert!(
+            code.instructions.len() > 1,
+            "compiled try/except must have at least two PCs",
+        );
+
+        let earlier_pc = 0usize;
+        let right_pc = 1usize;
+        let landing = "handler";
+        let mut ssarepr = SSARepr::new("orphan_catch_remap");
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                1,
+            ))]));
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                2,
+            ))]));
+        ssarepr.insns.push(Insn::op(
+            "int_is_true",
+            vec![Operand::Register(Register::new(Kind::Int, 0))],
+        ));
+        ssarepr.insns.push(Insn::op(
+            "catch_exception",
+            vec![Operand::TLabel(TLabel::new(landing))],
+        ));
+        ssarepr.pc_first_insn_pos.push((earlier_pc as i64, 0));
+        ssarepr.pc_first_insn_pos.push((right_pc as i64, 5));
+
+        let mut live_markers = vec![0; code.instructions.len()];
+        live_markers[right_pc] = 1;
+        let after_call_markers = vec![None; code.instructions.len()];
+        let mut first_insn_post_merge = vec![None; code.instructions.len()];
+        first_insn_post_merge[earlier_pc] = Some(0);
+        first_insn_post_merge[right_pc] = Some(3);
+        let label2alive = std::collections::HashMap::from([(
+            landing.to_string(),
+            std::collections::HashSet::from([Register::new(Kind::Ref, 7)]),
+        )]);
+
+        // The fixture only discriminates if the two tables disagree about who
+        // owns the `catch_exception`: the stale pre-merge positions put it on
+        // the earlier PC, the remapped ones on the PC that actually owns it.
+        let catch_q = 3usize;
+        assert_eq!(
+            sparse_owner_pc(&sparse_pc_owner_table(&ssarepr), catch_q),
+            Some(earlier_pc),
+            "pre-merge positions must resolve the catch to the earlier PC",
+        );
+        let post_merge_pc_pos = {
+            let mut table: Vec<(usize, usize)> = first_insn_post_merge
+                .iter()
+                .enumerate()
+                .filter_map(|(pc, entry)| entry.map(|pos| (pos, pc)))
+                .collect();
+            table.sort_unstable();
+            table
+        };
+        assert_eq!(
+            sparse_owner_pc(&post_merge_pc_pos, catch_q),
+            Some(right_pc),
+            "post-merge positions must resolve the catch to its own PC",
+        );
+
+        let extra_refs = catch_target_extra_ref_colors(
+            &ssarepr,
+            &live_markers,
+            &after_call_markers,
+            &first_insn_post_merge,
+            &label2alive,
+            &code,
+        );
+
+        assert_eq!(
+            extra_refs.get(&1),
+            Some(&std::collections::BTreeSet::from([7])),
+        );
+        assert!(
+            !extra_refs.contains_key(&0),
+            "pre-merge ownership would widen the earlier PC's marker",
         );
     }
 
