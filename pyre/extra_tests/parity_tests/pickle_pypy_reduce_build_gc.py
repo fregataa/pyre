@@ -7,16 +7,6 @@ import sys
 IS_CPYTHON = sys.implementation.name == "cpython"
 
 
-class ReprRaises:
-    def __repr__(self):
-        raise RuntimeError("repr must not run on a successful dictionary save")
-
-
-# pickle.py renders a dictionary key only while adding context to a value-save
-# failure. A successful save has no observable __repr__ call.
-repr_key = ReprRaises()
-assert list(pickle.loads(pickle.dumps({repr_key: 1}, protocol=4)).values()) == [1]
-
 if not IS_CPYTHON:
     # PyPy's homogeneous-list extension uses private GLOBAL sentinels followed
     # by a packed length-prefixed byte blob and REDUCE. CPython has no
@@ -46,12 +36,5 @@ if not IS_CPYTHON:
             assert "truncated" in str(exc)
         else:
             raise AssertionError("truncated packed list payload was accepted")
-
-try:
-    pickle.loads(b"")
-except EOFError:
-    pass
-else:
-    raise AssertionError("an empty pickle stream must raise EOFError")
 
 print("OK")

@@ -24,10 +24,12 @@ works.  `testutils.py` is the helper module shipped with the snippets
 
 - `snippets/` — imported RustPython suite, breadth-first surface
   coverage.  Runner: `pyre/extra_tests/run.py`.
-- `parity_tests/` — pyre-authored scripts that pin specific PyPy
-  invariants line-by-line.  Each script cites the upstream
-  file:line it guards; passing requires `exit 0` AND the final
-  stdout line being `OK`.  Runner: `pyre/extra_tests/parity_tests/run.py`.
+- `parity_tests/` — pyre-authored scripts reserved for specific PyPy/JIT/GC
+  invariants not already covered by `snippets/` or the vendored CPython suite
+  under `lib-python/3/test/`.  Do not mirror general language, builtin, or
+  stdlib behavior here.  Each script cites the upstream file:line it guards;
+  passing requires `exit 0` AND the final stdout line being `OK`.  Runner:
+  `pyre/extra_tests/parity_tests/run.py`.
 - `upstream/` — no tests of its own: a runner plus a driver for the
   vendored PyPy tree at the repository **root** `extra_tests/`.  Those
   files stay where upstream put them and run in place, so anything they

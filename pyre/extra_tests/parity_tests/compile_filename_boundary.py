@@ -41,12 +41,7 @@ class Path:
         return self.name
 
 
-# A str filename is handed through unchanged.
-assert compile(SOURCE, "plain.py", "exec").co_filename == "plain.py"
-
-# bytes decode with the filesystem encoding.  The ASCII case matters on its own:
-# it needs no surrogate to expose a filename that never reaches the code object.
-assert compile(SOURCE, b"ascii.py", "exec").co_filename == "ascii.py"
+# Bytes decode with the filesystem encoding.
 assert compile(SOURCE, NAME_BYTES, "exec").co_filename == NAME_TEXT
 
 # A str the encoding can only spell as a surrogate encodes back to the same
@@ -62,20 +57,8 @@ if UNSPELLABLE is not None:
     else:
         raise AssertionError("compile() invented a spelling for %r" % (UNSPELLABLE,))
 
-# `__fspath__` is honoured, and may answer with either str or bytes.
+# The filesystem boundary also applies to a bytes-valued `__fspath__`.
 assert compile(SOURCE, Path(NAME_BYTES), "exec").co_filename == NAME_TEXT
-assert compile(SOURCE, Path("spelled.py"), "exec").co_filename == "spelled.py"
-
-# An object that is neither a path nor a string is a TypeError, not a filename
-# quietly replaced by "<string>".  The two runtimes word it differently, so only
-# the class is under test.
-for bad in (42, object(), None):
-    try:
-        compile(SOURCE, bad, "exec")
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("compile() accepted %r as a filename" % (bad,))
 
 # `bytesbuf0_w` rejects an embedded NUL.
 for nul in ("a\x00b.py", b"a\x00b.py"):
@@ -105,19 +88,11 @@ else:
     raise AssertionError("compile() accepted an unterminated '('")
 
 
-# `repr()` reads `co_filename`, so it follows a replacement instead of showing
-# the name the object was compiled under.
+# `repr()` reads `co_filename`, so it follows a surrogate-bearing replacement.
 code = compile(SOURCE, "before.py", "exec")
-assert 'file "before.py"' in repr(code), repr(code)
-
 replaced = code.replace(co_filename=NAME_TEXT)
 assert replaced.co_filename == NAME_TEXT
 assert 'file "%s"' % NAME_TEXT in repr(replaced), ascii(repr(replaced))
-
-# `pycode.py:570-572` reports the zero sentinel as line -1.
-assert 'line -1>' in repr(code.replace(co_firstlineno=0)), ascii(
-    repr(code.replace(co_firstlineno=0))
-)
 
 # and a filename that has no plain-text spelling reaches repr() the same way.
 from_bytes = compile(SOURCE, NAME_BYTES, "exec")

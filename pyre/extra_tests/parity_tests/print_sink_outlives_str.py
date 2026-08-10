@@ -8,30 +8,16 @@
 # after it goes through a freed object.  The sink therefore has to be held for
 # the whole call, not read once into a local.
 #
-# `check_str_rebinds_stdout` is CPython's `test_print.test_gh130163`.  The other
-# two move the rebinding into the sink's own `write`: `write` is a plain
-# function in the instance dict, so the call does not pass the sink as `self`
+# CPython's `test_print.test_gh130163` covers rebinding from an argument's
+# `__str__`.  These cases move the rebinding into the sink's own `write`.
+# `write` is a plain function in the instance dict, so the call does not pass
+# the sink as `self`
 # and nothing but `print` itself keeps it alive while it runs.  That covers the
 # separator and terminator writes, which take a different path from the
 # argument write.
 import gc
 import sys
 from io import StringIO
-
-
-def check_str_rebinds_stdout():
-    class X:
-        def __str__(self):
-            sys.stdout = StringIO()
-            gc.collect()
-            return "foo"
-
-    saved = sys.stdout
-    try:
-        sys.stdout = StringIO()  # the only reference
-        print(X())
-    finally:
-        sys.stdout = saved
 
 
 def check_write_rebinds_stdout(*args, **kwargs):
@@ -64,7 +50,6 @@ def check_write_rebinds_stdout(*args, **kwargs):
     assert len(written) > 1, written
 
 
-check_str_rebinds_stdout()
 # Two arguments so the separator write runs between them, and the default
 # terminator write runs after.
 check_write_rebinds_stdout("a", "b")

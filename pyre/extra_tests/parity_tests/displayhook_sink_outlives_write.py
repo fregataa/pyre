@@ -12,25 +12,7 @@
 # What both guarantee is that the two writes happen and that neither goes
 # through a reclaimed object, so that is what this checks.
 import gc
-import io
 import sys
-
-
-def check_repr_rebinds_stdout():
-    """`test_sys.TestSys.test_gh130163` — the repr drops the sink."""
-
-    class X:
-        def __repr__(self):
-            sys.stdout = io.StringIO()
-            gc.collect()
-            return "foo"
-
-    saved = sys.stdout
-    try:
-        sys.stdout = io.StringIO()  # the only reference
-        sys.displayhook(X())
-    finally:
-        sys.stdout = saved
 
 
 def check_write_rebinds_stdout():
@@ -69,7 +51,6 @@ def check_write_rebinds_stdout():
     assert log[0][0] == "first", log
 
 
-check_repr_rebinds_stdout()
 check_write_rebinds_stdout()
 
 print("OK")
