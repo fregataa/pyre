@@ -2749,6 +2749,12 @@ pub fn step<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
+    // The walker mixes translated vable operations (which update the shadow)
+    // with concrete interpreter steps (which update the heap PyFrame).  Pull
+    // those concrete writes into `virtualizable_boxes` before any handler can
+    // read or synchronize it, matching the invariant documented by
+    // `TraceCtx::refresh_virtualizable_shadow_from_heap`.
+    ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }
@@ -5960,6 +5966,11 @@ enum FbwListEffect {
     Append {
         list: pyre_object::PyObjectRef,
         length_before: usize,
+        /// `PyListObject.allocated` as the specialization read it before the
+        /// append.  The length rewind alone would leave the over-allocation
+        /// the eager append computed, so the undo restores the field the same
+        /// way it restores the length.
+        allocated_before: isize,
     },
     PopEnd {
         list: pyre_object::PyObjectRef,
@@ -6510,6 +6521,12 @@ enum VstackOpClass {
     /// BINARY_SUBSCR / COMPARE_OP / unary ops / CALL /
     /// IS_OP / CONTAINS_OP / single-result BUILD_*.
     ResultToTos,
+    /// Pyre's method-form `LOAD_GLOBAL` pushes the callable and then a NULL
+    /// `self_or_null` sentinel.  The callable is recovered from the
+    /// virtualizable shadow; the top slot is an explicit Ref constant so a
+    /// guard inside the following CALL can snapshot the live NULL instead of
+    /// inheriting an older value from that frame slot.
+    LoadGlobalMethod,
     /// The opcode only pops (and/or stores to a local/global/attr/subscr,
     /// or is an unconditional control transfer).  Truncate to the new
     /// depth WITHOUT touching the surviving TOS — the box already in that
@@ -9910,7 +9927,8 @@ fn handle<Sym: WalkSym>(
         // long_mod / long_div until the build-pipeline jtransform
         // port lands) get a `setdefault`-allocated dynamic byte and
         // resolve through BH dispatch only.
-        // `cast_int_to_float` / `cast_int_to_ptr` / `cast_ptr_to_int`
+        // `cast_float_to_int` / `cast_int_to_float` / `cast_int_to_ptr` /
+        // `cast_ptr_to_int`
         // route through `dispatch_regular_record` (see `arith.rs`
         // `unop_cast_record`) — part of the `pyjitpl.py`
         // exec-generated unary family.

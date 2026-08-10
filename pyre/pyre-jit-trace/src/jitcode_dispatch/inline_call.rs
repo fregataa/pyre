@@ -1311,6 +1311,13 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     if fresh.is_empty() {
         return None;
     }
+    // Validate the CALL operand slice itself, not the complete reconstructed
+    // stack.  A CALL inside WITH/FOR_ITER can retain non-null prefix operands;
+    // checking `stack.first()` after prepending them lets an unresolved NULL
+    // callable slip through and publishes an invalid frame at the CALL.
+    if !matches!(fresh.first(), Some(ConcreteValue::Ref(r)) if !r.is_null()) {
+        return None;
+    }
     // The encoded residual args describe only the CALL operands.  Values can
     // remain below them on the Python operand stack (notably the iterator of
     // an enclosing FOR_ITER).  RPython resumes the complete MIFrame stack, so
@@ -1333,7 +1340,7 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
             _ => return None,
         }
     }
-    stack.first().is_some_and(|c| !c.is_null()).then_some(stack)
+    Some(stack)
 }
 
 /// Fold a keyword call's `kwnames`->parameter permutation at trace time so a
@@ -6773,6 +6780,35 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
+
+    // RPython `rclass.py`/`rbuiltin.py` allocation lowering: entering the
+    // canonical `w_int_new` helper with one signed argument records the
+    // `NEW_WITH_VTABLE + SETFIELD_GC` box directly.  The LLBC fallback body
+    // spells the same operation as a zero-argument allocation residual plus
+    // header/payload stores; its generic allocator has no host fnaddr (it is
+    // an lltype allocation opcode, not a callable), so descending that legacy
+    // spelling would abort at the symbolic funcptr.  Treat the translated
+    // helper call as the allocation intrinsic at this frame boundary, exactly
+    // where RPython's rtyper has already replaced `malloc(W_IntObject)`.
+    let is_w_int_new = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+        .is_some_and(|jc| jc.name == "w_int_new" && jc.code.as_ptr() == sub_body.code.as_ptr());
+    if is_w_int_new
+        && dst_bank == 'r'
+        && int_args.len() == 1
+        && ref_args.is_empty()
+        && let Some(ConcreteValue::Int(value)) = int_arg_concretes.first().copied()
+    {
+        let boxed_ptr = pyre_object::w_int_new(value) as i64;
+        let boxed = walker_box_int(ctx, op.pc, int_args[0], value)?;
+        let boxed_concrete = box_int_concrete(value, boxed_ptr);
+        ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        let ConcreteValue::Ref(boxed_shadow) = concrete_from_recorded_opref(ctx, boxed) else {
+            unreachable!("box_int_concrete must produce a Ref concrete")
+        };
+        write_ref_reg(ctx, op.pc, dst, boxed, ConcreteValue::Ref(boxed_shadow))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     let callee_outcome = run_sub_jitcode_walk(
         ctx,

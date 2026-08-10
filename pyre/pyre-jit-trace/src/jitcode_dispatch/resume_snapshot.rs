@@ -55,6 +55,10 @@ fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchEr
         .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })
 }
 
+pub(crate) fn vstack_box_for_snapshot(value: OpRef) -> Option<OpRef> {
+    (value != OpRef::NONE).then_some(value)
+}
+
 /// `generate_guard` (`pyjitpl.py`) keys `after_residual_call`
 /// on the guard opcode itself: `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` /
 /// `GUARD_NOT_FORCED` / `GUARD_ALWAYS_FAILS` resume *after* the residual
@@ -660,7 +664,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // backends — so a slot the mirror does not cover (invalid
                 // mirror, slot beyond the mirror, or an Int-bank temp the
                 // Ref-only mirror leaves NONE) is simply omitted; resume
-                // re-materializes it rather than reading the flat color.
+                // re-materializes it rather than reading the flat color. A
+                // ConstPtr(NULL) is not a hole: it is CALL's live
+                // `self_or_null` operand and must overwrite a stale shadow
+                // slot in the capture-only overlay.
                 (0..depth)
                     .filter_map(|s| {
                         let v = if ctx.vstack_valid {
@@ -668,11 +675,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         } else {
                             OpRef::NONE
                         };
-                        if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
-                            Some((nvs + nlocals + s, v))
-                        } else {
-                            None
-                        }
+                        vstack_box_for_snapshot(v).map(|v| (nvs + nlocals + s, v))
                     })
                     .collect()
             } else {
@@ -1275,14 +1278,14 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     caller_sym: &Sym,
     ctx: &WalkContext<'_, '_, Sym>,
     call_jitcode_pc: usize,
-) -> Vec<(usize, pyre_object::PyObjectRef)> {
+) -> Option<Vec<(usize, pyre_object::PyObjectRef)>> {
     if caller_sym.jitcode().is_null() {
-        return Vec::new();
+        return None;
     }
     let (nlocals, depth, pcdep_entries) = unsafe {
         let jc = &*caller_sym.jitcode();
         if jc.payload.code_ptr.is_null() {
-            return Vec::new();
+            return None;
         }
         // The caller CALL key is a plain JitCode→Python inversion, so use the
         // certified predecessor twins rather than the marker/trivia flavor
@@ -1299,7 +1302,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     };
     let stack_end = nlocals + depth;
     if depth == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let mut overrides = Vec::new();
     if ctx.vstack_valid && ctx.vstack_depth == depth && ctx.vstack_boxes.len() >= depth {
@@ -1375,13 +1378,28 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     // guessing: `[callable, null_or_self, arg0 .. arg_{argc-1}]` ends at
     // `stack_end`, so the sentinel sits `argc + 1` below it, right under the
     // arguments and right above the callable.
-    if let Some(slot) = call_null_or_self_slot(caller_sym, call_jitcode_pc, stack_end)
-        && slot >= nlocals
-        && !overrides.iter().any(|&(present, _)| present == slot)
+    let null_or_self_slot = call_null_or_self_slot(caller_sym, call_jitcode_pc, stack_end)?;
+    if null_or_self_slot >= nlocals
+        && !overrides
+            .iter()
+            .any(|&(present, _)| present == null_or_self_slot)
     {
-        overrides.push((slot, std::ptr::null_mut::<u8>() as pyre_object::PyObjectRef));
+        overrides.push((
+            null_or_self_slot,
+            std::ptr::null_mut::<u8>() as pyre_object::PyObjectRef,
+        ));
     }
+    // The slot immediately below null_or_self is the callable.  Ref(0) is a
+    // valid value only in the null_or_self slot above; in the callable slot it
+    // means the sparse vstack/color reconstruction is incomplete.  Decline
+    // the parent-frame image instead of publishing a CALL that will dispatch
+    // through a null object.
+    let callable_slot = null_or_self_slot.checked_sub(1)?;
     overrides
+        .iter()
+        .find_map(|&(slot, value)| (slot == callable_slot).then_some(value))
+        .filter(|value| !value.is_null())?;
+    Some(overrides)
 }
 
 /// Absolute frame slot holding the `null_or_self` operand of the `CALL` whose
@@ -1735,7 +1753,8 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     if depth == 0 && !call_is_void {
         return Err(unavail("Unavail::Top/DepthZero"));
     }
-    let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc);
+    let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc)
+        .ok_or_else(|| unavail("Unavail::Top/CallStack"))?;
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
     // `stack_slot_color_map` — when the result remains live, it is not a live
