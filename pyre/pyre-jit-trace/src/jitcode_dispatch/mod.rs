@@ -2598,10 +2598,9 @@ pub(crate) fn census_record(name: &'static str) {
 }
 
 thread_local! {
-    /// Code objects already counted by
-    /// [`census_record_frame_shape_decline`], so a `CurrentFrameOnly` code
-    /// entered many times (a hot helper) records exactly one census entry
-    /// instead of one per call.  Keyed by the stable `CodeObject` pointer.
+    /// Code objects already counted by a pre-trace frame admission diagnostic,
+    /// so a hot declined helper records exactly one census entry instead of one
+    /// per call. Keyed by the stable `CodeObject` pointer.
     static FRAME_SHAPE_DECLINE_SEEN: std::cell::RefCell<std::collections::BTreeSet<usize>> =
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
@@ -2622,6 +2621,93 @@ pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) {
     if first {
         census_record(kind);
     }
+}
+
+/// Record a frame-level FOR_ITER admission denial once per code object.
+/// `kind` names the predicate that denied the frame, so a pre-trace rejection
+/// remains attributable in the same census as frame-shape and traced-walk
+/// declines. Returns whether this was the first decline recorded for `code_ptr`.
+pub fn census_record_for_iter_gate_decline(code_ptr: usize, kind: &'static str) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some()
+            || std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some()
+    }) {
+        return false;
+    }
+    let first = FRAME_SHAPE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
+    if first {
+        census_record(kind);
+    }
+    first
+}
+
+#[derive(Clone, Copy, Default)]
+struct ForiterInflightCensusCounts {
+    delivered: usize,
+    refused: usize,
+}
+
+thread_local! {
+    /// In-flight FOR_ITER delivery outcomes, keyed by the frame's stable raw
+    /// `CodeObject` identity and the Python body pc. The map is touched only
+    /// when its diagnostic is enabled, so ordinary execution does not
+    /// allocate or count on the abort path.
+    static FORITER_INFLIGHT_CENSUS: std::cell::RefCell<
+        std::collections::BTreeMap<(usize, usize), ForiterInflightCensusCounts>
+    > = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Whether the in-flight FOR_ITER delivery census collects. Callers that must
+/// compute a census key before recording share this gate, so resolving the key
+/// costs nothing when the diagnostic is off.
+pub(crate) fn foriter_inflight_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_FORITER_INFLIGHT_CENSUS").is_some()
+            || std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some()
+    })
+}
+
+/// Record one legacy in-flight FOR_ITER delivery decision. Like
+/// [`census_record_for_iter_gate_decline`], the collection gate precedes the
+/// thread-local lookup, so the census costs nothing when diagnostics are off.
+fn census_record_foriter_inflight(code_ptr: usize, body_pc: usize, delivered: bool) {
+    if !foriter_inflight_census_enabled() {
+        return;
+    }
+    FORITER_INFLIGHT_CENSUS.with(|c| {
+        let mut map = c.borrow_mut();
+        let counts = map.entry((code_ptr, body_pc)).or_default();
+        if delivered {
+            counts.delivered += 1;
+        } else {
+            counts.refused += 1;
+        }
+    });
+    census_dump_foriter_inflight();
+}
+
+/// Print the accumulated in-flight delivery table after each observation, so
+/// the last block in a process log is its final tally without an exit hook.
+fn census_dump_foriter_inflight() {
+    FORITER_INFLIGHT_CENSUS.with(|c| {
+        for (&(code_ptr, body_pc), counts) in c.borrow().iter() {
+            let (name, source) = if code_ptr == 0 {
+                ("<unknown>", "<unknown>")
+            } else {
+                // The code object is owned by the live frame/JitCode for the
+                // duration of the process; the census only reads its labels.
+                let code = unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) };
+                (code.qualname.as_str(), code.source_path.as_str())
+            };
+            eprintln!(
+                "[fbw-foriter-census] code=0x{code_ptr:x} name={name:?} source={source:?} \
+                 body_pc={body_pc} DELIVERED={} REFUSED={}",
+                counts.delivered, counts.refused
+            );
+        }
+    });
 }
 
 /// The accumulated decline census as `(variant name, count)` pairs, sorted by
@@ -7105,6 +7191,23 @@ fn walker_execute_may_force_boxed<Sym: WalkSym>(
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<i64> {
+    match walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)? {
+        Ok(result) if result != 0 => Some(result),
+        _ => None,
+    }
+}
+
+/// Execute the authentic boxed helper at record time, retaining its raising
+/// result for specializations that trace through an exception arm.  The
+/// ordinary result-only gate above deliberately maps a raise back to `None`;
+/// this lower-level form lets a caller replace the opaque call with guarded
+/// allocation IR while keeping the interpreter-produced exception as its
+/// concrete shadow.
+fn walker_execute_may_force_boxed_outcome<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Option<Result<i64, i64>> {
     if allboxes.is_empty() || !allboxes[0].is_constant() {
         return None;
     }
@@ -7128,16 +7231,9 @@ fn walker_execute_may_force_boxed<Sym: WalkSym>(
         };
         args.push(v);
     }
-    // Execute the helper concretely for the authentic boxed result
-    // (small-int caching / identity).  A raised helper (`Err`) or a NULL
-    // result defers to the generic `CallMayForce` record so the
-    // Python-level `__op__` semantics are preserved.
-    let boxed_result_i64 =
-        match majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args) {
-            Ok(result) if result != 0 => result,
-            _ => return None,
-        };
-    Some(boxed_result_i64)
+    Some(majit_metainterp::executor::execute_residual_call(
+        call_descr, func_ptr, &args,
+    ))
 }
 
 /// Resolve the concrete `PyObjectRef` carried by a Ref-bank operand's
@@ -7237,6 +7333,35 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
     i64,
     i64,
 )> {
+    let (lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val) =
+        walker_int_specialization_input_operands(ctx, r_args)?;
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    Some((
+        lhs,
+        rhs,
+        lhs_obj,
+        rhs_obj,
+        lhs_val,
+        rhs_val,
+        boxed_result_i64,
+    ))
+}
+
+/// Operand-only half of [`walker_int_specialization_operands`].  Raising
+/// specializations must choose their guarded arm before executing the helper:
+/// the helper's exception is needed as a concrete shadow, but the helper call
+/// itself must not become the trace operation.
+fn walker_int_specialization_input_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    i64,
+    i64,
+)> {
     if r_args.len() != 2 {
         return None;
     }
@@ -7245,10 +7370,10 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
     let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
     let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
     let (lhs_val, rhs_val) = unsafe {
-        // `bool` is a `W_IntObject` subclass sharing the 8-byte `intval` at
-        // offset 16; the consumer unboxes it through its own `&BOOL_TYPE`
-        // guard, so it stays on the int path.  Returns the concrete objects
-        // so the consumer can pick the per-operand class/descr.
+        // `bool` is a `W_IntObject` subclass sharing the `intval` layout; the
+        // consumer unboxes it through its own `&BOOL_TYPE` guard, so it stays
+        // on the int path. Returns the concrete objects so the consumer can
+        // pick the per-operand class/descr.
         if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
             return None;
         }
@@ -7266,16 +7391,7 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
             pyre_object::w_int_get_value(rhs_obj),
         )
     };
-    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
-    Some((
-        lhs,
-        rhs,
-        lhs_obj,
-        rhs_obj,
-        lhs_val,
-        rhs_val,
-        boxed_result_i64,
-    ))
+    Some((lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val))
 }
 
 /// Float counterpart of [`walker_int_specialization_operands`].  Each
@@ -7300,6 +7416,38 @@ fn walker_float_specialization_operands<Sym: WalkSym>(
     f64,
     f64,
     i64,
+)> {
+    let (lhs, rhs, lhs_obj, rhs_obj, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64) =
+        walker_float_specialization_input_operands(ctx, r_args)?;
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    Some((
+        lhs,
+        rhs,
+        lhs_obj,
+        rhs_obj,
+        lhs_is_int,
+        rhs_is_int,
+        lhs_f64,
+        rhs_f64,
+        boxed_result_i64,
+    ))
+}
+
+/// Operand-only half of [`walker_float_specialization_operands`], used when a
+/// raising arithmetic arm needs the helper-produced exception rather than a
+/// boxed value.
+fn walker_float_specialization_input_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    bool,
+    bool,
+    f64,
+    f64,
 )> {
     if r_args.len() != 2 {
         return None;
@@ -7340,17 +7488,8 @@ fn walker_float_specialization_operands<Sym: WalkSym>(
     if lhs_is_int && rhs_is_int {
         return None;
     }
-    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
     Some((
-        lhs,
-        rhs,
-        lhs_obj,
-        rhs_obj,
-        lhs_is_int,
-        rhs_is_int,
-        lhs_f64,
-        rhs_f64,
-        boxed_result_i64,
+        lhs, rhs, lhs_obj, rhs_obj, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64,
     ))
 }
 
@@ -7980,11 +8119,12 @@ fn walker_guard_class<Sym: WalkSym>(
 }
 
 /// Guard the fixed-layout mapdict-carrier representation, the receiver type's
-/// live version tag, and the exact map shape used by the mapdict attribute
-/// folds.  The concrete layout vtable proves that the receiver has the shared
-/// `[PyObject | map | storage]` prefix (`W_ObjectObject`, or a native-layout
-/// carrier such as `W_Random`); the promoted map identity pins its class and
-/// storage coordinates (mapdict.py).
+/// live Python class, live version tag, and the exact map shape used by the
+/// mapdict attribute folds.  Native builtin subclasses share their `ob_type`
+/// with exact builtin values, so the Python class guard is what proves that a
+/// later receiver still has the wide user layout before either mapdict field
+/// is read. The promoted map identity then pins its storage coordinates
+/// (mapdict.py).
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8015,6 +8155,14 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
             .class_now_known(obj, layout_type_addr);
     }
 
+    // `typedef.py:174-227` gives a builtin user subclass a generated payload
+    // containing MapdictStorageMixin. pyre represents that generated payload
+    // with a distinct GC type id but retains the builtin `ob_type`, so
+    // GuardClass alone cannot separate (for example) W_IntObjectUser from the
+    // shorter W_IntObject. Pin `w_class` before loading `map` at the user
+    // offset; an exact builtin or a different subclass exits first.
+    walker_guard_exact_w_class(ctx, op_pc, obj, w_type)?;
+
     // The instance map pins the storage layout, but class mutation can change
     // lookup precedence without changing that map. Pin the receiver type's
     // version tag so such a mutation revokes the loop before the folded
@@ -8039,8 +8187,9 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
-    let map_op =
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
+    let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, unsafe {
+        crate::descr::mapdict_map_descr(concrete_obj)
+    });
     if !map_op.is_constant() {
         let map_const = ctx.trace_ctx.const_int(map as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
@@ -8367,6 +8516,23 @@ unsafe fn walker_exact_builtin_class(
         }
         let canonical = pyre_object::pyobject::get_instantiate(&*(*obj).ob_type);
         std::ptr::eq(w_class, canonical).then_some(canonical)
+    }
+}
+
+/// Canonical Python class for an exact int/float specialization operand.
+/// Tagged ints have no object header and bool cannot be subclassed, so a null
+/// result tells `walker_guard_exact_w_class` that the existing shape guard is
+/// already sufficient. Heap operands were admitted by
+/// `is_exact_builtin_instance` in the shared operand gate.
+fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        pyre_object::PY_NULL
+    } else if unsafe { pyre_object::is_bool(obj) } {
+        pyre_object::PY_NULL
+    } else if unsafe { pyre_object::is_float(obj) } {
+        pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE)
+    } else {
+        pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE)
     }
 }
 
