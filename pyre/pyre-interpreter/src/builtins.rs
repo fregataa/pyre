@@ -3836,6 +3836,20 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         },
     };
 
+    // The sink has to outlive the Python this call runs.  `str(arg)` and every
+    // `file.write` attribute lookup re-enter the eval loop, so a `sys.stdout`
+    // rebinding there can drop the last reference to the object resolved just
+    // above and the next safepoint reclaims it — the write that follows would
+    // then go through a dangling pointer.  Root it once for the rest of the
+    // call and read the rooted slot at each use, so a collection that moves it
+    // is followed and one that would have freed it cannot happen.
+    let file_roots = pyre_object::gc_roots::push_roots();
+    let file_slot = file.map(|fp| {
+        let base = file_roots.base();
+        file_roots.pin_root(fp);
+        base
+    });
+
     // `bltinmodule.c print_impl` writes incrementally: `str(arg)`, then the
     // separator before each following arg, then `end`.  Each source is rendered
     // at emit time so a raising `__str__` leaves the bytes already emitted on
@@ -3845,7 +3859,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // stdout path renders through the strict utf-8 error handler in
     // `print_render`.
     let emit = |source: PyObjectRef| -> Result<(), crate::PyError> {
-        let Some(fp) = file else {
+        let Some(file_slot) = file_slot else {
             let s = unsafe { print_render(source)? };
             crate::print_output(&s);
             return Ok(());
@@ -3859,6 +3873,10 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::gc_roots::pin_root(s_obj);
         let s_obj =
             pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
+        // Read the sink only here: `py_str_wtf8` above ran `__str__`, and the
+        // rooted slot — not the pointer resolved before it — is what a move
+        // under that call updated.
+        let fp = file_roots.get(file_slot);
         let r = crate::baseobjspace::call_method(fp, "write", &[s_obj]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
@@ -3871,7 +3889,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // throwaway str object per gap/line.  The `file=` path still hands a str
     // to `file.write`.
     let emit_literal = |lit: &str| -> Result<(), crate::PyError> {
-        let Some(fp) = file else {
+        let Some(file_slot) = file_slot else {
             crate::print_output(lit);
             return Ok(());
         };
@@ -3882,6 +3900,9 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::gc_roots::pin_root(s);
         let s =
             pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
+        // Same as `emit`: the preceding write's own lookup may have moved the
+        // sink, so take it from the rooted slot.
+        let fp = file_roots.get(file_slot);
         let r = crate::baseobjspace::call_method(fp, "write", &[s]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
@@ -3903,11 +3924,12 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         None => emit_literal("\n")?,
     }
     if flush {
-        match file {
+        match file_slot {
             None => {
                 crate::host_seam::flush_stdout();
             }
-            Some(fp) => {
+            Some(file_slot) => {
+                let fp = file_roots.get(file_slot);
                 let r = crate::baseobjspace::call_method(fp, "flush", &[]);
                 if r.is_null() {
                     return Err(crate::call::take_call_error().unwrap_or_else(|| {
@@ -3928,6 +3950,44 @@ fn set_builtins_underscore(value: PyObjectRef) {
     }
 }
 
+/// One `print_item_to(x, sys_stdout())` / `print_newline_to(sys_stdout())`
+/// step: resolve the live sink, then write one string through it.
+///
+/// The resolution belongs to the step, not to the call. `app.py:252-253`
+/// evaluates `sys_stdout()` once per write, so the sink is never carried from
+/// one write to the next — and it must not be here either, because a write
+/// runs Python that may rebind `sys.stdout`. A sink reachable only through
+/// that binding is reclaimed at the following safepoint, and reusing the
+/// pointer then reads freed memory.
+///
+/// `Ok(false)` reports `sys.stdout is None`, which writes nothing.
+fn displayhook_write(part: PyObjectRef) -> Result<bool, crate::PyError> {
+    // Pin the string for the whole step. It is reachable only through this
+    // Rust local, and both resolving the sink (a module `__getattr__`) and
+    // looking up its `write` can re-enter the eval loop, where the
+    // `PYRE_GC_INTERP` safepoint sweeps an unrooted old-gen object and moves a
+    // surviving one — so read it back from the rooted slot at the point of use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let part_slot = roots.base();
+    roots.pin_root(part);
+    match resolve_default_print_target()? {
+        DefaultPrintTarget::Native => {
+            let s = unsafe { print_render(roots.get(part_slot))? };
+            crate::print_output(&s);
+        }
+        DefaultPrintTarget::Rebound(fp) => {
+            let r = crate::baseobjspace::call_method(fp, "write", &[roots.get(part_slot)]);
+            if r.is_null() {
+                return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                    crate::PyError::runtime_error("displayhook: file.write() failed")
+                }));
+            }
+        }
+        DefaultPrintTarget::Silent => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// `sys.displayhook(value)` — print `repr(value)` followed by a newline to
 /// the live `sys.stdout` and bind `builtins._` to the value. A `None` value
 /// prints nothing and leaves `_` unchanged (`sys_displayhook` in sysmodule.c).
@@ -3940,24 +4000,17 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     // stale binding, then set to the value once the write succeeds.
     set_builtins_underscore(w_none());
     let repr = pyre_object::w_str_from_wtf8(unsafe { crate::display::py_repr_wtf8(value)? });
-    let newline = w_str_new("\n");
-    match resolve_default_print_target()? {
-        DefaultPrintTarget::Native => {
-            let s = unsafe { print_render(repr)? };
-            crate::print_output(&s);
-            crate::print_output("\n");
-        }
-        DefaultPrintTarget::Rebound(fp) => {
-            for part in [repr, newline] {
-                let r = crate::baseobjspace::call_method(fp, "write", &[part]);
-                if r.is_null() {
-                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                        crate::PyError::runtime_error("displayhook: file.write() failed")
-                    }));
-                }
-            }
-        }
-        DefaultPrintTarget::Silent => return Ok(w_none()),
+    // `pypy/module/sys/app.py:252-253` —
+    //     print_item_to(repr(obj), sys_stdout())
+    //     print_newline_to(sys_stdout())
+    // two writes, each against a freshly fetched `sys.stdout`. The newline
+    // string is built here rather than alongside `repr` for the same reason:
+    // nothing outlives the write it belongs to.
+    if !displayhook_write(repr)? {
+        return Ok(w_none());
+    }
+    if !displayhook_write(w_str_new("\n"))? {
+        return Ok(w_none());
     }
     set_builtins_underscore(value);
     Ok(w_none())
