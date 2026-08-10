@@ -2048,6 +2048,17 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // A declined adopt leaves everything to the rollback below, which is the
     // pre-existing behaviour.
     let live_root_addr = sym.live_vable_frame_addr();
+    // Clear a stash the sub-walk left BEFORE adopting, not after.  An adopted
+    // terminal stores the frame's `DoneWithThisFrame*` result here
+    // (`try_adopt_blackhole`), and that result IS this drain's answer: the
+    // guard's caller takes it as the bridge resolution
+    // (`fbw_finish_concrete_take` in `call_jit.rs`).  Clearing after the adopt
+    // dropped it, and the drop is silent — the adopt also commits the walk-end
+    // state, so the caller neither finds a concrete nor replays through the
+    // blackhole, and the frame's return value reaches Python as `None`.
+    // Clearing first keeps the same protection against a stale stash while
+    // leaving whatever the adopt installs intact.
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
     let adopted = crate::jitcode_dispatch::fbw_executed_effect_count() != effects_at_entry
         && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::CarrierAbort);
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
