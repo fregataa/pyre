@@ -449,6 +449,12 @@ pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
     unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather() }
 }
 
+/// `PyBuffer_ToContiguous(..., 'F')` for a live memoryview.
+#[majit_macros::dont_look_inside]
+unsafe fn memoryview_gather_fortran_bytes(mv: PyObjectRef) -> Vec<u8> {
+    unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather_order(true) }
+}
+
 /// Buffer-acquisition parameters `(format, itemsize, readonly, total_bytes)`
 /// for a bytes / bytearray / array exporter (or a subclass of one), or
 /// `None` when `obj` provides no buffer.
@@ -1336,14 +1342,57 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
 }
 
-/// `memoryview.tobytes` — copy the live view (honouring stride) to `bytes`.
+/// CPython 3.14 `memoryview_tobytes_impl` — copy the live view through
+/// `PyBuffer_ToContiguous` in C, Fortran, or any-contiguous order.
 fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    clinic_arity(
+        "tobytes",
+        positional.len().saturating_sub(1),
+        real_kwarg_count(kwargs),
+        0,
+        1,
+        0,
+    )?;
+    kwarg_reject_unknown(kwargs, &["order"], "tobytes")?;
+    let mv = positional.first().copied().unwrap_or(w_none());
+    let w_order = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "order", "tobytes", 1)?;
     unsafe {
         memoryview_check_released(mv)?;
-        Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-            &memoryview_gather_bytes(mv),
-        ))
+        let order = match w_order {
+            None => 'C',
+            Some(value) if pyre_object::is_none(value) => 'C',
+            Some(value) if crate::baseobjspace::isinstance_str_w(value) => {
+                match pyre_object::w_str_get_wtf8(value).as_str() {
+                    Ok("C") => 'C',
+                    Ok("F") => 'F',
+                    Ok("A") => 'A',
+                    _ => {
+                        return Err(crate::PyError::value_error("order must be 'C', 'F' or 'A'"));
+                    }
+                }
+            }
+            Some(value) => {
+                return Err(crate::PyError::type_error(format!(
+                    "tobytes() argument 'order' must be str or None, not {}",
+                    crate::type_methods::arg_type_name(value)
+                )));
+            }
+        };
+        let fortran = match order {
+            'F' => true,
+            'A' => {
+                let (c_contiguous, f_contiguous) = memoryview_contiguity(mv);
+                f_contiguous && !c_contiguous
+            }
+            _ => false,
+        };
+        let bytes = if fortran {
+            memoryview_gather_fortran_bytes(mv)
+        } else {
+            memoryview_gather_bytes(mv)
+        };
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
     }
 }
 
@@ -2527,7 +2576,6 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__gt__", memoryview_gt, 2),
         ("__ge__", memoryview_ge, 2),
         ("count", memoryview_count, 2),
-        ("tobytes", memoryview_tobytes, 1),
         ("tolist", memoryview_tolist, 1),
         ("toreadonly", memoryview_toreadonly, 1),
         ("release", memoryview_release, 1),
@@ -2543,7 +2591,17 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
             )
         };
     }
+    let class_getitem = make_builtin_function(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+    );
+    let from_flags = make_builtin_function_with_arity("_from_flags", memoryview_from_flags, 3);
     unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"));
+        crate::function::fset_func_text_signature(
+            from_flags,
+            w_str_new("($type, /, object, flags)"),
+        );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__buffer__",
@@ -2559,19 +2617,12 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(class_getitem),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "_from_flags",
-            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
-                "_from_flags",
-                memoryview_from_flags,
-                3,
-            )),
+            pyre_object::function::w_classmethod_new(from_flags),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -2587,6 +2638,7 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__exit__", memoryview_exit as MvFn),
         ("__release_buffer__", memoryview_release_buffer),
         ("__delitem__", memoryview_delitem),
+        ("tobytes", memoryview_tobytes),
         ("hex", memoryview_hex),
         ("cast", memoryview_cast),
     ] {
@@ -2623,6 +2675,135 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
                 ),
             )
         };
+    }
+    // CPython 3.14 Argument Clinic metadata for the PyPy memoryview TypeDef.
+    // The two classmethod carriers are stamped before wrapping above.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__buffer__", "($self, flags, /)"),
+        ("__release_buffer__", "($self, buffer, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__setitem__", "($self, key, value, /)"),
+        ("__delitem__", "($self, key, /)"),
+        ("release", "($self, /)"),
+        ("tobytes", "($self, /, order='C')"),
+        ("hex", "($self, /, sep=<unrepresentable>, bytes_per_sep=1)"),
+        ("tolist", "($self, /)"),
+        ("cast", "($self, /, format, shape=<unrepresentable>)"),
+        ("toreadonly", "($self, /)"),
+        ("count", "($self, value, /)"),
+        ("index", "($self, value, start=0, stop=sys.maxsize, /)"),
+        ("__enter__", "($self, /)"),
+        ("__exit__", "($self, /, *exc_info)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("memoryview TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
+}
+
+/// `pypy/interpreter/gateway.py:1328-1332 GatewayCache.build` parity — attach
+/// the text signature after constructing the builtin function. The spellings
+/// are CPython 3.14's public `builtins` signatures, which take precedence when
+/// PyPy 3.11's generated signature differs.
+fn install_builtin_text_signatures(ns: PyObjectRef) {
+    const SIGNATURES: &[(&str, &str)] = &[
+        (
+            "__import__",
+            "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)",
+        ),
+        ("abs", "($module, x, /)"),
+        ("aiter", "($module, async_iterable, /)"),
+        ("all", "($module, iterable, /)"),
+        (
+            "anext",
+            "($module, aiterator, default=<unrepresentable>, /)",
+        ),
+        ("any", "($module, iterable, /)"),
+        ("ascii", "($module, obj, /)"),
+        ("bin", "($module, number, /)"),
+        ("breakpoint", "($module, /, *args, **kws)"),
+        ("callable", "($module, obj, /)"),
+        ("chr", "($module, i, /)"),
+        (
+            "compile",
+            "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, _feature_version=-1)",
+        ),
+        ("delattr", "($module, obj, name, /)"),
+        ("divmod", "($module, x, y, /)"),
+        ("eval", "($module, source, /, globals=None, locals=None)"),
+        (
+            "exec",
+            "($module, source, /, globals=None, locals=None, *, closure=None)",
+        ),
+        ("format", "($module, value, format_spec='', /)"),
+        ("globals", "($module, /)"),
+        ("hasattr", "($module, obj, name, /)"),
+        ("hash", "($module, obj, /)"),
+        ("hex", "($module, number, /)"),
+        ("id", "($module, obj, /)"),
+        ("input", "($module, prompt='', /)"),
+        ("isinstance", "($module, obj, class_or_tuple, /)"),
+        ("issubclass", "($module, cls, class_or_tuple, /)"),
+        ("len", "($module, obj, /)"),
+        ("locals", "($module, /)"),
+        ("oct", "($module, number, /)"),
+        (
+            "open",
+            "($module, /, file, mode='r', buffering=-1, encoding=None,\n     errors=None, newline=None, closefd=True, opener=None)",
+        ),
+        ("ord", "($module, character, /)"),
+        ("pow", "($module, /, base, exp, mod=None)"),
+        (
+            "print",
+            "($module, /, *args, sep=' ', end='\\n', file=None, flush=False)",
+        ),
+        ("repr", "($module, obj, /)"),
+        ("round", "($module, /, number, ndigits=None)"),
+        ("setattr", "($module, obj, name, value, /)"),
+        (
+            "sorted",
+            "($module, iterable, /, *, key=None, reverse=False)",
+        ),
+        ("sum", "($module, iterable, /, start=0)"),
+    ];
+
+    for &(name, signature) in SIGNATURES {
+        let function = crate::module_ns_get(ns, name)
+            .unwrap_or_else(|| panic!("missing builtin function {name}"));
+        unsafe {
+            crate::function::fset_func_text_signature(function, w_str_new(signature));
+        }
+    }
+
+    // CPython's getset descriptor exposes a real `None` for builtins whose
+    // signatures Argument Clinic cannot represent. Pyre's `PY_NULL` means
+    // the attribute is absent, so preserve this distinction explicitly.
+    for name in [
+        "__build_class__",
+        "dir",
+        "getattr",
+        "iter",
+        "max",
+        "min",
+        "next",
+        "vars",
+    ] {
+        let function = crate::module_ns_get(ns, name)
+            .unwrap_or_else(|| panic!("missing builtin function {name}"));
+        unsafe {
+            crate::function::fset_func_text_signature(function, w_none());
+        }
     }
 }
 
@@ -3501,6 +3682,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "classmethod", || {
         crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
     });
+    install_builtin_text_signatures(ns);
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:60-69
@@ -10541,6 +10723,689 @@ pub fn compile_err_to_syntax_error(
     compile_err_to_syntax_error_maybe_incomplete(e, source, false)
 }
 
+/// Convert Ruff/RustPython's one-based UTF-8 byte column to the one-based
+/// Unicode character column exposed by ``SyntaxError.offset``.
+///
+/// CPython's tokenizer keeps byte offsets internally too, but
+/// ``_PyPegen_byte_offset_to_character_offset`` converts them before the
+/// exception is materialised.  RustPython's `SourceLocation` is deliberately
+/// built with `PositionEncoding::Utf8`, so its `character_offset` is still a
+/// byte column despite the field name.  Preserve the parser's selected line
+/// and span and port only that final conversion here.
+fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize) -> usize {
+    if lineno == 0 || byte_offset == 0 {
+        return byte_offset;
+    }
+    let Some(line) = source.split('\n').nth(lineno - 1) else {
+        return byte_offset;
+    };
+    let byte_index = byte_offset.saturating_sub(1).min(line.len());
+    let boundary = (0..=byte_index)
+        .rev()
+        .find(|&index| line.is_char_boundary(index))
+        .unwrap_or(0);
+    line[..boundary].chars().count() + 1
+}
+
+fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
+    let byte_index = byte_index.min(source.len());
+    let line_start = source[..byte_index]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let lineno = source[..line_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    (lineno, byte_index - line_start + 1)
+}
+
+fn source_byte_index(source: &str, lineno: usize, byte_offset: usize) -> Option<usize> {
+    let line_start = source
+        .split_inclusive('\n')
+        .take(lineno.checked_sub(1)?)
+        .map(str::len)
+        .sum::<usize>();
+    let index = line_start.checked_add(byte_offset.checked_sub(1)?)?;
+    (index <= source.len() && source.is_char_boundary(index)).then_some(index)
+}
+
+/// `pypy/interpreter/pyparser/python.gram:invalid_expression` is also run by
+/// the recursive parser used for an f-string replacement field.  Ruff finds
+/// the outer f-string error first, so repeat that recursive parse and map its
+/// known range back onto the original source.
+fn fstring_missing_comma_span(source: &str, raw_index: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let raw_index = raw_index.min(bytes.len());
+    let open = bytes[..raw_index].iter().rposition(|byte| *byte == b'{')?;
+    let mut cursor = open + 1;
+    let mut delimiters = Vec::new();
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\'' | b'"' => {
+                let quote = bytes[cursor];
+                let triple = bytes[cursor..].starts_with(&[quote, quote, quote]);
+                let quote_len = if triple { 3 } else { 1 };
+                cursor += quote_len;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\\' {
+                        cursor = (cursor + 2).min(bytes.len());
+                    } else if triple && bytes[cursor..].starts_with(&[quote, quote, quote]) {
+                        cursor += 3;
+                        break;
+                    } else if !triple && bytes[cursor] == quote {
+                        cursor += 1;
+                        break;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                delimiters.push(bytes[cursor]);
+                cursor += 1;
+            }
+            b')' | b']' | b'}' if !delimiters.is_empty() => {
+                delimiters.pop();
+                cursor += 1;
+            }
+            b'}' | b'!' | b':' | b'=' if delimiters.is_empty() => break,
+            _ => cursor += 1,
+        }
+    }
+    let expression = source.get(open + 1..cursor)?;
+    let wrapped = format!("({expression})");
+    let inner_error = crate::compile::compile_source(&wrapped, crate::compile::Mode::Eval).err()?;
+    if inner_error.to_string() != "invalid syntax. Perhaps you forgot a comma?" {
+        return None;
+    }
+    let (start_line, start_offset) = inner_error.python_location();
+    let (end_line, end_offset) = inner_error.python_end_location()?;
+    let start = source_byte_index(&wrapped, start_line, start_offset)?.checked_sub(1)?;
+    let end = source_byte_index(&wrapped, end_line, end_offset)?.checked_sub(1)?;
+    Some((open + 1 + start, open + 1 + end))
+}
+
+/// CPython 3.14's symtable reports a `global`/`nonlocal` conflict at the first
+/// declaration in the lexical scope.  RustPython misses the conflict while it
+/// scans and later reports an unbound nonlocal at the second declaration.
+fn global_nonlocal_conflict_span(
+    error: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{self, visitor::Visitor};
+
+    let message = error.to_string();
+    let name = message
+        .strip_prefix("no binding for nonlocal '")
+        .and_then(|rest| rest.strip_suffix("' found"))
+        .or_else(|| {
+            message
+                .strip_prefix("name '")
+                .and_then(|rest| rest.strip_suffix("' is nonlocal and global"))
+        })?;
+    let (lineno, offset) = error.python_location();
+    let error_index = source_byte_index(source, lineno, offset)?;
+    let parsed = crate::compile::parser::parse_module(source).ok()?;
+
+    fn innermost_scope<'a>(body: &'a [ast::Stmt], index: usize) -> Option<&'a [ast::Stmt]> {
+        for statement in body {
+            let range = statement.range();
+            if !(range.start().to_usize() <= index && index <= range.end().to_usize()) {
+                continue;
+            }
+            let child = match statement {
+                ast::Stmt::FunctionDef(node) => Some(node.body.as_slice()),
+                ast::Stmt::ClassDef(node) => Some(node.body.as_slice()),
+                _ => None,
+            };
+            if let Some(child) = child {
+                return innermost_scope(child, index).or(Some(child));
+            }
+        }
+        None
+    }
+
+    struct DeclarationVisitor<'a> {
+        name: &'a str,
+        first: Option<(usize, usize)>,
+        global: bool,
+        nonlocal: bool,
+    }
+
+    impl Visitor<'_> for DeclarationVisitor<'_> {
+        fn visit_stmt(&mut self, statement: &ast::Stmt) {
+            let names = match statement {
+                ast::Stmt::Global(node) => Some((true, node.names.as_slice())),
+                ast::Stmt::Nonlocal(node) => Some((false, node.names.as_slice())),
+                // These bodies are distinct lexical scopes.  Their decorators,
+                // defaults, and annotations cannot contain declarations.
+                ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => return,
+                _ => None,
+            };
+            if let Some((is_global, names)) = names
+                && names
+                    .iter()
+                    .any(|identifier| identifier.as_str() == self.name)
+            {
+                self.global |= is_global;
+                self.nonlocal |= !is_global;
+                let range = statement.range();
+                let range = (range.start().to_usize(), range.end().to_usize());
+                if self.first.is_none_or(|first| range.0 < first.0) {
+                    self.first = Some(range);
+                }
+            }
+            ast::visitor::walk_stmt(self, statement);
+        }
+    }
+
+    let module_body = parsed.syntax().body.as_slice();
+    let scope = innermost_scope(module_body, error_index).unwrap_or(module_body);
+    let mut visitor = DeclarationVisitor {
+        name,
+        first: None,
+        global: false,
+        nonlocal: false,
+    };
+    for statement in scope {
+        visitor.visit_stmt(statement);
+    }
+    let (start, end) = visitor
+        .first
+        .filter(|_| visitor.global && visitor.nonlocal)?;
+    Some((format!("name '{name}' is nonlocal and global"), start, end))
+}
+
+/// `python.gram:invalid_expression` wins over `invalid_arguments` when an
+/// unparenthesized generator call is the right operand of a binary expression.
+/// CPython 3.14 selects the `for` token in that form rather than the complete
+/// generator range selected by Ruff.
+fn binary_call_generator_error_span(source: &str) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    'for_index: for for_index in 0..bytes.len().saturating_sub(2) {
+        if &bytes[for_index..for_index + 3] != b"for"
+            || bytes
+                .get(for_index.wrapping_sub(1))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            || bytes
+                .get(for_index + 3)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            continue;
+        }
+        let Some(open) = bytes[..for_index].iter().rposition(|byte| *byte == b'(') else {
+            continue;
+        };
+        let mut cursor = open;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let name_end = cursor;
+        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
+        {
+            cursor -= 1;
+        }
+        if cursor == name_end {
+            continue;
+        }
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if !matches!(
+            bytes.get(cursor.wrapping_sub(1)),
+            Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'|' | b'&' | b'^')
+        ) {
+            continue 'for_index;
+        }
+        return Some((for_index, for_index + 3));
+    }
+    None
+}
+
+/// `python.gram:invalid_assignment_target` calls `_PyPegen_get_expr_name` for
+/// both ordinary and augmented assignments.  RustPython stops at the colon in
+/// a dict comprehension instead, so parse the complete left expression and
+/// restore CPython 3.14's diagnostic for that named target.
+fn dict_comprehension_assignment_error(source: &str) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast;
+
+    let bytes = source.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut cursor = 0;
+    let assignment = loop {
+        let byte = *bytes.get(cursor)?;
+        match byte {
+            b'\'' | b'"' => {
+                let quote = byte;
+                let triple = bytes[cursor..].starts_with(&[quote, quote, quote]);
+                cursor += if triple { 3 } else { 1 };
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\\' {
+                        cursor = (cursor + 2).min(bytes.len());
+                    } else if triple && bytes[cursor..].starts_with(&[quote, quote, quote]) {
+                        cursor += 3;
+                        break;
+                    } else if !triple && bytes[cursor] == quote {
+                        cursor += 1;
+                        break;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                delimiters.push(byte);
+                cursor += 1;
+            }
+            b')' | b']' | b'}' => {
+                delimiters.pop()?;
+                cursor += 1;
+            }
+            b'=' if delimiters.is_empty()
+                && !matches!(
+                    bytes.get(cursor.wrapping_sub(1)),
+                    Some(b'<' | b'>' | b'!' | b'=' | b':')
+                )
+                && bytes.get(cursor + 1) != Some(&b'=') =>
+            {
+                break cursor;
+            }
+            _ => cursor += 1,
+        }
+    };
+
+    let mut lhs_end = assignment;
+    while lhs_end > 0 && bytes[lhs_end - 1].is_ascii_whitespace() {
+        lhs_end -= 1;
+    }
+    let augmented = matches!(
+        bytes.get(lhs_end.wrapping_sub(1)),
+        Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'&' | b'|' | b'^')
+    );
+    if augmented {
+        lhs_end -= 1;
+        while lhs_end > 0 && bytes[lhs_end - 1].is_ascii_whitespace() {
+            lhs_end -= 1;
+        }
+    }
+    let lhs_start = bytes[..lhs_end]
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())?;
+    let expression = source.get(lhs_start..lhs_end)?;
+    let parsed = crate::compile::parser::parse_expression(expression).ok()?;
+    if !matches!(parsed.syntax().body.as_ref(), ast::Expr::DictComp(_)) {
+        return None;
+    }
+    let message = if augmented {
+        "'dict comprehension' is an illegal expression for augmented assignment".to_owned()
+    } else {
+        "cannot assign to dict comprehension here. Maybe you meant '==' instead of '='?".to_owned()
+    };
+    Some((message, lhs_start, lhs_end))
+}
+
+/// `Parser/string_parser.c parse_string_literal` raises the non-ASCII bytes
+/// error at the token (`RAISE_SYNTAX_ERROR_KNOWN_LOCATION(t)`), not at the
+/// offending code point.  Ruff's diagnostic instead selects that code point;
+/// recover the containing literal token while retaining its parser message.
+fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let raw_index = raw_index.min(bytes.len());
+    let line_start = bytes[..raw_index]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut quote_start = bytes[line_start..raw_index]
+        .iter()
+        .rposition(|byte| matches!(*byte, b'\'' | b'"'))?
+        + line_start;
+    let quote = bytes[quote_start];
+    let triple = quote_start >= line_start + 2
+        && bytes[quote_start - 1] == quote
+        && bytes[quote_start - 2] == quote;
+    if triple {
+        quote_start -= 2;
+    }
+    let mut token_start = quote_start;
+    while token_start > line_start && bytes[token_start - 1].is_ascii_alphabetic() {
+        token_start -= 1;
+    }
+    let prefix = &bytes[token_start..quote_start];
+    if !prefix.iter().any(|byte| matches!(*byte, b'b' | b'B'))
+        || !prefix
+            .iter()
+            .all(|byte| matches!(*byte, b'b' | b'B' | b'r' | b'R'))
+    {
+        return None;
+    }
+
+    let quote_len = if triple { 3 } else { 1 };
+    let mut cursor = quote_start + quote_len;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            cursor = (cursor + 2).min(bytes.len());
+            continue;
+        }
+        if triple {
+            if bytes[cursor..].starts_with(&[quote, quote, quote]) {
+                return Some((token_start, cursor + 3));
+            }
+        } else if bytes[cursor] == quote {
+            return Some((token_start, cursor + 1));
+        } else if bytes[cursor] == b'\n' {
+            return None;
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// CPython 3.14 `Parser/lexer/lexer.c`
+/// `maybe_raise_syntax_error_for_string_prefixes`.  Ruff tokenizes an
+/// incompatible prefix as a NAME followed by a STRING and reports the gap
+/// between simple statements, so recover the prefix immediately before the
+/// quote selected by that parser error and apply CPython's ordered checks.
+fn incompatible_string_prefix_error(
+    source: &str,
+    raw_index: usize,
+) -> Option<(String, usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut quote = raw_index.min(bytes.len());
+    if !matches!(bytes.get(quote), Some(b'\'' | b'"')) {
+        quote = bytes[..quote]
+            .iter()
+            .rposition(|byte| matches!(*byte, b'\'' | b'"'))?;
+    }
+    let mut start = quote;
+    while start > 0
+        && matches!(
+            bytes[start - 1].to_ascii_lowercase(),
+            b'b' | b'r' | b'u' | b'f' | b't'
+        )
+    {
+        start -= 1;
+    }
+    if start == quote
+        || bytes
+            .get(start.wrapping_sub(1))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return None;
+    }
+    let prefix = &bytes[start..quote];
+    let mut seen = [false; 5];
+    for byte in prefix {
+        let index = match byte.to_ascii_lowercase() {
+            b'b' => 0,
+            b'r' => 1,
+            b'u' => 2,
+            b'f' => 3,
+            b't' => 4,
+            _ => return None,
+        };
+        if seen[index] {
+            return None;
+        }
+        seen[index] = true;
+    }
+    let pair = if seen[2] && seen[0] {
+        ("u", "b")
+    } else if seen[2] && seen[1] {
+        ("u", "r")
+    } else if seen[2] && seen[3] {
+        ("u", "f")
+    } else if seen[2] && seen[4] {
+        ("u", "t")
+    } else if seen[0] && seen[3] {
+        ("b", "f")
+    } else if seen[0] && seen[4] {
+        ("b", "t")
+    } else if seen[3] && seen[4] {
+        ("f", "t")
+    } else {
+        return None;
+    };
+    Some((
+        format!("'{}' and '{}' prefixes are incompatible", pair.0, pair.1),
+        start,
+        quote,
+    ))
+}
+
+/// CPython 3.14 `Parser/string_parser.c:decode_unicode_with_escapes` sends
+/// non-raw Unicode literals through the `unicode_escape` decoder before the
+/// f-string parser interprets replacement fields.  Ruff instead diagnoses an
+/// incomplete `\N{...` as either its own escape error or an unclosed f-string
+/// field.  Recover the decoder-first error, including the byte range relative
+/// to the literal contents used by the codec error message.
+fn malformed_unicode_name_escape(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'#' {
+            cursor = bytes[cursor..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |newline| cursor + newline + 1);
+            continue;
+        }
+        if !matches!(bytes[cursor], b'\'' | b'"') {
+            cursor += 1;
+            continue;
+        }
+
+        let quote_start = cursor;
+        let mut token_start = quote_start;
+        while token_start > 0 && bytes[token_start - 1].is_ascii_alphabetic() {
+            token_start -= 1;
+        }
+        if bytes
+            .get(token_start.wrapping_sub(1))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            cursor += 1;
+            continue;
+        }
+        let prefix = &bytes[token_start..quote_start];
+        if !prefix
+            .iter()
+            .all(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'f' | b'r' | b't' | b'u'))
+            || prefix
+                .iter()
+                .any(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'r'))
+        {
+            cursor += 1;
+            continue;
+        }
+
+        let quote = bytes[quote_start];
+        let triple = bytes[quote_start..].starts_with(&[quote, quote, quote]);
+        let quote_len = if triple { 3 } else { 1 };
+        let content_start = quote_start + quote_len;
+        let mut content_end = content_start;
+        while content_end < bytes.len() {
+            if triple && bytes[content_end..].starts_with(&[quote, quote, quote]) {
+                break;
+            }
+            if !triple && bytes[content_end] == quote {
+                break;
+            }
+            if bytes[content_end] == b'\\' {
+                content_end = (content_end + 2).min(bytes.len());
+            } else {
+                content_end += 1;
+            }
+        }
+
+        let mut escape = content_start;
+        while escape < content_end {
+            if bytes[escape] != b'\\' {
+                escape += 1;
+                continue;
+            }
+            if bytes.get(escape + 1) != Some(&b'N') {
+                escape = (escape + 2).min(content_end);
+                continue;
+            }
+            let malformed_end = if bytes.get(escape + 2) != Some(&b'{') {
+                Some(escape + 1)
+            } else if bytes[escape + 3..content_end]
+                .iter()
+                .all(|byte| *byte != b'}')
+            {
+                Some(content_end.saturating_sub(1))
+            } else {
+                None
+            };
+            if let Some(malformed_end) = malformed_end {
+                return Some(format!(
+                    "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
+                    escape - content_start,
+                    malformed_end - content_start,
+                ));
+            }
+            escape += 2;
+        }
+        cursor = content_end.saturating_add(quote_len);
+    }
+    None
+}
+
+/// CPython 3.14 `Parser/python.gram` f-string replacement-field invalid
+/// rules.  A `#` starts an ordinary tokenizer comment inside a field: on one
+/// physical line it consumes the apparent closing brace, while a multiline
+/// field containing only comments reaches the dedicated empty-expression
+/// rule.  Ruff surfaces both through coarser f-string parser errors.
+fn fstring_comment_diagnostic(message: &str, source: &str) -> Option<&'static str> {
+    if !source.contains('#') {
+        return None;
+    }
+    if message == "f-string: unterminated string" {
+        return Some("'{' was never closed");
+    }
+    if message != "Expected an expression" {
+        return None;
+    }
+    if source.contains("{)#") {
+        Some("f-string: unmatched ')'")
+    } else if source.contains('\n') {
+        Some("f-string: valid expression required before '}'")
+    } else {
+        None
+    }
+}
+
+/// CPython's tokenizer keeps the opening-delimiter stack while lexing an
+/// f-string replacement field.  Ruff sometimes lets its expression parser
+/// replace that tokenizer error with `Expected ...` or a generic missing
+/// brace, so recover the first mismatched closer and its exact source byte.
+fn fstring_mismatched_delimiter(source: &str) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let quote = bytes.iter().enumerate().find_map(|(index, byte)| {
+        if !matches!(*byte, b'\'' | b'"') {
+            return None;
+        }
+        let mut prefix = index;
+        while prefix > 0 && bytes[prefix - 1].is_ascii_alphabetic() {
+            prefix -= 1;
+        }
+        bytes[prefix..index]
+            .iter()
+            .any(|byte| byte.eq_ignore_ascii_case(&b'f'))
+            .then_some(index)
+    })?;
+    let quote_byte = bytes[quote];
+    let triple = bytes[quote..].starts_with(&[quote_byte, quote_byte, quote_byte]);
+    let mut cursor = quote + if triple { 3 } else { 1 };
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'{' || bytes.get(cursor + 1) == Some(&b'{') {
+            cursor += 1;
+            continue;
+        }
+        cursor += 1;
+        let mut stack = Vec::new();
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\'' | b'"' => {
+                    let inner_quote = bytes[cursor];
+                    cursor += 1;
+                    while cursor < bytes.len() && bytes[cursor] != inner_quote {
+                        cursor += if bytes[cursor] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                opener @ (b'(' | b'[' | b'{') => stack.push(opener),
+                closer @ (b')' | b']' | b'}') => {
+                    let expected_open = match closer {
+                        b')' => b'(',
+                        b']' => b'[',
+                        b'}' => b'{',
+                        _ => unreachable!(),
+                    };
+                    if let Some(&opening) = stack.last() {
+                        if opening != expected_open {
+                            return Some((
+                                format!(
+                                    "closing parenthesis '{}' does not match opening parenthesis '{}'",
+                                    closer as char, opening as char
+                                ),
+                                cursor,
+                            ));
+                        }
+                        stack.pop();
+                    } else if closer == b'}' {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Whether the parser's raw byte lies on a physical line containing an
+/// f-prefixed string token.  CPython's tokenizer retains that prefix when it
+/// specializes unterminated-string diagnostics; Ruff's unclosed-string error
+/// drops it.
+fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
+    let bytes = source.as_bytes();
+    let raw_index = raw_index.min(bytes.len());
+    let line_start = bytes[..raw_index]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let line_end = bytes[raw_index..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |newline| raw_index + newline);
+    for quote in line_start..line_end {
+        if !matches!(bytes[quote], b'\'' | b'"') {
+            continue;
+        }
+        let mut prefix = quote;
+        while prefix > line_start && bytes[prefix - 1].is_ascii_alphabetic() {
+            prefix -= 1;
+        }
+        let token_head_end = quote
+            + if bytes[quote..].starts_with(&[bytes[quote], bytes[quote], bytes[quote]]) {
+                3
+            } else {
+                1
+            };
+        if bytes[prefix..quote]
+            .iter()
+            .any(|byte| byte.eq_ignore_ascii_case(&b'f'))
+            && (prefix..=token_head_end).contains(&raw_index)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -10624,8 +11489,8 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // `syntax_error_subclass` can supply a replacement message, so it
     // runs before the located error is built.
     let subclass = syntax_error_subclass(&e, source);
-    let msg = if let Some((_, Some(replacement))) = subclass {
-        replacement.to_string()
+    let mut msg = if let Some((_, Some(replacement))) = &subclass {
+        replacement.clone()
     } else if let crate::compile::CompileError::Parse(parse_err) = &e {
         // astcompiler/codegen.py:3048-3051 reports duplicate call/class
         // keywords after parsing, using CPython 3.14's lower-case wording.
@@ -10635,6 +11500,12 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             ParseErrorType::DuplicateKeywordArgumentError(name) => {
                 format!("keyword argument repeated: {name}")
             }
+            ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                InterpolatedStringErrorType::SingleRbrace,
+            )) => "f-string: single '}' is not allowed".to_owned(),
+            ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                InterpolatedStringErrorType::UnclosedLbrace,
+            )) => "f-string: expecting '}'".to_owned(),
             // The parser spells every unlexable character the same way. Split
             // it the way `pytokenizer.py:130-140` does — non-printable
             // characters name only their code point, printable ones are quoted
@@ -10659,21 +11530,151 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         e.to_string()
     };
-    let (lineno, offset) = e.python_location();
+    let unterminated_fstring = match &e {
+        crate::compile::CompileError::Parse(parse_error) => {
+            unclosed_error_is_fstring(source, parse_error.raw_location.start().to_usize())
+        }
+        _ => false,
+    };
+    if unterminated_fstring {
+        if msg.starts_with("unterminated triple-quoted string literal") {
+            msg = msg.replacen(
+                "unterminated triple-quoted string literal",
+                "unterminated triple-quoted f-string literal",
+                1,
+            );
+        } else if msg.starts_with("unterminated string literal") {
+            msg = msg.replacen(
+                "unterminated string literal",
+                "unterminated f-string literal",
+                1,
+            );
+        }
+    }
+    if let Some(unicode_error) = malformed_unicode_name_escape(source) {
+        msg = unicode_error;
+    }
+    if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
+        msg = comment_error.to_owned();
+    }
+    let delimiter_error = fstring_mismatched_delimiter(source);
+    if let Some((delimiter_message, _)) = &delimiter_error {
+        msg = delimiter_message.clone();
+    }
+    if msg == "f-string: expecting `}`" {
+        msg = "f-string: expecting '}'".to_owned();
+    } else if msg == "f-string: expecting '}', or format specs" && source.contains(":{{") {
+        msg = "f-string: expecting a valid expression after '{'".to_owned();
+    }
+    if msg == "f-string: expecting a valid expression after '{'" {
+        let bytes = source.as_bytes();
+        let quote = bytes.iter().rposition(|byte| matches!(*byte, b'\'' | b'"'));
+        if quote.is_some_and(|quote| bytes.get(quote.wrapping_sub(1)) == Some(&b'{')) {
+            msg = "f-string: expecting '}'".to_owned();
+        }
+    }
+    let literal_span = if msg == "bytes can only contain ASCII literal characters" {
+        match &e {
+            crate::compile::CompileError::Parse(parse_error) => {
+                nonascii_bytes_literal_span(source, parse_error.raw_location.start().to_usize())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let fstring_span = if literal_span.is_none() && msg.starts_with("f-string: expecting") {
+        match &e {
+            crate::compile::CompileError::Parse(parse_error) => {
+                fstring_missing_comma_span(source, parse_error.raw_location.start().to_usize())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if fstring_span.is_some() {
+        msg = "invalid syntax. Perhaps you forgot a comma?".to_owned();
+    }
+    let scope_conflict = global_nonlocal_conflict_span(&e, source);
+    if let Some((replacement, _, _)) = &scope_conflict {
+        msg = replacement.clone();
+    }
+    let scope_span = scope_conflict.map(|(_, start, end)| (start, end));
+    let generator_span = match &e {
+        crate::compile::CompileError::Parse(parse_error)
+            if matches!(
+                &parse_error.error,
+                ParseErrorType::UnparenthesizedGeneratorExpression
+            ) =>
+        {
+            binary_call_generator_error_span(source)
+        }
+        _ => None,
+    };
+    if generator_span.is_some() {
+        msg = "invalid syntax".to_owned();
+    }
+    let assignment_error = dict_comprehension_assignment_error(source);
+    if let Some((replacement, _, _)) = &assignment_error {
+        msg = replacement.clone();
+    }
+    let assignment_span = assignment_error.map(|(_, start, end)| (start, end));
+    let prefix_error = match &e {
+        crate::compile::CompileError::Parse(parse_error) => {
+            incompatible_string_prefix_error(source, parse_error.raw_location.start().to_usize())
+        }
+        _ => None,
+    };
+    if let Some((replacement, _, _)) = &prefix_error {
+        msg = replacement.clone();
+    }
+    let prefix_span = prefix_error.map(|(_, start, end)| (start, end));
+    let delimiter_span = delimiter_error.map(|(_, index)| (index, index));
+    let diagnostic_span = literal_span
+        .or(fstring_span)
+        .or(scope_span)
+        .or(generator_span)
+        .or(assignment_span)
+        .or(prefix_span)
+        .or(delimiter_span);
+    let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
+        (
+            source_byte_location(source, start),
+            Some(source_byte_location(source, end)),
+        )
+    } else {
+        (e.python_location(), None)
+    };
+    // Parser diagnostics are converted by pegen before exposure, while
+    // compiler/symtable diagnostics retain the UTF-8 byte columns used by AST
+    // locations (for example `return "ä"` ends at offset 12, not 11).
+    let parser_error = matches!(&e, crate::compile::CompileError::Parse(_));
+    let offset = if parser_error {
+        syntax_error_character_offset(source, lineno, byte_offset)
+    } else {
+        byte_offset
+    };
     let mut error = if lineno == 0 {
         crate::PyError::syntax_error(msg)
     } else {
-        let (end_lineno, end_offset) = e
-            .python_end_location()
-            .or_else(|| codegen_statement_end(&e, source, lineno, offset))
-            .unwrap_or((lineno, offset));
+        let parser_end = diagnostic_end.or_else(|| e.python_end_location());
+        let (end_lineno, end_byte_offset) = parser_end
+            .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
+            .unwrap_or((lineno, byte_offset));
+        let end_offset = if parser_error && parser_end.is_some() {
+            syntax_error_character_offset(source, end_lineno, end_byte_offset)
+        } else {
+            end_byte_offset
+        };
         let filename = e.source_path().to_string();
         // Parser errors own their source text directly, keeping the trailing
         // newline like `e.text`.  Later compiler failures omit it for the
         // synthetic ``<string>`` input, while file compilation keeps the
         // decoded source line for the top-level error printer.
-        let text = if matches!(&e, crate::compile::CompileError::Parse(_)) || filename != "<string>"
-        {
+        let text = if unterminated_fstring {
+            source.lines().nth(lineno - 1)
+        } else if matches!(&e, crate::compile::CompileError::Parse(_)) || filename != "<string>" {
             source.split_inclusive('\n').nth(lineno - 1)
         } else {
             None
@@ -10860,7 +11861,7 @@ fn scan_line_nesting(bytes: &[u8], depth: &mut usize, in_triple: &mut Option<u8>
 fn syntax_error_subclass(
     e: &crate::compile::CompileError,
     source: &str,
-) -> Option<(&'static str, Option<&'static str>)> {
+) -> Option<(&'static str, Option<String>)> {
     use rustpython_compiler::parser::{LexicalErrorType, ParseErrorType};
     let crate::compile::CompileError::Parse(parse_err) = e else {
         return None;
@@ -10873,11 +11874,21 @@ fn syntax_error_subclass(
     let indentation = |plain: Option<&'static str>| match first_indent_fault(source) {
         Some(IndentFault::TabsAndSpaces) => (
             "TabError",
-            Some("inconsistent use of tabs and spaces in indentation"),
+            Some("inconsistent use of tabs and spaces in indentation".to_owned()),
         ),
-        _ => ("IndentationError", plain),
+        _ => ("IndentationError", plain.map(str::to_owned)),
     };
     match &parse_err.error {
+        ParseErrorType::OtherError(msg)
+            if (msg.starts_with("Missing parentheses in call to 'print'")
+                || msg.starts_with("Missing parentheses in call to 'exec'"))
+                && matches!(first_indent_fault(source), Some(IndentFault::TabsAndSpaces)) =>
+        {
+            Some((
+                "TabError",
+                Some("inconsistent use of tabs and spaces in indentation".to_owned()),
+            ))
+        }
         // The parser spells this one "Unexpected indentation"; the tokenizer
         // raises `unexpected indent`.  The dedent message below already reads
         // as the tokenizer writes it, so it keeps the parser's.
@@ -10887,6 +11898,46 @@ fn syntax_error_subclass(
         // which the compiler reconstructs as a plain message.
         ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {
             Some(("IndentationError", None))
+        }
+        // `python.gram:invalid_if_stmt` checks `NEWLINE !INDENT` before an
+        // invalid expression on the following line.  RustPython's diagnostic
+        // normalization currently chooses its Python-2 `print` hint first;
+        // restore the grammar's priority when the source has no suite indent.
+        ParseErrorType::OtherError(msg)
+            if msg.starts_with("Missing parentheses in call to 'print'") =>
+        {
+            let lineno = parse_err.location.line.get();
+            let current = source.split_inclusive('\n').nth(lineno.checked_sub(1)?)?;
+            let (header_index, header) = source
+                .split_inclusive('\n')
+                .take(lineno.checked_sub(1)?)
+                .enumerate()
+                .filter(|(_, line)| {
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with('#')
+                })
+                .last()?;
+            let indent_width = |line: &str| {
+                line.as_bytes()
+                    .iter()
+                    .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\x0c'))
+                    .count()
+            };
+            let header_text = header.trim();
+            if indent_width(current) <= indent_width(header)
+                && header_text.starts_with("if ")
+                && header_text.ends_with(':')
+            {
+                Some((
+                    "IndentationError",
+                    Some(format!(
+                        "expected an indented block after 'if' statement on line {}",
+                        header_index + 1
+                    )),
+                ))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -11966,16 +13017,16 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if args.is_empty() {
         // `bltinmodule.c builtin_dir` — with no argument, list the names in
         // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
-        // frame exactly as `locals()` does (module scope returns the globals
-        // dict), then return the mapping's sorted keys.  `getdictscope` rather
-        // than `frame_locals_snapshot`: only the key set is read, and the two
-        // agree on it, so the snapshot copy would be a pure allocation.
+        // frame exactly as `locals()` does, then return the mapping's sorted
+        // keys.  PEP 709 hidden comprehension locals are present in the frame
+        // snapshot while active even though they are absent from a module or
+        // class namespace, so `getdictscope` is not equivalent here.
         let frame = topframe_for_locals();
         if frame.is_null() {
             return Ok(w_list_new(vec![]));
         }
         let frame_mut = unsafe { &mut *frame };
-        let w_locals_dict = frame_mut.getdictscope()?;
+        let w_locals_dict = frame_mut.frame_locals_snapshot()?;
         if w_locals_dict.is_null() {
             return Ok(w_list_new(vec![]));
         }
@@ -16628,6 +17679,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         })?;
         return Ok(w_complex_new(r, i));
     }
+    let mut real_was_complex = false;
     let (mut real, mut imag) = match w_real {
         Some(a) => {
             let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
@@ -16654,6 +17706,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                     crate::type_methods::arg_type_name(a)
                 ))?;
             }
+            real_was_complex = has_complex_protocol;
             value
         }
         None => (0.0, 0.0),
@@ -16672,13 +17725,15 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             let converted = builtin_float(&[b])?;
             (unsafe { w_float_get_value(converted) }, 0.0)
         };
-        // complex(x, y) == x + y*j even if y is already complex; preserve the
-        // signs of zero lanes by subtracting/adding only when the source lane
-        // is nonzero, otherwise taking the operand's real part directly.
-        if bi != 0.0 {
-            real -= bi;
-        }
-        if imag != 0.0 {
+        // CPython 3.14 `complex_new_impl`: the real lane always uses ordinary
+        // IEEE subtraction. A complex-valued first operand combines its
+        // existing imaginary lane with `+=`; a real-valued first operand has
+        // no imaginary lane, so the second operand's real lane is assigned
+        // directly. Keeping the conversion-path distinction gives both
+        // `complex(complex(1, +0), -0).imag == +0` and
+        // `complex(-0, -0).imag == -0`.
+        real -= bi;
+        if real_was_complex {
             imag += br;
         } else {
             imag = br;
@@ -16820,6 +17875,185 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_error_offsets_convert_utf8_bytes_to_characters() {
+        assert_eq!(
+            syntax_error_character_offset("Python = \"Python\" +", 1, 20),
+            20
+        );
+        assert_eq!(
+            syntax_error_character_offset("Python = \"Ṕýţĥòñ\" +", 1, 27),
+            20
+        );
+        assert_eq!(syntax_error_character_offset("α = 0xI", 1, 7), 6);
+        assert_eq!(syntax_error_character_offset("first\nα = 0xI", 2, 7), 6);
+        assert_eq!(syntax_error_character_offset("α", 1, 0), 0);
+    }
+
+    #[test]
+    fn nonascii_bytes_error_selects_the_literal_token() {
+        assert_eq!(nonascii_bytes_literal_span("b\"fooжжж\"", 5), Some((0, 12)));
+        assert_eq!(nonascii_bytes_literal_span("x = rb'é'", 7), Some((4, 10)));
+        assert_eq!(
+            nonascii_bytes_literal_span("b'''aé''' + b'x'", 5),
+            Some((0, 10))
+        );
+    }
+
+    #[test]
+    fn malformed_unicode_name_escape_precedes_fstring_parsing() {
+        for (source, range) in [
+            (r"f'\N'", "0-1"),
+            (r"f'\N{'", "0-2"),
+            (r"'\N{GREEK CAPITAL LETTER DELTA'", "0-28"),
+        ] {
+            let message = malformed_unicode_name_escape(source).unwrap();
+            assert!(message.contains(&format!("position {range}:")), "{message}");
+            assert!(message.ends_with(r"malformed \N character escape"));
+        }
+        assert_eq!(malformed_unicode_name_escape(r"r'\N'"), None);
+        assert_eq!(malformed_unicode_name_escape(r"'\N{DELTA}'"), None);
+        assert_eq!(malformed_unicode_name_escape(r"'\\N'"), None);
+    }
+
+    #[test]
+    fn fstring_comments_follow_tokenizer_precedence() {
+        assert_eq!(
+            fstring_comment_diagnostic("f-string: unterminated string", "f'{1#}'"),
+            Some("'{' was never closed")
+        );
+        assert_eq!(
+            fstring_comment_diagnostic("Expected an expression", "f'{)#}'"),
+            Some("f-string: unmatched ')'")
+        );
+        assert_eq!(
+            fstring_comment_diagnostic(
+                "Expected an expression",
+                "f'''\n{\n# only a comment\n}'''\n",
+            ),
+            Some("f-string: valid expression required before '}'")
+        );
+    }
+
+    #[test]
+    fn fstring_delimiters_report_the_opening_mismatch() {
+        for (source, message, index) in [
+            (
+                "f'{((}'",
+                "closing parenthesis '}' does not match opening parenthesis '('",
+                5,
+            ),
+            (
+                "f'{a[4)}'",
+                "closing parenthesis ')' does not match opening parenthesis '['",
+                6,
+            ),
+            (
+                "f'{a(4]}'",
+                "closing parenthesis ']' does not match opening parenthesis '('",
+                6,
+            ),
+        ] {
+            assert_eq!(
+                fstring_mismatched_delimiter(source),
+                Some((message.to_owned(), index))
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_fstrings_retain_their_prefix() {
+        assert!(unclosed_error_is_fstring("f\"", 2));
+        assert!(unclosed_error_is_fstring("x = 1\nz = rf'''", 10));
+        assert!(!unclosed_error_is_fstring("x = 1\nz = '''", 10));
+        assert!(!unclosed_error_is_fstring(r#"f'{"x'"#, 3));
+    }
+
+    #[test]
+    fn fstring_missing_comma_uses_recursive_expression_range() {
+        assert_eq!(fstring_missing_comma_span("f'{6 0}'", 5), Some((3, 6)));
+        // Ruff's normalized range can end in the middle of a UTF-8 scalar;
+        // never project such a range into the outer SyntaxError.
+        assert_eq!(fstring_missing_comma_span("f'{α β}'", 7), None);
+        assert_eq!(
+            fstring_missing_comma_span(
+                "f\"\"\"\n\n\n            {\n            6\n            0=\"\"\"",
+                43,
+            ),
+            Some((33, 48))
+        );
+    }
+
+    #[test]
+    fn missing_if_suite_precedes_legacy_print_diagnostic() {
+        let source = "if True:\nprint \"No indent\"";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert_eq!(
+            syntax_error_subclass(&error, source),
+            Some((
+                "IndentationError",
+                Some("expected an indented block after 'if' statement on line 1".to_owned())
+            ))
+        );
+
+        let source = "if True:\n        print()\n\texec \"mixed tabs and spaces\"";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert_eq!(
+            syntax_error_subclass(&error, source),
+            Some((
+                "TabError",
+                Some("inconsistent use of tabs and spaces in indentation".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn global_nonlocal_conflict_uses_first_declaration() {
+        for (source, declaration) in [
+            ("def f():\n  global x\n  nonlocal x", "global x"),
+            (
+                "def f():\n  if True:\n    global x\n  nonlocal x",
+                "global x",
+            ),
+        ] {
+            let error =
+                crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+            let start = source.find(declaration).unwrap();
+            assert_eq!(
+                global_nonlocal_conflict_span(&error, source),
+                Some((
+                    "name 'x' is nonlocal and global".to_owned(),
+                    start,
+                    start + declaration.len(),
+                ))
+            );
+        }
+
+        let source = "def f():\n  global x\n  def g():\n    nonlocal x";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert_eq!(global_nonlocal_conflict_span(&error, source), None);
+    }
+
+    #[test]
+    fn binary_call_generator_error_selects_for_token() {
+        let source = "\"┬ó┬ó┬ó┬ó┬ó┬ó\" + f(4, x for x in range(1))\n";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::compile::CompileError::Parse(ref parse_error)
+                if matches!(
+                    &parse_error.error,
+                    rustpython_compiler::parser::ParseErrorType::UnparenthesizedGeneratorExpression
+                )
+        ));
+        let start = source.find("for").unwrap();
+        assert_eq!(
+            binary_call_generator_error_span(source),
+            Some((start, start + 3))
+        );
+        assert_eq!(binary_call_generator_error_span("f(4, x for x in y)"), None);
+    }
 
     #[test]
     fn builtin_ord_identity_uses_wrapped_code_not_display_name() {
@@ -17210,12 +18444,33 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_complex_preserves_imag_arg_negative_zero_with_complex_real() {
+    fn test_builtin_complex_uses_python314_ieee_zero_combination() {
         crate::typedef::init_typeobjects();
         let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
             unsafe { w_complex_get_real(result).to_bits() },
             1.0f64.to_bits()
+        );
+        assert_eq!(
+            unsafe { w_complex_get_imag(result).to_bits() },
+            0.0f64.to_bits()
+        );
+
+        let result = builtin_complex(&[w_float_new(-0.0), w_float_new(-0.0)]).unwrap();
+        assert_eq!(
+            unsafe { w_complex_get_real(result).to_bits() },
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            unsafe { w_complex_get_imag(result).to_bits() },
+            (-0.0f64).to_bits()
+        );
+
+        let result =
+            builtin_complex(&[w_complex_new(-0.0, -0.0), w_complex_new(-0.0, -0.0)]).unwrap();
+        assert_eq!(
+            unsafe { w_complex_get_real(result).to_bits() },
+            0.0f64.to_bits()
         );
         assert_eq!(
             unsafe { w_complex_get_imag(result).to_bits() },

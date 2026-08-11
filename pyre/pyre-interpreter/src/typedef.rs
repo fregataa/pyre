@@ -2727,7 +2727,7 @@ fn new_descr_class(args: &[PyObjectRef], type_name: &str) -> Result<PyObjectRef,
 /// arguments`); the body itself is variadic, so the trailing marker dict
 /// would otherwise arrive as one more translation-table argument.
 macro_rules! make_maketrans_descr {
-    ($owner:literal, $func:expr) => {{
+    ($owner:literal, $func:expr $(, $text_signature:literal)?) => {{
         fn maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
             if crate::builtins::has_real_kwargs(kwargs) {
@@ -2738,7 +2738,14 @@ macro_rules! make_maketrans_descr {
             }
             ($func)(args)
         }
-        pyre_object::w_staticmethod_new(make_builtin_function("maketrans", maketrans))
+        let function = make_builtin_function("maketrans", maketrans);
+        $(unsafe {
+            crate::function::fset_func_text_signature(
+                function,
+                w_str_new($text_signature),
+            )
+        };)?
+        pyre_object::w_staticmethod_new(function)
     }};
 }
 
@@ -4053,21 +4060,46 @@ fn init_super_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(super_descr_new);
+    unsafe {
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
+    };
     for (name, value) in [
-        ("__new__", make_new_descr(super_descr_new)),
+        ("__new__", new_descr),
         (
             "__init__",
-            make_builtin_function("__init__", super_descr_init),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__init__",
+                super_descr_init,
+                "($self, /, *args, **kwargs)",
+            ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", super_descr_repr, 1),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__repr__",
+                super_descr_repr,
+                1,
+                "($self, /)",
+            ),
         ),
         (
             "__getattribute__",
-            make_builtin_function_with_arity("__getattribute__", super_descr_getattribute, 2),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__getattribute__",
+                super_descr_getattribute,
+                2,
+                "($self, name, /)",
+            ),
         ),
-        ("__get__", make_builtin_function("__get__", super_descr_get)),
+        (
+            "__get__",
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__get__",
+                super_descr_get,
+                "($self, instance, owner=None, /)",
+            ),
+        ),
     ] {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
@@ -4182,6 +4214,20 @@ fn range_descr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_bool_from(unsafe { pyre_object::w_range_bool(args[0]) }))
 }
 
+fn make_range_method(
+    name: &'static str,
+    function: DunderFn,
+    arity: u16,
+    text_signature: &'static str,
+) -> PyObjectRef {
+    crate::gateway::make_builtin_function_with_arity_and_text_signature(
+        name,
+        function,
+        arity,
+        text_signature,
+    )
+}
+
 /// PyPy `functional.py W_Range.typedef`, kept in the same entry order.
 fn init_range_type(ns: PyObjectRef) {
     unsafe {
@@ -4199,83 +4245,109 @@ fn init_range_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(range_descr_new);
+    unsafe {
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
+    };
     let entries = [
-        ("__new__", make_new_descr(range_descr_new)),
+        ("__new__", new_descr),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", range_descr_repr, 1),
+            make_range_method("__repr__", range_descr_repr, 1, "($self, /)"),
         ),
         (
             "__getitem__",
-            make_builtin_function_with_arity("__getitem__", range_descr_getitem, 2),
+            make_range_method("__getitem__", range_descr_getitem, 2, "($self, key, /)"),
         ),
         (
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::range_iter_method, 1),
+            make_range_method(
+                "__iter__",
+                crate::baseobjspace::range_iter_method,
+                1,
+                "($self, /)",
+            ),
         ),
         (
             "__len__",
-            make_builtin_function_with_arity("__len__", range_descr_len, 1),
+            make_range_method("__len__", range_descr_len, 1, "($self, /)"),
         ),
         (
             "__reversed__",
-            make_builtin_function_with_arity(
+            make_range_method(
                 "__reversed__",
                 crate::baseobjspace::range_reversed_method,
                 1,
+                "($self, /)",
             ),
         ),
         (
             "__reduce__",
-            make_builtin_function_with_arity(
+            make_range_method(
                 "__reduce__",
                 crate::baseobjspace::range_reduce_method,
                 1,
+                "($self, /)",
             ),
         ),
         (
             "__contains__",
-            make_builtin_function_with_arity("__contains__", range_descr_contains, 2),
+            make_range_method("__contains__", range_descr_contains, 2, "($self, key, /)"),
         ),
         (
             "__eq__",
-            make_builtin_function_with_arity("__eq__", range_descr_eq, 2),
+            make_range_method("__eq__", range_descr_eq, 2, "($self, value, /)"),
         ),
         (
             "__ne__",
-            make_builtin_function_with_arity("__ne__", range_descr_ne, 2),
+            make_range_method("__ne__", range_descr_ne, 2, "($self, value, /)"),
         ),
         (
             "__lt__",
-            make_builtin_function_with_arity("__lt__", range_descr_lt, 2),
+            make_range_method("__lt__", range_descr_lt, 2, "($self, value, /)"),
         ),
         (
             "__le__",
-            make_builtin_function_with_arity("__le__", range_descr_le, 2),
+            make_range_method("__le__", range_descr_le, 2, "($self, value, /)"),
         ),
         (
             "__gt__",
-            make_builtin_function_with_arity("__gt__", range_descr_gt, 2),
+            make_range_method("__gt__", range_descr_gt, 2, "($self, value, /)"),
         ),
         (
             "__ge__",
-            make_builtin_function_with_arity("__ge__", range_descr_ge, 2),
+            make_range_method("__ge__", range_descr_ge, 2, "($self, value, /)"),
         ),
         (
             "__hash__",
-            make_builtin_function_with_arity("__hash__", crate::baseobjspace::range_hash_method, 1),
+            make_range_method(
+                "__hash__",
+                crate::baseobjspace::range_hash_method,
+                1,
+                "($self, /)",
+            ),
         ),
         (
             "__bool__",
-            make_builtin_function_with_arity("__bool__", range_descr_bool, 1),
+            make_range_method("__bool__", range_descr_bool, 1, "($self, /)"),
         ),
         (
             "count",
-            make_builtin_function_with_arity("count", crate::baseobjspace::range_count_method, 2),
+            make_range_method(
+                "count",
+                crate::baseobjspace::range_count_method,
+                2,
+                "($self, object, /)",
+            ),
         ),
         (
             "index",
-            make_builtin_function_with_arity("index", crate::baseobjspace::range_index_method, 2),
+            make_range_method(
+                "index",
+                crate::baseobjspace::range_index_method,
+                2,
+                "($self, object, /)",
+            ),
         ),
     ];
     for (name, value) in entries {
@@ -4300,6 +4372,33 @@ fn install_functional_entry(ns: PyObjectRef, name: &'static str, value: PyObject
     unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
 }
 
+/// CPython 3.14's Argument Clinic signature shared by the functional iterator
+/// `tp_new` wrappers. PyPy's GatewayCache likewise attaches the generated text
+/// signature after constructing the builtin carrier.
+fn make_functional_new_descr(
+    function: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+) -> PyObjectRef {
+    let descr = make_new_descr(function);
+    unsafe {
+        crate::function::fset_func_text_signature(descr, w_str_new("($type, *args, **kwargs)"))
+    };
+    descr
+}
+
+fn make_functional_method(name: &'static str, function: DunderFn, arity: u16) -> PyObjectRef {
+    let text_signature = if arity == 1 {
+        "($self, /)"
+    } else {
+        "($self, object, /)"
+    };
+    crate::gateway::make_builtin_function_with_arity_and_text_signature(
+        name,
+        function,
+        arity,
+        text_signature,
+    )
+}
+
 /// PyPy `functional.py W_Enumerate.typedef`.
 fn init_enumerate_type(ns: PyObjectRef) {
     install_functional_entry(
@@ -4309,21 +4408,25 @@ fn init_enumerate_type(ns: PyObjectRef) {
             "Return an enumerate object.\n\n  iterable\n    an object supporting iteration\n\nThe enumerate object yields pairs containing a count (from start, which\ndefaults to zero) and a value yielded by the iterable argument.\n\nenumerate is useful for obtaining an indexed list:\n    (0, seq[0]), (1, seq[1]), (2, seq[2]), ...",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(enumerate_descr_new));
+    install_functional_entry(
+        ns,
+        "__new__",
+        make_functional_new_descr(enumerate_descr_new),
+    );
     install_functional_entry(
         ns,
         "__iter__",
-        make_builtin_function_with_arity("__iter__", crate::baseobjspace::enumerate_iter_method, 1),
+        make_functional_method("__iter__", crate::baseobjspace::enumerate_iter_method, 1),
     );
     install_functional_entry(
         ns,
         "__next__",
-        make_builtin_function_with_arity("__next__", crate::baseobjspace::enumerate_next_method, 1),
+        make_functional_method("__next__", crate::baseobjspace::enumerate_next_method, 1),
     );
     install_functional_entry(
         ns,
         "__reduce__",
-        make_builtin_function_with_arity(
+        make_functional_method(
             "__reduce__",
             crate::baseobjspace::enumerate_reduce_method,
             1,
@@ -4332,10 +4435,14 @@ fn init_enumerate_type(ns: PyObjectRef) {
     install_functional_entry(
         ns,
         "__class_getitem__",
-        pyre_object::function::w_classmethod_new(make_builtin_function(
-            "__class_getitem__",
-            crate::_pypy_generic_alias::generic_alias_class_getitem,
-        )),
+        pyre_object::function::w_classmethod_new(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+                2,
+                "($type, object, /)",
+            ),
+        ),
     );
 }
 
@@ -4346,7 +4453,7 @@ fn init_reversed_type(ns: PyObjectRef) {
         "__doc__",
         w_str_new("Return a reverse iterator over the values of the given sequence."),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(reversed_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(reversed_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -4366,11 +4473,7 @@ fn init_reversed_type(ns: PyObjectRef) {
             2,
         ),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, arity),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, arity));
     }
 }
 
@@ -4383,7 +4486,7 @@ fn init_map_type(ns: PyObjectRef) {
             "map(func, *iterables) --> map object\n\nMake an iterator that computes the function using arguments from\neach of the iterables.  Stops when the shortest iterable is exhausted.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(map_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(map_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -4394,11 +4497,7 @@ fn init_map_type(ns: PyObjectRef) {
         ("__reduce__", crate::baseobjspace::map_reduce_method, 1),
         ("__setstate__", crate::baseobjspace::map_setstate_method, 2),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, arity),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, arity));
     }
 }
 
@@ -4411,7 +4510,7 @@ fn init_filter_type(ns: PyObjectRef) {
             "filter(function or None, iterable) --> filter object\n\nReturn an iterator yielding those items of iterable for which function(item)\nis true. If function is None, return the items that are true.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(filter_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(filter_descr_new));
     for (name, function) in [
         (
             "__iter__",
@@ -4420,11 +4519,7 @@ fn init_filter_type(ns: PyObjectRef) {
         ("__next__", crate::baseobjspace::filter_next_method),
         ("__reduce__", crate::baseobjspace::filter_reduce_method),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, 1),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, 1));
     }
 }
 
@@ -4437,7 +4532,7 @@ fn init_zip_type(ns: PyObjectRef) {
             "zip(*iterables) --> A zip object yielding tuples until an input is exhausted.\n\nThe zip object yields n-length tuples, where n is the number of iterables\npassed as positional arguments to zip().  The i-th element in every tuple\ncomes from the i-th iterable argument to zip().  This continues until the\nshortest argument is exhausted.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(zip_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(zip_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -4448,11 +4543,7 @@ fn init_zip_type(ns: PyObjectRef) {
         ("__reduce__", crate::baseobjspace::zip_reduce_method, 1),
         ("__setstate__", crate::baseobjspace::zip_setstate_method, 2),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, arity),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, arity));
     }
 }
 
@@ -4910,10 +5001,14 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -5215,6 +5310,48 @@ fn init_list_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(name, func, 2),
             )
         };
+    }
+    // CPython 3.14 Argument Clinic metadata. The registrations above retain
+    // PyPy W_ListObject.typedef's source order and carrier kinds; only the
+    // Function metadata field is filled after all entries exist.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, index, /)"),
+        ("__setitem__", "($self, key, value, /)"),
+        ("__delitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__iadd__", "($self, value, /)"),
+        ("__imul__", "($self, value, /)"),
+        ("__reversed__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+        ("clear", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("append", "($self, object, /)"),
+        ("insert", "($self, index, object, /)"),
+        ("extend", "($self, iterable, /)"),
+        ("pop", "($self, index=-1, /)"),
+        ("remove", "($self, value, /)"),
+        ("index", "($self, value, start=0, stop=sys.maxsize, /)"),
+        ("count", "($self, value, /)"),
+        ("reverse", "($self, /)"),
+        ("sort", "($self, /, *, key=None, reverse=False)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("list TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
@@ -5946,103 +6083,108 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "maketrans",
-            make_maketrans_descr!("str", |args: &[PyObjectRef]| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "maketrans expected at least 1 argument, got 0",
-                    ));
-                }
-                if args.len() > 3 {
-                    return Err(crate::PyError::type_error(format!(
-                        "maketrans expected at most 3 arguments, got {}",
-                        args.len()
-                    )));
-                }
-
-                let d = pyre_object::w_dict_new();
-                if args.len() >= 2 {
-                    if !unsafe { pyre_object::is_str(args[0]) } {
+            make_maketrans_descr!(
+                "str",
+                |args: &[PyObjectRef]| {
+                    if args.is_empty() {
                         return Err(crate::PyError::type_error(
-                            "first maketrans argument must be a string if there is a second argument",
+                            "maketrans expected at least 1 argument, got 0",
                         ));
                     }
-                    if !unsafe { pyre_object::is_str(args[1]) } {
+                    if args.len() > 3 {
                         return Err(crate::PyError::type_error(format!(
-                            "maketrans() argument 2 must be str, not {}",
-                            crate::type_methods::arg_type_name(args[1])
-                        )));
-                    }
-                    if args.len() == 3 && !unsafe { pyre_object::is_str(args[2]) } {
-                        return Err(crate::PyError::type_error(format!(
-                            "maketrans() argument 3 must be str, not {}",
-                            crate::type_methods::arg_type_name(args[2])
+                            "maketrans expected at most 3 arguments, got {}",
+                            args.len()
                         )));
                     }
 
-                    let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                    let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                    if unsafe { pyre_object::w_str_len(args[0]) != pyre_object::w_str_len(args[1]) }
-                    {
-                        return Err(crate::PyError::value_error(
-                            "the first two maketrans arguments must have equal length",
-                        ));
-                    }
-                    for (xc, yc) in x.code_points().zip(y.code_points()) {
-                        unsafe {
-                            pyre_object::w_dict_store(
-                                d,
-                                pyre_object::w_int_new(xc.to_u32() as i64),
-                                pyre_object::w_int_new(yc.to_u32() as i64),
-                            );
+                    let d = pyre_object::w_dict_new();
+                    if args.len() >= 2 {
+                        if !unsafe { pyre_object::is_str(args[0]) } {
+                            return Err(crate::PyError::type_error(
+                                "first maketrans argument must be a string if there is a second argument",
+                            ));
                         }
-                    }
-                    if args.len() == 3 {
-                        let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
-                        for zc in z.code_points() {
+                        if !unsafe { pyre_object::is_str(args[1]) } {
+                            return Err(crate::PyError::type_error(format!(
+                                "maketrans() argument 2 must be str, not {}",
+                                crate::type_methods::arg_type_name(args[1])
+                            )));
+                        }
+                        if args.len() == 3 && !unsafe { pyre_object::is_str(args[2]) } {
+                            return Err(crate::PyError::type_error(format!(
+                                "maketrans() argument 3 must be str, not {}",
+                                crate::type_methods::arg_type_name(args[2])
+                            )));
+                        }
+
+                        let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                        let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+                        if unsafe {
+                            pyre_object::w_str_len(args[0]) != pyre_object::w_str_len(args[1])
+                        } {
+                            return Err(crate::PyError::value_error(
+                                "the first two maketrans arguments must have equal length",
+                            ));
+                        }
+                        for (xc, yc) in x.code_points().zip(y.code_points()) {
                             unsafe {
                                 pyre_object::w_dict_store(
                                     d,
-                                    pyre_object::w_int_new(zc.to_u32() as i64),
-                                    pyre_object::w_none(),
+                                    pyre_object::w_int_new(xc.to_u32() as i64),
+                                    pyre_object::w_int_new(yc.to_u32() as i64),
                                 );
                             }
                         }
-                    }
-                } else {
-                    if !unsafe { pyre_object::is_dict(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "if you give only one argument to maketrans it must be a dict",
-                        ));
-                    }
-                    let src = args[0];
-                    unsafe {
-                        // `w_dict_items` dispatches through `is_module_dict`
-                        // so `str.maketrans(some_module.__dict__)` walks the
-                        // strategy storage when handed a W_ModuleDictObject.
-                        for (k, v) in pyre_object::w_dict_items(src) {
-                            let ord_key = if pyre_object::is_int(k) {
-                                k
-                            } else if pyre_object::is_str(k) {
-                                let s = pyre_object::w_str_get_wtf8(k);
-                                let mut cps = s.code_points();
-                                let cp = cps.next();
-                                if cp.is_none() || cps.next().is_some() {
-                                    return Err(crate::PyError::value_error(
-                                        "string keys in translate table must be of length 1",
-                                    ));
+                        if args.len() == 3 {
+                            let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
+                            for zc in z.code_points() {
+                                unsafe {
+                                    pyre_object::w_dict_store(
+                                        d,
+                                        pyre_object::w_int_new(zc.to_u32() as i64),
+                                        pyre_object::w_none(),
+                                    );
                                 }
-                                pyre_object::w_int_new(cp.unwrap().to_u32() as i64)
-                            } else {
-                                return Err(crate::PyError::type_error(
-                                    "keys in translate table must be strings or integers",
-                                ));
-                            };
-                            pyre_object::w_dict_store(d, ord_key, v);
+                            }
+                        }
+                    } else {
+                        if !unsafe { pyre_object::is_dict(args[0]) } {
+                            return Err(crate::PyError::type_error(
+                                "if you give only one argument to maketrans it must be a dict",
+                            ));
+                        }
+                        let src = args[0];
+                        unsafe {
+                            // `w_dict_items` dispatches through `is_module_dict`
+                            // so `str.maketrans(some_module.__dict__)` walks the
+                            // strategy storage when handed a W_ModuleDictObject.
+                            for (k, v) in pyre_object::w_dict_items(src) {
+                                let ord_key = if pyre_object::is_int(k) {
+                                    k
+                                } else if pyre_object::is_str(k) {
+                                    let s = pyre_object::w_str_get_wtf8(k);
+                                    let mut cps = s.code_points();
+                                    let cp = cps.next();
+                                    if cp.is_none() || cps.next().is_some() {
+                                        return Err(crate::PyError::value_error(
+                                            "string keys in translate table must be of length 1",
+                                        ));
+                                    }
+                                    pyre_object::w_int_new(cp.unwrap().to_u32() as i64)
+                                } else {
+                                    return Err(crate::PyError::type_error(
+                                        "keys in translate table must be strings or integers",
+                                    ));
+                                };
+                                pyre_object::w_dict_store(d, ord_key, v);
+                            }
                         }
                     }
-                }
-                Ok(d)
-            }),
+                    Ok(d)
+                },
+                "(x, y=<unrepresentable>, z=<unrepresentable>, /)"
+            ),
         )
     };
     for (name, func) in [
@@ -6079,10 +6221,152 @@ fn init_str_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for the PyPy unicode TypeDef
+    // callables. `maketrans` is stamped on the function inside its staticmethod
+    // carrier above; these entries are the remaining Function carriers.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__str__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("encode", "($self, /, encoding='utf-8', errors='strict')"),
+        ("replace", "($self, old, new, /, count=-1)"),
+        ("split", "($self, /, sep=None, maxsplit=-1)"),
+        ("rsplit", "($self, /, sep=None, maxsplit=-1)"),
+        ("join", "($self, iterable, /)"),
+        ("capitalize", "($self, /)"),
+        ("casefold", "($self, /)"),
+        ("title", "($self, /)"),
+        ("center", "($self, width, fillchar=' ', /)"),
+        ("count", "($self, sub[, start[, end]], /)"),
+        ("expandtabs", "($self, /, tabsize=8)"),
+        ("find", "($self, sub[, start[, end]], /)"),
+        ("partition", "($self, sep, /)"),
+        ("index", "($self, sub[, start[, end]], /)"),
+        ("ljust", "($self, width, fillchar=' ', /)"),
+        ("lower", "($self, /)"),
+        ("lstrip", "($self, chars=None, /)"),
+        ("rfind", "($self, sub[, start[, end]], /)"),
+        ("rindex", "($self, sub[, start[, end]], /)"),
+        ("rjust", "($self, width, fillchar=' ', /)"),
+        ("rstrip", "($self, chars=None, /)"),
+        ("rpartition", "($self, sep, /)"),
+        ("splitlines", "($self, /, keepends=False)"),
+        ("strip", "($self, chars=None, /)"),
+        ("swapcase", "($self, /)"),
+        ("translate", "($self, table, /)"),
+        ("upper", "($self, /)"),
+        ("startswith", "($self, prefix[, start[, end]], /)"),
+        ("endswith", "($self, suffix[, start[, end]], /)"),
+        ("removeprefix", "($self, prefix, /)"),
+        ("removesuffix", "($self, suffix, /)"),
+        ("isascii", "($self, /)"),
+        ("islower", "($self, /)"),
+        ("isupper", "($self, /)"),
+        ("istitle", "($self, /)"),
+        ("isspace", "($self, /)"),
+        ("isdecimal", "($self, /)"),
+        ("isdigit", "($self, /)"),
+        ("isnumeric", "($self, /)"),
+        ("isalpha", "($self, /)"),
+        ("isalnum", "($self, /)"),
+        ("isidentifier", "($self, /)"),
+        ("isprintable", "($self, /)"),
+        ("zfill", "($self, width, /)"),
+        ("format", "($self, /, *args, **kwargs)"),
+        ("format_map", "($self, mapping, /)"),
+        ("__format__", "($self, format_spec, /)"),
+        ("__sizeof__", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("str TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/dictmultiobject.py TypeDef("dict", ...)
+
+fn dict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_dict_receiver(args, "__sizeof__", false)?;
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+
+    let receiver = args[0];
+    let dict = crate::type_methods::resolve_dict_backing(receiver);
+    debug_assert!(!dict.is_null());
+    let w_type = crate::typedef::r#type(receiver)
+        .expect("every dict has a type")
+        .as_ptr();
+    let basicsize = cpython_type_layout(w_type)
+        .expect("dict and its subclasses have CPython layout metadata")
+        .0 as usize;
+    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(dict) };
+    if items.is_empty() {
+        // CPython's empty dict shares the immortal empty-keys table, whose
+        // storage is consequently not charged to the instance.
+        return Ok(w_int_new(basicsize as i64));
+    }
+
+    // CPython 3.14 `dictobject.c:_PyDict_KeysSize`: the smallest power-of-two
+    // key table whose two-thirds usable fraction holds the live entries, plus
+    // its indices and entries.  PyPy has no dict `__sizeof__`; this is one of
+    // the Python-3.14 surface additions where the project's stated version
+    // target takes precedence over the PyPy TypeDef.
+    let mut table_size = 8usize;
+    while (table_size << 1) / 3 < items.len() {
+        table_size = table_size
+            .checked_mul(2)
+            .ok_or_else(crate::builtins::reservation_failed)?;
+    }
+    let index_width = if table_size <= u8::MAX as usize {
+        1
+    } else if table_size <= u16::MAX as usize {
+        2
+    } else if table_size <= u32::MAX as usize {
+        4
+    } else {
+        8
+    };
+    let index_bytes = table_size
+        .checked_mul(index_width)
+        .ok_or_else(crate::builtins::reservation_failed)?
+        .max(std::mem::size_of::<usize>());
+    let unicode_only = items.iter().all(|(key, _)| unsafe {
+        pyre_object::pyobject::is_exact_type(*key, &pyre_object::STR_TYPE)
+    });
+    let entry_size = if unicode_only {
+        2 * std::mem::size_of::<usize>()
+    } else {
+        3 * std::mem::size_of::<usize>()
+    };
+    let usable = (table_size << 1) / 3;
+    let keys_size = 4usize
+        .checked_mul(std::mem::size_of::<usize>())
+        .and_then(|header| header.checked_add(index_bytes))
+        .and_then(|partial| partial.checked_add(usable.checked_mul(entry_size)?))
+        .ok_or_else(crate::builtins::reservation_failed)?;
+    Ok(w_int_new(
+        basicsize
+            .checked_add(keys_size)
+            .ok_or_else(crate::builtins::reservation_failed)? as i64,
+    ))
+}
 
 fn init_dict_type(ns: PyObjectRef) {
     unsafe {
@@ -6107,6 +6391,18 @@ fn init_dict_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                dict_descr_sizeof,
+                1,
+                "($self, /)",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__new__",
             make_new_descr(dict_descr_new),
         )
@@ -6117,10 +6413,14 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     // `dictmultiobject.py:137-138 descr_init` →
@@ -6650,6 +6950,43 @@ fn init_dict_type(ns: PyObjectRef) {
             pyre_object::function::w_classmethod_new(fromkeys),
         )
     };
+    // CPython 3.14 Argument Clinic metadata. Keep the PyPy TypeDef carriers
+    // installed above and fill only their Function metadata fields.  In
+    // particular, `update` deliberately keeps a None text signature.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__ior__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__setitem__", "($self, key, value, /)"),
+        ("__delitem__", "($self, key, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("get", "($self, key, default=None, /)"),
+        ("setdefault", "($self, key, default=None, /)"),
+        ("pop", "($self, key, default=<unrepresentable>, /)"),
+        ("popitem", "($self, /)"),
+        ("keys", "($self, /)"),
+        ("items", "($self, /)"),
+        ("values", "($self, /)"),
+        ("clear", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("__reversed__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("dict TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
     fn dict_fromkeys_impl(
         cls: PyObjectRef,
         iterable: PyObjectRef,
@@ -7349,7 +7686,9 @@ fn init_frame_type(ns: PyObjectRef) {
             // reached through a traceback's `tb_frame` gets neither.
             crate::executioncontext::force_frame_before_locals_read(f);
             let frame = unsafe { &mut *f };
-            if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
+            if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+                || frame.has_active_hidden_locals()
+            {
                 return Ok(crate::pyframe::frame_locals_proxy::new(args[1]));
             }
             let w = frame.getdictscope()?;
@@ -8504,10 +8843,14 @@ fn init_tuple_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -8664,6 +9007,34 @@ fn init_tuple_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata. Keep the PyPy TypeDef entry
+    // construction above unchanged and attach each signature to its builtin
+    // carrier after registration, as GatewayCache does for interp2app.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("index", "($self, value, start=0, stop=sys.maxsize, /)"),
+        ("count", "($self, value, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("tuple TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 /// `tupleobject.c` `tuple * n` / `n * tuple`.  A non-integer count
@@ -9051,43 +9422,28 @@ fn init_slice_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(slice_descr_new);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(slice_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"));
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr)
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity("__repr__", slice_descr_repr, 1),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__eq__",
-            make_builtin_function_with_arity("__eq__", slice_descr_eq, 2),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__ne__",
-            make_builtin_function_with_arity("__ne__", slice_descr_ne, 2),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__lt__",
-            make_builtin_function_with_arity("__lt__", slice_descr_lt, 2),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__repr__",
+                slice_descr_repr,
+                1,
+                "($self, /)",
+            ),
         )
     };
     for (name, func) in [
-        ("__le__", slice_descr_le as DunderFn),
+        ("__eq__", slice_descr_eq as DunderFn),
+        ("__ne__", slice_descr_ne),
+        ("__lt__", slice_descr_lt),
+        ("__le__", slice_descr_le),
         ("__gt__", slice_descr_gt),
         ("__ge__", slice_descr_ge),
     ] {
@@ -9095,7 +9451,12 @@ fn init_slice_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    name,
+                    func,
+                    2,
+                    "($self, value, /)",
+                ),
             )
         };
     }
@@ -9104,14 +9465,24 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity("__hash__", slice_descr_hash, 1),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__hash__",
+                slice_descr_hash,
+                1,
+                "($self, /)",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity("__reduce__", slice_descr_reduce, 1),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__reduce__",
+                slice_descr_reduce,
+                1,
+                "($self, /)",
+            ),
         )
     };
     unsafe {
@@ -9151,7 +9522,12 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "indices",
-            make_builtin_function_with_arity("indices", slice_method_indices, 2),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "indices",
+                slice_method_indices,
+                2,
+                "($self, object, /)",
+            ),
         )
     };
 }
@@ -11122,10 +11498,13 @@ fn init_type_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__prepare__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__prepare__",
-                |_args| Ok(pyre_object::w_dict_new()),
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "__prepare__",
+                    |_args| Ok(pyre_object::w_dict_new()),
+                    "($cls, name, bases, /, **kwds)",
+                ),
+            ),
         )
     };
 
@@ -11430,6 +11809,31 @@ fn init_type_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for type's callable descriptor
+    // surface. `__prepare__` is attached to the carrier before its
+    // classmethod wrapper above; the remaining entries are plain builtin
+    // carriers in W_TypeObject.typedef's namespace.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__call__", "($self, /, *args, **kwargs)"),
+        ("__getattribute__", "($self, name, /)"),
+        ("__setattr__", "($self, name, value, /)"),
+        ("__delattr__", "($self, name, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("mro", "($self, /)"),
+        ("__subclasses__", "($self, /)"),
+        ("__instancecheck__", "($self, instance, /)"),
+        ("__subclasscheck__", "($self, subclass, /)"),
+        ("__dir__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("type TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 struct MroUpdate {
@@ -15753,6 +16157,13 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         make_builtin_function_with_arity("__annotate__", staticmethod_annotate_set, 3);
     let annotate_deleter =
         make_builtin_function_with_arity("__annotate__", staticmethod_annotate_del, 2);
+    let class_getitem = make_builtin_function(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+    );
+    unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
+    };
     let entries = [
         (
             "__doc__",
@@ -15821,10 +16232,7 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         ),
         (
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(class_getitem),
         ),
         (
             "__repr__",
@@ -15837,6 +16245,17 @@ fn init_staticmethod_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__call__", "($self, /, *args, **kwargs)"),
+        ("__get__", "($self, instance, owner=None, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("staticmethod TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
@@ -16034,6 +16453,13 @@ fn init_classmethod_type(ns: PyObjectRef) {
         make_builtin_function_with_arity("__annotate__", classmethod_annotate_set, 3);
     let annotate_deleter =
         make_builtin_function_with_arity("__annotate__", classmethod_annotate_del, 2);
+    let class_getitem = make_builtin_function(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+    );
+    unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
+    };
     let entries = [
         (
             "__doc__",
@@ -16098,10 +16524,7 @@ fn init_classmethod_type(ns: PyObjectRef) {
         ),
         (
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(class_getitem),
         ),
         (
             "__repr__",
@@ -16114,6 +16537,16 @@ fn init_classmethod_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__get__", "($self, instance, owner=None, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("classmethod TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
@@ -16373,30 +16806,44 @@ fn property_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
 /// PyPy `W_Property.typedef`, extended only where Python 3.14's public
 /// surface differs (`__name__`, `__set_name__`, no PyPy-3.11 `__reduce__`).
 fn init_property_type(ns: PyObjectRef) {
+    let new_descr = make_new_descr(property_descr_new);
+    unsafe {
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
+    };
     let entries = [
-        ("__new__", make_new_descr(property_descr_new)),
+        ("__new__", new_descr),
         (
             "__init__",
-            make_builtin_function("__init__", property_descr_init),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__init__",
+                property_descr_init,
+                "($self, /, *args, **kwargs)",
+            ),
         ),
         (
             "__get__",
-            make_builtin_function("__get__", crate::baseobjspace::property_descr_get_impl),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__get__",
+                crate::baseobjspace::property_descr_get_impl,
+                "($self, instance, owner=None, /)",
+            ),
         ),
         (
             "__set__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__set__",
                 crate::baseobjspace::property_descr_set_impl,
                 3,
+                "($self, instance, value, /)",
             ),
         ),
         (
             "__delete__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__delete__",
                 crate::baseobjspace::property_descr_delete_impl,
                 2,
+                "($self, instance, /)",
             ),
         ),
         (
@@ -16450,26 +16897,29 @@ fn init_property_type(ns: PyObjectRef) {
         ),
         (
             "getter",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "getter",
                 crate::baseobjspace::property_getter_impl,
                 2,
+                "($self, object, /)",
             ),
         ),
         (
             "setter",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "setter",
                 crate::baseobjspace::property_setter_impl,
                 2,
+                "($self, object, /)",
             ),
         ),
         (
             "deleter",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "deleter",
                 crate::baseobjspace::property_deleter_impl,
                 2,
+                "($self, object, /)",
             ),
         ),
         (
@@ -16478,7 +16928,11 @@ fn init_property_type(ns: PyObjectRef) {
             // user-visible count without the bound receiver.  Let the
             // implementation parse the call so its exact 3.14 diagnostics
             // are not pre-empted by gateway's generic fixed-arity wording.
-            make_builtin_function("__set_name__", crate::baseobjspace::property_set_name_impl),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__set_name__",
+                crate::baseobjspace::property_set_name_impl,
+                "($self, owner, name, /)",
+            ),
         ),
     ];
     for (name, value) in entries {
@@ -17458,10 +17912,13 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "from_bytes",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "from_bytes",
-                int_from_bytes,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "from_bytes",
+                    int_from_bytes,
+                    "($type, /, bytes, byteorder='big', *, signed=False)",
+                ),
+            ),
         )
     };
     // int.__index__ / __int__ / __trunc__ — exact ints preserve identity;
@@ -17724,6 +18181,72 @@ fn init_int_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for the PyPy int TypeDef
+    // callables. `__pow__`, `__rpow__`, `from_bytes`, and `__sizeof__` are
+    // stamped at construction because their carrier/signature needs special
+    // handling; the remaining plain Function carriers are filled here.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__radd__", "($self, value, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__divmod__", "($self, value, /)"),
+        ("__rdivmod__", "($self, value, /)"),
+        ("__neg__", "($self, /)"),
+        ("__pos__", "($self, /)"),
+        ("__abs__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+        ("__invert__", "($self, /)"),
+        ("__lshift__", "($self, value, /)"),
+        ("__rlshift__", "($self, value, /)"),
+        ("__rshift__", "($self, value, /)"),
+        ("__rrshift__", "($self, value, /)"),
+        ("__and__", "($self, value, /)"),
+        ("__rand__", "($self, value, /)"),
+        ("__xor__", "($self, value, /)"),
+        ("__rxor__", "($self, value, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__int__", "($self, /)"),
+        ("__float__", "($self, /)"),
+        ("__floordiv__", "($self, value, /)"),
+        ("__rfloordiv__", "($self, value, /)"),
+        ("__truediv__", "($self, value, /)"),
+        ("__rtruediv__", "($self, value, /)"),
+        ("__index__", "($self, /)"),
+        ("conjugate", "($self, /)"),
+        ("bit_length", "($self, /)"),
+        ("bit_count", "($self, /)"),
+        (
+            "to_bytes",
+            "($self, /, length=1, byteorder='big', *, signed=False)",
+        ),
+        ("as_integer_ratio", "($self, /)"),
+        ("__trunc__", "($self, /)"),
+        ("__floor__", "($self, /)"),
+        ("__ceil__", "($self, /)"),
+        ("__round__", "($self, ndigits=None, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("__format__", "($self, format_spec, /)"),
+        ("is_integer", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("int TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 /// Complex `repr` (`Xj` for a pure-`+0` real part, else `(re±imj)`),
 /// delegated to `rustpython_literal::complex::to_string`.
@@ -17772,33 +18295,36 @@ fn init_complex_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "from_number",
-            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
-                "from_number",
-                |args| {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "complex.from_number() missing required argument 'number' (pos 1)",
-                        ));
-                    }
-                    let value = args[1];
-                    if unsafe {
-                        pyre_object::is_str(value)
-                            || pyre_object::is_bytes(value)
-                            || pyre_object::is_bytearray(value)
-                    } {
-                        return Err(crate::PyError::type_error(format!(
-                            "must be real number, not {}",
-                            crate::type_methods::arg_type_name(value)
-                        )));
-                    }
-                    // Reuse complex.__new__'s exact-base identity and subclass
-                    // allocation.  The constructor's numeric-only path runs
-                    // __complex__, __float__, then __index__ without parsing
-                    // text because those inputs were rejected above.
-                    complex_descr_new(&[args[0], value])
-                },
-                2,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "from_number",
+                    |args| {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "complex.from_number() missing required argument 'number' (pos 1)",
+                            ));
+                        }
+                        let value = args[1];
+                        if unsafe {
+                            pyre_object::is_str(value)
+                                || pyre_object::is_bytes(value)
+                                || pyre_object::is_bytearray(value)
+                        } {
+                            return Err(crate::PyError::type_error(format!(
+                                "must be real number, not {}",
+                                crate::type_methods::arg_type_name(value)
+                            )));
+                        }
+                        // Reuse complex.__new__'s exact-base identity and subclass
+                        // allocation.  The constructor's numeric-only path runs
+                        // __complex__, __float__, then __index__ without parsing
+                        // text because those inputs were rejected above.
+                        complex_descr_new(&[args[0], value])
+                    },
+                    2,
+                    "($type, number, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -17999,6 +18525,42 @@ fn init_complex_type(ns: PyObjectRef) {
             )
         };
     }
+    // CPython 3.14 Argument Clinic metadata for the PyPy complex TypeDef
+    // callables. `from_number` is stamped before its classmethod wrapping;
+    // all remaining carriers are plain Function objects.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__radd__", "($self, value, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__pow__", "($self, value, mod=None, /)"),
+        ("__rpow__", "($self, value, mod=None, /)"),
+        ("__neg__", "($self, /)"),
+        ("__pos__", "($self, /)"),
+        ("__abs__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+        ("__truediv__", "($self, value, /)"),
+        ("__rtruediv__", "($self, value, /)"),
+        ("conjugate", "($self, /)"),
+        ("__complex__", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("__format__", "($self, format_spec, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("complex TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 fn init_float_type(ns: PyObjectRef) {
@@ -18046,36 +18608,39 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "from_number",
-            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
-                "from_number",
-                |args| {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "float.from_number() missing required argument 'number' (pos 1)",
-                        ));
-                    }
-                    let value = args[1];
-                    // Python 3.14 float.from_number uses the numeric
-                    // conversion protocol (__float__, then __index__) but,
-                    // unlike float(), never accepts textual inputs.
-                    if unsafe {
-                        pyre_object::is_str(value)
-                            || pyre_object::is_bytes(value)
-                            || pyre_object::is_bytearray(value)
-                            || pyre_object::is_complex(value)
-                    } {
-                        return Err(crate::PyError::type_error(format!(
-                            "must be real number, not {}",
-                            crate::type_methods::arg_type_name(value)
-                        )));
-                    }
-                    // Reuse float.__new__'s exact base/subclass allocation:
-                    // exact base floats retain identity, while a classmethod
-                    // invoked on a float subclass returns that subclass.
-                    float_descr_new(&[args[0], value])
-                },
-                2,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "from_number",
+                    |args| {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "float.from_number() missing required argument 'number' (pos 1)",
+                            ));
+                        }
+                        let value = args[1];
+                        // Python 3.14 float.from_number uses the numeric
+                        // conversion protocol (__float__, then __index__) but,
+                        // unlike float(), never accepts textual inputs.
+                        if unsafe {
+                            pyre_object::is_str(value)
+                                || pyre_object::is_bytes(value)
+                                || pyre_object::is_bytearray(value)
+                                || pyre_object::is_complex(value)
+                        } {
+                            return Err(crate::PyError::type_error(format!(
+                                "must be real number, not {}",
+                                crate::type_methods::arg_type_name(value)
+                            )));
+                        }
+                        // Reuse float.__new__'s exact base/subclass allocation:
+                        // exact base floats retain identity, while a classmethod
+                        // invoked on a float subclass returns that subclass.
+                        float_descr_new(&[args[0], value])
+                    },
+                    2,
+                    "($type, number, /)",
+                ),
+            ),
         )
     };
     // float.__getformat__(kind) → returns the format string for the
@@ -18085,29 +18650,32 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getformat__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__getformat__",
-                |args| {
-                    // A class method, so `args[0]` is the class and the kind
-                    // follows it.
-                    let kind = args
-                        .get(1)
-                        .copied()
-                        .filter(|&a| unsafe { pyre_object::is_str(a) })
-                        .map(|a| unsafe { pyre_object::w_str_get_value(a).to_string() })
-                        .ok_or_else(|| {
-                            crate::PyError::type_error(
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "__getformat__",
+                    |args| {
+                        // A class method, so `args[0]` is the class and the kind
+                        // follows it.
+                        let kind = args
+                            .get(1)
+                            .copied()
+                            .filter(|&a| unsafe { pyre_object::is_str(a) })
+                            .map(|a| unsafe { pyre_object::w_str_get_value(a).to_string() })
+                            .ok_or_else(|| {
+                                crate::PyError::type_error(
+                                    "__getformat__() argument must be 'double' or 'float'",
+                                )
+                            })?;
+                        match kind.as_str() {
+                            "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
+                            _ => Err(crate::PyError::value_error(
                                 "__getformat__() argument must be 'double' or 'float'",
-                            )
-                        })?;
-                    match kind.as_str() {
-                        "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
-                        _ => Err(crate::PyError::value_error(
-                            "__getformat__() argument must be 'double' or 'float'",
-                        )),
-                    }
-                },
-            )),
+                            )),
+                        }
+                    },
+                    "($type, typestr, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -18136,49 +18704,55 @@ fn init_float_type(ns: PyObjectRef) {
             // Registered without a fixed arity so the body's own `arity_exact`
             // words the mismatch: a class method's receiver is the class, and
             // only the body knows to discount it.
-            pyre_object::function::w_classmethod_new(make_builtin_function("fromhex", |args| {
-                // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
-                // Parse hexadecimal floating-point literals like '0x1.8p3'.
-                crate::type_methods::arity_exact(args, "fromhex", 1)?;
-                let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
-                    unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
-                } else {
-                    // `@unwrap_spec(s='text')` — the operand is rejected by
-                    // `space.text_w`, which words it this way.
-                    return Err(crate::PyError::type_error(format!(
-                        "expected str, got {} object",
-                        crate::type_methods::arg_type_name(args[1])
-                    )));
-                };
-                // Delegate parsing to the shared hex-float reader, which rounds
-                // round-half-even over the full exponent range (subnormals down to
-                // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
-                // ASCII whitespace itself, and flags overflow distinctly.
-                match rustpython_common::float_ops::from_hex(&s_arg) {
-                    Ok(v) => {
-                        let w_float = pyre_object::w_float_new(v);
-                        // floatobject.py:419: return
-                        // space.call_function(w_cls, w_float).  This runs a
-                        // subclass's __new__ and __init__ rather than merely
-                        // retagging the parsed base float.
-                        crate::call::call_function_impl_result(args[0], &[w_float])
-                    }
-                    Err(e) => {
-                        use rustpython_common::float_ops::HexFloatError;
-                        Err(match e {
-                            HexFloatError::Overflow => crate::PyError::overflow_error(
-                                "hexadecimal value too large to represent as a float",
-                            ),
-                            HexFloatError::TooLong => crate::PyError::value_error(
-                                "hexadecimal string too long to convert",
-                            ),
-                            HexFloatError::Invalid => crate::PyError::value_error(
-                                "invalid hexadecimal floating-point string",
-                            ),
-                        })
-                    }
-                }
-            })),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "fromhex",
+                    |args| {
+                        // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
+                        // Parse hexadecimal floating-point literals like '0x1.8p3'.
+                        crate::type_methods::arity_exact(args, "fromhex", 1)?;
+                        let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
+                            unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
+                        } else {
+                            // `@unwrap_spec(s='text')` — the operand is rejected by
+                            // `space.text_w`, which words it this way.
+                            return Err(crate::PyError::type_error(format!(
+                                "expected str, got {} object",
+                                crate::type_methods::arg_type_name(args[1])
+                            )));
+                        };
+                        // Delegate parsing to the shared hex-float reader, which rounds
+                        // round-half-even over the full exponent range (subnormals down to
+                        // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
+                        // ASCII whitespace itself, and flags overflow distinctly.
+                        match rustpython_common::float_ops::from_hex(&s_arg) {
+                            Ok(v) => {
+                                let w_float = pyre_object::w_float_new(v);
+                                // floatobject.py:419: return
+                                // space.call_function(w_cls, w_float).  This runs a
+                                // subclass's __new__ and __init__ rather than merely
+                                // retagging the parsed base float.
+                                crate::call::call_function_impl_result(args[0], &[w_float])
+                            }
+                            Err(e) => {
+                                use rustpython_common::float_ops::HexFloatError;
+                                Err(match e {
+                                    HexFloatError::Overflow => crate::PyError::overflow_error(
+                                        "hexadecimal value too large to represent as a float",
+                                    ),
+                                    HexFloatError::TooLong => crate::PyError::value_error(
+                                        "hexadecimal string too long to convert",
+                                    ),
+                                    HexFloatError::Invalid => crate::PyError::value_error(
+                                        "invalid hexadecimal floating-point string",
+                                    ),
+                                })
+                            }
+                        }
+                    },
+                    "($type, string, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -18432,6 +19006,56 @@ fn init_float_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for the PyPy float TypeDef
+    // callables. Classmethod carriers are stamped before wrapping above;
+    // these are the remaining plain Function carriers.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__radd__", "($self, value, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__divmod__", "($self, value, /)"),
+        ("__rdivmod__", "($self, value, /)"),
+        ("__pow__", "($self, value, mod=None, /)"),
+        ("__rpow__", "($self, value, mod=None, /)"),
+        ("__neg__", "($self, /)"),
+        ("__pos__", "($self, /)"),
+        ("__abs__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+        ("__int__", "($self, /)"),
+        ("__float__", "($self, /)"),
+        ("__floordiv__", "($self, value, /)"),
+        ("__rfloordiv__", "($self, value, /)"),
+        ("__truediv__", "($self, value, /)"),
+        ("__rtruediv__", "($self, value, /)"),
+        ("conjugate", "($self, /)"),
+        ("__trunc__", "($self, /)"),
+        ("__floor__", "($self, /)"),
+        ("__ceil__", "($self, /)"),
+        ("__round__", "($self, ndigits=None, /)"),
+        ("as_integer_ratio", "($self, /)"),
+        ("hex", "($self, /)"),
+        ("is_integer", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("__format__", "($self, format_spec, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("float TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 /// `float.as_integer_ratio()` — PyPy
@@ -18757,18 +19381,21 @@ fn init_bool_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(bool_descr_new);
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(bool_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function("__repr__", bool_repr),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__repr__",
+                bool_repr,
+                1,
+                "($self, /)",
+            ),
         )
     };
     // CPython 3.14 gives bool an explicit deprecated `__invert__` wrapper;
@@ -18777,7 +19404,12 @@ fn init_bool_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__invert__",
-            make_builtin_function("__invert__", bool_descr_invert),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__invert__",
+                bool_descr_invert,
+                1,
+                "($self, /)",
+            ),
         )
     };
     // boolobject.py:97-106 — bool defines its own bitwise dunders so that
@@ -18795,14 +19427,24 @@ fn init_bool_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 and_name,
-                make_builtin_function_with_arity(and_name, f, 2),
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    and_name,
+                    f,
+                    2,
+                    "($self, value, /)",
+                ),
             )
         };
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 rand_name,
-                make_builtin_function(rand_name, f),
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    rand_name,
+                    f,
+                    2,
+                    "($self, value, /)",
+                ),
             )
         };
     }
@@ -20134,17 +20776,16 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "maketrans",
-            make_maketrans_descr!("bytes", bytes_maketrans),
+            make_maketrans_descr!("bytes", bytes_maketrans, "(frm, to, /)"),
         )
     };
+    let fromhex = make_builtin_function("fromhex", bytes_fromhex);
     unsafe {
+        crate::function::fset_func_text_signature(fromhex, w_str_new("($type, string, /)"));
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "fromhex",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "fromhex",
-                bytes_fromhex,
-            )),
+            pyre_object::function::w_classmethod_new(fromhex),
         )
     };
     unsafe {
@@ -20312,6 +20953,78 @@ fn init_bytes_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for W_BytesObject.typedef.
+    // `maketrans` and `fromhex` are stamped before their staticmethod and
+    // classmethod carriers are installed; the remaining entries are plain
+    // Function carriers in the type dictionary.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__str__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__buffer__", "($self, flags, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("__bytes__", "($self, /)"),
+        ("capitalize", "($self, /)"),
+        ("center", "($self, width, fillchar=b' ', /)"),
+        ("count", "($self, sub[, start[, end]], /)"),
+        ("decode", "($self, /, encoding='utf-8', errors='strict')"),
+        ("endswith", "($self, suffix[, start[, end]], /)"),
+        ("expandtabs", "($self, /, tabsize=8)"),
+        ("find", "($self, sub[, start[, end]], /)"),
+        ("hex", "($self, /, sep=<unrepresentable>, bytes_per_sep=1)"),
+        ("index", "($self, sub[, start[, end]], /)"),
+        ("isalnum", "($self, /)"),
+        ("isalpha", "($self, /)"),
+        ("isascii", "($self, /)"),
+        ("isdigit", "($self, /)"),
+        ("islower", "($self, /)"),
+        ("isspace", "($self, /)"),
+        ("istitle", "($self, /)"),
+        ("isupper", "($self, /)"),
+        ("join", "($self, iterable_of_bytes, /)"),
+        ("ljust", "($self, width, fillchar=b' ', /)"),
+        ("lower", "($self, /)"),
+        ("lstrip", "($self, bytes=None, /)"),
+        ("partition", "($self, sep, /)"),
+        ("replace", "($self, old, new, count=-1, /)"),
+        ("removeprefix", "($self, prefix, /)"),
+        ("removesuffix", "($self, suffix, /)"),
+        ("rfind", "($self, sub[, start[, end]], /)"),
+        ("rindex", "($self, sub[, start[, end]], /)"),
+        ("rjust", "($self, width, fillchar=b' ', /)"),
+        ("rpartition", "($self, sep, /)"),
+        ("rsplit", "($self, /, sep=None, maxsplit=-1)"),
+        ("rstrip", "($self, bytes=None, /)"),
+        ("split", "($self, /, sep=None, maxsplit=-1)"),
+        ("splitlines", "($self, /, keepends=False)"),
+        ("startswith", "($self, prefix[, start[, end]], /)"),
+        ("strip", "($self, bytes=None, /)"),
+        ("swapcase", "($self, /)"),
+        ("title", "($self, /)"),
+        ("translate", "($self, table, /, delete=b'')"),
+        ("upper", "($self, /)"),
+        ("zfill", "($self, width, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("bytes TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
     // bytes methods are mostly shared with bytearray — add as needed.
 }
 
@@ -23868,17 +24581,16 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "maketrans",
-            make_maketrans_descr!("bytearray", bytes_maketrans),
+            make_maketrans_descr!("bytearray", bytes_maketrans, "(frm, to, /)"),
         )
     };
+    let fromhex = make_builtin_function("fromhex", bytearray_fromhex);
     unsafe {
+        crate::function::fset_func_text_signature(fromhex, w_str_new("($type, string, /)"));
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "fromhex",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "fromhex",
-                bytearray_fromhex,
-            )),
+            pyre_object::function::w_classmethod_new(fromhex),
         )
     };
     // In-place mutators specific to the mutable bytearray.
@@ -24080,6 +24792,92 @@ fn init_bytearray_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(name, func, 2),
             )
         };
+    }
+    // CPython 3.14 Argument Clinic metadata for W_BytearrayObject.typedef.
+    // `maketrans` and `fromhex` are stamped before wrapping; `__sizeof__`
+    // already uses the gateway constructor which takes an explicit signature.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__str__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__buffer__", "($self, flags, /)"),
+        ("__release_buffer__", "($self, buffer, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__setitem__", "($self, key, value, /)"),
+        ("__delitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__iadd__", "($self, value, /)"),
+        ("__imul__", "($self, value, /)"),
+        ("__alloc__", "($self, /)"),
+        ("__reduce__", "($self, /)"),
+        ("__reduce_ex__", "($self, proto=0, /)"),
+        ("append", "($self, item, /)"),
+        ("capitalize", "($self, /)"),
+        ("center", "($self, width, fillchar=b' ', /)"),
+        ("clear", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("count", "($self, sub[, start[, end]], /)"),
+        ("decode", "($self, /, encoding='utf-8', errors='strict')"),
+        ("endswith", "($self, suffix[, start[, end]], /)"),
+        ("expandtabs", "($self, /, tabsize=8)"),
+        ("extend", "($self, iterable_of_ints, /)"),
+        ("find", "($self, sub[, start[, end]], /)"),
+        ("hex", "($self, /, sep=<unrepresentable>, bytes_per_sep=1)"),
+        ("index", "($self, sub[, start[, end]], /)"),
+        ("insert", "($self, index, item, /)"),
+        ("isalnum", "($self, /)"),
+        ("isalpha", "($self, /)"),
+        ("isascii", "($self, /)"),
+        ("isdigit", "($self, /)"),
+        ("islower", "($self, /)"),
+        ("isspace", "($self, /)"),
+        ("istitle", "($self, /)"),
+        ("isupper", "($self, /)"),
+        ("join", "($self, iterable_of_bytes, /)"),
+        ("ljust", "($self, width, fillchar=b' ', /)"),
+        ("lower", "($self, /)"),
+        ("lstrip", "($self, bytes=None, /)"),
+        ("partition", "($self, sep, /)"),
+        ("pop", "($self, index=-1, /)"),
+        ("remove", "($self, value, /)"),
+        ("replace", "($self, old, new, count=-1, /)"),
+        ("removeprefix", "($self, prefix, /)"),
+        ("removesuffix", "($self, suffix, /)"),
+        ("resize", "($self, size, /)"),
+        ("reverse", "($self, /)"),
+        ("rfind", "($self, sub[, start[, end]], /)"),
+        ("rindex", "($self, sub[, start[, end]], /)"),
+        ("rjust", "($self, width, fillchar=b' ', /)"),
+        ("rpartition", "($self, sep, /)"),
+        ("rsplit", "($self, /, sep=None, maxsplit=-1)"),
+        ("rstrip", "($self, bytes=None, /)"),
+        ("split", "($self, /, sep=None, maxsplit=-1)"),
+        ("splitlines", "($self, /, keepends=False)"),
+        ("startswith", "($self, prefix[, start[, end]], /)"),
+        ("strip", "($self, bytes=None, /)"),
+        ("swapcase", "($self, /)"),
+        ("title", "($self, /)"),
+        ("translate", "($self, table, /, delete=b'')"),
+        ("upper", "($self, /)"),
+        ("zfill", "($self, width, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("bytearray TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
@@ -24374,6 +25172,56 @@ setlike_method_gateways!(
     setlike_descr_copy
 );
 
+fn setlike_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    let w_type = crate::typedef::r#type(args[0])
+        .expect("every set has a type")
+        .as_ptr();
+    let basicsize = cpython_type_layout(w_type)
+        .expect("set and frozenset subclasses have CPython layout metadata")
+        .0 as usize;
+    let len = unsafe { pyre_object::w_set_len(args[0]) };
+
+    // CPython 3.14 `setobject.c:set___sizeof___impl` includes the inline
+    // eight-entry small table in `tp_basicsize` and charges an external table
+    // only after insertion crosses the 3/5 fill threshold.  Its resize target
+    // is four times `used` (twice above 50,000), rounded up to a power of two.
+    let mut table_size = 8usize;
+    let mut threshold = ((table_size - 1) * 3).div_ceil(5);
+    while len >= threshold {
+        let multiplier = if threshold > 50_000 { 2 } else { 4 };
+        let minimum = threshold
+            .checked_mul(multiplier)
+            .ok_or_else(crate::builtins::reservation_failed)?;
+        table_size = 8;
+        while table_size <= minimum {
+            table_size = table_size
+                .checked_mul(2)
+                .ok_or_else(crate::builtins::reservation_failed)?;
+        }
+        threshold = ((table_size - 1) * 3).div_ceil(5);
+    }
+    let external = if table_size == 8 {
+        0
+    } else {
+        table_size
+            .checked_mul(2 * std::mem::size_of::<usize>())
+            .ok_or_else(crate::builtins::reservation_failed)?
+    };
+    Ok(w_int_new(
+        basicsize
+            .checked_add(external)
+            .ok_or_else(crate::builtins::reservation_failed)? as i64,
+    ))
+}
+
+setlike_method_gateways!(
+    set_gateway_sizeof,
+    frozenset_gateway_sizeof,
+    "__sizeof__",
+    setlike_descr_sizeof
+);
+
 fn setlike_gateway(
     frozen: bool,
     set_gateway: crate::gateway::BuiltinCodeFn,
@@ -24387,6 +25235,18 @@ fn setlike_gateway(
 }
 
 fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                setlike_gateway(frozen, set_gateway_sizeof, frozenset_gateway_sizeof),
+                1,
+                "($self, /)",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -24691,6 +25551,42 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             ),
         )
     };
+    // Shared CPython 3.14 Argument Clinic metadata for the callables in
+    // W_BaseSetObject's PyPy TypeDef surface.  The concrete set/frozenset
+    // initializers below add metadata for their type-specific entries.
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__and__", "($self, value, /)"),
+        ("__rand__", "($self, value, /)"),
+        ("__xor__", "($self, value, /)"),
+        ("__rxor__", "($self, value, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__contains__", "($self, object, /)"),
+        ("copy", "($self, /)"),
+        ("difference", "($self, /, *others)"),
+        ("intersection", "($self, /, *others)"),
+        ("isdisjoint", "($self, other, /)"),
+        ("issubset", "($self, other, /)"),
+        ("issuperset", "($self, other, /)"),
+        ("__reduce__", "($self, /)"),
+        ("symmetric_difference", "($self, other, /)"),
+        ("union", "($self, /, *others)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("set-like TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 // The `|` / `&` / `-` / `^` operator slots (`nb_or` etc.) require the
@@ -25374,23 +26270,25 @@ fn init_set_type(ns: PyObjectRef) {
             pyre_object::w_str_new("Build an unordered collection of unique elements."),
         )
     };
+    let new_descr = make_new_descr(set_descr_new);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(set_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     // setobject.py __class_getitem__ = gateway.interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -25599,6 +26497,26 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function_with_arity("__ixor__", set_op_inplace_xor, 2),
         )
     };
+    for (name, text_signature) in [
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__isub__", "($self, value, /)"),
+        ("__iand__", "($self, value, /)"),
+        ("__ixor__", "($self, value, /)"),
+        ("__ior__", "($self, value, /)"),
+        ("add", "($self, object, /)"),
+        ("clear", "($self, /)"),
+        ("discard", "($self, object, /)"),
+        ("difference_update", "($self, /, *others)"),
+        ("intersection_update", "($self, /, *others)"),
+        ("pop", "($self, /)"),
+        ("remove", "($self, object, /)"),
+        ("symmetric_difference_update", "($self, other, /)"),
+        ("update", "($self, /, *others)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("set TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 fn init_frozenset_type(ns: PyObjectRef) {
@@ -25609,23 +26527,25 @@ fn init_frozenset_type(ns: PyObjectRef) {
             pyre_object::w_str_new("Build an immutable unordered collection of unique elements."),
         )
     };
+    let new_descr = make_new_descr(frozenset_descr_new);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(frozenset_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     // setobject.py __class_getitem__ = gateway.interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     init_setlike_common(ns, true);
@@ -25636,7 +26556,7 @@ fn init_frozenset_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__hash__",
                 |args| {
                     crate::type_methods::require_frozenset_receiver(args, "__hash__", false)?;
@@ -25645,6 +26565,7 @@ fn init_frozenset_type(ns: PyObjectRef) {
                     )?))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };

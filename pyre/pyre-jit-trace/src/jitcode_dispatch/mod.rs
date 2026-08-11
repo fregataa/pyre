@@ -5799,7 +5799,7 @@ pub unsafe fn fbw_finish_concrete_root_walker_area(
 /// in flight is "after" every one of them (re-running ANY of their bodies
 /// re-applies it), so the executor marks the flag on EVERY active entry; a
 /// fresh consume's own entry starts clear.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InflightForiterBody {
     /// Legacy entry-PC fallback for a per-opcode walk or fixture with no
     /// full-body JitCode coordinate.
@@ -5943,11 +5943,12 @@ thread_local! {
     /// A LIFO stack, not a single slot: a walk that descends into a NESTED
     /// FOR_ITER has BOTH the outer loop's consumed item and the inner loop's
     /// consumed item in flight at once.  Each [`InflightForiter`] is keyed by
-    /// its resolved body pc (the FOR_ITER's own pc + 1, derived from the
-    /// consuming op's pc), so a re-consume of the SAME FOR_ITER (the prior iteration's
-    /// body completed) replaces that loop's entry while a consume of a
-    /// DIFFERENT (nested) FOR_ITER pushes a new entry — the outer entry is no
-    /// longer destroyed by the inner consume.  The abort delivery
+    /// its exact JitCode + native opcode coordinate (or by the legacy Python
+    /// pc when no JitCode exists), so equally numbered caller/callee FOR_ITERs
+    /// remain distinct. A re-consume of the SAME FOR_ITER (the prior
+    /// iteration's body completed) replaces that loop's entry while a consume
+    /// of a DIFFERENT (nested) FOR_ITER pushes a new entry — the outer entry is
+    /// no longer destroyed by the inner consume.  The abort delivery
     /// ([`fbw_foriter_inflight_take`]) still consumes only the most-recent
     /// (top) entry, matching the single-slot behaviour; preserving the
     /// remaining entries is the representation S2 needs to deliver each at its
@@ -5999,6 +6000,19 @@ thread_local! {
     /// replay this leg exists to avoid.  Holds symbolic `OpRef`s only — the
     /// concrete refs are resolved and rooted inside the flush.
     static FBW_QMUT_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Kept-stack branch-abort resume carrier: `(py_pc, complete operand-stack
+    /// OpRef mirror)` captured from the live MIFrame-equivalent walk context
+    /// before it is dropped.
+    ///
+    /// Like the quasiimmutable carrier above, this is needed only for a
+    /// mid-expression abort: the virtualizable array is authoritative at merge
+    /// points, while RPython resumes a blackhole from the MIFrame register
+    /// image at the exact abort point (`blackhole.py:1711-1727`).  The trace
+    /// epilogue accepts this carrier only when its Python coordinate exactly
+    /// matches the decoded abort resume pc.
+    static FBW_BRANCH_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
         const { std::cell::RefCell::new(None) };
 
     /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
@@ -6191,20 +6205,49 @@ thread_local! {
 /// FOR_ITER — a non-FOR_ITER resume pc that merely happens to satisfy
 /// `body_pc == some entry's resolved body pc` is Shape B.
 fn foriter_header_at(frame: usize, resume_py_pc: usize) -> bool {
-    let frame_ptr = frame as *const u8;
-    let w_code =
-        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-    if w_code.is_null() {
+    let Some(raw_code) = frame_raw_code(frame) else {
         return false;
-    }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
     };
     matches!(
         pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, resume_py_pc),
         Some((pyre_interpreter::Instruction::ForIter { .. }, _))
     )
+}
+
+/// Whether an in-flight FOR_ITER continuation belongs to `frame` at this
+/// exact body coordinate.  PyPy's in-flight iterator state lives on the
+/// corresponding MIFrame; matching only the Python pc collapses equally
+/// numbered caller/callee FOR_ITERs onto one shared slot.
+fn foriter_body_matches_frame(body: InflightForiterBody, frame: usize, body_pc: usize) -> bool {
+    if inflight_foriter_body_pc(body) != Some(body_pc) {
+        return false;
+    }
+    match body {
+        // The legacy fallback has no JitCode identity to compare.  It is used
+        // only when the walk itself cannot provide one, so retain its former
+        // single-frame behaviour.
+        InflightForiterBody::Py(_) => true,
+        InflightForiterBody::Jit { jitcode_index, .. } => {
+            let Some(frame_code) = frame_raw_code(frame) else {
+                return false;
+            };
+            crate::state::raw_code_for_jitcode_index(jitcode_index)
+                .is_some_and(|inflight_code| std::ptr::eq(inflight_code, frame_code))
+        }
+    }
+}
+
+fn frame_raw_code(frame: usize) -> Option<*const pyre_interpreter::CodeObject> {
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return None;
+    }
+    Some(unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    })
 }
 
 fn exact_floor_segment_anchor(

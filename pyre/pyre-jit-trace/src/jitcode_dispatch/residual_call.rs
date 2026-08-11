@@ -1535,9 +1535,39 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
 /// ([`flush_qmut_abort_state`]): both resume the interpreter
 /// mid-expression, where the vable shadow's stack region reads NULL and only the
 /// walk's own mirror can say what the operands are.
-fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: &[OpRef]) -> bool {
+pub(crate) fn flush_with_latched_stack(
+    ctx: &TraceCtx,
+    frame: usize,
+    py_pc: usize,
+    oprefs: &[OpRef],
+) -> bool {
+    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None)
+}
+
+/// Resume a FOR_ITER body from the complete header stack plus the item the
+/// authoritative walk already consumed.  RPython keeps both pieces in the
+/// live MIFrame register image; pyre records the item in the FOR_ITER carrier
+/// separately from the operand-stack mirror, so they must be reunited before
+/// converting the frame to interpreter state.
+pub(crate) fn flush_with_latched_stack_and_item(
+    ctx: &TraceCtx,
+    frame: usize,
+    header_py_pc: usize,
+    oprefs: &[OpRef],
+    push: (pyre_object::PyObjectRef, usize),
+) -> bool {
+    flush_with_latched_stack_inner(ctx, frame, header_py_pc, oprefs, Some(push))
+}
+
+fn flush_with_latched_stack_inner(
+    ctx: &TraceCtx,
+    frame: usize,
+    py_pc: usize,
+    oprefs: &[OpRef],
+    push: Option<(pyre_object::PyObjectRef, usize)>,
+) -> bool {
     {
-        let mut stack = Vec::with_capacity(oprefs.len());
+        let mut stack = Vec::with_capacity(oprefs.len() + usize::from(push.is_some()));
         for &opref in oprefs.iter() {
             match ctx.concrete_of_opref(opref) {
                 Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
@@ -1563,6 +1593,12 @@ fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: 
                 }
             }
         }
+        let resume_py_pc = if let Some((item, body_pc)) = push {
+            stack.push(item);
+            body_pc
+        } else {
+            py_pc
+        };
         // Why this latch exists, checkable at runtime.  Measured over
         // pyre/bench/synth, the only slot that ever disagrees with the vable
         // shadow is the in-progress opcode's TOS, and it holds a compile-time
@@ -1580,28 +1616,43 @@ fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: 
         // remove the need for it: `LOAD_ATTR` already emits the push mirror
         // via `emit_pushvalue_ref!` and its slot still reads NULL, because the
         // pop follows the push.
-        if fbw_debug_abort_enabled() {
-            let base = ctx
-                .virtualizable_info()
-                .map_or(usize::MAX, |info| info.num_static_extra_boxes);
-            let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
-            for (rel, &obj) in stack.iter().enumerate() {
-                let entry =
-                    ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
-                let shadow = entry.map(|(_opref, value)| value);
-                let agrees =
-                    matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
-                if !agrees {
-                    // Report the OpRef too: a live box with a NULL value means
-                    // the symbolic write landed and only the concrete mirror is
-                    // absent, which is a different defect from no write at all.
+        let base = ctx
+            .virtualizable_info()
+            .map_or(usize::MAX, |info| info.num_static_extra_boxes);
+        let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
+        for (rel, &obj) in stack.iter().enumerate() {
+            let entry =
+                ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
+            let shadow = entry.map(|(_opref, value)| value);
+            let agrees =
+                matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
+            if !agrees && fbw_debug_abort_enabled() {
+                // Report the OpRef too: a live box with a NULL value means
+                // the symbolic write landed and only the concrete mirror is
+                // absent, which is a different defect from no write at all.
+                eprintln!(
+                    "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} box={:?} (DISAGREES)",
+                    stack.len(),
+                    obj as usize,
+                    entry.map(|(opref, _)| opref),
+                );
+            }
+            // The only orthodox disagreement is the operand the in-progress
+            // opcode popped from TOS: the vable slot is NULL while the MIFrame
+            // register image still carries the consumed object.  A mismatch
+            // below TOS means the latch is not this frame's continuation.
+            let consumed_tos = rel + 1 == stack.len()
+                && obj as usize != 0
+                && matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0);
+            if !agrees && !consumed_tos {
+                if fbw_debug_abort_enabled() {
                     eprintln!(
-                        "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} box={:?} (DISAGREES)",
+                        "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {rel}/{} \
+                         is not the consumed TOS",
                         stack.len(),
-                        obj as usize,
-                        entry.map(|(opref, _)| opref),
                     );
                 }
+                return false;
             }
         }
         // The flush's Int/Float local boxing can trigger a minor collection;
@@ -1614,8 +1665,12 @@ fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: 
                 stack.len(),
             ));
         }
-        let committed =
-            crate::state::flush_walk_end_state_to_frame_with_full_stack(ctx, frame, py_pc, &stack);
+        let committed = crate::state::flush_walk_end_state_to_frame_with_full_stack(
+            ctx,
+            frame,
+            resume_py_pc,
+            &stack,
+        );
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
         committed
     }
@@ -3578,6 +3633,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             recorded,
                             majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
                         );
+                        // `pyjitpl.py` keeps the residual CALL result in the
+                        // MIFrame Ref register consumed by the enclosing
+                        // Python opcode.  This direct-record path bypasses
+                        // `write_ref_reg`, so publish the same last-Ref value
+                        // to the operand-stack mirror explicitly.  Without
+                        // it a CALL returning None leaves a NULL hole at the
+                        // following POP_TOP and an abort cannot flush past an
+                        // already-executed mutation such as `seen.add(w)`.
+                        ctx.vstack_last_ref = recorded;
                     }
                     majit_ir::Type::Float => {
                         ctx.trace_ctx.set_opref_concrete(
