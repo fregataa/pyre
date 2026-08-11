@@ -9989,7 +9989,9 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if let Some(method) =
             unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__") }
         {
-            let result = crate::call::call_function_impl_result(method, &[obj])?;
+            let result = unsafe {
+                crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
+            };
             unsafe {
                 if is_float(result) {
                     // floatobject.py:228-238 — an exact float is returned as-is;
@@ -10018,7 +10020,9 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if let Some(method) =
             unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__index__") }
         {
-            let r = crate::call::call_function_impl_result(method, &[obj])?;
+            let r = unsafe {
+                crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
+            };
             // descroperation.py:609 `space.index` returns an arbitrary-size
             // Python int.  Accept both the machine-word and W_LongObject
             // layouts, then reuse the integer float conversion so an
