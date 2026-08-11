@@ -1,3 +1,6 @@
+# CPython-suite gap: closure tests cannot cover pyre JIT residual-call liveness.
+# parity-tests reason: guard a closure-owned set across an inlined recursive call.
+
 """A recursive closure must keep its freshly captured set live across a call."""
 
 import _pylong

@@ -1,3 +1,6 @@
+# CPython-suite gap: source-codec startup is not run through pyre's process EC.
+# parity-tests reason: guard codec imports during script execution startup.
+
 """A script codec import runs inside the process ExecutionContext."""
 
 import os

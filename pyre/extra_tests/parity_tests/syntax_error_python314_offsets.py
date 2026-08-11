@@ -1,3 +1,6 @@
+# CPython-suite gap: multibyte SyntaxError offsets are not exhaustively asserted.
+# parity-tests reason: guard pyre's CPython 3.14 character-column semantics.
+
 """Python 3.14 SyntaxError positions use character, not UTF-8 byte, columns."""
 
 

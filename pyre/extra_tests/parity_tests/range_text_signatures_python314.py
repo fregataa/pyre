@@ -1,3 +1,6 @@
+# CPython-suite gap: exact range descriptor text signatures are not asserted.
+# parity-tests reason: guard pyre's CPython 3.14 signature metadata surface.
+
 """CPython 3.14 text signatures for range descriptors."""
 
 import inspect

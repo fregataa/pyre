@@ -1,3 +1,6 @@
+# CPython-suite gap: exact dict and set __sizeof__ values are not asserted.
+# parity-tests reason: guard pyre's CPython 3.14 container size surface.
+
 """Python 3.14 ``__sizeof__`` surface for dict and set-like types."""
 
 for typ in (dict, set, frozenset):

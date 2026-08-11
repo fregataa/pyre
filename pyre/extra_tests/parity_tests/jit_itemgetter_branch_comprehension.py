@@ -1,3 +1,6 @@
+# CPython-suite gap: itemgetter tests cannot exercise pyre's inlined JIT branch.
+# parity-tests reason: guard FOR_ITER resume after an itemgetter branch abort.
+
 from operator import itemgetter
 
 

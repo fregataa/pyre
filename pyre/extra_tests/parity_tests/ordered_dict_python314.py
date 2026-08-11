@@ -1,3 +1,6 @@
+# CPython-suite gap: these OrderedDict 3.14 contracts are not jointly asserted.
+# parity-tests reason: guard pyre's app-level OrderedDict compatibility surface.
+
 """Python 3.14 public OrderedDict contracts layered over PyPy app_odict."""
 
 from collections import OrderedDict

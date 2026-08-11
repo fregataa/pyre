@@ -1,3 +1,6 @@
+# CPython-suite gap: exact staticmethod/classmethod signatures are not asserted.
+# parity-tests reason: guard pyre's CPython 3.14 signature metadata surface.
+
 """CPython 3.14 signatures for staticmethod and classmethod wrappers."""
 
 import inspect

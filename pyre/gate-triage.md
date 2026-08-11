@@ -962,15 +962,16 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 
-### §6b — VALUE knobs (11): config, not gates
+### §6b — VALUE knobs (13): config, not gates
 
 `PYRE_DYN_INDIRECT`, `PYRE_FBW_MULTIFRAME_DEPTH`, `PYRE_JD1_THRESHOLD`,
 `PYRE_OPTION_RESIDUAL_NARROW`, `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
+`PYRE_DTRACE_CONST_FROM`, `PYRE_DTRACE_CONST_TO`,
 `PYRE_TRACE_CALL_DIAG`, `PYRE_TRACE_OPS_DIAG`,
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
 `PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
 
-### §6c — Default-OFF diagnostics, censuses and probes (52): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (54): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -978,6 +979,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
 `PYRE_DESCR_SPELLING_GATE`,
 `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
+`PYRE_DETERMINISM_TRACE`, `PYRE_DTRACE_CONST_BT`,
 `PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_STRICT_DIAG`, `PYRE_FIELD_IDENTITY_CENSUS`,

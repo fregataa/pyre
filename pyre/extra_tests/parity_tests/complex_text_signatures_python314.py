@@ -1,3 +1,6 @@
+# CPython-suite gap: exact complex descriptor text signatures are not asserted.
+# parity-tests reason: guard pyre's CPython 3.14 signature metadata surface.
+
 """CPython 3.14 text signatures for complex descriptors."""
 
 import inspect

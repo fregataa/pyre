@@ -1,3 +1,6 @@
+# CPython-suite gap: memoryview.tobytes order conversions are not all asserted.
+# parity-tests reason: guard pyre's CPython 3.14 memoryview conversion surface.
+
 """Python 3.14 memoryview.tobytes(order) conversion semantics."""
 
 data = bytearray(range(6))
