@@ -1219,7 +1219,7 @@ fn analyze_pipeline_from_module_paths(
     // disables `_jit_look_inside_` etc. for module-qualified callers,
     // which `CallControl::find_all_graphs` looks up by callee path.
     for func in &program.functions {
-        if !func.self_ty_root.is_none() || func.hints.is_empty() {
+        if func.self_ty_root.is_some() || func.hints.is_empty() {
             continue;
         }
         let graph = match &func.return_type {
@@ -1682,7 +1682,7 @@ fn analyze_pipeline_from_module_paths(
         // registered above carries a graph.
         let graph: model::FunctionGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
-            .map(|g| g.clone())
+            .cloned()
             .unwrap_or_else(|| method_info.graph.clone());
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
@@ -1799,10 +1799,8 @@ fn analyze_pipeline_from_module_paths(
                     }
                     // RPython: random_effects_on_gcobjs is on external funcobj only.
                     // Only register for paths WITHOUT a graph (external functions).
-                    "gc_effects" => {
-                        if !call_control.function_graphs().contains_key(p) {
-                            call_control.mark_external_gc_effects(p.clone());
-                        }
+                    "gc_effects" if !call_control.function_graphs().contains_key(p) => {
+                        call_control.mark_external_gc_effects(p.clone());
                     }
                     _ => {}
                 }
