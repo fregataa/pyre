@@ -10622,16 +10622,16 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// `msg.into()` on a generic parameter bound `T: Into<String>` —
-    /// a `CallKind::Trait` whose trait ref is a *clause* (no resolved
-    /// impl for [`Self::blanket_into_devirt`] to read).  The blanket
-    /// `impl<T, U: From<T>> Into<U> for T` makes the result
-    /// `U::from(self)`; for a string-family target the conversion is
-    /// identity in the lifted value model (Rust `String` and `&str`
-    /// both lower to the immutable rpy_string), so the caller may
-    /// alias the destination to the argument.  The callsite's `dest`
-    /// type *is* the trait ref's target type argument, so it is the
-    /// only payload field consulted besides the trait identity.
+    /// `msg.into()` on a generic parameter bound `T: Into<String>` or
+    /// `T: Into<Wtf8Buf>` — a `CallKind::Trait` whose trait ref is a
+    /// *clause* (no resolved impl for [`Self::blanket_into_devirt`] to
+    /// read).  The blanket `impl<T, U: From<T>> Into<U> for T` makes the
+    /// result `U::from(self)`; for a string-family target the conversion
+    /// is identity in the lifted value model (`String`, `&str`, `Wtf8`
+    /// and `Wtf8Buf` all lower to the immutable rpy_string), so the
+    /// caller may alias the destination to the argument.  The callsite's
+    /// `dest` type *is* the trait ref's target type argument, so it is
+    /// the only payload field consulted besides the trait identity.
     fn trait_clause_into_string_identity(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
         let CallKind::Trait(v) = &reg.kind else {
             return false;
@@ -10646,7 +10646,7 @@ impl<'a> Lowering<'a> {
             .llbc
             .trait_by_id(trait_id)
             .is_some_and(|td| td.item_meta.name_path() == "core::convert::Into");
-        is_into && tyref_is_string_adt(dest_ty, self.llbc)
+        is_into && tyref_is_string_value(dest_ty, self.llbc)
     }
 
     /// Whether the FunDecl's first signature input is the given ADT,
@@ -12702,14 +12702,16 @@ impl<'a> Lowering<'a> {
 
     /// Resolve the trait-spelled `Into::into` (`["Into", "into"]` — a
     /// generic-parameter receiver, so Charon cannot select the impl at
-    /// the call site) to its operand when the destination type is
-    /// `alloc::string::String`.  `impl Into<String>` message parameters
-    /// (the `PyError` constructor family) reach `msg.into()` inside the
-    /// generic body; the annotation model maps `String` and `str` to
-    /// the same string value (`project_pyre_field_type` — `s_unicode0`),
-    /// matching upstream's single string type (`rstr.py`), so the
-    /// conversion is an identity at the annotation level.  Other
-    /// destination types keep the generic `Call` form.
+    /// the call site) to its operand when the destination is a
+    /// string-family value (`alloc::string::String` or the `Wtf8` /
+    /// `Wtf8Buf` wrappers).  `impl Into<String>` / `impl Into<Wtf8Buf>`
+    /// message parameters (the `PyError` constructor family) reach
+    /// `msg.into()` inside the generic body; the annotation model maps
+    /// `String`, `str`, `Wtf8` and `Wtf8Buf` to the same string value
+    /// (`project_pyre_field_type` — `s_unicode0`), matching upstream's
+    /// single string type (`rstr.py`), so the conversion is an identity
+    /// at the annotation level.  Other destination types keep the
+    /// generic `Call` form.
     fn trait_into_string_alias(
         &self,
         segments: &[String],
@@ -12725,20 +12727,24 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return None;
         };
-        let dest_path = self.tyref_adt_name_path(dest_ty)?;
-        (dest_path == "alloc::string::String").then(|| arg.clone())
+        tyref_is_string_value(dest_ty, self.llbc).then(|| arg.clone())
     }
 
     /// Resolve the WTF-8 string wrappers `Wtf8::new(&str) -> &Wtf8` and
-    /// `Wtf8Buf::from_string(String) -> Wtf8Buf` to their sole string
+    /// `Wtf8Buf::from_string(String) -> Wtf8Buf`, and the reverse reinterpret
+    /// `wtf8_key_as_str_unchecked(&Wtf8) -> &str`, to their sole string
     /// argument.  Rust's `&str` / `String` / `Wtf8` / `Wtf8Buf` all map
     /// to the single immutable rpy_string value (`project_pyre_field_type`
     /// — `s_unicode0`, matching upstream's one string type in `rstr.py`),
     /// so the wrap is an identity at the annotation level; the boxing the
     /// callers want (`box_str_constant`) happens downstream on the bound
-    /// value.  Both bodies are Opaque in the LLBC (external
+    /// value.  The `Wtf8` bodies are Opaque in the LLBC (external
     /// `rustpython_wtf8` crate), leaving the generic `Call` permanently
-    /// unliftable.
+    /// unliftable; `wtf8_key_as_str_unchecked` is a pyre free fn whose
+    /// `from_utf8_unchecked` body is likewise left unlifted by folding the
+    /// call away.  It is matched by leaf name because its qualified path
+    /// (`pyre_object::dictmultiobject::wtf8_key_as_str_unchecked`) differs
+    /// between the defining-crate LLBC and a cross-crate caller.
     fn wtf8_string_identity_alias(
         &self,
         segments: &[String],
@@ -12747,14 +12753,16 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return None;
         };
-        matches!(
+        let is_wrap = matches!(
             segments,
             [a, b] if matches!(
                 (a.as_str(), b.as_str()),
                 ("Wtf8", "new") | ("Wtf8Buf", "from_string")
             )
-        )
-        .then(|| arg.clone())
+        );
+        let is_str_reinterpret =
+            matches!(segments, [.., leaf] if leaf == "wtf8_key_as_str_unchecked");
+        (is_wrap || is_str_reinterpret).then(|| arg.clone())
     }
 
     /// The unwrapped ADT body `Value` a [`TyRef`] resolves to, following
@@ -12784,16 +12792,6 @@ impl<'a> Lowering<'a> {
             break;
         }
         Some(v)
-    }
-
-    /// The fully-qualified `name_path()` of the ADT a [`TyRef`]
-    /// resolves to, following `Deduplicated` / `HashConsedValue`
-    /// wrapper layers.  `None` for non-ADT shapes.
-    fn tyref_adt_name_path(&self, ty: &TyRef) -> Option<String> {
-        let v = self.tyref_adt_body(ty)?;
-        let def_id = inline_adt_def_id(v)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        Some(td.item_meta.name_path())
     }
 
     /// The struct-root canonical name of `ty` when it resolves to a
