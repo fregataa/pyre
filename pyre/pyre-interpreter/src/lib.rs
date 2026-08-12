@@ -1124,7 +1124,39 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // too; nothing unconditional follows it, so no id differs per target.
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(169, typed::<crate::module::posix::W_DirEntry>()),
+        // rustls-backed `_ssl` native payloads.  They are appended after the
+        // last pre-existing native class in the same order `build_gc`
+        // registers them, so no established type id moves.
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+        subclass_range_alias(170, typed::<crate::module::_ssl::W_SSLContext>()),
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+        subclass_range_alias(171, typed::<crate::module::_ssl::W_MemoryBIO>()),
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+        subclass_range_alias(172, typed::<crate::module::_ssl::W_SSLSession>()),
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+        subclass_range_alias(173, typed::<crate::module::_ssl::W_SSLSocket>()),
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+        subclass_range_alias(174, typed::<crate::module::_ssl::W_Certificate>()),
     ]
+}
+
+/// The rclass hierarchy present in this interpreter configuration.
+///
+/// `_ssl` owns the final five native hierarchy slots and is compiled out of a
+/// sandbox build. Keep that configuration knowledge here, beside the module
+/// and alias gates, rather than leaking the `sandbox` feature into
+/// `pyre-object`.
+pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
+    let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
+    {
+        const SSL_HIERARCHY_SLOTS: usize = 5;
+        &hierarchy[..hierarchy.len() - SSL_HIERARCHY_SLOTS]
+    }
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "sandbox")))]
+    {
+        hierarchy
+    }
 }
 
 // ── Print / stderr hooks for wasm (fd-1 / fd-2 capture) ──
