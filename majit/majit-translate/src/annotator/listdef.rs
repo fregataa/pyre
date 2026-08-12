@@ -34,14 +34,40 @@
 //!   but the semantics match byte-for-byte.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::fmt;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use indexmap::IndexSet;
 
 use super::repr_guard::ReprGuard;
 
 use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::model::{AnnotatorError, SomeList, SomeValue, UnionError};
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static REFLOW_FROM_LISTITEM: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn reflow_from_listitem_count() -> u64 {
+    REFLOW_FROM_LISTITEM.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static LISTITEM_WIDEN: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn listitem_widen_count() -> u64 {
+    LISTITEM_WIDEN.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static LISTITEM_NOTIFY_UPDATE: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn listitem_notify_update_count() -> u64 {
+    LISTITEM_NOTIFY_UPDATE.load(Ordering::Relaxed)
+}
 
 /// RPython `class TooLateForChange(AnnotatorError)` (listdef.py:6-7).
 /// Raised when mutation is attempted on a `dont_change_any_more`
@@ -188,7 +214,9 @@ pub struct ListItem {
     /// every owner currently using this `ListItem`.
     pub(crate) itemof: Vec<ItemOwner>,
     /// RPython `self.read_locations = set()` (listdef.py:33).
-    pub(crate) read_locations: HashSet<PositionKey>,
+    /// The ordered container is required because the key hashes on a
+    /// pointer and the loop over the members produces a work order.
+    pub(crate) read_locations: IndexSet<PositionKey>,
     /// Flattened `DictKey.custom_eq_hash` (dictdef.py:13). `false` for
     /// every non-DictKey ListItem.
     pub custom_eq_hash: bool,
@@ -215,7 +243,7 @@ impl ListItem {
             immutable: false,
             must_not_resize: false,
             itemof: Vec::new(),
-            read_locations: HashSet::new(),
+            read_locations: IndexSet::new(),
             // Flattened DictKey defaults (dictdef.py:8-9, 13).
             custom_eq_hash: false,
             s_rdict_eqfn: SomeValue::Impossible,
@@ -240,6 +268,7 @@ impl ListItem {
     /// state is a guarded path that already errors via
     /// [`TooLateForChange`].
     pub fn notify_update(&self) {
+        LISTITEM_NOTIFY_UPDATE.fetch_add(1, Ordering::Relaxed);
         let Some(bk) = self.bookkeeper.as_ref() else {
             return;
         };
@@ -247,6 +276,7 @@ impl ListItem {
             return;
         };
         for position_key in &self.read_locations {
+            REFLOW_FROM_LISTITEM.fetch_add(1, Ordering::Relaxed);
             ann.reflowfromposition(position_key);
         }
     }
@@ -268,6 +298,7 @@ impl ListItem {
                 });
             }
             self.s_value = s_new_value;
+            LISTITEM_WIDEN.fetch_add(1, Ordering::Relaxed);
             self.notify_update();
         }
         Ok(updated)

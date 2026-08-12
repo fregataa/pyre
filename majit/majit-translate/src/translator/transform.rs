@@ -244,7 +244,10 @@ pub fn transform_dead_code(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
         // rebinds the attribute which changes subsequent comparisons).
         let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
         for link in exits_snapshot {
-            let followed = ann.links_followed.borrow().contains(&LinkKey::of(&link));
+            let followed = ann
+                .links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&link));
             if followed {
                 continue;
             }
@@ -282,6 +285,80 @@ pub fn transform_dead_code(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
             }
         }
     }
+}
+
+/// Stable, process-comparable identification for dead-code cutoff diagnostics.
+pub(crate) struct CutoffBlockTrace {
+    graph_name: String,
+    n: usize,
+    total: usize,
+    block_position: Option<usize>,
+    operations: usize,
+}
+
+impl std::fmt::Display for CutoffBlockTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "graph={:?} n={} total={} block={} ops={}",
+            self.graph_name,
+            self.n,
+            self.total,
+            self.block_position
+                .map(|position| position.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.operations,
+        )
+    }
+}
+
+fn cutoff_block_trace_with_counts(
+    ann: &RPythonAnnotator,
+    block: &BlockRef,
+    n: usize,
+    total: usize,
+) -> CutoffBlockTrace {
+    let graph = ann
+        .annotated
+        .borrow()
+        .get(&BlockKey::of(block))
+        .and_then(|graph| graph.clone());
+    let (graph_name, block_position) = match graph {
+        Some(graph) => {
+            let graph = graph.borrow();
+            let position = graph
+                .iterblocks()
+                .iter()
+                .position(|candidate| Rc::ptr_eq(candidate, block));
+            (graph.name.clone(), position)
+        }
+        None => ("<unowned>".to_string(), None),
+    };
+    CutoffBlockTrace {
+        graph_name,
+        n,
+        total,
+        block_position,
+        operations: total,
+    }
+}
+
+/// Capture the same block identification used by `[DTRACE-CUT]` so the
+/// per-block panic isolator can name a failed cutoff without using pointers.
+pub(crate) fn cutoff_block_trace(ann: &RPythonAnnotator, block: &BlockRef) -> CutoffBlockTrace {
+    let (n, total) = {
+        let blk = block.borrow();
+        let n = blk
+            .operations
+            .iter()
+            .position(|op| match &op.result {
+                Hlvalue::Variable(v) => v.annotation.borrow().is_none(),
+                Hlvalue::Constant(_) => false,
+            })
+            .unwrap_or(blk.operations.len());
+        (n, blk.operations.len())
+    };
+    cutoff_block_trace_with_counts(ann, block, n, total)
 }
 
 /// RPython `transform.py:167-198` — `cutoff_alwaysraising_block(self, block)`.
@@ -329,6 +406,10 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
             .unwrap_or(blk.operations.len());
         (n, blk.operations.len())
     };
+    if crate::determinism_trace_enabled() {
+        let trace = cutoff_block_trace_with_counts(ann, block, n, total);
+        eprintln!("[DTRACE-CUT] {trace}");
+    }
     // upstream: `assert 0 <= n < len(block.operations)`.
     assert!(
         n < total,
@@ -390,7 +471,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
     // upstream: `self.links_followed[errlink] = True`.
     ann.links_followed
         .borrow_mut()
-        .insert(LinkKey::of(&errlink));
+        .insert(LinkKey::of(&errlink), errlink.clone());
 
     // upstream: `etype, evalue = graph.exceptblock.inputargs`.
     let (etype_rc, evalue_rc) = {
@@ -1019,7 +1100,9 @@ mod tests {
         // Mark the single exit as followed so transform_dead_code
         // doesn't prune it.
         for link in &start.borrow().exits {
-            ann.links_followed.borrow_mut().insert(LinkKey::of(link));
+            ann.links_followed
+                .borrow_mut()
+                .insert(LinkKey::of(link), link.clone());
         }
 
         transform_graph(&ann, None, Some(&[start.clone()]));
@@ -1066,7 +1149,9 @@ mod tests {
             .borrow_mut()
             .insert(BlockKey::of(&start), start.clone());
         for link in &start.borrow().exits {
-            ann.links_followed.borrow_mut().insert(LinkKey::of(link));
+            ann.links_followed
+                .borrow_mut()
+                .insert(LinkKey::of(link), link.clone());
         }
 
         transform_graph(&ann, None, Some(&[start.clone()]));
@@ -1116,7 +1201,9 @@ mod tests {
         start.closeblock(vec![left.clone(), right.clone()]);
 
         // Only the false branch is followed.
-        ann.links_followed.borrow_mut().insert(LinkKey::of(&left));
+        ann.links_followed
+            .borrow_mut()
+            .insert(LinkKey::of(&left), left.clone());
         ann.annotated
             .borrow_mut()
             .insert(BlockKey::of(&start), Some(graph.clone()));
