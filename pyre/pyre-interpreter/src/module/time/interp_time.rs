@@ -1376,7 +1376,9 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // is not valid WTF-8; fall back to surrogateescape rather than raising,
         // mirroring str_decode_locale_surrogateescape.
         let result = match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
-            Ok(wtf8) => pyre_object::w_str_from_wtf8(wtf8),
+            // interp_time.py:1188 returns `space.newutf8(decoded, size)`:
+            // strftime's formatted value is an ordinary runtime string.
+            Ok(wtf8) => pyre_object::w_str_from_wtf8_managed(wtf8),
             Err(bytes) => crate::typedef::charp2uni(&bytes),
         };
         Ok(result)
@@ -1411,7 +1413,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     // surrogateescape rather than raising.
                     let rendered = buf[..n].to_vec();
                     return Ok(match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
-                        Ok(wtf8) => w_str_from_wtf8(wtf8),
+                        Ok(wtf8) => w_str_from_wtf8_managed(wtf8),
                         Err(bytes) => crate::typedef::charp2uni(&bytes),
                     });
                 }
@@ -1485,7 +1487,9 @@ fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
     const MON_NAME: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    Ok(w_str_new(&format!(
+    // interp_time.py:_asctime returns the result of ordinary `%` formatting;
+    // the rendered value is a collectable runtime string.
+    Ok(w_str_new_managed(&format!(
         "{} {}{:>3} {:02}:{:02}:{:02} {}",
         WDAY_NAME[tm.tm_wday as usize],
         MON_NAME[tm.tm_mon as usize],
@@ -1508,24 +1512,12 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "time.ctime is unavailable on wasm32",
         ))
     }
-    #[cfg(unix)]
+    #[cfg(not(target_arch = "wasm32"))]
     {
+        // interp_time.py:ctime always delegates through localtime + _asctime.
+        // Keep one result-allocation path on Unix and Windows alike.
         let tm = _c_localtime(seconds)?;
         _asctime_from_tm(&tm)
-    }
-    #[cfg(windows)]
-    {
-        unsafe extern "C" {
-            fn _ctime64(time: *const i64) -> *const libc::c_char;
-        }
-        let t = seconds;
-        let p = unsafe { _ctime64(&t) };
-        if p.is_null() {
-            return Err(crate::PyError::value_error("unconvertible time"));
-        }
-        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
-        let s = lossy.trim_end_matches('\n');
-        Ok(w_str_new(s))
     }
 }
 

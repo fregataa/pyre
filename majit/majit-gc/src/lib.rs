@@ -1,3 +1,4 @@
+pub use collector::HEAP_DUMP_EIO;
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 /// GC traits and interfaces for the JIT.
 ///
@@ -2461,15 +2462,28 @@ pub fn is_app_level_object(obj: GcRef) -> bool {
 }
 
 pub type DumpRpyHeapFn = fn(i32) -> Result<bool, i32>;
+pub type HeapDumpWriteFn = fn(i32, &[u8]) -> Result<isize, i32>;
 pub type GetTypeidsTextFn = fn() -> Option<Vec<u8>>;
 pub type GetTypeidsListFn = fn() -> Option<Vec<usize>>;
 
 global_hook!(static ACTIVE_DUMP_RPY_HEAP: DumpRpyHeapFn);
+global_hook!(static HEAP_DUMP_WRITE: HeapDumpWriteFn);
 global_hook!(static ACTIVE_GET_TYPEIDS_TEXT: GetTypeidsTextFn);
 global_hook!(static ACTIVE_GET_TYPEIDS_LIST: GetTypeidsListFn);
 
 pub fn set_active_dump_rpy_heap(hook: Option<DumpRpyHeapFn>) {
     ACTIVE_DUMP_RPY_HEAP.set(hook);
+}
+
+/// Install the host write used by `inspector.py:212-223 HeapDumper.flush`.
+/// Sandboxed interpreters use this to translate guest descriptors through
+/// their host seam; when absent, the collector retains its native raw write.
+pub fn set_heap_dump_write(hook: Option<HeapDumpWriteFn>) {
+    HEAP_DUMP_WRITE.set(hook);
+}
+
+pub(crate) fn try_heap_dump_write(fd: i32, bytes: &[u8]) -> Option<Result<isize, i32>> {
+    HEAP_DUMP_WRITE.get().map(|write| write(fd, bytes))
 }
 
 pub fn set_active_get_typeids_text(hook: Option<GetTypeidsTextFn>) {
@@ -2889,6 +2903,11 @@ pub fn gc_set_enabled(enabled: bool) {
 /// major-progress path returns early while it is clear, and an explicit
 /// `gc.collect()` passes `force_enabled` to get past it.
 pub fn gc_isenabled() -> bool {
+    // Before `store_singleton` there is no collector to suppress, and nothing
+    // could have disabled automatic collection yet.
+    if !gc_sync::is_initialized() {
+        return true;
+    }
     gc_sync::gc_query_reentrant(|gc| gc.isenabled())
 }
 

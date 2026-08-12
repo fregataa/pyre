@@ -656,7 +656,6 @@ fn pin_referents(w_obj: PyObjectRef) {
 /// `referents.py:35-39 wrap`: app-level objects pass through, internal nodes
 /// become `W_GcRef`.  Results are rooted as they are made because constructing
 /// a later wrapper can initialize a type and allocate.
-/// Wrap the raw nodes rooted at `first..last`, leaving the wrappers pinned.
 ///
 /// Returns the first shadow-stack slot of the wrapped range, which runs to the
 /// stack top on return. A slot range rather than a `Vec<PyObjectRef>` because
@@ -705,11 +704,7 @@ fn list_from_roots(first: usize) -> PyObjectRef {
 }
 
 fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelAction> {
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    if ec.is_null() {
-        return None;
-    }
-    let action = unsafe { (*ec).user_del_action };
+    let action = crate::executioncontext::space_user_del_action();
     if action.is_null() {
         None
     } else {
@@ -982,7 +977,21 @@ fn gc_call_method(
     }
 }
 
+#[cfg(feature = "sandbox")]
+fn heap_dump_write_via_host(fd: i32, bytes: &[u8]) -> Result<isize, i32> {
+    crate::host_seam::ops::write(fd, bytes)
+        .map(|written| written as isize)
+        // A non-OS seam failure still needs an errno. Use the collector's code
+        // for targets and failure modes that cannot supply one.
+        .map_err(|error| match error {
+            crate::host_seam::SeamError::Os(errno) => errno,
+            _ => majit_gc::HEAP_DUMP_EIO,
+        })
+}
+
 fn dump_rpy_heap_fd(fd: i32) -> Result<(), crate::PyError> {
+    #[cfg(feature = "sandbox")]
+    majit_gc::set_heap_dump_write(Some(heap_dump_write_via_host));
     match majit_gc::dump_rpy_heap(fd) {
         Ok(true) => Ok(()),
         Ok(false) => Err(crate::PyError::not_implemented(

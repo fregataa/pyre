@@ -98,9 +98,9 @@ fn json_decode_error(msg: String, doc: PyObjectRef, pos: usize) -> PyError {
 
 fn encode_basestring_impl(obj: PyObjectRef, ascii_only: bool) -> PyResult {
     let value = require_string(obj)?;
-    Ok(pyre_object::w_str_from_wtf8(machinery::encode_string(
-        value, ascii_only,
-    )))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        machinery::encode_string(value, ascii_only),
+    ))
 }
 
 fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyResult {
@@ -115,10 +115,17 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
         json_decode_error("Unterminated string starting at".to_owned(), doc, start)
     })?;
     match machinery::scan_string(rest, start, strict) {
-        Ok((decoded, next, _)) => Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_from_wtf8(decoded),
-            pyre_object::w_int_new(next as i64),
-        ])),
+        Ok((decoded, next, _)) => {
+            let _roots = gc_roots::push_roots();
+            let decoded_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(decoded));
+            let next_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(pyre_object::w_int_new(next as i64));
+            Ok(pyre_object::w_tuple_new(vec![
+                gc_roots::shadow_stack_get(decoded_slot),
+                gc_roots::shadow_stack_get(next_slot),
+            ]))
+        }
         Err(err) => Err(json_decode_error(err.msg, doc, err.pos)),
     }
 }
@@ -818,7 +825,7 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
     gc_roots::pin_root(exc);
     // The note quotes a key the caller supplied, which may hold a lone
     // surrogate, so it is carried as the WTF-8 it is.
-    let note = pyre_object::w_str_from_wtf8(note.into());
+    let note = pyre_object::w_str_from_wtf8_managed(note.into());
     let note_slot = gc_roots::shadow_stack_len();
     gc_roots::pin_root(note);
     if let Ok(add_note) =
@@ -1058,7 +1065,7 @@ fn coerce_key(self_obj: PyObjectRef, key: PyObjectRef) -> Result<Option<PyObject
         if is_instance(key, &pyre_object::FLOAT_TYPE) {
             let mut out = rustpython_wtf8::Wtf8Buf::new();
             encode_float(self_obj, &mut out, key)?;
-            return Ok(Some(pyre_object::w_str_from_wtf8(out)));
+            return Ok(Some(pyre_object::w_str_from_wtf8_managed(out)));
         }
     }
     if crate::baseobjspace::is_true(encoder_attr(self_obj, "skipkeys")?)? {
@@ -1171,8 +1178,11 @@ fn encode_dict(
 
 fn encoder_call_impl(self_obj: PyObjectRef, obj: PyObjectRef, level: i64) -> PyResult {
     let encoded = encode_value(self_obj, obj, level.max(0))?;
-    Ok(pyre_object::w_list_new(vec![pyre_object::w_str_from_wtf8(
-        encoded,
+    let _roots = gc_roots::push_roots();
+    let encoded_slot = gc_roots::shadow_stack_len();
+    gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(encoded));
+    Ok(pyre_object::w_list_new(vec![gc_roots::shadow_stack_get(
+        encoded_slot,
     )]))
 }
 

@@ -4006,7 +4006,7 @@ fn super_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             pyre_object::w_type_get_name(bound_type)
         })
     };
-    Ok(w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<super: <class '{}'>, {}>",
         start_name, bound_name
     )))
@@ -9626,7 +9626,7 @@ fn union_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
             "descriptor '__repr__' requires a 'types.UnionType' object",
         ));
     }
-    Ok(pyre_object::w_str_from_wtf8(unsafe {
+    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
         crate::display::py_repr_wtf8(self_)?
     }))
 }
@@ -10376,7 +10376,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                             "descriptor '__repr__' requires a 'getset_descriptor' object but received a '{received}'"
                         )));
                     }
-                    Ok(pyre_object::w_str_new(&unsafe {
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
                         getset_descriptor_repr(descr)
                     }))
                 },
@@ -10990,7 +10990,7 @@ fn init_type_type(ns: PyObjectRef) {
                         "<class '{}'>",
                         crate::baseobjspace::type_repr_qualified_name(obj)
                     );
-                    Ok(pyre_object::w_str_new(&rendered))
+                    Ok(pyre_object::w_str_new_managed(&rendered))
                 },
                 1,
             ),
@@ -13475,7 +13475,7 @@ fn init_function_type(ns: PyObjectRef) {
                         " at {}>",
                         crate::display::repr_addr(function as usize)
                     ));
-                    Ok(pyre_object::w_str_from_wtf8(repr))
+                    Ok(pyre_object::w_str_from_wtf8_managed(repr))
                 },
                 1,
             ),
@@ -13893,7 +13893,7 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     } else {
                         unsafe { crate::function::function_get_self_or_none(carrier) }
                     };
-                    Ok(pyre_object::w_str_new(&unsafe {
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
                         crate::function::builtin_function_repr_text(name, w_self)
                     }))
                 },
@@ -14669,7 +14669,7 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                     let type_name = crate::typedef::r#type(w_self)
                         .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
                         .unwrap_or("object");
-                    Ok(pyre_object::w_str_new(&format!(
+                    Ok(pyre_object::w_str_new_managed(&format!(
                         "<method-wrapper '{name}' of {type_name} object at {}>",
                         crate::display::repr_addr(w_self as usize)
                     )))
@@ -14854,7 +14854,7 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                     let name = crate::function::function_get_name(descr);
                     let owner = crate::function::fget_func_objclass(descr)?;
                     let owner_name = pyre_object::w_type_get_name(owner);
-                    Ok(pyre_object::w_str_new(&format!(
+                    Ok(pyre_object::w_str_new_managed(&format!(
                         "<method '{name}' of '{owner_name}' objects>"
                     )))
                 },
@@ -15014,7 +15014,7 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
                     let name = crate::function::function_get_name(function);
                     let owner = crate::function::fget_func_objclass(function)?;
                     let owner_name = pyre_object::w_type_get_name(owner);
-                    Ok(pyre_object::w_str_new(&format!(
+                    Ok(pyre_object::w_str_new_managed(&format!(
                         "<method '{name}' of '{owner_name}' objects>"
                     )))
                 },
@@ -15646,7 +15646,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             "descriptor '__repr__' requires a 'member_descriptor' object",
                         ));
                     }
-                    Ok(pyre_object::w_str_new(&unsafe {
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
                         member_descriptor_repr(member)
                     }))
                 },
@@ -15817,7 +15817,7 @@ fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
             crate::display::repr_addr(value as usize)
         )
     };
-    Ok(w_str_new(&text))
+    Ok(w_str_new_managed(&text))
 }
 
 /// `nestedscope.py:934-952 Cell.typedef`, in source order. CPython 3.14 is
@@ -26665,7 +26665,7 @@ fn generator_frame(obj: PyObjectRef) -> *mut crate::pyframe::PyFrame {
 
 fn generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new(&format!(
+    Ok(w_str_new_managed(&format!(
         "<generator object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
         crate::display::repr_addr(args[0] as usize)
@@ -26674,7 +26674,7 @@ fn generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new(&format!(
+    Ok(w_str_new_managed(&format!(
         "<coroutine object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
         crate::display::repr_addr(args[0] as usize)
