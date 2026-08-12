@@ -105,38 +105,59 @@ pub fn w_method_new(
 /// Select a CPython-compatible public type for a Method-layout object while
 /// preserving PyPy's raw `METHOD_TYPE` payload and GC descriptor.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_set_public_class(obj: PyObjectRef, w_class: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     (*obj).w_class = w_class;
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_get_module(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const Method)).w_module
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_set_module(obj: PyObjectRef, w_module: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     (*(obj as *mut Method)).w_module = w_module;
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_method(obj: PyObjectRef) -> bool {
     py_type_check(obj, &METHOD_TYPE)
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_get_func(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const Method)).w_function
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_get_self(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const Method)).w_self
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_get_class(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const Method)).w_class
 }
@@ -193,12 +214,18 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     })
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const StaticMethod)).w_function
 }
 
 /// function.py:697 `self.w_function = w_function`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     unsafe {
         (*(obj as *mut StaticMethod)).w_function = func;
@@ -209,6 +236,9 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
 /// function.py:678-681 `StaticMethod.getdict` — allocate the instance
 /// dictionary on first access and retain its identity.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let sm = obj as *mut StaticMethod;
@@ -223,6 +253,9 @@ pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// function.py:683-688 `StaticMethod.setdict`; the caller performs the
 /// dict type check before replacing this field.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
         (*(obj as *mut StaticMethod)).w_dict = w_dict;
@@ -231,6 +264,9 @@ pub unsafe fn w_staticmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
     py_type_check(obj, &STATICMETHOD_TYPE)
 }
@@ -286,12 +322,18 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     })
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const ClassMethod)).w_function
 }
 
 /// function.py:752 `self.w_function = w_function`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     unsafe {
         (*(obj as *mut ClassMethod)).w_function = func;
@@ -301,6 +343,9 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
 
 /// function.py:726-729 `ClassMethod.getdict`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let cm = obj as *mut ClassMethod;
@@ -315,6 +360,9 @@ pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// function.py:731-736 `ClassMethod.setdict`; the object-space layer checks
 /// for dict or a dict subclass before replacing the field.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
         (*(obj as *mut ClassMethod)).w_dict = w_dict;
@@ -323,6 +371,9 @@ pub unsafe fn w_classmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_classmethod(obj: PyObjectRef) -> bool {
     py_type_check(obj, &CLASSMETHOD_TYPE)
 }
