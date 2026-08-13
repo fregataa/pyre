@@ -1697,32 +1697,34 @@ pub fn remove_sys_module(name: &str) {
     }
 }
 
-/// Drop the Python-visible import cache during process shutdown.
-///
-/// CPython's `finalize_modules()` clears `sys.modules` before module-global
-/// teardown; PyPy's object space likewise owns modules through
-/// `space.sys.modules`, rather than a permanent side table.  Keeping every
-/// imported module in the cache until `process::exit` prevents its managed
-/// module/dict cycles and their `__del__` objects from ever becoming
-/// unreachable.  Retain `sys` and `builtins` themselves because pyre's
-/// unraisable-error path still consults their live dictionaries while the
-/// released modules are finalized.
-pub fn release_sys_modules_for_shutdown() -> Vec<PyObjectRef> {
+/// `finalize_remove_modules`: snapshot real modules, then detach import-cache
+/// entries so module/dict cycles can become unreachable during shutdown.
+pub fn release_sys_modules_for_shutdown() -> Vec<(Wtf8Buf, PyObjectRef)> {
     let dict = sys_modules_dict();
     if dict.is_null() {
         return Vec::new();
     }
-    let entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+    let entries = unsafe { pyre_object::w_dict_items(dict) };
     let mut modules = Vec::new();
-    for (name, module) in entries {
-        if matches!(name.as_str(), "sys" | "builtins") {
-            continue;
-        }
+    for (key, module) in entries {
+        let name = if unsafe { pyre_object::is_str(key) } {
+            Some(unsafe { pyre_object::w_str_get_wtf8(key) }.to_owned())
+        } else {
+            None
+        };
         if !module.is_null() && unsafe { pyre_object::is_module(module) } {
-            modules.push(module);
+            if let Some(name) = &name {
+                modules.push((name.clone(), module));
+            }
         }
-        unsafe {
-            pyre_object::w_dict_delitem_str(dict, &name);
+        let keep_entry = name.as_deref().is_some_and(|name| {
+            let bytes = name.as_bytes();
+            bytes == b"sys" || bytes == b"builtins"
+        });
+        if !keep_entry {
+            unsafe {
+                pyre_object::w_dict_delitem(dict, key);
+            }
         }
     }
     modules
