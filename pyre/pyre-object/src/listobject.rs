@@ -774,7 +774,7 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
-/// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy
+/// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy.
 ///
 /// First append on an empty list picks the typed strategy that matches
 /// the appended item, then installs an empty typed storage. Caller is
@@ -1040,7 +1040,13 @@ impl ListStorage {
     }
 }
 
-fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
+/// Construct a list with an explicitly selected storage strategy.
+///
+/// An interpreter-internal seam: Python-visible constructors go through
+/// [`w_list_new`], which picks the strategy with [`list_strategy_for`]. The
+/// JIT's strategy tests use this to pin one representation instead of
+/// depending on that inference.
+pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // pin every PyObjectRef in `items` before the GC malloc paths
     // below (`alloc_list_items_block_gc`, the collecting header allocation) so the

@@ -1191,7 +1191,8 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     translated `f_generator_wref` (pyframe.py:75-76/276-279), hence a
 ///     non-owning back-reference rather than a GC edge.
 ///   - `debugdata` / `lastblock` — managed field slots are forwarded.
-///   - `debugdata->{w_locals, w_f_trace, hidden_operationerr}` — null-guarded.
+///   - `debugdata->{w_locals, w_extra_locals, w_f_trace,
+///     hidden_operationerr}` — null-guarded.
 ///
 /// Excluded (matches the walker): `execution_context` (persistent, not
 /// GC), the module-dict / method-cache / prebuilt-family global walks (those are not frame-owned; the
@@ -1286,6 +1287,7 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
         if walk_fields {
             let d = unsafe { &mut *frame.debugdata };
             f(&mut d.w_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(&mut d.w_extra_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(&mut d.w_f_trace as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(&mut d.hidden_operationerr as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         }
@@ -3054,6 +3056,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         std::mem::size_of::<pyre_interpreter::pyframe::FrameDebugData>(),
         vec![
             std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_locals),
+            std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_extra_locals),
             std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_f_trace),
             std::mem::offset_of!(
                 pyre_interpreter::pyframe::FrameDebugData,
@@ -3729,66 +3732,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         twister_descr.ptr_offsets.to_vec(),
     ));
     twister_descr.gc_type_id.set(twister_tid);
-    // ── GC-root registration completeness oracle ─────────────────────────
-    // Every `#[pyre_class]` type appends its descriptor to the whole-program
-    // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
-    // (non-empty `ptr_offsets`) whose children are reachable by NEITHER the
-    // marker (its resolved tid's `TypeInfo` traces those offsets or carries a
-    // custom trace) NOR the immortal-root walker (`register_pyre_class_offsets`)
-    // has its backing list / source iterator dropped on the next moving
-    // collection — the recurring unregistered-GC-root bug (the PR#628 hand
-    // walker, the immortal iterator triad, `collections.deque` W_Deque).  Assert
-    // completeness here, before `freeze_types()`, so a newly-added managed-child
-    // type that misses `build_gc` fails loudly at init instead of silently at
-    // the next collection.  Read-only over already-registered state; the slice
-    // is an oracle only (see its docs), so link-section under-population can only
-    // weaken the check, never false-alarm.  Native only: the guard reads
-    // `PYRE_CLASS_DESCRIPTORS`, whose wasm link-section population is not
-    // guaranteed, and the recurring bug is caught on the native CI backends.
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let mut unregistered: Vec<&'static str> = Vec::new();
-        for descr in pyre_object::lltype::PYRE_CLASS_DESCRIPTORS {
-            if descr.ptr_offsets.is_empty() {
-                // No inline managed children the GC must forward.
-                continue;
-            }
-            // Path 1 — immortal-root walker / closure offset registry.
-            let in_offset_registry =
-                unsafe { pyre_object::gc_hook::offsets_for_pytype(descr.pytype_ptr) }
-                    .is_some_and(|o| !o.is_empty());
-            if in_offset_registry {
-                continue;
-            }
-            // Path 2 — the marker traces the type's own resolved tid.  The
-            // descriptor's `gc_type_id` cell is the real tid (pre-set for
-            // `type_id = N` types, stamped by `register_pyre_class` for auto-id
-            // ones); an unregistered type is `UNASSIGNED` or out of range.
-            let tid = descr.gc_type_id.get();
-            let marker_traced = tid != pyre_object::lltype::TypeIdCell::UNASSIGNED
-                && (tid as usize) < gc.types.len()
-                && {
-                    let ti = gc.types.get(tid);
-                    ti.custom_trace.is_some()
-                        || descr
-                            .ptr_offsets
-                            .iter()
-                            .all(|off| ti.gc_ptr_offsets.contains(off))
-                };
-            if marker_traced {
-                continue;
-            }
-            unregistered.push(descr.pyname);
-        }
-        assert!(
-            unregistered.is_empty(),
-            "GC-root registration gap: #[pyre_class] type(s) with managed \
-             children were never wired into build_gc — neither a marker tid \
-             tracing their inline `PyObjectRef` offsets nor \
-             register_pyre_class_offsets — so their children are dropped on the \
-             next collection.  Register each in build_gc: {unregistered:?}",
-        );
-    }
     // PyPy setobject.py:875/963 stores a copied r_dict behind the set's GC
     // pointer field; rdict.py:210 makes that table a GcStruct("dicttable").
     // The box is a leaf because `set_object_custom_trace` owns both edges:
@@ -3939,6 +3882,90 @@ fn build_gc() -> Box<MiniMarkGC> {
         .object_layout_without_subclass_range(),
     );
     pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID.set(tuple_user_tid);
+    // `interp__weakref.py:19-28 WeakrefLifeline(W_Root)` has no typedef and
+    // therefore no app-level rclass vtable/subclass range.  Its three managed
+    // fields still need an ordinary translated GcStruct layout. Append this
+    // hidden layout at the absolute tail so every established id above remains
+    // stable; do not add it to `pytype_to_tid` or the subclass alias census.
+    let lifeline_descr = <pyre_object::weakref::W_WeakrefLifeline
+        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let lifeline_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        lifeline_descr.object_size,
+        lifeline_descr.ptr_offsets.to_vec(),
+    ));
+    if lifeline_descr.gc_type_id.is_unassigned() {
+        lifeline_descr.gc_type_id.set(lifeline_tid);
+    } else {
+        debug_assert_eq!(lifeline_descr.gc_type_id.get(), lifeline_tid);
+    }
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        lifeline_descr.pytype_ptr as usize,
+        lifeline_descr.ptr_offsets,
+    );
+    // `interp__weakref.py:193-205 W_Weakref` exact builtin payload. Like the
+    // lifeline above, its allocation is selected by its translated GC layout;
+    // Python class identity remains in the header's `w_class`. Append it after
+    // the lifeline so the already-published lifeline tid stays stable. The
+    // separate generated user-subclass layout remains mapdict-backed.
+    let weakref_descr =
+        <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let weakref_object_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        weakref_descr.object_size,
+        weakref_descr.ptr_offsets.to_vec(),
+    ));
+    if weakref_descr.gc_type_id.is_unassigned() {
+        weakref_descr.gc_type_id.set(weakref_object_tid);
+    } else {
+        debug_assert_eq!(weakref_descr.gc_type_id.get(), weakref_object_tid);
+    }
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        weakref_descr.pytype_ptr as usize,
+        weakref_descr.ptr_offsets,
+    );
+
+    // ── GC-root registration completeness oracle ─────────────────────────
+    // Every `#[pyre_class]` type appends its descriptor to the whole-program
+    // `PYRE_CLASS_DESCRIPTORS` slice. A type with inline managed children must
+    // be reachable by either its marker layout or the immortal-root offset
+    // registry. Run the oracle only after the absolute-tail registrations so
+    // hidden non-vtable GcStructs such as WeakrefLifeline are included too.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut unregistered: Vec<&'static str> = Vec::new();
+        for descr in pyre_object::lltype::PYRE_CLASS_DESCRIPTORS {
+            if descr.ptr_offsets.is_empty() {
+                continue;
+            }
+            let in_offset_registry =
+                unsafe { pyre_object::gc_hook::offsets_for_pytype(descr.pytype_ptr) }
+                    .is_some_and(|o| !o.is_empty());
+            if in_offset_registry {
+                continue;
+            }
+            let tid = descr.gc_type_id.get();
+            let marker_traced = tid != pyre_object::lltype::TypeIdCell::UNASSIGNED
+                && (tid as usize) < gc.types.len()
+                && {
+                    let ti = gc.types.get(tid);
+                    ti.custom_trace.is_some()
+                        || descr
+                            .ptr_offsets
+                            .iter()
+                            .all(|off| ti.gc_ptr_offsets.contains(off))
+                };
+            if !marker_traced {
+                unregistered.push(descr.pyname);
+            }
+        }
+        assert!(
+            unregistered.is_empty(),
+            "GC-root registration gap: #[pyre_class] type(s) with managed \
+             children were never wired into build_gc — neither a marker tid \
+             tracing their inline `PyObjectRef` offsets nor \
+             register_pyre_class_offsets — so their children are dropped on the \
+             next collection. Register each in build_gc: {unregistered:?}",
+        );
+    }
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges
@@ -4585,9 +4612,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // Register the real portal `JitDriverStaticData` so `get_assembler_token` /
     // `compile_tmp_callback` (warmstate.py:714-723, compile.py:1101-1150) have
     // a slot with `portal_runner_adr` + `portal_calldescr` populated.
-    // The empty `ensure_default_driver_sd` placeholder remains at
-    // jitdrivers_sd[0]; this pushes the greens/reds portal schema at index 1+
-    // per the documented `register_jitdriver_sd` contract.
+    // `register_jitdriver_sd` replaces the translation-time empty placeholder
+    // at slot 0, preserving the jdindex emitted by the shared codewriter.
     // warmspot.py:1010-1012 `jd.portal_runner_adr = adr_of(ll_portal_runner)`.
     let mut jd = PyreJitState::pypyjit_driver_descriptor();
     jd.result_type = majit_ir::Type::Ref;
@@ -4597,7 +4623,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // baseobjspace.py:29 `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
     // unknown-length unpack loop `_unpackiterable_unknown_length`. Registered
-    // here, right after jd0, so it lands at `jitdrivers_sd[2]` and inherits the
+    // here, right after jd0, so it lands at `jitdrivers_sd[1]` and inherits the
     // same `portal_finishtoken` / `propagate_exc_descr` via the
     // `finish_setup_descrs_for_jitdrivers` tail. jd1 is novable
     // (`virtualizable_info` stays `None`), so `elect_active_jitdriver_sd`'s
@@ -7056,14 +7082,17 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     let exit =
         pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
     // A `LIST_APPEND` (inlined-comprehension accumulator) body is
-    // admitted only when the body performs no CALL: a per-element call
-    // that enters a user Python frame (a class ctor / user function)
-    // bumps the eval-loop entry odometer, and a subsequent mid-body
-    // abort routes through `fbw_foriter_inflight_take`, which REFUSES
-    // delivery to avoid a double-apply — dropping the trace-attempt
-    // iteration's item. That user-frame in-flight-delivery gap is a
-    // separate concern (single-executor tracing, gh#73/#34); decline
-    // call-bearing bodies to interpretation until it is closed.
+    // admitted only when the body performs no CALL. A compiled loop's
+    // live-at-exit values stay reachable from the exit state until the
+    // next JIT activity overwrites it, so the loop variable keeps its
+    // final binding past the `STORE_FAST` that restores the isolated
+    // comprehension slot to unbound. A call-free body binds values the
+    // enclosing frame holds anyway; a per-element call binds a freshly
+    // constructed object, and `extra_tests/parity_tests/
+    // weakref_gc_lifeline.py` then sees the last element survive the
+    // collection that should have run its weakref callback. Decline
+    // call-bearing bodies to interpretation until the exit state stops
+    // rooting what it no longer resumes.
     //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
@@ -12900,9 +12929,10 @@ mod tests {
 
     #[test]
     fn for_iter_call_bearing_list_append_comprehension_is_unsafe_for_entry_trace() {
-        // A per-element CALL enters a user Python frame; a mid-body abort then
-        // refuses the in-flight FOR_ITER delivery (a separate user-frame gap,
-        // gh#73/#34), so a call-bearing LIST_APPEND body stays interpreter-only.
+        // A per-element CALL binds a freshly constructed object to the
+        // comprehension's isolated slot, and the compiled loop's exit state
+        // keeps that last binding reachable, so a call-bearing LIST_APPEND
+        // body stays interpreter-only.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [str(i) for i in range(n)]\n",

@@ -2591,7 +2591,10 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let w_name = resolve(3, "name");
     let w_argdefs = resolve(4, "argdefs");
     let w_closure = resolve(5, "closure");
-    let w_kwdefaults = crate::builtins::kwarg_get(kwargs, "kwdefaults").unwrap_or(PY_NULL);
+    // Python 3.14's sixth constructor parameter is positional-or-keyword.
+    // Keep it in the same slot resolver as `code` through `closure`; reading
+    // only the kwargs dict silently discarded the positional value.
+    let w_kwdefaults = resolve(6, "kwdefaults");
 
     if w_code.is_null() || !unsafe { crate::pycode::is_code(w_code) } {
         return Err(crate::PyError::type_error(
@@ -2644,7 +2647,9 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     if !w_kwdefaults.is_null() && !unsafe { pyre_object::is_none(w_kwdefaults) } {
         if !unsafe { pyre_object::is_dict(w_kwdefaults) } {
-            return Err(crate::PyError::type_error("kwdefaults must be a dict"));
+            return Err(crate::PyError::type_error(
+                "arg 6 (kwdefaults) must be None or dict",
+            ));
         }
         unsafe { function_set_kwdefaults(func, w_kwdefaults) };
     }
@@ -3371,6 +3376,12 @@ pub fn funccall_valuestack(
     dropvalues: usize,
     methodcall: bool,
 ) -> PyObjectRef {
+    // RPython's translated `Function.funccall_valuestack` keeps `frame` and
+    // its virtualizable array live from function entry.  The pending-stack
+    // exception drain below and all code/default metadata lookups therefore
+    // see forwarded stack operands before `_flat_pycall` copies them.
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    crate::pyframe::remember_frame_locals_array(frame.locals_cells_stack_w);
     // A compiled callee prologue can publish an overflow before control
     // returns to this dispatcher.  The fresh stack check belongs to the
     // Python frame entry (`PyFrame.execute_frame.insert_stack_check_here`),
@@ -3538,6 +3549,12 @@ fn _flat_pycall(
     frame: &mut crate::pyframe::PyFrame,
     dropvalues: usize,
 ) -> PyObjectRef {
+    // RPython's GC transform keeps the live caller frame rooted across
+    // `space.createframe`: the positional arguments still live on its value
+    // stack and are copied only after that collecting allocation returns
+    // (`function.py:208-211`).  Register the locals/value-stack array before
+    // constructing the callee, not merely while the callee executes, so a
+    // moved argument is reloaded from the forwarded caller slot.
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -3591,7 +3608,6 @@ fn _flat_pycall(
             }
         }
     } else {
-        let _caller_locals_root = FrameLocalsRoot::new(frame);
         let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
         match eval_fn(&mut new_frame) {
@@ -3619,6 +3635,8 @@ fn _flat_pycall_defaults(
     defs_to_load: usize,
     dropvalues: usize,
 ) -> PyObjectRef {
+    // Same RPython GC-transform live-frame root as `_flat_pycall`: positional
+    // stack entries are copied only after the callee allocation returns.
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -3674,7 +3692,6 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let _caller_locals_root = FrameLocalsRoot::new(frame);
         let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
         match eval_fn(&mut new_frame) {

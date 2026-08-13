@@ -5274,8 +5274,7 @@ fn min_max_multiple_args(
     Ok(pyre_object::gc_roots::shadow_stack_get(best_item_slot))
 }
 
-/// typeobject.py:886 `descr__new__` — `type.__new__(metatype, name, bases, dict)`
-/// and its one-argument form `type(obj)`.
+/// CPython 3.14 `type_new` — `type.__new__(metatype, name, bases, dict)`.
 ///
 /// `descr__new__(space, w_typetype, __args__)` takes the metatype as its own
 /// gateway parameter and everything behind it as `__args__`, so `pos[0]` is the
@@ -5293,85 +5292,48 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // dict (the builtin kwargs ABI); strip it before the arity check and
     // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
     let (pos, kwargs) = split_builtin_kwargs(args);
-    // The gateway supplies `w_typetype` from a declared parameter, so this
-    // shape is refused by the argument parser and never reaches
-    // `descr__new__`.  pyre reads the metatype out of the same flat slice and
-    // has to word that refusal itself — in the parser's words, which is the
-    // one message here that is not `descr__new__`'s own.
+    // `type_new` receives the metatype separately from the tuple parsed by
+    // `PyArg_ParseTuple`.  Pyre's flat builtin ABI has to reproduce the
+    // descriptor gateway's missing-metatype refusal before splitting it out.
     if pos.is_empty() {
         return Err(crate::PyError::type_error(
-            "type.__new__() missing 1 required positional argument: 'typetype'",
+            "type.__new__(): not enough arguments",
         ));
     }
 
     let w_typetype = pos[0];
     let arguments_w = &pos[1..];
-    // The count decides the form before any argument is read; `w_typetype` is
-    // touched only to word the refusal, which is why `_precheck_for_new` runs
-    // after it and not before.
-    if arguments_w.len() != 1 && arguments_w.len() != 3 {
-        return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
-    }
-
+    // `type_new` is entered only after `tp_new_wrapper` has established that
+    // the first argument is a type.  This check therefore precedes parsing
+    // `(name, bases, dict)`, regardless of that tuple's arity.
     precheck_for_new(w_typetype)?;
-    if arguments_w.len() == 1 {
-        // typeobject.py:901-908 — the one-argument form belongs to `type`
-        // alone: `type(x)` reports the type of `x`, while `Metaclass(x)` is a
-        // class statement missing its bases and its namespace.
-        if unsafe { std::ptr::eq(w_typetype, crate::typedef::w_type()) } {
-            return type_descr_new_without_metaclass(arguments_w, kwargs);
-        }
-        return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
+    if arguments_w.len() != 3 {
+        return Err(crate::PyError::type_error(new_arity_message(
+            arguments_w.len(),
+        )));
     }
 
     type_descr_new_with_metaclass(arguments_w, w_typetype, kwargs)
 }
-/// typeobject.py:888-895 `descr__new__` — the wording for a `type.__new__`
-/// call whose argument count is neither one nor three.  `type` itself names
-/// both accepted counts; any other metatype names only the three-argument
-/// form, under the count upstream writes as a literal.
-fn new_arity_message(w_metatype: PyObjectRef) -> String {
-    if unsafe { std::ptr::eq(w_metatype, crate::typedef::w_type()) } {
-        return "type.__new__() takes 1 or 3 arguments".to_string();
-    }
-    let name = type_new_getname(w_metatype);
-    format!("{name}.__new__() takes exactly 3 arguments (1 given)")
+/// Python 3.14 `type_new`: the inherited slot keeps the defining type's name
+/// in its error, even when invoked through a metaclass subclass.  PyPy 3.11's
+/// `descr__new__` instead interpolates that subclass (`M.__new__`), but the
+/// project's version target is 3.14.
+fn new_arity_message(given: usize) -> String {
+    format!("type.__new__() takes exactly 3 arguments ({given} given)")
 }
 
-/// typeobject.py:1001-1003 `_precheck_for_new` — the metatype must be a type
-/// before anything reads it as one.  It runs after the arity decision and
-/// before the one-argument form is resolved.
+/// CPython 3.14 `tp_new_wrapper` — the metatype must be a type before
+/// `type_new` parses its three construction arguments.
 fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_type(w_type) } {
         Ok(())
     } else {
         let type_name = crate::baseobjspace::object_functionstr_type_name(w_type);
         Err(crate::PyError::type_error(format!(
-            "X is not a type object ({type_name})"
+            "type.__new__(X): X is not a type object ({type_name})"
         )))
     }
-}
-
-/// `W_Root.getname` (baseobjspace.py:90-94), the `%N` operand spelling: a type
-/// reports its own name, any other object reports its `__name__` attribute,
-/// and a failed lookup reports `?`.  The arity message reaches this with an
-/// unvalidated metatype, so it must not read one through the type layout.
-fn type_new_getname(w_obj: PyObjectRef) -> String {
-    if unsafe { pyre_object::is_type(w_obj) } {
-        return unsafe { pyre_object::w_type_get_name(w_obj) }.to_string();
-    }
-    match crate::baseobjspace::getattr_str(w_obj, "__name__").and_then(crate::baseobjspace::utf8_w)
-    {
-        Ok(name) => name.to_string(),
-        Err(_) => "?".to_string(),
-    }
-}
-
-fn type_descr_new_without_metaclass(
-    args: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-) -> Result<PyObjectRef, crate::PyError> {
-    type_descr_new_with_metaclass(args, pyre_object::PY_NULL, kwargs)
 }
 
 /// typeobject.py:141 `_check_surrogate` — a type name may not contain a
@@ -5495,9 +5457,6 @@ fn type_descr_new_with_metaclass(
     w_metaclass: PyObjectRef,
     kwargs: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 && args.len() != 3 {
-        return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
-    }
     // type(name, bases, dict) — 3-arg form creates a new type
     // PyPy: typeobject.py type.__new__(metatype, name, bases, dict)
     if args.len() == 3 {
@@ -5892,20 +5851,22 @@ fn type_descr_new_with_metaclass(
         return Ok(w_type);
     }
 
-    // type(obj) — 1-arg form returns the type
-    // PyPy objspace.py:400: space.type(w_obj) → w_obj.getclass(space)
-    // typedef::type() respects __class__ override for all object kinds.
-    let obj = args[0];
+    unreachable!("type.__new__ argument count was checked by type_descr_new")
+}
+
+/// CPython 3.14 `type_call` / `type_vectorcall` one-argument fast path.
+/// This deliberately does not belong to `type_descr_new`: a direct
+/// `type.__new__(type, obj)` must still require `(name, bases, dict)`.
+pub(crate) fn type_of_object(obj: PyObjectRef) -> PyObjectRef {
+    // `typedef::type()` respects __class__ overrides for all object kinds.
     if let Some(tp) = crate::typedef::r#type(obj) {
-        return Ok(tp.as_ptr());
+        return tp.as_ptr();
     }
     if obj.is_null() {
-        return Ok(crate::typedef::gettypeobject(
-            &pyre_object::pyobject::NONE_TYPE,
-        ));
+        return crate::typedef::gettypeobject(&pyre_object::pyobject::NONE_TYPE);
     }
     let name = unsafe { (*(*obj).ob_type).name };
-    Ok(box_str_constant(rustpython_wtf8::Wtf8::new(name)))
+    box_str_constant(rustpython_wtf8::Wtf8::new(name))
 }
 
 /// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py
@@ -10848,6 +10809,10 @@ fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize
 
 fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
     let byte_index = byte_index.min(source.len());
+    let byte_index = (0..=byte_index)
+        .rev()
+        .find(|&index| source.is_char_boundary(index))
+        .unwrap_or(0);
     let line_start = source[..byte_index]
         .rfind('\n')
         .map_or(0, |index| index + 1);
@@ -11278,7 +11243,12 @@ fn incompatible_string_prefix_error(
 /// incomplete `\N{...` as either its own escape error or an unclosed f-string
 /// field.  Recover the decoder-first error, including the byte range relative
 /// to the literal contents used by the codec error message.
-fn malformed_unicode_name_escape(source: &str) -> Option<String> {
+/// The message a malformed `\N` escape produces, with the byte offset of the
+/// literal that carries it.
+///
+/// The caller needs the offset because this walks the whole source: the escape
+/// is only what gets reported when nothing earlier in the file already failed.
+fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
     let bytes = source.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
@@ -11358,10 +11328,13 @@ fn malformed_unicode_name_escape(source: &str) -> Option<String> {
                 None
             };
             if let Some(malformed_end) = malformed_end {
-                return Some(format!(
-                    "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
-                    escape - content_start,
-                    malformed_end - content_start,
+                return Some((
+                    format!(
+                        "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
+                        escape - content_start,
+                        malformed_end - content_start,
+                    ),
+                    token_start,
                 ));
             }
             escape += 2;
@@ -11650,8 +11623,20 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             );
         }
     }
-    if let Some(unicode_error) = malformed_unicode_name_escape(source) {
-        msg = unicode_error;
+    if let Some((unicode_error, literal_start)) = malformed_unicode_name_escape(source) {
+        // Both the decode and the parse are failures of the same compile, and
+        // the one reported is whichever comes first in the source. A literal
+        // that sits after the parser's own error keeps that error, so
+        // `1 +\nx = "\N"\n` still reports the incomplete expression on line 1.
+        let parser_start = match &e {
+            crate::compile::CompileError::Parse(parse_error) => {
+                Some(parse_error.raw_location.start().to_usize())
+            }
+            _ => None,
+        };
+        if parser_start.is_none_or(|start| start >= literal_start) {
+            msg = unicode_error;
+        }
     }
     if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
         msg = comment_error.to_owned();
@@ -13444,30 +13429,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             return Ok(origin_hash ^ args_hash);
         }
         if pyre_object::is_union(obj) {
-            // UnionType.__hash__ (`_pypy_generic_alias.py:275`) —
-            // `hash(frozenset(self.__args__))`, order-independent so it
-            // agrees with `__eq__`'s set equality.
-            let args = pyre_object::w_union_get_args(obj);
-            // `try_hash_value` runs each member's `__hash__`, which may collect;
-            // `args` is a raw local re-read in the loop, so pin it.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(args);
-            let n = pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
-            let mut hashes = Vec::with_capacity(n);
-            for i in 0..n {
-                if let Some(item) = pyre_object::w_tuple_getitem(
-                    pyre_object::gc_roots::shadow_stack_get(args_slot),
-                    i as i64,
-                ) {
-                    // Preserve frozenset construction's fallible element-hash
-                    // phase.  Building a low-level frozenset first would use
-                    // its stored infallible digest path and hide an
-                    // unhashable union member.
-                    hashes.push(try_hash_value(item)?);
-                }
-            }
-            return Ok(_hash_frozenset(&hashes));
+            return crate::_pypy_generic_alias::union_hash_value(obj);
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
@@ -13955,19 +13917,10 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return hash_value(origin) ^ hash_value(args);
         }
         if pyre_object::is_union(obj) {
-            // UnionType.__hash__ (`_pypy_generic_alias.py:275`) —
-            // `hash(frozenset(self.__args__))`.  Resolved here too so the
-            // infallible `hash_w`/`hash_value` path agrees with the
-            // fallible `try_hash_value` one.
-            let args = pyre_object::w_union_get_args(obj);
-            let n = w_tuple_len(args);
-            let mut members = Vec::with_capacity(n);
-            for i in 0..n {
-                if let Some(item) = w_tuple_getitem(args, i as i64) {
-                    members.push(item);
-                }
-            }
-            return hash_value(pyre_object::w_frozenset_from_items(&members));
+            // Strict callers take the Result-bearing arm above.  The
+            // callback-only infallible path reads the already-built hashable
+            // partition and never repartitions against mutable hash slots.
+            return hash_value(pyre_object::w_union_get_hashable_args(obj));
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
@@ -17993,6 +17946,12 @@ mod tests {
     }
 
     #[test]
+    fn source_byte_location_accepts_an_offset_inside_utf8() {
+        assert_eq!(source_byte_location("αx", 1), (1, 1));
+        assert_eq!(source_byte_location("first\nαx", 7), (2, 1));
+    }
+
+    #[test]
     fn nonascii_bytes_error_selects_the_literal_token() {
         assert_eq!(nonascii_bytes_literal_span("b\"fooжжж\"", 5), Some((0, 12)));
         assert_eq!(nonascii_bytes_literal_span("x = rb'é'", 7), Some((4, 10)));
@@ -18009,13 +17968,19 @@ mod tests {
             (r"f'\N{'", "0-2"),
             (r"'\N{GREEK CAPITAL LETTER DELTA'", "0-28"),
         ] {
-            let message = malformed_unicode_name_escape(source).unwrap();
+            let (message, literal_start) = malformed_unicode_name_escape(source).unwrap();
             assert!(message.contains(&format!("position {range}:")), "{message}");
             assert!(message.ends_with(r"malformed \N character escape"));
+            assert_eq!(literal_start, 0);
         }
         assert_eq!(malformed_unicode_name_escape(r"r'\N'"), None);
         assert_eq!(malformed_unicode_name_escape(r"'\N{DELTA}'"), None);
         assert_eq!(malformed_unicode_name_escape(r"'\\N'"), None);
+        // The offset is what lets an earlier parse error keep the report.
+        assert_eq!(
+            malformed_unicode_name_escape("1 +\nx = \"\\N\"\n").map(|(_, start)| start),
+            Some(8)
+        );
     }
 
     #[test]

@@ -1567,30 +1567,14 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
 
 /// descroperation.py `descr__call__` — `space.lookup(w_obj, '__call__')`.
 ///
-/// Consulted once the builtin callables above have had their turn, so it
-/// admits only the receivers none of them claim: an object carrying a generic
-/// payload (`weakref.ref` and friends, whose class holds the `__call__`), and
-/// an instance of a user-defined class — including one deriving from a builtin
-/// type, where `class C(int)` carries its `__call__` on the type just as a
-/// plain `class C` does.  `space.lookup` applies equally to interp-level
-/// `W_Root` payloads whose `TypeDef` publishes a call slot, so the accelerator
-/// key wrapper is admitted here as well.
+/// Consulted once the builtin callables above have had their turn.  PyPy's
+/// `space.lookup` applies uniformly to every `W_Root`: the storage layout is
+/// irrelevant when the object's dynamic type publishes a `__call__` slot.
 fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, PyError> {
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
     let w_type = w_type.as_ptr();
-    // Most fixed-layout builtin payloads are deliberately not generic
-    // instances.  Admit the accelerator payloads whose TypeDefs publish
-    // `__call__`, while retaining the guard for all other internal objects.
-    let typed_callable = crate::module::_functools::W_KeyWrapper::from_obj(callable).is_some()
-        || crate::module::_json::W_Scanner::from_obj(callable).is_some()
-        || crate::module::_json::W_Encoder::from_obj(callable).is_some();
-    if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) }
-        && !typed_callable
-    {
-        return Ok(None);
-    }
     let Some(call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") }) else {
         return Ok(None);
     };
@@ -2962,6 +2946,9 @@ pub fn call_with_kwargs_in_ctx(
         let type_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(callable);
         let current_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
+        if let Some(result) = type_call_special_case(current_type(), pos_args, !kwargs.is_empty()) {
+            return result;
+        }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
         // The `function`, `memoryview`, and deque iterator types are
@@ -3044,9 +3031,8 @@ pub fn call_with_kwargs_in_ctx(
         if let Some(w_insttype) = type_call_init_type(
             pyre_object::gc_roots::shadow_stack_get(instance_slot),
             current_type(),
-        ) && !type_call_type_x_shortcut(current_type(), pos_args.len(), kwargs.is_empty())
-            && let Some(init_descr) =
-                unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+        ) && let Some(init_descr) =
+            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
         {
             // typeobject.py:737-740 `space.get_and_call_args`: exact
             // Function takes the instance explicitly; every other descriptor
@@ -3455,6 +3441,16 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
         }
     };
 
+    if let Some(result) = type_call_special_case(current_type(), args, false) {
+        return match result {
+            Ok(value) => value,
+            Err(error) => {
+                set_call_error(error);
+                PY_NULL
+            }
+        };
+    }
+
     if let Err(e) = check_type_instantiable(current_type()) {
         set_call_error(e);
         return PY_NULL;
@@ -3479,9 +3475,8 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
     if let Some(w_insttype) = type_call_init_type(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         current_type(),
-    ) && !type_call_type_x_shortcut(current_type(), args.len(), true)
-        && let Some(init_fn) =
-            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+    ) && let Some(init_fn) =
+        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
     {
         let mut init_args = Vec::with_capacity(1 + args.len());
         init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
@@ -3530,12 +3525,29 @@ fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyO
     }
 }
 
-/// typeobject.py:735-736 — the `type(x)` shortcut: `type.__call__` skips
-/// __init__ when self is the `type` builtin, there are no keyword
-/// arguments, and exactly one positional argument (`type(x)` returns the
-/// class of x, already produced by __new__).
-fn type_call_type_x_shortcut(w_type: PyObjectRef, nargs: usize, no_kwargs: bool) -> bool {
-    no_kwargs && nargs == 1 && std::ptr::eq(w_type, crate::typedef::w_type())
+/// CPython 3.14 `type_call` / `type_vectorcall` — exact `type` owns the
+/// one-argument query form.  `type.__new__` itself accepts only the three
+/// class-construction arguments.
+fn type_call_special_case(
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+    has_kwargs: bool,
+) -> Option<PyResult> {
+    if !std::ptr::eq(w_type, crate::typedef::w_type()) {
+        return None;
+    }
+    if args.len() == 1 {
+        if has_kwargs {
+            return Some(Err(PyError::type_error(
+                "type() takes no keyword arguments",
+            )));
+        }
+        return Some(Ok(crate::builtins::type_of_object(args[0])));
+    }
+    if args.len() != 3 {
+        return Some(Err(PyError::type_error("type() takes 1 or 3 arguments")));
+    }
+    None
 }
 
 /// Pointer-based subtype check for descr_call __init__ guard — the MRO
@@ -4911,6 +4923,9 @@ fn type_descr_call_with_mode(
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
+    if let Some(result) = type_call_special_case(w_type, args, false) {
+        return result;
+    }
     check_type_instantiable(w_type)?;
     // Step 1: Look up __new__ via type MRO → allocate instance.
     // PyPy: typeobject.py descr_call → `w_newtype, w_newdescr =
@@ -4945,7 +4960,6 @@ fn type_descr_call_with_mode(
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
     if let Some(w_insttype) = type_call_init_type(current_instance(), w_type)
-        && !type_call_type_x_shortcut(w_type, args.len(), true)
         && let Some(init_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
     {

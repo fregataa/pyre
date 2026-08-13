@@ -9560,12 +9560,10 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     let union_args = unsafe { pyre_object::w_union_get_args(self_) };
     let newargs = crate::_pypy_generic_alias::subs_parameters(self_, union_args, params, items)?;
     if newargs.is_empty() {
-        // `if len(newargs) == 0: return UnionType(())` — unreachable for a
-        // real union (always ≥1 member), kept for parity.
-        return Ok(pyre_object::w_union_from_members(
-            Vec::new(),
-            pyre_object::w_tuple_new(vec![]),
-        ));
+        // Unreachable for a real union (always ≥1 member).  Route even this
+        // defensive branch through the authoritative builder; an empty union
+        // is rejected rather than manufacturing an object without partitions.
+        return crate::_pypy_generic_alias::union_from_items(&[]);
     }
     // `curr = newargs[0]; for i in range(1, len(newargs)): curr |= newargs[i]`.
     //
@@ -10697,6 +10695,77 @@ fn make_getset_property_full(
         false, // use_closure
         resolved_name,
     )
+}
+
+/// `_PyObject_IS_GC`: `Py_TPFLAGS_HAVE_GC` on the instance's type, refined by
+/// `tp_is_gc` where the type installs one.
+///
+/// This is a property of the type, not of the object's current collector
+/// state: `()` is untracked yet `sys.getsizeof` still charges it a
+/// `PyGC_Head`, because `tuple` carries the flag. Reading pyre's own GC
+/// ownership instead answers a different question — pyre's nursery owns
+/// `object()` and `b""`, which `object` and `bytes` never declare.
+pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
+    let Some(tp) = r#type(w_obj) else {
+        return false;
+    };
+    if !cpython_type_has_gc_flag(tp.as_ptr()) {
+        return false;
+    }
+    // `type_is_gc` is the only `tp_is_gc` in the builtin types, and it answers
+    // with `Py_TPFLAGS_HEAPTYPE`: a statically allocated type object is never
+    // collected, while one built by `type_new` is.
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return unsafe { pyre_object::w_type_is_heaptype(w_obj) };
+    }
+    true
+}
+
+/// Whether `w_type` declares `Py_TPFLAGS_HAVE_GC`.
+///
+/// A type carries the flag when its instances can hold a reference that joins
+/// a cycle, which is nearly all of them, so what is enumerated here is the
+/// complement: the scalars, the buffers and the singletons. `type_new` sets
+/// the flag on every heap type.
+///
+/// Two matches are needed because a builtin only gets its own Layout when it
+/// has a payload of its own. `int` and `bytes` do, so their layout identifies
+/// them; `NoneType` and `code` do not, and share the base instance layout with
+/// `function`, `generator`, the iterators and the dict views — all of which do
+/// declare the flag. Those are matched on the type object instead.
+fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        return false;
+    }
+    if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+        return true;
+    }
+    let same_type = |tp: &PyType| std::ptr::eq(w_type, gettypeobject(tp));
+    // `object` holds nothing; the singletons are one instance each; a code
+    // object's references are all reachable from the function that owns it;
+    // and both range iterators count, one in machine words and one in ints
+    // that cannot themselves reference anything.
+    if std::ptr::eq(w_type, w_object())
+        || same_type(&pyre_object::NONE_TYPE)
+        || same_type(&pyre_object::NOTIMPLEMENTED_TYPE)
+        || same_type(&pyre_object::ELLIPSIS_TYPE)
+        || same_type(&crate::pycode::CODE_TYPE)
+        || same_type(&pyre_object::functional::RANGE_ITER_TYPE)
+        || same_type(&pyre_object::functional::LONG_RANGE_ITER_TYPE)
+    {
+        return false;
+    }
+    let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
+    let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
+    !(is(&pyre_object::INT_TYPE)
+        || is(&pyre_object::LONG_TYPE)
+        || is(&pyre_object::BOOL_TYPE)
+        || is(&pyre_object::FLOAT_TYPE)
+        || is(&pyre_object::COMPLEX_TYPE)
+        || is(&pyre_object::STR_TYPE)
+        || is(&pyre_object::bytesobject::BYTES_TYPE)
+        || is(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
+        || is(&pyre_object::functional::RANGE_TYPE))
 }
 
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
@@ -19551,6 +19620,11 @@ pub(crate) fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             "object.__new__(X): X is not a type object ({name})"
         )));
     }
+    // CPython 3.14 `object_new`: calling `object.__new__(type)` cannot bypass
+    // a NULL `tp_new` / `Py_TPFLAGS_DISALLOW_INSTANTIATION`.  `type_call`
+    // performs the same check for ordinary `type()`, but the descriptor is
+    // independently callable as `type.__new__(type)`.
+    crate::call::check_type_instantiable(cls)?;
     // objectobject.py descr__new__ — surplus arguments are accepted only
     // when __new__ or __init__ is overridden; the bare object() takes
     // none.  A type that overrides __new__ but forwards excess args to
