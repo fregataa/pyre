@@ -175,146 +175,142 @@ fn parse_read_bb_and_local(msg: &str) -> Option<(usize, u64)> {
     Some((r, n))
 }
 
-/// Diagnostic: for each uninitialised-local
-/// lowering failure, classify whether processing blocks in
-/// reverse-postorder would bind the failing local before its read
-/// (forward-ref, fixable by traversal order alone, no phi) or whether the
-/// only `Assign` to the local reaches the reading block exclusively via a
-/// back-edge (genuine loop-carried value, needs a phi / block-inputarg).
-#[test]
-#[ignore = "diagnostic; set PYRE_MIR_STRESS_LLBC"]
-fn classify_uninitialised_local_rpo_vs_loop_carried() {
-    let Some(path) = stress_path() else {
-        eprintln!("skip: set PYRE_MIR_STRESS_LLBC");
-        return;
-    };
-    let llbc = Llbc::load(&path).expect("load stress llbc");
+/// The census's finder predicate, and the one duplicated literal here.
+///
+/// This spelling is a copy. `resolve_place` in `majit_translate`'s
+/// `front::mir` builds the failure message, and `is_known_lowering_gap`
+/// tests for this same substring to decide whether to re-lower the body in
+/// reverse-postorder. Neither is reachable from an integration test, so
+/// nothing in this file can arm the literal against its producer: if the
+/// driver's wording moves, this census reads 0 and that zero is a dead
+/// selector wearing the shape of a clean corpus. Stated rather than
+/// guarded — a guard here would only assert the copy against itself.
+const FINDER: &str = "uninitialised local";
 
-    let mut forward_ref = 0usize;
-    let mut loop_carried = 0usize;
-    let mut other = 0usize;
+/// Which bucket one uninitialised-local read falls into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UninitClass {
+    ForwardRef,
+    LoopCarried,
+    Unknown,
+}
 
-    for fd in llbc.iter_local_fns() {
-        if fd.is_global_initializer.is_some() {
-            continue;
+impl UninitClass {
+    fn label(self) -> &'static str {
+        match self {
+            UninitClass::ForwardRef => "forward-ref",
+            UninitClass::LoopCarried => "loop-carried",
+            UninitClass::Unknown => "unknown",
         }
-        let Some(body): Option<Unstructured> = fd.unstructured() else {
-            continue;
-        };
-        let Err(LowerError::Unsupported(msg)) = lower_fun_decl(&llbc, fd) else {
-            continue;
-        };
-        if !msg.contains("uninitialised local") {
-            continue;
-        }
-        let name = fd.item_meta.name_path();
-        let Some((read_bb, local_n)) = parse_read_bb_and_local(&msg) else {
-            eprintln!("PARSE-FAIL {name} | {msg}");
-            other += 1;
-            continue;
-        };
+    }
+}
 
-        let blocks = &body.body;
-
-        // (1) Every block that BINDS local N, i.e. seeds `local_var[N]`.
-        // The driver seeds the slot in two places:
-        //   * `lower_assign` on a *direct* `PlaceKind::Local(N)` Assign
-        //     statement (mir.rs:700), and
-        //   * the Call-terminator destination `CallPayload.dest` when it
-        //     is a direct `Local(N)` (mir.rs:1624).
-        // A *projection* write (`(*N).field = …`) presupposes N already
-        // bound and never seeds the slot — we record those separately for
-        // the detail string only.
-        let mut direct_assign_blocks: Vec<usize> = Vec::new();
-        let mut proj_assign_blocks: Vec<usize> = Vec::new();
-        for (bb_idx, blk) in blocks.iter().enumerate() {
-            let mut seeds = false;
-            let mut proj = false;
-            for st in &blk.statements {
-                if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind() {
-                    match &place.kind {
-                        PlaceKind::Local(i) if *i == local_n => seeds = true,
-                        PlaceKind::Projection(..)
-                            if place_base_local(&place.kind) == Some(local_n) =>
-                        {
-                            proj = true
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // Call-terminator destination — the dominant binding site for
-            // these failures (the local is the result of a fn call).
-            if let Ok(TermKind::Call { call, .. }) = blk.term() {
-                match &call.dest.kind {
+/// Bucket one `(read_bb, local_n)` uninitialised-local read against a
+/// body's CFG, returning the class and the human detail line.
+///
+/// Extracted from the census loop so that the census and its positive
+/// control run the SAME classifier: a control that re-implements the
+/// classification grades a second copy and says nothing about the one that
+/// produced the tally.
+fn classify_uninit_read(
+    blocks: &[BasicBlock],
+    read_bb: usize,
+    local_n: u64,
+) -> (UninitClass, String) {
+    // (1) Every block that BINDS local N, i.e. seeds `local_var[N]`.
+    // The driver seeds the slot in two places:
+    //   * `lower_assign` on a *direct* `PlaceKind::Local(N)` Assign
+    //     statement, and
+    //   * the Call-terminator destination `CallPayload.dest` when it is a
+    //     direct `Local(N)`.
+    // A *projection* write (`(*N).field = …`) presupposes N already bound
+    // and never seeds the slot — we record those separately for the detail
+    // string only.
+    let mut direct_assign_blocks: Vec<usize> = Vec::new();
+    let mut proj_assign_blocks: Vec<usize> = Vec::new();
+    for (bb_idx, blk) in blocks.iter().enumerate() {
+        let mut seeds = false;
+        let mut proj = false;
+        for st in &blk.statements {
+            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind() {
+                match &place.kind {
                     PlaceKind::Local(i) if *i == local_n => seeds = true,
-                    PlaceKind::Projection(..)
-                        if place_base_local(&call.dest.kind) == Some(local_n) =>
-                    {
+                    PlaceKind::Projection(..) if place_base_local(&place.kind) == Some(local_n) => {
                         proj = true
                     }
                     _ => {}
                 }
             }
-            if seeds {
-                direct_assign_blocks.push(bb_idx);
-            }
-            if proj {
-                proj_assign_blocks.push(bb_idx);
+        }
+        // Call-terminator destination — the dominant binding site for
+        // these failures (the local is the result of a fn call).
+        if let Ok(TermKind::Call { call, .. }) = blk.term() {
+            match &call.dest.kind {
+                PlaceKind::Local(i) if *i == local_n => seeds = true,
+                PlaceKind::Projection(..) if place_base_local(&call.dest.kind) == Some(local_n) => {
+                    proj = true
+                }
+                _ => {}
             }
         }
-        direct_assign_blocks.dedup();
-        proj_assign_blocks.dedup();
-
-        // (2)+(3) CFG: reverse-postorder + back-edge set from block 0.
-        let (rpo_index, back_edges) = rpo_and_back_edges(blocks);
-
-        // Classify against the *binding* (direct) assign blocks.
-        let read_rpo = rpo_index.get(read_bb).copied().unwrap_or(usize::MAX);
-
-        // Forward-ref signal A: at least one direct-assign block precedes
-        // the read block in reverse-postorder.
-        let mut rpo_precedes = false;
-        // Forward-ref signal B (stronger): at least one direct-assign
-        // block reaches the read block over forward edges only (never
-        // crossing a back-edge), i.e. on a non-loop path.
-        let mut forward_reaches = false;
-        for &ab in &direct_assign_blocks {
-            let ab_rpo = rpo_index.get(ab).copied().unwrap_or(usize::MAX);
-            if ab_rpo != usize::MAX && read_rpo != usize::MAX && ab_rpo < read_rpo {
-                rpo_precedes = true;
-            }
-            if reaches_without_backedge(blocks, ab, read_bb, &back_edges) {
-                forward_reaches = true;
-            }
+        if seeds {
+            direct_assign_blocks.push(bb_idx);
         }
+        if proj {
+            proj_assign_blocks.push(bb_idx);
+        }
+    }
+    direct_assign_blocks.dedup();
+    proj_assign_blocks.dedup();
 
-        let category;
-        let detail;
-        if direct_assign_blocks.is_empty() {
-            // No direct binding site at all (only projection writes, or
-            // none). RPO ordering cannot help; this is not a plain
-            // forward-ref. Treat as loop-carried/other and explain.
-            if proj_assign_blocks.is_empty() {
-                category = "unknown";
-                detail = format!(
+    // (2)+(3) CFG: reverse-postorder + back-edge set from block 0.
+    let (rpo_index, back_edges) = rpo_and_back_edges(blocks);
+
+    // Classify against the *binding* (direct) assign blocks.
+    let read_rpo = rpo_index.get(read_bb).copied().unwrap_or(usize::MAX);
+
+    // Forward-ref signal A: at least one direct-assign block precedes the
+    // read block in reverse-postorder.
+    let mut rpo_precedes = false;
+    // Forward-ref signal B (stronger): at least one direct-assign block
+    // reaches the read block over forward edges only (never crossing a
+    // back-edge), i.e. on a non-loop path.
+    let mut forward_reaches = false;
+    for &ab in &direct_assign_blocks {
+        let ab_rpo = rpo_index.get(ab).copied().unwrap_or(usize::MAX);
+        if ab_rpo != usize::MAX && read_rpo != usize::MAX && ab_rpo < read_rpo {
+            rpo_precedes = true;
+        }
+        if reaches_without_backedge(blocks, ab, read_bb, &back_edges) {
+            forward_reaches = true;
+        }
+    }
+
+    if direct_assign_blocks.is_empty() {
+        // No direct binding site at all (only projection writes, or none).
+        // RPO ordering cannot help; this is not a plain forward-ref.
+        if proj_assign_blocks.is_empty() {
+            (
+                UninitClass::Unknown,
+                format!(
                     "local {local_n} read at bb{read_bb} has NO Assign anywhere \
                      (direct or projection); cannot classify"
-                );
-                other += 1;
-            } else {
-                category = "loop-carried";
-                detail = format!(
+                ),
+            )
+        } else {
+            (
+                UninitClass::LoopCarried,
+                format!(
                     "local {local_n} read at bb{read_bb} has only projection-base \
                      writes at {proj_assign_blocks:?} (no direct Local({local_n}) \
                      Assign to seed local_var); RPO ordering cannot bind it"
-                );
-                loop_carried += 1;
-            }
-        } else if rpo_precedes || forward_reaches {
-            category = "forward-ref";
-            forward_ref += 1;
-            detail = format!(
+                ),
+            )
+        }
+    } else if rpo_precedes || forward_reaches {
+        (
+            UninitClass::ForwardRef,
+            format!(
                 "direct Assign(Local({local_n})) at blocks {direct_assign_blocks:?}; \
                  read at bb{read_bb}; RPO read-rank={read_rpo}; \
                  rpo_precedes={rpo_precedes} forward_reaches={forward_reaches} \
@@ -325,11 +321,12 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
                 } else {
                     format!("; proj-writes at {proj_assign_blocks:?}")
                 }
-            );
-        } else {
-            category = "loop-carried";
-            loop_carried += 1;
-            detail = format!(
+            ),
+        )
+    } else {
+        (
+            UninitClass::LoopCarried,
+            format!(
                 "direct Assign(Local({local_n})) at blocks {direct_assign_blocks:?}; \
                  read at bb{read_bb}; RPO read-rank={read_rpo}; back-edges={:?}; \
                  every assign-block reaches the read ONLY through a back-edge \
@@ -341,16 +338,320 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
                 } else {
                     format!("; proj-writes at {proj_assign_blocks:?}")
                 }
-            );
-        }
+            ),
+        )
+    }
+}
 
-        eprintln!("CLASSIFY [{category}] {name} | {detail}");
+/// Collapse an `Unsupported` reason to a stable family key: every run of
+/// ASCII digits becomes `#`, and the result is bounded. `bb12: read of MIR
+/// local 7 …` and `bb3: read of MIR local 40 …` therefore share one row,
+/// so the reason table counts SHAPES rather than instances.
+fn reason_family(msg: &str) -> String {
+    let mut out = String::new();
+    let mut last_digit = false;
+    for c in msg.chars() {
+        if out.len() >= 72 {
+            out.push('…');
+            break;
+        }
+        if c.is_ascii_digit() {
+            if !last_digit {
+                out.push('#');
+            }
+            last_digit = true;
+        } else {
+            last_digit = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Positive control for the census below: demonstrate that the classifier
+/// and its message parser CAN produce a non-zero bucket, on this corpus,
+/// through the same code the census runs.
+///
+/// A denominator alone does not make the tally readable — a walk that
+/// examines N functions and hands 0 to the classifier is still ambiguous
+/// unless something shows the classifier is capable of bucketing at all.
+/// This refuses (panics) rather than returning an uninterpretable zero:
+/// if no body in the corpus can arm it, the tally must not be reported.
+///
+/// It grades the INSTRUMENT, never the corpus: the subjects are synthesised
+/// `(read_bb, local)` pairs over a real body, so a green here says nothing
+/// about how many genuine uninitialised-local failures exist.
+fn arm_classifier(llbc: &Llbc) -> String {
+    // (1) The message parser, both directions, against literals.
+    let probe = "bb7: read of MIR local 42 before any Assign — \
+                 uninitialised local, not yet supported";
+    let unrelated = "bb7: a failure of some entirely different shape";
+    assert_eq!(
+        parse_read_bb_and_local(probe),
+        Some((7, 42)),
+        "control: the parser did not read (bb, local) out of a \
+         producer-shaped message — the census can classify nothing"
+    );
+    assert_eq!(
+        parse_read_bb_and_local(unrelated),
+        None,
+        "control: the parser accepted a message carrying no local read — \
+         its Some() would not be evidence"
+    );
+
+    // (2) The finder predicate, both directions, against the same pair.
+    // See FINDER: this arms the predicate against a literal of the
+    // producer's shape, NOT against the producer.
+    assert!(
+        probe.contains(FINDER),
+        "control: FINDER misses a producer-shaped message"
+    );
+    assert!(
+        !unrelated.contains(FINDER),
+        "control: FINDER matches an unrelated message"
+    );
+
+    // (3)+(4) The classifier itself, on a REAL body from this corpus.
+    for fd in llbc.iter_local_fns() {
+        let Some(body): Option<Unstructured> = fd.unstructured() else {
+            continue;
+        };
+        let blocks = &body.body;
+        if blocks.len() < 2 {
+            continue;
+        }
+        let (rpo_index, _back_edges) = rpo_and_back_edges(blocks);
+
+        // Discovery only: find a block that directly binds SOME local, and
+        // a block that follows it in reverse-postorder. The bucket itself
+        // is decided by `classify_uninit_read`, not here.
+        let mut found: Option<(usize, usize, u64)> = None;
+        'outer: for (a, blk) in blocks.iter().enumerate() {
+            if rpo_index[a] == usize::MAX {
+                continue;
+            }
+            let mut bound: Option<u64> = None;
+            for st in &blk.statements {
+                if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind() {
+                    if let PlaceKind::Local(i) = &place.kind {
+                        bound = Some(*i);
+                        break;
+                    }
+                }
+            }
+            if bound.is_none() {
+                if let Ok(TermKind::Call { call, .. }) = blk.term() {
+                    if let PlaceKind::Local(i) = &call.dest.kind {
+                        bound = Some(*i);
+                    }
+                }
+            }
+            let Some(n) = bound else { continue };
+            for r in 0..blocks.len() {
+                if rpo_index[r] != usize::MAX && rpo_index[r] > rpo_index[a] {
+                    found = Some((a, r, n));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((assign_bb, read_bb, local_n)) = found else {
+            continue;
+        };
+        let name = fd.item_meta.name_path();
+
+        // POSITIVE arm: a read placed after its binding block in RPO must
+        // bucket as forward-ref.
+        let (cls, detail) = classify_uninit_read(blocks, read_bb, local_n);
+        assert_eq!(
+            cls,
+            UninitClass::ForwardRef,
+            "control: a read of local {local_n} at bb{read_bb}, bound at \
+             bb{assign_bb} which precedes it in RPO, did not bucket as \
+             forward-ref in {name} | {detail}"
+        );
+
+        // NEGATIVE arm: a local nothing binds must NOT bucket as either
+        // named class, or the positive arm above is not discriminating.
+        let (absent_cls, _) = classify_uninit_read(blocks, read_bb, u64::MAX);
+        assert_eq!(
+            absent_cls,
+            UninitClass::Unknown,
+            "control: a local with no Assign anywhere bucketed as \
+             {} in {name} — the classifier is not discriminating",
+            absent_cls.label()
+        );
+
+        return format!(
+            "control ARMED on {name}: local {local_n} bound at bb{assign_bb}, \
+             read at bb{read_bb} => forward-ref; the same read of an unbound \
+             local => unknown"
+        );
     }
 
+    panic!(
+        "control UNARMED: no body in this corpus offers a direct local \
+         binding with an RPO-later block, so nothing demonstrates the \
+         classifier can bucket a subject — refusing to report a tally \
+         nobody can read"
+    );
+}
+
+/// Diagnostic: for each uninitialised-local
+/// lowering failure, classify whether processing blocks in
+/// reverse-postorder would bind the failing local before its read
+/// (forward-ref, fixable by traversal order alone, no phi) or whether the
+/// only `Assign` to the local reaches the reading block exclusively via a
+/// back-edge (genuine loop-carried value, needs a phi / block-inputarg).
+///
+/// The subject set is post-retry, which changes what the buckets mean.
+/// `lower_fun_decl` lowers linearly, and on a `LowerError::Unsupported`
+/// whose message satisfies `is_known_lowering_gap` — which is satisfied by
+/// exactly this census's [`FINDER`] substring — it re-lowers the whole body
+/// in `BlockOrder::ReversePostorder`. The retry's `?` propagates whatever
+/// that second attempt fails with, so a message reaching this census has
+/// already failed under BOTH block orders. Consequently a non-zero
+/// `forward_ref` is a DISAGREEMENT between this classifier and the driver
+/// (the classifier says RPO ordering binds the read; the driver ran RPO and
+/// it did not), never a subject waiting for an RPO fix.
+///
+/// The tally is therefore printed with its denominator: the filter ladder
+/// from local functions walked down to messages the finder matched, plus
+/// the family distribution of every `Unsupported` reason seen. Three zeros
+/// on a live `Err(Unsupported)` population and three zeros on an empty one
+/// are different readings, and the tally alone cannot tell them apart.
+#[test]
+#[ignore = "diagnostic; set PYRE_MIR_STRESS_LLBC"]
+fn classify_uninitialised_local_rpo_vs_loop_carried() {
+    let Some(path) = stress_path() else {
+        eprintln!("skip: set PYRE_MIR_STRESS_LLBC");
+        return;
+    };
+    let llbc = Llbc::load(&path).expect("load stress llbc");
+
+    // Arm the instrument BEFORE reporting anything it produces. This
+    // panics rather than returning if the classifier cannot be shown to
+    // bucket a subject on this corpus.
+    eprintln!("{}", arm_classifier(&llbc));
+
+    let mut forward_ref = 0usize;
+    let mut loop_carried = 0usize;
+    let mut other = 0usize;
+
+    // The filter ladder, so the three buckets sit on a stated population.
+    let mut walked = 0usize;
+    let mut skipped_global_init = 0usize;
+    let mut skipped_no_body = 0usize;
+    let mut lowered_ok = 0usize;
+    let mut err_not_found = 0usize;
+    let mut err_schema = 0usize;
+    let mut err_unsupported = 0usize;
+    let mut finder_matched = 0usize;
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+
+    for fd in llbc.iter_local_fns() {
+        walked += 1;
+        if fd.is_global_initializer.is_some() {
+            skipped_global_init += 1;
+            continue;
+        }
+        let Some(body): Option<Unstructured> = fd.unstructured() else {
+            skipped_no_body += 1;
+            continue;
+        };
+        let msg = match lower_fun_decl(&llbc, fd) {
+            Ok(_) => {
+                lowered_ok += 1;
+                continue;
+            }
+            Err(LowerError::FunctionNotFound(_)) => {
+                err_not_found += 1;
+                continue;
+            }
+            Err(LowerError::Schema(_)) => {
+                err_schema += 1;
+                continue;
+            }
+            Err(LowerError::Unsupported(msg)) => {
+                err_unsupported += 1;
+                *reasons.entry(reason_family(&msg)).or_insert(0) += 1;
+                msg
+            }
+        };
+        if !msg.contains(FINDER) {
+            continue;
+        }
+        finder_matched += 1;
+        let name = fd.item_meta.name_path();
+        let Some((read_bb, local_n)) = parse_read_bb_and_local(&msg) else {
+            eprintln!("PARSE-FAIL {name} | {msg}");
+            other += 1;
+            continue;
+        };
+
+        let (class, detail) = classify_uninit_read(&body.body, read_bb, local_n);
+        match class {
+            UninitClass::ForwardRef => forward_ref += 1,
+            UninitClass::LoopCarried => loop_carried += 1,
+            UninitClass::Unknown => other += 1,
+        }
+        eprintln!("CLASSIFY [{}] {name} | {detail}", class.label());
+    }
+
+    let bucketed = forward_ref + loop_carried + other;
+
     eprintln!("\n=== uninitialised-local classification tally ===");
-    eprintln!("forward_ref  (RPO-fixable, no phi): {forward_ref}");
-    eprintln!("loop_carried (needs phi/inputarg):  {loop_carried}");
-    eprintln!("other/unknown:                       {other}");
+    eprintln!("forward_ref  (classifier says RPO order binds it): {forward_ref}");
+    eprintln!("loop_carried (classifier says needs phi/inputarg): {loop_carried}");
+    eprintln!("other/unknown:                                     {other}");
+    eprintln!("--- bucketed total:                                {bucketed}");
+
+    eprintln!("\n=== denominator: the ladder those buckets sit on ===");
+    eprintln!("local fns walked:                {walked}");
+    eprintln!("  skipped, global initializer:   {skipped_global_init}");
+    eprintln!("  skipped, no Unstructured body: {skipped_no_body}");
+    eprintln!("  lowered Ok:                    {lowered_ok}");
+    eprintln!("  Err(FunctionNotFound):         {err_not_found}");
+    eprintln!("  Err(Schema):                   {err_schema}");
+    eprintln!("  Err(Unsupported):              {err_unsupported}");
+    eprintln!("    of which matched {:?}: {finder_matched}", FINDER);
+
+    let mut families: Vec<(&String, &usize)> = reasons.iter().collect();
+    families.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    const TOP: usize = 20;
+    eprintln!(
+        "\n=== Err(Unsupported) reason families \
+         (probe-set total {err_unsupported} over {} distinct families) ===",
+        families.len()
+    );
+    for (family, n) in families.iter().take(TOP) {
+        eprintln!("  {n:>6}  {family}");
+    }
+    if families.len() > TOP {
+        let elided: usize = families.iter().skip(TOP).map(|(_, n)| **n).sum();
+        eprintln!(
+            "  ({} further families elided, {elided} occurrence(s))",
+            families.len() - TOP
+        );
+    }
+
+    // Partition identities. Neither says anything about the corpus — both
+    // hold by construction — but they make a future `continue` added
+    // without a counter, or a matched message that falls out of the
+    // classifier entirely, loud rather than a silently shrunk denominator.
+    assert_eq!(
+        bucketed, finder_matched,
+        "every message the finder matched must land in exactly one bucket"
+    );
+    assert_eq!(
+        walked,
+        skipped_global_init
+            + skipped_no_body
+            + lowered_ok
+            + err_not_found
+            + err_schema
+            + err_unsupported,
+        "every walked function must land on exactly one ladder rung"
+    );
 }
 
 /// Classification of where a Call/Assert/Drop `on_unwind` target leads,
@@ -366,10 +667,10 @@ struct UnwindTally {
     /// How many `on_unwind` targets' goto-chains execute *any*
     /// non-trivial statement before reaching UnwindResume/Abort.
     real_work: usize,
-    /// How many of those non-trivial chains carry a `Drop` terminator
-    /// somewhere in the chain (destructor cleanup, the most common
-    /// "looks like work" case).
-    real_work_drop_in_chain: usize,
+    /// How many of those non-trivial chains are destructor cleanup: the
+    /// source terminator is a `Drop` and the chain does not end at a
+    /// `Call` or a `Return`.
+    real_work_destructor_cleanup: usize,
     /// fn::bb examples of real-work unwind chains (capped).
     examples: Vec<String>,
     /// Goto-chain length histogram (0 = on_unwind target is itself the
@@ -412,6 +713,13 @@ fn classify_unwind_chain(
 ) -> (&'static str, bool, bool, usize) {
     let mut cur = start_bb;
     let mut did_real_work = false;
+    // NOTE: this flag is only observable on the arms that keep WALKING.
+    // The `Call`, `Return` and `Switch` arms return the instant they are
+    // reached, so they hand back whatever it held before the walk stopped
+    // — structurally `false` for a zero-hop chain, whatever the source
+    // terminator was. Do not use it as an exemption predicate; the caller
+    // keys the exemption on the source terminator and the eventual, both
+    // of which it already knows.
     let mut drop_in_chain = false;
     let mut hops = 0usize;
     // Bound the walk so a malformed/cyclic chain can't hang the test.
@@ -507,10 +815,32 @@ fn mir_on_unwind_target_taxonomy() {
                 classify_unwind_chain(blocks, on_unwind as usize);
             *tally.eventual.entry(eventual).or_default() += 1;
             *tally.chain_len_hist.entry(chain_len).or_default() += 1;
+            // A `Drop` terminator's unwind edge IS the destructor-cleanup
+            // continuation — precisely what this exemption exists for —
+            // while a chain ending in a `Call` or a `Return` may be a
+            // handler, which is the thing the assertion below exists to
+            // catch. So exempt on the SOURCE terminator plus the eventual,
+            // never on `drop_in_chain`: that flag is written only while
+            // walking and is unreachable at the arms that return at once.
+            //
+            // `Switch` is the third case and it splits. `classify_unwind_chain`
+            // calls it "cleanup that inspects state", and inside drop glue that
+            // is what it is: dropping an array branches over its elements, and
+            // this corpus holds exactly one such chain
+            // (`<array>::<Impl>::drop_in_place`, measured). Outside drop glue a
+            // branch on the unwind path is the catch-like control flow the
+            // assertion below exists to catch, so the exemption is withheld
+            // there. Keying on the drop-glue symbol is a proxy; it is the one
+            // the corpus actually distinguishes, and a `Switch` appearing under
+            // any other name is reported rather than absorbed.
+            let in_drop_glue = fd.item_meta.name_path().contains("drop_in_place");
+            let destructor_cleanup = term_kind_label == "Drop"
+                && !matches!(eventual, "Call" | "Return")
+                && (eventual != "Switch" || in_drop_glue);
             if did_work {
                 tally.real_work += 1;
-                if drop_in_chain {
-                    tally.real_work_drop_in_chain += 1;
+                if destructor_cleanup {
+                    tally.real_work_destructor_cleanup += 1;
                 }
                 if tally.examples.len() < 40 {
                     tally.examples.push(format!(
@@ -549,12 +879,13 @@ fn mir_on_unwind_target_taxonomy() {
         tally.real_work
     );
     eprintln!(
-        "    of which carry a Drop (destructor) in the chain: {}",
-        tally.real_work_drop_in_chain
+        "    of which are destructor cleanup (Drop source, non-Call/Return \
+         eventual): {}",
+        tally.real_work_destructor_cleanup
     );
     eprintln!(
-        "    non-Drop real-work chains (genuine catch suspects): {}",
-        tally.real_work - tally.real_work_drop_in_chain
+        "    non-destructor real-work chains (genuine catch suspects): {}",
+        tally.real_work - tally.real_work_destructor_cleanup
     );
     if !tally.examples.is_empty() {
         eprintln!("\nreal-work examples (capped at 40):");
@@ -563,24 +894,23 @@ fn mir_on_unwind_target_taxonomy() {
         }
     }
 
-    // This test is observational: it never fails, it only prints the
-    // taxonomy. The decisive number to read is
-    // `non-Drop real-work chains` — if that is 0, every on_unwind path
-    // is a bare panic-propagation (UnwindResume/Abort) or pure
-    // destructor cleanup, and dropping it loses no try/except.
+    // The decisive number to read is `non-destructor real-work chains` —
+    // if that is 0, every on_unwind path is a bare panic-propagation
+    // (UnwindResume/Abort) or pure destructor cleanup, and dropping it
+    // loses no try/except.
     assert!(
         tally.total_call_terms > 0,
         "expected at least one Call/Assert/Drop terminator in the snapshot"
     );
-    // The decisive invariant — no on_unwind path does
-    // catch-like work (a Call/Switch/Return or a non-trivial statement)
+    // The decisive invariant — no on_unwind path does catch-like work (a
+    // Call/Return, a Switch outside drop glue, or a non-trivial statement)
     // other than pure destructor drop-glue. If this ever trips, the
     // corpus grew a Rust catch/cleanup that the front-graph driver would
     // silently drop, and the "drop on_unwind" adaptation must be revisited.
-    let non_drop_real_work = tally.real_work - tally.real_work_drop_in_chain;
+    let non_destructor_real_work = tally.real_work - tally.real_work_destructor_cleanup;
     assert_eq!(
-        non_drop_real_work, 0,
-        "found {non_drop_real_work} on_unwind chain(s) doing non-destructor \
+        non_destructor_real_work, 0,
+        "found {non_destructor_real_work} on_unwind chain(s) doing non-destructor \
          catch-like work; dropping on_unwind would lose semantics — see \
          examples above"
     );
@@ -707,20 +1037,9 @@ fn dump_lowering_signatures() {
                 None => {}
             }
             for link in &blk.exits {
-                // The remaining Variable-carrying Link fields,
-                // `last_exception` / `last_exc_value`, are the only other
-                // operands a rebind could touch.  The flat MIR driver
-                // never populates them (rtyper-stage fields), so the
-                // signature omits them — assert that invariant so the
-                // omission is provably safe rather than an oversight.
-                // `exitcase` / `llexitcase` are deliberately omitted too,
-                // but carry no Variable (pure MIR-switch constants,
-                // RPO-invariant), so they need no guard.
-                assert!(
-                    link.last_exception.is_none() && link.last_exc_value.is_none(),
-                    "MIR-built Link carries last_exception/last_exc_value; \
-                     signature() must label them"
-                );
+                // `exitcase` / `llexitcase` are deliberately omitted: they
+                // carry no Variable (pure MIR-switch constants,
+                // RPO-invariant), so they need no label.
                 s.push_str(&format!("->{:?}(", link.target));
                 for a in &link.args {
                     match a {
@@ -729,6 +1048,25 @@ fn dump_lowering_signatures() {
                     }
                 }
                 s.push(')');
+                // `last_exception` / `last_exc_value` are Variable-carrying
+                // Link fields a rebind can touch, so they are labelled like
+                // any other operand.  The flat MIR driver populates them:
+                // `lower_unstructured_with_static_addrs_and_attrs` runs
+                // `rewire_result_exc_call_sites`, `rewire_next_call_sites`
+                // and `rewire_checked_arith_call_sites`, and each assigns
+                // these fields on the exception exit it builds.  Omitting
+                // them would let a rebind of either move without moving
+                // the signature.
+                for (tag, arg) in [
+                    ("exc:", &link.last_exception),
+                    ("excv:", &link.last_exc_value),
+                ] {
+                    let Some(a) = arg else { continue };
+                    match a {
+                        LinkArg::Value(v) => s.push_str(&format!("{tag}{},", label(v.id()))),
+                        LinkArg::Const(_) => s.push_str(&format!("{tag}K,")),
+                    }
+                }
             }
             s.push(']');
         }

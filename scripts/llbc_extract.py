@@ -10,13 +10,17 @@ declared by the driver, so the engine stays neutral about which consumer
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +52,12 @@ class CrateSpec:
     - `excluded_deps`: path-dependency package names dropped from this crate's
       fingerprint because the artefact holds zero references to them; the
       extraction guard re-checks the artefact and fails loud if that drifts.
+      Naming a package drops its EXCLUSIVELY-REACHED SUBTREE too — anything
+      reachable only by going through it. A package some non-excluded parent
+      also reaches is kept, so listing a widely-shared package removes only
+      its own files. The guard checks the NAMED packages; the subtree is
+      covered by inheritance (see `_collect_inputs`), which is why the two
+      are not, and must not be, the same set.
     - `layout_targets`: target triples, besides the extraction host, this
       crate also emits a layout sidecar for (see `layout_sidecar_name`).
       `None` takes the driver's default; `()` opts out. Every listed target
@@ -88,6 +98,21 @@ class Engine:
     metadata_feature_crates: tuple[str, ...] = ()
     layout_targets: tuple[str, ...] = ()
     layout_target_rustflags: str = ""
+    # Files/directories a driver declares by hand because the git channel
+    # cannot carry them. Two kinds, and BOTH are hashed by content:
+    #
+    #   * outside `root` — the engine module itself, a sibling checkout. `git
+    #     ls-files` refuses a pathspec that leaves the repository.
+    #   * inside `root` but IGNORED — an uncommitted `.cargo/config.toml`, a
+    #     lockfile a repo gitignores. `_collect_inputs` resolves pathspecs
+    #     through `ls-files ∪ ls-files --others --exclude-standard`, and an
+    #     ignored file is in neither, so declaring it as a pathspec is inert.
+    #     `refuse_inert_pathspecs` names this field as the remedy, so keep it
+    #     accepting in-root paths: labels come from `os.path.relpath`, which
+    #     spells an in-root path without any `..`.
+    #
+    # Patched path deps need no declaration — `_collect_inputs` discovers those.
+    external_inputs: tuple[Path, ...] = ()
 
     def spec(self, crate: str) -> CrateSpec:
         try:
@@ -258,6 +283,19 @@ def metadata(
     args = [
         "cargo",
         "metadata",
+        # `--locked` because this call is reached from `--list-inputs`, which
+        # callers run as a read-only membership check before deciding whether
+        # a file they are about to edit is a fingerprint input. Without it
+        # `cargo metadata` refreshes `Cargo.lock` when the lock is out of
+        # date — and `Cargo.lock` is itself one of the inputs this driver
+        # fingerprints, so the check would edit the thing it is asked about.
+        # The hazard is conditional (a current lock makes it a no-op), which
+        # is the worse shape: it is harmless until it is not.
+        #
+        # A stale lock now fails loudly here instead of being silently
+        # updated. That is the intent: refreshing the lock is an action a
+        # caller should take deliberately, not one a query performs for them.
+        "--locked",
         "--format-version=1",
         "--filter-platform",
         platform,
@@ -370,10 +408,324 @@ def _reject_unresolvable_include(where: str, tail: str) -> None:
     )
 
 
-def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
+def refuse_inert_pathspecs(eng: Engine) -> None:
+    """Refuse a declared fingerprint input that cannot contribute anything.
+
+    A pathspec is an input only if git will list a file under it, because
+    `_collect_inputs` resolves the in-root channel through `git ls-files` and
+    nothing else. A pathspec matching zero files is therefore a silent no-op —
+    and a no-op that READS as coverage everywhere a human looks: in the
+    driver's list, in the comments that cite it, and in the design decisions
+    that rest on it. A driver carried `Cargo.lock` in exactly that state while
+    a comment eight lines above called it a declared input and used it to
+    justify skipping the more expensive `cargo metadata` walk, so the cheaper
+    option was resting on coverage that did not exist.
+
+    This lives in the ENGINE rather than in one driver because every consumer
+    of the engine has the same hole: the check was first written against one
+    driver's `BASE_PATHSPECS`, and each other driver kept the defect until it
+    grew its own copy. Refusing here catches the whole class at the one place
+    that resolves pathspecs, and it would have fired the day either known
+    offender was added.
+
+    Scope is the DECLARED pathspecs — `base_pathspecs`, and each spec's
+    `fingerprint_pathspecs`. The ones `_collect_inputs` discovers from `cargo
+    metadata` are facts about the build rather than a human's claim of
+    coverage, and refusing on those would fail a driver over a dependency's
+    layout it does not control. Every spec is checked, not only the crates
+    requested on this run: a pathspec that rots in a spec nobody asked for
+    today is then found on the next run, rather than the next time that one
+    crate happens to be extracted.
+
+    Git is the authority for this check. `Path.exists()` below feeds the
+    message and nothing else; do not replace the git query with it. An
+    ignored file EXISTS on disk and is invisible to `git ls-files`, which is
+    the entire defect. Filesystem-reachable and git-reachable are different
+    predicates, and a check that conflates them answers a question nobody
+    asked. (The defect is not `exists()`; it is using `exists()` to answer a
+    question about git. An `is_file()` test on a module about to be imported is
+    a genuine filesystem question and stays correct.)
+
+    Drivers may also declare `external_inputs`. Those inputs are hashed by
+    reading their bytes rather than through git, so filesystem existence is
+    the correct predicate for that separate channel. The authority must match
+    the channel that carries the input.
+
+    `ls-files ∪ ls-files --others --exclude-standard` is the definition of
+    git-reachable used here, matching `_collect_inputs` exactly. `ls-files
+    --error-unmatch` alone is TRACKED-only, and would call a brand-new unadded
+    file inert when the engine does hash it.
+
+    The two failure modes need different remedies, so they are reported apart:
+    a path that EXISTS but is ignored is a coverage hole, a path that does not
+    exist is a typo or a file that moved.
+    """
+
+    def git_lists(*args: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(eng.root), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return bool(result.stdout.strip())
+
+    declared: list[tuple[str, list[str]]] = [("base_pathspecs", eng.base_pathspecs)]
+    for name, spec in eng.specs.items():
+        if spec.fingerprint_pathspecs is not None:
+            declared.append(
+                (f"specs[{name!r}].fingerprint_pathspecs", spec.fingerprint_pathspecs)
+            )
+
+    inert: list[tuple[str, str, bool]] = []
+    for label, pathspecs in declared:
+        for pathspec in pathspecs:
+            # `--others` only when the tracked query came back empty: the live
+            # case is one subprocess per pathspec instead of two, and this runs
+            # on every invocation including the `--check` a build script makes.
+            if git_lists("ls-files", "--", pathspec):
+                continue
+            if git_lists("ls-files", "--others", "--exclude-standard", "--", pathspec):
+                continue
+            inert.append((label, pathspec, (eng.root / pathspec).exists()))
+    if not inert:
+        return
+
+    lines = ["extract-llbc.py: declared fingerprint pathspecs that match no file:"]
+    for label, pathspec, on_disk in inert:
+        if on_disk:
+            lines.append(
+                f"  {label}: {pathspec!r} — EXISTS on disk but git will not list"
+                f" it (ignored?), so it contributes nothing to the fingerprint."
+                f" Either stop declaring it or cover it another way — an"
+                f" out-of-root or ignored file goes in `external_inputs=`,"
+                f" which is hashed by content; do not leave it here reading as"
+                f" coverage."
+            )
+        else:
+            lines.append(
+                f"  {label}: {pathspec!r} — does not exist. Renamed, moved, or a"
+                f" typo: whatever it was meant to fingerprint is now"
+                f" unfingerprinted."
+            )
+    raise SystemExit("\n".join(lines))
+
+
+def _package_closure(
+    target_ids: list[str],
+    by_id: dict,
+    resolve_nodes: dict,
+    exclude: set[str],
+) -> list[dict]:
+    """Path-dependency packages reachable from `target_ids` avoiding `exclude`.
+
+    Pure graph reachability over cargo-metadata shapes: `by_id` maps package id
+    to package, and `resolve_nodes` maps package id to its resolve node. Kept
+    separate from `_collect_inputs` so `--self-test` can drive it on a synthetic
+    graph. A fingerprint with extra files still compares equal to itself, so a
+    real repository cannot expose an over-inclusive walk.
+
+    The exclusion is applied here, in the walk, and not in the emission loop
+    in `_collect_inputs` — excluding a package drops its whole EXCLUSIVELY-
+    REACHED SUBTREE, not just its own files.
+
+    `continue` before appending is what makes it a subtree drop: the node is
+    neither emitted nor traversed. A package a non-excluded parent also reaches
+    is still pushed from that parent, so this computes "reachable by a path
+    avoiding every excluded package" — which is the property the safety
+    argument below needs, and it holds regardless of pop order. Both halves are
+    load-bearing and `--self-test`'s diamond case checks them together: drop
+    what only the excluded package reaches, keep what something else does.
+
+    Do not widen `extract`'s artefact guard to transitively dropped packages.
+    The guard searches for the explicitly excluded package's symbol, but a
+    transitive dependency may have no symbol that can serve as a positive
+    control. Its absence instead follows from the checked parent's absence: a
+    package reachable only through that parent cannot appear without it.
+    """
+    seen: set[str] = set()
+    stack = list(target_ids)
+    closure = []
+    while stack:
+        package_id = stack.pop()
+        if package_id in seen:
+            continue
+        seen.add(package_id)
+        package = by_id[package_id]
+        if package["name"] in exclude:
+            continue
+        closure.append(package)
+
+        for dep in resolve_nodes.get(package_id, {}).get("deps", []):
+            dep_kinds = dep.get("dep_kinds", [])
+            # An empty `dep_kinds` is a normal (non-dev) edge; only drop deps
+            # whose every listed kind is `dev`.
+            if dep_kinds and all(kind.get("kind") == "dev" for kind in dep_kinds):
+                continue
+            dep_package = by_id.get(dep["pkg"])
+            if dep_package is not None and dep_package.get("source") is None:
+                stack.append(dep_package["id"])
+    return closure
+
+
+def nested_repo_entries(entries: list[str]) -> list[str]:
+    """`--others` entries git reported as directories instead of descending.
+
+    `git ls-files --others` walks an ordinary untracked directory and lists the
+    FILES in it. At a directory holding its own `.git` it stops, and emits the
+    DIRECTORY, with a trailing slash. So a trailing slash in that output is
+    git's own statement that it did not look inside.
+
+    Keyed on the slash rather than on an `is_dir()` probe because the slash is
+    the producer's record of what it did, where a filesystem call re-derives a
+    guess about it — and the two can disagree while a build runs.
+
+    Measured, git 2.50.1, all under one covered pathspec: a nested repo with
+    commits and one freshly `git init`ed both carry the slash; an ordinary
+    untracked directory of sources, a directory whose files are all ignored, an
+    empty directory, and an ignored nested repo produce no directory entry at
+    all. The benign shapes are the ones that matter here — this refusal is
+    fail-closed, so a predicate that flagged any new module directory would
+    stop every extraction in the repository.
+    """
+    return sorted(entry for entry in entries if entry.endswith("/"))
+
+
+def refuse_nested_repos(entries: list[str]) -> None:
+    """Refuse when a nested repository sits under a fingerprinted pathspec.
+
+    Not a conservative over-hash like the untracked leg above it: this is the
+    one shape where the fingerprint is WRONG rather than merely wide. The
+    directory entry enters the input list, `source_fingerprint` finds it is not
+    a file, and it hashes through the `<deleted>` branch — one constant token.
+    Editing, adding, or deleting files inside such a repository leaves the
+    digest byte-identical. The stamp would then claim to cover a path whose
+    contents cannot move it, and that digest is also the CI cache key.
+
+    Refusing rather than recursing is the direction the untracked leg's own
+    argument points: it prefers a cost that is always a re-extraction over an
+    answer that is sometimes wrong. Recursing would mean deciding what a nested
+    repository's commit means for a source hash, which is a larger question
+    than this guard needs to answer.
+    """
+    nested = nested_repo_entries(entries)
+    if not nested:
+        return
+    # Each parenthesised pair is ONE message line: without the parentheses a
+    # dropped comma reads exactly like the wrapping, and would silently join two
+    # lines of the refusal into one.
+    lines = [
+        (
+            "extract-llbc.py: a nested git repository sits under a fingerprinted"
+            " pathspec:"
+        ),
+        *(f"    {entry}" for entry in nested),
+        "",
+        (
+            "`git ls-files --others` does not descend into one, so every file"
+            " inside is"
+        ),
+        (
+            "absent from `source=` while the directory itself hashes to a single"
+            " constant"
+        ),
+        (
+            "token — the digest does not move when those contents change, grow, or"
+            " are"
+        ),
+        "deleted outright. The stamp would claim a coverage it does not have.",
+        "",
+        (
+            "Move it outside the fingerprinted pathspecs, or add it to"
+            " `.gitignore`"
+        ),
+        "(an ignored nested repo is excluded here and is not compiled either).",
+        (
+            "Registering it as a SUBMODULE does not fix this: a gitlink arrives on"
+            " the"
+        ),
+        (
+            "tracked leg, carries no trailing slash, and hashes through the same"
+            " branch."
+        ),
+    ]
+    raise SystemExit("\n".join(lines))
+
+
+_inputs_cache: dict[tuple, tuple[list[str], list[Path]]] = {}
+
+
+def forget_collected_inputs() -> None:
+    """Drop the memoised input sets, because the tree they describe has moved.
+
+    The memo below answers "what does this crate compile" for a tree as it was
+    when the walk ran, so anything in this process that CHANGES the tree has to
+    call this before the next walk reads it. Two do, and each would otherwise
+    get a stale answer at exactly the moment it needs a fresh one: `extract`,
+    whose whole post-build re-hash exists to catch a tree that moved while
+    Charon ran, and `self_test`, whose probe file exists precisely to move the
+    input set.
+    """
+    _inputs_cache.clear()
+
+
+def _collect_inputs(
+    eng: Engine, crates: list[str], cargo_features: str
+) -> tuple[list[str], list[Path]]:
+    """Split the fingerprint's inputs by which channel can carry them.
+
+    Returns `(pathspecs, external)`:
+
+    * `pathspecs` — repo-relative, resolved through `git ls-files` below, so
+      the working tree (including untracked-not-ignored files) is what gets
+      hashed.
+    * `external` — absolute paths the git channel cannot carry: anything
+      outside `eng.root`, which `git ls-files` refuses to name at all, plus
+      whatever a driver declares in `external_inputs` (which is also how an
+      in-root but IGNORED file gets covered). Hashed by content instead, by
+      `external_fingerprint`.
+
+    The second list used to be dropped on the floor. The dependency walk below
+    admits path deps by `source is None`, which is how cargo spells BOTH an
+    in-tree workspace member and a `[patch]` redirect into a sibling checkout —
+    so a patched dependency was discovered, found to be out-of-root, and
+    discarded with no diagnostic. An out-of-tree consumer that patches a
+    dependency to a sibling workspace has this shape, including proc-macro
+    crates whose expansions become part of the extracted item bodies.
+
+    `majit-macros` is a proc macro, so its expansion IS the extracted crate's
+    item bodies. It was dropped by TWO independent gates, and finding the
+    first hid the second: this out-of-root discard, and the target-kind filter
+    below, which admitted neither `proc-macro` nor `cdylib` until it was
+    inverted into a deny-list. Both are fixed; do not read that as the class
+    being closed, since each was found only after the previous one was.
+
+    Memoised, because none of this is cheap: two `git ls-files` subprocesses per
+    call plus `include_closure`, which reads the text of every `.rs` input. One
+    `extract` of one crate reaches here five times — twice through `stamp_for`,
+    then the provenance closure, `window_writes` and the post-build digest — and
+    `--fingerprint` twice, under a caller-imposed budget (120s in
+    `pyre-jit-trace/build.rs`) past which freshness degrades to UNKNOWN for
+    every crate. The key spells out the engine fields this walk reads, except
+    the SPEC TABLE, which the crate names stand for: `run_cli` builds one
+    Engine from a driver's specs and nothing edits them afterwards.
+    `forget_collected_inputs` is how a caller that moved the tree says so.
+    """
+    key = (
+        str(eng.root),
+        eng.metadata_feature_crates,
+        tuple(eng.base_pathspecs),
+        eng.external_inputs,
+        eng.layout_targets,
+        tuple(crates),
+        cargo_features,
+    )
+    if key in _inputs_cache:
+        return _inputs_cache[key]
+
     root = eng.root
     target_names: list[str] = []
     pathspecs = list(eng.base_pathspecs)
+    external: list[Path] = [Path(p).resolve() for p in eng.external_inputs]
 
     for crate in crates:
         spec = eng.spec(crate)
@@ -423,46 +775,39 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
                     "extract-llbc.py: unknown crate(s): " + ", ".join(sorted(missing))
                 )
 
-            seen: set[str] = set()
-            stack = [by_name[name]["id"] for name in target_names]
-            closure = []
-            while stack:
-                package_id = stack.pop()
-                if package_id in seen:
-                    continue
-                seen.add(package_id)
-                package = by_id[package_id]
-                # Apply the exclusion in the walk, not after it. This drops a
-                # package's exclusively-reached subtree as well as the named
-                # package. A node also reachable from a non-excluded parent is
-                # still pushed along that path and therefore remains present.
-                # The extracted artefact guard certifies the named package's
-                # absence; a subtree that has no path avoiding that package
-                # cannot occur without it.
-                if package["name"] in exclude:
-                    continue
-                closure.append(package)
-
-                for dep in resolve_nodes.get(package_id, {}).get("deps", []):
-                    dep_kinds = dep.get("dep_kinds", [])
-                    # An empty `dep_kinds` is a normal (non-dev) edge; only
-                    # drop deps whose every listed kind is `dev`.
-                    if dep_kinds and all(
-                        kind.get("kind") == "dev" for kind in dep_kinds
-                    ):
-                        continue
-                    dep_package = by_id.get(dep["pkg"])
-                    if dep_package is not None and dep_package.get("source") is None:
-                        stack.append(dep_package["id"])
+            closure = _package_closure(
+                [by_name[name]["id"] for name in target_names],
+                by_id,
+                resolve_nodes,
+                exclude,
+            )
 
             for package in closure:
                 package_dir = Path(package["manifest_path"]).resolve().parent
                 if package_dir.is_relative_to(root):
                     rel_dir = package_dir.relative_to(root).as_posix()
                     pathspecs.append(f"{rel_dir}/Cargo.toml")
+                else:
+                    external.append(package_dir / "Cargo.toml")
                 for target in package["targets"]:
                     kinds = set(target["kind"])
-                    if not ({"lib", "bin", "custom-build"} & kinds):
+                    # This is a deny-list so new library-like target kinds are
+                    # admitted by default. The old allow-list omitted
+                    # `proc-macro` and `cdylib`; proc-macro expansions are
+                    # inlined into consuming crates, so their sources must be
+                    # fingerprinted.
+                    #
+                    # The package loop above appends `Cargo.toml` BEFORE this
+                    # loop runs, which is what made the omission invisible: the
+                    # dropped crate still showed up in `--list-inputs`, so it
+                    # read as covered while none of its sources were hashed.
+                    #
+                    # Naming what is NOT compiled into the artefact is a short,
+                    # closed list; naming what IS grows silently with every
+                    # crate type cargo adds. Getting this wrong now costs a
+                    # re-extraction, never a wrong answer — the same direction
+                    # the untracked-file leg below is deliberately biased in.
+                    if kinds & {"example", "test", "bench"}:
                         continue
                     src_path = Path(target["src_path"]).resolve()
                     if src_path.is_relative_to(root):
@@ -470,40 +815,209 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
                         pathspecs.append(rel_src)
                         if "custom-build" not in kinds:
                             pathspecs.append(str(Path(rel_src).parent) + "/")
+                    else:
+                        # Same shape as the in-root arm, one channel over: the
+                        # entry point always, its directory only for a real
+                        # target. A `custom-build`'s src_path is the crate's
+                        # own `build.rs`, so its parent is the CRATE ROOT —
+                        # walking that would pull in `target/` and every
+                        # sibling target's sources.
+                        external.append(src_path)
+                        if "custom-build" not in kinds:
+                            external.append(src_path.parent)
 
-    # git is the enumerator, but the index is not the input set: Charon and
-    # rustc read the working tree, so a source file that is on disk and not yet
-    # added belongs in the digest. `--cached` alone leaves it out, and a crate
-    # extracted while one of its files was untracked then fingerprints as fresh
-    # against sources the artefact was never built from — staging that same
-    # file later flips the identical bytes to STALE.
+    def ls_files_raw(*extra_flags: str) -> list[str]:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", *extra_flags, "--", *pathspecs],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return [raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw]
+
+    def ls_files(*extra_flags: str) -> set[Path]:
+        # `Path()` normalises the trailing slash away, so a caller that needs to
+        # tell a directory entry from a file entry must read `ls_files_raw`.
+        # That erasure is why the nested-repo blindness was invisible here.
+        return {Path(entry) for entry in ls_files_raw(*extra_flags)}
+
+    # Charon reads the working tree, so include untracked, non-ignored files.
+    # Keep the raw spelling until nested repositories have been rejected:
+    # converting a directory entry to `Path` erases its trailing slash.
     #
-    # `--exclude-standard` is what keeps the generated trees out. Everything it
-    # drops under these pathspecs today is produced by a build —
-    # `majit/charon-corpus/{target/,Cargo.lock}` and `pyre/check.snap/` — and
-    # nothing a crate compiles.
-    result = subprocess.run(
-        [
-            "git",
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            *pathspecs,
-        ],
-        cwd=root,
-        check=True,
-        stdout=subprocess.PIPE,
-    )
-    files = {
-        Path(raw.decode("utf-8"))
-        for raw in result.stdout.split(b"\0")
-        if raw
-    }
+    others = ls_files_raw("--others", "--exclude-standard")
+    refuse_nested_repos(others)
+    files = ls_files() | {Path(entry) for entry in others}
     files |= include_closure(root, files)
-    return sorted(files, key=lambda path: path.as_posix())
+    result = (sorted(files, key=lambda path: path.as_posix()), external)
+    _inputs_cache[key] = result
+    return result
+
+
+def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
+    """Repo-relative inputs hashed into `source=`."""
+    return _collect_inputs(eng, crates, cargo_features)[0]
+
+
+def external_input_groups(
+    eng: Engine, crates: list[str], cargo_features: str
+) -> list[tuple[str, list[tuple[str, Path]]]]:
+    """Out-of-root inputs GROUPED by the root that declared or discovered them.
+
+    `[(root label, [(file label, absolute path), …]), …]`, sorted by root label
+    and, within a root, by file label.
+
+    Deliberately NOT named `external_inputs`: that is the driver-facing keyword
+    of `run_cli`, and a parameter of that name shadows the module-level
+    function for the whole body.
+
+    The group, not the file and not the whole set, is the unit `external=`
+    records a digest for, and that choice is the only reason `check` can name a
+    mover. One digest over every out-of-root file fires identically whether a
+    doc comment moved in a crate the artefact barely references or
+    `majit-macros` did — a proc macro whose expansion IS the extracted crate's
+    item bodies, so its movement voids every measurement already read out of
+    the artefact. Same remedy (`--force`), very different consequence, and a
+    single digest cannot tell them apart. Per-file reporting is the other
+    extreme and becomes unreadable for a large declared closure.
+
+    Roots are deduped by label — the metadata walk runs once per layout
+    platform and rediscovers the same packages — but files are NOT deduped
+    across roots. `<crate>/src/lib.rs` and `<crate>/src/` are both roots the
+    walk emits, so an edit to `lib.rs` moves both, and that pair of movers is
+    the narrowing a reader wants rather than noise.
+
+    The label — not the absolute path — is what enters the digest, so two
+    checkouts of the same layout in different directories agree. Labels are
+    relative to the artefact root, so a stamp survives relocating a group of
+    sibling repositories as a unit. It does not survive rearranging them
+    relative to each other, which is correct because that changes which
+    sources are compiled.
+
+    Directories are expanded here rather than at collection time so the walk
+    sees the working tree at hashing time, matching `source=`'s
+    save-not-commit behaviour for the in-root half.
+    """
+    _, roots = _collect_inputs(eng, crates, cargo_features)
+
+    def label_for(path: Path) -> str:
+        return Path(os.path.relpath(path, eng.root)).as_posix()
+
+    groups: dict[str, list[tuple[str, Path]]] = {}
+    for entry in roots:
+        root_label = label_for(entry)
+        if root_label in groups:
+            continue
+        if entry.is_dir():
+            found: dict[str, Path] = {}
+            for sub in entry.rglob("*"):
+                # `target/` is build output and dot-dirs are VCS/tooling state;
+                # neither is a compiler input, and `target/` alone is tens of GB.
+                parts = set(sub.relative_to(entry).parts[:-1])
+                if "target" in parts or any(p.startswith(".") for p in parts):
+                    continue
+                if sub.is_file():
+                    found[label_for(sub)] = sub
+            groups[root_label] = sorted(found.items())
+        else:
+            # A file, or a declared root that does not exist. The absent case
+            # still gets a group, so it moves the digest when it appears —
+            # exactly as a deleted tracked file does in `source=`.
+            groups[root_label] = [(root_label, entry)]
+    return sorted(groups.items())
+
+
+def external_group_digest(root_label: str, files: list[tuple[str, Path]]) -> str:
+    """Digest of one out-of-root group.
+
+    The root label is folded in first so an EMPTY group (a declared directory
+    holding no file the filter admits) still gets a digest of its own rather
+    than colliding with every other empty group.
+    """
+    digest = hashlib.sha256()
+    digest.update(root_label.encode("utf-8"))
+    digest.update(b"\0")
+    for label, path in files:
+        digest.update(label.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes() if path.is_file() else b"<absent>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def external_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
+    """`external=`'s stamp value: one `<root label>=<digest>` per group.
+
+    Empty is the common case (a consumer whose whole dependency closure lives
+    inside its own repo, which is every pyre crate today) and it is spelled as
+    an empty value rather than a digest-of-nothing, so the stamp says plainly
+    that nothing outside the repo was folded in.
+
+    `shlex.quote` per entry, space-separated: a root label is a filesystem path
+    and may hold a space or a quote, and the value has to survive as ONE line
+    of a line-oriented stamp. `parse_external` is the inverse.
+
+    One stamp KEY, not one key per root. `STAMP_KEYS` is a fixed schema and
+    `check` refuses a stamp missing any member of it; deriving the key set from
+    the very declaration whose movement is under test would mean a dropped
+    input takes its own coverage assertion with it, and "the field is gone"
+    would read the same as "there was never such a field".
+    """
+    groups = external_input_groups(eng, crates, cargo_features)
+    return " ".join(
+        shlex.quote(f"{root_label}={external_group_digest(root_label, files)}")
+        for root_label, files in groups
+    )
+
+
+def parse_external(value: str) -> dict[str, str]:
+    """Split an `external=` stamp value into `{root label: digest}`.
+
+    Inverse of `external_fingerprint`'s encoding. `rpartition`, not `partition`:
+    a label may contain `=`, and the hex digest that follows never does.
+    """
+    entries: dict[str, str] = {}
+    for token in shlex.split(value):
+        label, sep, digest = token.rpartition("=")
+        if sep:
+            entries[label] = digest
+    return entries
+
+
+def external_diff(crate: str, recorded: str, expected: str) -> list[str]:
+    """Name WHICH out-of-root input moved, rather than printing two digests.
+
+    `external=` carries one digest per root precisely so this can be written.
+    With a single digest there is nothing to say here beyond "something outside
+    the repo changed" — a guard that fires without informing, which is the
+    shape this field is structured to avoid.
+    """
+    was = parse_external(recorded)
+    now = parse_external(expected)
+    lines: list[str] = []
+    for label in sorted(set(was) | set(now)):
+        if label not in now:
+            lines.append(
+                f"{crate}: external: {label!r} is no longer a declared input, "
+                f"but the artefact was built with it folded in"
+            )
+        elif label not in was:
+            lines.append(
+                f"{crate}: external: {label!r} is an input the artefact never "
+                f"covered"
+            )
+        elif was[label] != now[label]:
+            lines.append(f"{crate}: external: {label!r} changed")
+    if not lines:
+        # The packed values differ while every root agrees: an encoding this
+        # engine did not write, or a reordering. Reporting nothing here would
+        # turn a mismatch into a silent pass.
+        lines.append(
+            f"{crate}: external: {recorded!r} does not match {expected!r} "
+            f"although every root agrees — the value was not written by this "
+            f"engine"
+        )
+    return lines
 
 
 def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
@@ -549,6 +1063,19 @@ def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> s
         full_path = eng.root / path
         if full_path.is_file():
             digest.update(full_path.read_bytes())
+        elif full_path.exists():
+            # A directory in the input list is never a source file. Hashing it
+            # below would fold it to one constant token that no edit inside it
+            # can move — the nested-repo defect, and equally a registered
+            # submodule, which `refuse_nested_repos` cannot see because a
+            # gitlink arrives tracked and unslashed.
+            raise SystemExit(
+                "extract-llbc.py: a fingerprint input is a DIRECTORY, not a"
+                f" file:\n    {path.as_posix()}\n"
+                "Hashing it would record one constant token for the whole"
+                " subtree.\nIf it is a submodule or a nested repository, move"
+                " it out of the\nfingerprinted pathspecs or ignore it."
+            )
         else:
             # The `--cached` half of the enumeration includes tracked paths
             # deleted in the working tree. A deletion is part of the source
@@ -656,8 +1183,366 @@ def stamp_for(
             f"layout_flags={' '.join(layout_flags)}",
             f"layout_rustflags={eng.layout_target_rustflags}",
             f"source={source_fingerprint(eng, [crate], cargo_features)}",
+            # Inputs `source=` structurally cannot cover: everything outside
+            # this repo. Kept as its own field rather than folded into
+            # `source=` so `check`'s per-field diff can say WHICH side moved —
+            # "your own sources changed" and "a patched dependency in another
+            # checkout changed" call for different actions, and collapsing
+            # them would repeat the mistake this field exists to fix.
+            f"external={external_fingerprint(eng, [crate], cargo_features)}",
         ]
     )
+
+
+# Every field `stamp_for` writes, in order. A stamp that does not carry all of
+# them was not written by this engine — or was truncated mid-write — and the
+# comparison in `check` would then quietly skip whatever is absent.
+STAMP_KEYS = (
+    "crate",
+    "platform",
+    "charon",
+    "fingerprint_schema",
+    "extraction_abi",
+    "features",
+    "flags",
+    "charon_flags",
+    "layout_targets",
+    "layout_flags",
+    "layout_rustflags",
+    "source",
+    "external",
+)
+
+
+def parse_stamp(text: str) -> dict[str, str]:
+    """Split a stamp into its `key=value` fields.
+
+    Only used to replay `features=` and to render a readable per-field diff;
+    the verdict in `check` is an exact text comparison, so a line this drops
+    (blank, or without a `=`) still fails the check.
+    """
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key] = value
+    return fields
+
+
+def file_mtime(path: Path) -> str:
+    return datetime.datetime.fromtimestamp(path.stat().st_mtime).isoformat(
+        timespec="seconds"
+    )
+
+
+# Provenance records what the repository looked like around the build. It is
+# stored beside the artefact, reported by `check`, and never used as a gate.
+#
+# This does not go in the fingerprint stamp and must not be moved there.
+# Two independent reasons, either one sufficient:
+#
+#   * `check` compares the stamp as exact text and already has an arm for a
+#     stamp that "carries content this engine did not write". Extra lines in
+#     the stamp file are a REFUSAL, not extra information.
+#   * a commit sha moves on EVERY commit, including the overwhelming majority
+#     that touch nothing this artefact reads. A git field inside a compared
+#     stamp would report every artefact stale after every unrelated commit,
+#     which deletes the entire point of a content-addressed fingerprint —
+#     `source=` exists precisely so that an unrelated commit does not force a
+#     re-extraction.
+#
+# So the two files answer different questions and are kept apart on purpose:
+# the stamp answers "is this artefact current", the provenance answers "what
+# was going on when it was built". Only the first is allowed to fail a build.
+#
+# The first sidecars this code writes describe a tree that contains this
+# CODE, and that is not an anomaly. This file is one of the engine sources
+# listed in every driver's base pathspecs, so it is hashed into `source=` for
+# EVERY crate: editing it re-stales all artefacts by construction, and the only
+# run that can produce a provenance sidecar is one made from a tree that
+# already holds the change. Committing before extracting is therefore not a
+# nicety — it is what makes that first sidecar read `dirty_in_closure=0`. Run
+# it the other way round and the change lists ITSELF as an in-closure dirty
+# file, which is the correct report and looks like a defect.
+#
+# More generally, a nonzero
+# `dirty_in_closure` IS A REPORT, NOT A DEFECT. An extraction is normally
+# batched into a window several people's work lands in, so a sidecar routinely
+# names files somebody else was editing. What it tells you is narrow and worth
+# saying exactly: `source=` hashes the WORKING TREE, so the artefact is correct
+# FOR THAT TREE and is not reproducible from any commit. Kill such a run only
+# if commit-reproducible artefacts are what you came for; the freshness
+# question was already answered, by the stamp, and the answer was yes.
+def git_head(root: Path) -> str:
+    """`HEAD`'s sha, or a LABELLED reason it is unavailable.
+
+    Never raises, and never returns the empty string. An unlabelled blank would
+    read as "no commit" when it means "could not ask", and those call for
+    opposite reactions from whoever reads the sidecar.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return "unavailable(git-not-runnable)"
+    if result.returncode != 0:
+        return "unavailable(rev-parse-failed)"
+    return result.stdout.decode("utf-8", errors="replace").strip() or "unavailable(empty)"
+
+
+def git_dirty(root: Path) -> tuple[str, list[tuple[str, str]]]:
+    """`(status, [(porcelain XY, path), …])` for the worktree at `root`.
+
+    `-uall` is load-bearing. The default collapses an untracked directory into
+    a single `?? dir/` entry, while the fingerprint's own untracked leg
+    (`git ls-files --others --exclude-standard`) works per FILE. Classifying a
+    directory against a set of files would report `?? majit/examples/new/` as
+    outside the closure while every file under it is inside it — the one
+    reading a person would act on, inverted.
+
+    The status is returned separately rather than folded into an empty list,
+    because "the tree is clean" and "git could not be asked" both produce no
+    entries and demand opposite reactions.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "-z", "-uall"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return "unavailable(git-not-runnable)", []
+    if result.returncode != 0:
+        return "unavailable(status-failed)", []
+
+    fields = result.stdout.decode("utf-8", errors="replace").split("\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if not entry:
+            continue
+        # Porcelain v1 spends exactly two columns on the status and one on the
+        # separator, so slice rather than split: a path may itself begin with a
+        # space, and `-z` means it is not quoted to hide that.
+        code, path = entry[:2], entry[3:]
+        # An `R`/`C` entry spends a SECOND NUL-separated field on the original
+        # path. Not consuming it re-reads that path as a status code and mints
+        # a junk entry — and, worse, shifts every entry after it by one.
+        if "R" in code or "C" in code:
+            if index < len(fields):
+                path = f"{path} (from {fields[index]})"
+                index += 1
+        entries.append((code, path))
+    return "ok", entries
+
+
+# Ceiling on the per-file `dirty=` listing. Not a ceiling on the COUNTS, which
+# stay exact however far past this the tree is.
+DIRTY_LINE_LIMIT = 200
+
+
+def provenance_for(
+    *,
+    crate: str,
+    head_before: str,
+    head_after: str,
+    started: str,
+    finished: str,
+    dirty_status: str,
+    dirty: list[tuple[str, str]],
+    dirty_before: int | None,
+    closure: set[str],
+) -> str:
+    """The provenance sidecar's text: the HEAD pair, and dirt CLASSIFIED.
+
+    Both halves exist because each detects a distinct failure.
+
+    `head_before`/`head_after` are a pair because a build that straddles a
+    commit is only visible as one. A single post-hoc `rev-parse` records the
+    later revision and hides that source changed while the artefact was built.
+
+    Every dirty path is classified against this crate's own fingerprint
+    closure, because the bare porcelain is not actionable: three files dirty
+    during an extraction is a run to kill if they are inputs and a non-event if
+    they are not, and only the classification distinguishes those. A reader
+    handed the unclassified list has to reconstruct the closure by hand, which
+    is the step nobody takes.
+
+    `in-closure` covers the in-root half only. The out-of-root inputs
+    `external=` hashes live in sibling checkouts this `git status` never sees,
+    so `outside` means "not an input from this repository", never "cannot
+    affect the artefact".
+
+    A `dirty=` line is `<XY> <where> <path>` with the field widths FIXED at the
+    front: `value[:2]` is the porcelain status, `value[3:]` is
+    `<where> <path>`. Splitting the whole value on whitespace does not work and
+    the reason is easy to miss — a porcelain code is two columns of which
+    either may be a SPACE (` M`, `A `), so ` M in-closure x.rs` splits into an
+    empty first field. Positions, not separators.
+    """
+    lines = [
+        f"crate={crate}",
+        f"head_before={head_before}",
+        f"head_after={head_after}",
+        f"started={started}",
+        f"finished={finished}",
+        f"dirty_status={dirty_status}",
+    ]
+    # A count, not a second list: the pre-build snapshot is here for the same
+    # reason the HEAD pair is — so a tree that moved during the build is
+    # legible — and repeating the whole listing to say so would bury the one
+    # that describes the stamped state.
+    #
+    # This is the complete unclassified porcelain output. `dirty_in_closure` and
+    # `dirty_outside` below are a partition of a LATER snapshot, so the only
+    # valid comparison is against their SUM; reading `dirty_before` against
+    # either half alone compares a total to a part. And the two are SUPPOSED to
+    # be free to differ — that difference is the whole instrument, and making
+    # them agree would delete it.
+    lines.append(
+        f"dirty_before={'unknown' if dirty_before is None else dirty_before}"
+    )
+    classified = [
+        (code, path, "in-closure" if path in closure else "outside")
+        for code, path in dirty
+    ]
+    in_closure = [entry for entry in classified if entry[2] == "in-closure"]
+    outside = [entry for entry in classified if entry[2] == "outside"]
+    # COUNTS ARE ALWAYS EXACT; only the per-file listing is bounded. `-uall`
+    # asks git to expand untracked directories file by file, so a single
+    # untracked tree of generated files could otherwise write a sidecar of
+    # unbounded size into `build/`. In-closure entries are listed first and
+    # never dropped: they are the actionable set, and a truncation that ate
+    # them would remove the only lines anyone acts on.
+    lines.append(f"dirty_in_closure={len(in_closure)}")
+    lines.append(f"dirty_outside={len(outside)}")
+    shown = in_closure + outside[: max(0, DIRTY_LINE_LIMIT - len(in_closure))]
+    # Always written, including as `0`, so a reader never has to decide what an
+    # absent key meant.
+    lines.append(f"dirty_omitted={len(classified) - len(shown)}")
+    for code, path, where in shown:
+        lines.append(f"dirty={code} {where} {path}")
+    return "\n".join(lines)
+
+
+def parse_provenance(text: str) -> tuple[dict[str, str], list[str]]:
+    """`({single-valued key: value}, [dirty line, …])`.
+
+    `dirty=` repeats, so it is returned as its own list; collapsing it into the
+    dict would keep the last entry and silently report one dirty file where
+    there were thirty.
+    """
+    fields: dict[str, str] = {}
+    dirty: list[str] = []
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        if key == "dirty":
+            dirty.append(value)
+        else:
+            fields[key] = value
+    return fields, dirty
+
+
+def dirty_report_lines(fields: dict[str, str], in_closure: list[str]) -> list[str]:
+    """The dirty half of `report_provenance`'s output, as text.
+
+    Split out from the printer so `--self-test` can drive it. Both conditional
+    lines below are SILENT on a healthy sidecar — the delta is zero and nothing
+    is omitted — so a run against the real tree cannot tell a correct branch
+    from a dead one, and every sidecar this repository has ever written is
+    healthy in exactly that way. Keeping it a pure function also keeps the
+    self-test off the disk, for the reason `self_test_exclusion_diamond` gives.
+
+    Two moments, on two lines. Printed as one line with the pre-build count in a
+    parenthetical, this reads as a single measurement whose parts should sum,
+    and it silently mixes three bases: a stamp-time in-closure count, a
+    stamp-time outside count, and a pre-build UNCLASSIFIED whole-tree total.
+    That reading is what has to be prevented — the numbers were never wrong, and
+    a disagreement between the moments is the instrument, not a fault.
+    """
+    at_stamp_in = fields.get("dirty_in_closure", "?")
+    at_stamp_out = fields.get("dirty_outside", "?")
+    before = fields.get("dirty_before", "?")
+    lines = [
+        f"    dirty when stamped: {at_stamp_in} in this crate's closure,"
+        f" {at_stamp_out} outside",
+        f"    dirty before the build: {before} (whole tree, unclassified)",
+    ]
+    # Computed, not left to the reader to do in their head. The two TOTALS are
+    # comparable — `dirty_before` and `in_closure + outside` are both whole
+    # porcelain — and it is the naive comparison against one HALF, or against a
+    # count of the rows below, that is invalid. Silent at zero, and silent when
+    # `dirty_before` is `unknown`, which is not the same as zero.
+    if at_stamp_in.isdigit() and at_stamp_out.isdigit() and before.isdigit():
+        delta = int(at_stamp_in) + int(at_stamp_out) - int(before)
+        if delta:
+            lines.append(
+                f"    ⇒ the tree MOVED during the build: {delta:+d} dirty"
+                " path(s) between the two snapshots — the pair exists to say so"
+            )
+    # The `dirty=` rows are a bounded DISPLAY while the counts above are exact,
+    # so counting the rows is not a check on the counts. Said here because the
+    # bound lives in the writer and no reader of this output would find it.
+    omitted = fields.get("dirty_omitted", "0")
+    if omitted not in ("0", "?"):
+        lines.append(
+            f"      WARNING: {omitted} further dirty path(s) not listed — do not count"
+            " the rows, the counts above are the exact ones"
+        )
+    lines.extend(f"      {entry}" for entry in in_closure)
+    return lines
+
+
+def report_provenance(dest: Path) -> None:
+    """Print an artefact's provenance. Returns nothing and gates nothing.
+
+    Absence is not a staleness signal. Every
+    artefact extracted before this sidecar existed lacks it, and so does every
+    artefact copied in from elsewhere; refusing on that would turn a reporting
+    aid into a second, weaker freshness gate answering a question `source=`
+    already answers properly.
+
+    The in-closure dirty entries are printed in full and the outside ones only
+    counted, because that is the asymmetry the classification exists to
+    express: an input dirty during the build is the thing to act on, and a
+    hundred unrelated edits are the noise that hid it.
+    """
+    path = dest.with_suffix(dest.suffix + ".provenance")
+    if not path.exists():
+        print(
+            "    no provenance sidecar (predates it, or was written by another"
+            " tool) — not a staleness signal"
+        )
+        return
+    fields, dirty = parse_provenance(path.read_text())
+    before, after = fields.get("head_before", "?"), fields.get("head_after", "?")
+    if before == after:
+        print(f"    built at HEAD {before}, {fields.get('started', '?')}")
+    else:
+        # Said plainly rather than as a warning: the artefact may be perfectly
+        # current — `source=` is content-addressed and does not care which
+        # commit the tree sat on. What a straddle costs is the ability to name
+        # ONE tree this artefact came from.
+        print(f"    WARNING: built across a commit: {before} -> {after}")
+    status = fields.get("dirty_status", "?")
+    if status != "ok":
+        print(f"    dirty state at build time: {status} — neither clean nor known")
+        return
+    # Positional, per `provenance_for`: the status occupies two fixed columns,
+    # so the classification starts at offset 3. A substring test would also
+    # match a PATH that happened to contain the word.
+    in_closure = [entry for entry in dirty if entry[3:].startswith("in-closure ")]
+    for line in dirty_report_lines(fields, in_closure):
+        print(line)
 
 
 def crate_layout_targets(eng: Engine, spec: CrateSpec) -> list[str]:
@@ -755,6 +1640,81 @@ def ensure_charon_std(charon_bin: Path, targets: list[str], root: Path) -> None:
             )
 
 
+def touch_and_note(target: Path, own_writes: dict[tuple[int, int], int]) -> None:
+    """`touch` a path and record the mtime that touch produced.
+
+    Every touch of a closure input must go through this rather than
+    `Path.touch()`. `window_writes` tells the extractor's own writes from a
+    peer's by comparing against the exact mtime recorded here, so a touch that
+    is not recorded is reported as a candidate on every clean run. Repeated
+    false positives would make the report unactionable.
+
+    Pairing the write with its record in ONE call is what keeps them from
+    drifting. There are already two touch sites (the crate root before the
+    charon build, and again before each cross-target layout build), the second
+    is easy to miss, and the failure it causes is a permanent false positive
+    rather than an error.
+
+    Keyed by `(st_dev, st_ino)` rather than by path so it cannot be defeated by
+    two spellings of one file, and in nanoseconds because `st_mtime` is a float
+    whose rounding makes exact equality unreliable.
+    """
+    target.touch()
+    st = target.stat()
+    own_writes[(st.st_dev, st.st_ino)] = st.st_mtime_ns
+
+
+def window_writes(
+    inputs: list[Path],
+    root: Path,
+    lo_ns: int,
+    hi_ns: int,
+    own_writes: dict[tuple[int, int], int],
+) -> tuple[list[tuple[int, Path]], int, list[str]]:
+    """Closure inputs written while this crate was being extracted.
+
+    The stamp comparison beside this one is an ENDPOINT check: it hashes the
+    tree before the build and again after. That is blind to the write that
+    matters most — an edit that opens and closes INSIDE the build re-converges,
+    so both hashes agree, `git status` and `git diff` are clean, and the
+    artefact is stamped over a tree that briefly was not the one it names.
+
+    A restore is itself a write, so mtime lands inside the window even when the
+    bytes came back. That is the only channel that retains the event, and it
+    retains it for a short time: mtime holds ONE value, so the next ordinary
+    write destroys it. That is why this runs here, in the producer, at the
+    moment the window closes — a sweep run later is not a weaker version of
+    this check, it silently answers a different question.
+
+    Returns `(candidates, covered, unresolved)`. `candidates` is the word on
+    purpose: this names files, never an author.
+
+    KNOWN LIMITS, printed by the caller rather than filed elsewhere:
+      * An mtime-preserving restore (`cp -p`) defeats it completely.
+      * A write that landed before this crate's own `touch` of the same file is
+        overwritten by that touch and cannot be seen.
+      * It has never produced a real-world true positive; it is proven to fire
+        on a constructed edit-and-restore only.
+    """
+    candidates: list[tuple[int, Path]] = []
+    unresolved: list[str] = []
+    for rel in inputs:
+        try:
+            st = (root / rel).stat()
+        except OSError as exc:
+            # Reported, never skipped silently: an input the sweep could not
+            # read is a hole in its own denominator.
+            unresolved.append(f"{rel.as_posix()} ({exc.strerror})")
+            continue
+        if not lo_ns <= st.st_mtime_ns <= hi_ns:
+            continue
+        if own_writes.get((st.st_dev, st.st_ino)) == st.st_mtime_ns:
+            continue  # the extractor's own touch, to the nanosecond
+        candidates.append((st.st_mtime_ns, rel))
+    candidates.sort()
+    return candidates, len(inputs) - len(unresolved), unresolved
+
+
 def extract(eng: Engine, args: argparse.Namespace) -> None:
     cargo_features = eng.cargo_features
     platform_key, charon_dest, charon_bin = charon_paths(eng.charon_root)
@@ -767,6 +1727,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
 
     dest_dir = llbc_dest(eng.out_dir, eng.root)
     charon_stamp = charon_version(charon_dest)
+    unstamped: list[str] = []
     env = os.environ.copy()
     prepend_msvc_link(env)
 
@@ -780,6 +1741,20 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     # rustc), so this never thrashes the runtime build's cache, and the LLBC is
     # independent of debuginfo so the artefact is byte-identical.
     env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
+    # The dev profile enables incremental compilation, which splits a crate into
+    # codegen units and reuses object files from the previous session. Charon
+    # drives rustc for the crates it extracts while plain rustc builds the rest,
+    # and the two disagree about which CGUs are still valid: the resulting
+    # archive fuses objects from different sessions, so CGU-local symbols
+    # (`...drop_in_place...llvm.<hash>`) are referenced by one object and
+    # defined in none. The failure surfaces far from its cause, as
+    # `Undefined symbols for architecture arm64` while LINKING the
+    # `pyre-jit-trace` BUILD SCRIPT, which is a host binary and therefore the
+    # first thing in the graph that has to resolve real code out of
+    # `libmajit_translate`. The tell is that the `.rcgu.o` files named in the
+    # linker error carry a different session tag than the loose ones on disk.
+    # Extraction only needs MIR, so incremental buys nothing here.
+    env["CARGO_INCREMENTAL"] = "0"
     # Dependency build scripts run while Charon extracts a target crate. They
     # must not recursively demand the very LLBC artefact currently being
     # produced (pyre-jit -> pyre-jit-trace -> pyre-jit.ullbc). Consumers may
@@ -835,7 +1810,31 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             and stamp_path.read_text() == stamp + "\n"
         ):
             print(f"=== skipping {crate} -> {dest} (fingerprint unchanged) ===")
+            # No provenance is written here on purpose. The sidecar describes
+            # the artefact, and the artefact is the one the previous run built:
+            # re-stamping it with the current HEAD would claim this checkout produced
+            # bytes it did not.
             continue
+
+        # The stamp certifies the exact artefact bytes from the previous
+        # successful extraction. This run may replace those bytes before any
+        # of the validation below fails, so the old certificate must stop
+        # being publishable before Charon can write to `dest`.
+        stamp_path.unlink(missing_ok=True)
+
+        # Opening half of the provenance pair, taken before the Charon build
+        # that is about to run for minutes. See `provenance_for`.
+        head_before = git_head(eng.root)
+        started = datetime.datetime.now().isoformat(timespec="seconds")
+        # The window is opened from THIS process's clock, not from an
+        # argument: a bound supplied by a caller is a bound nobody can
+        # check, and a guessed one reads exactly like a measured one.
+        window_lo_ns = time.time_ns()
+        own_writes: dict[tuple[int, int], int] = {}
+        dirty_status_before, dirty_entries_before = git_dirty(eng.root)
+        dirty_before = (
+            len(dirty_entries_before) if dirty_status_before == "ok" else None
+        )
 
         print(f"=== extracting {crate} -> {dest} ===")
         # Charon writes the `.ullbc` only while rustc actually compiles
@@ -850,7 +1849,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         crate_root = path / "src" / "lib.rs"
         if not crate_root.exists():
             crate_root = path / "src" / "main.rs"
-        crate_root.touch()
+        touch_and_note(crate_root, own_writes)
 
         host_env = {**env, **host_config_env}
         command = [
@@ -895,7 +1894,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     layout_env.get("RUSTFLAGS", "") + " " + eng.layout_target_rustflags
                 ).strip()
             full = sidecar.with_suffix(sidecar.suffix + ".full")
-            crate_root.touch()
+            touch_and_note(crate_root, own_writes)
             subprocess.run(
                 [
                     str(charon_bin),
@@ -920,6 +1919,57 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             write_layout_sidecar(full, sidecar)
             full.unlink()
             print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
+        # Every walk from here on reports on the tree AFTER the builds above,
+        # so the memoised pre-build input sets are dropped first. The three
+        # readers below — the provenance closure, `window_writes` and the
+        # post-build digest — exist to see a tree that moved while Charon ran,
+        # and an input set carried over from before it would hide exactly the
+        # movement they are looking for. They still share one walk with each
+        # other, which is the intent.
+        forget_collected_inputs()
+
+        # Closing half of the provenance pair, and the sidecar write.
+        #
+        # This precedes the two guards below, both of which can end the run,
+        # because the artefact at `dest` has ALREADY been rewritten by the
+        # Charon build above. The invariant worth holding is "the provenance
+        # beside an artefact describes the bytes in it" — leaving the write
+        # until after the guards would, on a guard failure, leave the previous
+        # run's provenance sitting beside this run's bytes, which is the same
+        # lie the skip path is careful not to tell.
+        #
+        # It is also the reason this is not gated: an artefact the stamp
+        # refuses is exactly the one whose provenance a reader needs.
+        head_after = git_head(eng.root)
+        finished = datetime.datetime.now().isoformat(timespec="seconds")
+        dirty_status, dirty_entries = git_dirty(eng.root)
+        closure = {
+            path.as_posix()
+            for path in fingerprint_inputs(eng, [crate], cargo_features)
+        }
+        provenance_path = dest.with_suffix(dest.suffix + ".provenance")
+        provenance_path.write_text(
+            provenance_for(
+                crate=crate,
+                head_before=head_before,
+                head_after=head_after,
+                started=started,
+                finished=finished,
+                dirty_status=dirty_status,
+                dirty=dirty_entries,
+                dirty_before=dirty_before,
+                closure=closure,
+            )
+            + "\n"
+        )
+        if head_after != head_before:
+            print(
+                f"    NOTE: HEAD moved during this build"
+                f" ({head_before[:11]} -> {head_after[:11]}); recorded in"
+                f" {provenance_path.name}. Whether that matters is answered by"
+                f" the source-hash check below, not by this line."
+            )
+
         # Guard the fingerprint exclusion (CrateSpec.excluded_deps): a package
         # dropped from this crate's fingerprint must not appear in its artefact,
         # else a later edit to that package would silently serve a stale cache.
@@ -934,11 +1984,655 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     f" — its source now affects this artefact, so the artefact"
                     f" must re-extract when it changes."
                 )
+        # `stamp` was computed at the top of this iteration, BEFORE the charon
+        # build that has just run for minutes. If the tree moved in between it
+        # names a source hash this artefact was not built from, and the wrong
+        # direction is a RETURN to the stamped state — a reverted edit, a branch
+        # switched back — where `check` then reports FRESH over an artefact
+        # built from other sources. Re-stamping with the post-build value would
+        # be equally untrue: the artefact straddles both trees and belongs to
+        # neither, and a stamp that looks authoritative is worse than none.
+        # Sited BEFORE the stamp decision so it reports on both branches:
+        # when the stamp is refused, "the tree moved" is exactly when a reader
+        # wants the file names, and when it is accepted this is the only check
+        # that saw the middle of the window at all.
+        moved, covered, unresolved = window_writes(
+            fingerprint_inputs(eng, [crate], cargo_features),
+            eng.root,
+            window_lo_ns,
+            time.time_ns(),
+            own_writes,
+        )
+        print(
+            f"    window writes: {len(moved)} candidate(s) over {covered} of"
+            f" {covered + len(unresolved)} closure inputs"
+        )
+        for _, rel in moved:
+            print(f"        {rel.as_posix()}")
+        for line in unresolved:
+            print(f"        UNRESOLVED {line}")
+        if moved:
+            print(
+                "      Those paths were written while this artefact was being"
+                " built. Candidates, not an accusation, and blind to an"
+                " mtime-preserving restore."
+            )
+        if source_fingerprint(eng, [crate], cargo_features) != parse_stamp(stamp)["source"]:
+            stamp_path.unlink(missing_ok=True)
+            unstamped.append(crate)
+            print(
+                f"    REFUSING to stamp {dest.name}: the tree moved during its"
+                f" build, so no source hash describes this artefact. Left"
+                f" unstamped — reported as freshness UNKNOWN, not as fresh."
+            )
+            continue
         stamp_path.write_text(stamp + "\n")
         print(f"    wrote {dest} ({dest.stat().st_size} bytes)")
 
     print()
+    if unstamped:
+        raise SystemExit(
+            "extract-llbc.py: the tree moved while extracting "
+            + ", ".join(unstamped)
+            + ".\n  Those artefacts are written but deliberately unstamped."
+            "\n  Re-run with --force once the tree is quiet."
+        )
     print(f"all extractions complete. artefacts under: {dest_dir}")
+
+
+def check(eng: Engine, args: argparse.Namespace) -> None:
+    """Refuse an artefact whose stamp does not match the tree it sits beside.
+
+    `extract` already computes this comparison — it is the `skipping <crate>
+    (fingerprint unchanged)` test — but only a caller who runs the extractor
+    ever benefits from it. A consumer that opens `<out_dir>/<crate>.ullbc` as
+    found gets whatever was last written there, and a stale artefact does not
+    fail: it answers, in detail, about sources that no longer exist. So this is
+    the same comparison, run by the consumer, reported through the exit status.
+    Nonzero means DO NOT READ the artefact.
+
+    Every way of reaching the end WITHOUT having compared the stamp against a
+    freshly computed one is a refusal, not a pass: an absent stamp, an empty
+    stamp, a stamp missing fields. Treating "nothing to compare" as "nothing
+    wrong" is what makes a gate decorative — a harness reads the exit status,
+    not the output.
+
+    Two things are deliberately not gated, and one is simply not covered here
+    — the list is written out because an incomplete "what this does not check"
+    reads as a complete one, which is the same shape as an allow-list that
+    silently omits a member:
+
+      * `features=` is replayed out of the stamp rather than compared. The
+        stamp records the configuration the artefact was built under, and the
+        question here is whether the artefact is current FOR that
+        configuration; comparing it against this process's `CARGO_FEATURES`
+        would refuse a byte-correct artefact whenever the caller left the
+        default in place. Replaying keeps `flags=`, `charon_flags=`,
+        `layout_flags=`, `source=` and `external=` real comparisons — all
+        five are recomputed from the replayed value. (`external=` belongs on
+        that list because the dependency walk it feeds off is itself run
+        per feature set, so a feature that pulls in a patched path dep
+        changes which out-of-root inputs exist.)
+      * artefact and stamp mtimes are printed, never gated. `extract` writes
+        both in one pass, and the source digest already answers the question a
+        timestamp only approximates.
+      * the `excluded_deps` exclusion is not re-asked here, and MOSTLY DOES NOT
+        NEED TO BE — do not add a second checker without reading this first.
+        `extract` re-reads the artefact and refuses if a NAMED excluded
+        package is referenced by it; `stamp_path.write_text` is the
+        stamp's ONLY writer and sits immediately after that guard, so a
+        violation raises before any stamp exists. A matching stamp is therefore
+        the guard's certificate: it could only have been written by an
+        extraction the guard passed. The skip path inherits this — it fires on
+        `stamp == recorded`, and that recorded stamp had the same provenance.
+        The oracle discriminates rather than being vacuous: `majit_translate`
+        occurs 373 times in `pyre-jit.ullbc`, which excludes nothing, and 0
+        times in `pyre-interpreter.ullbc`, which excludes it.
+
+        Three narrow things the certificate does NOT carry:
+
+          - it does not distinguish "the guard passed" from "the guard was
+            vacuous". A spec with empty `excluded_deps` runs an empty loop and
+            writes an indistinguishable stamp.
+          - it does not cover the exclusively reached subtree the exclusion
+            also drops, and widening the loop to cover it would be worse
+            than leaving it uncovered, because the guard's power is per
+            symbol. A transitively dropped package may have no matching symbol
+            in any artefact, so no artefact can serve as its positive control.
+            The subtree is instead certified by inheritance: the walk drops a
+            package only when every path to it runs through
+            an excluded one, and the named package's absence is checked
+            here, so a package that cannot appear without it cannot appear.
+          - `--force` re-extracts with the skip bypassed, and an excluded
+            package's sources changing is BY CONSTRUCTION invisible to
+            `source=`. So a forced run can write a violating artefact, raise at
+            the guard, and leave the previous stamp in place still matching the
+            tree — after which this function passes. It fails loud once, at the
+            forced extraction, and is silent on every check after. (Read from
+            the code path, not reproduced: reproducing it needs a real
+            extraction. The half that IS demonstrated is that `check` never
+            looks at artefact content — a stamp-matching fixture holding
+            arbitrary bytes passes.)
+
+    Nothing here re-extracts. Re-extraction runs a whole-crate Charon build and
+    writes into the working tree, so it stays a human's scheduling decision and
+    the refusal names the command instead. No cost figure is quoted anywhere in
+    this function: what it costs depends on how warm the cargo cache is, and a
+    number carried over from one cold run reads as measured when it is not.
+    `LLBC_DEST` points the check at a directory other than the driver's default,
+    which is what a caller who must not disturb the live artefacts uses.
+
+    Exit 0 has to be EARNED, never fallen into. `verified` records the crates
+    that positively matched, and the epilogue refuses unless every requested
+    crate is in it — so an empty crate list, or any future branch that forgets
+    to file a failure, refuses instead of reporting success by default.
+    """
+    platform_key, charon_dest, _ = charon_paths(eng.charon_root)
+    charon_stamp = charon_version(charon_dest)
+    dest_dir = llbc_dest(eng.out_dir, eng.root)
+    # `crates` is what was requested, and the epilogue's `unaccounted` check
+    # depends on it staying that way. Rebuilding this list from resolved specs
+    # would drop a name the loop could not process before the epilogue ever saw
+    # it, turning "this crate was never confirmed" back into silent success.
+    crates = args.crates or eng.default_crates
+
+    stale: list[str] = []
+    verified: set[str] = set()
+    # Feature set to re-extract each crate under: the one its stamp records, so
+    # a mixed set does not collapse into one wrong remedy command. A crate whose
+    # stamp never got read keeps this process's feature set.
+    stamped_features: dict[str, str] = {crate: eng.cargo_features for crate in crates}
+
+    for crate in crates:
+        spec = eng.spec(crate)
+        dest = dest_dir / spec.output_name
+        stamp_path = dest.with_suffix(dest.suffix + ".fingerprint")
+        print(f"=== checking {crate} -> {dest} ===")
+
+        if not dest.exists():
+            stale.append(f"{crate}: no artefact at {dest}")
+            continue
+        if dest.stat().st_size == 0:
+            stale.append(
+                f"{crate}: artefact {dest} is 0 bytes — Charon aborted before "
+                f"writing it"
+            )
+            continue
+        print(f"    artefact {dest.stat().st_size} bytes, mtime {file_mtime(dest)}")
+        # Before the stamp arms, all of which can `continue`. Provenance is
+        # most useful on exactly the paths that refuse.
+        report_provenance(dest)
+
+        for target in crate_layout_targets(eng, spec):
+            sidecar = dest_dir / spec.layout_sidecar_name(target)
+            if not sidecar.exists() or sidecar.stat().st_size == 0:
+                stale.append(
+                    f"{crate}: {target} layout sidecar {sidecar} is missing or "
+                    f"empty — field offsets for that target would be read out "
+                    f"of the extraction host's layouts"
+                )
+
+        if not stamp_path.exists():
+            stale.append(
+                f"{crate}: no fingerprint stamp at {stamp_path} — the artefact "
+                f"records nothing about the sources it came from, so there is "
+                f"nothing to compare it against"
+            )
+            continue
+        stamp_bytes = stamp_path.read_bytes()
+        if not stamp_bytes:
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} is 0 bytes — it "
+                f"records no source digest, so it cannot match the tree"
+            )
+            continue
+        text = stamp_bytes.decode("utf-8", errors="replace")
+        if not text.strip():
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} holds only whitespace"
+            )
+            continue
+        print(f"    stamp {len(stamp_bytes)} bytes, mtime {file_mtime(stamp_path)}")
+
+        recorded = parse_stamp(text)
+        missing = [key for key in STAMP_KEYS if key not in recorded]
+        if missing:
+            # Order matters: the LIKELIEST cause is listed first, and it is the
+            # one the two original guesses both excluded. Adding a key to
+            # STAMP_KEYS makes EVERY stamp already on disk land here at once,
+            # so right after such a change this arm fires for a reason that is
+            # neither "a foreign tool wrote it" nor "it was truncated" — the
+            # stamp is this engine's own output from before the field existed.
+            # Saying only those two sends a reader hunting a corruption that is
+            # not there. Measured after `external=` was added: all five live
+            # pyre stamps refuse through here, none of them damaged.
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} has no "
+                f"{', '.join(missing)} field — written before this engine "
+                f"recorded that field, or by another tool, or truncated. "
+                f"Re-extract either way; the artefact predates what the stamp "
+                f"is now required to cover, so it cannot be compared"
+            )
+            continue
+
+        features = recorded["features"]
+        stamped_features[crate] = features
+        flags = crate_flags(spec, features)
+        expected = stamp_for(
+            eng,
+            crate=crate,
+            platform_key=platform_key,
+            charon_stamp=charon_stamp,
+            cargo_features=features,
+            flags=flags,
+            charon_flags=charon_crate_flags(spec, features),
+            layout_targets=crate_layout_targets(eng, spec),
+            layout_flags=crate_layout_flags(spec, features, flags),
+        )
+        if text == expected + "\n":
+            print(f"    fingerprint matches the tree (source={recorded['source']})")
+            verified.add(crate)
+            continue
+
+        want = parse_stamp(expected)
+        differing = [key for key in STAMP_KEYS if recorded[key] != want.get(key)]
+        if not differing:
+            # The text differs while every modelled field agrees, so the stamp
+            # carries content this engine does not write. Reporting nothing
+            # here would turn a mismatch into a silent pass.
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} does not match "
+                f"byte-for-byte although every field agrees — it carries "
+                f"content this engine did not write"
+            )
+            continue
+        for key in differing:
+            if key == "external":
+                # Two packed per-root lists, not two hashes: printing them as
+                # opaque values would hand the reader kilobytes and no answer.
+                stale.extend(
+                    external_diff(crate, recorded[key], want.get(key, ""))
+                )
+                continue
+            stale.append(
+                f"{crate}: {key}: artefact says {recorded[key]!r}, "
+                f"tree says {want.get(key)!r}"
+            )
+
+    # Exit 0 requires a positive match for every requested crate, and at least
+    # one crate to have been requested. Both halves matter: an empty list has no
+    # unaccounted crates, so testing only for those would let "checked nothing"
+    # through as success — the exact shape this whole function exists to refuse.
+    unaccounted = [crate for crate in crates if crate not in verified]
+    if not stale and (not crates or unaccounted):
+        stale.append(
+            "checked nothing for: " + (" ".join(unaccounted) or "(no crates requested)")
+        )
+    if not stale:
+        print()
+        print(f"llbc artefacts current: {' '.join(crates)}")
+        return
+
+    driver = sys.argv[0] or "scripts/extract-llbc.py"
+    # The per-crate lines above went to stdout, which is block-buffered when
+    # this runs under a harness; flush so the verdict does not land before the
+    # evidence it was drawn from.
+    sys.stdout.flush()
+    print(file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print("LLBC STALE — do not read these artefacts", file=sys.stderr)
+    for line in stale:
+        print(f"  {line}", file=sys.stderr)
+    print(
+        "\n"
+        "  Re-extract before reading. This runs a whole-crate Charon build and\n"
+        "  writes into the working tree, so nothing here runs it for you —\n"
+        "  how long it takes depends on how warm the cargo cache is:",
+        file=sys.stderr,
+    )
+    for features in dict.fromkeys(stamped_features.values()):
+        group = [c for c in crates if stamped_features[c] == features]
+        print(
+            f"      CARGO_FEATURES={features} python3 {driver} --force "
+            f"{' '.join(group)}",
+            file=sys.stderr,
+        )
+    # Two things a reader needs at exactly this moment and can find nowhere
+    # near it: what makes the re-extraction stick, and what they may still do
+    # meanwhile. Both are printed here rather than left in a doc, because this
+    # banner is where someone learns they are blocked.
+    print(
+        "\n"
+        "  WARNING: re-extracting while a closure input is dirty re-stales the result\n"
+        "  the moment that edit changes again. The fingerprint is over the\n"
+        "  WORKING TREE, so an uncommitted in-closure edit is invisible to\n"
+        "  `git log` and to a --check taken a minute earlier. On a shared\n"
+        "  checkout, require this intersection to be EMPTY first:\n"
+        f"      python3 {driver} --list-inputs {' '.join(crates)} | sort -u > cl.txt\n"
+        "      git status --porcelain | sed 's/^...//' | sort -u        > dirty.txt\n"
+        "      comm -12 dirty.txt cl.txt          # must print nothing\n"
+        "  Both sides are repo-relative, so they compare directly. If it comes\n"
+        "  back empty, confirm the instrument is live before believing it —\n"
+        "  `Cargo.lock` is an input, so seeding it into dirty.txt must produce\n"
+        "  a hit.\n"
+        "\n"
+        "  Meanwhile: COMPILING is available under PYRE_LLBC_STRICT=0, which\n"
+        "  demotes this to a warning rather than silencing it. MEASURING is\n"
+        "  not. Stale offsets can name the wrong bytes, and a miscompiled field\n"
+        "  access returns a NUMBER rather than an error, so an unsound run is\n"
+        "  indistinguishable from a real one. The criterion is whether the work\n"
+        "  READS FIELD OFFSETS, not which crate it lives in: a pure source-text\n"
+        "  audit is exempt, anything that runs a trace never is.",
+        file=sys.stderr,
+    )
+    print("=" * 72, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def self_test_exclusion_diamond() -> None:
+    """Drive `_package_closure` on a synthetic diamond; check BOTH its halves.
+
+    `excluded_deps` has to do two opposite things at once, and a real tree
+    cannot demonstrate either. Excluding a package must drop what only that
+    package reaches, and must NOT drop what something else also reaches — and a
+    fingerprint that gets this wrong still hashes to something, still compares
+    equal to itself, and still passes `--check`. The pre-fix engine filtered at
+    emission and carried four unreferenced files without making any check fail.
+    So the property is checked here on a graph built for it.
+
+    The graph, with `excluded` excluded:
+
+        root ──► keep_via_both ──► shared
+          └────► excluded ──┬────► shared           (also reached from above)
+                            └────► behind_excluded  (reached ONLY via excluded)
+
+    Two-sided, and neither side alone is sufficient:
+
+    * `behind_excluded` must be absent. An engine that filters at emission
+      keeps it, and this is the only assertion that sees that defect.
+    * `shared` must be PRESENT. An engine that prunes by ancestry instead
+      (dropping everything downstream of an excluded node) also passes the
+      first assertion, and drops a package the tree genuinely depends on. That
+      is a wrong answer in the unsafe direction — an under-fingerprinted crate
+      whose artefact goes stale silently.
+
+    The unexcluded control runs first and is not a formality: it establishes
+    that both nodes are reachable AT ALL. Without it, "absent" and "present"
+    are being read off a graph that might reach neither, and the excluded run
+    would pass for a reason unrelated to exclusion.
+
+    Not covered here: the `dep_kinds`/dev-edge filter in the same walk. It is
+    a different property with a different failure mode and no fixture yet.
+    """
+    def pkg(name, source=None):
+        return {"id": f"{name} 0.0.0", "name": name, "source": source}
+
+    def node(name, *deps):
+        return (
+            f"{name} 0.0.0",
+            {"deps": [{"pkg": f"{d} 0.0.0", "dep_kinds": []} for d in deps]},
+        )
+
+    names = ["root", "keep_via_both", "excluded", "shared", "behind_excluded"]
+    by_id = {p["id"]: p for p in (pkg(n) for n in names)}
+    resolve_nodes = dict(
+        [
+            node("root", "keep_via_both", "excluded"),
+            node("keep_via_both", "shared"),
+            node("excluded", "shared", "behind_excluded"),
+            node("shared"),
+            node("behind_excluded"),
+        ]
+    )
+    root_ids = ["root 0.0.0"]
+
+    def walk(exclude):
+        return sorted(
+            p["name"] for p in _package_closure(root_ids, by_id, resolve_nodes, exclude)
+        )
+
+    control = walk(set())
+    excluded = walk({"excluded"})
+    print("  exclusion diamond")
+    print(f"    exclude {{}}            {control}")
+    print(f"    exclude {{excluded}}    {excluded}")
+
+    failures = []
+    # The control first: an unreachable node proves nothing by being absent.
+    for name in ("shared", "behind_excluded"):
+        if name not in control:
+            failures.append(
+                f"control walk does not reach {name!r} — the fixture graph is "
+                f"broken, and every verdict below it is vacuous"
+            )
+    if not failures:
+        if "behind_excluded" in excluded:
+            failures.append(
+                "'behind_excluded' survived the exclusion — the exclusion is "
+                "being applied at emission rather than in the walk, so a "
+                "package reachable ONLY through an excluded one still moves "
+                "the fingerprint"
+            )
+        if "shared" not in excluded:
+            failures.append(
+                "'shared' was dropped by the exclusion — the walk is pruning "
+                "by ancestry rather than by reachability-avoiding-the-excluded, "
+                "so a package the tree still depends on left the fingerprint "
+                "and its artefact can go stale unnoticed"
+            )
+        if "excluded" in excluded:
+            failures.append("the excluded package itself is in the closure")
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def self_test_provenance_rendering() -> None:
+    """Drive `dirty_report_lines` over cases the live sidecars cannot produce.
+
+    Both of its conditional lines are silent on every artefact this repository
+    has ever stamped — the delta is zero and nothing is omitted — so `--check`
+    against the real tree exercises neither, and a dead branch would read
+    exactly like a correct one. The movement line especially: it exists for a
+    build that straddled a peer's edit, which is the case nobody can arrange on
+    demand and everybody needs reported.
+
+    The three negatives are load-bearing, not padding. A renderer that emitted
+    the movement line unconditionally satisfies every positive row here and is
+    worse than no line at all, because it accuses a clean build of moving; and
+    `unknown` is not zero, so a renderer that coerced it would report a delta
+    against a count it never had.
+    """
+    base = {
+        "dirty_before": "3",
+        "dirty_in_closure": "0",
+        "dirty_outside": "3",
+        "dirty_omitted": "0",
+    }
+    cases = [
+        ("steady tree", {}, False, False),
+        ("grew by 2", {"dirty_in_closure": "1", "dirty_outside": "4"}, True, False),
+        ("shrank by 2", {"dirty_before": "5"}, True, False),
+        ("moved inside the closure", {"dirty_in_closure": "1"}, True, False),
+        ("pre-build count unknown", {"dirty_before": "unknown"}, False, False),
+        ("listing truncated", {"dirty_omitted": "7"}, False, True),
+        ("moved AND truncated", {"dirty_before": "9", "dirty_omitted": "4"}, True, True),
+    ]
+
+    print("  provenance rendering")
+    failures = []
+    for label, over, want_moved, want_omitted in cases:
+        text = "\n".join(dirty_report_lines({**base, **over}, []))
+        got_moved = "MOVED during the build" in text
+        got_omitted = "do not count" in text
+        verdict = "ok" if (got_moved, got_omitted) == (want_moved, want_omitted) else "FAILED"
+        print(f"    {verdict:<6} {label}: moved={got_moved} truncated={got_omitted}")
+        if verdict == "FAILED":
+            failures.append(
+                f"{label!r}: expected moved={want_moved} truncated={want_omitted},"
+                f" got moved={got_moved} truncated={got_omitted}"
+            )
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def self_test_nested_repo_detection() -> None:
+    """Drive the nested-repo refusal on a synthetic tree, BOTH arms.
+
+    `self_test` below draws its probe from `fingerprint_inputs`, i.e. from a
+    directory the fingerprint already covers, so it can never place one where
+    coverage fails — it would keep passing whatever this guard did. Hence a
+    separate case with its own tree.
+
+    Runs real `git` against a real nested repository rather than handing
+    `nested_repo_entries` a list of strings: the load-bearing fact is what git
+    DOES with a nested repo, and a list written here would only ever agree with
+    what its author believed. If a future git stops emitting the trailing
+    slash, this fails; a string fixture would not.
+
+    The BENIGN arm carries as much weight as the hazard one. This refusal is
+    fail-closed, so a predicate that flagged every untracked directory would
+    satisfy a detection-only test and then stop every extraction that follows a
+    new module directory.
+
+    Everything happens inside a temporary directory. `self_test` writes its
+    probe into the shared worktree, a brief real mutation; doing that with a
+    nested repo would be a worse one, because a peer extracting in that instant
+    would take this very refusal instead of merely seeing a moved hash.
+    """
+    def ls_others(root: Path) -> list[str]:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--others", "--exclude-standard", "--", "covered"],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return [raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        def git(*args: str, cwd: Path | None = None) -> None:
+            subprocess.run(
+                ["git", *args],
+                cwd=cwd or root,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        git("init", "-q", ".")
+        git("config", "user.email", "self-test@example.invalid")
+        git("config", "user.name", "llbc self-test")
+        (root / "covered").mkdir()
+        (root / "covered" / "tracked.rs").write_text("// tracked\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+
+        # Benign: an ordinary untracked directory holding a new module. This is
+        # also the liveness control — the leg must LIST it, so a git that
+        # returned nothing at all cannot pass this test by being empty.
+        (root / "covered" / "plain").mkdir()
+        (root / "covered" / "plain" / "new_module.rs").write_text("// new\n")
+        benign_entries = ls_others(root)
+        benign_flagged = nested_repo_entries(benign_entries)
+
+        # Hazard: a nested repository under the same covered path.
+        nested = root / "covered" / "nested"
+        nested.mkdir()
+        git("init", "-q", ".", cwd=nested)
+        (nested / "inside.rs").write_text("// invisible to the outer repo\n")
+        hazard_entries = ls_others(root)
+        hazard_flagged = nested_repo_entries(hazard_entries)
+
+    print("    benign tree    " + " ".join(benign_entries))
+    print(f"      flagged      {benign_flagged}")
+    print("    + nested repo  " + " ".join(hazard_entries))
+    print(f"      flagged      {hazard_flagged}")
+
+    failures = []
+    if "covered/plain/new_module.rs" not in benign_entries:
+        failures.append(
+            "the untracked leg did not list a new module — the test measured nothing"
+        )
+    if benign_flagged:
+        failures.append(
+            f"an ordinary untracked directory was flagged {benign_flagged} —"
+            " this refusal would stop every extraction after a new module dir"
+        )
+    if hazard_flagged != ["covered/nested/"]:
+        failures.append(
+            f"a nested repository was not flagged: got {hazard_flagged} —"
+            " the fingerprint would hash its whole subtree as one constant"
+        )
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+    print("\nself-test passed: nested-repo refusal (hazard flagged, benign not)")
+
+
+def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
+    """A/B/A the fingerprint against a new untracked `.rs` under a covered path.
+
+    The blind spot being guarded is silent by construction: `git ls-files` lists
+    tracked paths only, so before `fingerprint_inputs` folded in `--others
+    --exclude-standard`, adding a brand-new module left the hash unmoved and
+    `--check` blessed an artefact built from different source. A wrong answer
+    there prints nothing, so the guard needs a demonstration rather than a
+    reading of the patch. Both legs are required: that the hash *moves* for the
+    new file, and that removing the probe *restores* it, so a change which
+    invalidated every stamp cannot pass by refusing everything.
+
+    The probe exists for one `source_fingerprint` call and is removed in a
+    `finally`. On a shared worktree that is a real if brief mutation — anyone
+    fingerprinting the same crate in that instant sees the moved hash.
+    """
+    inputs = fingerprint_inputs(eng, crates, cargo_features)
+    # Deepest `.rs`: exact-file pathspecs (Cargo.toml, target roots, build.rs)
+    # sit shallow, so a deeply nested file was listed by a `dir/` pathspec and
+    # its directory is therefore covered for new files too.
+    covered = max((p for p in inputs if p.suffix == ".rs"), key=lambda p: (len(p.parts), p.as_posix()), default=None)
+    if covered is None:
+        raise SystemExit(f"self-test: no .rs input for {' '.join(crates)}")
+    probe = eng.root / covered.parent / "__llbc_self_test_probe.rs"
+    if probe.exists():
+        raise SystemExit(f"self-test: {probe} already exists; refusing to clobber it")
+    before = source_fingerprint(eng, crates, cargo_features)
+    try:
+        probe.write_text("// transient probe written by --self-test; safe to delete\n")
+        # Both legs of this test are a deliberate change to the input SET, which
+        # is the one thing `_collect_inputs` memoises. Reading a carried-over set
+        # here would report the guard blind and the removal residual — a failure
+        # printed by the cache rather than by the code under test.
+        forget_collected_inputs()
+        moved = source_fingerprint(eng, crates, cargo_features)
+        listed = probe.relative_to(eng.root) in set(fingerprint_inputs(eng, crates, cargo_features))
+    finally:
+        probe.unlink(missing_ok=True)
+        forget_collected_inputs()
+    after = source_fingerprint(eng, crates, cargo_features)
+    print(f"    probe          {probe.relative_to(eng.root).as_posix()}")
+    print(f"    before         {before}")
+    print(f"    with probe     {moved}  (listed as an input: {listed})")
+    print(f"    after removal  {after}")
+    failures = []
+    if moved == before:
+        failures.append("a new untracked .rs did not move the fingerprint — the guard is blind")
+    if after != before:
+        failures.append("removing the probe did not restore the fingerprint — it left residue")
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"\nself-test passed: {' '.join(crates)}")
 
 
 def run_cli(
@@ -953,6 +2647,7 @@ def run_cli(
     metadata_feature_crates: tuple[str, ...] = (),
     layout_targets: tuple[str, ...] = (),
     layout_target_rustflags: str = "",
+    external_inputs: tuple[Path, ...] = (),
 ) -> None:
     """Argparse UX shared by every driver (positional crates, --force, …)."""
     all_crates = " ".join(specs)
@@ -960,8 +2655,26 @@ def run_cli(
         description="Extract Charon ULLBC artefacts with source-fingerprint skip logic."
     )
     parser.add_argument("crates", nargs="*", help=f"known: {all_crates}")
-    parser.add_argument("--fingerprint", action="store_true")
-    parser.add_argument("--list-inputs", action="store_true")
+    # The dispatch below takes the FIRST of these that is set and returns, so
+    # accepting two would perform one and drop the other with no output saying
+    # so — `--check --self-test` would run the self-test and report success for
+    # a freshness check that never ran. That is the shape this file refuses
+    # everywhere else, and argparse can refuse it here.
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--fingerprint", action="store_true")
+    modes.add_argument("--list-inputs", action="store_true")
+    modes.add_argument(
+        "--check",
+        action="store_true",
+        help="compare the existing artefacts against the tree and exit nonzero "
+        "if any is stale; never extracts",
+    )
+    modes.add_argument(
+        "--self-test",
+        action="store_true",
+        help="prove the source fingerprint still sees a new untracked .rs; "
+        "writes and removes one transient probe file, never extracts",
+    )
     parser.add_argument(
         "--force",
         action="store_true",
@@ -993,14 +2706,77 @@ def run_cli(
         metadata_feature_crates=metadata_feature_crates,
         layout_targets=layout_targets,
         layout_target_rustflags=layout_target_rustflags,
+        external_inputs=tuple(external_inputs),
     )
+    # Before ANY subcommand, including the read-only instruments: an inert
+    # pathspec makes `--list-inputs` and `--fingerprint` report a coverage the
+    # stamp does not have, and those are the two outputs a reader trusts when
+    # deciding whether the guard is working.
+    refuse_inert_pathspecs(eng)
 
     crates = args.crates or default_crates
     if args.list_inputs:
         for path in fingerprint_inputs(eng, crates, cargo_features):
             print(path.as_posix())
+        # Marked, because the two channels are hashed into different stamp
+        # fields and an unmarked union would read as one list of repo-relative
+        # paths — which is what made the out-of-root inputs easy to miss. The
+        # root is named on every line because it, not the file, is the unit
+        # `external=` records a digest for and `check` reports a move against.
+        for root_label, files in external_input_groups(eng, crates, cargo_features):
+            if not files:
+                # A declared root the filter emptied. It still holds a digest,
+                # so listing nothing for it would under-report the coverage.
+                print(f"external[{root_label}]: (no files)")
+            for label, _ in files:
+                print(f"external[{root_label}]:{label}")
         return
     if args.fingerprint:
-        print(source_fingerprint(eng, crates, cargo_features))
+        # BOTH fields. Printing only `source=` here previously cost a session:
+        # three legs returned identical hashes that were consistent with every
+        # hypothesis, because the field under test was not in the output.
+        print(f"source={source_fingerprint(eng, crates, cargo_features)}")
+        print(f"external={external_fingerprint(eng, crates, cargo_features)}")
+        return
+    if args.self_test:
+        # The diamond runs first because it mutates nothing: on a shared
+        # worktree, a broken input-set computation should be reported without
+        # writing a probe file into the tree to find it out. It is also the
+        # case `self_test` structurally cannot cover — that one compares the
+        # fingerprint against itself, so it stays green over an input set that
+        # is silently wrong.
+        self_test_exclusion_diamond()
+        # Same reason, one artefact along: `--check` renders provenance on every
+        # run and exercises neither of its conditional lines, because ordinary
+        # sidecars describe steady, complete extractions.
+        self_test_provenance_rendering()
+        # Same reason again: this one builds its own repository in a
+        # temporary directory and never touches the worktree.
+        self_test_nested_repo_detection()
+        self_test(eng, crates, cargo_features)
+        return
+    if args.check:
+        check(eng, args)
         return
     extract(eng, args)
+
+
+# This module is the shared extraction ENGINE. Every consumer imports it — the
+# per-repo wrappers call `run_cli` with their own `SPECS` — and nothing has ever
+# invoked it as a program.
+#
+# Without this block, running it directly defined `main()` and fell off the end:
+# zero output, **exit 0**, for every argument including `--check`, `--fingerprint`
+# and `--help`. A freshness check aimed here reported success without executing,
+# which is worse than the staleness it was run to detect.
+#
+# The body refuses instead of dispatching. Adding a `main()` call would make
+# direct invocation *work* and mint a second, under-specified entry point: the
+# engine alone cannot know which crates to extract or where their sources live —
+# that is exactly what a wrapper's `CrateSpec` and `PYRE_ROOT` resolution supply.
+if __name__ == "__main__":
+    raise SystemExit(
+        "llbc_extract.py is the shared extraction ENGINE, not an entry point.\n"
+        "Use the repository's scripts/extract-llbc.py wrapper instead.\n"
+        "The wrapper supplies the CrateSpec table this module needs."
+    )
