@@ -82,8 +82,11 @@ pyre-dynasm
 
 # Rust / Cargo
 /target
+# `tools/ubuntu24-*-repro` bind-mounts the worktree, so the container's builds
+# need their own CARGO_TARGET_DIR or they overwrite the host binaries.
+/target-linux
 
-# Build artefacts: Charon binary fetched via scripts/install-charon.sh
+# Build artefacts: Charon binary fetched via scripts/install-charon.py
 /build/
 
 # Local Claude settings (personal, not committed)
