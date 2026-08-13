@@ -3816,18 +3816,11 @@ impl ResumeDataLoopMemo {
         UNASSIGNED
     }
 
-    /// resume.py:192-226 _number_boxes — tag each box in a snapshot section.
+    /// `ResumeDataLoopMemo._number_boxes` tags each box in a snapshot section.
     ///
-    /// Exact port of RPython's `_number_boxes(self, iter, iterator, numb_state)`.
-    ///
-    /// `env` provides box access matching RPython's box operations:
-    /// - `get_box_replacement(opref)` → forwarded OpRef (resume.py:202)
-    /// - `is_const(opref)` → isinstance(box, Const) (resume.py:204)
-    /// - `get_const(opref)` → (value, type) for constants
-    /// - `get_type(opref)` → box.type ('i', 'r', 'f') (resume.py:211,214)
-    /// - `is_virtual_ref(opref)` → getptrinfo(box).is_virtual() (resume.py:212-213)
-    /// - `is_virtual_raw(opref)` → getrawptrinfo(box).is_virtual() (resume.py:215-216)
-    ///   resume.py:192-226 `_number_boxes` — tag each box in a snapshot section.
+    /// `env` supplies the operations used by the upstream method: replacement
+    /// lookup, constant lookup, box type lookup, and virtual Ref/raw-pointer
+    /// classification.
     pub fn _number_boxes(
         &mut self,
         boxes: &[SnapshotBox],

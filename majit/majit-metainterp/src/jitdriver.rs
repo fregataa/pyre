@@ -1907,8 +1907,8 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
-    /// `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` →
-    /// `blackhole.py:1799 convert_and_run_from_pyjitpl`.
+    /// `MetaInterp.run_blackhole_interp_to_cancel_tracing` delegates to
+    /// `blackhole.convert_and_run_from_pyjitpl`.
     ///
     /// A tracing abort can land anywhere in the portal jitcode, including in
     /// the middle of a source opcode whose remaining effects have not run.  The
@@ -1916,32 +1916,31 @@ impl<S: JitState> JitDriver<S> {
     /// read one: it converts `metainterp.framestack` into a blackhole chain,
     /// runs it forward until the bottommost frame reaches its
     /// `jit_merge_point`, and resumes the interpreter from the greens that
-    /// merge point reports (`blackhole.py:1068-1069` raises
-    /// `ContinueRunningNormally`, caught by `warmspot.py:961
-    /// handle_jitexception`).  Every opcode the walk left half-executed
+    /// merge point reports through `ContinueRunningNormally`, which
+    /// `WarmRunnerDesc.handle_jitexception` catches. Every opcode the walk left half-executed
     /// therefore *finishes* instead of being skipped.
     ///
     /// Returns the resume pc when the conversion ran and reached a merge point,
     /// having already written the blackhole's register banks back into `state`.
     /// `None` leaves the abort on the pre-existing source-pc handoff — the walk
-    /// did not abort, or the state shape has no seed path (see below).
+    /// did not abort, or the state shape has no seed path.
     ///
     /// **`None` means "declined before the chain ran", and only that.** Once
     /// `drive_multi_frame_blackhole` returns, the chain has executed the rest
     /// of the half-finished opcodes against the real heap; the caller's
-    /// source-pc handoff resumes at a pc dispatch advanced *before* those
+    /// source-pc handoff resumes at a pc dispatch advanced before those
     /// opcodes' arms, so answering `None` there runs them a second time —
     /// the very double-application this conversion exists to prevent. Every
     /// post-chain path therefore returns `Some`, using the `single_pass_finish`
     /// + `usize::MAX` "no forward pc" outcome when it has no merge point to
-    ///   resume at. Upstream has no such split: `blackhole.py:1799
-    /// convert_and_run_from_pyjitpl` never returns to its caller at all.
+    ///   resume at. Upstream has no such split:
+    /// `blackhole.convert_and_run_from_pyjitpl` never returns to its caller.
     ///
     /// **Seeding.** The walk keeps state fields on the sym; the blackhole reads
     /// them out of the identity registers `StateFieldLayout` names.  The abort
     /// arm captured the sym's image, and this places it into the root frame's
     /// banks before the conversion.  A `[.. ; virt]` array needs two more
-    /// things, both done here: its elements pushed into native `state` (they
+    /// things: its elements are pushed into native `state` (they
     /// live on the trace-ctx shadow during the walk, and the chain's
     /// `getarrayitem_vable_*` read the real object), and the virtualizable
     /// identity seeded into its own slot plus handed to the chain alongside the

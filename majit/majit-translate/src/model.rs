@@ -3795,7 +3795,8 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             }
             Some(ExitSwitch::LastException) | None => {}
         }
-        // Terminal blocks implicitly read every inputarg (`simplify.py:459-462`).
+        // `simplify.transform_dead_op_vars` treats every terminal-block
+        // input argument as read.
         if block.exits.is_empty() {
             read_vars.extend(block.inputargs.iter().cloned());
         }
@@ -3874,14 +3875,16 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     removed
 }
 
-/// Remove dead operations and dead inputargs from `graph` per
-/// backward dataflow over operation operands + exitswitches +
-/// `Link.args`-as-dependencies.  Line-by-line port of
-/// `simplify.transform_dead_op_vars_in_blocks(blocks, graphs,
-/// translator=None)` (`rpython/translator/simplify.py:422-524`).
+/// Remove dead operations and input arguments using the backward dataflow from
+/// `simplify.transform_dead_op_vars_in_blocks`.
 ///
-/// `blocks` is the BFS-reachable closure of every entry block (mirrors
-/// `flowspace/model.py:66 iterblocks()`).
+/// Removable operations contribute operand dependencies from their result;
+/// side-effecting and potentially raising operations contribute immediate
+/// reads. Exit switches and terminal-block inputs are reads, while each link
+/// argument depends on the target input it supplies. Start-block parameters are
+/// pinned as a calling-convention contract, then liveness flows backward to a
+/// fixpoint before unread removable producers and their link arguments are
+/// dropped.
 ///
 /// TODO: `start_blocks` is `{graph.startblock} ∪
 /// {blocks with no incoming link}` rather than the strict single-graph
@@ -3921,7 +3924,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///          each block with no exits (`returnblock` / `exceptblock` /
 ///          otherwise terminal), the inputargs are also added — return
 ///          and except blocks implicitly use their inputs
-///          (`simplify.py:459-462`).
+///          (`simplify.transform_dead_op_vars`).
 ///   2. For every Link, record `dependencies[targetarg].add(linkarg)`
 ///      mapping (`simplify.py:457-458`).  This is the key
 ///      difference from a naïve forward pass — link args are NOT
