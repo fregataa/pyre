@@ -37,6 +37,10 @@ modules surface only when the non-PASS modules are actually run, so use
 `--strict-baseline` (gates on unrecorded improvements), `--full`, or
 `--update-baseline` to detect them. `SKIP` baseline entries are not run.
 
+Baseline entries carry no platform. `PLATFORM_GATED` excludes modules CPython
+skips wholesale on this host, preventing another host's PASS from becoming a
+false `PASS -> SKIP` regression; it does not make the baseline portable.
+
 Usage:
     python3 pyre/cpython_tests/run.py [--backend dynasm|cranelift]
         [--no-jit] [--mode script|module|regrtest] [--jobs N]
@@ -101,6 +105,45 @@ KNOWN_SKIPS = {
     "test.test_xpickle": "spawns per-version pythonX.Y subprocesses (PATH-dependent, can deadlock)",
     "test.test_c_locale_coercion": "asserts child stderr is empty, but MAJIT_STATS=1 prints a [jit-stats] line to every process's stderr",
 }
+
+# Whole modules that CPython skips at import on some platforms. Off-platform
+# modules are neither run nor written to the baseline, avoiding false
+# `PASS -> SKIP` regressions. Keep each predicate aligned with CPython's guard;
+# modules that only skip individual cases do not belong here. Baseline host
+# enforcement remains `check.py`'s job (`CPYTHON_SUITE_BASELINE_HOST`).
+PLATFORM_GATED = {
+    # `if not is_apple: raise unittest.SkipTest("Apple-specific")`, where
+    # `test.support.is_apple` is darwin plus the mobile Apple platforms.
+    "test.test_apple": (
+        lambda p: p in ("darwin", "ios", "tvos", "watchos"),
+        "Apple-specific",
+    ),
+    # `if sys.platform[:3] == 'win': raise unittest.SkipTest(...)`
+    "test.test_threadsignals": (
+        lambda p: p[:3] != "win",
+        "signals not testable on Windows",
+    ),
+    # `if support.is_emscripten or support.is_wasi: raise unittest.SkipTest(...)`
+    "test.test_selectors": (
+        lambda p: p not in ("emscripten", "wasi"),
+        "cannot create socketpair on Emscripten/WASI",
+    ),
+    # `if support.is_wasi: raise unittest.SkipTest(...)`
+    "test.test_urllib_response": (
+        lambda p: p != "wasi",
+        "cannot create socket on WASI",
+    ),
+}
+
+
+def platform_gate(module: str) -> str | None:
+    """The reason `module` does not apply to this host, or `None` if it does."""
+    gate = PLATFORM_GATED.get(module)
+    if gate is None:
+        return None
+    applies, reason = gate
+    return None if applies(sys.platform) else reason
+
 
 # These modules intentionally assert on a child interpreter's exact stderr.
 # MAJIT_STATS is runner instrumentation rather than language-visible output,
@@ -506,8 +549,15 @@ def main() -> int:
     gate_pass_only = not (args.full or args.update_baseline or args.strict_baseline)
     to_run: list[str] = []
     skipped: list[str] = []
+    off_platform: list[tuple[str, str]] = []
     deselected = 0
     for m in modules:
+        # Even full/update runs must not overwrite another platform's result.
+        gate_reason = platform_gate(m)
+        if gate_reason is not None:
+            off_platform.append((m, gate_reason))
+            skipped.append(m)
+            continue
         exp = expected_status(baseline, m, args.backend)
         is_skip = (exp == "SKIP") or (m in KNOWN_SKIPS)
         if is_skip and not args.full and not args.update_baseline:
@@ -521,6 +571,8 @@ def main() -> int:
     print(f"pyre CPython suite — backend={args.backend} mode={args.mode} "
           f"jit={'off' if args.no_jit else 'on'} jobs={args.jobs}")
     print(f"binary: {binary}")
+    for m, reason in off_platform:
+        print(f"  off-platform on {sys.platform}: {m} ({reason})")
     extra = f", {deselected} not gated (non-PASS)" if deselected else ""
     print(f"{len(to_run)} to run, {len(skipped)} skipped{extra}, "
           f"timeout={args.timeout}s\n")
@@ -634,6 +686,9 @@ def write_baseline(path: Path, baseline: dict, results: dict, backend: str) -> N
     modules = baseline.setdefault("modules", {})
     baseline["stdlib_version"] = stdlib_version()
     for m, (status, _detail) in results.items():
+        # Defensive: never overwrite another platform's recorded result.
+        if platform_gate(m) is not None:
+            continue
         entry = modules.setdefault(m, {})
         # A curated KNOWN_SKIP stays SKIP regardless of what the run observed
         # (it is a "do not run" decision, not a result). Modules absent from

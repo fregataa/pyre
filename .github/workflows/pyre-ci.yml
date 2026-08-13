@@ -564,11 +564,13 @@ jobs:
 
   cpython-tests:
     name: CPython suite (gate)
-    # aarch64: the baseline is recorded on darwin-aarch64 and the JIT codegen is
-    # arch-specific, so the gate runs where the baseline was observed.
     runs-on: ubuntu-24.04
-    needs: prepare-charon-llbc-macos
-    if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
+    # Artifacts are named for this Linux runner, so wait for the Linux prepare
+    # leg; waiting for macOS races the Linux upload. Separately, the baseline is
+    # darwin-arm64-specific (`CPYTHON_SUITE_BASELINE_HOST`); `PLATFORM_GATED`
+    # only handles modules CPython skips wholesale on this host.
+    needs: prepare-charon-llbc-linux
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     timeout-minutes: 30
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
