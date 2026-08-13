@@ -2963,32 +2963,54 @@ pub fn fuse_boxing_alloc(
     // (read out of the `NewWithVtable` size descriptor), so it must travel with
     // the op rather than being dropped.  Returns `0` when the cluster carries no
     // resolvable constant type-pointer (e.g. a synthetic test fixture).
+    //
+    // `jtransform.py:1023 rewrite_op_malloc` gets the vtable from malloc's
+    // `STRUCT`. `malloc_typed(value)` instead recovers it from
+    // `value.ob_header.ob_type`; it must match `w_class`, since values may carry
+    // a subclass there.
     fn store_value(graph: &FunctionGraph, base: &Variable, field_name: &str) -> Option<Variable> {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .find_map(|o| match &o.kind {
-                OpKind::FieldWrite {
-                    base: b,
-                    field,
-                    value,
-                    ..
-                } if b == base && field.name.as_str() == field_name => value.as_variable().cloned(),
-                _ => None,
-            })
+        let (_, value) = unique_store(graph, base, field_name)?;
+        value.as_variable().cloned()
     }
-    /// The op-result variables `var` can be, following the links when `var` is
-    /// a `Block.inputargs` phi rather than an op result.
-    ///
-    /// A field store is recorded against the variable the producing operation
-    /// wrote, so a header value that crosses a block boundary — each preceding
-    /// call ends a block — leaves its `ob_type` / `w_class` stores behind on
-    /// the predecessor's variable, and a bare `base == var` lookup on the phi
-    /// finds nothing. Collecting the roots first puts the lookup back on the
-    /// variable the stores actually name. Every root is then required to agree,
-    /// exactly as `resolve_addr` requires of a merged pointer. `depth` bounds
-    /// the walk so a loop-carried phi whose own link arg is itself terminates.
+    /// The unique graph-wide store to `base.field_name`, or `None` if absent
+    /// or conflicting. Without reaching-definition analysis, choosing among
+    /// disagreeing stores would depend on block order, so the pass declines.
+    /// This matches `rpython/translator/backendopt/malloc.py:176-186`, which
+    /// disables malloc optimization for multiple creation points ("aliasing
+    /// problems").
+    fn unique_store<'g>(
+        graph: &'g FunctionGraph,
+        base: &Variable,
+        field_name: &str,
+    ) -> Option<(&'g FieldDescriptor, &'g LinkArg)> {
+        let mut found: Option<(&FieldDescriptor, &LinkArg)> = None;
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let OpKind::FieldWrite {
+                base: b,
+                field,
+                value,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if b != base || field.name.as_str() != field_name {
+                continue;
+            }
+            match found {
+                None => found = Some((field, value)),
+                Some((_, seen)) if seen == value => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+    /// Resolve `var` to producer variables through `Block.inputargs` phis.
+    /// Stores name producers rather than phis, and every incoming root must
+    /// later agree. `depth` terminates loop-carried phis. Upstream records the
+    /// same relation by unioning link args with inputargs in
+    /// `rpython/translator/backendopt/malloc.py:169`; this local pass recovers
+    /// those endpoints on demand.
     fn store_roots(
         graph: &FunctionGraph,
         var: &Variable,
@@ -3243,23 +3265,13 @@ pub fn fuse_boxing_alloc(
             };
             // Resolve every payload field's store: `FieldWrite { base: %agg,
             // field.name == payload }`.  A malformed cluster missing any payload
-            // store is left untouched so the annotate wall still flags it rather
-            // than emitting a half-initialised allocation.
+            // store is left untouched so the annotate wall still flags it.
+            // Conflicting stores also decline: no reaching write is known.
             let mut payloads = Vec::with_capacity(fields.len());
             let mut complete = true;
             for (field_name, payload_ty) in &fields {
-                let found = graph
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.operations)
-                    .find_map(|o| match &o.kind {
-                        OpKind::FieldWrite {
-                            base, field, value, ..
-                        } if base == agg && field.name.as_str() == field_name.as_str() => {
-                            Some((field.clone(), value.clone()))
-                        }
-                        _ => None,
-                    });
+                let found = unique_store(graph, agg, field_name.as_str())
+                    .map(|(field, value)| (field.clone(), value.clone()));
                 match found {
                     Some((field, value)) => payloads.push(Payload {
                         field,
@@ -7673,19 +7685,224 @@ mod tests {
     }
 
     #[test]
+    fn fuse_boxing_alloc_declines_a_field_written_twice_over() {
+        // A cluster built before a branch may be rewritten on one arm. Without
+        // reaching definitions, conflicting payload or header stores must
+        // decline; redundant stores of the same value may still fuse.
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        const OTHER_TYPE_ADDR: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                        },
+                        args,
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        fn ctor(graph: &mut FunctionGraph, blk: BlockId, name: &str) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor(name),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some(name.into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+
+        /// A `W_FloatObject` cluster built in the dominator, malloc'd behind a
+        /// branch, with `rewrite` free to add a second store on one arm.
+        fn cluster(
+            rewrite: &dyn Fn(&mut FunctionGraph, BlockId, &Var, &Var),
+        ) -> (FunctionGraph, BlockId) {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let cast = |graph: &mut FunctionGraph, addr: i64| {
+                let ty = graph
+                    .push_op_var(entry, OpKind::ConstRefAddr(addr), true)
+                    .unwrap();
+                call(graph, entry, &["__pyre_cast_instance", "PyType"], vec![ty])
+            };
+            let ob_type = cast(&mut graph, FLOAT_TYPE_ADDR);
+            let w_class_cast = cast(&mut graph, FLOAT_TYPE_ADDR);
+            let w_class = call(
+                &mut graph,
+                entry,
+                &["pyre_object", "pyobject", "get_instantiate"],
+                vec![w_class_cast],
+            );
+            let header = ctor(&mut graph, entry, "PyObject");
+            graph.push_op_var(
+                entry,
+                field(&header, "ob_type", "PyObject", &ob_type),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&header, "w_class", "PyObject", &w_class),
+                false,
+            );
+            let payload = graph
+                .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+                .unwrap();
+            let agg = ctor(&mut graph, entry, "W_FloatObject");
+            graph.push_op_var(
+                entry,
+                field(&agg, "ob_header", "W_FloatObject", &header),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&agg, "floatval", "W_FloatObject", &payload),
+                false,
+            );
+
+            // Both arms carry one aggregate to the join through a phi.
+            let cond = call(
+                &mut graph,
+                entry,
+                &["pyre_object", "gc_interp", "enabled"],
+                vec![],
+            );
+            let (arm, arm_args) = graph.create_block_with_arg_vars(1);
+            let (skip, skip_args) = graph.create_block_with_arg_vars(1);
+            graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond.clone()));
+            graph.closeblock(
+                entry,
+                vec![
+                    Link::from_variables(
+                        &graph,
+                        vec![agg.clone()],
+                        arm,
+                        Some(ExitCase::Bool(true)),
+                    ),
+                    Link::from_variables(
+                        &graph,
+                        vec![agg.clone()],
+                        skip,
+                        Some(ExitCase::Bool(false)),
+                    ),
+                ],
+            );
+            rewrite(&mut graph, arm, &agg, &header);
+
+            let (join, join_args) = graph.create_block_with_arg_vars(1);
+            graph.set_goto(arm, join, vec![arm_args[0].clone()]);
+            graph.set_goto(skip, join, vec![skip_args[0].clone()]);
+            let ret = call(
+                &mut graph,
+                join,
+                &["pyre_object", "lltype", "malloc_typed"],
+                vec![join_args[0].clone()],
+            );
+            graph.set_return(join, Some(ret));
+            (graph, join)
+        }
+
+        let untouched = |_: &mut FunctionGraph, _: BlockId, _: &Var, _: &Var| {};
+        let payload_again = |graph: &mut FunctionGraph, blk: BlockId, agg: &Var, _: &Var| {
+            let other = graph
+                .push_op_var(blk, OpKind::ConstFloat(1.0f64.to_bits()), true)
+                .unwrap();
+            graph.push_op_var(blk, field(agg, "floatval", "W_FloatObject", &other), false);
+        };
+        let payload_same = |graph: &mut FunctionGraph, blk: BlockId, agg: &Var, _: &Var| {
+            // Repeating the same `LinkArg` is redundant, not ambiguous.
+            let same = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find_map(|o| match &o.kind {
+                    OpKind::FieldWrite {
+                        base, field, value, ..
+                    } if base == agg && field.name.as_str() == "floatval" => {
+                        value.as_variable().cloned()
+                    }
+                    _ => None,
+                })
+                .expect("the dominator stores floatval");
+            graph.push_op_var(blk, field(agg, "floatval", "W_FloatObject", &same), false);
+        };
+        let header_again = |graph: &mut FunctionGraph, blk: BlockId, agg: &Var, _: &Var| {
+            let other_header = ctor(graph, blk, "PyObject");
+            graph.push_op_var(
+                blk,
+                field(agg, "ob_header", "W_FloatObject", &other_header),
+                false,
+            );
+        };
+        let obtype_again = |graph: &mut FunctionGraph, blk: BlockId, _: &Var, header: &Var| {
+            let other = graph
+                .push_op_var(blk, OpKind::ConstRefAddr(OTHER_TYPE_ADDR), true)
+                .unwrap();
+            let cast = call(graph, blk, &["__pyre_cast_instance", "PyType"], vec![other]);
+            graph.push_op_var(blk, field(header, "ob_type", "PyObject", &cast), false);
+        };
+
+        let rows: [(
+            &str,
+            &dyn Fn(&mut FunctionGraph, BlockId, &Var, &Var),
+            usize,
+        ); 5] = [
+            ("no second store", &untouched, 1),
+            ("floatval rewritten on one arm", &payload_again, 0),
+            ("floatval restored to the same value", &payload_same, 1),
+            ("ob_header rewritten on one arm", &header_again, 0),
+            ("ob_type rewritten on one arm", &obtype_again, 0),
+        ];
+        for (row, rewrite, expected) in rows {
+            let (mut graph, join) = cluster(rewrite);
+            assert_eq!(
+                fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+                expected,
+                "{row}: wrong number of fused clusters"
+            );
+            let residual = graph.block(join).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            });
+            assert_eq!(
+                residual,
+                expected == 0,
+                "{row}: malloc_typed residual must survive exactly when the cluster declines"
+            );
+        }
+    }
+
+    #[test]
     fn fuse_boxing_alloc_resolves_a_header_that_crosses_a_link() {
-        // Here the *header itself* crosses the boundary, not just the two
-        // values it stores.  That is the shape every constructor with a
-        // preceding call leaves behind — the `PyObject` ctor and its
-        // `ob_type` / `w_class` stores stay in the predecessor while the
-        // header arrives at the `malloc_typed` as a `Block.inputargs` phi.  A
-        // field store is recorded against the variable the producing
-        // operation wrote, so asking the phi for `ob_type` finds nothing and
-        // the cluster declines however constant its type pointer is; the
-        // lookup has to resolve the phi back to its roots first.  Roots
-        // reached through a merge must agree, for the reason `resolve_addr`
-        // requires it of a merged pointer: no single vtable stands for a
-        // header that is one of two types.
+        // The header reaches malloc as a phi while its stores remain on the
+        // producer variable. Resolve that producer first, and require all
+        // merged roots to name one vtable.
         type Var = crate::flowspace::model::Variable;
         const FLOAT_TYPE_ADDR: i64 = 4357049520;
         const OTHER_TYPE_ADDR: i64 = 4357049600;
