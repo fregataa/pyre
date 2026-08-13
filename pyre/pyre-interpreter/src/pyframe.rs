@@ -914,18 +914,29 @@ impl FrameBox {
     /// `pyframe.py:259 initialize_as_generator(name, qualname)` — function
     /// calls pass the function's current writable metadata so each newly
     /// created generator freezes it independently of the code object.
-    /// `__name__` / `__qualname__` are the function's own strings, which may
-    /// carry a lone surrogate, and they are read back as values -- so they
-    /// arrive as WTF-8 rather than through a lossy `&str`.
+    /// `__name__` / `__qualname__` are the function's own immutable string
+    /// objects, retained by reference exactly as `generator.py:22-23` does.
     pub fn into_generator_named(
         mut self,
-        name: Option<&rustpython_wtf8::Wtf8>,
-        qualname: Option<&rustpython_wtf8::Wtf8>,
+        name: Option<PyObjectRef>,
+        qualname: Option<PyObjectRef>,
     ) -> crate::PyResult {
         self.fix_array_ptrs();
-        let register_final = code_yields_inside_try(self.code());
+        let register_final = unsafe {
+            crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
+        };
         let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
         let _origin_roots = pyre_object::gc_roots::push_roots();
+        let name_slot = name.map(|name| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(name);
+            slot
+        });
+        let qualname_slot = qualname.map(|qualname| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(qualname);
+            slot
+        });
         let coroutine_origin_slot = if is_coroutine {
             let origin = capture_coroutine_origin(self.execution_context);
             pyre_object::gc_roots::pin_root(origin);
@@ -970,6 +981,8 @@ impl FrameBox {
         } else {
             pyre_object::generator::w_generator_new(frame_ptr as *mut u8, pycode)
         };
+        let _generator_roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(generator);
         if let Some(slot) = coroutine_origin_slot {
             unsafe {
                 pyre_object::generator::w_coroutine_set_origin(
@@ -978,62 +991,35 @@ impl FrameBox {
                 );
             }
         }
-        // GeneratorOrCoroutine.__init__ stores `_name` / `_qualname` on the
-        // generator.  Root the new owner while allocating the two wrapped
-        // strings, then publish them through the normal GC write barrier.
-        let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(generator);
-        if let Some(name) = name {
-            let w_name = pyre_object::w_str_from_wtf8(name.to_wtf8_buf());
-            unsafe { pyre_object::generator::w_generator_set_name(generator, w_name) };
+        // generator.py:22-23 stores the function's existing `_name` /
+        // `_qualname` objects directly on the generator.
+        if let Some(slot) = name_slot {
+            unsafe {
+                pyre_object::generator::w_generator_set_name(
+                    generator,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                )
+            };
         }
-        if let Some(qualname) = qualname {
-            let w_qualname = pyre_object::w_str_from_wtf8(qualname.to_wtf8_buf());
-            unsafe { pyre_object::generator::w_generator_set_qualname(generator, w_qualname) };
+        if let Some(slot) = qualname_slot {
+            unsafe {
+                pyre_object::generator::w_generator_set_qualname(
+                    generator,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                )
+            };
         }
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }
         // generator.py:24-27: every Coroutine needs its `_finalize_` hook for
         // the never-awaited warning. Ordinary generators only need one when
-        // collection must unwind a suspended `finally`/`with` body. Upstream
-        // uses `CO_YIELD_INSIDE_TRY` for that second arm. RustPython's
-        // compiler does not expose the flag, so `register_final` reconstructs
-        // exactly that question from its Python 3.14 exception table.
+        // collection must unwind a suspended `finally`/`with` body.
         if is_coroutine || register_final {
             crate::executioncontext::register_finalizer(generator);
         }
         Ok(generator)
     }
-}
-
-/// PyPy `astcompiler/codegen.py:2825-2826` / `generator.py:24-27`:
-/// reconstruct `CO_YIELD_INSIDE_TRY` for RustPython code objects.
-///
-/// Python 3.14 wraps every generator body in a depth-zero, `lasti` exception
-/// entry which only converts an escaping `StopIteration`; that synthetic
-/// entry must not make every generator finalizable. Entries emitted for an
-/// actual `try` around a yield either omit `lasti` at depth zero (`try`) or
-/// carry a non-zero unwind depth (`with`). `lookup_exceptiontable` selects the
-/// innermost entry, matching the compiler's `has_yield_inside_try` question.
-fn code_yields_inside_try(code: &CodeObject) -> bool {
-    let mut index = 0;
-    while index < code.instructions.len() {
-        if matches!(
-            code.instructions[index].op,
-            crate::bytecode::Instruction::YieldValue { .. }
-        ) {
-            let offset = (index * 2) as u32;
-            if let Some((_target, depth, lasti)) =
-                crate::pycode::lookup_exceptiontable(&code.exceptiontable, offset)
-                && (depth != 0 || !lasti)
-            {
-                return true;
-            }
-        }
-        index += 1;
-    }
-    false
 }
 
 /// Capture `coroutine.cr_origin` from the visible caller chain.
@@ -4843,7 +4829,8 @@ mod tests {
                 _ => None,
             })
             .expect("nested function code");
-        super::code_yields_inside_try(code)
+        let w_code = crate::pycode::box_code_constant(code);
+        unsafe { crate::pycode::w_code_yields_inside_try(w_code) }
     }
 
     #[test]

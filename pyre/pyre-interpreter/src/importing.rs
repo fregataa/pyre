@@ -1730,15 +1730,16 @@ pub fn release_sys_modules_for_shutdown() -> Vec<(Wtf8Buf, PyObjectRef)> {
     modules
 }
 
-/// GC root walk over every bound module's dict storage.
+/// GC root walk over every bound module's wrapped name and dict storage.
 ///
 /// The walk is keyed on [`MODULE_DICT_ROOTS`], not on the live name→module
 /// map: a module that lost its name to a later import is still immortal and
 /// still reachable from Python, so its dict must keep being marked.
 ///
 /// Modules (`malloc_typed`) are Box-immortal, while their non-moving
-/// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_dict` field
-/// first so the header is marked and its custom trace can reach the
+/// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_name` and
+/// `Module.w_dict` field first so their headers are marked and the dict's
+/// custom trace can reach the
 /// authoritative `dstorage` / `object_storage` / cell registry. A movable
 /// value bound at module scope
 /// — e.g. `gc.collect` reached through `gc.__dict__`, or any
@@ -1769,6 +1770,7 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
         }
         unsafe {
             let module = &mut *(module as *mut pyre_object::module::Module);
+            visitor(&mut module.w_name);
             visitor(&mut module.w_dict);
             let w_dict = module.w_dict;
             pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
@@ -3366,24 +3368,51 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
         return err;
     }
     unsafe {
-        let mut tb = w_exception_get_traceback(exc);
-        while !tb.is_null() && !is_none(tb) {
+        use pyre_object::gc_roots::{
+            pin_root, push_roots, shadow_stack_get, shadow_stack_len, shadow_stack_set,
+        };
+
+        // `code_get_field` realises `co_filename`, which allocates and can
+        // therefore collect.  A traceback node emitted by compiled code is
+        // nursery-resident, so a collection moves it and a raw cursor carried
+        // across the call would name reclaimed memory — both when the walk
+        // steps to `w_next` and when the survivor is republished below.  Keep
+        // the cursor in a root slot and re-read it after every call that can
+        // allocate, the discipline `write_traceback_chain` already follows for
+        // its own walk.
+        let _roots = push_roots();
+        let exc_slot = shadow_stack_len();
+        pin_root(exc);
+        let tb_slot = shadow_stack_len();
+        pin_root(w_exception_get_traceback(exc));
+        let code_slot = shadow_stack_len();
+        pin_root(pyre_object::PY_NULL);
+        loop {
+            let tb = shadow_stack_get(tb_slot);
+            if tb.is_null() || is_none(tb) {
+                break;
+            }
             let w_code = crate::pytraceback::w_pytraceback_get_w_code(tb);
-            let is_bootstrap = !w_code.is_null()
-                && crate::pycode::code_get_field(w_code, "co_filename")
+            if w_code.is_null() {
+                break;
+            }
+            shadow_stack_set(code_slot, w_code);
+            let is_bootstrap =
+                crate::pycode::code_get_field(shadow_stack_get(code_slot), "co_filename")
                     .ok()
                     .filter(|f| pyre_object::is_str(*f))
-                    // A module imported from a path with no UTF-8 spelling
-                    // carries a surrogate escape in `co_filename`; it is not
-                    // one of the bootstrap names either way.
+                    // A module imported from a path with no UTF-8 spelling carries a
+                    // surrogate escape in `co_filename`; it is not one of the
+                    // bootstrap names either way.
                     .and_then(|f| pyre_object::w_str_get_value_opt(f))
                     .is_some_and(is_bootstrap_filename);
             if !is_bootstrap {
                 break;
             }
-            tb = crate::pytraceback::w_pytraceback_get_w_next(tb);
+            let tb = shadow_stack_get(tb_slot);
+            shadow_stack_set(tb_slot, crate::pytraceback::w_pytraceback_get_w_next(tb));
         }
-        w_exception_set_traceback(exc, tb);
+        w_exception_set_traceback(shadow_stack_get(exc_slot), shadow_stack_get(tb_slot));
     }
     err
 }
