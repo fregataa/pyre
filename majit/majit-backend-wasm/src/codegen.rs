@@ -30,6 +30,99 @@ const SLOT_SIZE: u64 = 8;
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
 
+/// Dense wasm-local assignment for the sparse value-id namespace.
+struct ValueLocals {
+    by_id: Vec<Option<u32>>,
+    types: Vec<ValType>,
+}
+
+impl ValueLocals {
+    fn mark(by_id: &mut [Option<u32>], id_types: &mut [ValType], id: u32, ty: ValType) {
+        let i = id as usize;
+        assert!(i < by_id.len(), "value id {id} exceeds pre-pass bounds");
+        by_id[i] = Some(0);
+        id_types[i] = ty;
+    }
+
+    fn collect(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> Self {
+        let mut by_id = vec![None; num_vars as usize];
+        let mut id_types = vec![ValType::I64; num_vars as usize];
+
+        for ia in inputargs {
+            Self::mark(
+                &mut by_id,
+                &mut id_types,
+                ia.index,
+                if ia.tp == Type::Float {
+                    ValType::F64
+                } else {
+                    ValType::I64
+                },
+            );
+        }
+        for op in ops {
+            let result = op.pos.get();
+            if result != OpRef::NONE && !result.is_constant() {
+                Self::mark(
+                    &mut by_id,
+                    &mut id_types,
+                    result.raw(),
+                    if op.result_type() == Type::Float {
+                        ValType::F64
+                    } else {
+                        ValType::I64
+                    },
+                );
+            }
+            for arg in op.getarglist() {
+                let arg = arg.to_opref();
+                if arg != OpRef::NONE && !arg.is_constant() {
+                    let ty = id_types[arg.raw() as usize];
+                    Self::mark(&mut by_id, &mut id_types, arg.raw(), ty);
+                }
+            }
+            if let Some(failargs) = op.getfailargs() {
+                for arg in failargs {
+                    let arg = arg.to_opref();
+                    if arg != OpRef::NONE && !arg.is_constant() {
+                        let ty = id_types[arg.raw() as usize];
+                        Self::mark(&mut by_id, &mut id_types, arg.raw(), ty);
+                    }
+                }
+            }
+        }
+
+        let mut types = Vec::new();
+        for (id, slot) in by_id.iter_mut().enumerate() {
+            if slot.is_some() {
+                *slot = Some(types.len() as u32 + 1);
+                types.push(id_types[id]);
+            }
+        }
+        Self { by_id, types }
+    }
+
+    fn local(&self, id: u32) -> u32 {
+        self.by_id
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| panic!("wasm value local is unmapped for id {id}"))
+    }
+
+    fn ty(&self, id: u32) -> ValType {
+        self.types[(self.local(id) - 1) as usize]
+    }
+
+    fn count(&self) -> u32 {
+        self.types.len() as u32
+    }
+
+    fn types(&self) -> &[ValType] {
+        &self.types
+    }
+}
+
 /// Call area layout in the historical fixed frame geometry.
 const CALL_RESULT_OFS: u64 = 2000;
 const CALL_FUNC_OFS: u64 = 2008;
@@ -361,8 +454,8 @@ impl RefValues {
 /// allocation inside the trace can forward it.
 ///
 /// Keyed by value id (`OpRef::raw()` / input `index`), which is the dense
-/// `[0, num_vars)` space the wasm value locals already use (`1 + raw`); a flat
-/// vector indexed by that id is the natural fit — no hashing, and iteration is
+/// `[0, num_vars)` value-id space; a flat vector indexed by that id is the
+/// natural fit — no hashing, and iteration is
 /// in id order, so the emitted module stays deterministic without sorting. The
 /// `is_constant` guard lives in one place (`home`): a constant `raw()` is a
 /// distinct namespace that must never alias a value's home.
@@ -727,6 +820,26 @@ fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
     ref_values.contains(val).then(|| op.arg(0).to_opref())
 }
 
+/// wasm emission's complete SETFIELD_GC write-barrier gate.  The import census
+/// deliberately keeps using [`write_barrier_base`]: it must remain an
+/// un-elided over-approximation so an arm that emits a barrier always has the
+/// `jit_call` import available.  Unlike SETARRAYITEM_GC, a SETFIELD_GC can
+/// carry a non-pointer field descriptor even when its value has a Ref home
+/// (the ForceToken layout is one such case).  rewrite.rs:1917-1923 rejects
+/// that store because the collector does not trace the field.
+fn emitted_write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
+    let base = write_barrier_base(op, ref_values)?;
+    if op.opcode == OpCode::SetfieldGc
+        && !op
+            .getdescr()
+            .and_then(|d| d.as_field_descr().map(|fd| fd.is_pointer_field()))
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(base)
+}
+
 /// Whether any op in the trace needs a write-barrier trampoline call, which
 /// requires the `jit_call` import to be present.
 fn has_ref_store_op(ops: &[Op], ref_values: &RefValues) -> bool {
@@ -748,7 +861,7 @@ fn has_ref_store_op(ops: &[Op], ref_values: &RefValues) -> bool {
 fn emit_write_barrier(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
     wb_fn_ptr: i64,
@@ -913,6 +1026,7 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
 /// native regalloc likewise reloads a spilled box only on its next use.
 fn emit_reload_refs_from_homes(
     sink: &mut InstructionSink<'_>,
+    value_types: &ValueLocals,
     ref_homes: &RefHomes,
     liveness: &HomeLiveness,
     at_op: usize,
@@ -927,7 +1041,7 @@ fn emit_reload_refs_from_homes(
         }
         sink.local_get(0);
         sink.i64_load(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
-        sink.local_set(1 + raw);
+        sink.local_set(value_types.local(raw));
     }
 }
 
@@ -1002,6 +1116,7 @@ fn emit_ca_reload_caller(sink: &mut InstructionSink<'_>, top_addr: u32) {
 /// *at* the CALL_ASSEMBLER op, not after it.
 fn emit_reload_ca_input_refs_from_homes(
     sink: &mut InstructionSink<'_>,
+    value_types: &ValueLocals,
     ref_homes: &RefHomes,
     ref_values: &RefValues,
     op: &Op,
@@ -1017,7 +1132,7 @@ fn emit_reload_ca_input_refs_from_homes(
         };
         sink.local_get(0);
         sink.i64_load(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
-        sink.local_set(1 + arg.raw());
+        sink.local_set(value_types.local(arg.raw()));
     }
 }
 
@@ -1186,13 +1301,11 @@ fn residual_call_float_sig(op: &Op) -> Option<Vec<ValType>> {
 /// void residual CALL whose descr records the dummy-word C ABI
 /// (`result_size == 8`, minted by `make_call_descr_void_word_abi`) — the
 /// callee is really `(i64×n) -> i64` with the result ignored, so it lowers
-/// through the same i64 type family with a trailing `drop`. A plain void
-/// descr (`result_size == 0`) may target a genuinely `()`-returning callee
-/// OR a word-returning one (the reflective host trampoline absorbs the
-/// difference), so it stays on `jit_call`. This includes `CallMayForceN`
-/// with the word ABI: the wasm virtualizable is always materialized, so
-/// `GuardNotForced` is a no-op and a direct call is sound. Float / release-GIL
-/// / cond / assembler calls and non-reflectable descrs remain on the trampoline.
+/// through the same i64 type family with a trailing `drop`. This includes
+/// `CallMayForceN` with the word ABI: the wasm virtualizable is always
+/// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
+/// Float / release-GIL / cond / assembler calls and non-reflectable descrs
+/// remain on the trampoline.
 fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
     use OpCode::*;
     if !matches!(
@@ -1220,33 +1333,37 @@ fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
     Some(nargs)
 }
 
-/// Whether `op` is the exact `() -> ()` helper that clears the caught-
-/// exception propagation root after `PUSH_EXC_INFO` publishes the exception
-/// on the execution context.
-///
-/// A plain void call descr (`result_size == 0`) is not enough to select this
-/// ABI: pyre also records word-returning helpers as void when their result is
-/// ignored, and only the reflective host trampoline can absorb that mismatch.
-/// `ClearInFlightException` is codewriter-stamped onto the one genuinely
-/// nullary, genuinely void target (`bh_clear_in_flight_exception`), so this
-/// exact tag + descr + operand shape is safe to call through a `() -> ()`
-/// table type. Keeping the allow-list singular also prevents an unrelated
-/// void helper from silently bypassing the signature audit.
-fn residual_call_true_void(op: &Op) -> bool {
-    if op.opcode != OpCode::CallN {
-        return false;
+/// True-void counterpart of [`residual_call_void_word_arity`]: an eligible
+/// void residual CALL whose descr records a `()` result (`result_size == 0`).
+/// Int/Ref-only arguments lower through the `(i64×n) -> ()` type family with
+/// no result to drop. Float / release-GIL / cond / assembler calls,
+/// non-reflectable descrs, and descr/operand arity mismatches remain on the
+/// trampoline.
+fn residual_call_void_true_arity(op: &Op) -> Option<usize> {
+    use OpCode::*;
+    if !matches!(
+        op.opcode,
+        CallN | CallPureN | CallLoopinvariantN | CallMayForceN
+    ) {
+        return None;
     }
-    let Some(descr) = op.getdescr() else {
-        return false;
-    };
-    let Some(cd) = descr.as_call_descr() else {
-        return false;
-    };
-    cd.result_type() == Type::Void
-        && cd.result_size() == 0
-        && cd.arg_types().is_empty()
-        && op.getarglist().len() == 1
-        && cd.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ClearInFlightException
+    let descr = op.getdescr()?;
+    let cd = descr.as_call_descr()?;
+    if cd.result_type() != Type::Void || cd.result_size() != 0 {
+        return None;
+    }
+    let arg_types = cd.arg_types();
+    if arg_types
+        .iter()
+        .any(|t| !matches!(t, Type::Int | Type::Ref))
+    {
+        return None;
+    }
+    let nargs = op.getarglist().len().saturating_sub(1);
+    if arg_types.len() != nargs {
+        return None;
+    }
+    Some(nargs)
 }
 
 /// Arity of `op`'s in-module `(i64×n) -> i64` lowering, if it has one: an
@@ -1254,7 +1371,8 @@ fn residual_call_true_void(op: &Op) -> bool {
 /// allocation (the `wasm_jit_alloc*` helper targets are plain
 /// `extern "C" fn(i64×n) -> i64` table entries), or a ref-storing store
 /// (its `wasm_jit_write_barrier` helper takes 1 arg). All of these share
-/// the residual-call type family, so one max covers them.
+/// the i64-result residual-call type family, so one max covers them. True-void
+/// residuals use a separate result family and arity census.
 fn direct_helper_i64_arity(op: &Op, ref_values: &RefValues) -> Option<usize> {
     if let Some(n) = residual_call_i64_arity(op) {
         return Some(n);
@@ -1295,10 +1413,10 @@ fn has_call_ops(ops: &[Op]) -> bool {
 /// invocation and therefore needs the corresponding function import.
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
-/// i64 and typed float residual families, `New*`, and write barriers are direct
-/// under `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string allocation
-/// retain the trampoline. When the direct family is disabled, all of the
-/// existing call-area users return to the trampoline baseline.
+/// i64, typed float, and true-void residual families, `New*`, and write barriers
+/// are direct under `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string
+/// allocation retain the trampoline. When the direct family is disabled, all
+/// of the existing call-area users return to the trampoline baseline.
 fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
     if !WASM_DIRECT_RESIDUAL_CALL {
@@ -1314,11 +1432,11 @@ fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bo
         // carrying either is declined. Kept as a conservative superset.
         OpCode::Newstr | OpCode::Newunicode => true,
         // Every residual CALL uses the trampoline unless its exact lowering
-        // predicate supplies an i64 helper ABI or a typed float ABI.
+        // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
             direct_helper_i64_arity(op, &ref_values).is_none()
                 && residual_call_float_sig(op).is_none()
-                && !residual_call_true_void(op)
+                && residual_call_void_true_arity(op).is_none()
         }
         // `New*` and ref-store write barriers are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
@@ -1411,31 +1529,15 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     (guards, max_var)
 }
 
-/// Wasm local type for each SSA value. Frame slots deliberately remain i64
-/// bit carriers, while Float values stay in f64 locals between operations.
-fn collect_value_types(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> Vec<ValType> {
-    let mut value_types = vec![ValType::I64; num_vars as usize];
-    for ia in inputargs {
-        if ia.tp == Type::Float && (ia.index as usize) < value_types.len() {
-            value_types[ia.index as usize] = ValType::F64;
-        }
-    }
-    for op in ops {
-        let result = op.pos.get();
-        if result != OpRef::NONE
-            && !result.is_constant()
-            && op.result_type() == Type::Float
-            && (result.raw() as usize) < value_types.len()
-        {
-            value_types[result.raw() as usize] = ValType::F64;
-        }
-    }
-    value_types
+/// Dense wasm-local assignment and type lookup for each addressed SSA value.
+fn collect_value_types(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> ValueLocals {
+    ValueLocals::collect(inputargs, ops, num_vars)
 }
 
 /// Assign each Ref-typed value (input arg or op result) a dense home-slot
 /// index, keyed by its value id (`raw()`), the same id its wasm local uses
-/// (`1 + raw`). Input args and op results share one value-id space (see
+/// (the dense wasm local is assigned separately). Input args and op results
+/// share one value-id space (see
 /// `collect_guards_and_vars`), so a single map covers both. Int / Float /
 /// Void values are skipped — only GC references need a forwarding home.
 /// Allocate the per-guard bridge-slot cell array for inter-trace chaining and
@@ -1752,18 +1854,21 @@ pub fn build_wasm_module(
             }
         }
     }
-    // `PUSH_EXC_INFO`'s propagation-root clear is the one signature-audited
-    // true-void residual helper. It gets a dedicated `() -> ()` type instead
-    // of being mixed into the `(i64×n) -> i64` family.
-    let has_true_void_residual =
-        WASM_DIRECT_RESIDUAL_CALL && ops.iter().any(residual_call_true_void);
+    // True-void residual calls use `(i64×n) -> ()`, a separate family from the
+    // i64- and f64-result types. As with the uniform i64 family, declaring
+    // `0..=max` makes each type index a base plus the call arity.
+    let true_void_residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
+        ops.iter().filter_map(residual_call_void_true_arity).max()
+    } else {
+        None
+    };
     // The shared indirect-function table backs direct residual helpers as well
     // as host-trampoline dispatch, chained bridges, and CA recursion.
     let needs_table = needs_call
         || bridge_dispatch
         || residual_max_arity.is_some()
         || !float_residual_sigs.is_empty()
-        || has_true_void_residual
+        || true_void_residual_max_arity.is_some()
         || ca.emit_ca;
     // `ca.emit_ca` forces the direct helper family to include arities 0..=2,
     // so all CA frame-helper trampoline `else` arms below are baseline-only.
@@ -1816,10 +1921,12 @@ pub fn build_wasm_module(
     for sig in float_residual_type_indices.keys() {
         types.ty().function(sig.clone(), vec![ValType::F64]);
     }
-    let true_void_residual_type_idx =
+    let true_void_residual_type_base =
         float_residual_type_base + float_residual_type_indices.len() as u32;
-    if has_true_void_residual {
-        types.ty().function(vec![], vec![]);
+    if let Some(max) = true_void_residual_max_arity {
+        for n in 0..=max {
+            types.ty().function(vec![ValType::I64; n], vec![]);
+        }
     }
     module.section(&types);
 
@@ -1901,7 +2008,7 @@ pub fn build_wasm_module(
         frame,
         residual_max_arity.map(|_| residual_type_base),
         &float_residual_type_indices,
-        has_true_void_residual.then_some(true_void_residual_type_idx),
+        true_void_residual_max_arity.map(|_| true_void_residual_type_base),
         ca,
         bridge_finish_fi,
         ca_helper_type_idx,
@@ -1924,7 +2031,7 @@ fn build_function(
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     num_vars: u32,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
@@ -1956,9 +2063,10 @@ fn build_function(
     // descr-derived parameter sequence. These types return `f64`; Float SSA
     // values are converted to/from their i64 bit carrier around the call.
     float_residual_type_indices: &indexmap::IndexMap<Vec<ValType>, u32>,
-    // Dedicated `() -> ()` type for the signature-audited
-    // ClearInFlightException residual, or `None` when absent.
-    true_void_residual_type_idx: Option<u32>,
+    // Base wasm type index of the `(i64×n) -> ()` true-void residual-call
+    // types (type `true_void_residual_type_base + n` for arity `n`), or
+    // `None` when the trace has no eligible true-void residual call.
+    true_void_residual_type_base: Option<u32>,
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`). `ca.emit_ca` off keeps
     // the body byte-identical.
     ca: CaParams,
@@ -1974,38 +2082,38 @@ fn build_function(
     // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
     // branches are retained solely for the direct-family-disabled baseline.
     debug_assert!(!ca.emit_ca || residual_type_base.is_some());
-    // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` i64 locals
-    // past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) for the `UintMulHigh`
+    let num_value_locals = value_types.count();
+    // Value locals occupy the dense local range beginning at 1; reserve
+    // `UMULHI_SCRATCH` i64 locals past them for the `UintMulHigh`
     // 32-bit-split expansion, plus one i64 local for the pending overflow flag.
     // One i32 local past those holds the bridge table slot for the epilogue
     // `call_indirect` dispatch (unused when `!bridge_dispatch`).
-    let ovf_flag_local = num_vars + UMULHI_SCRATCH + 1;
-    let bridge_slot_local = num_vars + UMULHI_SCRATCH + 2;
+    let ovf_flag_local = num_value_locals + UMULHI_SCRATCH + 1;
+    let bridge_slot_local = num_value_locals + UMULHI_SCRATCH + 2;
     // The self-recursive CALL_ASSEMBLER arm needs two more i32 scratch locals:
     // `ca_cfp_local` (the current callee frame pointer) and `ca_fi_local` (the
     // returned frame[0] fail index). Reserve them only under `emit_ca` so a
     // flag-off module keeps exactly one i32 local (byte-identical).
-    let ca_cfp_local = num_vars + UMULHI_SCRATCH + 3;
-    let ca_fi_local = num_vars + UMULHI_SCRATCH + 4;
+    let ca_cfp_local = num_value_locals + UMULHI_SCRATCH + 3;
+    let ca_fi_local = num_value_locals + UMULHI_SCRATCH + 4;
     // Extra i32 scratches when the inline nursery-bump fast path is armed:
     // one holds the loaded `nursery_free` across the bump/commit sequence;
     // runtime varsize array allocation also needs one for the computed
     // total/new-free word.
     let base_i32_locals: u32 = if ca.emit_ca { 3 } else { 1 };
-    let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 2 + base_i32_locals;
+    let alloc_scratch_local = num_value_locals + UMULHI_SCRATCH + 2 + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
     debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
     debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
-    debug_assert_eq!(value_types.len(), num_vars as usize);
     let mut locals = Vec::new();
     let mut start = 0;
-    while start < value_types.len() {
-        let ty = value_types[start];
+    while start < value_types.types().len() {
+        let ty = value_types.types()[start];
         let mut end = start + 1;
-        while end < value_types.len() && value_types[end] == ty {
+        while end < value_types.types().len() && value_types.types()[end] == ty {
             end += 1;
         }
         locals.push(((end - start) as u32, ty));
@@ -2033,10 +2141,10 @@ fn build_function(
     // binding dominates the whole body, including a resume-at-LABEL entry.
     for (raw, bits) in unbound_pool_const_seeds(inputargs, ops, constants, num_vars)? {
         sink.i64_const(bits);
-        if value_types[raw as usize] == ValType::F64 {
+        if value_types.ty(raw) == ValType::F64 {
             sink.f64_reinterpret_i64();
         }
-        sink.local_set(1 + raw);
+        sink.local_set(value_types.local(raw));
     }
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
@@ -2075,11 +2183,8 @@ fn build_function(
         .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
         .collect();
 
-    // x86/assembler.py:835-846 `write_pending_failure_recoveries` places the
-    // guard recovery stubs after the hot trace. Wasm uses one universal hot
-    // exit block and records only an exit ordinal at each guard site; the
-    // fail-argument spills are emitted in the cold dispatcher below. This is
-    // also the shape used by the dynasm sibling's pending guard tokens.
+    // The enclosing exit block gives each guard and Finish a direct path to
+    // the bridge-dispatch epilogue after it has spilled its fail arguments.
     sink.block(BlockType::Empty); // A $hot_exit
     if key_dispatch {
         // Per resumable label j (opened outermost = the loop header):
@@ -2127,20 +2232,20 @@ fn build_function(
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
     // caller fills slot `k` for the k-th input — `execute_token` for a loop
-    // entry, `emit_guard_exit`'s positional fail-arg spill for a bridge entry —
+    // entry, `emit_guard_spill`'s positional fail-arg spill for a bridge entry —
     // so read from the POSITIONAL slot `k`, not `ia.index` (a value number that
     // equals `k` for a loop but not for a bridge, whose live-in args carry their
-    // trace value numbers). The local index stays `1 + ia.index` because the
-    // body addresses each value by its number. For `key_dispatch` this runs on
+    // trace value numbers). `ValueLocals` maps each body value id to its dense
+    // local index. For `key_dispatch` this runs on
     // the key-0 (preamble) path only — past the `br_if` above — so a resuming
     // bridge never scatters its frame-passed label values into the function
     // inputargs' home slots; those stay null-initialized (GC-safe) and the
     // resume loader sets the live label-arg homes.
     for (k, ia) in inputargs.iter().enumerate() {
-        let local_idx = 1 + ia.index;
+        let local_idx = value_types.local(ia.index);
         let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
         sink.local_get(0).i64_load(mem64(offset));
-        if value_types[ia.index as usize] == ValType::F64 {
+        if value_types.ty(ia.index) == ValType::F64 {
             sink.f64_reinterpret_i64();
         }
         sink.local_set(local_idx);
@@ -2162,8 +2267,17 @@ fn build_function(
     let mut labels_passed = 0usize;
     let mut ovf_flag_live = false;
     let mut fused_guard_at: Option<usize> = None;
+    // rewrite.py:41-45 `_write_barrier_applied`, represented by
+    // RewriteState::wb_applied in rewrite.rs.  A base enters this set after
+    // its barrier is emitted or when a nursery allocation produces it; clear
+    // at every potentially-collecting op and LABEL so this describes every
+    // path reaching the next op, including entry through a LABEL loader.
+    let mut wb_applied = indexmap::IndexSet::<OpRef>::new();
 
     for (op_idx, op) in ops.iter().enumerate() {
+        if op.opcode == OpCode::Label || op.opcode.can_malloc() {
+            wb_applied.clear();
+        }
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
             // Branch over the resume loader, then close C_j, emit the loader
@@ -2191,13 +2305,13 @@ fn build_function(
             for (i, la) in all_label_args[labels_passed].iter().enumerate() {
                 sink.local_get(0);
                 sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
-                if value_types[la.raw() as usize] == ValType::F64 {
+                if value_types.ty(la.raw()) == ValType::F64 {
                     sink.f64_reinterpret_i64();
                 }
-                sink.local_set(1 + la.raw());
+                sink.local_set(value_types.local(la.raw()));
                 if let Some(h) = ref_homes.home(*la) {
                     sink.local_get(0);
-                    sink.local_get(1 + la.raw());
+                    sink.local_get(value_types.local(la.raw()));
                     sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                 }
             }
@@ -2210,13 +2324,13 @@ fn build_function(
                     .expect("LABEL live-in has assigned capture storage");
                 sink.local_get(0);
                 sink.i64_load(mem64(label_resume.frame_offset(storage, frame)));
-                if value_types[r.raw() as usize] == ValType::F64 {
+                if value_types.ty(r.raw()) == ValType::F64 {
                     sink.f64_reinterpret_i64();
                 }
-                sink.local_set(1 + r.raw());
+                sink.local_set(value_types.local(r.raw()));
                 if let Some(h) = ref_homes.home(r) {
                     sink.local_get(0);
-                    sink.local_get(1 + r.raw());
+                    sink.local_get(value_types.local(r.raw()));
                     sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                 }
             }
@@ -2362,7 +2476,7 @@ fn build_function(
                 );
                 for &i in &moved {
                     let label_arg = label_args[i];
-                    if value_types[label_arg.raw() as usize] == ValType::F64 {
+                    if value_types.ty(label_arg.raw()) == ValType::F64 {
                         emit_resolve_f64(
                             &mut sink,
                             constants,
@@ -2374,7 +2488,7 @@ fn build_function(
                     }
                 }
                 for &i in moved.iter().rev() {
-                    sink.local_set(1 + label_args[i].raw());
+                    sink.local_set(value_types.local(label_args[i].raw()));
                 }
                 // The parallel move rebinds loop-carried locals without going
                 // through store-on-def, so a Ref label arg that is REBOUND to a
@@ -2397,7 +2511,7 @@ fn build_function(
                             continue;
                         }
                         sink.local_get(0);
-                        sink.local_get(1 + la.raw());
+                        sink.local_get(value_types.local(la.raw()));
                         sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                     }
                 }
@@ -2405,8 +2519,7 @@ fn build_function(
             }
 
             OpCode::Finish => {
-                sink.i32_const(guard_idx as i32);
-                sink.local_set(bridge_slot_local);
+                emit_guard_spill(&mut sink, constants, value_types, guard_idx, op);
                 sink.br(block_exit_depth);
                 guard_idx += 1;
             }
@@ -2657,7 +2770,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     sink.i32_const(exc_value_addr);
                     sink.i64_load(mem64(0));
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
                 sink.i32_const(exc_type_addr);
                 sink.i64_const(0);
@@ -2684,7 +2797,9 @@ fn build_function(
             // High 64 bits of the unsigned 64×64→128 product. The optimizer
             // emits this for division/modulo-by-constant strength reduction;
             // wasm has no mul-high instruction, so expand via 32-bit split.
-            OpCode::UintMulHigh => emit_umulhi(&mut sink, constants, value_types, op, num_vars),
+            OpCode::UintMulHigh => {
+                emit_umulhi(&mut sink, constants, value_types, op, value_types.count())
+            }
 
             // Overflow variants: compute result + overflow flag
             OpCode::IntAddOvf => {
@@ -2694,7 +2809,7 @@ fn build_function(
                     value_types,
                     op,
                     BinOp::I64Add,
-                    num_vars,
+                    value_types.count(),
                     ovf_flag_local,
                 );
             }
@@ -2705,7 +2820,7 @@ fn build_function(
                     value_types,
                     op,
                     BinOp::I64Sub,
-                    num_vars,
+                    value_types.count(),
                     ovf_flag_local,
                 );
             }
@@ -2716,7 +2831,7 @@ fn build_function(
                     value_types,
                     op,
                     BinOp::I64Mul,
-                    num_vars,
+                    value_types.count(),
                     ovf_flag_local,
                 );
             }
@@ -2772,7 +2887,7 @@ fn build_function(
                         sink.i64_const(shift);
                         sink.i64_shr_s();
                     }
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::IntForceGeZero => {
@@ -2782,14 +2897,14 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     // if val < 0, use 0; else use val
                     // Wasm: local.tee + i64.const 0 + local.get + i64.lt_s + select
-                    let tmp_local = 1 + vi; // reuse result local as temp
+                    let tmp_local = value_types.local(vi); // reuse result local as temp
                     sink.local_tee(tmp_local);
                     sink.i64_const(0);
                     sink.local_get(tmp_local);
                     sink.i64_const(0);
                     sink.i64_lt_s();
                     sink.select();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -2801,7 +2916,7 @@ fn build_function(
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.f64_div();
                     sink.f64_floor();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -2811,7 +2926,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_trunc_sat_f64_s();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::CastIntToFloat => {
@@ -2819,14 +2934,14 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_convert_i64_s();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::ConvertFloatBytesToLonglong => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::ConvertLonglongBytesToFloat => {
@@ -2834,7 +2949,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_reinterpret_i64();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -2858,14 +2973,14 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.i64_extend_i32_s();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -2874,14 +2989,14 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::SameAsF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -2894,7 +3009,7 @@ fn build_function(
                     let field_offset = field_offset_from_descr(op);
                     let (size, signed) = field_size_sign_from_descr(op);
                     emit_sized_int_load(&mut sink, field_offset, size, signed);
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::GetfieldGcR | OpCode::GetfieldRawR => {
@@ -2910,11 +3025,13 @@ fn build_function(
                         memory_index: 0,
                     });
                     sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                if let Some(base) = write_barrier_base(op, ref_values) {
+                if let Some(base) = emitted_write_barrier_base(op, ref_values)
+                    && !wb_applied.contains(&base)
+                {
                     emit_write_barrier(
                         &mut sink,
                         constants,
@@ -2924,6 +3041,9 @@ fn build_function(
                         wb_fn_ptr,
                         base,
                     );
+                    // rewrite.rs:1941-1947 `gen_write_barrier`: remember
+                    // only after the barrier has been emitted.
+                    wb_applied.insert(base);
                 }
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
@@ -2954,7 +3074,7 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -2969,7 +3089,7 @@ fn build_function(
                     // at its real width, like `bh_arraylen_gc`. A fixed i64_load
                     // would fold the next field into the high half on wasm32.
                     emit_sized_int_load(&mut sink, len_offset, len_size, false);
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcPureI | OpCode::GetarrayitemRawI => {
@@ -2979,7 +3099,7 @@ fn build_function(
                     emit_array_addr(&mut sink, constants, value_types, op);
                     let (item_size, signed) = array_item_size_sign_from_descr(op);
                     emit_sized_int_load(&mut sink, 0, item_size, signed);
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemRawR => {
@@ -2992,7 +3112,7 @@ fn build_function(
                         memory_index: 0,
                     });
                     sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::GetarrayitemGcF | OpCode::GetarrayitemGcPureF | OpCode::GetarrayitemRawF => {
@@ -3004,11 +3124,13 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                if let Some(base) = write_barrier_base(op, ref_values) {
+                if let Some(base) = emitted_write_barrier_base(op, ref_values)
+                    && !wb_applied.contains(&base)
+                {
                     emit_write_barrier(
                         &mut sink,
                         constants,
@@ -3018,6 +3140,9 @@ fn build_function(
                         wb_fn_ptr,
                         base,
                     );
+                    // rewrite.rs:1941-1947 `gen_write_barrier`: remember
+                    // only after the barrier has been emitted.
+                    wb_applied.insert(base);
                 }
                 emit_array_addr(&mut sink, constants, value_types, op);
                 if array_item_is_float_from_descr(op) {
@@ -3116,7 +3241,7 @@ fn build_function(
                     sink.i32_add();
                     let (item_size, signed) = array_item_size_sign_from_descr(op);
                     emit_sized_int_load(&mut sink, 0, item_size, signed);
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::RawStore => {
@@ -3142,7 +3267,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     sink.i32_const(crate::jit_exc_value_addr() as i32);
                     sink.i64_load(mem64(0));
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
                 sink.i32_const(crate::jit_exc_type_addr() as i32);
                 sink.i64_const(0);
@@ -3158,7 +3283,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     sink.i32_const(crate::jit_exc_type_addr() as i32);
                     sink.i64_load(mem64(0));
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::RestoreException => {
@@ -3472,7 +3597,7 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i64_add();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             // Emitted by `RawBufferPtrInfo::_force_elements` after a
@@ -3525,7 +3650,7 @@ fn build_function(
                         memory_index: 0,
                     });
                     sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -3715,7 +3840,14 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                 }
-                emit_reload_ca_input_refs_from_homes(&mut sink, ref_homes, ref_values, op, frame);
+                emit_reload_ca_input_refs_from_homes(
+                    &mut sink,
+                    value_types,
+                    ref_homes,
+                    ref_values,
+                    op,
+                    frame,
+                );
                 // dispatch key = 0: run the loop from its entry (preamble), not a
                 // LABEL resume — this is a fresh call.
                 sink.local_get(ca_cfp_local);
@@ -3821,7 +3953,7 @@ fn build_function(
                 }
                 // store-on-def homes the result Ref (from whichever branch).
                 if !OpRef::raw_is_constant(vi) {
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 } else {
                     sink.drop();
                 }
@@ -3869,7 +4001,15 @@ fn build_function(
                     ca.ca_reload_fn_ptr,
                     ca.inline,
                 );
-                emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip, frame);
+                emit_reload_refs_from_homes(
+                    &mut sink,
+                    value_types,
+                    ref_homes,
+                    &liveness,
+                    op_idx,
+                    skip,
+                    frame,
+                );
             }
 
             // ── CALL operations (via trampoline) ──
@@ -3919,7 +4059,7 @@ fn build_function(
                     // call_indirect(table_index, type_index): table 0, type for arity n.
                     sink.call_indirect(0, base + nargs as u32);
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     } else {
                         sink.drop(); // value-producing call whose result is unused
                     }
@@ -3931,6 +4071,7 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
+                        value_types,
                         ref_homes,
                         &liveness,
                         op_idx,
@@ -3960,7 +4101,13 @@ fn build_function(
                         ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
-                        &mut sink, ref_homes, &liveness, op_idx, None, frame,
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        None,
+                        frame,
                     );
                 } else if let Some((sig, &type_idx)) = residual_call_float_sig(op).and_then(|sig| {
                     float_residual_type_indices
@@ -3983,7 +4130,7 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, type_idx);
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     } else {
                         sink.drop(); // value-producing call whose result is unused
                     }
@@ -3995,22 +4142,42 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
+                        value_types,
                         ref_homes,
                         &liveness,
                         op_idx,
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
                     );
-                } else if let Some(type_idx) =
-                    true_void_residual_type_idx.filter(|_| residual_call_true_void(op))
-                {
-                    // Exact `() -> ()` in-module helper. Unlike the generic
-                    // trampoline path, this cannot allocate, collect, force,
-                    // or replace the frame, so no frame/ref-home reload is
-                    // needed after the call.
+                } else if let (Some(base), Some(nargs)) = (
+                    true_void_residual_type_base,
+                    residual_call_void_true_arity(op),
+                ) {
+                    // Direct in-module true-void residual call: the callee is
+                    // `(i64×n)->()` (descr result_size == 0), so the call has no
+                    // result to drop.
+                    let call_args = &op.getarglist()[1..];
+                    for arg in call_args {
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    }
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
-                    sink.call_indirect(0, type_idx);
+                    sink.call_indirect(0, base + nargs as u32);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        None,
+                        frame,
+                    );
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
@@ -4051,10 +4218,10 @@ fn build_function(
                     if !OpRef::raw_is_constant(vi) && !is_void {
                         emit_call_area_addr(&mut sink);
                         sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                        if value_types[vi as usize] == ValType::F64 {
+                        if value_types.ty(vi) == ValType::F64 {
                             sink.f64_reinterpret_i64();
                         }
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     }
                     // Mirror the direct path: a trampoline residual call may force and collect.
                     emit_reload_frame_if_necessary(
@@ -4065,6 +4232,7 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
+                        value_types,
                         ref_homes,
                         &liveness,
                         op_idx,
@@ -4168,6 +4336,7 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
+                        value_types,
                         ref_homes,
                         &liveness,
                         op_idx,
@@ -4200,7 +4369,7 @@ fn build_function(
                     sink.i64_extend_i32_u();
                     sink.end();
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     } else {
                         sink.drop();
                     }
@@ -4214,7 +4383,7 @@ fn build_function(
                     sink.i32_const(alloc_fn_ptr as i32);
                     sink.call_indirect(0, base + 2);
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     } else {
                         sink.drop();
                     }
@@ -4243,7 +4412,7 @@ fn build_function(
                         // result pointer
                         emit_call_area_addr(&mut sink);
                         sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     }
                 }
 
@@ -4257,7 +4426,7 @@ fn build_function(
                         && vtable_offset.is_some();
                     if write_vtable {
                         let vt_off = vtable_offset.unwrap() as u64;
-                        sink.local_get(1 + vi);
+                        sink.local_get(value_types.local(vi));
                         sink.i32_wrap_i64();
                         sink.i32_const(vtable as i32);
                         sink.i32_store(MemArg {
@@ -4278,7 +4447,7 @@ fn build_function(
                         && let Some((w_class_offset, w_class)) = w_class_init
                         && w_class != 0
                     {
-                        sink.local_get(1 + vi);
+                        sink.local_get(value_types.local(vi));
                         sink.i32_wrap_i64();
                         sink.i32_const(w_class as i32);
                         sink.i32_store(MemArg {
@@ -4303,9 +4472,31 @@ fn build_function(
                         ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
-                        &mut sink, ref_homes, &liveness, op_idx, skip, frame,
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        skip,
+                        frame,
                     );
                 }
+                // No `remember_wb` for the result. rewrite.rs:1130 and :2731
+                // seed it only on the branches that reached
+                // `can_use_nursery`; the `gen_malloc_fixedsize` decline does
+                // not, and :2720 spells out why — "the first result can come
+                // from an old-gen slow path whose TRACK_YOUNG_PTRS flag
+                // gen_initialize_tid intentionally preserves". Here the
+                // generation is not a codegen-time fact at all: a
+                // `non_moving` descr routes to `new_oldgen_fn_ptr`, whose
+                // `alloc_in_oldgen` stamps TRACK_YOUNG_PTRS, and the plain
+                // helper picks nursery or old-gen at runtime (the GC spells
+                // that out through `alloc_nursery_collecting_typed_rooted`'s
+                // `needs_write_barrier` out-parameter). Eliding here would
+                // drop the barrier on a fresh old object, losing an
+                // old-to-young edge. The inline flag test already makes the
+                // young case a load and a not-taken branch, so the elision
+                // this forgoes is the cheap one.
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos.get().raw();
@@ -4417,6 +4608,7 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
+                        value_types,
                         ref_homes,
                         &liveness,
                         op_idx,
@@ -4458,7 +4650,7 @@ fn build_function(
                     sink.i64_extend_i32_u();
                     sink.end();
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     } else {
                         sink.drop();
                     }
@@ -4486,6 +4678,7 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
+                        value_types,
                         ref_homes,
                         &liveness,
                         op_idx,
@@ -4550,6 +4743,7 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
+                        value_types,
                         ref_homes,
                         &liveness,
                         op_idx,
@@ -4591,7 +4785,7 @@ fn build_function(
                     sink.end();
                     sink.end();
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     } else {
                         sink.drop();
                     }
@@ -4607,7 +4801,7 @@ fn build_function(
                     sink.i32_const(alloc_array_fn_ptr as i32);
                     sink.call_indirect(0, base + 5);
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     } else {
                         sink.drop();
                     }
@@ -4648,7 +4842,7 @@ fn build_function(
                     if !OpRef::raw_is_constant(vi) {
                         emit_call_area_addr(&mut sink);
                         sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                        sink.local_set(1 + vi);
+                        sink.local_set(value_types.local(vi));
                     }
                 }
                 // `wasm_jit_alloc_array` collects; reload other live Refs. The
@@ -4664,9 +4858,18 @@ fn build_function(
                         ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
-                        &mut sink, ref_homes, &liveness, op_idx, skip, frame,
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        skip,
+                        frame,
                     );
                 }
+                // No `remember_wb` for the result, for the reason the
+                // New/NewWithVtable arm above gives: a `non_moving` array
+                // descr routes to `new_array_oldgen_fn_ptr`.
             }
 
             // ── Misc ──
@@ -4674,7 +4877,7 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     sink.i64_const(0); // sentinel force token
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -4699,7 +4902,7 @@ fn build_function(
                         }
                         _ => unreachable!(),
                     }
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::FloatNeg => {
@@ -4707,7 +4910,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_neg();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::FloatAbs => {
@@ -4715,7 +4918,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_abs();
-                    sink.local_set(1 + vi);
+                    sink.local_set(value_types.local(vi));
                 }
             }
 
@@ -4747,14 +4950,14 @@ fn build_function(
 
         // store-on-def: mirror a freshly-defined Ref result into its home slot
         // so a (future) collecting allocation can forward it. The local
-        // `1 + raw` holds the value the matched arm just set; `ref_homes` only
+        // The mapped value local holds the value the matched arm just set; `ref_homes` only
         // keys Ref-typed value ids, so non-Ref / void / constant ops are
         // skipped. Each value-producing arm is operand-stack-neutral, so this
         // appended store is balanced.
         let result = op.pos.get();
         if let Some(h) = ref_homes.home(result) {
             sink.local_get(0);
-            sink.local_get(1 + result.raw());
+            sink.local_get(value_types.local(result.raw()));
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
     }
@@ -4763,45 +4966,11 @@ fn build_function(
         sink.end(); // end loop
     }
     // A well-formed trace exits through a guard or Finish. Preserve the old
-    // malformed/natural-fallthrough behavior without letting it enter the cold
-    // dispatcher with an uninitialized selector.
+    // malformed/natural-fallthrough behavior without reaching bridge dispatch
+    // with a stale frame fail index.
     sink.local_get(0);
     sink.return_();
     sink.end(); // end A $hot_exit
-
-    // Structured-Wasm equivalent of the native backends' out-of-line guard
-    // recovery stubs. Locals retain their fail-site SSA values across the
-    // branch, so each handler can perform the original positional spills here
-    // without adding hot-path frame traffic or GC roots.
-    let cold_exits: Vec<&Op> = ops
-        .iter()
-        .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish)
-        .collect();
-    if !cold_exits.is_empty() {
-        let exit_count = cold_exits.len() as u32;
-        sink.block(BlockType::Empty); // $cold_done
-        for _ in cold_exits.iter().rev() {
-            sink.block(BlockType::Empty);
-        }
-        sink.local_get(bridge_slot_local);
-        if fail_index_base != 0 {
-            sink.i32_const(fail_index_base as i32);
-            sink.i32_sub();
-        }
-        sink.br_table((0..exit_count).collect::<Vec<_>>(), exit_count);
-        for (ordinal, op) in cold_exits.into_iter().enumerate() {
-            sink.end();
-            emit_guard_exit(
-                &mut sink,
-                constants,
-                value_types,
-                fail_index_base + ordinal as u32,
-                op,
-            );
-            sink.br(exit_count - ordinal as u32 - 1);
-        }
-        sink.end(); // end $cold_done
-    }
 
     // Epilogue bridge dispatch. Control reaches here only
     // after a guard `br`'d out of the exit block, having written its
@@ -5026,7 +5195,7 @@ fn resolve_const_bits(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) ->
 fn emit_resolve(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     opref: OpRef,
 ) {
     if opref.is_constant() {
@@ -5041,8 +5210,8 @@ fn emit_resolve(
         // out of bounds (`raw() == u32::MAX`).
         sink.i64_const(0);
     } else {
-        sink.local_get(1 + opref.raw());
-        if value_types[opref.raw() as usize] == ValType::F64 {
+        sink.local_get(value_types.local(opref.raw()));
+        if value_types.ty(opref.raw()) == ValType::F64 {
             sink.i64_reinterpret_f64();
         }
     }
@@ -5053,7 +5222,7 @@ fn emit_resolve(
 fn emit_resolve_f64(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     opref: OpRef,
 ) {
     if opref.is_constant() {
@@ -5061,8 +5230,8 @@ fn emit_resolve_f64(
         sink.i64_const(val);
         sink.f64_reinterpret_i64();
     } else {
-        debug_assert_eq!(value_types[opref.raw() as usize], ValType::F64);
-        sink.local_get(1 + opref.raw());
+        debug_assert_eq!(value_types.ty(opref.raw()), ValType::F64);
+        sink.local_get(value_types.local(opref.raw()));
     }
 }
 
@@ -5174,7 +5343,7 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
 fn emit_array_addr(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
 ) {
     let (base_size, item_size) = op
@@ -5197,7 +5366,7 @@ fn emit_array_addr(
 fn emit_guard_true(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
@@ -5217,7 +5386,7 @@ fn emit_guard_true(
 fn emit_guard_false(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
@@ -5295,36 +5464,43 @@ fn next_op_can_accept_cc<'a>(
     Some(next_op)
 }
 
-/// Common guard exit: condition is on stack (i32), emit a tiny hot failure arm.
+/// Common guard exit: condition is on stack (i32), spill and branch on failure.
+///
+/// The spill belongs in this arm rather than in one shared exit handler after
+/// the trace. x86/assembler.py:835-846 `write_pending_failure_recoveries` can
+/// place its recovery stubs after the hot code because `GuardToken.fail_locs`
+/// (llsupport/assembler.py:24) freezes the register or stack location the
+/// allocator gave each fail argument *at the guard*, so a stub reads a fixed
+/// home and nothing keeps the value live past its own guard. Wasm has no way
+/// to record such a location: the allocator is the engine's, and it derives
+/// liveness from where the emitted code reads a local. Routing every guard to
+/// one handler block therefore makes it a join point whose live-in set is the
+/// union of every guard's fail arguments, so each becomes live at every guard
+/// in the trace, and the resulting long ranges spill in the hot body. Reading
+/// them here ends each range at the guard that needs it.
 ///
 /// `block_exit_depth` is the statement-level depth of the enclosing exit
 /// `block` (preamble = 0, loop body = 1); the `+ 1` accounts for the `if`
-/// this opens. The actual fail-argument recovery is emitted out of line by
-/// `build_function`, matching x86's `write_pending_failure_recoveries`.
+/// this opens. The stores run only on the failing edge, so the fallthrough
+/// carries no frame traffic.
 fn emit_guard_if_exit(
     sink: &mut InstructionSink<'_>,
-    _constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
     guard_idx: u32,
-    _op: &Op,
+    op: &Op,
     block_exit_depth: u32,
 ) {
     sink.if_(BlockType::Empty);
-    // The bridge-slot scratch is the first i32 local after the value locals,
-    // the UintMulHigh scratch locals, and the overflow flag. It is dead until
-    // the bridge epilogue overwrites it with `local.tee`, so it doubles as the
-    // cold-exit selector without growing the local or GC-root set.
-    let exit_selector_local = value_types.len() as u32 + UMULHI_SCRATCH + 2;
-    sink.i32_const(guard_idx as i32);
-    sink.local_set(exit_selector_local);
+    emit_guard_spill(sink, constants, value_types, guard_idx, op);
     sink.br(block_exit_depth + 1);
     sink.end();
 }
 
-fn emit_guard_exit(
+fn emit_guard_spill(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     guard_idx: u32,
     op: &Op,
 ) {
@@ -5403,7 +5579,7 @@ fn apply_binop(sink: &mut InstructionSink<'_>, op: BinOp) {
 fn emit_binop(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
     binop: BinOp,
 ) {
@@ -5414,7 +5590,7 @@ fn emit_binop(
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     apply_binop(sink, binop);
-    sink.local_set(1 + vi);
+    sink.local_set(value_types.local(vi));
 }
 
 /// `UintMulHigh`: high 64 bits of the unsigned 64×64→128 product. Wasm has
@@ -5422,35 +5598,42 @@ fn emit_binop(
 /// a = ah·2³²+al, b = bh·2³²+bl, with carry-safe intermediates
 ///   mid1 = ah·bl + (al·bl >> 32)
 ///   high = ah·bh + (mid1 >> 32) + ((al·bh + (mid1 & 0xFFFFFFFF)) >> 32)
-/// Uses the five scratch locals reserved at `num_vars+1 ..= num_vars+5`.
+/// Uses the five scratch locals reserved after the dense value-local range.
 fn emit_umulhi(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
-    num_vars: u32,
+    value_local_count: u32,
 ) {
     let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
-    emit_umulhi_to_local(sink, constants, value_types, op, num_vars, 1 + vi);
+    emit_umulhi_to_local(
+        sink,
+        constants,
+        value_types,
+        op,
+        value_local_count,
+        value_types.local(vi),
+    );
 }
 
 fn emit_umulhi_to_local(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
-    num_vars: u32,
+    value_local_count: u32,
     output_local: u32,
 ) {
     const MASK32: i64 = 0xFFFF_FFFF;
-    let al = num_vars + 1;
-    let ah = num_vars + 2;
-    let bl = num_vars + 3;
-    let bh = num_vars + 4;
-    let mid1 = num_vars + 5;
+    let al = value_local_count + 1;
+    let ah = value_local_count + 2;
+    let bl = value_local_count + 3;
+    let bh = value_local_count + 4;
+    let mid1 = value_local_count + 5;
 
     // al = a & 0xFFFFFFFF
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
@@ -5512,26 +5695,26 @@ fn emit_umulhi_to_local(
 fn emit_ovf_binop(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
     binop: BinOp,
-    num_vars: u32,
+    value_local_count: u32,
     ovf_flag_local: u32,
 ) -> bool {
     let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
         return false;
     }
-    let result_local = 1 + vi;
+    let result_local = value_types.local(vi);
 
     if matches!(binop, BinOp::I64Mul) {
         // Keep both factors in the umulhi scratch bank. The hot signed-32
         // overflow check below reuses them without resolving the SSA operands
         // again; the slow 64-bit path is free to overwrite the same bank.
         emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-        sink.local_tee(num_vars + 1);
+        sink.local_tee(value_local_count + 1);
         emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
-        sink.local_tee(num_vars + 2);
+        sink.local_tee(value_local_count + 2);
     } else {
         emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
         emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
@@ -5573,13 +5756,13 @@ fn emit_ovf_binop(
             // every multiplication into a software 64x64->128 product. The
             // exact sign-extension checks preserve the full-width slow path
             // for every value outside that proven-safe domain.
-            sink.local_get(num_vars + 1);
+            sink.local_get(value_local_count + 1);
             sink.i64_extend32_s();
-            sink.local_get(num_vars + 1);
+            sink.local_get(value_local_count + 1);
             sink.i64_eq();
-            sink.local_get(num_vars + 2);
+            sink.local_get(value_local_count + 2);
             sink.i64_extend32_s();
-            sink.local_get(num_vars + 2);
+            sink.local_get(value_local_count + 2);
             sink.i64_eq();
             sink.i32_and();
             sink.if_(BlockType::Empty);
@@ -5589,8 +5772,15 @@ fn emit_ovf_binop(
 
             // Convert the unsigned high word to the signed high word:
             // smulhi = umulhi - ((a >>s 63) & b) - ((b >>s 63) & a).
-            let high_local = num_vars + 1;
-            emit_umulhi_to_local(sink, constants, value_types, op, num_vars, high_local);
+            let high_local = value_local_count + 1;
+            emit_umulhi_to_local(
+                sink,
+                constants,
+                value_types,
+                op,
+                value_local_count,
+                high_local,
+            );
             sink.local_get(high_local);
             emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             sink.i64_const(63);
@@ -5726,7 +5916,7 @@ fn cond_kind_of(opcode: OpCode) -> Option<CondKind> {
 fn push_cond(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
     kind: CondKind,
 ) {
@@ -5780,7 +5970,7 @@ fn push_cond(
 fn push_guard_failure_cond(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
     kind: CondKind,
     guard_opcode: OpCode,
@@ -5818,7 +6008,7 @@ fn push_guard_failure_cond(
 fn emit_cond(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
     kind: CondKind,
 ) {
@@ -5828,7 +6018,7 @@ fn emit_cond(
     }
     push_cond(sink, constants, value_types, op, kind);
     sink.i64_extend_i32_u();
-    sink.local_set(1 + vi);
+    sink.local_set(value_types.local(vi));
 }
 
 // ── Unary op helper ──
@@ -5836,7 +6026,7 @@ fn emit_cond(
 fn emit_unary_vi(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
+    value_types: &ValueLocals,
     op: &Op,
     prefix: impl FnOnce(&mut InstructionSink<'_>),
     suffix: impl FnOnce(&mut InstructionSink<'_>),
@@ -5846,7 +6036,7 @@ fn emit_unary_vi(
         prefix(sink);
         emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
         suffix(sink);
-        sink.local_set(1 + vi);
+        sink.local_set(value_types.local(vi));
     }
 }
 

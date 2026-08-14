@@ -9,7 +9,7 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, ExtraEffect, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
+use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store};
 
@@ -458,6 +458,171 @@ fn build_module_default(
     )
 }
 
+fn emitted_local_count(bytes: &[u8]) -> u32 {
+    wasmparser::Parser::new(0)
+        .parse_all(bytes)
+        .find_map(|payload| match payload.unwrap() {
+            wasmparser::Payload::CodeSectionEntry(body) => Some(
+                body.get_locals_reader()
+                    .unwrap()
+                    .into_iter()
+                    .map(|local| local.unwrap().0)
+                    .sum(),
+            ),
+            _ => None,
+        })
+        .expect("generated module must contain its trace function")
+}
+
+#[test]
+fn sparse_value_ids_declare_only_addressable_value_locals() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(40),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(40), OpRef::const_int(1)],
+            OpRef::int_op(900),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(900))]),
+    ];
+
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(emitted_local_count(&bytes), 12);
+}
+
+/// Count the direct `wasm_jit_write_barrier` table calls by their unique table
+/// target immediate.  The direct lowering places that `i32.const` immediately
+/// before its `call_indirect`.
+fn direct_write_barrier_call_count(bytes: &[u8], target: i32) -> usize {
+    let mut count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            let mut target_on_stack = false;
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I32Const { value } if value == target => {
+                        target_on_stack = true;
+                    }
+                    wasmparser::Operator::CallIndirect { .. } if target_on_stack => {
+                        count += 1;
+                        target_on_stack = false;
+                    }
+                    _ => target_on_stack = false,
+                }
+            }
+        }
+    }
+    count
+}
+
+fn build_module_with_write_barrier_target(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    write_barrier_target: i64,
+) -> Vec<u8> {
+    let (bytes, _, _, _, _) = codegen::build_wasm_module(
+        inputargs,
+        ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+        codegen::AllocHelpers::default(),
+        write_barrier_target,
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // The allocated trace keeps both Ref inputs live across New; reserve
+        // their homes in the shared helper geometry.
+        codegen::FrameGeometry::compact(4, 2, 0),
+        codegen::CaParams::default(),
+    )
+    .expect("wasm codegen should succeed");
+    bytes
+}
+
+#[test]
+fn write_barrier_elision_keeps_one_barrier_per_base() {
+    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+    use std::sync::Arc;
+
+    const WB_TARGET: i64 = 0x4a11;
+    let pointer_field = Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false));
+    let finish = Op::new(OpCode::Finish, &[]);
+
+    let new_obj = make_op(OpCode::New, &[], OpRef::ref_op(2));
+    new_obj.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, 1)));
+    let new_store_a = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(2)), rb(OpRef::input_arg_ref(0))],
+    );
+    new_store_a.setdescr(pointer_field.clone());
+    let new_store_b = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(2)), rb(OpRef::input_arg_ref(1))],
+    );
+    new_store_b.setdescr(pointer_field.clone());
+    let allocated = build_module_with_write_barrier_target(
+        &[
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Ref, 1),
+        ],
+        &[new_obj, new_store_a, new_store_b, finish.clone()],
+        WB_TARGET,
+    );
+    validate_wasm(&allocated);
+    assert_eq!(
+        direct_write_barrier_call_count(&allocated, WB_TARGET as i32),
+        1,
+        "an allocation result is not seeded into the applied set — its generation \
+         is a runtime choice — so the first store barriers and the second is elided"
+    );
+
+    let live_store_a = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
+    );
+    live_store_a.setdescr(pointer_field.clone());
+    let live_store_b = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(2))],
+    );
+    live_store_b.setdescr(pointer_field);
+    let repeated_livein = build_module_with_write_barrier_target(
+        &[
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Ref, 1),
+            InputArg::from_type(Type::Ref, 2),
+        ],
+        &[live_store_a, live_store_b, finish],
+        WB_TARGET,
+    );
+    validate_wasm(&repeated_livein);
+    assert_eq!(
+        direct_write_barrier_call_count(&repeated_livein, WB_TARGET as i32),
+        1,
+        "repeated stores into one live-in base must emit one write-barrier call"
+    );
+}
+
 fn execute_ovf_trace_with_guard(
     opcode: OpCode,
     guard_opcode: OpCode,
@@ -609,50 +774,56 @@ fn test_int_mul_ovf_emits_signed32_fast_path_and_full_width_fallback() {
     );
 }
 
-/// PyPy's native backends append guard recovery stubs after the hot trace.
-/// Keep fail-argument stores out of the successful guard arm in Wasm too: a
-/// selector branch should reach one cold `br_table` dispatcher, where the
-/// original int/ref/float-bit spills are performed.
+/// Each guard spills its own fail arguments before it branches to the shared
+/// bridge-dispatch epilogue.
 #[test]
-fn test_guard_recovery_is_out_of_line() {
+fn test_guard_fail_args_spill_in_their_own_failure_arms() {
     let inputargs = vec![
         InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 1),
-        InputArg::from_type(Type::Float, 2),
+        InputArg::from_type(Type::Int, 1),
     ];
-    let fail_args = smallvec![
+    let first_guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
+    first_guard.setfailargs(smallvec![
         rb(OpRef::input_arg_int(0)),
-        rb(OpRef::input_arg_ref(1)),
-        rb(OpRef::input_arg_float(2)),
-    ];
-    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
-    guard.setfailargs(fail_args.clone());
-    let finish = Op::new(OpCode::Finish, &fail_args);
-    finish.setfailargs(fail_args);
-    let (bytes, guards) =
-        build_module_default(&inputargs, &[guard, finish], &indexmap::IndexMap::new());
+        rb(OpRef::input_arg_int(1)),
+    ]);
+    let second_guard = Op::new(OpCode::GuardFalse, &[rb(OpRef::input_arg_int(1))]);
+    second_guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_int(1)),
+        rb(OpRef::input_arg_int(0)),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    let (bytes, guards) = build_module_default(
+        &inputargs,
+        &[first_guard, second_guard, finish],
+        &indexmap::IndexMap::new(),
+    );
     validate_wasm(&bytes);
-    assert_eq!(guards.len(), 2);
+    assert_eq!(guards.len(), 3);
 
-    let mut control_is_if = Vec::new();
-    let mut stores_inside_if = 0;
+    let mut control_stack = Vec::new();
+    let mut stores_per_guard_arm = Vec::new();
     let mut br_tables = 0;
     for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
             let mut operators = body.get_operators_reader().unwrap();
             while !operators.eof() {
                 match operators.read().unwrap() {
-                    wasmparser::Operator::If { .. } => control_is_if.push(true),
+                    wasmparser::Operator::If { .. } => control_stack.push(Some(0usize)),
                     wasmparser::Operator::Block { .. } | wasmparser::Operator::Loop { .. } => {
-                        control_is_if.push(false);
+                        control_stack.push(None);
                     }
                     wasmparser::Operator::End => {
-                        control_is_if.pop();
+                        if let Some(Some(stores)) = control_stack.pop() {
+                            stores_per_guard_arm.push(stores);
+                        }
                     }
-                    wasmparser::Operator::I64Store { .. }
-                        if control_is_if.iter().any(|inside_if| *inside_if) =>
-                    {
-                        stores_inside_if += 1;
+                    wasmparser::Operator::I64Store { .. } => {
+                        if let Some(Some(stores)) =
+                            control_stack.iter_mut().rev().find(|frame| frame.is_some())
+                        {
+                            *stores += 1;
+                        }
                     }
                     wasmparser::Operator::BrTable { .. } => br_tables += 1,
                     _ => {}
@@ -660,8 +831,11 @@ fn test_guard_recovery_is_out_of_line() {
             }
         }
     }
-    assert_eq!(stores_inside_if, 0, "guard arms must not spill fail args");
-    assert_eq!(br_tables, 1, "all exits must share one cold dispatcher");
+    assert_eq!(stores_per_guard_arm, [3, 3]);
+    assert_eq!(
+        br_tables, 0,
+        "guard exits must not use a selector dispatcher"
+    );
 }
 
 #[test]
@@ -949,13 +1123,29 @@ fn test_call_generates_import() {
     assert!(has_jit_call, "module should import jit_call_compact");
 }
 
-fn true_void_call(helper: PyreHelperKind) -> Op {
+fn void_call(arg_types: Vec<Type>, args: &[OpRef], result_size: usize) -> Op {
+    void_call_with_helper(arg_types, args, result_size, PyreHelperKind::None)
+}
+
+fn void_call_with_helper(
+    arg_types: Vec<Type>,
+    args: &[OpRef],
+    result_size: usize,
+    helper: PyreHelperKind,
+) -> Op {
+    let mut operands = vec![rb(OpRef::const_int(42))];
+    operands.extend(args.iter().copied().map(rb));
+    let op = Op::new(OpCode::CallN, &operands);
     let mut effect = EffectInfo::default();
-    effect.extraeffect = ExtraEffect::CannotRaise;
-    effect.can_collect = false;
     effect.pyre_helper = helper;
-    let op = Op::new(OpCode::CallN, &[rb(OpRef::const_int(42))]);
-    op.setdescr(majit_ir::make_call_descr(vec![], Type::Void, effect));
+    op.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        arg_types,
+        Type::Void,
+        false,
+        result_size,
+        effect,
+    ));
     op
 }
 
@@ -1009,11 +1199,28 @@ fn indirect_call_types_and_drop_count(bytes: &[u8]) -> (Vec<(u32, u32)>, usize) 
     (indirect_calls, drops)
 }
 
+fn function_type(
+    bytes: &[u8],
+    type_index: usize,
+) -> (Vec<wasmparser::ValType>, Vec<wasmparser::ValType>) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::TypeSection(types) = payload.unwrap() {
+            let ty = types
+                .into_iter_err_on_gc_types()
+                .nth(type_index)
+                .unwrap_or_else(|| panic!("missing function type {type_index}"))
+                .unwrap();
+            return (ty.params().to_vec(), ty.results().to_vec());
+        }
+    }
+    panic!("module has no type section");
+}
+
 #[test]
-fn test_clear_in_flight_exception_uses_true_void_indirect_call() {
+fn test_nullary_true_void_call_uses_indirect_call_without_drop() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![
-        true_void_call(PyreHelperKind::ClearInFlightException),
+        void_call(vec![], &[], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
@@ -1028,11 +1235,137 @@ fn test_clear_in_flight_exception_uses_true_void_indirect_call() {
 }
 
 #[test]
-fn test_untagged_size_zero_void_call_keeps_trampoline() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
     let ops = vec![
-        true_void_call(PyreHelperKind::None),
+        void_call(
+            vec![Type::Int, Type::Ref],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
+            0,
+        ),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert!(has_table_import(&bytes));
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(3, 0)]);
+    assert_eq!(
+        function_type(&bytes, 3),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![]
+        )
+    );
+    assert_eq!(drops, 0, "a genuine void call has no result to drop");
+}
+
+#[test]
+fn test_true_void_family_does_not_shift_new_call_type() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(3));
+    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
+    let ops = vec![
+        void_call(
+            vec![Type::Ref, Type::Ref],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            0,
+        ),
+        new_op,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(6, 0), (1, 0), (3, 0), (1, 0)]);
+    assert_eq!(
+        function_type(&bytes, 6),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![]
+        )
+    );
+    assert_eq!(
+        function_type(&bytes, 3),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        )
+    );
+    assert_eq!(drops, 0);
+}
+
+#[test]
+fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(3));
+    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
+    let ops = vec![
+        void_call_with_helper(
+            vec![Type::Ref, Type::Ref],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            8,
+            PyreHelperKind::ListAppendValue,
+        ),
+        new_op,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(3, 0), (1, 0), (3, 0), (1, 0)]);
+    assert_eq!(
+        function_type(&bytes, indirect_calls[0].0 as usize),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        ),
+        "jit_list_append returns an ignored machine word"
+    );
+    assert_eq!(
+        function_type(&bytes, indirect_calls[2].0 as usize),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        ),
+        "New must reference its declared (i64, i64) -> i64 type"
+    );
+    assert_eq!(drops, 1, "only jit_list_append's result is discarded");
+}
+
+#[test]
+fn test_true_void_float_arg_call_keeps_trampoline() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        void_call(vec![Type::Float], &[OpRef::input_arg_float(0)], 0),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
 
@@ -1044,32 +1377,28 @@ fn test_untagged_size_zero_void_call_keeps_trampoline() {
 }
 
 #[test]
-fn test_malformed_tagged_void_call_keeps_trampoline() {
+fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let mut effect = EffectInfo::default();
-    effect.extraeffect = ExtraEffect::CannotRaise;
-    effect.can_collect = false;
-    effect.pyre_helper = PyreHelperKind::ClearInFlightException;
-    let call = Op::new(
-        OpCode::CallN,
-        &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_int(0))],
-    );
-    call.setdescr(majit_ir::make_call_descr(
-        vec![Type::Int],
-        Type::Void,
-        effect,
-    ));
     let ops = vec![
-        call,
+        void_call(vec![Type::Int], &[OpRef::input_arg_int(0)], 8),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
-    assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
-    let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
-    assert!(indirect_calls.is_empty());
+    assert!(has_table_import(&bytes));
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(2, 0), (1, 0)]);
+    assert_eq!(
+        function_type(&bytes, 2),
+        (
+            vec![wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        )
+    );
+    assert_eq!(drops, 1, "the ignored word result must be dropped");
 }
 
 #[test]
@@ -1081,7 +1410,7 @@ fn test_true_void_type_index_accounts_for_trampoline_type() {
             &[OpRef::const_int(43), OpRef::input_arg_int(0)],
             OpRef::int_op(1),
         ),
-        true_void_call(PyreHelperKind::ClearInFlightException),
+        void_call(vec![], &[], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
