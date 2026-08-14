@@ -2833,7 +2833,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // keyword is rejected with "takes no keyword arguments".
         crate::gateway::make_module_builtin_function_with_arity_and_sig(
             "abs",
-            builtin_abs,
+            __pyre_wrap_builtin_abs,
             1,
             crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
         )
@@ -4510,6 +4510,10 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         [val] => *val,
         _ => parse_single_required(args, "val", "abs")?,
     };
+    builtin_abs_obj(obj)
+}
+
+fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if is_bool(obj) {
             return Ok(w_int_new(w_bool_get_value(obj) as i64));
@@ -4557,6 +4561,23 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     )))
 }
 
+pub fn __pyre_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 1 {
+        return builtin_abs(args);
+    }
+    let obj = args[0];
+    builtin_abs_obj(obj)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_abs"),
+        func: __pyre_wrap_builtin_abs,
+    };
+
 /// Strip the trailing `__pyre_kw__` dict that `call_with_kwargs`
 /// (`call.rs`) appends for builtin callees and return the positional
 /// slice paired with a keyword lookup helper.
@@ -4596,6 +4617,7 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// iterator-adapter graph: a `take_while` closure inlined per wrapper gives
 /// every `__pyre_wrap_*` shim its own closure type, and merging those
 /// distinct types on one `TakeWhile` graph's input has no common base class.
+#[majit_macros::unroll_safe]
 pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> usize {
     let mut count = 0;
     while count < args.len() && !args[count].is_null() {
@@ -5963,12 +5985,28 @@ macro_rules! exc_constructor {
             // `self.args_w = args_w`.  The string form of the exception
             // is derived from `args_w` on demand (`descr_str`), so the
             // constructor only captures the args — no eager message copy.
-            let exc = pyre_object::interp_exceptions::w_exception_new_empty($kind);
-            let args_list = pyre_object::interp_exceptions::w_exception_args_new(args.to_vec());
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let args_base = pyre_object::gc_roots::shadow_stack_len();
+            for &arg in args {
+                pyre_object::gc_roots::pin_root(arg);
             }
-            Ok(exc)
+            let exc = pyre_object::interp_exceptions::w_exception_new_empty($kind);
+            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(exc);
+            // The allocation above may collect and move the arguments without
+            // updating the raw slice, so rebuild them from their rooted slots.
+            let mut rooted_args = Vec::with_capacity(args.len());
+            for i in 0..args.len() {
+                rooted_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + i));
+            }
+            let args_list = pyre_object::interp_exceptions::w_exception_args_new(rooted_args);
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_args(
+                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                    args_list,
+                );
+            }
+            Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
         }
     };
 }

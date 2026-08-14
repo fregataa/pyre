@@ -6090,9 +6090,11 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             )
     };
     if tuple_canonical {
-        return try_walker_specialize_subscr_tuple(
-            ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
-        );
+        return spec_gate("subscr_tuple", || {
+            try_walker_specialize_subscr_tuple(
+                ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
+            )
+        });
     }
 
     // The arity-2 specialisations reach the same `getitem`, but their items
@@ -6102,10 +6104,12 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     // `ob_type`, so a tuple subclass (which keeps `&TUPLE_TYPE`) can never
     // pass the class guard below.
     if let Some(pair_kind) = specialised_pair_kind(unsafe { (*list_obj).ob_type }) {
-        return try_walker_specialize_subscr_specialised_pair(
-            ctx, op_pc, list_op, key_op, list_obj, key_obj, pair_kind, allboxes, call_descr, dst,
-            dst_bank,
-        );
+        return spec_gate("subscr_specialised_pair", || {
+            try_walker_specialize_subscr_specialised_pair(
+                ctx, op_pc, list_op, key_op, list_obj, key_obj, pair_kind, allboxes, call_descr,
+                dst, dst_bank,
+            )
+        });
     }
 
     // The `dict.lookup` gate.  Both `w_class` checks are load-bearing: a dict
@@ -9490,15 +9494,17 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
     if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
         // `_make_descr_binop(_divmod, _int_divmod)` (longobject.py:459) keeps a
         // dedicated long/int arm; every other operand shape stays generic.
-        return try_walker_specialize_builtin_divmod_long_int(
-            ctx,
-            op,
-            r_args,
-            dst,
-            concrete_callable,
-            lhs_obj,
-            rhs_obj,
-        );
+        return spec_gate("builtin_divmod_long_int", || {
+            try_walker_specialize_builtin_divmod_long_int(
+                ctx,
+                op,
+                r_args,
+                dst,
+                concrete_callable,
+                lhs_obj,
+                rhs_obj,
+            )
+        });
     }
     let (la, rb) = unsafe {
         (
@@ -9897,7 +9903,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
             }
@@ -10459,7 +10465,7 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
         ctx, op, sym, &sub_body, self_ref, inner_self, len_before, raw_item, dst,
     ) {
         Ok(()) => Ok(Some(())),
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-POP-SUBWALK pc={pc}");
             }
@@ -10695,7 +10701,14 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     if unsafe { pyre_object::w_list_len(inner_self) } == len_before
         && subwalk_guard_follows_store(ctx.trace_ctx, walk_start)
     {
-        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op.pc });
+        // This decline is an ordering verdict on the receiver, not a descent
+        // that reached an unlowered helper, so there is no symbolic address to
+        // carry.  Zero is unambiguous: a real symbolic hash always carries the
+        // `SYMBOLIC_FNADDR_BASE` tag.
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op.pc,
+            symbolic: 0,
+        });
     }
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
 
@@ -10768,7 +10781,7 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
             }
@@ -12717,7 +12730,9 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         return Ok(None);
     };
     if unsafe { pyre_object::functional::is_zip(iter_obj) } {
-        return try_walker_specialize_zip_two_tuple_iters(ctx, op_pc, iter_op, iter_obj);
+        return spec_gate("zip_two_tuple_iters", || {
+            try_walker_specialize_zip_two_tuple_iters(ctx, op_pc, iter_op, iter_obj)
+        });
     }
     let (concrete_current, concrete_remaining, concrete_step) = unsafe {
         if !pyre_object::functional::is_range_iter(iter_obj) {

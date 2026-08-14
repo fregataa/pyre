@@ -7,6 +7,7 @@
 //! (oopspec) and recursive (portal) call classification.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
@@ -4699,6 +4700,30 @@ impl CallControl {
     /// `CallPath`; otherwise it falls back to the stable symbolic address
     /// shim for source-only analysis.
     pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
+        // A `__pyre_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
+        // returns `Result<PyObjectRef, PyError>` (sret), neither of which the
+        // one-register-per-slot residual-call ABI can carry. The codewriter
+        // gives every wrapper its own jitcode and inlines it, so refusing the
+        // address here costs nothing and prevents a wrong-ABI call if inlining
+        // is ever declined. This guard precedes every resolution arm because a
+        // wrapper otherwise resolves through `target_to_path` and never reaches
+        // the symbolic tail. Both resolution arms below return
+        // `symbolic_fnaddr_for_path(&path)` when `function_fnaddrs` misses, so
+        // deriving the refusal from the same path makes a fire on a path that
+        // would have missed byte-identical to the unguarded result. Only a fire
+        // that refuses a resolved address changes the constant, keeping that
+        // change attributable to a real refusal.
+        let wrapper_path = crate::model::fn_const_segments(target)
+            .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
+            .or_else(|| self.target_to_path(target));
+        if let Some(path) = &wrapper_path
+            && path
+                .last_segment()
+                .is_some_and(|leaf| leaf.starts_with("__pyre_wrap_"))
+        {
+            return symbolic_fnaddr_for_path(path);
+        }
+
         if let Some(segments) = crate::model::fn_const_segments(target) {
             let path = CallPath::from_segments(segments.iter().map(String::as_str));
             return self
@@ -6676,17 +6701,52 @@ fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {
     ((hasher.finish() & !SYMBOLIC_FNADDR_HIGH_MASK) | SYMBOLIC_FNADDR_BASE) as i64
 }
 
+static SYMBOLIC_FNADDR_PATHS: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
+
+fn record_symbolic_fnaddr(value: i64, description: String) {
+    let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut paths = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    paths
+        .entry(value)
+        .and_modify(|existing| {
+            if description < *existing {
+                existing.clone_from(&description);
+            }
+        })
+        .or_insert(description);
+}
+
+pub(crate) fn symbolic_fnaddr_paths_snapshot() -> Vec<(i64, String)> {
+    let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let paths = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut snapshot: Vec<_> = paths
+        .iter()
+        .map(|(&value, description)| (value, description.clone()))
+        .collect();
+    snapshot.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    snapshot
+}
+
 pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
-    stable_symbolic_fnaddr(path)
+    let symbolic = stable_symbolic_fnaddr(path);
+    record_symbolic_fnaddr(symbolic, path.canonical_key());
+    symbolic
 }
 
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
     if let Some(segments) = crate::model::fn_const_segments(target) {
-        return stable_symbolic_fnaddr(&CallPath::from_segments(
-            segments.iter().map(String::as_str),
-        ));
+        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        let symbolic = stable_symbolic_fnaddr(&path);
+        record_symbolic_fnaddr(symbolic, path.canonical_key());
+        return symbolic;
     }
-    stable_symbolic_fnaddr(target)
+    let symbolic = stable_symbolic_fnaddr(target);
+    record_symbolic_fnaddr(symbolic, format!("target:{target}"));
+    symbolic
 }
 
 impl Default for CallControl {
@@ -8287,8 +8347,11 @@ pub(crate) fn get_type_flag(
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
-        // RPython: Void fields are skipped
-        "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
+        // Zero-sized types occupy no storage and contribute no field slot
+        // (heaptracker.py:60-62; lltype.py:334 `_names_without_voids()`).
+        s if s == "()" || s == "PhantomData" || s.starts_with("PhantomData<") => {
+            (ArrayFlag::Void, majit_ir::value::Type::Void, 0)
+        }
         // Unknown type — treat as GC pointer (conservative)
         _ => (
             ArrayFlag::Pointer,
@@ -8354,6 +8417,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
+        | OpKind::ConstStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone
@@ -9033,6 +9097,23 @@ mod tests {
         let jitcode = cc.get_jitcode(&path);
 
         assert_eq!(jitcode.fnaddr, symbolic_fnaddr_for_path(&path));
+    }
+
+    #[test]
+    fn symbolic_fnaddr_minters_record_descriptions() {
+        let path = CallPath::from_segments(["symbolic_registry", "path_callee"]);
+        let path_symbolic = symbolic_fnaddr_for_path(&path);
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["symbolic_registry".to_string()],
+            "TargetCallee",
+        );
+        let target_symbolic = symbolic_fnaddr_for_target(&target);
+        let target_description = format!("target:{target}");
+
+        let paths = symbolic_fnaddr_paths_snapshot();
+        assert!(paths.contains(&(path_symbolic, path.canonical_key())));
+        assert!(target_description.starts_with("target:"));
+        assert!(paths.contains(&(target_symbolic, target_description)));
     }
 
     #[test]
