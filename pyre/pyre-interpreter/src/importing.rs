@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    LazyLock, Mutex,
+    LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
 // `Path` is used only by the host_env source/package loaders; keep it gated
@@ -706,19 +706,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(unicodedata);
     pyre_install_module!(pyexpat);
 
-    // `_sysconfigdata_{abiflags}_{platform}_{multiarch}` is a generated
-    // Python module containing `build_time_vars = {...}` that sysconfig
-    // imports from `_init_posix`.  Empty dict suffices.
-    // PyPy: `lib_pypy/pypy_tools/build_cffi_imports.py` creates the same file.
-    for name in &[
-        "_sysconfigdata__darwin_",
-        "_sysconfigdata__linux_",
-        "_sysconfigdata__linux_x86_64-linux-gnu",
-        "_sysconfigdata__linux_aarch64-linux-gnu",
-    ] {
-        register_builtin_module(name, init_sysconfigdata_empty);
-    }
-
     // Empty C-extension stubs — `_opcode_metadata.py` etc. exist in the
     // real stdlib and are loaded from disk, but their builtin shims here
     // simply succeed at `import X`.
@@ -747,6 +734,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);
+    register_builtin_module("_sysconfigdata", init_sysconfigdata);
 }
 
 fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -856,11 +844,12 @@ fn init_string_module(ns: PyObjectRef) {
 /// `sysconfig._init_non_posix` SUBSCRIPTS `Py_GIL_DISABLED` and `Py_DEBUG` to
 /// spell `ABIFLAGS`, so on Windows a missing key is a `KeyError` out of the
 /// first `get_config_var` call rather than the `None` the `.get()` readers
-/// take. Both are 0 here — pyre is neither build, which is what an empty
-/// `sys.abiflags` already says. `EXT_SUFFIX` and `SOABI` name pyre's own
-/// cpyext ABI (never CPython's ABI tag) and track `_imp.extension_suffixes()`:
-/// a `cpyext` build names one, and without the feature there is no extension
-/// ABI to name, so both keys stay absent for the `.get()` readers.
+/// take. Pyre runs its mutators without a global interpreter lock, so
+/// `Py_GIL_DISABLED` is 1 and the derived `ABIFLAGS` is `t`; `Py_DEBUG` is 0.
+/// `EXT_SUFFIX` and `SOABI` name pyre's own cpyext ABI (never CPython's ABI
+/// tag) and track `_imp.extension_suffixes()`: a `cpyext` build names one, and
+/// without the feature there is no extension ABI to name, so both keys stay
+/// absent for the `.get()` readers.
 fn init_sysconfig_stub(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -868,11 +857,11 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
         crate::make_builtin_function("config_vars", |_| {
             let vars = pyre_object::w_dict_new();
             unsafe {
-                for name in ["Py_DEBUG", "Py_GIL_DISABLED"] {
+                for (name, value) in [("Py_DEBUG", 0), ("Py_GIL_DISABLED", 1)] {
                     pyre_object::w_dict_store(
                         vars,
                         pyre_object::w_str_new(name),
-                        pyre_object::w_int_new(0),
+                        pyre_object::w_int_new(value),
                     );
                 }
                 #[cfg(all(
@@ -896,6 +885,301 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
             Ok(vars)
         }),
     );
+}
+
+/// The platform half of the extension ABI, empty where there is none.
+/// `sys.implementation._multiarch` publishes the same string.
+pub(crate) fn multiarch() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-linux-gnu"
+    } else {
+        ""
+    }
+}
+
+/// The name `EXT_SUFFIX` and `SO` publish.
+///
+/// A `cpyext` build has an extension loader, and the suffix it builds its
+/// candidate filenames from is the authority. Without the loader there is no
+/// loaded ABI to read, so the same name is spelled from the pieces the loader
+/// would have used and a build that gains the loader keeps the metadata it
+/// already published.
+fn extension_abi_suffix() -> String {
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    {
+        crate::cpyext::extension_suffix().to_string()
+    }
+    #[cfg(not(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    )))]
+    {
+        let platform_tag = match multiarch() {
+            "" => String::new(),
+            tag => format!("-{tag}"),
+        };
+        let shared_ext = if cfg!(windows) { ".pyd" } else { ".so" };
+        format!(".pyre314{platform_tag}{shared_ext}")
+    }
+}
+
+/// `shutil.which` for the compiler probe in `init_sysconfigdata`: the build
+/// variables name `gcc` only when one is on `PATH`.
+///
+/// The entries are tested with [`exists_and_is_executable`], the same probe
+/// `find_invoked_executable` walks `PATH` with, so both answer X_OK the way
+/// `os.access` does rather than by reading mode bits.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| {
+            !directory.as_os_str().is_empty() && exists_and_is_executable(&directory.join(program))
+        })
+    })
+}
+
+/// A sandboxed interpreter reaches no host `PATH` and a wasm guest has no host
+/// process at all, so neither names a compiler.
+#[cfg(not(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+)))]
+fn on_path(_program: &str) -> bool {
+    false
+}
+
+/// `sys.base_prefix` as a path, empty where the interpreter publishes `''`.
+fn sysconfigdata_base_prefix() -> PathBuf {
+    #[cfg(feature = "host_env")]
+    {
+        startup_path_config().base_prefix.clone()
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        PathBuf::new()
+    }
+}
+
+/// `_sysconfigdata` — `build_time_vars`, the mapping `sysconfig._init_posix`
+/// merges into the config vars.
+///
+/// CPython writes this module out of its `configure` run and installs it beside
+/// the stdlib. Pyre has no configure step, so the values come from the running
+/// build instead, and a builtin module keeps them where the rest of the build
+/// metadata already lives: `_sysconfig.config_vars()` answers `_init_non_posix`
+/// from the same source on Windows.
+///
+/// `sysconfig._get_sysconfigdata` reaches this module by name only after
+/// `_PYTHON_SYSCONFIGDATA_NAME` and `_PYTHON_SYSCONFIGDATA_PATH` have had their
+/// turn, so a cross-compilation snapshot still overrides it.
+fn init_sysconfigdata(ns: PyObjectRef) {
+    fn store_str(vars: PyObjectRef, key: &str, value: &str) {
+        unsafe {
+            pyre_object::w_dict_store(
+                vars,
+                pyre_object::w_str_new(key),
+                pyre_object::w_str_new(value),
+            );
+        }
+    }
+    fn store_int(vars: PyObjectRef, key: &str, value: i64) {
+        unsafe {
+            pyre_object::w_dict_store(
+                vars,
+                pyre_object::w_str_new(key),
+                pyre_object::w_int_new(value),
+            );
+        }
+    }
+
+    let so_ext = extension_abi_suffix();
+    // SOABI is PEP 3149 compliant, but CPython3 has `so_ext.split('.')[1]`
+    // ("ABI tag"-"platform tag") where this is the ABI tag only.  wheel 0.34.2
+    // depends on this value, so don't make it CPython compliant without
+    // checking wheel: it uses `pep425tags.get_abi_tag` with special handling
+    // for CPython.
+    let soabi = so_ext
+        .split('.')
+        .nth(1)
+        .unwrap_or_default()
+        .split('-')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("-");
+
+    let gnuld = on_path("gcc");
+    // Darwin names the architecture in CC and CXX, and `platform.machine()`
+    // spells aarch64 `arm64` there.
+    #[cfg(target_os = "macos")]
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    #[cfg(target_os = "macos")]
+    let arch_flag = format!(" -arch {arch}");
+    #[cfg(not(target_os = "macos"))]
+    let arch_flag = "";
+
+    let cc = format!(
+        "{}{arch_flag}",
+        if gnuld { "gcc -pthread" } else { "cc -pthread" }
+    );
+    let cxx = format!(
+        "{}{arch_flag}",
+        if gnuld && on_path("g++") {
+            "g++ -pthread"
+        } else {
+            "c++ -pthread"
+        }
+    );
+
+    #[cfg(not(target_os = "macos"))]
+    let (ldflags, ldshared, ldcxxshared) = {
+        let ldflags = String::from("-Wl,-Bsymbolic-functions");
+        let ldshared = format!("{cc} -shared {ldflags}");
+        (
+            ldflags,
+            ldshared,
+            String::from("c++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions"),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let (ldflags, ldshared, ldcxxshared) = (
+        String::from("-undefined dynamic_lookup"),
+        String::from("clang -bundle -undefined dynamic_lookup "),
+        String::from("clang++ -bundle -undefined dynamic_lookup "),
+    );
+
+    let base_prefix = sysconfigdata_base_prefix();
+    let base_prefix_str = pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(
+        base_prefix.as_os_str(),
+    ));
+
+    let vars = pyre_object::w_dict_new();
+    // `_init_non_posix` derives the same `t` from `Py_GIL_DISABLED` below.
+    // The lower-case `abiflags` that forms the include and site-packages
+    // directory names is a separate variable, read from `sys.abiflags`
+    // (`sysconfig:545`), and stays empty: the release tree has no `t` suffix
+    // on its stdlib directory for `site.py:409` to find.
+    store_str(vars, "ABIFLAGS", "t");
+    store_str(vars, "SOABI", &soabi);
+    // Deprecated in Python 3, kept for backward compatibility.
+    store_str(vars, "SO", &so_ext);
+    store_str(vars, "MULTIARCH", multiarch());
+    store_str(vars, "CC", &cc);
+    store_str(vars, "CXX", &cxx);
+    store_str(vars, "OPT", "-DNDEBUG -O2");
+    store_str(vars, "CFLAGS", "-DNDEBUG -O2");
+    store_str(vars, "CCSHARED", "-fPIC");
+    store_str(vars, "LDFLAGS", &ldflags);
+    store_str(vars, "LDSHARED", &ldshared);
+    store_str(vars, "LDCXXSHARED", &ldcxxshared);
+    store_str(vars, "EXT_SUFFIX", &so_ext);
+    store_str(vars, "SHLIB_SUFFIX", ".so");
+    store_str(vars, "AR", "ar");
+    store_str(vars, "ARFLAGS", "rc");
+    store_str(vars, "EXE", "");
+    store_str(vars, "VERSION", "3.14");
+    store_str(vars, "LDVERSION", "3.14");
+    // cpyext never uses Py_DEBUG.  Pyre runs its mutators without a global
+    // interpreter lock.  Py_ENABLE_SHARED at 1 would add a python shared
+    // object to link lines as `-lpython3.x`.
+    store_int(vars, "Py_DEBUG", 0);
+    store_int(vars, "Py_GIL_DISABLED", 1);
+    store_int(vars, "Py_ENABLE_SHARED", 0);
+    // Pyre currently has neither a CPython-compatible C API nor a separately
+    // linkable runtime library.  Keep the build ABI metadata above for wheel
+    // tags, but never invent files that are absent from the installation.
+    for key in [
+        "LIBRARY",
+        "LDLIBRARY",
+        "LIBPYTHON",
+        "INCLUDEPY",
+        "CONFINCLUDEPY",
+        "LIBDIR",
+    ] {
+        store_str(vars, key, "");
+    }
+    store_int(vars, "SIZEOF_VOID_P", std::mem::size_of::<usize>() as i64);
+    if gnuld {
+        store_str(vars, "GNULD", "yes");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // scikit-build checks WITH_DYLD; it is left over from the NextStep rld
+        // linker.  MACOSX_DEPLOYMENT_TARGET was added to solve problems that
+        // may have been solved elsewhere — see cibuildwheel PR 185 and
+        // pypa/wheel, and check the interaction with `build_cffi_imports.py`
+        // before removing it.  Keep it in sync with DARWIN_VERSION_MIN in
+        // `rpython/translator/platform/darwin.py` and `Lib/_osx_support.py`.
+        store_int(vars, "WITH_DYLD", 1);
+        store_str(
+            vars,
+            "MACOSX_DEPLOYMENT_TARGET",
+            if arch == "arm64" { "11.0" } else { "10.15" },
+        );
+    }
+    // Python 3.14's relocation check reads these from the generated data.
+    unsafe {
+        for key in ["prefix", "exec_prefix", "srcdir"] {
+            pyre_object::w_dict_store(vars, pyre_object::w_str_new(key), base_prefix_str);
+        }
+    }
+    // Keep PyPy's relocatable zoneinfo search rooted at `base_prefix`.  The
+    // C-runtime path block above intentionally differs: PyPy ships libpypy
+    // beside its binary, whereas pyre has no separate library to name.
+    #[cfg(not(windows))]
+    {
+        let mut tzpaths = vec![
+            base_prefix.join("share").join("zoneinfo"),
+            base_prefix.join("lib").join("zoneinfo"),
+            base_prefix.join("share").join("lib").join("zoneinfo"),
+            base_prefix.join("..").join("etc").join("zoneinfo"),
+        ];
+        // Absolute system paths, unless `base_prefix` is `/usr` and the four
+        // relative entries above already name them.
+        if base_prefix != Path::new("/usr") {
+            tzpaths.extend(
+                [
+                    "/usr/share/zoneinfo",
+                    "/usr/lib/zoneinfo",
+                    "/usr/share/lib/zoneinfo",
+                    "/etc/zoneinfo",
+                ]
+                .map(PathBuf::from),
+            );
+        }
+        let mut joined = std::ffi::OsString::new();
+        for (index, path) in tzpaths.iter().enumerate() {
+            if index > 0 {
+                joined.push(":");
+            }
+            joined.push(path);
+        }
+        unsafe {
+            pyre_object::w_dict_store(
+                vars,
+                pyre_object::w_str_new("TZPATH"),
+                pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(&joined)),
+            );
+        }
+    }
+    crate::module_ns_store(ns, "build_time_vars", vars);
 }
 
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
@@ -993,18 +1277,6 @@ fn init_scproxy(ns: PyObjectRef) {
 
 /// Empty module initializer for C-extension stubs.
 fn empty_module_init(_ns: PyObjectRef) {}
-
-/// `_sysconfigdata_*` stub — sysconfig imports this generated module to
-/// read the CPython build variables. We expose a minimal `build_time_vars`
-/// dict that lets sysconfig initialize without crashing.
-fn init_sysconfigdata_empty(ns: PyObjectRef) {
-    let vars = pyre_object::w_dict_new();
-    // A few keys are load-bearing — sysconfig.get_config_vars() populates
-    // them, but an import-time crash hits on 'Py_GIL_DISABLED' and
-    // similar. Leave the dict empty; .get('X') returns None for unknown
-    // keys which every caller already handles.
-    crate::module_ns_store(ns, "build_time_vars", vars);
-}
 
 /// Try to load a builtin module by name.
 ///
@@ -1473,82 +1745,515 @@ pub fn restage_sys_path_0(path0: &std::ffi::OsStr) {
     *SYS_PATH_0_PENDING.lock().unwrap() = Some(path0.to_os_string());
 }
 
-/// Locate the vendored stdlib (`lib-python/3`) by walking up the running
-/// executable's ancestor directories.
+/// Process-wide path configuration computed before `sys` exposes any path.
 ///
-/// PyPy equivalent: initpath.py walks up from the executable to a
-/// directory containing `lib-python/X.Y`.
-#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-fn find_intree_stdlib() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let mut dir = exe.parent();
-    while let Some(d) = dir {
-        let candidate = d.join("lib-python").join("3");
-        if candidate.is_dir() {
-            return Some(candidate);
+/// PyPy keeps this state on the one object space (`module/sys/state.py`) and
+/// fills it from `initpath.py:find_executable` / `find_stdlib`.  It is not
+/// execution-context or thread state: a worker importing `sys` must observe
+/// the same executable, installation prefix and virtual environment as the
+/// launcher thread.  Keep that ownership shape here instead of using TLS.
+#[cfg(feature = "host_env")]
+#[derive(Clone, Debug)]
+pub(crate) struct StartupPathConfig {
+    pub executable: PathBuf,
+    pub base_executable: PathBuf,
+    pub prefix: PathBuf,
+    pub base_prefix: PathBuf,
+    /// Bootstrap search entries in PyPy's order.  A source checkout keeps
+    /// `lib_pypy` before `lib-python/3`; an installed tree has one merged
+    /// `lib/pyre3.14t` entry.
+    pub stdlib_paths: Vec<PathBuf>,
+    /// The language stdlib root (the entry containing `os.py` / `site.py`).
+    /// This is exposed as `sys._stdlib_dir` and is deliberately distinct from
+    /// the complete search list above.
+    pub stdlib: Option<PathBuf>,
+}
+
+#[cfg(feature = "host_env")]
+static STARTUP_PATH_CONFIG: OnceLock<StartupPathConfig> = OnceLock::new();
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+#[derive(Default, Debug, PartialEq, Eq)]
+struct PyVenvConfig {
+    home: Option<PathBuf>,
+    executable: Option<PathBuf>,
+}
+
+/// Parse only the two path keys needed during bootstrap.  This deliberately
+/// mirrors PyPy's tiny `find_pyvenv_cfg` parser rather than importing `configparser`
+/// before the stdlib path exists.  CPython's `venv.create_configuration`
+/// writes both keys as UTF-8, one `key = value` pair per line.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn parse_pyvenv_cfg(contents: &str) -> PyVenvConfig {
+    let mut config = PyVenvConfig::default();
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
         }
-        dir = d.parent();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "home" => config.home = Some(PathBuf::from(value)),
+            "executable" => config.executable = Some(PathBuf::from(value)),
+            _ => {}
+        }
+    }
+    config
+}
+
+/// PyPy `initpath.py:_exists_and_is_executable`: executable discovery is a
+/// launch decision, not merely a filesystem existence check.  In particular,
+/// a non-executable file earlier on PATH must not shadow the real interpreter.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn exists_and_is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // Like os.access(X_OK), libc::access checks the process's real uid and
+        // gid.  Inspecting mode bits by hand would get ACLs and root wrong.
+        unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn absolute_from(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// Return the executable spelling used to invoke pyre, made absolute without
+/// resolving symlinks.  `std::env::current_exe()` resolves the process image on
+/// several hosts and would turn `venv/bin/pyre -> base/bin/pyre` back into the
+/// base path before we get a chance to inspect the venv's `pyvenv.cfg`.
+///
+/// PyPy equivalent: `initpath.py:find_executable` searches PATH and applies
+/// `abspath`, while `resolvedirof` follows links only for stdlib discovery.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn find_invoked_executable() -> PathBuf {
+    let argv0 = SYS_ORIG_ARGV.lock().unwrap().first().cloned();
+    if let Some(argv0) = argv0 {
+        let mut candidate = PathBuf::from(argv0);
+        #[cfg(windows)]
+        if candidate.extension().is_none() {
+            candidate.set_extension("exe");
+        }
+        let cwd = host_os::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if candidate.components().count() > 1 || candidate.is_absolute() {
+            let absolute = absolute_from(candidate, &cwd);
+            if exists_and_is_executable(&absolute) {
+                return absolute;
+            }
+        } else if let Some(path) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| absolute_from(dir.join(&candidate), &cwd))
+                .find(|path| exists_and_is_executable(path))
+        }) {
+            return path;
+        }
+        // PyPy deliberately exposes an empty sys.executable for an argv[0]
+        // which cannot be resolved to an executable (CPython issue #7774).
+        return PathBuf::new();
+    }
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pyre"))
+}
+
+/// Recognize both PyPy-style source trees (`lib-python/3`) and the packaged
+/// Pyre layout (`lib/pyre3.14t`).  The latter is the installation shape pip and
+/// venv will consume; accepting the former keeps the repository executable as
+/// the untranslated/development oracle, matching PyPy's two
+/// `compute_stdlib_path_*` arms.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
+    // `compute_stdlib_path_packaged` and `_sourcetree` both prefer the
+    // versioned zip.  It belongs on sys.path, but it is not `sys._stdlib_dir`:
+    // PyPy sets that attribute only for an entry containing a real `os.py`.
+    let lib_pyzip = prefix.join("python314.zip");
+    if lib_pyzip.is_file() {
+        return Some((vec![lib_pyzip], None));
+    }
+
+    // pypy/module/sys/initpath.py `compute_stdlib_path_maybe_source` puts
+    // `lib_pypy` on sys.path ahead of `lib-python/3`.  pyre does not: most of
+    // `lib_pypy` is PyPy's cffi/pure-Python shims for modules pyre implements
+    // natively or not at all (`_testcapi`, `_md5`, `_sha*`, `_sqlite3`, ...),
+    // and the CPython suite branches on whether `import X` succeeds.  Exposing
+    // a partial shim turns a clean skip into a run against a module that
+    // cannot answer.  The supported surface is `lib-python/3` plus the builtin
+    // modules: what `lib_pypy` still owns for PyPy is a builtin module here
+    // (`_sysconfigdata`, `_sysconfig`, ...) rather than a Python file.
+    let lib_python = prefix.join("lib-python").join("3");
+    if lib_python.join("site.py").is_file() {
+        let mut paths = vec![lib_python.clone()];
+        append_macos_stdlib_paths(&mut paths, &lib_python);
+        return Some((paths, Some(lib_python)));
+    }
+
+    // `compute_stdlib_path`: release packaging merges the two source trees
+    // into one implementation-version directory.
+    for packaged in [
+        prefix.join("lib").join("pyre3.14t"),
+        // cargo-dist's Homebrew formula installs non-binary archive contents
+        // into `pkgshare` (`<keg>/share/pyrex`).  This is still a single
+        // interpreter-owned prefix, analogous to PyPy's macOS bundle search
+        // arm, and must not depend on a Homebrew-specific environment value.
+        prefix
+            .join("share")
+            .join("pyrex")
+            .join("lib")
+            .join("pyre3.14t"),
+    ] {
+        if packaged.join("site.py").is_file() {
+            let mut paths = vec![packaged.clone()];
+            append_macos_stdlib_paths(&mut paths, &packaged);
+            return Some((paths, Some(packaged)));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let candidate = prefix.join("Lib");
+        if candidate.join("site.py").is_file() {
+            return Some((vec![candidate.clone()], Some(candidate)));
+        }
     }
     None
 }
 
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn append_macos_stdlib_paths(paths: &mut Vec<PathBuf>, stdlib: &Path) {
+    // initpath.py appends both entries on macOS without probing them first.
+    #[cfg(target_os = "macos")]
+    {
+        let plat_mac = stdlib.join("plat-mac");
+        paths.push(plat_mac.clone());
+        paths.push(plat_mac.join("lib-scriptpackages"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (paths, stdlib);
+}
+
+/// Follow links whose final component is the executable while preserving the
+/// spelling of its ancestor directories.  This is PyPy `resolvedirof`, not
+/// `realpath`: canonicalizing the entire path would silently turn a macOS
+/// `/var/...` venv into `/private/var/...` and make sys.prefix disagree with
+/// pyvenv.cfg and site-packages paths.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn resolve_final_symlinks(path: &Path) -> PathBuf {
+    let cwd = host_os::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut resolved = absolute_from(path.to_path_buf(), &cwd);
+    loop {
+        let Ok(metadata) = host_fs::symlink_metadata(&resolved) else {
+            return resolved;
+        };
+        if !metadata.file_type().is_symlink() {
+            return resolved;
+        }
+        let Ok(target) = std::fs::read_link(&resolved) else {
+            return resolved;
+        };
+        resolved = if target.is_absolute() {
+            target
+        } else {
+            resolved.parent().unwrap_or(Path::new("")).join(target)
+        };
+    }
+}
+
+/// Walk from an executable or `pyvenv.cfg` home directory to the first Pyre
+/// stdlib and return both the stdlib and its owning installation prefix.
+/// Symlinks are resolved for this search only; `sys.executable` retains the
+/// invocation spelling above.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn find_stdlib_from(start: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>, PathBuf)> {
+    if start.as_os_str().is_empty() {
+        return None;
+    }
+    let resolved = resolve_final_symlinks(start);
+    let mut dir = if resolved.is_dir() {
+        Some(resolved.as_path())
+    } else {
+        resolved.parent()
+    };
+    while let Some(prefix) = dir {
+        if let Some((paths, stdlib_dir)) = stdlib_at_prefix(prefix) {
+            return Some((paths, stdlib_dir, prefix.to_path_buf()));
+        }
+        dir = prefix.parent();
+    }
+    None
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn prefix_from_stdlib(stdlib: &Path) -> PathBuf {
+    let parent = stdlib.parent();
+    if stdlib
+        .file_name()
+        .is_some_and(|name| name == "python314.zip")
+    {
+        return parent.unwrap_or(stdlib).to_path_buf();
+    }
+    if stdlib.file_name().is_some_and(|name| name == "3")
+        && parent
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "lib-python")
+    {
+        return parent
+            .and_then(Path::parent)
+            .unwrap_or(stdlib)
+            .to_path_buf();
+    }
+    if parent
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "lib")
+    {
+        // cargo-dist Homebrew data lives at
+        // `<keg>/share/pyrex/lib/pyre3.14t`, while the executable still lives
+        // at `<keg>/bin/pyre`.  An explicit PYRE_STDLIB pointing at that data
+        // must recover the keg, not claim `<keg>/share/pyrex` as sys.prefix.
+        if let Some(pyre_share) = parent.and_then(Path::parent)
+            && pyre_share.file_name().is_some_and(|name| name == "pyrex")
+            && pyre_share
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "share")
+        {
+            return pyre_share
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(stdlib)
+                .to_path_buf();
+        }
+        return parent
+            .and_then(Path::parent)
+            .unwrap_or(stdlib)
+            .to_path_buf();
+    }
+    if stdlib.file_name().is_some_and(|name| name == "Lib") {
+        return parent.unwrap_or(stdlib).to_path_buf();
+    }
+    parent.unwrap_or(stdlib).to_path_buf()
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn read_pyvenv_config(executable: &Path) -> Option<(PathBuf, PyVenvConfig)> {
+    let exe_dir = executable.parent()?;
+    for candidate in [
+        exe_dir.join("pyvenv.cfg"),
+        exe_dir.parent()?.join("pyvenv.cfg"),
+    ] {
+        if let Ok(mut contents) = host_fs::read(&candidate) {
+            // PyPy performs one bounded 16 KiB bootstrap read.  Do not let an
+            // unbounded config file become startup input before stdlib setup.
+            contents.truncate(16 * 1024);
+            return Some((
+                candidate,
+                parse_pyvenv_cfg(&String::from_utf8_lossy(&contents)),
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn compute_startup_path_config_from(
+    executable: PathBuf,
+    explicit_stdlib: Option<PathBuf>,
+) -> StartupPathConfig {
+    let pyvenv = read_pyvenv_config(&executable);
+
+    let base_executable = pyvenv
+        .as_ref()
+        .and_then(|(_, config)| config.executable.clone())
+        .or_else(|| pyvenv.as_ref().map(|_| resolve_final_symlinks(&executable)))
+        .unwrap_or_else(|| executable.clone());
+
+    let (stdlib_paths, stdlib, base_prefix) =
+        if let Some(stdlib_path) = explicit_stdlib.filter(|path| path.is_dir() || path.is_file()) {
+            let prefix = prefix_from_stdlib(&stdlib_path);
+            let stdlib_dir = stdlib_path.is_dir().then(|| stdlib_path.clone());
+            // Naming the stdlib directory says where it is, not that it is the
+            // only entry, so reproduce the shape `stdlib_at_prefix` builds.
+            let mut paths = vec![stdlib_path];
+            if let Some(stdlib_dir) = stdlib_dir.as_deref() {
+                append_macos_stdlib_paths(&mut paths, stdlib_dir);
+            }
+            (paths, stdlib_dir, prefix)
+        } else {
+            // CPython 3.14's venv config records the exact base executable.  PyPy
+            // records `home`.  Try both, in that order, then the invoked image;
+            // `find_stdlib_from` resolves links only for this search.
+            let mut starts = Vec::new();
+            starts.push(base_executable.clone());
+            if let Some(home) = pyvenv.as_ref().and_then(|(_, config)| config.home.clone())
+                && !starts.contains(&home)
+            {
+                starts.push(home);
+            }
+            if !starts.contains(&executable) {
+                starts.push(executable.clone());
+            }
+            // `find_invoked_executable` reports an unresolvable argv[0] as an
+            // empty path, which is the right spelling for `sys.executable` but
+            // says nothing about where the stdlib is.  The process image still
+            // knows, so search from it before giving up: without this a caller
+            // that passes a made-up argv[0] (the `-i` REPL spawned by
+            // `test_inspect`, whose argv[0] is `<stdin>`) gets `sys.path ==
+            // ['']` and cannot import anything at all.
+            if let Ok(image) = std::env::current_exe()
+                && !starts.contains(&image)
+            {
+                starts.push(image);
+            }
+            starts
+                .iter()
+                .find_map(|start| find_stdlib_from(start))
+                .map(|(paths, stdlib_dir, prefix)| (paths, stdlib_dir, prefix))
+                .unwrap_or_else(|| (Vec::new(), None, PathBuf::new()))
+        };
+
+    // `venv` writes pyvenv.cfg at the environment root (one directory above
+    // `bin`).  CPython 3.14 path initialization sets the venv prefix before
+    // importing site; site.py now only validates it and emits a warning on a
+    // mismatch.  For the compatibility form beside the executable, the file's
+    // own parent is likewise the environment prefix.
+    let prefix = pyvenv
+        .as_ref()
+        .and_then(|(config_path, _)| config_path.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| base_prefix.clone());
+
+    StartupPathConfig {
+        executable,
+        base_executable,
+        prefix,
+        base_prefix,
+        stdlib_paths,
+        stdlib,
+    }
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn compute_startup_path_config() -> StartupPathConfig {
+    compute_startup_path_config_from(
+        find_invoked_executable(),
+        std::env::var_os("PYRE_STDLIB").map(PathBuf::from),
+    )
+}
+
+#[cfg(all(feature = "sandbox", not(target_arch = "wasm32")))]
+fn compute_startup_path_config() -> StartupPathConfig {
+    use std::os::unix::ffi::OsStrExt;
+    let executable = PathBuf::from("/bin/pyre");
+    let stdlib = crate::host_seam::ops::getenv(b"PYRE_STDLIB")
+        .ok()
+        .flatten()
+        .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+    StartupPathConfig {
+        base_executable: executable.clone(),
+        prefix: PathBuf::from("/bin"),
+        base_prefix: PathBuf::from("/bin"),
+        executable,
+        stdlib_paths: stdlib.iter().cloned().collect(),
+        stdlib,
+    }
+}
+
+#[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+fn compute_startup_path_config() -> StartupPathConfig {
+    // The wasm runners install their VFS-backed path explicitly.  There is no
+    // process executable or host prefix to discover inside the guest.
+    StartupPathConfig {
+        executable: PathBuf::new(),
+        base_executable: PathBuf::new(),
+        prefix: PathBuf::new(),
+        base_prefix: PathBuf::new(),
+        stdlib_paths: Vec::new(),
+        stdlib: None,
+    }
+}
+
+#[cfg(feature = "host_env")]
+pub(crate) fn startup_path_config() -> &'static StartupPathConfig {
+    STARTUP_PATH_CONFIG.get_or_init(compute_startup_path_config)
+}
+
 /// Resolve the stdlib directory to add to `sys.path`.
 ///
-/// Order: the `PYRE_STDLIB` override, then the vendored `lib-python/3`
-/// next to the executable, then a host `python3`'s stdlib as a last
-/// resort. The vendored copy matches the `_sre` MAGIC pyre links; a host
-/// stdlib only works when its `re`/`_sre` MAGIC agrees.
+/// Order: the `PYRE_STDLIB` override, then PyPy's source and packaged layouts
+/// relative to the executable (or its venv base).  A host Python stdlib is
+/// intentionally never used: its bytecode, `_sre`, sysconfig and platform
+/// assumptions belong to a different interpreter.
 ///
 /// PyPy equivalent: initpath.py scans for lib-python/X.Y at startup.
 #[cfg(feature = "host_env")]
 pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
-    // Under sandbox the controller provisions the stdlib mount via
-    // `PYRE_STDLIB`; trust it verbatim — the seam-backed SourceProvider
-    // mediates every subsequent read — and never read `current_exe` or spawn
-    // a `python3` subprocess (both escape the controller).
-    #[cfg(feature = "sandbox")]
-    {
-        // Read through the env seam so the lookup reaches the controller's
-        // virtual environment (the child's real env was cleared at spawn); the
-        // controller seeds PYRE_STDLIB to the `--lib` mount at `/bin/lib`.
-        use std::os::unix::ffi::OsStrExt;
-        return crate::host_seam::ops::getenv(b"PYRE_STDLIB")
-            .ok()
-            .flatten()
-            .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
-    }
-    #[cfg(not(feature = "sandbox"))]
-    {
-        // Explicit override.
-        if let Ok(p) = host_os::var("PYRE_STDLIB") {
-            let path = PathBuf::from(p);
-            if path.is_dir() {
-                return Some(path);
-            }
-        }
-        // Vendored in-tree stdlib, located relative to the executable.
-        if let Some(path) = find_intree_stdlib() {
-            return Some(path);
-        }
-        // Last resort: borrow a host CPython's stdlib.
-        let output = {
-            // Spawning and reaping a child process blocks.
-            let _blocked = crate::module::thread::before_external_block();
-            std::process::Command::new("python3")
-                .args([
-                    "-c",
-                    "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
-                ])
-                .output()
-        }
-        .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let s = String::from_utf8(output.stdout).ok()?;
-        let path = PathBuf::from(s.trim());
-        if path.is_dir() { Some(path) } else { None }
-    }
+    startup_path_config().stdlib.clone()
 }
 
 /// Add a directory to `sys.path`.
@@ -2231,21 +2936,32 @@ fn find_module(
     Ok(None)
 }
 
-/// Detect and add CPython stdlib to sys.path (once).
+/// Install the PyPy-shaped bootstrap path exactly once for the process.
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn ensure_stdlib_path() {
-    thread_local! {
-        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
     }
-    DONE.with(|d| {
-        if d.get() {
-            return;
-        }
-        d.set(true);
-        if let Some(stdlib) = detect_stdlib_path() {
-            add_sys_path(&stdlib);
-        }
-    });
+    let config = startup_path_config();
+    if config.stdlib_paths.is_empty() {
+        let warning = format!(
+            "debug: WARNING: Library path not found, using the existing sys.path;\n\
+             debug: WARNING: sys.prefix = {:?}\n\
+             debug: WARNING: Make sure the pyre binary is kept inside its tree of files.\n",
+            config.prefix
+        );
+        // A sandbox build compiles this path too, and there the real stderr is
+        // not ours to write; `host_seam::ops` is that build's stderr.  It is
+        // also the only build that has it, so the ordinary one keeps `eprint!`.
+        #[cfg(feature = "sandbox")]
+        let _ = crate::host_seam::ops::write(2, warning.as_bytes());
+        #[cfg(not(feature = "sandbox"))]
+        eprint!("{warning}");
+    }
+    for path in &config.stdlib_paths {
+        add_sys_path(path);
+    }
 }
 
 #[cfg(feature = "host_env")]
@@ -4533,6 +5249,129 @@ pub fn import_all_from_w(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    #[test]
+    fn pyvenv_cfg_bootstrap_parser_reads_only_path_keys() {
+        let config = parse_pyvenv_cfg(
+            "home = /opt/pyre/bin\n\
+             include-system-site-packages = false\n\
+             executable = /opt/pyre/bin/pyre\n\
+             command = ignored\n",
+        );
+        assert_eq!(config.home, Some(PathBuf::from("/opt/pyre/bin")));
+        assert_eq!(config.executable, Some(PathBuf::from("/opt/pyre/bin/pyre")));
+    }
+
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    #[test]
+    fn stdlib_prefix_recognizes_source_and_packaged_layouts() {
+        assert_eq!(
+            prefix_from_stdlib(Path::new("/src/pyre/lib-python/3")),
+            PathBuf::from("/src/pyre")
+        );
+        assert_eq!(
+            prefix_from_stdlib(Path::new("/opt/pyre/lib/pyre3.14t")),
+            PathBuf::from("/opt/pyre")
+        );
+        assert_eq!(
+            prefix_from_stdlib(Path::new(
+                "/opt/homebrew/Cellar/pyrex/0.0.2/share/pyrex/lib/pyre3.14t"
+            )),
+            PathBuf::from("/opt/homebrew/Cellar/pyrex/0.0.2")
+        );
+        assert_eq!(
+            prefix_from_stdlib(Path::new("/opt/pyre/python314.zip")),
+            PathBuf::from("/opt/pyre")
+        );
+    }
+
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    #[test]
+    fn stdlib_layout_prefers_the_versioned_zip_without_claiming_a_directory() {
+        let tree = tempfile::tempdir().unwrap();
+        let packaged = tree.path().join("lib/pyre3.14t");
+        std::fs::create_dir_all(&packaged).unwrap();
+        std::fs::write(packaged.join("site.py"), "").unwrap();
+        let zip = tree.path().join("python314.zip");
+        std::fs::write(&zip, "not opened during path discovery").unwrap();
+
+        let (paths, stdlib_dir) = stdlib_at_prefix(tree.path()).unwrap();
+        assert_eq!(paths, vec![zip]);
+        assert_eq!(stdlib_dir, None);
+    }
+
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    #[test]
+    fn startup_config_keeps_venv_and_base_prefixes_distinct() {
+        let tree = tempfile::tempdir().unwrap();
+        let base = tree.path().join("base");
+        let base_executable = base.join("bin/pyre");
+        let base_stdlib = base.join("lib/pyre3.14t");
+        std::fs::create_dir_all(base_executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&base_stdlib).unwrap();
+        std::fs::write(&base_executable, "").unwrap();
+        std::fs::write(base_stdlib.join("site.py"), "").unwrap();
+
+        let venv = tree.path().join("venv");
+        let venv_executable = venv.join("bin/pyre");
+        std::fs::create_dir_all(venv_executable.parent().unwrap()).unwrap();
+        std::fs::write(&venv_executable, "").unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!(
+                "home = {}\nexecutable = {}\ninclude-system-site-packages = false\n",
+                base_executable.parent().unwrap().display(),
+                base_executable.display()
+            ),
+        )
+        .unwrap();
+
+        let config = compute_startup_path_config_from(venv_executable.clone(), None);
+        assert_eq!(config.executable, venv_executable);
+        assert_eq!(config.base_executable, base_executable);
+        assert_eq!(config.prefix, venv);
+        assert_eq!(config.base_prefix, base);
+        let mut expected_paths = vec![base_stdlib.clone()];
+        append_macos_stdlib_paths(&mut expected_paths, &base_stdlib);
+        assert_eq!(config.stdlib_paths, expected_paths);
+        assert_eq!(config.stdlib, Some(base_stdlib));
+    }
+
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32"),
+        unix
+    ))]
+    #[test]
+    fn executable_probe_rejects_a_regular_file_without_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = tempfile::tempdir().unwrap();
+        let executable = tree.path().join("pyre");
+        std::fs::write(&executable, "").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!exists_and_is_executable(&executable));
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(exists_and_is_executable(&executable));
+    }
 
     #[test]
     fn importhook_rejects_invalid_absolute_name_and_level() {

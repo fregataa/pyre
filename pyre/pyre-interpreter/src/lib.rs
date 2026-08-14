@@ -1123,41 +1123,51 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(167, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
         subclass_range_alias(168, typed::<crate::module::gc::stats::W_GcStats>()),
-        // `posix.DirEntry` — `allocate_stable` type registered last among the
-        // native rclass registrations in `build_gc`, before the bare twister
-        // id.
-        // `posix` is compiled out on wasm32 (`module/mod.rs`), so this alias is
-        // too; nothing unconditional follows it, so no id differs per target.
+        // PyPy zlib stream wrappers own their native stream and lock directly.
+        // Keep these unconditional entries ahead of target-gated native types.
+        subclass_range_alias(169, typed::<crate::module::zlib::W_Compress>()),
+        subclass_range_alias(170, typed::<crate::module::zlib::W_Decompress>()),
+        subclass_range_alias(171, typed::<crate::module::zlib::W_ZlibDecompressor>()),
+        // `posix.DirEntry` follows the unconditional zlib owners.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(169, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(172, typed::<crate::module::posix::W_DirEntry>()),
         // rustls-backed `_ssl` native payloads.  They are appended after the
         // last pre-existing native class in the same order `build_gc`
         // registers them, so no established type id moves.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(170, typed::<crate::module::_ssl::W_SSLContext>()),
+        subclass_range_alias(173, typed::<crate::module::_ssl::W_SSLContext>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(171, typed::<crate::module::_ssl::W_MemoryBIO>()),
+        subclass_range_alias(174, typed::<crate::module::_ssl::W_MemoryBIO>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(172, typed::<crate::module::_ssl::W_SSLSession>()),
+        subclass_range_alias(175, typed::<crate::module::_ssl::W_SSLSession>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(173, typed::<crate::module::_ssl::W_SSLSocket>()),
+        subclass_range_alias(176, typed::<crate::module::_ssl::W_SSLSocket>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(174, typed::<crate::module::_ssl::W_Certificate>()),
+        subclass_range_alias(177, typed::<crate::module::_ssl::W_Certificate>()),
+        // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
+        // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
+        // contributes no alias rather than sliding into the vacated SSL slot.
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+        subclass_range_alias(178, typed::<crate::module::mmap::W_MMap>()),
     ]
 }
 
 /// The rclass hierarchy present in this interpreter configuration.
 ///
-/// `_ssl` owns the final five native hierarchy slots and is compiled out of a
-/// sandbox build. Keep that configuration knowledge here, beside the module
-/// and alias gates, rather than leaking the `sandbox` feature into
-/// `pyre-object`.
+/// `_ssl` owns five native hierarchy slots and `mmap` owns one behind them
+/// wherever it is compiled.  A sandbox build has neither module, and both sit
+/// at the tail of `SUBCLASS_RANGE_HIERARCHY`, so dropping that many trailing
+/// entries leaves exactly the ids such a build registers.
 pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
     #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
     {
         const SSL_HIERARCHY_SLOTS: usize = 5;
-        &hierarchy[..hierarchy.len() - SSL_HIERARCHY_SLOTS]
+        #[cfg(any(unix, windows))]
+        const MMAP_HIERARCHY_SLOTS: usize = 1;
+        #[cfg(not(any(unix, windows)))]
+        const MMAP_HIERARCHY_SLOTS: usize = 0;
+        &hierarchy[..hierarchy.len() - SSL_HIERARCHY_SLOTS - MMAP_HIERARCHY_SLOTS]
     }
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "sandbox")))]
     {

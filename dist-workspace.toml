@@ -9,8 +9,11 @@ cargo-dist-version = "0.31.0"
 ci = "github"
 # Trigger release workflow via workflow_dispatch so a wrapper can normalize repo-specific tags
 dispatch-releases = true
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
+# The generic shell/PowerShell installers only move classified binaries and
+# discard archive data trees.  Pyre requires its stdlib beside the binary, so
+# publish complete archives and the Homebrew formula until those installers
+# support non-flat application layouts.
+installers = ["homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "youknowone/homebrew-tap"
 # Target platforms to build apps for (Rust target-triple syntax)
@@ -21,6 +24,15 @@ install-path = "CARGO_HOME"
 publish-jobs = ["homebrew"]
 # Whether to install an updater program
 install-updater = false
+# The release archive is a Python installation, not a standalone binary.
+# `stage-stdlib.py` generates this directory immediately before `dist build`
+# and it is included beside the executable in every archive and installer.
+# `include` keeps each item's own name and has no per-target form, so the one
+# entry names the stdlib directory on every platform: `lib` holding
+# `pyre3.14t`, except on Windows where the stdlib is `Lib` itself and the two
+# spellings are the same path.
+include = ["dist-assets/lib"]
+github-build-setup = "../pyre-dist-build-setup.yml"
 # A prefix git tags must include for dist to care about them
 tag-namespace = "release-pyre"
 # Skip checking whether the specified configuration files are up to date
