@@ -817,9 +817,14 @@ impl Optimizer {
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let imported_items = items
                     .iter()
-                    .map(|item_info| {
-                        let r = Self::import_virtual_state_value(item_info, ctx);
-                        ctx.materialize_operand_at(r)
+                    .map(|item_info| match item_info {
+                        Some(item_info) => {
+                            let item_ref = Self::import_virtual_state_value(item_info, ctx);
+                            ctx.materialize_operand_at(item_ref)
+                        }
+                        // virtualstate.py:272-280: absent fieldstate remains
+                        // an unwritten virtual-array slot on import.
+                        None => Operand::None,
                     })
                     .collect();
                 ctx.set_ptr_info(
@@ -869,8 +874,17 @@ impl Optimizer {
                         fields
                             .iter()
                             .map(|(field_idx, field_info)| {
-                                let r = Self::import_virtual_state_value(field_info, ctx);
-                                (*field_idx, ctx.materialize_operand_at(r))
+                                let field = match field_info {
+                                    Some(field_info) => {
+                                        let field_ref =
+                                            Self::import_virtual_state_value(field_info, ctx);
+                                        ctx.materialize_operand_at(field_ref)
+                                    }
+                                    // virtualstate.py:328-354: retain the
+                                    // dense unwritten element-field slot.
+                                    None => Operand::None,
+                                };
+                                (*field_idx, field)
                             })
                             .collect()
                     })
@@ -1296,15 +1310,20 @@ impl Optimizer {
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
-                    .map(|item_info| {
-                        let r = Self::import_virtual_state_from_label_args_recurse(
-                            item_info,
-                            imported_label_args,
-                            label_slot,
-                            ctx,
-                            walk_visited,
-                        );
-                        ctx.materialize_operand_at(r)
+                    .map(|item_info| match item_info {
+                        Some(item_info) => {
+                            let item_ref = Self::import_virtual_state_from_label_args_recurse(
+                                item_info,
+                                imported_label_args,
+                                label_slot,
+                                ctx,
+                                walk_visited,
+                            );
+                            ctx.materialize_operand_at(item_ref)
+                        }
+                        // virtualstate.py:272-280: absent fieldstate remains
+                        // an unwritten virtual-array slot on import.
+                        None => Operand::None,
                     })
                     .collect();
                 ctx.set_ptr_info(
@@ -1372,14 +1391,23 @@ impl Optimizer {
                         fields
                             .iter()
                             .map(|(field_idx, field_info)| {
-                                let r = Self::import_virtual_state_from_label_args_recurse(
-                                    field_info,
-                                    imported_label_args,
-                                    label_slot,
-                                    ctx,
-                                    walk_visited,
-                                );
-                                (*field_idx, ctx.materialize_operand_at(r))
+                                let field = match field_info {
+                                    Some(field_info) => {
+                                        let field_ref =
+                                            Self::import_virtual_state_from_label_args_recurse(
+                                                field_info,
+                                                imported_label_args,
+                                                label_slot,
+                                                ctx,
+                                                walk_visited,
+                                            );
+                                        ctx.materialize_operand_at(field_ref)
+                                    }
+                                    // virtualstate.py:328-354: retain the
+                                    // dense unwritten element-field slot.
+                                    None => Operand::None,
+                                };
+                                (*field_idx, field)
                             })
                             .collect()
                     })
@@ -2505,6 +2533,17 @@ impl Optimizer {
         // unbound terminal that fails `write_forwarded`'s bound-
         // precondition assert.
         ctx.bind_input_resops(ops);
+        // unroll.py:188 — the bridge iterator's fresh inputargs must enter
+        // optimization without forwarding.  This is deliberately a
+        // debug-only invariant, matching the upstream assertion without
+        // adding release-build work.
+        debug_assert!(
+            !self.building_bridge
+                || crate::optimizeopt::unroll::UnrollOptimizer::check_no_forwarding(
+                    &ctx,
+                    &ctx.inputargs,
+                )
+        );
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
