@@ -52,7 +52,7 @@ use syn::{
 /// `__MAJIT_HELPER_POLICIES`). Alternatively, use `helpers` or `calls`
 /// to explicitly list the functions that need JIT integration.
 pub struct JitInterpConfig {
-    /// The interpreter state type (e.g., `AheuiState`).
+    /// The interpreter state type (e.g., `InterpState`).
     pub state_type: Ident,
     /// The environment type (e.g., `Program`).
     pub env_type: Ident,
@@ -147,6 +147,9 @@ pub struct JitInterpConfig {
     /// The `PointeeType` is recorded so subsequent field access on the
     /// returned ref can resolve its struct layout.
     pub ref_fields: Vec<RefFieldEntry>,
+    /// Array base-pointer field declarations, `array_fields = { Struct::field
+    /// => ElementType, ... }`.  See [`ArrayFieldEntry`].
+    pub array_fields: Vec<ArrayFieldEntry>,
     /// Sub-word integer field declarations, `int_fields = { Struct::field =>
     /// u32, ... }`.  A field access lowers to `getfield_gc_i` /
     /// `setfield_gc_i` either way; what this adds is the field's real width
@@ -310,7 +313,7 @@ pub enum StateFieldKind {
     /// but the user-visible struct field carries the declared type. The
     /// macro emits `as i64` / `as <type>` casts at the JIT boundary so
     /// IR sees a uniform i64 while the interpreter keeps natural Rust
-    /// types (e.g. aheui's `selected: usize`, `stacksize: i32`).
+    /// types (e.g. `selected: usize`, `stacksize: i32`).
     Scalar {
         ir_type: Ident,
         /// `None` ⇒ Rust storage type matches `ir_type` (default i64
@@ -369,6 +372,12 @@ pub struct ResidualWriteEntry {
     /// pointer carried by `ref_scalar` type-puns several repr(C) layouts whose
     /// shared field offsets nevertheless have distinct field-descr identities.
     pub struct_type: Option<Path>,
+    /// Set by the `[]` suffix (`selected_ref.data[] => [...]`): the helpers
+    /// mutate the ELEMENTS of the array `<field>` points at, not the field
+    /// itself.  The two are independent claims — a residual that reallocates a
+    /// buffer writes both, and one that only stores through it writes only the
+    /// elements — so a declaration of each is written separately.
+    pub writes_elements: bool,
     pub helpers: Vec<Path>,
 }
 
@@ -403,6 +412,30 @@ pub struct RefFieldEntry {
     pub field: Ident,
     /// The struct the pointer points to (e.g. `Node`).
     pub pointee_type: Path,
+}
+
+/// One entry in `array_fields = { Struct::field => ElementType, ... }`.
+///
+/// Declares that `Struct.field` holds the base pointer of a contiguous
+/// array of `ElementType`, so `base.field[i]` lowers to a `getfield_gc_r`
+/// for the buffer pointer followed by `get/setarrayitem_gc_i` on it.
+///
+/// This is the non-virtualizable array vocabulary: the elements do NOT ride
+/// a guard's `vable_array` resume section, so the snapshot stays O(1) in the
+/// array's length. A `[..; virt]` state field is the other choice and is only
+/// correct for per-frame state whose length is bounded by the green key.
+///
+/// The buffer carries no object header, so its length is NOT readable with
+/// `arraylen_gc`; bound an index against a sibling `int_fields` length/offset
+/// field instead.
+#[derive(Clone)]
+pub struct ArrayFieldEntry {
+    /// The struct that owns the field (e.g. `Stack`).
+    pub struct_type: Path,
+    /// The field holding the array base pointer (e.g. `data`).
+    pub field: Ident,
+    /// The element type (e.g. `i64`).
+    pub element_type: Path,
 }
 
 /// One entry in `int_fields = { Struct::field => u32, ... }`.
@@ -478,7 +511,8 @@ pub(crate) enum CallPolicyKind {
     ElidableIntOrMemerrorWrapped,
     ResidualRef,
     /// Like `ResidualRef` but stamps the descr EffectInfo with
-    /// `PyreHelperKind::NurseryAlloc` (aheui inline nursery bump). Result is a
+    /// `PyreHelperKind::NurseryAlloc`, which the backend lowers to an inline
+    /// nursery bump. Result is a
     /// real escaping Ref — no virtualization.
     NurseryAllocRef,
     ResidualRefWrapped,
@@ -607,6 +641,7 @@ impl Parse for JitInterpConfig {
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
         let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
+        let mut array_fields: Vec<ArrayFieldEntry> = Vec::new();
         let mut int_fields: Vec<IntFieldEntry> = Vec::new();
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
@@ -669,6 +704,9 @@ impl Parse for JitInterpConfig {
                 }
                 "ref_fields" => {
                     ref_fields = parse_ref_fields_map(input)?;
+                }
+                "array_fields" => {
+                    array_fields = parse_array_fields_map(input)?;
                 }
                 "int_fields" => {
                     int_fields = parse_int_fields_map(input)?;
@@ -746,6 +784,7 @@ impl Parse for JitInterpConfig {
             residual_writes,
             pool_arrays,
             ref_fields,
+            array_fields,
             int_fields,
             call_returns,
             struct_allocs,
@@ -770,6 +809,18 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
         let ref_scalar: Ident = content.parse()?;
         content.parse::<Token![.]>()?;
         let field: Ident = content.parse()?;
+        // `<field>[]` — the elements behind the pointer, not the pointer field.
+        let writes_elements = content.peek(syn::token::Bracket);
+        if writes_elements {
+            let brackets;
+            bracketed!(brackets in content);
+            if !brackets.is_empty() {
+                return Err(brackets.error(
+                    "residual_writes element syntax takes no index: write `field[]`, \
+                     which declares a write to some element of the array",
+                ));
+            }
+        }
         let struct_type = if content.peek(Token![@]) {
             content.parse::<Token![@]>()?;
             Some(content.parse::<Path>()?)
@@ -785,6 +836,7 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
             ref_scalar,
             field,
             struct_type,
+            writes_elements,
             helpers: helpers.into_iter().collect(),
         });
         let _ = content.parse::<Token![,]>();
@@ -927,6 +979,27 @@ pub(crate) fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFie
             struct_type,
             field,
             pointee_type,
+        });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+/// Parse `array_fields = { Struct::field => ElementType, ... }`.
+/// Each entry declares that `Struct.field` is the base pointer of a
+/// contiguous `ElementType` array; see [`ArrayFieldEntry`].
+pub(crate) fn parse_array_fields_map(input: ParseStream) -> syn::Result<Vec<ArrayFieldEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let (struct_type, field) = split_struct_field_path(content.parse::<Path>()?)?;
+        content.parse::<Token![=>]>()?;
+        let element_type: Path = content.parse()?;
+        entries.push(ArrayFieldEntry {
+            struct_type,
+            field,
+            element_type,
         });
         let _ = content.parse::<Token![,]>();
     }
@@ -1443,22 +1516,38 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 __driver.dispatch_jitcode().cloned();
             __driver.merge_point(|__meta, __sym| {
                 use majit_metainterp::JitCodeSym;
-                // pyjitpl.py:1577 `self.pc = saved_pc`: a merge point whose
+                // pyjitpl.py:1574 `self.pc = saved_pc`: a merge point whose
                 // `reached_loop_header` returned without closing (the
                 // `current_merge_points.append` path, :3058-3060) resumes the
-                // walk at the SAME guest pc. This closure is re-run for that,
-                // so the header-revisit fast path below — which exists to close
-                // a trace that came back round to its header — must not fire on
-                // the resumption: it would return CloseLoop before the walk ran
-                // a single step, and the retrace would compile an empty body.
+                // walk at the merge point's own guest pc. This closure is
+                // re-run for that, so the header-revisit fast path below —
+                // which exists to close a trace that came back round to its
+                // header — must not fire on the resumption: it would return
+                // CloseLoop before the walk ran a single step, and the retrace
+                // would compile an empty body.
                 //
-                // PEEK only. The dispatch merge-point arm is the consumer
-                // (`take_merge_point_resumed`); taking it here would let the
-                // resumed walk's own first merge-point visit close instantly.
-                let __resumed = __meta
-                    .trace_ctx()
-                    .map(|__ctx| __ctx.merge_point_resumed)
-                    .unwrap_or(false);
+                // The flag is a PEEK. The dispatch merge-point arm is its
+                // consumer (`take_merge_point_resumed`); taking it here would
+                // let the resumed walk's own first merge-point visit close
+                // instantly. The pc beside it is consumed here, because the pc
+                // is what this closure hands to the walk.
+                let (__resumed, __resume_pc) = match __meta.trace_ctx() {
+                    ::core::option::Option::Some(__ctx) => {
+                        (__ctx.merge_point_resumed, __ctx.walk_resume_pc.take())
+                    }
+                    ::core::option::Option::None => (false, ::core::option::Option::None),
+                };
+                // The position half of `self.pc = saved_pc`. `__pc` is the
+                // native interpreter's `pc` captured by this closure, so it
+                // names where the walk STARTED; the driver re-enters without
+                // advancing it, and a walk that closed deeper in its own
+                // segment would restart before the state it is carrying.
+                // Re-seed at the pc the close published; `None` — every
+                // re-entry that publishes none — keeps `__pc`.
+                let __pc: usize = match __resume_pc {
+                    ::core::option::Option::Some(__p) if __resumed => __p,
+                    _ => __pc,
+                };
                 if !__resumed && __sym.trace_started && __pc == __sym.loop_header_pc() {
                     if let Some(__ctx) = __meta.trace_ctx() {
                         __ctx.walk_final_pc = Some(__pc);

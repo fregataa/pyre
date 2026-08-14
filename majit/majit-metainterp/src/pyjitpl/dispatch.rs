@@ -476,8 +476,8 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
 /// Build a `CanRaise` [`majit_ir::effectinfo::EffectInfo`] whose field write-set names `write_field`
 /// of struct `type_id`, sharing the exact keyed `Arc<SimpleFieldDescr>` that a
 /// `getfield_gc_i` on the same `(type_id, write_field)` resolves to.  A
-/// residual helper that mutates a struct field through opaque host code — e.g.
-/// aheui's `jit_storage_*` changing selected `Stack` fields — declares them so
+/// residual helper that mutates a struct field through opaque host code —
+/// changing a field of the currently selected struct, say — declares them so
 /// `OptHeap::force_from_effectinfo` invalidates cached getfields after the
 /// call.  Without it the residual call carries an empty write-set and the
 /// optimizer can CSE-fold a mutable field load across the call.  This is the
@@ -492,12 +492,27 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
 /// getfield — pointer identity, which `compute_bitstrings` keys on.  Must run
 /// before `finish_setup_descrs` (jitcode assembly does), matching the
 /// non-trivial-raw-set construction-timing `call_descr` asserts.
+///
+/// `arrays` is the element-write half: `(item_size, is_item_signed)` per array
+/// the residual mutates through its base pointer.  It cannot use the field
+/// half's pointer-identity trick — a read's array descr comes from
+/// `MetaInterpStaticData::dispatch_array_descr_cache` at trace time while this
+/// one is minted during jitcode assembly, so the two are never the same `Arc`.
+/// The array descrs built here therefore only have to carry the right SHAPE;
+/// `EffectInfo::writes_array_descr_by_shape` is what reads them back, and the
+/// remaining fields are pinned to the `Assembler::add_gc_int_array_descr` shape
+/// the reads intern (`base_size = 0`, no length header, `Type::Int`).
+///
+/// An empty `arrays` leaves the affirmative "writes no arrays" that
+/// `EffectInfo::const_new` already installs, so a fields-only caller is
+/// unaffected by the array half existing.
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
-pub fn struct_fields_write_effect_info(
+pub fn residual_write_effect_info(
     layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool)])],
+    arrays: &[(usize, bool)],
     can_raise: bool,
 ) -> majit_ir::EffectInfo {
     // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
@@ -563,11 +578,42 @@ pub fn struct_fields_write_effect_info(
                 .cloned()
                 .unwrap_or_else(|| {
                     panic!(
-                        "struct_fields_write_effect_info: field `{write_field}` not registered for type {type_id}"
+                        "residual_write_effect_info: field `{write_field}` not registered for type {type_id}"
                     )
                 }) as majit_ir::DescrRef
         }));
     }
+    let ads: Vec<majit_ir::DescrRef> = arrays
+        .iter()
+        .map(|&(item_size, is_item_signed)| {
+            majit_ir::descr::make_array_descr_from_lltype_shape(
+                /* type_id */ 0,
+                // A raw slice data pointer: the base points straight at
+                // `items[0]`, so there is no header to skip and no length word
+                // to read.
+                /* base_size */
+                0,
+                item_size,
+                /* len_offset */ None,
+                majit_ir::value::Type::Int,
+                /* is_array_of_pointers */ false,
+                /* is_array_of_structs */ false,
+                is_item_signed,
+                // The only arrays reachable here are the header-less buffers
+                // an `array_fields` declaration names, which the reads intern
+                // through `Assembler::add_raw_int_array_descr_signed`.  The shape
+                // predicate ignores this flag, but a descr that disagreed with
+                // the read it is meant to match would be a trap for the next
+                // reader of either side.
+                /* is_gc_managed */
+                false,
+                /* lendescr */ None,
+                /* is_pure */ false,
+                /* ei_index */ u32::MAX,
+                /* interior_field_descrs */ Vec::new(),
+            ) as majit_ir::DescrRef
+        })
+        .collect();
     let extra_effect = if can_raise {
         majit_ir::ExtraEffect::CanRaise
     } else {
@@ -575,6 +621,7 @@ pub fn struct_fields_write_effect_info(
     };
     let mut ei = majit_ir::EffectInfo::const_new(extra_effect, majit_ir::OopSpecIndex::None);
     ei._write_descrs_fields = Some(fds);
+    ei._write_descrs_arrays = Some(ads);
     ei
 }
 
@@ -748,8 +795,14 @@ pub trait JitCodeSym {
     ///
     /// The inline-frame snapshot trim must use THIS end: it blanks the range
     /// unconditionally, and blanking a working register would drop live data.
+    ///
+    /// The default is the EMPTY range, not `int_identity_slots_end()`. A
+    /// symbol reserves identity slots in its sub-JitCodes only by opting in
+    /// (`split_dispatch`, which is what raises `split_identity_floor`); a
+    /// symbol that has not opted in has ordinary working registers there, and
+    /// an over-wide default would silently blank them out of the snapshot.
     fn int_identity_reserved_end(&self) -> usize {
-        self.int_identity_slots_end()
+        self.int_identity_slots_base()
     }
 
     /// First int-bank register used as a canonical identity slot
@@ -4302,8 +4355,8 @@ where
             }
             // ── BC_GETARRAYITEM_GC_R ──
             //
-            // Ref-result element read for a raw-pointer array (aheui
-            // `pools[selected]` → `*mut Stack`).  Mirrors BC_GETARRAYITEM_GC_I
+            // Ref-result element read for a raw-pointer array (a
+            // `pools[selected]`-shaped read).  Mirrors BC_GETARRAYITEM_GC_I
             // but loads an 8-byte GC pointer and writes the ref bank.  Unlike
             // the int arm there is NO all-constant fold: the array base is a
             // live state pointer and the result must stay a `GetarrayitemGcR`
@@ -5221,7 +5274,7 @@ where
                 // trace time (verify_green_args, asserted below).
                 let mut mp_green_pc: Option<i64> = None;
                 // MAJIT_PCSEQ diagnostic: all int-green constants at this merge
-                // point (pc plus any scalar greens like aheui's stackok/is_queue).
+                // point (pc plus any scalar greens the consumer declares).
                 let mut mp_green_ints: Vec<i64> = Vec::new();
                 // pyjitpl.py:3912 same_greenkey compares EVERY green, not just
                 // the int slot.  Capture the ref (slot 1) and float (slot 2)
@@ -5758,8 +5811,8 @@ where
                     };
                     let pc_matches = mp_green_pc.is_none_or(|pc| pc == close_target_pc as i64);
                     // pyjitpl.py:3021/3912 same_greenkey: beyond the pc, close
-                    // only when EVERY green (aheui's stackok / is_queue, the
-                    // `program` ref, …) equals the trace-start header's.  Compare
+                    // only when EVERY green — the scalars and the ref the
+                    // consumer declares — equals the trace-start header's.  Compare
                     // element-wise against the header greens captured on the first
                     // visit (`header_greens`) — the SAME merge-point green
                     // vocabulary — which is `Box.same_constant` per Const type

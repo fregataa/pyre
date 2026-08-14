@@ -19,13 +19,19 @@ pub(super) const REFUSAL_SEPARATOR: &str = " || ";
 
 impl<'c> Lowerer<'c> {
     /// If `func` is a registered `residual_writes` mutator, return the
-    /// `struct_field_write_effect_info(...)` expression naming the written
-    /// fields, so the residual call records a write-set `EffectInfo` that
-    /// invalidates cached getfields on those fields.  `None` for a
+    /// `residual_write_effect_info(...)` expression naming the written fields
+    /// and arrays, so the residual call records a write-set `EffectInfo` that
+    /// invalidates cached getfields and cached array elements.  `None` for a
     /// plain residual call (empty write-set).  `can_raise` carries the
     /// call policy's extra-effect into the write-set `EffectInfo` so a
     /// `ResidualVoidCannotRaise` mutator keeps `CannotRaise` instead of
     /// silently widening to `CanRaise`.
+    ///
+    /// A `field` declaration names the field itself; a `field[]` declaration
+    /// names the ELEMENTS of the array `field` points at.  The two are separate
+    /// caches in `OptHeap` — invalidating the base field hands the next element
+    /// load a fresh base, which only helps when the base actually changes — so a
+    /// residual that mutates a buffer in place has to say `field[]`.
     pub(super) fn residual_write_effect_info_tokens(
         &self,
         func: &Expr,
@@ -36,22 +42,46 @@ impl<'c> Lowerer<'c> {
         let writes: Vec<_> = config
             .residual_writes
             .iter()
-            .filter(|(segments, _, _)| *segments == func_segments)
+            .filter(|(segments, _, _, _)| *segments == func_segments)
             .collect();
         let mut layouts: Vec<(&syn::Path, Vec<TokenStream>)> = Vec::new();
-        for (_, path, field) in writes {
-            let fields = if let Some((_, fields)) = layouts.iter_mut().find(|(p, _)| *p == path) {
-                fields
-            } else {
-                layouts.push((path, Vec::new()));
-                &mut layouts.last_mut().unwrap().1
-            };
+        // `(key, element_path)` for the `field[]` declarations, deduplicated by
+        // key: naming one array from two helpers of the same residual would
+        // otherwise repeat its descr in the write set.
+        let mut arrays: Vec<(String, &syn::Path)> = Vec::new();
+        for (_, path, field, writes_elements) in writes {
             let struct_last = path
                 .segments
                 .last()
                 .map(|segment| segment.ident.to_string())
                 .unwrap_or_default();
             let key = format!("{}::{}", struct_last, field);
+            if *writes_elements {
+                let Some((_, _, element_path)) = config.array_fields.get(&key) else {
+                    return Some(
+                        syn::Error::new(
+                            field.span(),
+                            format!(
+                                "jit_interp: residual_writes `{key}[]` declares a write to the \
+                                 elements of an array field, but `{key}` is not declared in \
+                                 `array_fields`, so there is no element type to mint the written \
+                                 array descr from"
+                            ),
+                        )
+                        .to_compile_error(),
+                    );
+                };
+                if !arrays.iter().any(|(seen, _)| *seen == key) {
+                    arrays.push((key, element_path));
+                }
+                continue;
+            }
+            let fields = if let Some((_, fields)) = layouts.iter_mut().find(|(p, _)| *p == path) {
+                fields
+            } else {
+                layouts.push((path, Vec::new()));
+                &mut layouts.last_mut().unwrap().1
+            };
             let is_ref = config.ref_fields.contains_key(&key);
             // Same declared width the getfield/setfield lowering registers, so
             // this write-EI rebuild mints the field descr the reads resolve to
@@ -90,13 +120,33 @@ impl<'c> Lowerer<'c> {
                 }
             })
             .collect();
+        let arrays: Vec<_> = arrays
+            .iter()
+            .map(|(_, element_path)| {
+                // `writes_array_descr_by_shape` keys on `is_item_signed`, so
+                // this has to derive it exactly as the element read and write
+                // do (`add_raw_int_array_descr_signed` in
+                // `lower_ref_binding_array_read` / `_write`).  A literal here
+                // mints a shape no unsigned-element read ever produces, and
+                // the declaration then silently stops invalidating the load it
+                // names — the optimizer keeps serving the element it cached
+                // from before the mutating call.
+                quote! {
+                    (
+                        ::core::mem::size_of::<#element_path>(),
+                        (<#element_path>::MIN as i128) < 0,
+                    )
+                }
+            })
+            .collect();
         Some(quote! {
             // The residual mutates a host-owned native struct field (no
             // GC header) → `is_gc_managed = false`, matching the
             // getfield/setfield lowering so the write-EI rebuilds the
             // SAME parent SizeDescr identity the getfield reads back.
-            majit_metainterp::struct_fields_write_effect_info(
+            majit_metainterp::residual_write_effect_info(
                 &[#(#layouts),*],
+                &[#(#arrays),*],
                 #can_raise,
             )
         })
@@ -550,8 +600,8 @@ impl<'c> Lowerer<'c> {
         // arm-pattern bound names) which are not in scope at the
         // surrounding Rust scope.  Without this guard, dispatch arm
         // sub-JitCode bodies that contain unrecognised method calls on
-        // a parent binding (e.g. aheui-jit's `program.get_operand(pc - 1)`
-        // when no `Program::get_operand` call policy is registered) would
+        // a parent binding (`program.get_operand(pc - 1)` with no
+        // `Program::get_operand` call policy registered, say) would
         // emit verbatim Rust referencing `program`/`pc` in the
         // `__sub_builder` block — failing to compile.  Returning `None`
         // here triggers the dispatch arm's `None` branch which substitutes
@@ -1253,6 +1303,12 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_state_ref_field_setfield(expr) {
             return Some(());
         }
+        // Array element write on a local ref binding whose field is declared
+        // in `array_fields`: `<binding>.<field>[<idx>] = <expr>` →
+        // getfield_gc_r for the buffer base, then setarrayitem_gc_i.
+        if let Some(()) = self.lower_ref_binding_array_write(expr) {
+            return Some(());
+        }
         // Field write on a local ref binding with known struct type:
         // `<binding>.<field> = <expr>` → setfield_gc_i/setfield_gc_r.
         if let Some(()) = self.lower_ref_binding_setfield(expr) {
@@ -1515,9 +1571,9 @@ impl<'c> Lowerer<'c> {
                 }
                 // Stmt-form variants of result-returning policies discard
                 // the value but still need the IR call op recorded so the
-                // compiled trace runs the side effect (e.g. aheui OP_POP's
-                // `lj::stack_pop(state.selected_ref);` discards the popped
-                // value but the pop side effect must reach compiled code).
+                // compiled trace runs the side effect (a `stack_pop(...)`
+                // whose result is discarded still has to pop in compiled
+                // code).
                 // Allocate a throwaway destination register; never read it.
                 //
                 // RPython jtransform.py:456 `handle_residual_call` lowers
@@ -2163,7 +2219,7 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    /// Lower I/O call: aheui_io::write_number(r, writer) → residual_call_void(shim, r)
+    /// Lower I/O call: `<io>::write_number(r, writer)` → `residual_call_void(shim, r)`
     fn lower_io_call_stmt(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Call(call) = expr else {
             return None;

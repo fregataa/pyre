@@ -1276,7 +1276,7 @@ pub struct JitDriver<S: JitState> {
     ///
     /// The Mutex serialises factory invocations from blackhole resume
     /// callers; in practice tracing/resume run single-threaded for the
-    /// state-field JIT consumer (aheui), so contention is negligible.
+    /// state-field JIT consumer, so contention is negligible.
     ///
     /// Snapshot contract: factory calls that can append distinct
     /// liveness entries must run before tracing starts, followed by
@@ -1285,7 +1285,8 @@ pub struct JitDriver<S: JitState> {
     /// `MetaInterpStaticData.liveness_info` immutable during tracing.
     shared_asm: std::sync::Arc<std::sync::Mutex<majit_translate::codewriter::assembler::Assembler>>,
     /// resume.py:1367 — CPU allocation backend for virtual materialization
-    /// during blackhole resume. Registered by pyre/aheui at startup.
+    /// during blackhole resume. Registered by the embedding interpreter at
+    /// startup.
     blackhole_allocator: Option<Box<dyn crate::resume::BlackholeAllocator + Send>>,
     /// warmspot.py:961 handle_jitexception parity: portal runner callback.
     /// Called when ContinueRunningNormally is raised at a recursive portal
@@ -1875,6 +1876,17 @@ impl<S: JitState> JitDriver<S> {
     /// RPython-compatible alias used by warmstate/compile wiring.
     pub fn set_param_max_unroll_recursion(&mut self, value: usize) {
         self.set_max_unroll_recursion(value);
+    }
+
+    /// warmspot.py:73 `jd.warmstate.set_param_enable_opts(enable_opts)`.
+    ///
+    /// Takes the `':'`-separated pass names of `ALL_OPTS`; `"all"` restores the
+    /// full set. Dropping `"unroll"` selects the simple-loop compilation path
+    /// for this driver alone, which is why this is per-driver rather than a
+    /// process-wide switch. `set_param` cannot carry it — that surface is
+    /// `i64`-valued, and this parameter is a string upstream too.
+    pub fn set_param_enable_opts(&mut self, value: &str) {
+        self.meta.warm_state_mut().set_param_enable_opts(value);
     }
 
     /// Whether this driver was declared recursive.
@@ -3002,7 +3014,7 @@ impl<S: JitState> JitDriver<S> {
                                 //
                                 // What the widened arm produces, at the op level: the
                                 // declined close returns here, the walk runs on and closes a
-                                // second time one aheui instruction later, and the bridge it
+                                // second time one interpreter instruction later, and the bridge it
                                 // compiles carries that instruction's pop (`IntAdd -1`, two
                                 // `GcLoadR`, two `GcStore`) ahead of a `Jump` into a
                                 // four-input label, where the close that was declined jumped
@@ -3081,9 +3093,19 @@ impl<S: JitState> JitDriver<S> {
                                         // `close_bridge` directly and have no such path.
                                         crate::mc_diag_bump(67); // bridge_unattempted_close
                                     }
+                                    // pyjitpl.py:1574 `self.pc = saved_pc` resumes at the
+                                    // merge point that was CONSULTED — the one whose greens
+                                    // `get_procedure_token` read (pyjitpl.py:3005), which is
+                                    // this one. The `continue` below re-runs the walk with
+                                    // the native interpreter's `pc` untouched, i.e. at the
+                                    // position the walk STARTED from, while the symbolic
+                                    // state stands here. Publish the position half before
+                                    // dropping the only record of it, or the re-entered walk
+                                    // replays the instructions between the two against state
+                                    // that belongs to neither.
+                                    ctx.resume_walk_after_close();
                                     ctx.close_greens = None;
                                     ctx.close_green_pc = None;
-                                    ctx.merge_point_resumed = true;
                                 }
                                 // The walk-final handoff staged at the top of this arm describes a trace
                                 // that ENDED; discard it, same as the `take_keep_tracing_after_close` path
@@ -3411,12 +3433,25 @@ impl<S: JitState> JitDriver<S> {
                         self.meta.single_pass_outcome = None;
                         self.meta.single_pass_scalar_values = None;
                         self.meta.single_pass_virt_array_values = None;
-                        // pyjitpl.py:1577 `self.pc = saved_pc` — the resumed walk
+                        // pyjitpl.py:1571/1574 `saved_pc` — the resumed walk
                         // re-enters at the merge point's own guest pc, so the
                         // merge-point op must fall through once instead of
-                        // closing again with nothing recorded in between.
+                        // closing again with nothing recorded in between, and
+                        // the walk must be seeded THERE rather than wherever
+                        // its segment began. `register_retrace_merge_point`
+                        // registered this merge point under `close_header_pc`,
+                        // the same pc `close_green_pc` names, so resuming
+                        // anywhere else also disagrees with that registration.
+                        //
+                        // The slot is here because nothing available reaches
+                        // this branch: it fires on no test in this crate, no
+                        // majit example, and no downstream corpus program at
+                        // thresholds 2/8/32/128. A zero says "still unreached";
+                        // the first non-zero is the first evidence this
+                        // resumption is exercised at all.
+                        crate::mc_diag_bump(78); // retrace_close_resumed
                         if let Some(ctx) = self.meta.trace_ctx() {
-                            ctx.merge_point_resumed = true;
+                            ctx.resume_walk_after_close();
                         }
                         continue;
                     }
@@ -7871,7 +7906,7 @@ mod tests {
     }
 
     /// State whose walk advances a scalar state field the recover hook cannot
-    /// re-derive (an aheui `selected`-style storage index). The Sym carries the
+    /// re-derive (a `selected`-style storage index). The Sym carries the
     /// scalar; `collect_scalar_state_field_values` reads it (at close time,
     /// while the sym is live) and `writeback_scalar_state_fields_from_values`
     /// pushes the captured value into native `state`.
@@ -7946,9 +7981,9 @@ mod tests {
     /// `writeback_scalar_state_fields` applies that stash to native `state`
     /// afterward. Previously the write-back read `self.sym` directly, but the
     /// CloseLoop arm had already set `self.sym = None`, so the write-back was
-    /// always a silent no-op — a program whose walk advanced a scalar (e.g. an
-    /// aheui SEL changing `selected`) would seed native state from the stale
-    /// trace-start value.
+    /// always a silent no-op — a program whose walk advanced a scalar (an
+    /// instruction switching the selected storage, say) would seed native
+    /// state from the stale trace-start value.
     #[test]
     fn single_pass_close_writes_back_walk_final_scalar() {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
@@ -8956,6 +8991,108 @@ mod cross_loop_cut_close_tests {
         assert!(
             driver.is_tracing(),
             "the walk keeps recording, as on the declined-attempt path",
+        );
+    }
+
+    /// `close_jumping_into` with the walk-entry bookkeeping the
+    /// `jit_merge_point!` expansion performs, and with a `close_green_pc` the
+    /// caller chooses.  Returns the `walk_resume_pc` observed at the top of
+    /// each walk — one entry per invocation of the closure, which is what the
+    /// macro reads to decide where to seed the walk.
+    fn close_jumping_into_observing_resume(
+        driver: &mut JitDriver<CutCloseState>,
+        target: u64,
+        close_pc: Option<i64>,
+    ) -> Vec<Option<usize>> {
+        let mut observed = Vec::new();
+        driver.merge_point(|meta, _sym| {
+            let Some(ctx) = meta.trace_ctx() else {
+                return TraceAction::Continue;
+            };
+            observed.push(ctx.walk_resume_pc.take());
+            if std::mem::take(&mut ctx.merge_point_resumed) {
+                return TraceAction::Continue;
+            }
+            ctx.close_greens = Some(inner_greens());
+            ctx.close_green_pc = close_pc;
+            ctx.close_jump_into_key = Some(target);
+            TraceAction::CloseLoop
+        });
+        observed
+    }
+
+    /// Where a declined close re-enters the walk.
+    ///
+    /// pyjitpl.py:1571/1574 `saved_pc`: upstream consults one merge point per
+    /// `opimpl_jit_merge_point` call, so the position that entered the call and
+    /// the position that declined cannot differ.  A pyre walk covers a whole
+    /// segment, so they can — and only the second one names the state the walk
+    /// is carrying.  The driver hands that pc over; the walk is re-seeded from
+    /// it rather than from wherever the segment began.
+    ///
+    /// `close_jumping_into`, which the rest of this module drives, publishes no
+    /// `close_green_pc` at all, so none of those tests can tell the two pcs
+    /// apart.
+    #[test]
+    fn a_declined_close_hands_over_the_pc_that_declined() {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let inner_key = 7081u64;
+        compile_inner_loop(&mut driver, inner_key, /* cut */ true);
+
+        // Deliberately unrelated to the trace's own header, which is what a
+        // close reached deeper in the walk than its entry looks like.
+        let declining_pc = 385i64;
+        start_outer_trace(&mut driver, 7082);
+        let seen = close_jumping_into_observing_resume(&mut driver, inner_key, Some(declining_pc));
+
+        assert!(
+            driver.is_tracing(),
+            "premise: the decline keeps tracing, so there is a re-entry to check",
+        );
+        assert_eq!(
+            seen.len(),
+            2,
+            "the declined close re-runs the walk exactly once",
+        );
+        assert_eq!(
+            seen[0], None,
+            "the first walk is seeded by its caller; nothing has declined yet",
+        );
+        assert_eq!(
+            seen[1],
+            Some(declining_pc as usize),
+            "the re-entered walk must be seeded at the merge point that \
+             declined. Seeded at the pc that entered the walk instead, it \
+             re-executes everything between the two against the state it \
+             already advanced past, and closes a loop whose registered green \
+             key contradicts the state its own JUMP carries",
+        );
+    }
+
+    /// …and a close that names no pc leaves the seed alone, rather than
+    /// pointing the walk at 0.  The pc is the merge point's green
+    /// (pyjitpl.py:3005), so a driver whose merge point yields none has
+    /// nothing to correct and keeps the pc it was called with.
+    #[test]
+    fn a_declined_close_without_a_pc_hands_over_nothing() {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let inner_key = 7091u64;
+        compile_inner_loop(&mut driver, inner_key, /* cut */ true);
+
+        start_outer_trace(&mut driver, 7092);
+        let seen = close_jumping_into_observing_resume(&mut driver, inner_key, None);
+
+        assert_eq!(
+            seen.len(),
+            2,
+            "the declined close re-runs the walk exactly once"
+        );
+        assert!(
+            seen.iter().all(Option::is_none),
+            "with no pc published there is nothing to re-seed from, and the \
+             walk keeps the pc its caller passed",
         );
     }
 

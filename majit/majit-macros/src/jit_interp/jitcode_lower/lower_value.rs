@@ -70,6 +70,14 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_state_ref_field_getfield(expr) {
             return Some(binding);
         }
+        // Array element read on a local ref binding whose field is declared
+        // in `array_fields`: `<binding>.<field>[<idx>]` → getfield_gc_r for
+        // the buffer base, then getarrayitem_gc_i. Before the plain field
+        // read, which cannot match an `Index` shape anyway, and before
+        // `lower_state_array_read`, which is the `state.<array>` form.
+        if let Some(binding) = self.lower_ref_binding_array_read(expr) {
+            return Some(binding);
+        }
         // Field read on a local ref binding with known struct type:
         // `<binding>.<field>` → getfield_gc_i/getfield_gc_r.
         if let Some(binding) = self.lower_ref_binding_getfield(expr) {
@@ -179,7 +187,7 @@ impl<'c> Lowerer<'c> {
                     return Some(binding.clone());
                 }
                 // Otherwise a path whose final segment is a SCREAMING_CASE
-                // symbolic constant (`VAL_QUEUE`, `aheui::VAL_PORT`) lowers to
+                // symbolic constant (`VAL_QUEUE`, `consts::VAL_PORT`) lowers to
                 // a runtime int const — the same `#path as i64` form match-arm
                 // patterns use (`extract_pat_value_tokens`); the Rust compiler
                 // resolves the const value while building the JitCode, and a

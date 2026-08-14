@@ -183,7 +183,9 @@ pub struct LowererConfig {
     /// naming the field so the optimizer invalidates the cached
     /// `getfield_gc_i`.  Source: `JitInterpConfig.residual_writes`, the struct
     /// `Path` recovered from `state_ref_scalars[ref_scalar]`.
-    pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident)>,
+    /// The trailing `bool` is the `[]` suffix: the helper writes the ELEMENTS
+    /// of the array the field points at, rather than the field itself.
+    pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident, bool)>,
     /// `(pool-base ref-scalar name, getter function path segments, element type)`.
     /// A call `<getter>(state.<base>, <int>)` whose function path matches
     /// `getter` AND whose arg0 is the `base` lowers to `getarrayitem_gc_r`
@@ -194,6 +196,13 @@ pub struct LowererConfig {
     /// encounters a field access and the `(struct, field)` pair matches, it
     /// emits `getfield_gc_r` / `setfield_gc_r` (ref-kind) instead of `_gc_i`.
     pub(super) ref_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
+    /// `array_fields = { Struct::field => ElementType }`, keyed
+    /// `"StructLastSegment::field"` → (struct_path, field_ident,
+    /// element_path). The field holds an array BASE POINTER, so
+    /// `base.field[i]` is a `getfield_gc_r` followed by
+    /// `get/setarrayitem_gc_i` — never `arraylen_gc`, since the buffer
+    /// carries no header length.
+    pub(super) array_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
     /// Sub-word integer struct field declarations.  Key = `"StructType::field"`,
     /// value = `(rust_int_type, is_signed)`.  Source:
     /// `JitInterpConfig.int_fields`.  A field listed here registers its real
@@ -880,14 +889,45 @@ fn int_fields_map(
         .collect()
 }
 
+/// Key `array_fields` entries the same way `ref_fields` are keyed —
+/// `"StructLastSegment::field"` -> `(struct_path, field_ident, element_path)` —
+/// so the lowerer resolves an array field off a binding's `struct_type`
+/// exactly as it resolves a ref field.
+fn build_array_fields_map(
+    array_fields: &[crate::jit_interp::ArrayFieldEntry],
+) -> HashMap<String, (syn::Path, Ident, syn::Path)> {
+    array_fields
+        .iter()
+        .map(|entry| {
+            let struct_name = entry
+                .struct_type
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let key = format!("{}::{}", struct_name, entry.field);
+            (
+                key,
+                (
+                    entry.struct_type.clone(),
+                    entry.field.clone(),
+                    entry.element_type.clone(),
+                ),
+            )
+        })
+        .collect()
+}
+
 impl LowererConfig {
     pub fn inline_helper(
         ref_fields: &[crate::jit_interp::RefFieldEntry],
+        array_fields: &[crate::jit_interp::ArrayFieldEntry],
         int_fields: &[crate::jit_interp::IntFieldEntry],
         native_int_binops: &[(syn::Path, syn::Ident)],
         native_tag_small: &[syn::Path],
         headerless_structs: &[syn::Path],
     ) -> Self {
+        let array_fields_map = build_array_fields_map(array_fields);
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
             .iter()
             .map(|entry| {
@@ -929,6 +969,7 @@ impl LowererConfig {
             residual_writes: Vec::new(),
             pool_arrays: Vec::new(),
             ref_fields: ref_fields_map,
+            array_fields: array_fields_map,
             int_fields: int_fields_map(int_fields),
             call_returns: HashMap::new(),
             headerless_structs: headerless_structs
@@ -966,6 +1007,7 @@ impl LowererConfig {
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
         ref_fields: &[crate::jit_interp::RefFieldEntry],
+        array_fields: &[crate::jit_interp::ArrayFieldEntry],
         int_fields: &[crate::jit_interp::IntFieldEntry],
         call_returns: &[(Path, Path)],
         headerless_structs: &[Path],
@@ -1125,12 +1167,18 @@ impl LowererConfig {
                         .map(|(_, p)| p.clone())
                 });
                 entry.helpers.iter().filter_map(move |helper| {
-                    struct_path
-                        .clone()
-                        .map(|p| (canonical_path_segments(helper), p, entry.field.clone()))
+                    struct_path.clone().map(|p| {
+                        (
+                            canonical_path_segments(helper),
+                            p,
+                            entry.field.clone(),
+                            entry.writes_elements,
+                        )
+                    })
                 })
             })
             .collect();
+        let array_fields_map = build_array_fields_map(array_fields);
         // Build the ref_fields lookup: key = "StructLastSegment::field",
         // value = (struct_path, field_ident, pointee_path).
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
@@ -1173,6 +1221,7 @@ impl LowererConfig {
             env_type_name: env_type.to_string(),
             residual_writes,
             ref_fields: ref_fields_map,
+            array_fields: array_fields_map,
             int_fields: int_fields_map(int_fields),
             call_returns: call_returns
                 .iter()
@@ -2568,6 +2617,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            // ref_params, ref_fields, array_fields, int_fields,
+            // native_int_binops, native_tag_small, headerless_structs — the
+            // surface these tests assert is the call encoding, which none of
+            // them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2593,6 +2647,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            // ref_params, ref_fields, array_fields, int_fields,
+            // native_int_binops, native_tag_small, headerless_structs — the
+            // surface these tests assert is the call encoding, which none of
+            // them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2618,6 +2677,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            // ref_params, ref_fields, array_fields, int_fields,
+            // native_int_binops, native_tag_small, headerless_structs — the
+            // surface these tests assert is the call encoding, which none of
+            // them participate in.
+            &[],
             &[],
             &[],
             &[],

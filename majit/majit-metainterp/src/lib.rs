@@ -156,9 +156,9 @@ pub use pyjitpl::{
     record_application_traceback_for_recording, record_application_traceback_hook_address,
     record_discarded_level_traceback_for_recording, record_discarded_level_traceback_hook_address,
     record_inline_application_traceback_for_recording,
-    record_inline_application_traceback_hook_address, set_record_application_traceback_hook,
-    set_record_discarded_level_traceback_hook, set_record_inline_application_traceback_hook,
-    struct_fields_write_effect_info, trace_jitcode, trace_jitcode_from_merge_point,
+    record_inline_application_traceback_hook_address, residual_write_effect_info,
+    set_record_application_traceback_hook, set_record_discarded_level_traceback_hook,
+    set_record_inline_application_traceback_hook, trace_jitcode, trace_jitcode_from_merge_point,
     trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
@@ -874,7 +874,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 78;
+pub const MC_DIAG_SLOTS: usize = 79;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -1213,6 +1213,12 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     "qmut_deps_simple_loop",
     "qmut_deps_entry_bridge",
     "qmut_deps_blackhole_arm",
+    // The second of the driver's two "close kept the trace alive, hand the
+    // walk back" re-entries (`take_keep_tracing_after_close`). Its sibling has
+    // no slot because the corpus reaches it; this one is reached by nothing
+    // runnable today, so a zero here is the difference between "the resumption
+    // is correct" and "the resumption has never run".
+    "retrace_close_resumed",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

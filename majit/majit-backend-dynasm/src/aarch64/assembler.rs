@@ -303,7 +303,8 @@ pub struct AssemblerARM64<'a> {
     /// Vec-backed `IndexMap`: `resolve_opref` reads this per emitted op during
     /// codegen and the sync loop inserts one entry per live var, so a Vec-`get`
     /// is O(n) and makes `_assemble` O(n^2) on large traces — `get_index_of`
-    /// inlines into `_assemble` and dominated aheui's logo compile. The box→
+    /// inlines into `_assemble` and dominated compile time on a trace of tens
+    /// of thousands of ops. The box→
     /// location map is a dict in the reference assembler; insertion order is
     /// preserved (no semantic change, only the lookup cost).
     opref_to_slot: indexmap::IndexMap<OpRef, usize>,
@@ -3387,9 +3388,11 @@ impl<'a> AssemblerARM64<'a> {
                     let rv = r.value;
                     dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
-                }
+                // aarch64/regalloc.py:964-966 keeps malloc's result in the
+                // selected result register (x0); it does not eagerly mirror
+                // every result into its jitframe slot.  Regalloc emits the
+                // eventual spill when a guard or register-pressure boundary
+                // actually needs one.
             }
             // aarch64/assembler.py:715 malloc_cond_varsize_frame
             OpCode::CallMallocNurseryVarsizeFrame => {
@@ -6033,18 +6036,24 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Inline aheui's headerless `jit_alloc_node(value, next)` nursery bump.
+    /// Inline nursery bump for a call tagged
+    /// [`majit_ir::PyreHelperKind::NurseryAlloc`].
     ///
-    /// The fast path only advances `nursery_free` and initializes the
-    /// 16-byte Node payload, so it cannot collect and emits no gcmap. The
-    /// slow path is the ordinary residual call wrapper, which may collect
-    /// inside `jit_alloc_node` / `Nursery::alloc` and passes `next` (the old
-    /// head) as the keep-root. This is sound because the op is still a call:
-    /// the optimizer's residual-call emission fences pending head/size
-    /// setfields before this allocation, matching the storage collector's
-    /// root-currentness requirement.
+    /// The tag declares a two-word headerless node taken from the
+    /// interpreter's own nursery, whose payload is the call's two arguments:
+    /// the value at offset 0 and the successor link at offset 8.
+    ///
+    /// The fast path only advances `nursery_free` and stores those two words,
+    /// so it cannot collect and emits no gcmap. The slow path is the ordinary
+    /// residual call wrapper, which may collect inside the callee; the callee
+    /// is free to treat the second argument as a keep-root, since that is the
+    /// object the new node links to. This is sound because the op is still a
+    /// call: the optimizer's residual-call emission fences pending setfields
+    /// before the allocation, so a collector that walks the interpreter's own
+    /// structures finds roots that are current.
     fn genop_nursery_alloc_inline(&mut self, op: &Op, arglocs: &[Loc]) {
-        const NURSERY_ALLOC_NODE_SIZE: u32 = 16; // aheui headerless Node = 16B (value@0,next@8)
+        // Two-word headerless node: value@0, link@8.
+        const NURSERY_ALLOC_NODE_SIZE: u32 = 16;
 
         let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
         if nf_addr == 0 || nt_addr == 0 {
@@ -6569,9 +6578,11 @@ impl<'a> AssemblerARM64<'a> {
             return;
         }
 
-        // x0 = nursery_free, x1 = new_free, x2 = scratch, x3 = nursery_top
-        self.emit_mov_imm64(2, nf_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x2]);
+        // aarch64/assembler.py:682-708 uses only x0/x1 plus the reserved IP
+        // scratch registers.  Keep x2..x13 available to regalloc on the fast
+        // path; the collecting slow path spills/restores them below.
+        self.emit_mov_imm64(16, nf_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16]);
 
         if total_size < 4096 {
             let ts = total_size as u32;
@@ -6581,18 +6592,18 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        self.emit_mov_imm64(3, nt_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x3, [x3]);
-        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x3);
+        self.emit_mov_imm64(17, nt_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x17]);
+        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x17);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
-        // Fast path: bump nursery_free, zero header, return payload ptr
-        self.emit_mov_imm64(2, nf_addr as i64);
+        // Fast path: x16 still holds &nursery_free; bump it, zero the header,
+        // and return the payload pointer.
         dynasm!(self.mc ; .arch aarch64
-            ; str x1, [x2]       // *nursery_free = new_free
+            ; str x1, [x16]      // *nursery_free = new_free
             ; str xzr, [x0]      // zero GcHeader
         );
         let hs = gc_hdr as u32;
@@ -6681,9 +6692,9 @@ impl<'a> AssemblerARM64<'a> {
     ///
     /// The fast path raw-bumps `dynasm_nursery_addrs()`, so it is correct only
     /// when the active dynasm GC is headerless-aware — its nursery must yield a
-    /// raw base carrying no `GcHeader` (aheui's `NurseryGcAllocator`, whose
-    /// nursery is the aheui node arena collected by aheui's own copying node
-    /// GC).  A headered collector such as MiniMarkGC must never back this op:
+    /// raw base carrying no `GcHeader` — what an interpreter that runs its own
+    /// collector over its own object arena supplies.  A headered collector such
+    /// as MiniMarkGC must never back this op:
     /// its nursery walk reads a `GcHeader` at `base - GcHeader::SIZE`, which a
     /// raw base lacks.  The overflow slowpath enforces this via
     /// `alloc_nursery_headerless`'s panicking default; the fast path relies on
@@ -6708,8 +6719,11 @@ impl<'a> AssemblerARM64<'a> {
             return;
         }
 
-        self.emit_mov_imm64(2, nf_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x2]);
+        // As in upstream malloc_cond, x0/x1 are the only managed registers
+        // clobbered by the fast path; nursery addresses live in reserved IP
+        // scratch registers.
+        self.emit_mov_imm64(16, nf_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16]);
 
         if size < 4096 {
             let sz = size as u32;
@@ -6719,17 +6733,28 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        self.emit_mov_imm64(3, nt_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x3, [x3]);
-        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x3);
+        // When the allocator reports the top slot immediately after the free
+        // slot, reuse x16 as the address base; allocators that keep the two
+        // slots independent retain the general path.
+        if nt_addr == nf_addr.wrapping_add(std::mem::size_of::<usize>()) {
+            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16, 8]);
+        } else {
+            self.emit_mov_imm64(17, nt_addr as i64);
+            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x17]);
+        }
+        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x17);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
-        self.emit_mov_imm64(2, nf_addr as i64);
+        // x16 still holds nf_addr from the load above: the intervening add,
+        // top load, compare, and branch only write x0, x1, x17, and flags.
+        // Keep that address live on the fast arm instead of materializing the
+        // same 64-bit constant a second time.  The slow arm has its own call
+        // sequence and does not join at this store.
         dynasm!(self.mc ; .arch aarch64
-            ; str x1, [x2]       // *nursery_free = new_free
+            ; str x1, [x16]      // *nursery_free = new_free
             ; b =>done
         );
 

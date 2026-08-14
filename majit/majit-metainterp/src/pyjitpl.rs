@@ -4,7 +4,7 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, struct_fields_write_effect_info, trace_jitcode,
+    StandaloneFrameStack, residual_write_effect_info, trace_jitcode,
     trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
@@ -6256,12 +6256,14 @@ impl<M: Clone> MetaInterp<M> {
         let trace_ops_snapshot = trace_ops.clone();
         let constants_snapshot = constants.clone();
 
-        // PyPy: pyjitpl.py:3016-3017 `can_use_unroll = cpu.supports_guard_gc_type
-        // and 'unroll' in warmstate.enable_opts`. PYRE_NO_UNROLL forces the
-        // simple-loop compilation path (compile.py:251 compile_simple_loop)
-        // without preamble peeling, useful for diagnostics and to isolate
-        // unroller-related regressions.
-        let no_unroll = crate::no_unroll_enabled();
+        // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
+        // warmstate.enable_opts. PYRE_NO_UNROLL remains a diagnostic override.
+        let no_unroll = crate::no_unroll_enabled()
+            || !self
+                .warm_state
+                .get_enable_opts()
+                .iter()
+                .any(|opt| opt == "unroll");
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
@@ -22225,7 +22227,7 @@ mod tests {
 
     /// The LABEL's argument order is its own, not the frontend's state-field
     /// order, and the two can agree in length while disagreeing in position.
-    /// `aheui`'s `pi/pi.jinseo` under the cranelift backend hit exactly that:
+    /// A downstream interpreter under the cranelift backend hit exactly that:
     /// four state values `(Int, Int, Ref, Ref)` entered a four-argument
     /// `(Int, Ref, Ref, Ref)` LABEL, and compiled code dereferenced the second
     /// `Int` as a pointer.

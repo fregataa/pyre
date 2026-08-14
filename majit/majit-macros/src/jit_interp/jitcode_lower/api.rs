@@ -395,6 +395,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     calls: &[crate::jit_interp::CallEntry],
     ref_params: &[(Ident, syn::Path)],
     ref_fields: &[crate::jit_interp::RefFieldEntry],
+    array_fields: &[crate::jit_interp::ArrayFieldEntry],
     int_fields: &[crate::jit_interp::IntFieldEntry],
     native_int_binops: &[(Path, Ident)],
     native_tag_small: &[Path],
@@ -433,6 +434,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         .collect();
     let inline_config = if ref_param_structs.is_empty()
         && ref_fields.is_empty()
+        && array_fields.is_empty()
         && int_fields.is_empty()
         && native_int_binops.is_empty()
         && native_tag_small.is_empty()
@@ -442,6 +444,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     } else {
         Some(LowererConfig::inline_helper(
             ref_fields,
+            array_fields,
             int_fields,
             native_int_binops,
             native_tag_small,
@@ -638,8 +641,8 @@ fn try_generate_jitcode_body_inner(
 /// A.3.6.1 (jtransform.py:1693-1714): bind body-local `let` stmts that
 /// appear in the dispatch while-body BEFORE the `jit_merge_point!()`
 /// macro stmt, so that consumer-declared
-/// `#[jit_interp(greens = [<body-local>])]` (e.g. aheui-jit's
-/// `greens = [stackok]` with `let stackok = program.get_req_size(pc) <= ...`)
+/// `#[jit_interp(greens = [<body-local>])]` (say `greens = [ok]` with
+/// `let ok = program.get_req_size(pc) <= ...`)
 /// flow through `resolve_greens` / `emit_promote_greens` without panic.
 ///
 /// TODO: RPython has no equivalent two-pass walker.

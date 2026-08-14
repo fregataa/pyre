@@ -34,6 +34,15 @@ pub(super) fn field_scalar_tokens(
     }
 }
 
+/// A `<local ref binding>.<field>` access that `array_fields` declares, resolved
+/// but not yet emitted.  See [`JitCodeLowerer::match_array_field_base`].
+struct ArrayFieldBase {
+    base_reg: u16,
+    struct_path: syn::Path,
+    member: syn::Member,
+    element_type: syn::Path,
+}
+
 impl<'c> Lowerer<'c> {
     /// Read an immediate operand byte from the green bytecode array:
     /// `program[<index>]`.  Mirrors the dispatch-top opcode fetch
@@ -893,7 +902,7 @@ impl<'c> Lowerer<'c> {
     /// `setfield_gc` on the same `(struct_type_id, field)` — mirroring an
     /// RPython `len(obj)`/`obj.field` getfield_gc_i on a mutable field.
     ///
-    /// Only int fields are lowered here (the aheui length read); a ref field
+    /// Only int fields are lowered here (the length read); a ref field
     /// read would route through `getfield_gc_r` and is left unimplemented
     /// until a caller needs it.
     pub(super) fn lower_state_ref_field_getfield(&mut self, expr: &Expr) -> Option<Binding> {
@@ -1126,10 +1135,243 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// Match `<local ref binding>.<field>` against `array_fields` WITHOUT
+    /// emitting anything, so a caller can finish rejecting before it commits
+    /// any op to the trace.
+    ///
+    /// Split from [`Self::emit_array_field_base`] because the element write
+    /// has to emit its right-hand side first: Rust evaluates the assigned
+    /// value before the assignee place, and a lowering that emitted the base
+    /// load first would run the two in the opposite order from the
+    /// interpreter.
+    fn match_array_field_base(&self, field: &syn::ExprField) -> Option<ArrayFieldBase> {
+        let config = self.config?;
+        let Expr::Path(path) = &*field.base else {
+            return None;
+        };
+        let ident = path.path.get_ident()?;
+        let binding = self.bindings.get(&ident.to_string())?.clone();
+        if !matches!(binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        let struct_path = binding.struct_type.as_ref()?.clone();
+        let member = field.member.clone();
+        let member_name = named_member(&field.member)?;
+        let struct_last = struct_path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        let key = format!("{}::{}", struct_last, member_name);
+        let element_type = config.array_fields.get(&key)?.2.clone();
+        Some(ArrayFieldBase {
+            base_reg: binding.reg,
+            struct_path,
+            member,
+            element_type,
+        })
+    }
+
+    /// Emit the `getfield_gc_r` that loads the array's base pointer for a
+    /// shape [`Self::match_array_field_base`] already accepted.
+    ///
+    /// Shared by the element read and the element write so both take the
+    /// buffer pointer through the SAME interned field descr — a store to the
+    /// base (a realloc on growth) then invalidates the load the heapcache
+    /// served, instead of leaving a stale buffer pointer live in the trace.
+    fn emit_array_field_base(&mut self, shape: &ArrayFieldBase) -> u16 {
+        let ArrayFieldBase {
+            base_reg,
+            struct_path,
+            member,
+            element_type,
+        } = shape;
+        let (base_reg, struct_path, member, element_type) = (
+            *base_reg,
+            struct_path.clone(),
+            member.clone(),
+            element_type.clone(),
+        );
+        let tid = struct_type_id_tokens(&struct_path, false);
+        let buffer_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(base_reg)],
+                vec![Register::ref_(buffer_reg)],
+            ),
+            quote! {
+                // The `int_fields` twin of this check lives in
+                // `field_scalar_tokens`.  Nothing else ties the declared
+                // element type to the field: the concrete rewrite indexes the
+                // real pointer while the emitted descr takes its stride and
+                // signedness from the declaration, so a declaration that
+                // drifted from the struct (`Stack::data => u16` over a
+                // `*mut u8`) would compile and read past the buffer.  Naming
+                // the pointee rather than the pointer accepts `*const T` as
+                // well as `*mut T`; the closure body is type-checked but never
+                // evaluated.
+                const _: fn(&#struct_path) -> #element_type =
+                    |__s| unsafe { *__s.#member };
+                __builder.register_struct_layout(
+                    ::core::mem::size_of::<#struct_path>(),
+                    #tid,
+                    false,
+                    false,
+                    &[(
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        true,
+                        stringify!(#member),
+                        ::core::mem::size_of::<usize>(),
+                        false,
+                    )],
+                );
+                __builder.getfield_gc_r(
+                    #buffer_reg,
+                    #base_reg,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                    stringify!(#member),
+                );
+            },
+        );
+        buffer_reg
+    }
+
+    /// Recognizes an array element READ on a local ref binding:
+    /// `<binding>.<array_field>[<int expr>]` → `getfield_gc_r` for the buffer
+    /// base followed by `getarrayitem_gc_i`.
+    ///
+    /// This is the non-virtualizable counterpart of the `[..; virt]` element
+    /// read: the loaded value is an ordinary trace value, so it does NOT ride
+    /// the guard's `vable_array` resume section and the snapshot stays O(1) in
+    /// the array's length.
+    ///
+    /// No `arraylen_gc` is emitted anywhere on this path — the buffer has no
+    /// object header to read a length from. A bound belongs on a sibling
+    /// `int_fields` length field.
+    pub(super) fn lower_ref_binding_array_read(&mut self, expr: &Expr) -> Option<Binding> {
+        let Expr::Index(index_expr) = expr else {
+            return None;
+        };
+        let Expr::Field(field) = &*index_expr.expr else {
+            return None;
+        };
+        // Match before emitting anything, so a shape this does not handle
+        // leaves the trace untouched.  A place expression evaluates its base
+        // before its index, which is the order emitted here.
+        let shape = self.match_array_field_base(field)?;
+        let element_type = shape.element_type.clone();
+        let buffer_reg = self.emit_array_field_base(&shape);
+        let index = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(index.kind, BindingKind::Int) {
+            return None;
+        }
+        let index_reg = index.reg;
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(buffer_reg), Register::int(index_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_raw_int_array_descr_signed(
+                    ::core::mem::size_of::<#element_type>(),
+                    // descr.py:240-254 get_type_flag reads signedness off the
+                    // declared element type.  Hard-coding signed would
+                    // sign-extend a `u8` element of 0x80 to -128 where the
+                    // concrete Rust read yields 128.  `MIN` resolves through a
+                    // type alias, and a non-integer element type fails to
+                    // compile here rather than loading as a signed word.
+                    (<#element_type>::MIN as i128) < 0,
+                );
+                __builder.getarrayitem_gc_i(
+                    #result_reg as u16,
+                    #buffer_reg as u16,
+                    #index_reg as u16,
+                    __descr_idx,
+                );
+            },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack: index.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Recognizes an array element WRITE on a local ref binding:
+    /// `<binding>.<array_field>[<int expr>] = <int expr>` → `getfield_gc_r`
+    /// for the buffer base followed by `setarrayitem_gc_i`.
+    ///
+    /// Store counterpart of [`Self::lower_ref_binding_array_read`]; both take
+    /// the element descr from `add_raw_int_array_descr_signed`, so the store
+    /// invalidates the heapcache entry the matching load populated.
+    pub(super) fn lower_ref_binding_array_write(&mut self, expr: &Expr) -> Option<()> {
+        let Expr::Assign(assign) = expr else {
+            return None;
+        };
+        let Expr::Index(index_expr) = &*assign.left else {
+            return None;
+        };
+        let Expr::Field(field) = &*index_expr.expr else {
+            return None;
+        };
+        // Match before emitting, then emit in Rust's evaluation order for an
+        // assignment: the assigned value first, then the assignee place (base,
+        // then index).  Emitting the base load first would run the array's
+        // side effects ahead of the right-hand side's.
+        let shape = self.match_array_field_base(field)?;
+        let element_type = shape.element_type.clone();
+        let value = self.lower_value_expr(&assign.right)?;
+        if !matches!(value.kind, BindingKind::Int) {
+            return None;
+        }
+        let buffer_reg = self.emit_array_field_base(&shape);
+        let index = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(index.kind, BindingKind::Int) {
+            return None;
+        }
+        let index_reg = index.reg;
+        let value_reg = value.reg;
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![
+                    Register::ref_(buffer_reg),
+                    Register::int(index_reg),
+                    Register::int(value_reg),
+                ],
+                vec![],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_raw_int_array_descr_signed(
+                    ::core::mem::size_of::<#element_type>(),
+                    // descr.py:240-254 get_type_flag reads signedness off the
+                    // declared element type.  Hard-coding signed would
+                    // sign-extend a `u8` element of 0x80 to -128 where the
+                    // concrete Rust read yields 128.  `MIN` resolves through a
+                    // type alias, and a non-integer element type fails to
+                    // compile here rather than loading as a signed word.
+                    (<#element_type>::MIN as i128) < 0,
+                );
+                __builder.setarrayitem_gc_i(
+                    #buffer_reg as u16,
+                    #index_reg as u16,
+                    #value_reg as u16,
+                    __descr_idx,
+                );
+            },
+        );
+        Some(())
+    }
+
     /// Recognizes a pool-array element read through the registered getter call
     /// `<getter>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on
     /// the raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points
-    /// at — the aheui `pools[selected]` read.  Unlike the residual-call form (an
+    /// at — the `pools[selected]` read.  Unlike the residual-call form (an
     /// opaque CALL_R the optimizer can neither re-produce in the short preamble
     /// nor invalidate), the getarrayitem on the immutable `pools` array
     /// re-derives the element each loop entry from the consistent `selected`
