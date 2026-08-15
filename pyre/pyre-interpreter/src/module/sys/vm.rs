@@ -1200,7 +1200,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "_xoptions", xoptions);
     // Format matches `platform._sys_version`'s CPython parser:
     // `version (buildinfo) [compiler]`.
-    module_ns_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1) [Rust]"));
+    //
+    // On Windows the compiler slot also names the bitness and the processor,
+    // the way the `MSC v.1944 64 bit (AMD64)` token does. That token is the
+    // only place the architecture is published: `sysconfig.get_platform`
+    // reads it back out of `sys.version` to answer `win-amd64`/`win-arm64`,
+    // and pip turns that answer into the wheel platform tag. Elsewhere the
+    // compiler string carries no architecture, so neither does this one.
+    let compiler = if !cfg!(windows) {
+        "Rust"
+    } else if cfg!(target_arch = "x86_64") {
+        "Rust 64 bit (AMD64)"
+    } else if cfg!(target_arch = "aarch64") {
+        "Rust 64 bit (ARM64)"
+    } else if cfg!(target_arch = "arm") {
+        "Rust 32 bit (ARM)"
+    } else {
+        "Rust 32 bit (Intel)"
+    };
+    module_ns_store(
+        ns,
+        "version",
+        w_str_new(&format!("3.14.6 (pyre 0.0.1) [{compiler}]")),
+    );
     module_ns_store(
         ns,
         "platform",
@@ -2603,8 +2625,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.meta_path — empty
     module_ns_store(ns, "meta_path", w_list_new(vec![]));
     // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode`
-    // (`-B` / PYTHONDONTWRITEBYTECODE); no bytecode cache is written regardless,
-    // but the reported value tracks the flag for compatibility.
+    // (`-B` / PYTHONDONTWRITEBYTECODE). The flag is honoured, not merely
+    // reported: `_bootstrap_external` writes `__pycache__/*.pyre314.pyc` next
+    // to every source it imports unless it is set.
     module_ns_store(
         ns,
         "dont_write_bytecode",

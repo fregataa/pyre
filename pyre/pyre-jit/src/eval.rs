@@ -741,6 +741,15 @@ unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
     };
 }
 
+#[cfg(all(windows, not(feature = "sandbox")))]
+unsafe fn overlapped_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_overlapped::w_overlapped_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
 /// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
@@ -3824,6 +3833,17 @@ fn build_gc() -> Box<MiniMarkGC> {
             mmap_descr.pytype_ptr as usize,
             mmap_descr.ptr_offsets,
         );
+    }
+    // `lib_pypy/_overlapped.py Overlapped`: the object owns its native
+    // OVERLAPPED record and pending buffers until cancellation/completion.
+    // Its three Python fields are ordinary generated trace offsets; sweep
+    // performs PyPy's cancel/wait-before-free ordering and closes hEvent.
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    {
+        let descr = <pyre_interpreter::module::_overlapped::W_Overlapped
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+        gc.types.set_destructor(tid, overlapped_destructor);
     }
     // `rrandom.Random` — the Mersenne Twister `interp_random.py:21` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
@@ -8243,6 +8263,11 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // eval_frame_plain here would skip maybe_enter_jit at every
     // opcode of the recursive portal frame, which breaks parity for
     // bhimpl_recursive_call_* paths.
+    // `ll_portal_runner` is an activation entry in its own right: recursive
+    // portal calls can reach it without the ordinary `eval_with_jit_inner`
+    // wrapper.  Account before constructing `FrameRoot`, because a moving GC
+    // may change the frame's address while the activation remains the same.
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
@@ -8352,10 +8377,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
-    // Spend one unit of the recursion budget on this frame's activation, in
-    // case this loop was reached without going through `eval_with_jit_inner`.
-    // A frame the wrapper already accounted spends nothing here.
-    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame_root.frame());
+    // Recursion accounting belongs to the activation seams
+    // (`eval_with_jit_inner` and `portal_runner_result`), not this re-entrant
+    // dispatch loop.  In particular, `FrameRoot` may have forwarded a moving
+    // frame since the seam; keying the same activation again by its new
+    // address would spend a second recursion unit.
     // Count this eval-loop activation for the GC safepoint's
     // at_outermost_activation gate (gh#393). The gate allows collection
     // at depth ≤ 2 (module + one called function) where the CALL opcode
