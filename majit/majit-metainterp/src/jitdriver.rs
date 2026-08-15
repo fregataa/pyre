@@ -1313,6 +1313,45 @@ pub struct JitDriver<S: JitState> {
     /// This driver's payload for the per-thread `frame_value_count` store,
     /// built once by `register_dispatch_jitcode`. `None` until then.
     state_field_fvc: Option<StateFieldFvcData>,
+    /// Reusable buffers for the compiled-entry argument walk.
+    ///
+    /// `warmstate.py:387-398 execute_assembler` builds the entry arguments
+    /// with no allocation at all: the reds are already unboxed locals, and
+    /// `func_execute_token` writes them straight into the jitframe the backend
+    /// owns. Here the same walk minted a fresh `Vec` per entry — one for the
+    /// raw live values, one for their types, one for the typed pair, and one
+    /// more for each virtualizable box list — so a call-heavy program paid
+    /// several malloc/free pairs per entry for buffers whose shape is fixed by
+    /// the compiled artifact and therefore identical on every call.
+    ///
+    /// The driver outlives every entry through it, so the buffers are cleared
+    /// and refilled rather than reallocated; after the first entry their
+    /// capacity already covers the artifact's inputarg count. Same motivation
+    /// as [`Self::descriptor_cache`], one layer further in.
+    ///
+    /// One set is enough even though a compiled run can re-enter the driver:
+    /// the taker holds its buffers as a local for the whole entry, so a nested
+    /// entry finds this slot empty and starts from fresh ones. Nesting
+    /// therefore costs what it costs today and never aliases; only the
+    /// outermost entry's buffers survive to be reused.
+    entry_scratch: EntryScratch,
+}
+
+/// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].
+#[derive(Default)]
+struct EntryScratch {
+    /// The typed live values handed to the backend as the entry's inputargs.
+    live_values: Vec<Value>,
+    /// `JitState::extract_live` output, before it is paired with its types.
+    raw: Vec<i64>,
+    /// `JitState::live_value_types` output.
+    types: Vec<Type>,
+    /// `JitState::export_virtualizable_boxes_into` static-field output.
+    vable_static: Vec<i64>,
+    /// `JitState::export_virtualizable_boxes_into` array-field output. The
+    /// inner `Vec`s are retained across entries too, so a virtualizable whose
+    /// array lengths are stable reuses their storage as well.
+    vable_arrays: Vec<Vec<i64>>,
 }
 
 thread_local! {
@@ -1423,6 +1462,7 @@ impl<S: JitState> JitDriver<S> {
             portal_runner: None,
             portal_jd_index: None,
             state_field_fvc: None,
+            entry_scratch: EntryScratch::default(),
             #[expect(
                 clippy::arc_with_non_send_sync,
                 reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
@@ -1779,7 +1819,10 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Get compiled loop metadata for the given green key.
-    pub fn get_compiled_meta(&self, green_key: u64) -> Option<&S::Meta> {
+    ///
+    /// The `Arc` is the entry's own, not a copy: a caller that needs to hold
+    /// the metadata across a run clones the refcount.
+    pub fn get_compiled_meta(&self, green_key: u64) -> Option<&std::sync::Arc<S::Meta>> {
         self.meta.get_compiled_meta(green_key)
     }
 
@@ -4261,7 +4304,11 @@ impl<S: JitState> JitDriver<S> {
         if !state.can_trace() {
             return None;
         }
-        if self.meta.has_compiled_loop(green_key) {
+        // `warmstate.py:471-478`: a temporary token is not entered. Reporting
+        // `None` rather than an `Abort` outcome keeps the answer the same shape
+        // as the "no compiled code at all" case, which is what a tmp-only cell
+        // is from this path's point of view.
+        if self.has_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -4356,8 +4403,26 @@ impl<S: JitState> JitDriver<S> {
         if dispatch_key.is_none() && self.meta.is_cross_loop_cut_key(green_key) {
             return None;
         }
-        if self.meta.has_compiled_loop(green_key) {
-            let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap().clone();
+        // `warmstate.py:471-478 maybe_compile_and_run`: a cell whose token was
+        // `attached by compile_tmp_callback()` is NOT entered — upstream falls
+        // straight to `jitcounter.tick(hash, increment_threshold)` and, on
+        // overflow, `bound_reached`. The pyre reading of "attached by
+        // compile_tmp_callback" is the absence of a `compiled_loops` meta
+        // (`has_runnable_compiled_loop`, which documents why): the temporary
+        // token has a body, so `has_compiled_loop` says yes, but MetaInterp
+        // never filed frontend meta for it. Binding the meta here rather than
+        // testing a predicate and unwrapping afterwards keeps the two in step —
+        // the fall-through below IS the counter processing upstream continues
+        // with. `has_compiled_loop` stays as the first conjunct: it is the
+        // `cell.get_procedure_token() is not None` half (code present and not
+        // invalidated), which the meta lookup alone does not imply, since
+        // `invalidate_loop` deliberately leaves the meta in place.
+        let runnable_meta = if self.entry_cell_has_compiled_code(green_key, structured_green_key) {
+            self.meta.get_compiled_meta(green_key).cloned()
+        } else {
+            None
+        };
+        if let Some(compiled_meta) = runnable_meta {
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             if !state.is_compatible(&compiled_meta) {
                 self.meta.invalidate_loop(green_key);
@@ -4366,35 +4431,55 @@ impl<S: JitState> JitDriver<S> {
             if !self.sync_before(state, &compiled_meta, descriptor.as_deref()) {
                 return None;
             }
+            // The entry arguments are assembled in buffers the driver keeps
+            // across calls, so a warm entry reuses the capacity the artifact's
+            // inputarg shape fixed instead of minting one `Vec` per call —
+            // `warmstate.py:503-511 maybe_compile_and_run` reaches
+            // `execute_assembler` with the reds already in hand and allocates
+            // nothing to describe them. Taken out of `self` for the duration
+            // because assembling them calls back into `self`; every exit below
+            // hands it back, and `entry_scratch_out` names that.
+            let mut scratch = self.take_entry_scratch();
             // `direct_live_values` arrive already in the target LABEL's argument
             // order; state-extracted ones are in state-field order and have to be
             // mapped before a dispatch-key entry can use them.
             let values_are_label_ordered = direct_live_values.is_some();
-            let mut live_values = if let Some(values) = direct_live_values {
-                values
+            if let Some(values) = direct_live_values {
+                scratch.live_values.extend(values);
             } else {
-                let live_values = state.extract_live_values(&compiled_meta);
+                state.extract_live_values_into(
+                    &compiled_meta,
+                    &mut scratch.live_values,
+                    &mut scratch.raw,
+                    &mut scratch.types,
+                );
                 if !Self::live_values_match_descriptor(
                     descriptor.as_deref(),
-                    &live_values,
+                    &scratch.live_values,
                     state.state_field_layout().total_live_values(),
                 ) {
+                    self.entry_scratch_out(scratch);
                     return None;
                 }
 
-                self.extend_compiled_live_values(
+                if !self.extend_compiled_live_values_into(
                     green_key,
                     state,
                     &compiled_meta,
                     descriptor.as_deref(),
-                    live_values,
-                )?
-            };
+                    &mut scratch.live_values,
+                    &mut scratch.vable_static,
+                    &mut scratch.vable_arrays,
+                ) {
+                    self.entry_scratch_out(scratch);
+                    return None;
+                }
+            }
             if dispatch_key.is_some() && !values_are_label_ordered {
-                let full_len = live_values.len();
+                let full_len = scratch.live_values.len();
                 let Some(packed) = self
                     .meta
-                    .pack_front_target_live_values(green_key, &live_values)
+                    .pack_front_target_live_values(green_key, &scratch.live_values)
                 else {
                     if crate::callee_rca_enabled() {
                         eprintln!(
@@ -4404,6 +4489,7 @@ impl<S: JitState> JitDriver<S> {
                             dispatch_key,
                         );
                     }
+                    self.entry_scratch_out(scratch);
                     return None;
                 };
                 if crate::callee_rca_enabled() {
@@ -4415,17 +4501,21 @@ impl<S: JitState> JitDriver<S> {
                         packed.len()
                     );
                 }
-                live_values = packed;
+                scratch.live_values.clear();
+                scratch.live_values.extend(packed);
             }
             if dispatch_key.is_some() && values_are_label_ordered {
                 // The compact values are LABEL-ordered by construction, but the
                 // same unchecked Ref dereference is downstream of them, so the
                 // types are confirmed here as well.
-                let types = self.meta.front_target_inputarg_types(green_key)?;
-                if types.len() != live_values.len()
+                let Some(types) = self.meta.front_target_inputarg_types(green_key) else {
+                    self.entry_scratch_out(scratch);
+                    return None;
+                };
+                if types.len() != scratch.live_values.len()
                     || types
                         .iter()
-                        .zip(live_values.iter())
+                        .zip(scratch.live_values.iter())
                         .any(|(want, value)| value.get_type() != *want)
                 {
                     if crate::callee_rca_enabled() {
@@ -4434,12 +4524,18 @@ impl<S: JitState> JitDriver<S> {
                              dispatch_key={:?} source=compact-label label_types={types:?} \
                              value_types={:?} -> decline",
                             dispatch_key,
-                            live_values.iter().map(|v| v.get_type()).collect::<Vec<_>>(),
+                            scratch
+                                .live_values
+                                .iter()
+                                .map(|v| v.get_type())
+                                .collect::<Vec<_>>(),
                         );
                     }
+                    self.entry_scratch_out(scratch);
                     return None;
                 }
             }
+            let live_values = &scratch.live_values;
 
             if crate::callee_rca_enabled() {
                 let layout = state.state_field_layout();
@@ -4481,17 +4577,28 @@ impl<S: JitState> JitDriver<S> {
                     format_rca_live_values(labels.as_deref(), &live_values)
                 );
             }
+            // Same point the RCA line above reports, but unconditional and
+            // counted: every decline has already returned, and the compiled
+            // body runs on the next statement, so one call here is one entry.
+            // Scoped so the borrow ends before `self.meta` is taken mutably.
+            if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
+                hook(green_key, target_pc);
+            }
 
             let result = if let Some(dispatch_key) = dispatch_key {
                 self.meta.run_compiled_detailed_with_values_at_dispatch_key(
                     green_key,
-                    &live_values,
+                    live_values,
                     dispatch_key,
                 )
             } else {
                 self.meta
-                    .run_compiled_detailed_with_values(green_key, &live_values)
+                    .run_compiled_detailed_with_values(green_key, live_values)
             };
+            // The compiled body has run and nothing below reads the entry
+            // arguments, so the buffers go back before the first exit past
+            // this point.
+            self.entry_scratch_out(scratch);
             let result = result?;
             if portal_rca_enabled() {
                 eprintln!(
@@ -4521,9 +4628,17 @@ impl<S: JitState> JitDriver<S> {
                 // as the portal's own return value.
                 self.meta.back_edge_finish = Some(result.typed_values.clone());
                 let run_meta = result.meta.clone();
-                if !result.typed_values.is_empty() {
-                    state.restore_values(&run_meta, &result.typed_values);
-                }
+                // The FINISH arguments are NOT the loop-carried state, so they
+                // are not written back into it. `warmstate.py:405-419
+                // execute_assembler` takes the `DoneWithThisFrameDescr*` fast
+                // path straight to `fail_descr.get_result(cpu, deadframe)` and
+                // returns; the only thing it reads off the deadframe is the
+                // portal's own result, and it touches no interpreter state on
+                // the way out. A `restore_values` here decodes the FINISH
+                // descr's `fail_arg_types` — one word for an int-returning
+                // portal — into slots indexed by the state's live-value
+                // layout, so a state with more than one live field indexes
+                // past the end of the list it was handed.
                 let run_descriptor = self.driver_descriptor_for(state, &run_meta);
                 self.sync_after(state, &run_meta, run_descriptor.as_deref());
                 // Kept for callers that cannot consume the latch (a portal whose
@@ -5062,7 +5177,13 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        if self.meta.has_compiled_loop(green_key) {
+        // Same `warmstate.py:471-478` gate as `back_edge_internal`: a cell
+        // holding only a `compile_tmp_callback` token has no `compiled_loops`
+        // meta, and upstream counts it normally instead of entering it. Without
+        // the meta the runner below can only return `Abort`, which stops this
+        // route from ever reaching `maybe_start_tracing` — i.e. the counter
+        // stops ticking and the real loop is never traced.
+        if self.has_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -5239,6 +5360,33 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// Borrow [`Self::entry_scratch`] for the duration of one compiled entry.
+    ///
+    /// Handed out by value rather than by reference because assembling the
+    /// entry arguments calls back into `self`; every caller must return it
+    /// through [`Self::entry_scratch_out`] before leaving, or the next entry
+    /// starts from empty buffers (correct, just slower).
+    ///
+    /// The buffers arrive with their previous contents dropped and their
+    /// capacity kept. `vable_arrays` keeps its outer elements so the inner
+    /// buffers survive too — see `JitState::export_virtualizable_boxes_into`.
+    fn take_entry_scratch(&mut self) -> EntryScratch {
+        let mut scratch = std::mem::take(&mut self.entry_scratch);
+        scratch.live_values.clear();
+        scratch.raw.clear();
+        scratch.types.clear();
+        scratch.vable_static.clear();
+        for array in &mut scratch.vable_arrays {
+            array.clear();
+        }
+        scratch
+    }
+
+    /// Return the buffers [`Self::take_entry_scratch`] handed out.
+    fn entry_scratch_out(&mut self, scratch: EntryScratch) {
+        self.entry_scratch = scratch;
+    }
+
     /// The driver's static data, resolved once and then shared.
     ///
     /// See [`Self::descriptor_cache`] for why the answer is memoized rather
@@ -5260,6 +5408,35 @@ impl<S: JitState> JitDriver<S> {
             .map(std::sync::Arc::new);
         self.descriptor_cache = Some(resolved.clone());
         resolved
+    }
+
+    /// `warmstate.py:458-464`: the cell a back edge decides on is the one whose
+    /// `comparekey(*greenargs)` matches, not whichever cell heads the bucket.
+    ///
+    /// Upstream walks unconditionally because its comparison is against the
+    /// greens already sitting in the portal's arguments — it builds nothing.
+    /// Pyre's `GreenKey` is a heap object with its own `values` and `types`
+    /// vectors, and this is the entry path, so building one per warm entry to
+    /// re-confirm a single-candidate bucket would put back the per-entry
+    /// allocations this path exists to avoid. An unchained bucket HAS one
+    /// candidate: the head is what the walk would find, and the hash form is
+    /// exact. The key is therefore built only when the bucket is chained,
+    /// which is the only case in which the two answers can differ.
+    ///
+    /// A caller that reached here without a structured key (`back_edge`,
+    /// `back_edge_keyed`) cannot resolve the chain at all and keeps the hash
+    /// answer; `back_edge_structured` and `back_edge_declarative` carry one.
+    fn entry_cell_has_compiled_code(
+        &self,
+        green_key: u64,
+        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+    ) -> bool {
+        match structured_green_key {
+            Some(make_key) if self.meta.green_key_bucket_is_chained(green_key) => {
+                self.meta.has_compiled_loop_for_key(&make_key())
+            }
+            _ => self.meta.has_compiled_loop(green_key),
+        }
     }
 
     fn live_values_match_descriptor(
@@ -5304,16 +5481,15 @@ impl<S: JitState> JitDriver<S> {
             .all(|(var, value)| var.tp == value.get_type())
     }
 
-    fn flatten_virtualizable_values(
+    fn flatten_virtualizable_values_into(
         info: &VirtualizableInfo,
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
-    ) -> Vec<Value> {
-        let mut values = Vec::with_capacity(
-            static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>(),
-        );
+        out: &mut Vec<Value>,
+    ) {
+        out.reserve(static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>());
         for (field, &raw) in info.static_fields.iter().zip(static_boxes.iter()) {
-            values.push(match field.field_type {
+            out.push(match field.field_type {
                 Type::Int => Value::Int(raw),
                 Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
                 Type::Float => Value::Float(f64::from_bits(raw as u64)),
@@ -5322,7 +5498,7 @@ impl<S: JitState> JitDriver<S> {
         }
         for (array, items) in info.array_fields.iter().zip(array_boxes.iter()) {
             for &raw in items {
-                values.push(match array.item_type {
+                out.push(match array.item_type {
                     Type::Int => Value::Int(raw),
                     Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
                     Type::Float => Value::Float(f64::from_bits(raw as u64)),
@@ -5330,7 +5506,6 @@ impl<S: JitState> JitDriver<S> {
                 });
             }
         }
-        values
     }
 
     /// warmstate.py:482-511: extend live values with virtualizable fields
@@ -5338,6 +5513,61 @@ impl<S: JitState> JitDriver<S> {
     /// RPython always has jitdriver_sd available; pyre may have descriptor=None
     /// when re-entering from guard failure, so fall back to virtualizable_info
     /// directly.
+    ///
+    /// Appends in place and reports success, so the compiled-entry path can
+    /// hand it a buffer that already has the artifact's capacity instead of a
+    /// freshly minted one. `statics` and `arrays` are scratch for the export;
+    /// they arrive cleared and their contents are not read on return. On
+    /// `false` `live_values` is restored to the length it arrived with, so a
+    /// declining caller sees the buffer it passed.
+    fn extend_compiled_live_values_into(
+        &self,
+        green_key: u64,
+        state: &S,
+        meta: &S::Meta,
+        descriptor: Option<&JitDriverStaticData>,
+        live_values: &mut Vec<Value>,
+        statics: &mut Vec<i64>,
+        arrays: &mut Vec<Vec<i64>>,
+    ) -> bool {
+        // `warmstate.py:188 cell.loop_token` is the single PyPy source of
+        // truth for the entry-path inputarg shape; route through
+        // `warm_state.get_compiled` so this site never consults pyre's
+        // `compiled_loops` side table (the F.7-orthodox retirement target).
+        let Some(compiled) = self.meta.warm_state_ref().get_compiled(green_key) else {
+            return false;
+        };
+        let compiled_inputs = compiled.inputarg_types().len();
+        if compiled_inputs <= live_values.len() {
+            return true;
+        }
+        // Fall back to virtualizable_info's default name if no descriptor.
+        let Some(info) = self.meta.virtualizable_info() else {
+            return false;
+        };
+        // Try descriptor path first (RPython jitdriver_sd.virtualizable), else
+        // jitdriver_sd.virtualizable_info.name (interp_jit.py:25). Borrowed
+        // rather than cloned: both spellings outlive this call, and the export
+        // below only reads the name.
+        let name: &str = match descriptor.and_then(|d| d.virtualizable()) {
+            Some(virtualizable) => &virtualizable.name,
+            None => &info.name,
+        };
+        if !state.export_virtualizable_boxes_into(meta, name, info, statics, arrays) {
+            return false;
+        }
+        let base = live_values.len();
+        Self::flatten_virtualizable_values_into(info, statics, arrays, live_values);
+        if live_values.len() != compiled_inputs {
+            live_values.truncate(base);
+            return false;
+        }
+        true
+    }
+
+    /// Owning form of [`Self::extend_compiled_live_values_into`], for the
+    /// bridge-setup and diagnostic paths that hold a `Vec` of their own and
+    /// run far from the steady entry path.
     fn extend_compiled_live_values(
         &self,
         green_key: u64,
@@ -5346,34 +5576,18 @@ impl<S: JitState> JitDriver<S> {
         descriptor: Option<&JitDriverStaticData>,
         mut live_values: Vec<Value>,
     ) -> Option<Vec<Value>> {
-        // `warmstate.py:188 cell.loop_token` is the single PyPy source of
-        // truth for the entry-path inputarg shape; route through
-        // `warm_state.get_compiled` so this site never consults pyre's
-        // `compiled_loops` side table (the F.7-orthodox retirement target).
-        let compiled_inputs = self
-            .meta
-            .warm_state_ref()
-            .get_compiled(green_key)?
-            .inputarg_types()
-            .len();
-        if compiled_inputs <= live_values.len() {
-            return Some(live_values);
-        }
-        // Try descriptor path first (RPython jitdriver_sd.virtualizable).
-        let vable_name = descriptor
-            .and_then(|d| d.virtualizable())
-            .map(|v| v.name.clone());
-        // Fall back to virtualizable_info's default name if no descriptor.
-        let info = self.meta.virtualizable_info()?;
-        // jitdriver_sd.virtualizable_info.name (interp_jit.py:25)
-        let name = vable_name.unwrap_or_else(|| info.name.clone());
-        let (static_boxes, array_boxes) = state.export_virtualizable_boxes(meta, &name, info)?;
-        let extra_values = Self::flatten_virtualizable_values(info, &static_boxes, &array_boxes);
-        if live_values.len() + extra_values.len() != compiled_inputs {
-            return None;
-        }
-        live_values.extend(extra_values);
-        Some(live_values)
+        let mut statics = Vec::new();
+        let mut arrays = Vec::new();
+        self.extend_compiled_live_values_into(
+            green_key,
+            state,
+            meta,
+            descriptor,
+            &mut live_values,
+            &mut statics,
+            &mut arrays,
+        )
+        .then_some(live_values)
     }
 
     fn sync_before(
@@ -5522,6 +5736,18 @@ impl<S: JitState> JitDriver<S> {
     /// Set a callback for guard failure events.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
         self.meta.set_on_guard_failure(f);
+    }
+
+    /// Set a callback fired immediately before a call enters compiled code.
+    /// `f` receives `(green_key, target_pc)`.
+    ///
+    /// Scope: this driver reaches compiled code through `back_edge_internal`,
+    /// which is the site the hook is installed at.  The sibling entry paths in
+    /// this file serve other front ends and do not fire it yet, so a zero count
+    /// is evidence only for a consumer whose entries all go through the back
+    /// edge.
+    pub fn set_on_compiled_entry(&mut self, f: impl Fn(u64, usize) + Send + 'static) {
+        self.meta.set_on_compiled_entry(f);
     }
 
     /// Set a callback for trace abort events. `f` receives `(green_key, permanent)`
@@ -6083,6 +6309,25 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn has_runnable_compiled_loop(&self, green_key: u64) -> bool {
         self.has_compiled_loop(green_key) && self.meta.get_compiled_meta(green_key).is_some()
+    }
+
+    /// Typed twin of [`Self::has_compiled_loop`]: `warmstate.py:458-464` walks
+    /// the bucket and tests `comparekey(*greenargs)` before deciding anything,
+    /// where the hash form can answer for whichever cell heads the bucket.
+    ///
+    /// The `compiled_loops` meta the runnable form additionally requires is
+    /// hash-keyed and has no chain, so only the JitCell half is resolved on
+    /// full key identity — see `MetaInterp::has_compiled_loop_for_key`.
+    #[inline]
+    pub fn has_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
+        self.meta.has_compiled_loop_for_key(key)
+    }
+
+    /// Typed twin of [`Self::has_runnable_compiled_loop`].
+    #[inline]
+    pub fn has_runnable_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
+        self.has_compiled_loop_for_key(key)
+            && self.meta.get_compiled_meta(key.get_uhash()).is_some()
     }
 
     /// Actual key the last compile_loop stored under.
@@ -8781,6 +9026,120 @@ mod tests {
         // return None from index().
         let driver = JitDriver::<TypedRestoreState>::new(1);
         assert_eq!(driver.index(), None);
+    }
+
+    /// Install the cell shape `warmstate.py:714-723 get_assembler_token` leaves
+    /// behind when it has to synthesise a token: a procedure token carrying a
+    /// backend body, flagged `JC_TEMPORARY`, and no `compiled_loops` entry —
+    /// MetaInterp never files frontend meta for a `compile_tmp_callback` stub
+    /// (`compile.py:1101-1150`).
+    fn attach_tmp_callback_cell<S: JitState>(driver: &mut JitDriver<S>, green_key: u64) {
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
+            driver.meta.warm_state_mut().alloc_token_number(),
+        ));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_tmp_callback_to_interp(green_key, token);
+    }
+
+    /// `warmstate.py:471-478 maybe_compile_and_run`: a cell whose token was
+    /// `attached by compile_tmp_callback()` is counted normally, never entered.
+    #[test]
+    fn a_tmp_callback_only_cell_is_counted_not_entered_at_the_back_edge() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 4413u64;
+        attach_tmp_callback_cell(&mut driver, key);
+
+        assert!(
+            driver.has_compiled_loop(key),
+            "the tmp callback token has a body, so the code-presence predicate says yes",
+        );
+        assert!(
+            !driver.has_runnable_compiled_loop(key),
+            "and it has no frontend meta, so the warm-entry runner cannot enter it",
+        );
+
+        // Before this fell through, the back edge unwrapped the absent meta and
+        // panicked at the loop header of any driver that can mint a tmp token.
+        let mut state = TypedRestoreState::default();
+        assert_eq!(
+            driver.back_edge_keyed(key, 0, &mut state, &(), || {}),
+            None,
+            "nothing ran and nothing was traced on the first tick",
+        );
+        assert!(
+            !driver.meta.is_tracing(),
+            "the first back edge only ticks the counter",
+        );
+
+        // The counter keeps ticking, so the real loop still gets traced — the
+        // tmp callback delays entry, it does not disable the key.
+        driver.back_edge_keyed(key, 0, &mut state, &(), || {});
+        assert!(
+            driver.meta.is_tracing(),
+            "the threshold is reached by counting, exactly as for a cell with no token",
+        );
+    }
+
+    /// `warmstate.py:458-464` resolves the cell by `comparekey(*greenargs)`
+    /// before reading a token off it. On a chained bucket the head is a
+    /// different cell, so the hash form and the typed form answer differently
+    /// — and the typed one is the one upstream asks.
+    #[test]
+    fn the_typed_entry_predicate_reads_the_keys_own_cell_not_the_bucket_head() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = GreenKey::new(vec![1500, 1600]);
+        let hash = key.get_uhash();
+
+        // A hash-only writer squats the bucket with a comparator-less cell and
+        // gives it a code-bearing token; then a typed writer for the SAME key
+        // chains its own, token-less cell behind it.
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
+            driver.meta.warm_state_mut().alloc_token_number(),
+        ));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_tmp_callback_to_interp(hash, token);
+        driver.meta.warm_state_mut().mark_dont_trace_for_key(&key);
+
+        assert!(
+            driver.meta.green_key_bucket_is_chained(hash),
+            "fixture: two cells in one bucket is the only case in which the \
+             two forms can disagree",
+        );
+        assert!(
+            driver.has_compiled_loop(hash),
+            "fixture: the head cell holds the code-bearing token, so a \
+             head-reading predicate says this key has compiled code",
+        );
+        assert!(
+            !driver.has_compiled_loop_for_key(&key),
+            "but the cell this key owns holds no token at all, so the answer \
+             upstream would give is no",
+        );
+    }
+
+    /// The `run_compiled` sibling route makes the same decision.
+    #[test]
+    fn a_tmp_callback_only_cell_is_not_dispatched_by_back_edge_or_run_compiled() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 5161u64;
+        attach_tmp_callback_cell(&mut driver, key);
+
+        let mut state = TypedRestoreState::default();
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(key, 0, &mut state, &(), || {})
+                .is_none(),
+            "an unenterable cell reports the same `None` as a cell with no code at all",
+        );
     }
 }
 

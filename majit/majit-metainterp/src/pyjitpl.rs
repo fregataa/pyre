@@ -980,7 +980,12 @@ pub(crate) struct CompiledEntry<M> {
     /// (`warmstate.rs:77`), so Pyre has not yet reached PyPy's "alive_loops
     /// is the only long-lived strong owner" shape.
     pub(crate) token: std::sync::Weak<JitCellToken>,
-    pub(crate) meta: M,
+    /// Shared, never copied. `warmstate.py:398 get_procedure_token` hands the
+    /// caller the cell's own `loop_token` object; the entry runner then reads
+    /// its fields in place and passes the same object to the exit handling.
+    /// Behind an `Arc` the pyre entry path matches that: a warm entry clones a
+    /// refcount where it used to clone the whole struct, on every call.
+    pub(crate) meta: std::sync::Arc<M>,
     /// Front-end loop-version state, mirroring RPython's
     /// jitcell_token.target_tokens ownership across recompilations.
     pub(crate) front_target_tokens: Vec<crate::history::TargetToken>,
@@ -1887,6 +1892,22 @@ pub struct JitHooks {
     pub on_trace_abort: Option<Box<dyn Fn(u64, bool) + Send>>,
     /// Called when compilation (loop or bridge) fails. Args: (green_key, error_message).
     pub on_compile_error: Option<Box<dyn Fn(u64, &str) + Send>>,
+    /// Called when a call is about to ENTER compiled code. Args: (green_key, target_pc).
+    ///
+    /// The other hooks all describe the artifact POPULATION — what was traced,
+    /// compiled, or thrown away.  None of them says a call ran any of it, and
+    /// the two come apart: a loop that compiled and is then never entered
+    /// leaves `on_compile_loop` fired and every artifact assertion satisfied.
+    /// A consumer asking "did this run in compiled code?" had no answer but a
+    /// proxy, and each available proxy is unsound in one direction —
+    /// `guard_failures` stops being recorded once a bridge covers the exit
+    /// guard, so it reads zero on a loop that is still entered every call.
+    ///
+    /// Fires after every decline has passed and immediately before the
+    /// compiled body runs, so a count of these is a count of entries, not of
+    /// attempts.  It is a callback tally like the compile hooks, not a
+    /// population: it only rises.
+    pub on_compiled_entry: Option<Box<dyn Fn(u64, usize) + Send>>,
 }
 
 /// Runtime callback used to attach an application traceback while the
@@ -2426,7 +2447,7 @@ impl<M: Clone> MetaInterp<M> {
     fn run_result_for_jump_exit(
         fail_index: u32,
         values: Vec<i64>,
-        meta: M,
+        meta: std::sync::Arc<M>,
         savedata: Option<GcRef>,
     ) -> Option<RunResult<M>> {
         (fail_index == u32::MAX).then_some(RunResult::Jump {
@@ -4401,6 +4422,12 @@ impl<M: Clone> MetaInterp<M> {
     /// Set a callback for guard failure events.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
         self.hooks.on_guard_failure = Some(Box::new(f));
+    }
+
+    /// Set a callback fired immediately before a call enters compiled code.
+    /// `f` receives `(green_key, target_pc)`.
+    pub fn set_on_compiled_entry(&mut self, f: impl Fn(u64, usize) + Send + 'static) {
+        self.hooks.on_compiled_entry = Some(Box::new(f));
     }
 
     /// Set a callback for trace start events.
@@ -7221,7 +7248,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         token: Arc::downgrade(&token),
-                        meta,
+                        meta: Arc::new(meta),
                         front_target_tokens,
                         front_entry_index,
                         front_target_source_positions,
@@ -8486,7 +8513,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         token: Arc::downgrade(&token),
-                        meta,
+                        meta: Arc::new(meta),
                         front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
@@ -9402,7 +9429,7 @@ impl<M: Clone> MetaInterp<M> {
                         green_key,
                         CompiledEntry {
                             token: Arc::downgrade(&token),
-                            meta,
+                            meta: Arc::new(meta),
                             front_target_tokens: ft,
                             front_entry_index,
                             front_target_source_positions: None,
@@ -9772,7 +9799,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         token: Arc::downgrade(&token),
-                        meta,
+                        meta: Arc::new(meta),
                         front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
@@ -9832,7 +9859,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Allows the interpreter to check preconditions (e.g., whether the
     /// current state matches the compiled loop's assumptions) before calling
     /// the run_compiled_* family.
-    pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
+    pub fn get_compiled_meta(&self, green_key: u64) -> Option<&std::sync::Arc<M>> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
@@ -10432,7 +10459,15 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
-        let exit_types = descr.fail_arg_types().to_vec();
+        // Borrowed, not copied. `warmstate.py:405-419 execute_assembler` reads
+        // the descr straight off the deadframe, and for a DoneWithThisFrame it
+        // goes to `fail_descr.get_result(cpu, deadframe)` without building any
+        // per-exit description; only the general `handle_fail` case needs one.
+        // Every reader below either only reads this list or says explicitly
+        // that it takes ownership, and this is the steady entry path, so the
+        // copy was paid on every call for the benefit of the guard-failure arm
+        // alone.
+        let exit_types: &[Type] = descr.fail_arg_types();
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
             .enumerate()
@@ -10470,11 +10505,13 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.clone(),
+                exit_types: exit_types.to_vec(),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                gc_ref_slots: gc_ref_slots.clone(),
-                force_token_slots: force_token_slots.clone(),
+                // Moved rather than cloned: the `else` arm below is the only
+                // other consumer and it is mutually exclusive with this one.
+                gc_ref_slots,
+                force_token_slots,
                 recovery_layout: None,
                 resume_layout: None,
                 storage: None,
@@ -10497,7 +10534,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     fail_index,
                     source_op_index: None,
-                    exit_types: exit_types.clone(),
+                    exit_types: exit_types.to_vec(),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
@@ -11333,6 +11370,34 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state
             .get_procedure_token(green_key)
             .is_some_and(|token| token.has_compiled_code())
+    }
+
+    /// `warmstate.py:458-464` — the same code-presence gate as
+    /// [`Self::has_compiled_loop`], resolved on the full green key instead of
+    /// on the bucket head.
+    ///
+    /// Upstream never decides anything about a cell it has not first matched
+    /// with `comparekey(*greenargs)`; the hash form here can answer for a
+    /// different key that shares the bucket. Consumers that hold the typed key
+    /// at the decision point should ask this one.
+    ///
+    /// Scope: this resolves the JitCell half only. `compiled_loops` — the
+    /// frontend meta index that [`Self::get_compiled_meta`] reads — is keyed by
+    /// hash and has no chain to walk, so it stays hash-resolved. That is the
+    /// remaining collision surface on the entry path.
+    #[inline]
+    pub fn has_compiled_loop_for_key(&self, key: &majit_ir::GreenKey) -> bool {
+        self.warm_state
+            .get_procedure_token_for_key(key)
+            .is_some_and(|token| token.has_compiled_code())
+    }
+
+    /// Whether the hash and typed forms of a cell query can disagree at this
+    /// key's bucket. False means the head IS the match, so the caller can take
+    /// the hash path without building a `GreenKey` to prove it.
+    #[inline]
+    pub fn green_key_bucket_is_chained(&self, green_key: u64) -> bool {
+        self.warm_state.bucket_is_chained(green_key)
     }
 
     /// Check if any guard in the compiled trace has Float-typed fail_args.
@@ -12344,7 +12409,7 @@ impl<M: Clone> MetaInterp<M> {
                     original_green_key,
                     CompiledEntry {
                         token: Arc::downgrade(&token),
-                        meta,
+                        meta: Arc::new(meta),
                         front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
@@ -16946,19 +17011,19 @@ pub enum RunResult<M> {
     /// The loop finished normally.
     Finished {
         values: Vec<i64>,
-        meta: M,
+        meta: std::sync::Arc<M>,
         savedata: Option<GcRef>,
     },
     /// The trace exited via a normal back-edge jump.
     Jump {
         values: Vec<i64>,
-        meta: M,
+        meta: std::sync::Arc<M>,
         savedata: Option<GcRef>,
     },
     /// A guard failed.
     GuardFailure {
         values: Vec<i64>,
-        meta: M,
+        meta: std::sync::Arc<M>,
         trace_id: u64,
         fail_index: u32,
         savedata: Option<GcRef>,
@@ -22233,7 +22298,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
-                meta: (),
+                meta: std::sync::Arc::new(()),
                 front_target_tokens: vec![start_token],
                 front_entry_index: Some(0),
                 front_target_source_positions: None,
@@ -22299,7 +22364,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
-                meta: (),
+                meta: std::sync::Arc::new(()),
                 front_target_tokens: vec![start_token],
                 front_entry_index: Some(0),
                 front_target_source_positions: source_positions,
@@ -22622,7 +22687,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
-                meta: (),
+                meta: std::sync::Arc::new(()),
                 front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
@@ -22718,7 +22783,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
-                meta: (),
+                meta: std::sync::Arc::new(()),
                 front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
@@ -23030,7 +23095,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token_arc),
-                meta: (),
+                meta: std::sync::Arc::new(()),
                 front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
@@ -23849,7 +23914,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
-                meta: (),
+                meta: std::sync::Arc::new(()),
                 front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
@@ -24526,15 +24591,21 @@ mod tests {
 
     #[test]
     fn test_run_result_for_jump_exit_returns_jump() {
-        let result = MetaInterp::<()>::run_result_for_jump_exit(u32::MAX, vec![42], (), None)
-            .expect("jump exit should produce a direct Jump result");
+        let result = MetaInterp::<()>::run_result_for_jump_exit(
+            u32::MAX,
+            vec![42],
+            std::sync::Arc::new(()),
+            None,
+        )
+        .expect("jump exit should produce a direct Jump result");
         match result {
             RunResult::Jump { values, .. } => assert_eq!(values, vec![42]),
             other => panic!("expected Jump result, got {other:?}"),
         }
 
         assert!(
-            MetaInterp::<()>::run_result_for_jump_exit(3, vec![42], (), None).is_none(),
+            MetaInterp::<()>::run_result_for_jump_exit(3, vec![42], std::sync::Arc::new(()), None)
+                .is_none(),
             "guard failure exits must keep using recovery paths"
         );
     }
@@ -24587,6 +24658,7 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
+        assert!(hooks.on_compiled_entry.is_none());
     }
 }
 
@@ -24602,7 +24674,7 @@ mod bridge_cell_token_tests {
             green_key,
             CompiledEntry {
                 token: std::sync::Weak::new(),
-                meta: (),
+                meta: std::sync::Arc::new(()),
                 front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
@@ -24656,7 +24728,7 @@ mod loop_side_table_tests {
     fn compiled_entry(root_trace_id: u64) -> CompiledEntry<()> {
         CompiledEntry {
             token: std::sync::Weak::new(),
-            meta: (),
+            meta: std::sync::Arc::new(()),
             front_target_tokens: Vec::new(),
             front_entry_index: None,
             front_target_source_positions: None,
