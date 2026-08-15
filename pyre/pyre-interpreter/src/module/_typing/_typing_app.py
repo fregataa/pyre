@@ -98,17 +98,21 @@ def _index(value) -> int:
     # protocol: a float or a string is a TypeError rather than a format that
     # silently compares unequal to every member.
     if isinstance(value, int):
-        return int(value)
-    try:
-        index = type(value).__index__
-    except AttributeError:
-        raise TypeError(
-            f"{type(value).__name__!r} object cannot be interpreted as an integer"
-        ) from None
-    result = index(value)
-    if not isinstance(result, int):
-        raise TypeError(f"__index__ returned non-int (type {type(result).__name__})")
-    return int(result)
+        result = value
+    else:
+        try:
+            index = type(value).__index__
+        except AttributeError:
+            raise TypeError(
+                f"{type(value).__name__!r} object cannot be interpreted as an integer"
+            ) from None
+        result = index(value)
+        if not isinstance(result, int):
+            raise TypeError(f"__index__ returned non-int (type {type(result).__name__})")
+    # `int(result)` would route a subclass through its own `__int__`, which may
+    # answer something other than the value the subclass stores. Narrowing to
+    # an exact `int` is what `PyNumber_Index` does with `_PyLong_Copy`.
+    return int.__index__(result)
 
 
 def _immutable_const_evaluator_error(name):
@@ -218,7 +222,12 @@ class TypeVar:
         # CPython 3.14 `_Py_make_typevar`: type parameters created by the
         # compiler infer variance, unlike an ordinary `TypeVar(...)` call.
         self.__infer_variance__ = True
-        self._default_value = NoDefault
+        # `_Py_make_typevar` leaves `default_value` NULL, which `_MISSING`
+        # stands for.  A `TypeVar(...)` call instead stores the `NoDefault`
+        # sentinel its signature defaults to, and the two states differ:
+        # `evaluate_default` answers `None` for the first and a constant
+        # evaluator over `NoDefault` for the second.
+        self._default_value = _MISSING
         self._evaluate_default = None
         self._constraints = _MISSING if evaluate_constraints is not None else ()
         self._evaluate_constraints = evaluate_constraints
@@ -242,6 +251,8 @@ class TypeVar:
     @property
     def __default__(self):
         if self._default_value is _MISSING:
+            if self._evaluate_default is None:
+                return NoDefault
             self._default_value = _evaluate_typeparam(self._evaluate_default)
         return self._default_value
 
@@ -265,6 +276,8 @@ class TypeVar:
     def evaluate_default(self):
         if self._evaluate_default is not None:
             return self._evaluate_default
+        if self._default_value is _MISSING:
+            return None
         return _const_evaluator(self._default_value)
 
     def __typing_subst__(self, arg):
@@ -284,7 +297,10 @@ class TypeVar:
         return args
 
     def has_default(self):
-        return self._evaluate_default is not None or self._default_value is not NoDefault
+        return self._evaluate_default is not None or (
+            self._default_value is not _MISSING
+            and self._default_value is not NoDefault
+        )
 
     def __reduce__(self):
         return self.__name__
@@ -326,6 +342,21 @@ class ParamSpec:
         self.__bound__ = bound
         self.__module__ = _caller_module()
 
+    @classmethod
+    def _make(cls, name):
+        # `_Py_make_paramspec`: the compiler-created parameter infers variance
+        # and leaves `default_value` NULL, which `_MISSING` stands for.
+        self = cls.__new__(cls)
+        self.__name__ = name
+        self.__covariant__ = False
+        self.__contravariant__ = False
+        self.__infer_variance__ = True
+        self._default_value = _MISSING
+        self._evaluate_default = None
+        self.__bound__ = None
+        self.__module__ = _caller_module()
+        return self
+
     @property
     def args(self):
         return ParamSpecArgs(self)
@@ -343,11 +374,16 @@ class ParamSpec:
         return typing._paramspec_prepare_subst(self, alias, args)
 
     def has_default(self):
-        return self._evaluate_default is not None or self._default_value is not NoDefault
+        return self._evaluate_default is not None or (
+            self._default_value is not _MISSING
+            and self._default_value is not NoDefault
+        )
 
     @property
     def __default__(self):
         if self._default_value is _MISSING:
+            if self._evaluate_default is None:
+                return NoDefault
             self._default_value = _evaluate_typeparam(self._evaluate_default)
         return self._default_value
 
@@ -355,6 +391,8 @@ class ParamSpec:
     def evaluate_default(self):
         if self._evaluate_default is not None:
             return self._evaluate_default
+        if self._default_value is _MISSING:
+            return None
         return _const_evaluator(self._default_value)
 
     def __reduce__(self):
@@ -434,6 +472,17 @@ class TypeVarTuple:
         self._evaluate_default = None
         self.__module__ = _caller_module()
 
+    @classmethod
+    def _make(cls, name):
+        # `_Py_make_typevartuple` leaves `default_value` NULL, which `_MISSING`
+        # stands for.
+        self = cls.__new__(cls)
+        self.__name__ = name
+        self._default_value = _MISSING
+        self._evaluate_default = None
+        self.__module__ = _caller_module()
+        return self
+
     def __iter__(self):
         import typing
         yield typing.Unpack[self]
@@ -446,11 +495,16 @@ class TypeVarTuple:
         return typing._typevartuple_prepare_subst(self, alias, args)
 
     def has_default(self):
-        return self._evaluate_default is not None or self._default_value is not NoDefault
+        return self._evaluate_default is not None or (
+            self._default_value is not _MISSING
+            and self._default_value is not NoDefault
+        )
 
     @property
     def __default__(self):
         if self._default_value is _MISSING:
+            if self._evaluate_default is None:
+                return NoDefault
             self._default_value = _evaluate_typeparam(self._evaluate_default)
         return self._default_value
 
@@ -458,6 +512,8 @@ class TypeVarTuple:
     def evaluate_default(self):
         if self._evaluate_default is not None:
             return self._evaluate_default
+        if self._default_value is _MISSING:
+            return None
         return _const_evaluator(self._default_value)
 
     def __reduce__(self):
@@ -537,17 +593,15 @@ class Generic:
 # call a single positional helper per intrinsic.
 
 def _intrinsic_typevar(name):
-    # CPython 3.14 `_Py_make_typevar` passes `infer_variance=true`.
-    return TypeVar(name, infer_variance=True)
+    return TypeVar._make(name)
 
 
 def _intrinsic_paramspec(name):
-    # CPython 3.14 `_Py_make_paramspec` passes `infer_variance=true`.
-    return ParamSpec(name, infer_variance=True)
+    return ParamSpec._make(name)
 
 
 def _intrinsic_typevartuple(name):
-    return TypeVarTuple(name)
+    return TypeVarTuple._make(name)
 
 
 def _intrinsic_typevar_with_bound(name, evaluate_bound):
