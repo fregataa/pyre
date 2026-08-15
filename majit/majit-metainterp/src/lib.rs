@@ -314,6 +314,28 @@ pub fn no_unroll_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("PYRE_NO_UNROLL").is_some())
 }
 
+/// Why the unroll optimizer will be skipped, or `None` when it runs.
+///
+/// Two disjoint conditions suppress unrolling, and which one fired is the whole
+/// content of the answer for anyone reading a log.  The env override is a
+/// process-wide switch a reader can check from their shell; the `enable_opts`
+/// omission is one jitdriver's own configuration, invisible from the
+/// environment and typically a deliberate, documented choice by that frontend.
+///
+/// Reporting the env override's name for both is worse than reporting nothing.
+/// A frontend that left `unroll` out of its `enable_opts` produces a log naming
+/// `PYRE_NO_UNROLL`; the reader checks their environment, finds it unset, and
+/// has been sent to look for a cause that does not exist.
+pub fn unroll_skip_reason(env_override: bool, enable_opts: &[String]) -> Option<&'static str> {
+    if env_override {
+        Some("PYRE_NO_UNROLL env override")
+    } else if !enable_opts.iter().any(|opt| opt == "unroll") {
+        Some("`unroll` is absent from this jitdriver's enable_opts")
+    } else {
+        None
+    }
+}
+
 pub fn stall_window() -> u64 {
     static VAL: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
         std::env::var("MAJIT_STALL_WINDOW")
@@ -672,6 +694,16 @@ pub fn unconsulted_field_declarations() -> Vec<UnconsultedFieldDeclaration> {
 /// Takes its denominator from the same census as
 /// [`assert_no_degraded_dispatch_arms`], for the same reason: an empty result
 /// is also what a portal that was never built produces.
+///
+/// ⚠ Covers ONE `#[jit_interp]` machine, which is usually the smaller half of a
+/// consumer's population. Each `#[jit_inline]` helper carries its own
+/// `int_fields` / `ref_fields` and records under its own name, so a helper
+/// repeating a declaration at every site turns one unconsulted key into dozens
+/// — and none of them have a dispatch-arm census to key this assertion on. A
+/// caller that wants the whole picture has to filter
+/// [`unconsulted_field_declarations`] itself and supply its own denominator;
+/// measured on one consumer, five of six survivors were on helpers, so a
+/// portal-only assertion reported the sixth and called the crate clean.
 pub fn assert_no_unconsulted_field_declarations(interp: &str) {
     let census = dispatch_arm_census();
     let Some(entry) = census.iter().find(|e| e.interp == interp) else {
