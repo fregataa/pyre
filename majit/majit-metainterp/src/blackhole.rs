@@ -1505,6 +1505,24 @@ impl BlackholeInterpreter {
 
     fn run_inner(&mut self) -> Option<MergePointArgs> {
         let trace = crate::majit_log_enabled() || crate::bh_debug_enabled();
+        // blackhole.py:86-91:
+        //
+        // ```python
+        // if (not we_are_translated()
+        //     and self.jitcode._startpoints is not None):
+        //     assert position in self.jitcode._startpoints, (
+        //         "the current position %d is in the middle of "
+        //         "an instruction!" % position)
+        // ```
+        //
+        // The builder's `dispatch_loop` carries this check, but nothing
+        // production dispatches through it — this loop is the one that runs.
+        // Its subject is the resume coordinate somebody wrote into the frame,
+        // and without the check a coordinate pointing into an operand payload
+        // surfaces only as a bogus opcode byte, naming the dispatch table
+        // instead of the writer.  `jit_strict_mode` is the untranslated-build
+        // analog: debug builds plus `MAJIT_STRICT`.
+        let check_startpoints = crate::jit_strict_mode();
         loop {
             if self.finished() {
                 if trace {
@@ -1518,6 +1536,15 @@ impl BlackholeInterpreter {
             }
             let pos_before = self.position;
             self.last_opcode_position = pos_before;
+            if check_startpoints && let Some(startpoints) = self.jitcode.startpoints.as_ref() {
+                assert!(
+                    startpoints.contains(&pos_before),
+                    "run_inner: position {pos_before} is in the middle of an instruction \
+                     (jitcode {:?} index {:?})",
+                    self.jitcode.name,
+                    self.jitcode.try_index(),
+                );
+            }
             let opcode = self.next_u8();
             if trace {
                 eprintln!(
@@ -1602,13 +1629,20 @@ impl BlackholeInterpreter {
             // is `AttributeError` at builder-construction time.  pyre
             // hits this branch only when a builder has not registered
             // every BC_* it intends to emit.
+            // The jitcode NAME is not an identity — `__new__` names one jitcode
+            // per class — and a byte that is unwired here is just as likely to
+            // be an operand the frame was resumed in the middle of as an opname
+            // the builder forgot.  Report the index and whether the position is
+            // a recorded instruction boundary so the two read apart.
             panic!(
                 "dispatch_step: unwired opcode={opcode:#x} pos={} \
-                 table_len={} jitcode={:?} — extend the builder's \
-                 setup_insns to cover this opname",
+                 table_len={} jitcode={:?} index={:?} startpoint={} — extend the \
+                 builder's setup_insns to cover this opname",
                 self.last_opcode_position,
                 self.dispatch_table.len(),
                 self.jitcode.name,
+                self.jitcode.try_index(),
+                self.jitcode.is_valid_startpoint(self.last_opcode_position),
             );
         };
         // Clone the Arc to detach the `code` borrow from `self`, so the
@@ -3935,6 +3969,37 @@ mod tests {
                 slot as usize, placeholder as usize,
                 "`cast_float_to_int/f>i` (byte {byte}) is unwired in the production builder",
             );
+        }
+
+        /// `complex` arithmetic reaches the three interior-field loads in
+        /// generated helper JitCodes.  They already have orthodox
+        /// `bhimpl_getinteriorfield_gc_*` handlers; the production builder must
+        /// register their emitted bytes so `setup_insns` can bind them.
+        #[test]
+        fn production_bh_builder_wires_every_interior_field_load() {
+            use majit_translate::insns;
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for (opname, byte) in [
+                (
+                    "getinteriorfield_gc_i/rid>i",
+                    insns::BC_GETINTERIORFIELD_GC_I,
+                ),
+                (
+                    "getinteriorfield_gc_r/rid>r",
+                    insns::BC_GETINTERIORFIELD_GC_R,
+                ),
+                (
+                    "getinteriorfield_gc_f/rid>f",
+                    insns::BC_GETINTERIORFIELD_GC_F,
+                ),
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_ne!(
+                    slot as usize, placeholder as usize,
+                    "`{opname}` (byte {byte}) is unwired in the production builder",
+                );
+            }
         }
 
         /// The two `fnaddr` classifiers agree with the walker's gate.
@@ -8752,6 +8817,18 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // / `new_with_vtable` read `bh.cpu`, which this builder sets above.
     for (key, byte) in [
         ("arraylen_gc/rd>i", majit_translate::insns::BC_ARRAYLEN_GC),
+        (
+            "getinteriorfield_gc_i/rid>i",
+            majit_translate::insns::BC_GETINTERIORFIELD_GC_I,
+        ),
+        (
+            "getinteriorfield_gc_r/rid>r",
+            majit_translate::insns::BC_GETINTERIORFIELD_GC_R,
+        ),
+        (
+            "getinteriorfield_gc_f/rid>f",
+            majit_translate::insns::BC_GETINTERIORFIELD_GC_F,
+        ),
         (
             "cast_float_to_int/f>i",
             majit_translate::insns::BC_CAST_FLOAT_TO_INT,
