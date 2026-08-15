@@ -97,6 +97,8 @@ struct Host {
     /// trampoline invocations). Compare against `jit_execute_count` to test
     /// whether per-op crossings or per-guard-exit crossings dominate.
     jit_call_count: u64,
+    /// Wall time inside `jit_call_trampoline`, in nanoseconds.
+    jit_call_time_ns: u128,
     /// Diagnostic (PYRE_WASM_EXEC_TRACE=1): histogram of (trace func_id,
     /// guard-exit fail_index) over every host round-trip, so we can see which
     /// guard keeps returning to the host instead of chaining in-module.
@@ -283,7 +285,15 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     let fuel_limit: Option<u64> = std::env::var("PYRE_WASM_FUEL")
         .ok()
         .and_then(|s| s.parse().ok());
-    if fuel_limit.is_some() {
+    // Fuel doubles as an exact executed-instruction counter, reported as
+    // `wasm_ops` in the stats line below. It is the one wasm measurement that
+    // does not move with machine load, which makes it the right thing to
+    // compare a codegen change against. Metering costs time on every
+    // instruction, so it stays confined to the two diagnostic modes that ask
+    // for it — a timed run sets neither and pays nothing.
+    let jit_stats = std::env::var_os("PYRE_WASM_JIT_STATS").is_some();
+    let meter_fuel = fuel_limit.is_some() || jit_stats;
+    if meter_fuel {
         config.consume_fuel(true);
     }
     // Diagnostic: PYRE_WASM_GUEST_PROFILE=<out.json> writes a sampling profile
@@ -346,7 +356,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         });
     }
     store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
-    if let Some(n) = fuel_limit {
+    // Counting-only runs get the whole budget: `wasm_ops` is a subtraction, and
+    // a run that exhausts its fuel reports the limit rather than its own cost.
+    let fuel_start = meter_fuel.then(|| fuel_limit.unwrap_or(u64::MAX));
+    if let Some(n) = fuel_start {
         store.set_fuel(n)?;
     }
 
@@ -543,9 +556,20 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // After a fuel-exhaustion trap the store has no fuel, so the diagnostic
     // export calls below would themselves immediately trap and read as 0.
     // Refill so the readout reflects the real (compile-time) counter values.
-    if fuel_limit.is_some() {
+    // Read the remaining budget first: `start - remaining` is the executed
+    // instruction count, which makes "how much does one loop iteration cost"
+    // answerable by differencing two runs at different trip counts. A run that
+    // exhausted its budget reports `used == limit` and says nothing, so size the
+    // limit above what the script needs.
+    let wasm_ops = fuel_start.map(|start| {
+        let remaining = store.get_fuel().unwrap_or(0);
+        let used = start.saturating_sub(remaining);
+        if let Some(limit) = fuel_limit {
+            eprintln!("[fuel] used={used} remaining={remaining} limit={limit}");
+        }
         let _ = store.set_fuel(u64::MAX);
-    }
+        used
+    });
     if let Some(path) = &guest_profile_out
         && let Some(p) = store.data_mut().guest_profiler.take()
     {
@@ -861,12 +885,15 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             .ok();
         let host = store.data();
         eprintln!(
-            "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} linear_mem={} gc_oldgen={} gc_nursery={} \
+            "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} jit_call_ms={:.1} \
+             wasm_ops={} linear_mem={} gc_oldgen={} gc_nursery={} \
              gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
             host.jit_compile_time_ns as f64 / 1.0e6,
             guest_jit_execute_count.unwrap_or(host.jit_execute_count),
             host.jit_call_count,
+            host.jit_call_time_ns as f64 / 1.0e6,
+            wasm_ops.map_or(-1, |n| n as i64),
             lin_mem,
             gc_oldgen,
             gc_nursery,
@@ -1516,8 +1543,19 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
 static PROBE_CALL_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
     std::sync::Mutex::new(None);
 
+/// Whether `PYRE_WASM_CALL_HIST` was set, read once.
+///
+/// `jit_call_trampoline` runs per residual call -- 15168 of them on
+/// fib_recursive -- and `std::env::var_os` takes the process-wide environment
+/// lock and scans it, so reading the variable there put that cost on every
+/// crossing whether or not the probe was wanted.
+fn probe_call_hist_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_WASM_CALL_HIST").is_some())
+}
+
 pub(crate) fn probe_call_hist_dump() {
-    if std::env::var_os("PYRE_WASM_CALL_HIST").is_none() {
+    if !probe_call_hist_enabled() {
         return;
     }
     let g = PROBE_CALL_HIST.lock().unwrap();
@@ -1536,7 +1574,21 @@ pub(crate) fn probe_call_hist_dump() {
     }
 }
 
+/// Time every residual crossing, including the paths that return early, so the
+/// share of a run spent leaving the guest is measured rather than inferred from
+/// `jit_call_count` alone.
 fn jit_call_trampoline(
+    caller: &mut Caller<'_, Host>,
+    frame_ptr: u32,
+    call_area_ofs: u32,
+) -> Result<()> {
+    let entered = std::time::Instant::now();
+    let r = jit_call_trampoline_inner(caller, frame_ptr, call_area_ofs);
+    caller.data_mut().jit_call_time_ns += entered.elapsed().as_nanos();
+    r
+}
+
+fn jit_call_trampoline_inner(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
     call_area_ofs: u32,
@@ -1547,7 +1599,7 @@ fn jit_call_trampoline(
     let call_area = frame_ptr as usize + call_area_ofs as usize;
 
     let func_ptr = read_u32(&memory, &*caller, call_area + 8);
-    if std::env::var_os("PYRE_WASM_CALL_HIST").is_some() {
+    if probe_call_hist_enabled() {
         let mut g = PROBE_CALL_HIST.lock().unwrap();
         *g.get_or_insert_with(Default::default)
             .entry(func_ptr)
