@@ -412,6 +412,10 @@ impl CachedField {
                 Some(v) if !v.is_none() => v,
                 _ => continue,
             };
+            let cached_val = ctx.get_replacement_opref(cached_val);
+            if cached_val.is_none() {
+                continue;
+            }
             let opcode = descr
                 .as_field_descr()
                 .map(|fd| OpCode::getfield_for_type(fd.field_type()))
@@ -660,6 +664,10 @@ impl ArrayCachedItem {
                 Some(v) if !v.is_none() => v,
                 _ => continue,
             };
+            let cached_val = ctx.get_replacement_opref(cached_val);
+            if cached_val.is_none() {
+                continue;
+            }
             // compile.py:451 ResOperation(... [arrayop, ConstInt(index)] ...)
             let idx_ref = ctx.make_constant_int(self.index);
             let opcode = descr
@@ -954,7 +962,7 @@ impl OptHeap {
     /// (`info.py:203-214`).  In majit this is `FieldDescr::index_in_parent`
     /// when a parent SizeDescr is available; older/simple descriptors fall
     /// back to their `Descr::index()`.
-    fn field_slot_index(descr: &DescrRef) -> u32 {
+    pub(crate) fn field_slot_index(descr: &DescrRef) -> u32 {
         let descr_idx = descr.index();
         let Some(field_descr) = descr.as_field_descr() else {
             return descr_idx;
@@ -2965,6 +2973,28 @@ impl OptHeap {
         result
     }
 
+    /// heap.py:436-452: operations with no effect on the GC heap caches.
+    fn has_no_heap_cache_effect(opcode: OpCode) -> bool {
+        matches!(
+            opcode,
+            OpCode::SetfieldGc
+                | OpCode::SetfieldRaw
+                | OpCode::SetarrayitemGc
+                | OpCode::SetarrayitemRaw
+                | OpCode::SetinteriorfieldRaw
+                | OpCode::RawStore
+                | OpCode::Strsetitem
+                | OpCode::Unicodesetitem
+                | OpCode::DebugMergePoint
+                | OpCode::JitDebug
+                | OpCode::EnterPortalFrame
+                | OpCode::LeavePortalFrame
+                | OpCode::Copystrcontent
+                | OpCode::Copyunicodecontent
+                | OpCode::CheckMemoryError
+        )
+    }
+
     /// Handle operations that may have side effects.
     /// Forces lazy sets and invalidates caches as needed.
     /// Tracks allocations for aliasing analysis.
@@ -2975,6 +3005,10 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let opcode = op.opcode;
+
+        if Self::has_no_heap_cache_effect(opcode) {
+            return OptimizationResult::Emit(op.clone());
+        }
 
         // Track allocations for aliasing analysis.
         // Allocated objects are always non-null.
@@ -3260,9 +3294,9 @@ impl OptHeap {
             // pointer arithmetic over `VirtualRawBuffer` /
             // `VirtualRawSlice` is handled by virtualize.py:358-385.
             // RAW_STORE is also listed in `emitting_operation`'s "no
-            // effect on GC struct" list (heap.py:442). Falling through
-            // to handle_side_effects matches the PyPy default
-            // (`dispatch_opt(default=OptHeap.emit)` at heap.py:898).
+            // effect on GC struct" list (heap.py:442). The shared exemption in
+            // handle_side_effects makes this fallthrough match
+            // `dispatch_opt(default=OptHeap.emit)` at heap.py:898.
 
             // ── GC_LOAD / GC_LOAD_INDEXED: generic memory loads ──
             // These could read from any field/array slot, so force all
@@ -3444,27 +3478,9 @@ impl Optimization for OptHeap {
             ctx.current_pass_idx = saved_pass_idx;
             return;
         }
-        // heap.py:436-452: specific opcodes that don't affect GC caches
-        match op.opcode {
-            OpCode::SetfieldGc
-            | OpCode::SetfieldRaw
-            | OpCode::SetarrayitemGc
-            | OpCode::SetarrayitemRaw
-            | OpCode::SetinteriorfieldRaw
-            | OpCode::RawStore
-            | OpCode::Strsetitem
-            | OpCode::Unicodesetitem
-            | OpCode::DebugMergePoint
-            | OpCode::JitDebug
-            | OpCode::EnterPortalFrame
-            | OpCode::LeavePortalFrame
-            | OpCode::Copystrcontent
-            | OpCode::Copyunicodecontent
-            | OpCode::CheckMemoryError => {
-                ctx.current_pass_idx = saved_pass_idx;
-                return;
-            }
-            _ => {}
+        if Self::has_no_heap_cache_effect(op.opcode) {
+            ctx.current_pass_idx = saved_pass_idx;
+            return;
         }
         // heap.py:453-463: calls → handle effects
         if op.opcode.is_call() {
@@ -4138,7 +4154,7 @@ mod tests {
     fn initialize_imported_short_heap_field(
         heap: &mut OptHeap,
         ctx: &mut OptContext,
-        object: OpRef,
+        object: &Operand,
         descr: &DescrRef,
         source: OpRef,
         resolved: OpRef,
@@ -4146,13 +4162,16 @@ mod tests {
     ) {
         use crate::optimizeopt::info::{PreambleOp, PtrInfo};
 
-        let mut preamble_op = Op::with_descr(opcode, &[bound_arg(object)], descr.clone());
+        let object_ref = object.to_opref();
+        ctx.seed_boxes_canonical(std::slice::from_ref(object));
+        let mut preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
         preamble_op.pos.set(source);
         ctx.initialize_imported_short_preamble_builder(
-            &[object, resolved],
-            &[object, resolved],
+            &[object_ref, resolved],
+            &[object_ref, resolved],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op.clone()),
+                source_op: None,
                 res: bound_arg(source),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
@@ -4160,7 +4179,7 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        let object_box = ctx.materialize_operand_at(object);
+        let object_box = object.clone();
         ctx.set_ptr_info(&object_box, PtrInfo::instance(None, None));
         ctx.with_ptr_info_mut(&object_box, |info| {
             info.set_preamble_field(
@@ -4175,7 +4194,7 @@ mod tests {
         })
         .unwrap();
         let _ = resolved;
-        heap.import_cached_fields(&[(object, descr.clone(), resolved)], ctx);
+        heap.import_cached_fields(&[(object_ref, descr.clone(), resolved)], ctx);
     }
 
     /// Call descriptor with default EffectInfo (non-random, non-elidable).
@@ -4305,12 +4324,13 @@ mod tests {
         // pointer, cached_value is the Int field result of GetfieldGcI.
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref, Type::Int]);
         let p0 = OpRef::input_arg_typed(0, Type::Ref);
+        let p0_box = bound_arg(p0);
         let p1 = OpRef::input_arg_typed(1, Type::Int);
         let cached_op_key = OpRef::int_op(100);
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
-            p0,
+            &p0_box,
             &d,
             cached_op_key,
             p1,
@@ -4318,7 +4338,7 @@ mod tests {
         );
 
         let pos2 = ctx.reserve_pos_typed(Type::Int);
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[bound_arg(p0)], d);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[p0_box.clone()], d);
         op.pos.set(pos2);
 
         let op_rc = std::rc::Rc::new(op.clone());
@@ -4341,12 +4361,13 @@ mod tests {
         // cached_value are both Ref (GetfieldGcR result type).
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref, Type::Ref]);
         let p0 = OpRef::input_arg_typed(0, Type::Ref);
+        let p0_box = bound_arg(p0);
         let p1 = OpRef::input_arg_typed(1, Type::Ref);
         let cached_op_key = OpRef::int_op(100);
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
-            p0,
+            &p0_box,
             &d_head,
             cached_op_key,
             p1,
@@ -4355,7 +4376,7 @@ mod tests {
 
         // First getfield on head: consumes the import, caches the value.
         let pos2 = ctx.reserve_pos_typed(Type::Ref);
-        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[bound_arg(p0)], d_head.clone());
+        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d_head.clone());
         op1.pos.set(pos2);
         let op1_rc = std::rc::Rc::new(op1.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op1_rc));
@@ -4369,7 +4390,7 @@ mod tests {
         // Second getfield on head after invalidation: must NOT return the
         // stale preamble value.  The import was consumed, so it should emit.
         let pos3 = ctx.reserve_pos_typed(Type::Ref);
-        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[bound_arg(p0)], d_head.clone());
+        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], d_head.clone());
         op2.pos.set(pos3);
         let result2 = heap.optimize_getfield(&op2, &std::rc::Rc::new(op2.clone()), &mut ctx);
         assert!(
@@ -4407,6 +4428,139 @@ mod tests {
         );
 
         let _ = heap.optimize_getfield(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+    }
+
+    /// Same shape as `test_getfield_read_after_read`, but through a descr that
+    /// owns a parent SizeDescr and sits at a non-zero slot — the production
+    /// shape (`PyFrame.execution_context` is `index_in_parent: 7`). The
+    /// parentless `TestDescr` used by the sibling test takes
+    /// `field_slot_index`'s `Descr::index()` fallback, so it never exercises
+    /// the `index_in_parent` slot that `ensure_ptr_info_arg0` sizes the
+    /// `StructPtrInfo` for at `optimizer.py:484 init_fields`.
+    #[test]
+    fn getfield_read_after_read_folds_through_a_parented_descr() {
+        let d: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "second read of the same parented field must reuse the first: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(result[1].opcode, OpCode::Jump);
+    }
+
+    /// The frame-enter shape `inline_helper` traces: read `ec` off the frame,
+    /// read `ec.topframeref`, read `ec` again, then store through the first
+    /// `ec` and read back through the second. Both `ec` reads name the same
+    /// receiver and the same descr, so the second must fold; once it does, the
+    /// store is visible to the read-back and the pair can cancel.
+    #[test]
+    fn getfield_folds_across_an_intervening_read_of_its_own_result() {
+        let d_ec: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
+        let d_tf: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 0 });
+        let p0 = rooted_inputarg_operand(Type::Ref, 100);
+        let stored = rooted_inputarg_operand(Type::Ref, 101);
+        // `assign_positions` numbers ops by index, so op 0's result is RefOp(0).
+        let ec1 = bound_arg(OpRef::ref_op(0));
+        let ec2 = bound_arg(OpRef::ref_op(2));
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcR, &[p0.clone()], d_ec.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[ec1.clone()], d_tf.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[p0.clone()], d_ec.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[ec1, stored], d_tf.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[ec2], d_tf),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+
+        let ec_reads = result
+            .iter()
+            .filter(|o| {
+                o.opcode == OpCode::GetfieldGcR
+                    && o.getdescr().is_some_and(|dd| {
+                        OptHeap::field_cache_identity(&dd) == OptHeap::field_cache_identity(&d_ec)
+                    })
+            })
+            .count();
+        assert_eq!(ec_reads, 1, "the second `ec` read must fold: {opcodes:?}");
+    }
+
+    /// Drive two identical `getfield_gc_r`s at a receiver that already carries
+    /// a given `PtrInfo`, and report whether the second folded.
+    fn second_getfield_folds_with_receiver_info(seed: crate::optimizeopt::info::PtrInfo) -> bool {
+        let d: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
+        let p0_box = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
+        ctx.seed_boxes_canonical(std::slice::from_ref(&p0_box));
+        ctx.set_ptr_info(&p0_box, seed);
+
+        let mut folded = false;
+        for _ in 0..2 {
+            let pos = ctx.reserve_pos_typed(Type::Ref);
+            let mut op = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d.clone());
+            op.pos.set(pos);
+            let op_rc = std::rc::Rc::new(op.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+            folded = matches!(
+                heap.optimize_getfield(&op, &op_rc, &mut ctx),
+                OptimizationResult::Remove
+            );
+        }
+        folded
+    }
+
+    /// An ordinary heap field read off a *virtualizable* receiver must still be
+    /// cached. Upstream has no `VirtualizablePtrInfo` — `info.py`'s hierarchy
+    /// stops at `InstancePtrInfo` / `StructPtrInfo` — so a virtualizable frame
+    /// carries a plain `InstancePtrInfo` and `optimizer.py:484 init_fields`
+    /// gives every declared slot a home. pyre's extra `PtrInfo::Virtualizable`
+    /// variant has no `setfield` / `getfield` arm (`ptr_info.rs` falls through
+    /// to `_ => {}` / `_ => None`), and `ensure_ptr_info_arg0` early-returns on
+    /// it instead of upgrading, so the write is dropped and every later read of
+    /// the same field misses.
+    ///
+    /// `inline_helper` traces exactly this: six `getfield_gc_r(p0,
+    /// PyFrame.execution_context)` off one frame, none folded, which keeps the
+    /// frame push/pop `topframeref` stores from cancelling and forces the
+    /// virtual `VRef` that `NewWithVtable`/`ForceToken` then materialise.
+    #[test]
+    fn getfield_off_a_virtualizable_receiver_is_still_cached() {
+        use crate::optimizeopt::info::{PtrInfo, VirtualizableFieldState};
+
+        assert!(
+            second_getfield_folds_with_receiver_info(PtrInfo::instance(None, None)),
+            "control: a non-virtualizable receiver must fold the second read"
+        );
+        assert!(
+            second_getfield_folds_with_receiver_info(PtrInfo::Virtualizable(
+                VirtualizableFieldState {
+                    fields: Vec::new(),
+                    field_descrs: Vec::new(),
+                    arrays: Vec::new(),
+                    heap_fields: Vec::new(),
+                    last_guard_pos: -1,
+                }
+            )),
+            "an ordinary field read off a virtualizable receiver must be cached too"
+        );
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──
@@ -5063,30 +5217,25 @@ mod tests {
     fn test_getarrayitem_postprocess_updates_ptr_info() {
         let d = descr(0);
         let idx = OpRef::int_op(50);
+        let array_box = rooted_resop_operand(Type::Ref, 100);
+        let index_box = rooted_resop_operand(Type::Int, idx.raw());
         let mut op = Op::with_descr(
             OpCode::GetarrayitemGcI,
-            &[
-                rooted_resop_operand(Type::Ref, 100),
-                rooted_resop_operand(Type::Int, idx.raw()),
-            ],
+            &[array_box.clone(), index_box.clone()],
             d.clone(),
         );
         op.pos.set(OpRef::int_op(200));
 
         let mut ctx = OptContext::new(256);
-        let b = ctx.materialize_operand_at(idx);
-        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
-        let pos100 = ctx.materialize_operand_at(OpRef::ref_op(100));
-        ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d, 8, false));
+        ctx.make_constant_box(&index_box, majit_ir::Value::Int(3));
+        ctx.set_ptr_info(&array_box, PtrInfo::virtual_array(d, 8, false));
 
         let mut pass = OptHeap::new();
         pass.setup();
 
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
-        let arr_box = ctx
-            .get_box_replacement_operand_opt(OpRef::ref_op(100))
-            .expect("array box");
+        let arr_box = array_box.get_box_replacement(false);
         assert_eq!(
             ctx.peek_ptr_info(&arr_box)
                 .and_then(|info| info.getitem(3))
@@ -5282,6 +5431,43 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
         assert_eq!(result[1].opcode, OpCode::SetfieldRaw);
+        assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_raw_store_no_effect_on_gc_cache() {
+        // heap.py:442: RAW_STORE writes raw memory and must not invalidate an
+        // unrelated GC-field cache. Unlike SETFIELD_RAW it reaches the default
+        // OptHeap dispatch, which is the catch-all path this test pins.
+        let d0 = descr(0);
+        let raw_descr = descr(1);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                d0.clone(),
+            ),
+            Op::with_descr(
+                OpCode::RawStore,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 200),
+                    rooted_inputarg_operand(Type::Int, 201),
+                    rooted_inputarg_operand(Type::Int, 202),
+                ],
+                raw_descr,
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                d0,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[201, 202]);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[1].opcode, OpCode::RawStore);
         assert_eq!(result[2].opcode, OpCode::Jump);
     }
 
@@ -7209,21 +7395,20 @@ mod tests {
         // i2 = getarrayitem_gc_i(p0, idx=3, descr=byte_array)  <- eliminated (same read)
         let d = byte_array_descr(50);
         let idx = OpRef::int_op(60);
+        // GETARRAYITEM_GC's receiver is a GC reference Box. Keeping it Int
+        // made the fixture depend on positional re-wrapping to recover a
+        // different Ref-shaped box instead of exercising the real cache path.
+        let array_box = rooted_resop_operand(Type::Ref, 100);
+        let index_box = rooted_resop_operand(Type::Int, idx.raw());
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[array_box.clone(), index_box.clone()],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[array_box.clone(), index_box.clone()],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -7231,13 +7416,17 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_operand_at(idx);
-        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
+        // The optimizer's real input-op seed makes position lookup resolve to
+        // this same receiver Box. Model that producer edge explicitly; a bare
+        // synthetic ResOp is otherwise absent from the context's OpRef store.
+        let positional_array = ctx.materialize_operand_at(array_box.to_opref());
+        ctx.make_equal_to(&positional_array, &array_box);
+        ctx.make_constant_box(&index_box, majit_ir::Value::Int(3));
 
         let mut pass = OptHeap::new();
         pass.setup();
 
-        for op in &ops {
+        for (op_index, op) in ops.iter().enumerate() {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
@@ -7269,6 +7458,14 @@ mod tests {
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
+            }
+            if op_index == 0 {
+                assert!(
+                    ctx.peek_ptr_info(&array_box)
+                        .and_then(|info| info.getitem(3))
+                        .is_some(),
+                    "first byte-array read must populate the receiver's item cache"
+                );
             }
         }
 

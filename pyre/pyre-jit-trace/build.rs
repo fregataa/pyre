@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v6";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v7";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -28,6 +28,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_drivers.bin",
     "insns.bin",
     "descrs.bin",
+    "descrs_index.bin",
     "ei_descr_mints.bin",
     "field_mint_census.bin",
     "liveness.bin",
@@ -49,28 +50,32 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// captured so `runtime_fnaddr_patch` can re-pair them with the runtime's
 /// addresses (see the comments at their write sites).
 ///
-/// The other three carry the values those tables exist to repair — the
+/// The other four carry the values those tables exist to repair — the
 /// codewriter bakes `pyre_interpreter::jit_trace_fnaddrs()` addresses into
 /// `JitCode.fnaddr` and funcptr/static-data entries of `JitCode.constants_i`,
 /// which `runtime_fnaddr_patch::patch_constants_i_fnaddrs` and
 /// `patch_static_addr_constants` overwrite after deserialization. They reach
 /// `jitcodes.bin` directly, `descrs.bin` through `BhDescr::JitCode.fnaddr`
-/// (`codewriter/assembler.rs`, `fnaddr: jitcode.fnaddr`), and
+/// (`codewriter/assembler.rs`, `fnaddr: jitcode.fnaddr`),
+/// `indirectcalltargets.bin` through its `(index, jitcode.fnaddr)` pairs, and
 /// `jit_metadata.json` through the same pipeline serialized as JSON.
 ///
 /// Excluded from the cross-process verdict only. Within one process the
 /// addresses are the same, so `DeterminismCheck::InProcess` still judges every
 /// one of them — a difference there is real, and `jitcodes.bin` / `descrs.bin`
-/// moving between two in-process generations is the defect that mode was
-/// written for.
+/// / `indirectcalltargets.bin` moving between two in-process generations is
+/// the defect that mode was written for.
 ///
 /// What decides the cross-process verdict after these exclusions:
-/// `jit_trace_gen.rs`, `jitcodes_index.bin`, `indirectcalltargets.bin`,
-/// `jit_drivers.bin`, `insns.bin`, `ei_descr_mints.bin`, `liveness.bin`.
+/// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
+/// `descrs_index.bin`, `ei_descr_mints.bin`, `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
 /// `i64` there, so a change in jitcode population, order or body length still
 /// moves it while an address change alone does not.
+/// `descrs_index.bin` is likewise a pure byte-offset table: `descrs.bin`
+/// remains host-addressed, but its index contains no address and stays in the
+/// cross-process verdict to judge descriptor population, order, and lengths.
 ///
 /// Caching them is still sound: a restore serves these tables and the
 /// `constants_i` baked against them from the *same* generation, so they stay
@@ -78,6 +83,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "jit_metadata.json",
     "jitcodes.bin",
+    "indirectcalltargets.bin",
     "descrs.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
@@ -232,7 +238,7 @@ fn emit_llbc_extraction_placeholders() {
     .unwrap();
     std::fs::write(
         format!("{out_dir}/indirectcalltargets.bin"),
-        bincode::serialize(&Vec::<usize>::new()).unwrap(),
+        bincode::serialize(&Vec::<(usize, i64)>::new()).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -245,9 +251,10 @@ fn emit_llbc_extraction_placeholders() {
         bincode::serialize(&std::collections::BTreeMap::<String, u8>::new()).unwrap(),
     )
     .unwrap();
+    std::fs::write(format!("{out_dir}/descrs.bin"), b"").unwrap();
     std::fs::write(
-        format!("{out_dir}/descrs.bin"),
-        bincode::serialize(&Vec::<majit_translate::jitcode::BhDescr>::new()).unwrap(),
+        format!("{out_dir}/descrs_index.bin"),
+        bincode::serialize(&vec![0_u32]).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -983,8 +990,16 @@ fn real_main() {
         let jitcodes_index_bin = bincode::serialize(&(jitcode_names, jitcode_offsets)).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes_index.bin"), &jitcodes_index_bin).unwrap();
-        let indirectcalltargets_bin =
-            bincode::serialize(&pipeline.indirectcalltarget_indices).unwrap();
+        // Keep the shell fnaddr beside each dense index.  A translated PyPy
+        // binary already owns these JitCode shells as AOT objects; pyre must
+        // not deserialize every body merely to build
+        // `bytecode_for_address`'s runtime fnaddr dictionary.
+        let indirectcalltargets: Vec<(usize, i64)> = pipeline
+            .indirectcalltarget_indices
+            .iter()
+            .map(|&index| (index, pipeline.jitcodes[index].fnaddr))
+            .collect();
+        let indirectcalltargets_bin = bincode::serialize(&indirectcalltargets).unwrap();
         std::fs::write(
             format!("{out_dir}/indirectcalltargets.bin"),
             &indirectcalltargets_bin,
@@ -1034,8 +1049,26 @@ fn real_main() {
         // `BlackholeInterpBuilder::setup_descrs(...)` — the single-store
         // model (same list consumed by every `BlackholeInterpreter` produced
         // by `acquire_interp`).
-        let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
+        // Encode entries independently so runtime can retain the one-pointer
+        // table shape upstream gets from translation-time constants without
+        // reconstituting every descriptor in this process.
+        let mut descrs_bin = Vec::new();
+        let mut descr_offsets = Vec::with_capacity(pipeline.descrs.len() + 1);
+        descr_offsets.push(0_u32);
+        for descr in &pipeline.descrs {
+            descrs_bin.extend(bincode::serialize(descr).unwrap());
+            descr_offsets.push(
+                u32::try_from(descrs_bin.len())
+                    .expect("serialized descrs.bin exceeds the u32 offset range"),
+            );
+        }
+        assert_eq!(descr_offsets.len(), pipeline.descrs.len() + 1);
+        assert_eq!(descr_offsets.first().copied(), Some(0));
+        assert_eq!(descr_offsets.last().copied(), Some(descrs_bin.len() as u32));
+        assert!(descr_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        let descrs_index_bin = bincode::serialize(&descr_offsets).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
+        std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
 
         // `MAJIT_MINT_INDEX_CENSUS=1`: how many `fielddescrof` mints resolved a
         // slot for `index_in_parent`, and how many carried out the `0` they were
