@@ -13,6 +13,22 @@ pub(super) fn field_scalar_tokens(
     struct_path: &syn::Path,
     member: &syn::Member,
 ) -> (TokenStream, TokenStream, TokenStream) {
+    // Every consultation THIS lowering makes reaches the maps through here, so
+    // one line records which declared keys an access site asked about.
+    // Recorded whether or not the key is declared: the report is over the
+    // DECLARED keys, and an undeclared one describes nothing to begin with.
+    //
+    // Not the only reader of `ref_fields`, and the difference bounds what the
+    // report can claim.  `RefFieldRewriter` consults it too, to rewrite the
+    // CONCRETE body's `x.field` into a deref of the raw-pointer carrier.  Both
+    // walk the same source, so they normally agree — they diverge exactly where
+    // this lowering stopped early and the rewriter did not, which is a degraded
+    // arm.  That is why an unconsulted key is reported rather than rejected,
+    // and why the gate prints the degraded arms beside it.
+    config
+        .consulted_field_keys
+        .borrow_mut()
+        .insert(key.to_string());
     match config.int_fields.get(key) {
         Some((ty, signed)) => (
             quote! { ::core::mem::size_of::<#ty>() },
@@ -29,9 +45,115 @@ pub(super) fn field_scalar_tokens(
         None => (
             quote! { ::core::mem::size_of::<i64>() },
             quote! { true },
-            quote! {},
+            ref_field_witness_tokens(&config.ref_fields, key, struct_path, member),
         ),
     }
+}
+
+/// A compile-time check that a `ref_fields` entry describes the field it names.
+///
+/// The lowering trusts the declaration twice and verifies it nowhere: the read
+/// becomes `getfield_gc_r` into the ref bank, and the binding's `struct_type`
+/// is what the NEXT hop resolves `offset_of!` against.  So a field that is not
+/// a pointer to the declared pointee produces either a ref-bank read of
+/// something that is not a reference, or an offset computed in the wrong
+/// struct, and nothing between the declaration and the emitted descr says so.
+///
+/// `usize` is admitted alongside the two raw-pointer spellings because it is
+/// the sanctioned carrier for a pointer whose declaring crate would rather not
+/// name the pointee's type.  A carrier's pointee is not checkable, which is the
+/// price of the carrier — what survives for it is that the field is
+/// pointer-width and pointer-kind, not an `i64` or a `u32` that drifted into
+/// the ref map.
+///
+/// The witness names the pointee rather than a whole pointer type so that
+/// `*mut T` and `*const T` both satisfy it, mirroring `emit_array_field_base`.
+///
+/// Where this adds coverage, measured rather than assumed.  On the
+/// `#[jit_inline]` path a drifted pointee on a raw-pointer field already fails
+/// the build: the concrete rewriter types the loaded value against the
+/// declaration and reports E0308.  On the `#[jit_interp]` state-field path it
+/// does not — a machine declaring `Holder::link => Wrong` over a
+/// `link: *mut Holder` compiles clean and faults at run time.  That path is
+/// what this witness closes; on the inline path it is a second, earlier line.
+///
+/// Empty for a key `ref_fields` does not declare, and that is a decision, not
+/// an omission: an undeclared field reads into the Int bank, and stable Rust
+/// has no way to assert that a type is *not* a pointer.  Catching that half
+/// takes a mechanism that works by disagreement instead of by declaration —
+/// `Assembler::register_struct_layout`'s conflict check, which reports one word
+/// registered as a pointer at one emit site and as a scalar at another.
+///
+/// It is not a general second line for this one, and the reason is worth
+/// stating: each jitcode gets its OWN layout map, so two *declarations* never
+/// meet there.  What meets is two emit sites within one jitcode — the same
+/// member reached by two lowering paths.  A machine whose sole access to an
+/// undeclared pointer field goes through one path stays undetected by both
+/// mechanisms.
+fn ref_field_witness_tokens(
+    ref_fields: &HashMap<String, (syn::Path, Ident, syn::Path)>,
+    key: &str,
+    struct_path: &syn::Path,
+    member: &syn::Member,
+) -> TokenStream {
+    let Some((_, _, pointee)) = ref_fields.get(key) else {
+        return quote! {};
+    };
+    quote! {
+        const _: () = {
+            trait __MajitRefField {}
+            impl __MajitRefField for *mut #pointee {}
+            impl __MajitRefField for *const #pointee {}
+            impl __MajitRefField for usize {}
+            #[allow(dead_code)]
+            fn __majit_ref_field_witness(__s: &#struct_path) {
+                fn __accept<T: __MajitRefField>(_: T) {}
+                __accept(__s.#member);
+            }
+        };
+    }
+}
+
+/// The `(base_size, len_offset, witness)` a `pool_arrays` declaration reports
+/// for its array, and the compile-time checks that the declaration describes
+/// the struct it names.
+///
+/// Both numbers are `offset_of!` on the declaration's own field names, so a
+/// field reordered ahead of the items moves the read with it instead of leaving
+/// it behind.  The witnesses cover what an offset cannot: that `items` really
+/// is an array of pointer-width elements, and that `len` really is a `usize` —
+/// the width the descr's lendescr reads it at.  Without the second one, a `u32`
+/// length word would be read as a machine word with its top half taken from
+/// whatever follows.
+///
+/// The element witness needs the declared pointee, so it is emitted only for a
+/// declaration that names one.  `offset_of!` is unconditional.
+fn pool_array_layout_tokens(
+    entry: &super::PoolArrayLowering,
+) -> (TokenStream, TokenStream, TokenStream) {
+    let struct_path = &entry.struct_path;
+    let items = &entry.items_field;
+    let base_size = quote! { ::core::mem::offset_of!(#struct_path, #items) };
+    let (len_offset, len_witness) = match &entry.len_field {
+        Some(len) => (
+            quote! { ::core::option::Option::Some(::core::mem::offset_of!(#struct_path, #len)) },
+            quote! {
+                const _: fn(&#struct_path) -> usize = |__s| __s.#len;
+            },
+        ),
+        None => (quote! { ::core::option::Option::None }, quote! {}),
+    };
+    let element_witness = match &entry.element_type {
+        Some(element) => quote! {
+            const _: fn(&#struct_path) -> *mut #element = |__s| __s.#items[0];
+        },
+        None => quote! {},
+    };
+    (
+        base_size,
+        len_offset,
+        quote! { #len_witness #element_witness },
+    )
 }
 
 /// A `<local ref binding>.<field>` access that `array_fields` declares, resolved
@@ -1370,8 +1492,9 @@ impl<'c> Lowerer<'c> {
 
     /// Recognizes a pool-array element read through the registered getter call
     /// `<getter>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on
-    /// the raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points
-    /// at — the `pools[selected]` read.  Unlike the residual-call form (an
+    /// the raw-pointer array (`[*mut U; N]` at the declared `items` offset) the
+    /// ref-scalar points at — the `pools[selected]` read.  Unlike the
+    /// residual-call form (an
     /// opaque CALL_R the optimizer can neither re-produce in the short preamble
     /// nor invalidate), the getarrayitem on the immutable `pools` array
     /// re-derives the element each loop entry from the consistent `selected`
@@ -1384,7 +1507,8 @@ impl<'c> Lowerer<'c> {
     /// `(state.<base>, int)` arg shape does NOT match, so it is not miscompiled
     /// into a pool read — it falls through to its own residual body (which is
     /// also the getter's concrete fallback when no `pool_arrays` is configured).
-    /// Pointer elements are 8 bytes at array offset 0 (`add_ptr_array_descr`).
+    /// Elements are pointer-width; where they start, and whether a length word
+    /// precedes them, come from the declaration (`pool_array_layout_tokens`).
     pub(super) fn lower_pool_array_get_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
         let config = self.config?;
         if call.args.len() != 2 {
@@ -1404,12 +1528,12 @@ impl<'c> Lowerer<'c> {
         // fallback (the marker function's own body) rather than miscompiling an
         // unrelated helper into a `getarrayitem_gc_r`.
         let func_segments = canonical_expr_segments(&call.func)?;
-        let element_type = config
+        let entry = config
             .pool_arrays
             .iter()
-            .find(|(base, getter, _)| base == &base_name && getter == &func_segments)?
-            .2
-            .clone();
+            .find(|entry| entry.base == base_name && entry.getter == func_segments)?;
+        let element_type = entry.element_type.clone();
+        let (base_size, len_offset, layout_witness) = pool_array_layout_tokens(entry);
         // Lower the `state.<base>` ref-scalar (declares its ref identity slot
         // live for resume) and the index, then read the pointer element.
         let base = self.lower_state_field_read(&call.args[0])?;
@@ -1430,7 +1554,8 @@ impl<'c> Lowerer<'c> {
                 vec![Register::ref_(result_reg)],
             ),
             quote! {
-                let __descr_idx = __builder.add_ptr_array_descr();
+                #layout_witness
+                let __descr_idx = __builder.add_ptr_array_descr(#base_size, #len_offset);
                 __builder.getarrayitem_gc_r(
                     #result_reg as u16,
                     #base_reg as u16,
@@ -1721,5 +1846,72 @@ impl<'c> Lowerer<'c> {
             depends_on_stack: false,
             struct_type: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ref_fields_map(
+        entries: &[(&str, &str, &str, &str)],
+    ) -> HashMap<String, (syn::Path, Ident, syn::Path)> {
+        entries
+            .iter()
+            .map(|(key, struct_path, field, pointee)| {
+                (
+                    (*key).to_string(),
+                    (
+                        syn::parse_str::<syn::Path>(struct_path).expect("struct path"),
+                        syn::parse_str::<Ident>(field).expect("field ident"),
+                        syn::parse_str::<syn::Path>(pointee).expect("pointee path"),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn witness_for(key: &str) -> String {
+        let map = ref_fields_map(&[("Stack::head", "Stack", "head", "Node")]);
+        let struct_path: syn::Path = syn::parse_str("Stack").expect("struct path");
+        let member: syn::Member = syn::parse_str("head").expect("member");
+        ref_field_witness_tokens(&map, key, &struct_path, &member).to_string()
+    }
+
+    /// A declared ref field admits the three spellings the lowering can
+    /// actually receive, and no others. The pointee is named once per pointer
+    /// spelling, which is what turns a drifted declaration into a type error.
+    #[test]
+    fn a_declared_ref_field_witnesses_its_pointee() {
+        let tokens = witness_for("Stack::head");
+        for expected in [
+            "impl __MajitRefField for * mut Node",
+            "impl __MajitRefField for * const Node",
+            "impl __MajitRefField for usize",
+        ] {
+            assert!(
+                tokens.contains(expected),
+                "the witness must admit `{expected}`; tokens={tokens}"
+            );
+        }
+        assert!(
+            tokens.contains("__accept (__s . head)"),
+            "the witness must touch the field it names, or it witnesses \
+             nothing about the struct; tokens={tokens}"
+        );
+    }
+
+    /// The other half of the same predicate, stated so the gap is a decision
+    /// rather than an oversight: a field named in no map reads into the Int
+    /// bank, and stable Rust cannot assert that a type is *not* a pointer, so
+    /// no witness is emitted for it.
+    #[test]
+    fn an_undeclared_field_gets_no_ref_witness() {
+        assert_eq!(
+            witness_for("Stack::size"),
+            "",
+            "a key `ref_fields` does not declare must emit nothing; emitting a \
+             witness there would reject every legitimate integer field"
+        );
     }
 }

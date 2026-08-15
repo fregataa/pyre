@@ -2498,6 +2498,22 @@ pub(super) fn lower_dispatch_chain(
         lowerer.emit_jump(&default_label);
     }
 
+    // The denominator for `record_degraded_dispatch_arm` below, staged from the
+    // same loop's own admission test so the two cannot drift: an arm is counted
+    // here exactly when the loop emits a body for it.  Without it an empty
+    // degraded registry reads as "nothing degraded" and as "no portal was
+    // built" at once, and only the first is a pass.
+    {
+        let census_interp = config.state_type_name.clone();
+        let census_arms = classified_arms
+            .iter()
+            .filter(|arm| !matches!(arm.pat, Pat::Wild(_)) && !is_lowercase_binding_pat(&arm.pat))
+            .count();
+        lowerer.emit_aux(quote::quote! {
+            majit_metainterp::record_dispatch_arm_census(#census_interp, #census_arms);
+        });
+    }
+
     for (arm_idx, arm) in classified_arms.iter().enumerate() {
         // `_` wildcard: skip here; handled by the default GOTO below.
         // All other patterns (including Pat::Ident like `OP_NOP`) are
@@ -3004,6 +3020,33 @@ pub(super) fn lower_dispatch_chain(
         // Jumping here means "this arm did not match; proceed to next arm".
         if let Some(skip_label) = skip_label.as_ref() {
             lowerer.emit_label_def(skip_label);
+        }
+    }
+
+    // Every arm has lowered, so the consulted-key set is final: report the
+    // declared `int_fields` / `ref_fields` keys no access site asked about.
+    //
+    // Reported rather than rejected, and the reason is the degraded arm. An
+    // arm that refused to lower never reached its field accesses, so a key
+    // used only there is unconsulted through no fault of the declaration —
+    // failing the build on it would turn one refusal into two. The consumer's
+    // gate reads this alongside `degraded_dispatch_arms` and can tell them
+    // apart; a compile error could not.
+    {
+        let interp = config.state_type_name.clone();
+        let consulted = config.consulted_field_keys.borrow();
+        let mut unconsulted: Vec<&String> = config
+            .int_fields
+            .keys()
+            .chain(config.ref_fields.keys())
+            .filter(|key| !consulted.contains(*key))
+            .collect();
+        unconsulted.sort();
+        unconsulted.dedup();
+        for key in unconsulted {
+            lowerer.emit_aux(quote::quote! {
+                majit_metainterp::record_unconsulted_field_declaration(#interp, #key);
+            });
         }
     }
 

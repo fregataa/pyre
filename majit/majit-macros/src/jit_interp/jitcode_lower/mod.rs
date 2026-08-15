@@ -103,6 +103,28 @@ where
 
 // ── LowererConfig ────────────────────────────────────────────────────
 
+/// One `pool_arrays` declaration, resolved against the state's `ref(_)` fields.
+///
+/// `JitInterpConfig.PoolArrayEntry` names the base by its state-field name;
+/// this carries the base struct's `Path` alongside it, recovered from
+/// `state_ref_scalars`, because the emitted `offset_of!` needs the type and the
+/// declaration only names the field.
+#[derive(Clone)]
+pub(super) struct PoolArrayLowering {
+    /// The `ref(T)` state field that holds the base pointer.
+    pub(super) base: String,
+    /// The marker function whose call indexes the array, canonicalized.
+    pub(super) getter: Vec<String>,
+    /// `T` of the `ref(T)` — the struct the array lives in.
+    pub(super) struct_path: syn::Path,
+    /// The array field inside `struct_path`.
+    pub(super) items_field: Ident,
+    /// A length word ahead of the items, when the consumer keeps one.
+    pub(super) len_field: Option<Ident>,
+    /// The element's pointee type, when declared.
+    pub(super) element_type: Option<syn::Path>,
+}
+
 /// Configuration for state_fields-aware JitCode lowering.
 ///
 /// Built from `JitInterpConfig` at proc-macro time and passed to the Lowerer
@@ -186,11 +208,10 @@ pub struct LowererConfig {
     /// The trailing `bool` is the `[]` suffix: the helper writes the ELEMENTS
     /// of the array the field points at, rather than the field itself.
     pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident, bool)>,
-    /// `(pool-base ref-scalar name, getter function path segments, element type)`.
     /// A call `<getter>(state.<base>, <int>)` whose function path matches
     /// `getter` AND whose arg0 is the `base` lowers to `getarrayitem_gc_r`
     /// instead of a residual CALL_R.  Source: `JitInterpConfig.pool_arrays`.
-    pub(super) pool_arrays: Vec<(String, Vec<String>, Option<syn::Path>)>,
+    pub(super) pool_arrays: Vec<PoolArrayLowering>,
     /// Ref-kind struct field declarations.  Key = `"StructType::field"`,
     /// value = `(struct_path, field_ident, pointee_path)`.  When the lowerer
     /// encounters a field access and the `(struct, field)` pair matches, it
@@ -209,6 +230,17 @@ pub struct LowererConfig {
     /// width and signedness with the struct layout instead of the machine-word
     /// default, which is what makes `descr.is_integer_bounded()` true for it.
     pub(super) int_fields: HashMap<String, (Ident, bool)>,
+    /// `"StructType::field"` keys some access site asked about while lowering.
+    ///
+    /// A declared key that never appears here matched no access, so it emitted
+    /// nothing — no descr width, and no witness either. That is what makes it
+    /// worth reporting rather than merely tidying: an entry that produces no
+    /// tokens is also an entry whose claim about the field was never checked,
+    /// and the two are indistinguishable from the declaration alone.
+    ///
+    /// Shared rather than cloned: the config is cloned per lowering entry
+    /// point, and a key consulted by any of them counts for all.
+    pub(super) consulted_field_keys: std::rc::Rc<std::cell::RefCell<HashSet<String>>>,
     /// Return struct type for ref-returning calls.  Key = canonical func
     /// path segments, value = struct type path.  When a `residual_ref` call
     /// result is bound, the lowerer sets `Binding.struct_type` from this map
@@ -971,6 +1003,7 @@ impl LowererConfig {
             ref_fields: ref_fields_map,
             array_fields: array_fields_map,
             int_fields: int_fields_map(int_fields),
+            consulted_field_keys: Default::default(),
             call_returns: HashMap::new(),
             headerless_structs: headerless_structs
                 .iter()
@@ -1201,6 +1234,26 @@ impl LowererConfig {
                 )
             })
             .collect();
+        // Resolved before the struct literal takes `state_ref_scalars`: the
+        // emitted `offset_of!` needs the base struct's type, and the
+        // declaration names only its state-field.
+        let pool_arrays: Vec<PoolArrayLowering> = pool_arrays
+            .iter()
+            .map(|entry| {
+                let base = entry.base.to_string();
+                let (_, struct_path) = state_ref_scalars
+                    .get(&base)
+                    .expect("the loop above rejected a base that is not a ref(_) state field");
+                PoolArrayLowering {
+                    base,
+                    getter: canonical_path_segments(&entry.getter),
+                    struct_path: struct_path.clone(),
+                    items_field: entry.items_field.clone(),
+                    len_field: entry.len_field.clone(),
+                    element_type: entry.element_type.clone(),
+                }
+            })
+            .collect();
         Self {
             io_shims,
             calls,
@@ -1223,6 +1276,7 @@ impl LowererConfig {
             ref_fields: ref_fields_map,
             array_fields: array_fields_map,
             int_fields: int_fields_map(int_fields),
+            consulted_field_keys: Default::default(),
             call_returns: call_returns
                 .iter()
                 .map(|(func, ret_type)| (canonical_path_segments(func), ret_type.clone()))
@@ -1231,16 +1285,7 @@ impl LowererConfig {
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
-            pool_arrays: pool_arrays
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.base.to_string(),
-                        canonical_path_segments(&entry.getter),
-                        entry.element_type.clone(),
-                    )
-                })
-                .collect(),
+            pool_arrays,
             native_int_binops: native_int_binops
                 .iter()
                 .map(|(path, op)| (canonical_path_segments(path), op.to_string()))

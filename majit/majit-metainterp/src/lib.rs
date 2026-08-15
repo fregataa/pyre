@@ -529,6 +529,335 @@ pub fn degraded_dispatch_arms() -> Vec<DegradedDispatchArm> {
         .clone()
 }
 
+/// How many dispatch arms one machine's portal emitted, recorded whether or
+/// not any of them degraded.
+///
+/// [`degraded_dispatch_arms`] is a numerator. On its own an empty result reads
+/// as "no arm degraded" and is indistinguishable from "no portal was ever
+/// built" — the same shape as the defect it exists to report, one level up. A
+/// consumer's gate therefore has to supply its own proof that the portal was
+/// installed, and every one of them supplies a different one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DispatchArmCensus {
+    /// The machine's declared `state = T` type name, matching
+    /// [`DegradedDispatchArm::interp`].
+    pub interp: &'static str,
+    /// Arms the portal emitted a body for. The `_` wildcard and a lowercase
+    /// binding pattern are excluded: both are the default edge rather than an
+    /// opcode, and neither can degrade.
+    pub arms: usize,
+}
+
+static DISPATCH_ARM_CENSUS: std::sync::Mutex<Vec<DispatchArmCensus>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `interp`'s portal emitted `arms` dispatch arms.
+///
+/// Called from the `__dispatch_jitcode_*` body alongside
+/// [`record_degraded_dispatch_arm`], so the denominator and the numerator are
+/// written in the same install. Deduplicated by content for the same reason:
+/// a portal may be built more than once per process and the fact is per
+/// machine, not per build.
+pub fn record_dispatch_arm_census(interp: &'static str, arms: usize) {
+    let entry = DispatchArmCensus { interp, arms };
+    let mut census = DISPATCH_ARM_CENSUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if census.contains(&entry) {
+        return;
+    }
+    census.push(entry);
+}
+
+/// Snapshot of every portal's arm count recorded so far.
+pub fn dispatch_arm_census() -> Vec<DispatchArmCensus> {
+    DISPATCH_ARM_CENSUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Panic unless `interp`'s portal was installed AND none of its arms degraded.
+///
+/// This is the gate every consumer would otherwise write, denominator and all.
+/// Reading `degraded_dispatch_arms()` alone cannot be that gate: it passes on
+/// an empty registry, and an empty registry is also what a portal that was
+/// never built produces. The census settles which one happened, so the two
+/// failures get two different messages instead of one silent pass.
+///
+/// Call it after whatever installs the portal. `#[jit_interp]` records both
+/// facts at install, not at trace time, so running the machine is not required
+/// — but nothing is recorded until the portal is built at least once.
+pub fn assert_no_degraded_dispatch_arms(interp: &str) {
+    let census = dispatch_arm_census();
+    let Some(entry) = census.iter().find(|e| e.interp == interp) else {
+        panic!(
+            "no dispatch-arm census for `{interp}`: its portal was never \
+             installed in this process, so an empty degraded list says nothing \
+             about it. Build the dispatch JitCode (or run the machine) first. \
+             Recorded machines: {:?}",
+            census.iter().map(|e| e.interp).collect::<Vec<_>>()
+        );
+    };
+    let degraded: Vec<DegradedDispatchArm> = degraded_dispatch_arms()
+        .into_iter()
+        .filter(|e| e.interp == interp)
+        .collect();
+    assert!(
+        degraded.is_empty(),
+        "{} of `{interp}`'s {} dispatch arms lowered to an abort stub. Every \
+         trace that reaches one of these opcodes aborts, once per threshold, \
+         forever: {:#?}",
+        degraded.len(),
+        entry.arms,
+        degraded
+    );
+}
+
+/// A declared field key that no access site asked about.
+///
+/// `int_fields` and `ref_fields` are consulted by key —
+/// `"StructType::field"`, built from the *declared* type of the base an access
+/// goes through. A key that matches no access emits nothing: no descr width,
+/// and no witness either. So the entry is at once inert and an unchecked claim
+/// about the field, and the declaration alone cannot say which.
+///
+/// Reported rather than rejected. A dispatch arm that refused to lower never
+/// reached its field accesses, so a key used only in that arm is unconsulted
+/// through no fault of the declaration; read this beside
+/// [`degraded_dispatch_arms`] before concluding an entry is dead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UnconsultedFieldDeclaration {
+    /// The machine's declared `state = T` type name, matching
+    /// [`DegradedDispatchArm::interp`].
+    pub interp: &'static str,
+    /// The declaration's key, as written: `"StructType::field"`.
+    pub key: &'static str,
+}
+
+static UNCONSULTED_FIELD_DECLARATIONS: std::sync::Mutex<Vec<UnconsultedFieldDeclaration>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `interp` declares `key` and no access site consulted it.
+///
+/// Emitted into the `__dispatch_jitcode_*` body beside
+/// [`record_dispatch_arm_census`], so it fires when the portal is installed.
+/// Deduplicated by content: a portal may be built more than once per process
+/// and the fact is per declaration, not per build.
+pub fn record_unconsulted_field_declaration(interp: &'static str, key: &'static str) {
+    let entry = UnconsultedFieldDeclaration { interp, key };
+    let mut entries = UNCONSULTED_FIELD_DECLARATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if entries.contains(&entry) {
+        return;
+    }
+    if majit_log_enabled() {
+        eprintln!("[jit] unconsulted field declaration: {interp} declares {key}, unused");
+    }
+    entries.push(entry);
+}
+
+/// Snapshot of every unconsulted field declaration recorded so far.
+pub fn unconsulted_field_declarations() -> Vec<UnconsultedFieldDeclaration> {
+    UNCONSULTED_FIELD_DECLARATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Panic unless `interp`'s portal was installed AND every field declaration it
+/// carries was consulted.
+///
+/// Takes its denominator from the same census as
+/// [`assert_no_degraded_dispatch_arms`], for the same reason: an empty result
+/// is also what a portal that was never built produces.
+pub fn assert_no_unconsulted_field_declarations(interp: &str) {
+    let census = dispatch_arm_census();
+    let Some(entry) = census.iter().find(|e| e.interp == interp) else {
+        panic!(
+            "no dispatch-arm census for `{interp}`: its portal was never \
+             installed in this process, so an empty unconsulted list says \
+             nothing about it. Build the dispatch JitCode (or run the machine) \
+             first. Recorded machines: {:?}",
+            census.iter().map(|e| e.interp).collect::<Vec<_>>()
+        );
+    };
+    let unconsulted: Vec<UnconsultedFieldDeclaration> = unconsulted_field_declarations()
+        .into_iter()
+        .filter(|e| e.interp == interp)
+        .collect();
+    let degraded: Vec<DegradedDispatchArm> = degraded_dispatch_arms()
+        .into_iter()
+        .filter(|e| e.interp == interp)
+        .collect();
+    assert!(
+        unconsulted.is_empty(),
+        "`{interp}` declares {} field key(s) no access site consulted, across \
+         its {} dispatch arms. Each emitted no width and no witness, so the \
+         declaration was never checked against the struct it names: {unconsulted:#?}. \
+         {} of its arms degraded, and a key used only in one of those is \
+         unconsulted for that reason rather than for being stale: {degraded:#?}",
+        unconsulted.len(),
+        entry.arms,
+        degraded.len(),
+    );
+}
+
+/// One field of a struct layout, as an emit site described it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StructLayoutField {
+    /// The field's declared name — its identity. Empty at the mint sites that
+    /// carry none, where the byte offset is all there is to key on.
+    pub name: String,
+    /// Whether the word holds a GC pointer. Decides `ArrayFlag::Pointer` vs a
+    /// signed/unsigned integer flag, and with it whether the collector traces
+    /// through the word.
+    pub is_ref: bool,
+    /// The field's width in bytes. A ref is a pointer word by construction.
+    pub size: usize,
+    /// Signedness, for an integer field.
+    pub signed: bool,
+}
+
+/// Why a struct-layout registration could not be honoured as submitted.
+///
+/// `JitCodeBuilder::register_struct_layout` accumulates a struct's layout
+/// across the emit sites that touch it, and dedups on the byte offset alone.
+/// An offset does not identify a field, so a second registration at a known
+/// offset is one of three things and only the first is benign: the same field
+/// again (the common case — every emit site re-registers what it accesses), a
+/// different field that happens to sit there, or the same field described
+/// differently. The latter two are these variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StructLayoutConflictKind {
+    /// A field arrived at an offset the spec already lists under a *different*
+    /// name, so the offset-keyed dedup discarded it. A flattened inline
+    /// aggregate and its first leaf share an address, which is how two real
+    /// fields legitimately collide.
+    ///
+    /// The spec is then short an entry: `add_struct_field_descr` resolves
+    /// `index_in_parent` and `name` against it, so an access to the dropped
+    /// field either resolves to its sibling's slot or fails to resolve at all.
+    DroppedSibling,
+    /// The *same* named field arrived described differently — most consequentially
+    /// as a GC pointer at one site and as a scalar at another. Whichever
+    /// registration arrived first decides what the collector believes about the
+    /// word, so the outcome depends on emit order.
+    Redescribed,
+}
+
+/// A struct-layout registration that disagreed with what was already recorded.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StructLayoutConflict {
+    /// The struct's `path_hash` type id, the key of the layout cache.
+    pub type_id: u64,
+    /// The byte offset both registrations name.
+    pub offset: usize,
+    pub kind: StructLayoutConflictKind,
+    /// What the spec holds — the registration that arrived first.
+    pub kept: StructLayoutField,
+    /// What arrived second and was discarded.
+    pub dropped: StructLayoutField,
+}
+
+static STRUCT_LAYOUT_CONFLICTS: std::sync::Mutex<Vec<StructLayoutConflict>> =
+    std::sync::Mutex::new(Vec::new());
+
+static STRUCT_LAYOUT_REGISTRATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static STRUCT_LAYOUT_COMPARISONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Record that a layout registration disagreed with the recorded spec.
+///
+/// Deduplicated by content: a jitcode may be built many times per process and
+/// the fact reported is per-disagreement, not per-build.
+pub fn record_struct_layout_conflict(conflict: StructLayoutConflict) {
+    let mut conflicts = STRUCT_LAYOUT_CONFLICTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if conflicts.contains(&conflict) {
+        return;
+    }
+    if majit_log_enabled() {
+        eprintln!("[jit] struct layout conflict: {conflict:?}");
+    }
+    conflicts.push(conflict);
+}
+
+/// Count `fields` submitted field descriptions.
+pub fn note_struct_layout_registration(fields: usize) {
+    STRUCT_LAYOUT_REGISTRATIONS.fetch_add(fields, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one field that met an entry already recorded at its offset — i.e. one
+/// field the conflict check actually had something to compare against.
+///
+/// The first one announces itself under `MAJIT_LOG`. A run that reports no
+/// conflicts has said nothing until something says the check ran at all, and
+/// the only other way to learn that from outside the process is to read
+/// [`struct_layout_comparisons`], which a binary does not expose.
+pub fn note_struct_layout_comparison() {
+    let previous = STRUCT_LAYOUT_COMPARISONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if previous == 0 && majit_log_enabled() {
+        eprintln!("[jit] struct layout conflict check is live");
+    }
+}
+
+/// Snapshot of every layout disagreement recorded so far.
+pub fn struct_layout_conflicts() -> Vec<StructLayoutConflict> {
+    STRUCT_LAYOUT_CONFLICTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Field descriptions submitted to `register_struct_layout` so far.
+pub fn struct_layout_registrations() -> usize {
+    STRUCT_LAYOUT_REGISTRATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Submitted fields that arrived at an offset already recorded for their
+/// struct — the denominator for [`struct_layout_conflicts`].
+///
+/// [`struct_layout_registrations`] is the wrong one. A field at an offset
+/// nobody has registered yet is simply appended: there is nothing to disagree
+/// with, so it does not exercise the check. A corpus could submit thousands of
+/// those, report zero conflicts, and never have compared anything. This counts
+/// the fields that were actually compared.
+pub fn struct_layout_comparisons() -> usize {
+    STRUCT_LAYOUT_COMPARISONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Panic unless some layout was re-registered AND none of the re-registrations
+/// disagreed.
+///
+/// Call it after whatever builds the jitcodes. Layouts are registered as the
+/// bytecode is emitted, so building the portal is enough — running the machine
+/// is not required.
+pub fn assert_no_struct_layout_conflicts() {
+    let comparisons = struct_layout_comparisons();
+    assert!(
+        comparisons > 0,
+        "no field was ever submitted at an offset already recorded for its \
+         struct, so the conflict check never compared anything and its empty \
+         result says nothing. {} field descriptions were registered in total. \
+         Build the jitcodes (or run the machine) first.",
+        struct_layout_registrations(),
+    );
+    let conflicts = struct_layout_conflicts();
+    assert!(
+        conflicts.is_empty(),
+        "{} of {comparisons} re-registered field descriptions disagreed with \
+         the layout already recorded for their struct. The first registration \
+         wins, so what the optimizer and the collector believe about these \
+         words depends on emit order: {conflicts:#?}",
+        conflicts.len(),
+    );
+}
+
 /// The shape of a compiled loop body, as a tier gate needs to read it.
 ///
 /// A compile counter says a trace was *compiled*; an op count says the body is
