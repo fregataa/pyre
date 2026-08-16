@@ -958,10 +958,34 @@ pub(crate) fn vstack_step_py_pc(
     // block (for example its RETURN_VALUE); applying that opcode here corrupts
     // the live caller stack before the destination block is entered.
     if metadata_block_head_py_pc(metadata, jit_pc).is_some() {
-        current_py_pc
-    } else {
-        vstack_containing_py_pc(metadata, jit_pc)
+        return current_py_pc;
     }
+    // Prefer the per-emission segmentation over the floor tier.  The floor
+    // table keys each Python PC to its FIRST jitcode offset, so a PC that
+    // emits in two disjoint regions is collapsed onto the earlier one and the
+    // later region reads as belonging to whichever PC last opened a segment.
+    // The mirror then sees a boundary the walk never crossed and replays that
+    // opcode's stack effect against a stack it does not describe — the same
+    // shape as applying a SWAP at a boundary that did not retire it.
+    //
+    // `py_exact_by_jit_pc` records the owning PC at every point the emitted
+    // stream changes owner, so it answers directly.  Empty for skeleton /
+    // fixture metadata, where the floor tier remains the only source.
+    if let Some(exact) =
+        crate::pyjitcode::exact_py_pc_for_jitcode_pc(&metadata.py_exact_by_jit_pc, jit_pc)
+        && !exact_segmentation_disabled()
+    {
+        return exact;
+    }
+    vstack_containing_py_pc(metadata, jit_pc)
+}
+
+/// `PYRE_VSTACK_NO_EXACT`: fall back to the floor tier for the mirror's
+/// coordinate. The escape hatch for A/B-ing the segmentation switchover
+/// against the tier it replaces.
+fn exact_segmentation_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("PYRE_VSTACK_NO_EXACT").is_some())
 }
 
 /// #73: step the walk-level operand-stack box mirror at
@@ -1047,6 +1071,30 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
             } else {
                 raw_depth()
             };
+            // Stage gate for the per-emission exact segmentation.  The
+            // boundary the mirror acts on is currently INFERRED — `py_pc` is
+            // the floor segment's owner, and whether an opcode retired is then
+            // guessed from (prev, new, depth).  `py_exact_by_jit_pc` answers it
+            // directly.  Compare the two at every step before any consumer
+            // trusts the new table: a disagreement is a boundary the floor tier
+            // reports differently from the emission record, and each one is a
+            // case the inference has to special-case.
+            if vstack_exact_audit_enabled() {
+                if let Some(exact) = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
+                    &jc.payload.metadata.py_exact_by_jit_pc,
+                    jit_pc,
+                ) && exact != py_pc
+                {
+                    let code = &*jc.payload.code_ptr;
+                    eprintln!(
+                        "[vstack-exact] code={} jit_pc={jit_pc} floor_py={py_pc} \
+                         exact_py={exact} cur_py={} boundary={}",
+                        code.obj_name,
+                        ctx.vstack_cur_pypc,
+                        py_pc != ctx.vstack_cur_pypc,
+                    );
+                }
+            }
             (py_pc, jc.payload.code_ptr, depth)
         }
     };
@@ -1243,6 +1291,31 @@ fn py_stack_depth(code_ptr: *const pyre_interpreter::CodeObject, py: u32) -> usi
         .unwrap_or(0) as usize
 }
 
+/// Drop any armed out-of-order region.
+///
+/// The region's snapshot is keyed on the `(py_pc, depth)` coordinate the walk
+/// left, and it is restored when the walk returns to that same coordinate on
+/// the premise that no Python opcode retired in between.  A caller that
+/// rewrites `vstack_boxes` wholesale and moves the coordinate — an exception
+/// handler entry, a call-assembler return — breaks that premise: the stack the
+/// snapshot describes no longer exists, so a later boundary that happens to
+/// land on the same `(py_pc, depth)` would restore it over the live mirror.
+pub(crate) fn disarm_vstack_reorder_region<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    if keep_reorder_region_across_reseed() {
+        return;
+    }
+    ctx.vstack_reorder_ceiling = u32::MAX;
+    ctx.vstack_reorder_saved = None;
+}
+
+/// `PYRE_VSTACK_KEEP_REORDER`: leave an armed region in place across a mirror
+/// re-seed. The escape hatch for A/B-ing the disarm against the behaviour it
+/// replaces.
+fn keep_reorder_region_across_reseed() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var_os("PYRE_VSTACK_KEEP_REORDER").is_some())
+}
+
 /// The handler-entry coordinate the mirror adopted, under `PYRE_VSTACK_DIAG`.
 /// `floor_py` is reported next to it: the two disagreeing is what an
 /// out-of-line catch target looks like from the walk's side, and without both
@@ -1343,6 +1416,7 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     };
     ctx.vstack_boxes.clear();
     ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    disarm_vstack_reorder_region(ctx);
     // The unwinder pushes the caught exception onto the new TOS.
     if handler_depth >= 1 && exc != OpRef::NONE {
         ctx.vstack_boxes[handler_depth - 1] = exc;
@@ -1416,6 +1490,7 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     // mirror shallower than the handler depth pads with NONE holes, which
     // `mirror_covers_kept` declines per slot rather than latching invalid.
     ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    disarm_vstack_reorder_region(ctx);
     // The unwinder pushes the caught exception onto the new TOS.
     if handler_depth >= 1 && exc != OpRef::NONE {
         ctx.vstack_boxes[handler_depth - 1] = exc;
