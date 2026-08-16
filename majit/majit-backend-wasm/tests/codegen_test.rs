@@ -420,25 +420,31 @@ fn build_module_with_frame(
     gc_info: &codegen::GuardGcTypeInfo,
     frame: codegen::FrameGeometry,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        inputargs,
-        ops,
-        constants,
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
         vtable_offset,
-        &HashMap::new(),
-        gc_info,
-        codegen::AllocHelpers::default(),
-        0,
-        None, // nursery
-        0,    // invalidated_flag_addr
-        0,    // gc_table_base
-        0,    // fail_index_base
-        0,    // external_jump_slot
-        0,    // external_jump_key
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: gc_info.clone(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
         frame,
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, guards, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     (bytes, guards)
 }
 
@@ -620,27 +626,32 @@ fn build_module_with_write_barrier_target(
     ops: &[Op],
     write_barrier_target: i64,
 ) -> Vec<u8> {
-    let (bytes, _, _, _, _) = codegen::build_wasm_module(
-        inputargs,
-        ops,
-        &indexmap::IndexMap::new(),
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        codegen::AllocHelpers::default(),
-        write_barrier_target,
-        None,
-        0,
-        0,
-        0,
-        0,
-        0,
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: write_barrier_target,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
         // The allocated trace keeps both Ref inputs live across New; reserve
         // their homes in the shared helper geometry.
-        codegen::FrameGeometry::compact(4, 2, 0),
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+        frame: codegen::FrameGeometry::compact(4, 2, 0),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     bytes
 }
 
@@ -1131,25 +1142,31 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
     let finish = Op::new(OpCode::Finish, &fail_args);
     finish.setfailargs(fail_args);
     let ops = [guard, finish];
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &indexmap::IndexMap::new(),
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        codegen::AllocHelpers::default(),
-        0,
-        None,
-        0,
-        0,
-        FAIL_INDEX_BASE,
-        0,
-        0,
-        codegen::FrameGeometry::fixed(),
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: FAIL_INDEX_BASE,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, guards, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     assert_eq!(guards[0].fail_index, FAIL_INDEX_BASE);
 
     let ref_bits = 0x1234_5678_i64;
@@ -1216,6 +1233,52 @@ fn test_empty_trace() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(guards[0].is_finish);
+}
+
+#[test]
+fn inlined_bridge_without_owner_loop_label_declines() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: vec![guard, finish],
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 1)],
+            ops: vec![Op::new(OpCode::Finish, &[])],
+            gc_table_base: 0,
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("a label-less owner cannot accept an inlined bridge"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("no local loop LABEL"));
 }
 
 #[test]
@@ -1449,6 +1512,59 @@ fn function_type(
         }
     }
     panic!("module has no type section");
+}
+
+fn entry_function_type_index(bytes: &[u8]) -> usize {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::FunctionSection(functions) = payload.unwrap() {
+            return functions
+                .into_iter()
+                .next()
+                .expect("module has an entry function")
+                .expect("entry function type is valid") as usize;
+        }
+    }
+    panic!("module has no function section");
+}
+
+#[test]
+fn zero_arity_parameter_entry_is_structurally_type_zero() {
+    // A published LABEL target is entered through type 0, `(i32) -> i32`.
+    // The separate type index emitted for a zero-arity parameter bridge must
+    // retain that same structural signature.
+    let inputargs = Vec::new();
+    let ops = vec![Op::new(OpCode::Label, &[]), Op::new(OpCode::Finish, &[])];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 4,
+        bridge_entry_arity: Some(0),
+        bridge_param_dispatch: true,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).unwrap();
+
+    validate_wasm(&bytes);
+    assert_eq!(
+        function_type(&bytes, entry_function_type_index(&bytes)),
+        function_type(&bytes, 0),
+        "a published LABEL target's module entry must be structurally `(i32) -> i32`"
+    );
 }
 
 #[test]
@@ -1737,25 +1853,31 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
     let constants = indexmap::IndexMap::new();
-    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &constants,
-        None,
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        codegen::AllocHelpers::default(),
-        0,
-        None,
-        0x1000, // invalidated_flag_addr
-        0,      // gc_table_base
-        0,      // fail_index_base
-        0,      // external_jump_slot
-        0,      // external_jump_key
-        codegen::FrameGeometry::fixed(),
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: None,
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0x1000,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, guards, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 2);
@@ -2103,25 +2225,30 @@ fn loop_invariant_gc_table_load_stays_outside_non_collecting_loop() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]),
     ];
     let gc_table_base = 4096;
-    let (bytes, _, _, _, _) = codegen::build_wasm_module(
-        &inputargs,
-        &ops,
-        &indexmap::IndexMap::new(),
-        Some(0),
-        &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-        codegen::AllocHelpers::default(),
-        0,
-        None,
-        0,
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
         gc_table_base,
-        0,
-        0,
-        0,
-        codegen::FrameGeometry::fixed(),
-        codegen::CaParams::default(),
-    )
-    .expect("wasm codegen should succeed");
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
 
     let mut control_stack = Vec::new();
@@ -2426,30 +2553,36 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
         let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
         finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
 
-        let (bytes, _, _, _, _) = codegen::build_wasm_module(
-            &[InputArg::from_type(Type::Int, 0)],
-            &[new_op, new_array_op, finish],
-            &indexmap::IndexMap::new(),
-            Some(0),
-            &HashMap::new(),
-            &codegen::GuardGcTypeInfo::default(),
-            codegen::AllocHelpers {
+        let inputs = codegen::ModuleBuildInputs {
+            inputargs: vec![InputArg::from_type(Type::Int, 0)],
+            ops: vec![new_op, new_array_op, finish],
+            inlined_bridges: Vec::new(),
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+            alloc: codegen::AllocHelpers {
                 new_fn_ptr: NEW_FN,
                 new_array_fn_ptr: NEW_ARRAY_FN,
                 new_oldgen_fn_ptr: NEW_OLDGEN_FN,
                 new_array_oldgen_fn_ptr: NEW_ARRAY_OLDGEN_FN,
             },
-            0,
-            None, // nursery: the inline bump is off, so only the helper choice shows
-            0,
-            0,
-            0,
-            0,
-            0,
-            codegen::FrameGeometry::fixed(),
-            codegen::CaParams::default(),
-        )
-        .expect("wasm codegen should succeed");
+            wb_fn_ptr: 0,
+            nursery: None, // the inline bump is off, so only the helper choice shows
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            fail_index_base: 0,
+            bridge_cells_base: 0,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: false,
+            trace_entry_census: None,
+            external_jump_slot: 0,
+            external_jump_key: 0,
+            frame: codegen::FrameGeometry::fixed(),
+            ca: codegen::CaParams::default(),
+        };
+        let (bytes, _, _) =
+            codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
         validate_wasm(&bytes);
         const_immediates(&bytes)
     };

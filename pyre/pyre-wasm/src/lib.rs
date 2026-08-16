@@ -351,6 +351,14 @@ pub extern "C" fn pyre_jit_bridge_diag(i: u32) -> u64 {
     majit_backend_wasm::bridge_diag(i as usize)
 }
 
+/// Packed `(needed, available)` geometry for an inline-module trial that did
+/// not fit its owner's frozen frame.  The host formats this diagnostic only.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_inline_geometry_diag(i: u32) -> u64 {
+    majit_backend_wasm::inline_geometry_diag(i as usize)
+}
+
 /// Test-only control plane for the terminal-declined CALL_ASSEMBLER regression.
 /// Exported rather than imported so it cannot perturb table/function indices
 /// used by JIT-emitted modules. Zero disables it; see
@@ -1141,12 +1149,57 @@ mod host_abi {
         majit_metainterp::guard_census_enable();
     }
 
+    /// Arm the per-trace, per-entry-resume-key census before tracing starts.
+    /// The runner owns `PYRE_WASM_TRACE_ENTRY_CENSUS`; the wasm guest cannot
+    /// read its environment, and arming before compilation keeps the counter
+    /// instructions absent from every unarmed trace module.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_trace_entry_census_enable() {
+        majit_backend_wasm::trace_entry_census_enable();
+    }
+
+    /// Arm loop-module replacement before tracing begins. The host owns the
+    /// environment; this guest export carries that choice into the backend.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_reemit_enable() {
+        majit_backend_wasm::reemit_enable();
+    }
+
+    /// Arm loop-closing bridge inlining. This also arms module replacement,
+    /// because an accepted region is installed by rebuilding its owner.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_inline_bridge_enable() {
+        majit_backend_wasm::inline_bridge_enable();
+    }
+
+    /// Disable the default guard-to-bridge parameter entries. The host owns
+    /// the environment, so this call carries its explicit opt-out into the
+    /// guest before tracing begins.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_bridge_params_disable() {
+        majit_backend_wasm::bridge_params_disable();
+    }
+
     /// The armed census as the same packed pair, for the host to print under
     /// `PYRE_WASM_GUARD_CENSUS`. Same `top` as `pyrex` prints natively, so the
     /// two lines compare directly. Reading, not draining.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_jit_guard_census() -> u64 {
         pack_into_guest(majit_metainterp::guard_census_summary(12).into_bytes())
+    }
+
+    /// Guest-memory trace-entry census readout. The runner prints every line
+    /// verbatim, preserving one greppable record per nonzero `(trace_id, key)`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_trace_entry_census() -> u64 {
+        pack_into_guest(majit_backend_wasm::trace_entry_census_summary().into_bytes())
+    }
+
+    /// Trial-build errors recorded while deciding whether a bridge can be
+    /// merged into its loop module.  The host surfaces this diagnostic text.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_inline_trial_errors() -> u64 {
+        pack_into_guest(majit_backend_wasm::inline_trial_errors().into_bytes())
     }
 
     /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for

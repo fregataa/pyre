@@ -568,6 +568,11 @@ pub struct ChainedTraceMeta {
     /// Per-guard, per-fail-arg induction-advance flags
     /// (`CompiledWasmLoop::guard_fail_arg_advanced` analog).
     pub guard_fail_arg_advanced: Vec<Vec<bool>>,
+    /// Number of values each guard transfers to a bridge.  A parameter entry
+    /// is admitted only when this agrees with the bridge's input list.
+    pub guard_fail_arg_counts: Vec<usize>,
+    /// Whether this trace's guard epilogue has typed parameter dispatch arms.
+    pub bridge_param_dispatch: bool,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
@@ -612,12 +617,12 @@ pub struct CompiledWasmLoop {
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's
     /// table slot here. `0` when the trace has no in-module dispatch (native, or
     /// a guardless / straight-line trace).
-    pub bridge_cells_base: u32,
+    pub bridge_cells_base: Cell<u32>,
     /// Number of cells in the `bridge_cells_base` array = this loop's own guard
     /// count at compile time. A bridge attaches only to one of these original
     /// guards (`source_fail_index < num_guard_cells`); descrs appended past this
     /// range belong to already-chained bridges and have no cell of their own.
-    pub num_guard_cells: usize,
+    pub num_guard_cells: Cell<usize>,
     /// True when this is a peeled loop (`codegen::is_resumable_peeled`) — there
     /// is real work (a preamble = the unrolled first iteration) before the last
     /// `LABEL`, single- or multi-label. Such a loop carries the resume-at-LABEL
@@ -642,6 +647,11 @@ pub struct CompiledWasmLoop {
     /// `compile_bridge`'s livelock check: a loop-closing bridge that JUMPs
     /// such a fail arg verbatim still advances the chained cycle.
     pub guard_fail_arg_advanced: Vec<Vec<bool>>,
+    /// Number of fail arguments for every guard/finish exit in this trace.
+    pub guard_fail_arg_counts: Vec<usize>,
+    /// Whether this module transfers a compiled bridge's fail arguments as
+    /// wasm call parameters instead of reloading their positional frame slots.
+    pub bridge_param_dispatch: bool,
     /// `(source_trace_id, source_fail_index, start, count)` ranges into
     /// `fail_descrs` for each chained bridge `compile_bridge` appended (lib.rs
     /// extend site). Lets `compiled_bridge_fail_descr_layouts` /
@@ -657,14 +667,18 @@ pub struct CompiledWasmLoop {
     /// by the bridge's backend `trace_id` (see [`ChainedTraceMeta`]). Lets a
     /// guard INSIDE a chained bridge chain its own nested sub-bridge.
     pub chained_trace_meta: RefCell<std::collections::HashMap<u64, ChainedTraceMeta>>,
-    /// Owns this loop's per-guard bridge-slot cell array so it is freed on
-    /// `Drop`; `bridge_cells_base` aliases its heap address (stable across the
-    /// struct move). `None` when the trace has no in-module dispatch.
-    pub _bridge_cells_owner: Option<Box<[u32]>>,
-    /// Owns the cell arrays of every bridge chained onto this loop. A bridge
-    /// module lives as long as the source loop it attaches to, so its cells are
-    /// freed when this loop drops. Appended by `compile_bridge`.
+    /// Owns this loop's current cell array and every bridge cell array chained
+    /// onto it. A re-emission retains the old array for an already-running
+    /// module before switching its baked base to a new array.
     pub _bridge_owned_cells: RefCell<Vec<Box<[u32]>>>,
+    /// Direct-loop guard index to bridge table slot. A re-emission replays
+    /// these slots into its fresh loop cell array.
+    pub bridge_slots: RefCell<std::collections::HashMap<u32, u32>>,
+    /// Post-intern module inputs retained for a loop re-emission. Entry
+    /// bridges store `None` because they tail-call another loop.
+    pub reemit: RefCell<Option<crate::codegen::ModuleBuildInputs>>,
+    /// The environment-gated identity re-emission runs once per token.
+    pub reemitted: Cell<bool>,
     /// `(descr identity, table slot)` for every label published by a bridge
     /// chained onto this loop. The bridge module lives as long as its source
     /// loop, so `Drop` retracts entries that still name that bridge's slot.
@@ -684,6 +698,12 @@ pub struct CompiledWasmLoop {
     /// A terminal callee decline invalidates them for a no-CA retrace.
     pub ca_callers: RefCell<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
 }
+
+// Compiled loop metadata is transferred through the token's `Any + Send`
+// holder, but all access to its IR snapshot and cell arrays is confined to the
+// single wasm execution thread. The contained `RefCell`s enforce that runtime
+// ownership model; moving the holder does not permit concurrent access.
+unsafe impl Send for CompiledWasmLoop {}
 
 impl CompiledWasmLoop {
     pub fn eager_func_handle(&self) -> u32 {

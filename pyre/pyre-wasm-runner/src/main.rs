@@ -127,6 +127,8 @@ struct Host {
 /// read back through the `pyre_fbw_census` export, and `MAJIT_GUARD_CENSUS`'s
 /// per-guard deopt census is `PYRE_WASM_GUARD_CENSUS`, armed through
 /// `pyre_jit_guard_census_enable` and read through `pyre_jit_guard_census`.
+/// `PYRE_WASM_TRACE_ENTRY_CENSUS` similarly arms the emitted-module entry
+/// census before tracing starts.
 ///
 /// Exempt: the names this runner interprets host-side (`PYRE_WASM_*`,
 /// `PYRE_STDLIB`, `MAJIT_STATS`) and `check.py`'s own `PYRE_CHECK_*`
@@ -536,6 +538,33 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
+    if std::env::var_os("PYRE_WASM_TRACE_ENTRY_CENSUS").is_some()
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_trace_entry_census_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
+    if std::env::var_os("PYRE_WASM_REEMIT").is_some()
+        && let Ok(arm) = instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_reemit_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
+    if std::env::var_os("PYRE_WASM_INLINE_BRIDGE").is_some()
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_bridge_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
+    // Parameter bridge entries are the default. The guest has no environment,
+    // so an explicit host-side opt-out must travel through this export before
+    // tracing begins.
+    if std::env::var_os("PYRE_WASM_BRIDGE_PARAMS")
+        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("0" | "false" | "off")))
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_bridge_params_disable")
+    {
+        arm.call(&mut store, ())?;
+    }
 
     let src = source.as_bytes();
     let len = src.len() as u32;
@@ -688,6 +717,24 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "cell_set",
                 "cell_missing",
                 "cell_rebridge",
+                "reemit_failed",
+                "reemit_ok",
+                "inline_ok",
+                "inline_decl_not_direct",
+                "inline_decl_not_loop_closing",
+                "inline_decl_not_reemittable",
+                "inline_decl_already_owned",
+                "inline_decl_frame",
+                "inline_decl_not_header",
+                "inline_decl_no_loop_label",
+                "inline_decl_value_layout",
+                "inline_decl_ref_layout",
+                "inline_decl_missing_label",
+                "inline_decl_other",
+                "bridge_param_ok",
+                "bridge_param_decl_source_frame",
+                "bridge_param_decl_arity",
+                "bridge_param_label_suppressed",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -695,6 +742,20 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 parts.push(format!("{lbl}={n}"));
             }
             eprintln!("[jit-stats] bridge_diag {}", parts.join(" "));
+        }
+        if let Ok(geometry) =
+            instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_inline_geometry_diag")
+        {
+            let mut parts = Vec::new();
+            for i in 0..3 {
+                let packed = geometry.call(&mut store, i).unwrap_or(0);
+                if packed != 0 {
+                    parts.push(format!("{}:{}/{}", i + 1, packed >> 32, packed as u32));
+                }
+            }
+            if !parts.is_empty() {
+                eprintln!("[jit-stats] inline_geometry {}", parts.join(" "));
+            }
         }
         // Per-walk full-body-walk census (diagnostic). Prints the same record
         // the native backends print as `[fbw-census]` under PYRE_FBW_CENSUS,
@@ -1079,6 +1140,21 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // back through their own exports. Absent on a module predating them, in
     // which case the run keeps the old stdout-only, always-0 behaviour.
     let err_bytes = take_guest_stderr(&mut store, &instance, &memory)?;
+    if let Ok(errors) =
+        instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_inline_trial_errors")
+        && let Ok(packed) = errors.call(&mut store, ())
+    {
+        let (ptr, len) = ((packed >> 32) as u32, packed as u32);
+        if len != 0 {
+            let mut bytes = vec![0u8; len as usize];
+            memory.read(&store, ptr as usize, &mut bytes)?;
+            dealloc.call(&mut store, (ptr, len))?;
+            eprintln!(
+                "[jit-stats] inline_trial_errors {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
     // `PYRE_FBW_DEBUG_ABORT` cannot select the walker's decline census in the
     // guest, and its `eprintln!` would reach nothing anyway, so the census
     // comes back through its own export and is printed here. Absent on a
@@ -1126,6 +1202,27 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 }
             }
             Err(_) => eprintln!("[jit-stats] guard_census=unexported"),
+        }
+    }
+    if std::env::var_os("PYRE_WASM_TRACE_ENTRY_CENSUS").is_some() {
+        match instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_trace_entry_census") {
+            Ok(census) => {
+                let census_result: Result<()> = (|| {
+                    let packed = census.call(&mut store, ())?;
+                    let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+                    if clen != 0 {
+                        let mut bytes = vec![0u8; clen as usize];
+                        memory.read(&store, ptr as usize, &mut bytes)?;
+                        dealloc.call(&mut store, (ptr, clen))?;
+                        eprint!("{}", String::from_utf8_lossy(&bytes));
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = census_result {
+                    eprintln!("pyre-wasm-runner: trace entry census failed: {err}");
+                }
+            }
+            Err(_) => eprintln!("[trace-entry-census] unexported"),
         }
     }
     let exit_code = instance
@@ -1246,6 +1343,20 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
                 Ok(id) => id,
                 Err(e) => {
                     eprintln!("[jit_compile_wasm] {e:?}");
+                    0
+                }
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        "pyre_jit",
+        "jit_replace_wasm",
+        |mut caller: Caller<'_, Host>, func_id: u32, bytes_ptr: u32, bytes_len: u32| -> u32 {
+            match jit_replace(&mut caller, func_id, bytes_ptr, bytes_len) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("[jit_replace_wasm] {e:?}");
                     0
                 }
             }
@@ -1406,7 +1517,11 @@ fn host_read(
 
 /// Compile and instantiate a JIT-emitted trace module, sharing the main
 /// module's linear memory and wiring the `jit_call` trampoline.
-fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
+fn jit_compile_trace(
+    caller: &mut Caller<'_, Host>,
+    bytes_ptr: u32,
+    bytes_len: u32,
+) -> Result<(Table, Func)> {
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
         .data()
@@ -1420,12 +1535,6 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         .context("read trace module bytes")?;
 
     let engine = caller.engine().clone();
-    if std::env::var_os("PYRE_WASM_DUMP_ALL_TRACES").is_some() {
-        match wasmprinter::print_bytes(&bytes) {
-            Ok(wat) => eprintln!("=== trace module ({} bytes) ===\n{wat}", bytes.len()),
-            Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
-        }
-    }
     let compile_start = std::time::Instant::now();
     let module_result = Module::new(&engine, &bytes);
     caller.data_mut().jit_compile_time_ns += compile_start.elapsed().as_nanos();
@@ -1484,18 +1593,66 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
 
     let instance =
         Instance::new(&mut *caller, &module, &externs).context("instantiate trace module")?;
+    if std::env::var_os("PYRE_WASM_DUMP_ALL_TRACES").is_some() {
+        let trace_id = instance
+            .get_global(&mut *caller, "trace_entry_census_id")
+            .and_then(|global| global.get(&mut *caller).i64())
+            .map(|id| format!(" trace_id={id}"))
+            .unwrap_or_default();
+        match wasmprinter::print_bytes(&bytes) {
+            Ok(wat) => eprintln!(
+                "=== trace module{trace_id} ({} bytes) ===\n{wat}",
+                bytes.len()
+            ),
+            Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
+        }
+    }
     let trace = instance
         .get_func(&mut *caller, "trace")
         .context("trace module is missing its `trace` export")?;
 
+    Ok((table, trace))
+}
+
+/// Compile and instantiate a trace, then append its export to the trace table.
+fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
+    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     // Register the trace into the shared indirect function table so it is
-    // reachable by table index. `grow` returns the previous size, i.e. the
-    // index of the newly appended entry, which becomes this trace's id.
+    // reachable by table index. `grow` returns the newly appended slot.
     let slot = table
         .grow(&mut *caller, 1, Ref::Func(Some(trace)))
         .context("register trace into shared table")? as u32;
-
     Ok(slot)
+}
+
+/// Compile and instantiate a trace, then replace an existing trace-table slot.
+fn jit_replace(
+    caller: &mut Caller<'_, Host>,
+    func_id: u32,
+    bytes_ptr: u32,
+    bytes_len: u32,
+) -> Result<u32> {
+    if (func_id as u64) < caller.data().trace_base {
+        return Err(Error::msg(format!(
+            "jit_replace_wasm: id {func_id} is not a trace slot"
+        )));
+    }
+    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    if !matches!(
+        table.get(&mut *caller, func_id as u64),
+        Some(Ref::Func(Some(_)))
+    ) {
+        return Err(Error::msg(format!(
+            "jit_replace_wasm: id {func_id} is not a live trace"
+        )));
+    }
+    // The Store retains every instantiated module. Replacing this table entry
+    // therefore leaves an old trace live when a non-tail indirect call still
+    // has one of its frames on the guest stack.
+    table
+        .set(&mut *caller, func_id as u64, Ref::Func(Some(trace)))
+        .context("replace trace in shared table")?;
+    Ok(func_id)
 }
 
 /// Run a previously compiled trace, returning its guard-exit index.

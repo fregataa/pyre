@@ -17,9 +17,9 @@ use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use wasm_encoder::{
-    BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    ImportSection, InstructionSink, MemArg, MemoryType, Module, RefType, TableType, TypeSection,
-    ValType,
+    BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
+    FunctionSection, GlobalSection, GlobalType, ImportSection, InstructionSink, MemArg, MemoryType,
+    Module, RefType, TableType, TypeSection, ValType,
 };
 
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
@@ -34,6 +34,9 @@ const UMULHI_SCRATCH: u32 = 5;
 struct ValueLocals {
     by_id: Vec<Option<u32>>,
     types: Vec<ValType>,
+    /// First non-parameter local.  Ordinary traces have one frame-pointer
+    /// parameter; parameter-entry bridges have that plus their fail values.
+    first_local: u32,
 }
 
 impl ValueLocals {
@@ -57,7 +60,7 @@ impl ValueLocals {
         has_authoritative_type[i] |= authoritative;
     }
 
-    fn collect(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> Self {
+    fn collect(inputargs: &[InputArg], ops: &[Op], num_vars: u32, first_local: u32) -> Self {
         let mut by_id = vec![None; num_vars as usize];
         let mut id_types = vec![ValType::I64; num_vars as usize];
         let mut has_authoritative_type = vec![false; num_vars as usize];
@@ -133,11 +136,15 @@ impl ValueLocals {
         let mut types = Vec::new();
         for (id, slot) in by_id.iter_mut().enumerate() {
             if slot.is_some() {
-                *slot = Some(types.len() as u32 + 1);
+                *slot = Some(types.len() as u32 + first_local);
                 types.push(id_types[id]);
             }
         }
-        Self { by_id, types }
+        Self {
+            by_id,
+            types,
+            first_local,
+        }
     }
 
     fn local(&self, id: u32) -> u32 {
@@ -149,7 +156,7 @@ impl ValueLocals {
     }
 
     fn ty(&self, id: u32) -> ValType {
-        self.types[(self.local(id) - 1) as usize]
+        self.types[(self.local(id) - self.first_local) as usize]
     }
 
     fn count(&self) -> u32 {
@@ -158,6 +165,16 @@ impl ValueLocals {
 
     fn types(&self) -> &[ValType] {
         &self.types
+    }
+
+    /// Local index immediately after the dense value-local range.
+    fn end_local(&self) -> u32 {
+        self.first_local + self.count()
+    }
+
+    /// Last dense value-local index, used as the base before scratch locals.
+    fn last_local(&self) -> u32 {
+        self.end_local() - 1
     }
 }
 
@@ -1543,7 +1560,7 @@ pub struct GuardExit {
 /// The default sets `supports_guard_gc_type = false`, matching
 /// `AbstractCPU.supports_guard_gc_type` in `backend/model.py:21`; the
 /// codegen arms assert this flag before reading any other field.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct GuardGcTypeInfo {
     pub supports_guard_gc_type: bool,
     /// `get_translated_info_for_typeinfo()` = (base, shift, sizeof_ti).
@@ -1893,9 +1910,20 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     (guards, max_var)
 }
 
+/// Number of guard/finish exits a module will need bridge-dispatch cells for.
+/// Cell ownership belongs to the compiled trace, outside module generation.
+pub fn guard_exit_count(inputargs: &[InputArg], ops: &[Op]) -> usize {
+    collect_guards_and_vars(inputargs, ops).0.len()
+}
+
 /// Dense wasm-local assignment and type lookup for each addressed SSA value.
-fn collect_value_types(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> ValueLocals {
-    ValueLocals::collect(inputargs, ops, num_vars)
+fn collect_value_types(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    num_vars: u32,
+    first_local: u32,
+) -> ValueLocals {
+    ValueLocals::collect(inputargs, ops, num_vars, first_local)
 }
 
 /// Assign each Ref-typed value (input arg or op result) a dense home-slot
@@ -1918,7 +1946,14 @@ fn collect_value_types(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> Val
 /// On native the trace is never executed, so the dispatch is omitted and no
 /// cells are needed — returning `(0, None)` keeps the emitted module
 /// byte-identical to the pre-chaining output and allocates nothing.
-fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
+pub fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
+    // `Box<[u32; 0]>` has a non-null dangling `as_mut_ptr()`.  The pointer is
+    // not a dispatch table, so preserve the no-dispatch representation even
+    // on wasm where allocating that empty box would otherwise make the
+    // epilogue load an uninitialised bridge-slot local.
+    if num_guards == 0 {
+        return (0, None);
+    }
     #[cfg(target_arch = "wasm32")]
     {
         let mut cells = vec![0u32; num_guards].into_boxed_slice();
@@ -2014,6 +2049,7 @@ pub struct CaInlineParams {
 /// backend lowers as `malloc_cond`: load free, bump, compare top, call the
 /// slow path only on overflow). `None` keeps every allocation on the
 /// `wasm_jit_alloc` helper call.
+#[derive(Clone)]
 pub struct NurseryAllocParams {
     /// Linear-memory address of the GC's `nursery_free` bump pointer.
     pub free_addr: u32,
@@ -2043,54 +2079,202 @@ pub struct AllocHelpers {
     pub new_array_oldgen_fn_ptr: i64,
 }
 
-type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize, u32, Option<Box<[u32]>>);
+type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
+
+/// Owned inputs for one wasm module build.  A loop retains this after its
+/// first build so it can emit the same trace again without revisiting mutable
+/// backend state such as the constants pool or GC-reference interning pass.
+pub struct ModuleBuildInputs {
+    pub inputargs: Vec<InputArg>,
+    /// These are the post-intern operations.  Re-interning them would lose the
+    /// already allocated GC-table base encoded by `gc_table_base`.
+    pub ops: Vec<Op>,
+    /// Loop-closing bridge regions emitted inside this loop's wasm function.
+    /// Their value ids are already in the owning trace's global space; retain
+    /// them verbatim so every analysis and the generated locals see the same
+    /// identities as the bridge metadata.
+    pub inlined_bridges: Vec<InlinedBridge>,
+    pub constants: indexmap::IndexMap<u32, i64>,
+    pub vtable_offset: Option<usize>,
+    pub classptr_to_typeid: HashMap<i64, u32>,
+    pub guard_gc_type_info: GuardGcTypeInfo,
+    pub alloc: AllocHelpers,
+    pub wb_fn_ptr: i64,
+    pub nursery: Option<NurseryAllocParams>,
+    pub invalidated_flag_addr: u32,
+    pub gc_table_base: u32,
+    pub fail_index_base: u32,
+    pub bridge_cells_base: u32,
+    /// A bridge reached from an armed guard takes its fail values as `i64`
+    /// parameters after the frame pointer. Float bits use the same i64 carrier,
+    /// so a single function type per arity covers every failure signature.
+    pub bridge_entry_arity: Option<usize>,
+    /// Emit fixed-arity guard-to-bridge parameter tail-call arms for this module.
+    pub bridge_param_dispatch: bool,
+    /// Guest-memory counters baked into an armed trace-entry census module.
+    /// `None` keeps the generated module byte-identical to the normal path.
+    pub trace_entry_census: Option<crate::TraceEntryCensusStorage>,
+    pub external_jump_slot: u32,
+    pub external_jump_key: u32,
+    pub frame: FrameGeometry,
+    pub ca: CaParams,
+}
+
+pub struct InlinedBridge {
+    /// Per-trace fail index of the guard that enters this region.
+    pub source_fail_index: u32,
+    pub trace_id: u64,
+    pub inputargs: Vec<InputArg>,
+    pub ops: Vec<Op>,
+    /// Base of this already-interned region's GC table. Each region retains
+    /// its own roots; codegen selects it by the LoadFromGcTable producer.
+    pub gc_table_base: u32,
+}
+
+/// Whether the exact operation stream emitted for `inputs` has a local loop
+/// back-edge target.  An inline bridge transfers with `br`, which can only
+/// target the wasm `loop` opened for that LABEL.
+pub fn merged_stream_has_loop_label(inputs: &ModuleBuildInputs) -> bool {
+    let mut ops = inputs.ops.clone();
+    for bridge in &inputs.inlined_bridges {
+        ops.extend(bridge.ops.iter().cloned());
+    }
+    find_loop_label_index(&ops).is_some_and(|label_idx| label_idx < inputs.ops.len())
+}
+
+impl Clone for InlinedBridge {
+    fn clone(&self) -> Self {
+        Self {
+            source_fail_index: self.source_fail_index,
+            trace_id: self.trace_id,
+            inputargs: self
+                .inputargs
+                .iter()
+                .map(InputArg::fresh_value_copy)
+                .collect(),
+            ops: self.ops.clone(),
+            gc_table_base: self.gc_table_base,
+        }
+    }
+}
+
+impl Clone for ModuleBuildInputs {
+    fn clone(&self) -> Self {
+        Self {
+            inputargs: self
+                .inputargs
+                .iter()
+                .map(InputArg::fresh_value_copy)
+                .collect(),
+            ops: self.ops.clone(),
+            inlined_bridges: self.inlined_bridges.clone(),
+            constants: self.constants.clone(),
+            vtable_offset: self.vtable_offset,
+            classptr_to_typeid: self.classptr_to_typeid.clone(),
+            guard_gc_type_info: self.guard_gc_type_info.clone(),
+            alloc: self.alloc,
+            wb_fn_ptr: self.wb_fn_ptr,
+            nursery: self.nursery.clone(),
+            invalidated_flag_addr: self.invalidated_flag_addr,
+            gc_table_base: self.gc_table_base,
+            fail_index_base: self.fail_index_base,
+            bridge_cells_base: self.bridge_cells_base,
+            bridge_entry_arity: self.bridge_entry_arity,
+            bridge_param_dispatch: self.bridge_param_dispatch,
+            trace_entry_census: self.trace_entry_census,
+            external_jump_slot: self.external_jump_slot,
+            external_jump_key: self.external_jump_key,
+            frame: self.frame,
+            ca: self.ca.clone(),
+        }
+    }
+}
 
 /// Build a wasm module from majit IR.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "this is the single code-generation phase boundary and keeps each RPython backend input—IR, descriptors, GC state, frame geometry, and chaining state—explicit and independently auditable"
-)]
 pub fn build_wasm_module(
-    inputargs: &[InputArg],
-    ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
-    vtable_offset: Option<usize>,
-    classptr_to_typeid: &HashMap<i64, u32>,
-    guard_gc_type_info: &GuardGcTypeInfo,
-    alloc: AllocHelpers,
-    wb_fn_ptr: i64,
-    // Inline nursery-bump fast path for eligible `New`/`NewWithVtable`
-    // (see `NurseryAllocParams`); `None` keeps allocations on the helper.
-    nursery: Option<&NurseryAllocParams>,
-    // Address of the owning JitCellToken.invalidated AtomicBool in shared
-    // linear memory. GUARD_NOT_INVALIDATED reads this byte at runtime, like
-    // the native backends bake the same Arc allocation's address.
-    invalidated_flag_addr: u32,
-    // Base address of this trace's per-loop `GcTable` slot array in shared
-    // linear memory (`gcreftracer.py:9` `array_base_addr`), baked as the
-    // `LoadFromGcTable` base immediate exactly as the native backends bake
-    // it. `0` when the trace holds no reference constant.
-    gc_table_base: u32,
-    fail_index_base: u32,
-    // Table slot of the loop a JUMP-with-no-local-LABEL re-enters (a loop-closing
-    // bridge). `0` for a loop trace (its JUMP is a local back-edge `br`) and for a
-    // straight-line bridge (no JUMP). When set, the terminal external JUMP writes
-    // the loop's next inputargs into the frame and `return_call_indirect`s the
-    // loop's table slot — a wasm tail call, so the loop⇄bridge cycle runs at
-    // constant stack depth instead of growing one frame per iteration.
-    external_jump_slot: u32,
-    // Resume-at-LABEL dispatch key for the terminal external JUMP (`target
-    // label ordinal + 1`, or 0 for a non-peeled target); see `build_function`.
-    external_jump_key: u32,
-    // Frozen layout of the frame this module executes on. A chained bridge
-    // receives its source token's layout; a loop receives its own compact
-    // layout at first compilation.
-    frame: FrameGeometry,
-    // Self-recursive CALL_ASSEMBLER arm parameters (`PYRE_WASM_CA`); `emit_ca`
-    // off keeps the module byte-identical.
-    ca: CaParams,
+    inputs: &ModuleBuildInputs,
 ) -> Result<BuildWasmModuleOutput, BackendError> {
-    let (mut guards, num_vars) = collect_guards_and_vars(inputargs, ops);
+    let ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges,
+        constants,
+        vtable_offset,
+        classptr_to_typeid,
+        guard_gc_type_info,
+        alloc,
+        wb_fn_ptr,
+        nursery,
+        invalidated_flag_addr,
+        gc_table_base,
+        fail_index_base,
+        bridge_cells_base,
+        bridge_entry_arity,
+        bridge_param_dispatch,
+        trace_entry_census,
+        external_jump_slot,
+        external_jump_key,
+        frame,
+        ca,
+    } = inputs;
+    // A bridge region has no function-entry loads, but its InputArgs and ops
+    // still need locals, liveness, homes, guard exits, and call signatures.
+    // Analyse the complete function as one stream while keeping `inputargs`
+    // below as the actual function-entry list.
+    // A normal module is emitted directly from its retained vectors.  Keep
+    // that path allocation-free: code generation runs in the guest process,
+    // so transient merged-stream allocations can otherwise perturb the next
+    // collection boundary before any bridge is attached.
+    let mut merged_inputargs = Vec::new();
+    let mut merged_ops = Vec::new();
+    let mut gc_table_bases = HashMap::new();
+    let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
+        (inputargs, ops)
+    } else {
+        merged_inputargs.extend(inputargs.iter().map(InputArg::fresh_value_copy));
+        merged_ops.extend(ops.iter().cloned());
+        for bridge in inlined_bridges {
+            merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
+            for op in &bridge.ops {
+                if op.opcode == OpCode::LoadFromGcTable {
+                    gc_table_bases.insert(op.pos.get().raw(), bridge.gc_table_base);
+                }
+            }
+            merged_ops.extend(bridge.ops.iter().cloned());
+        }
+        (&merged_inputargs, &merged_ops)
+    };
+    let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
+
+    // An inlined bridge branches back into the owner with wasm `br`.  The
+    // merged stream must therefore contain the local LABEL that opens the
+    // wasm loop; a label-less cross-loop bridge has no in-function target.
+    if !inlined_bridges.is_empty() && !merged_stream_has_loop_label(inputs) {
+        return Err(BackendError::Unsupported(
+            "wasm backend: inlined bridge stream has no local loop LABEL".into(),
+        ));
+    }
+    for bridge in inlined_bridges {
+        if bridge.ops.is_empty() {
+            return Err(BackendError::Unsupported(
+                "wasm backend: inlined bridge stream has an empty region".into(),
+            ));
+        }
+        let source_guard = guards
+            .get(bridge.source_fail_index as usize)
+            .ok_or_else(|| {
+                BackendError::Unsupported(
+                    "wasm backend: inlined bridge source guard is outside the owner stream".into(),
+                )
+            })?;
+        let source_args = source_guard.fail_arg_refs.len();
+        if source_args != bridge.inputargs.len() {
+            return Err(BackendError::Unsupported(format!(
+                "wasm backend: inlined bridge input arity {} differs from source guard arity {source_args}",
+                bridge.inputargs.len(),
+            )));
+        }
+    }
 
     // Every trace's guard/finish exits draw their indices from ONE global
     // fail-index space (`failguard::FAIL_DESCR_REGISTRY`): a cross-trace chain
@@ -2118,22 +2302,33 @@ pub fn build_wasm_module(
     // into its CA bridge, and a BRIDGE's own guards chain nested sub-bridges the
     // same way (a hot guard inside a chained bridge would otherwise round-trip
     // to the host forever). So any guarded trace wants dispatch cells.
-    let want_dispatch = !guards.is_empty();
-    let (cells_base, cells_owner) = if want_dispatch {
-        alloc_bridge_cells(guards.len())
+    let bridge_dispatch = *bridge_cells_base != 0;
+    // All boundary values use an i64 carrier, including raw Float bits. That
+    // makes the call type depend only on arity while preserving f64 payloads.
+    let bridge_param_arities: Vec<usize> = if *bridge_param_dispatch && bridge_dispatch {
+        let mut arities: Vec<usize> = guards
+            .iter()
+            .map(|guard| guard.fail_arg_refs.len())
+            .collect();
+        arities.sort_unstable();
+        arities.dedup();
+        arities
     } else {
-        (0, None)
+        Vec::new()
     };
-    let bridge_dispatch = cells_base != 0;
 
     // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
     // `[1, 1 + max(num inputs, max fail args))`. They precede the dispatch key,
     // Ref homes, and the always-present tail call area; a chained bridge must
     // fit the source token's frozen value-slot count before it can share that
     // frame.
-    let label_resume = LabelResumeData::collect(inputargs, ops);
-    let max_value_slots = normal_frame_value_slots(inputargs, ops) + label_resume.scalar_slots;
+    let label_resume = LabelResumeData::collect(&analysis_inputargs, &analysis_ops);
+    let max_value_slots =
+        normal_frame_value_slots(&analysis_inputargs, &analysis_ops) + label_resume.scalar_slots;
     if max_value_slots > frame.value_slots {
+        if !inlined_bridges.is_empty() {
+            super::record_inline_geometry(max_value_slots, frame.value_slots);
+        }
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {max_value_slots} frame value slots exceed frozen frame layout \
              ({})",
@@ -2141,11 +2336,33 @@ pub fn build_wasm_module(
         )));
     }
 
-    let value_types = collect_value_types(inputargs, ops, num_vars);
-    let ref_values = RefValues::collect(inputargs, ops);
-    let ref_homes = RefHomes::collect(inputargs, ops, ca.emit_ca, &label_resume.captured_refs);
+    let entry_param_count = 1 + bridge_entry_arity.unwrap_or(0) as u32;
+    if let Some(arity) = bridge_entry_arity
+        && *arity != inputargs.len()
+    {
+        return Err(BackendError::Unsupported(format!(
+            "wasm backend: bridge parameter arity {arity} differs from input arity {}",
+            inputargs.len(),
+        )));
+    }
+    let value_types = collect_value_types(
+        &analysis_inputargs,
+        &analysis_ops,
+        num_vars,
+        entry_param_count,
+    );
+    let ref_values = RefValues::collect(&analysis_inputargs, &analysis_ops);
+    let ref_homes = RefHomes::collect(
+        &analysis_inputargs,
+        &analysis_ops,
+        ca.emit_ca,
+        &label_resume.captured_refs,
+    );
     let num_ref_homes = ref_homes.len();
-    if num_ref_homes > frame.ordinary_home_slots() || !label_resume.supported_by(frame) {
+    if num_ref_homes > frame.ordinary_home_slots() || !label_resume.supported_by(*frame) {
+        if !inlined_bridges.is_empty() {
+            super::record_inline_geometry(num_ref_homes, frame.ordinary_home_slots());
+        }
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {num_ref_homes} ordinary ref homes and {} LABEL ref captures exceed frozen frame layout ({}, {})",
             label_resume.ref_slots,
@@ -2176,7 +2393,7 @@ pub fn build_wasm_module(
     // residual helpers, including the CA arm's inline fast path, use
     // `call_indirect` and need no import, although their frozen frame still
     // keeps the tail call area for future bridges.
-    let needs_call = has_trampoline_calls(inputargs, ops, ca.emit_ca);
+    let needs_call = has_trampoline_calls(&analysis_inputargs, &analysis_ops, ca.emit_ca);
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
@@ -2184,7 +2401,7 @@ pub fn build_wasm_module(
     // are none. Each distinct arity `0..=max` gets its own function type
     // (declared below) so those arms can `call_indirect` with a static type.
     let residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
-        let scanned = ops
+        let scanned = analysis_ops
             .iter()
             .filter_map(|op| direct_helper_i64_arity(op, &ref_values))
             .max();
@@ -2210,7 +2427,7 @@ pub fn build_wasm_module(
     // trace gets stable type indices while declaring each signature once.
     let mut float_residual_sigs = Vec::new();
     if WASM_DIRECT_RESIDUAL_CALL {
-        for op in ops {
+        for op in analysis_ops {
             if let Some(sig) = residual_call_float_sig(op)
                 && !float_residual_sigs.contains(&sig)
             {
@@ -2222,7 +2439,10 @@ pub fn build_wasm_module(
     // i64- and f64-result types. As with the uniform i64 family, declaring
     // `0..=max` makes each type index a base plus the call arity.
     let true_void_residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
-        ops.iter().filter_map(residual_call_void_true_arity).max()
+        analysis_ops
+            .iter()
+            .filter_map(residual_call_void_true_arity)
+            .max()
     } else {
         None
     };
@@ -2242,40 +2462,63 @@ pub fn build_wasm_module(
 
     // Type section
     let mut types = TypeSection::new();
-    // Type 0: trace function (param i32) -> (result i32)
+    // Type 0 remains the loop/host entry signature. A bridge parameter entry
+    // receives a separate type so its terminal JUMP can still call a loop.
     types.ty().function(vec![ValType::I32], vec![ValType::I32]);
-    if needs_call {
-        // Type 1: `jit_call_compact(base, call_area_ofs)` trampoline.
+    let mut next_type_idx = 1u32;
+    let bridge_entry_type_idx = bridge_entry_arity.map(|arity| {
+        let idx = next_type_idx;
+        next_type_idx += 1;
+        types.ty().function(
+            std::iter::once(ValType::I32)
+                .chain(std::iter::repeat_n(ValType::I64, arity))
+                .collect::<Vec<_>>(),
+            vec![ValType::I32],
+        );
+        idx
+    });
+    let mut bridge_param_type_indices = indexmap::IndexMap::new();
+    if let (Some(arity), Some(idx)) = (*bridge_entry_arity, bridge_entry_type_idx) {
+        bridge_param_type_indices.insert(arity, idx);
+    }
+    let jit_call_type_idx = if needs_call {
+        let idx = next_type_idx;
+        next_type_idx += 1;
         types
             .ty()
             .function(vec![ValType::I32, ValType::I32], vec![]);
-    }
+        Some(idx)
+    } else {
+        None
+    };
     // Residual-call types follow: `(i64×n) -> i64` for arity `n`, indexed by
     // `residual_type_base + n`. `residual_type_base` = the count of types above.
-    let residual_type_base = 1 + needs_call as u32;
+    let residual_type_base = next_type_idx;
     if let Some(max) = residual_max_arity {
         for n in 0..=max {
             types
                 .ty()
                 .function(vec![ValType::I64; n], vec![ValType::I64]);
         }
+        next_type_idx += max as u32 + 1;
     }
     // CA deopt-helper type `(i64 frame_ptr, i64 compiled_ptr) -> i64`. The CA arm
     // `call_indirect`s `wasm_ca_resume_deopt` through it when a self-recursive
     // callee leaves its trace through a guard (a deopt). Declared after the
     // residual-call type family so its index is independent of which residual
     // arities the bridge happens to use.
-    let ca_helper_type_idx = residual_type_base + residual_max_arity.map_or(0, |m| m as u32 + 1);
+    let ca_helper_type_idx = next_type_idx;
     if ca.emit_ca {
         types
             .ty()
             .function(vec![ValType::I64, ValType::I64], vec![ValType::I64]);
+        next_type_idx += 1;
     }
     // Float residual types follow all pre-existing direct helper types. Their
     // parameter sequence comes from the call descr (`i64` for Int/Ref, `f64`
     // for Float) and their result is always `f64`; the emitter uses this map to
     // select the exact `call_indirect` type for each callee.
-    let float_residual_type_base = ca_helper_type_idx + ca.emit_ca as u32;
+    let float_residual_type_base = next_type_idx;
     let float_residual_type_indices = float_residual_sigs
         .iter()
         .cloned()
@@ -2285,12 +2528,26 @@ pub fn build_wasm_module(
     for sig in float_residual_type_indices.keys() {
         types.ty().function(sig.clone(), vec![ValType::F64]);
     }
-    let true_void_residual_type_base =
-        float_residual_type_base + float_residual_type_indices.len() as u32;
+    next_type_idx += float_residual_type_indices.len() as u32;
+    let true_void_residual_type_base = next_type_idx;
     if let Some(max) = true_void_residual_max_arity {
         for n in 0..=max {
             types.ty().function(vec![ValType::I64; n], vec![]);
         }
+        next_type_idx += max as u32 + 1;
+    }
+    for arity in bridge_param_arities {
+        if bridge_param_type_indices.contains_key(&arity) {
+            continue;
+        }
+        bridge_param_type_indices.insert(arity, next_type_idx);
+        next_type_idx += 1;
+        types.ty().function(
+            std::iter::once(ValType::I32)
+                .chain(std::iter::repeat_n(ValType::I64, arity))
+                .collect::<Vec<_>>(),
+            vec![ValType::I32],
+        );
     }
     module.section(&types);
 
@@ -2309,7 +2566,11 @@ pub fn build_wasm_module(
     );
     if needs_call {
         // Import jit_call trampoline as function index 0
-        imports.import("env", "jit_call_compact", EntityType::Function(1));
+        imports.import(
+            "env",
+            "jit_call_compact",
+            EntityType::Function(jit_call_type_idx.expect("jit_call type")),
+        );
     }
     if needs_table {
         // Import the host's shared indirect function table as table index 0.
@@ -2334,13 +2595,32 @@ pub fn build_wasm_module(
 
     // Function section
     let mut functions = FunctionSection::new();
-    functions.function(0); // type 0
+    functions.function(bridge_entry_type_idx.unwrap_or(0));
     module.section(&functions);
+
+    // Only armed modules carry this global. The runner reads it after
+    // instantiation to give `PYRE_WASM_DUMP_ALL_TRACES` the same trace id the
+    // census reports; it is omitted entirely from ordinary trace modules.
+    if let Some(census) = trace_entry_census {
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: false,
+                shared: false,
+            },
+            &ConstExpr::i64_const(census.trace_id as i64),
+        );
+        module.section(&globals);
+    }
 
     // Export section: trace function index depends on whether we imported jit_call
     let trace_func_idx = if needs_call { 1 } else { 0 };
     let mut exports = ExportSection::new();
     exports.export("trace", ExportKind::Func, trace_func_idx);
+    if trace_entry_census.is_some() {
+        exports.export("trace_entry_census_id", ExportKind::Global, 0);
+    }
     module.section(&exports);
 
     // Code section
@@ -2348,51 +2628,53 @@ pub fn build_wasm_module(
     let jit_call_idx = if needs_call { Some(0u32) } else { None };
     let func = build_function(
         inputargs,
-        ops,
+        &analysis_inputargs,
+        &analysis_ops,
+        inlined_bridges,
         constants,
         num_vars,
         &value_types,
         jit_call_idx,
-        vtable_offset,
+        *vtable_offset,
         classptr_to_typeid,
         guard_gc_type_info,
-        alloc,
-        wb_fn_ptr,
-        nursery,
+        *alloc,
+        *wb_fn_ptr,
+        nursery.as_ref(),
         &ref_values,
         &ref_homes,
         &label_resume,
-        cells_base,
+        *bridge_cells_base,
         bridge_dispatch,
-        invalidated_flag_addr,
-        gc_table_base,
-        fail_index_base,
-        external_jump_slot,
-        external_jump_key,
-        frame,
+        *bridge_entry_arity,
+        &bridge_param_type_indices,
+        *invalidated_flag_addr,
+        *gc_table_base,
+        &gc_table_bases,
+        *fail_index_base,
+        *external_jump_slot,
+        *external_jump_key,
+        *frame,
         residual_max_arity.map(|_| residual_type_base),
         &float_residual_type_indices,
         true_void_residual_max_arity.map(|_| true_void_residual_type_base),
-        ca,
+        ca.clone(),
         bridge_finish_fi,
         ca_helper_type_idx,
+        *trace_entry_census,
     )?;
     codes.function(&func);
     module.section(&codes);
 
-    Ok((
-        module.finish(),
-        guards,
-        num_ref_homes,
-        cells_base,
-        cells_owner,
-    ))
+    Ok((module.finish(), guards, num_ref_homes))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_function(
+    entry_inputargs: &[InputArg],
     inputargs: &[InputArg],
     ops: &[Op],
+    inlined_bridges: &[InlinedBridge],
     constants: &indexmap::IndexMap<u32, i64>,
     num_vars: u32,
     value_types: &ValueLocals,
@@ -2408,8 +2690,11 @@ fn build_function(
     label_resume: &LabelResumeData,
     cells_base: u32,
     bridge_dispatch: bool,
+    bridge_entry_arity: Option<usize>,
+    bridge_param_type_indices: &indexmap::IndexMap<usize, u32>,
     invalidated_flag_addr: u32,
     gc_table_base: u32,
+    gc_table_bases: &HashMap<u32, u32>,
     fail_index_base: u32,
     external_jump_slot: u32,
     // Resume-at-LABEL dispatch key the terminal external JUMP writes before
@@ -2441,37 +2726,72 @@ fn build_function(
     // module type section when `ca.emit_ca`. The CA arm uses it to `call_indirect`
     // `ca.deopt_helper_slot` for a deopted callee.
     ca_helper_type_idx: u32,
+    trace_entry_census: Option<crate::TraceEntryCensusStorage>,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
     // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
     // branches are retained solely for the direct-family-disabled baseline.
     debug_assert!(!ca.emit_ca || residual_type_base.is_some());
-    let num_value_locals = value_types.count();
+    let value_locals_end = value_types.end_local();
     // Value locals occupy the dense local range beginning at 1; reserve
     // `UMULHI_SCRATCH` i64 locals past them for the `UintMulHigh`
     // 32-bit-split expansion, plus one i64 local for the pending overflow flag.
-    // One i32 local past those holds the bridge table slot for the epilogue
-    // `call_indirect` dispatch (unused when `!bridge_dispatch`).
-    let ovf_flag_local = num_value_locals + UMULHI_SCRATCH + 1;
-    let bridge_slot_local = num_value_locals + UMULHI_SCRATCH + 2;
+    // One i32 local past those holds a bridge table slot while a guard arm
+    // performs its direct indirect tail call (or while the frame-entry
+    // dispatcher is enabled without parameter entries).
+    let ovf_flag_local = value_locals_end + UMULHI_SCRATCH;
+    let bridge_slot_local = ovf_flag_local + 1;
     // The self-recursive CALL_ASSEMBLER arm needs two more i32 scratch locals:
     // `ca_cfp_local` (the current callee frame pointer) and `ca_fi_local` (the
     // returned frame[0] fail index). Reserve them only under `emit_ca` so a
     // flag-off module keeps exactly one i32 local (byte-identical).
-    let ca_cfp_local = num_value_locals + UMULHI_SCRATCH + 3;
-    let ca_fi_local = num_value_locals + UMULHI_SCRATCH + 4;
+    let ca_cfp_local = bridge_slot_local + 1;
+    let ca_fi_local = ca_cfp_local + 1;
     // Extra i32 scratches when the inline nursery-bump fast path is armed:
     // one holds the loaded `nursery_free` across the bump/commit sequence;
     // runtime varsize array allocation also needs one for the computed
     // total/new-free word.
-    let base_i32_locals: u32 = if ca.emit_ca { 3 } else { 1 };
-    let alloc_scratch_local = num_value_locals + UMULHI_SCRATCH + 2 + base_i32_locals;
+    let base_i32_locals: u32 = 1 + if ca.emit_ca { 2 } else { 0 };
+    let alloc_scratch_local = bridge_slot_local + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
+    // A keyed census must preserve the raw dispatch value until `br_table`.
+    // Its counter-address scratch cannot share `bridge_slot_local`, because
+    // the latter would replace the selector with a guest-memory address.
+    let trace_entry_key_local = bridge_slot_local
+        + base_i32_locals
+        + if nursery.is_some() || ca.inline.is_some() {
+            2
+        } else {
+            0
+        };
+    let trace_entry_needs_key_local = trace_entry_census.is_some() && is_resumable_peeled(ops);
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
     debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
     debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
+    let inline_guards: Vec<InlineGuard<'_>> = inlined_bridges
+        .iter()
+        .enumerate()
+        .map(|(region, bridge)| InlineGuard {
+            guard_idx: fail_index_base + bridge.source_fail_index,
+            inputargs: &bridge.inputargs,
+            // Blocks open in reverse attach order, making region 0 innermost.
+            // This is the target depth at statement level; the guard `if`
+            // contributes the final +1 in `emit_guard_if_exit`.
+            branch_depth: region as u32,
+        })
+        .collect();
+    let guard_dispatch = BridgeDispatch {
+        cells_base,
+        fail_index_base,
+        bridge_slot_local,
+        enabled: bridge_dispatch,
+        param_type_indices: bridge_param_type_indices,
+        inline_guards: &inline_guards,
+        ref_homes,
+        frame,
+    };
     let mut locals = Vec::new();
     let mut start = 0;
     while start < value_types.types().len() {
@@ -2494,7 +2814,8 @@ fn build_function(
                 2
             } else {
                 0
-            },
+            }
+            + u32::from(trace_entry_needs_key_local),
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -2519,6 +2840,15 @@ fn build_function(
     // re-execute the complete loop body.
     let loop_label_idx = find_loop_label_index(ops);
     let has_loop = loop_label_idx.is_some();
+    let bridge_op_count = inlined_bridges
+        .iter()
+        .map(|bridge| bridge.ops.len())
+        .sum::<usize>();
+    let bridge_start = ops.len().checked_sub(bridge_op_count).ok_or_else(|| {
+        BackendError::Unsupported(
+            "wasm backend: inlined bridge operations are not contained in the merged stream".into(),
+        )
+    })?;
 
     // Def / last-use positions for the post-collection Ref reload filter.
     let liveness = HomeLiveness::collect(inputargs, ops);
@@ -2584,6 +2914,24 @@ fn build_function(
         sink.local_get(0);
         sink.i64_load(mem64(frame.dispatch_key_ofs));
         sink.i32_wrap_i64();
+        // Without a census the key is already where `br_table` wants it. Only
+        // the census needs it a second time, so only the census pays to keep a
+        // copy: a `tee`/`get` pair here costs every entry into a peeled module.
+        if let Some(census) = trace_entry_census {
+            let dispatch_key_local = if trace_entry_needs_key_local {
+                trace_entry_key_local
+            } else {
+                bridge_slot_local
+            };
+            sink.local_tee(dispatch_key_local);
+            emit_trace_entry_census(
+                &mut sink,
+                census,
+                bridge_slot_local,
+                Some(dispatch_key_local),
+            );
+            sink.local_get(dispatch_key_local);
+        }
         // Depths at this point, innermost first: D=0, then (C_j, B_j) pairs
         // with C_j at 2j+1. Entry j+1 of the table targets C_j; entry 0 and
         // the default target D (the entry path).
@@ -2592,6 +2940,8 @@ fn build_function(
             .collect();
         sink.br_table(br_targets, 0);
         sink.end(); // end D $dispatch — key-0 entry path continues here
+    } else if let Some(census) = trace_entry_census {
+        emit_trace_entry_census(&mut sink, census, bridge_slot_local, None);
     }
 
     // Fresh entry owns key 0 and must clear both the trace's ordinary homes
@@ -2637,12 +2987,21 @@ fn build_function(
     // bridge never scatters its frame-passed label values into the function
     // inputargs' home slots; those stay null-initialized (GC-safe) and the
     // resume loader sets the live label-arg homes.
-    for (k, ia) in inputargs.iter().enumerate() {
+    for (k, ia) in entry_inputargs.iter().enumerate() {
         let local_idx = value_types.local(ia.index);
-        let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
-        sink.local_get(0).i64_load(mem64(offset));
-        if value_types.ty(ia.index) == ValType::F64 {
-            sink.f64_reinterpret_i64();
+        if bridge_entry_arity.is_some() {
+            // Parameter entries carry raw i64 words after frame_ptr. Float
+            // values use their IEEE bit pattern, matching the guard boundary.
+            sink.local_get(k as u32 + 1);
+            if value_types.ty(ia.index) == ValType::F64 {
+                sink.f64_reinterpret_i64();
+            }
+        } else {
+            let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
+            sink.local_get(0).i64_load(mem64(offset));
+            if value_types.ty(ia.index) == ValType::F64 {
+                sink.f64_reinterpret_i64();
+            }
         }
         sink.local_set(local_idx);
         if let Some(h) = ref_homes.home_id(ia.index) {
@@ -2664,6 +3023,7 @@ fn build_function(
             ref_homes,
             frame,
             gc_table_base,
+            gc_table_bases,
             *result,
         );
     }
@@ -2762,6 +3122,7 @@ fn build_function(
                     ref_homes,
                     frame,
                     gc_table_base,
+                    gc_table_bases,
                     *result,
                 );
             }
@@ -2770,8 +3131,49 @@ fn build_function(
         }
         if Some(op_idx) == loop_label_idx {
             sink.loop_(BlockType::Empty);
+            for _ in inlined_bridges.iter().rev() {
+                sink.block(BlockType::Empty);
+            }
             in_loop_body = true;
         }
+        // The loop's normal body ends with its JUMP, which branches around all
+        // regions. Closing one block before each attached region makes its
+        // body reachable only from the guard that branched to that block.
+        let mut started_bridge_regions = 0usize;
+        if in_loop_body && op_idx >= bridge_start {
+            let mut start = bridge_start;
+            for bridge in inlined_bridges {
+                if op_idx == start {
+                    sink.end();
+                }
+                if op_idx >= start {
+                    started_bridge_regions += 1;
+                }
+                start += bridge.ops.len();
+            }
+        }
+        // The blocks opened at the loop LABEL are closed once at the start of
+        // each appended region.  Compute the remaining nesting directly from
+        // this operation's position, so a label-less stream cannot close a
+        // block that was never opened.
+        let open_bridge_blocks = if in_loop_body {
+            let remaining = inlined_bridges
+                .len()
+                .checked_sub(started_bridge_regions)
+                .ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm backend: inlined bridge region bookkeeping exceeded its open blocks"
+                            .into(),
+                    )
+                })?;
+            u32::try_from(remaining).map_err(|_| {
+                BackendError::Unsupported(
+                    "wasm backend: too many inlined bridge regions for wasm branch depth".into(),
+                )
+            })?
+        } else {
+            0
+        };
         // Depth (from statement level) of the enclosing `block` that guard
         // exits `br` to. Without `key_dispatch`: preamble = 0, loop body = 1
         // (the `loop` sits between the body and block A). With `key_dispatch`
@@ -2781,15 +3183,27 @@ fn build_function(
         // before the loop). Straight-line traces use the universal hot exit
         // block at depth 0.
         let block_exit_depth = match (has_loop, in_loop_body) {
-            (false, _) => 0u32,
+            (false, _) => {
+                if open_bridge_blocks != 0 {
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: inlined bridge regions require a local loop LABEL".into(),
+                    ));
+                }
+                0u32
+            }
             (true, false) => {
+                if open_bridge_blocks != 0 {
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: inlined bridge region opened before its loop LABEL".into(),
+                    ));
+                }
                 if key_dispatch {
                     2 * (num_labels - labels_passed) as u32
                 } else {
                     0u32
                 }
             }
-            (true, true) => 1u32,
+            (true, true) => 1u32 + open_bridge_blocks,
         };
         // The guard whose condition the previous op already pushed and tested.
         // `block_exit_depth` is unchanged across the pair: only a LABEL moves
@@ -2823,6 +3237,7 @@ fn build_function(
                         guard_idx,
                         guard,
                         block_exit_depth,
+                        guard_dispatch,
                     );
                     guard_idx += 1;
                     fused_guard_at = Some(op_idx + 1);
@@ -2946,12 +3361,19 @@ fn build_function(
                         sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                     }
                 }
-                sink.br(0);
+                sink.br(open_bridge_blocks);
             }
 
             OpCode::Finish => {
-                emit_guard_spill(&mut sink, constants, value_types, guard_idx, op);
-                sink.br(block_exit_depth);
+                emit_guard_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                    guard_dispatch,
+                );
                 guard_idx += 1;
             }
 
@@ -2964,6 +3386,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -2975,6 +3398,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -2996,6 +3420,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3009,6 +3434,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3023,6 +3449,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3084,6 +3511,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3106,6 +3534,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3121,6 +3550,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3145,6 +3575,7 @@ fn build_function(
                         guard_idx,
                         op,
                         block_exit_depth,
+                        guard_dispatch,
                     );
                 }
                 guard_idx += 1;
@@ -3172,6 +3603,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3193,6 +3625,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
                 // Success path: capture the caught exception into the result
@@ -3228,9 +3661,13 @@ fn build_function(
             // High 64 bits of the unsigned 64×64→128 product. The optimizer
             // emits this for division/modulo-by-constant strength reduction;
             // wasm has no mul-high instruction, so expand via 32-bit split.
-            OpCode::UintMulHigh => {
-                emit_umulhi(&mut sink, constants, value_types, op, value_types.count())
-            }
+            OpCode::UintMulHigh => emit_umulhi(
+                &mut sink,
+                constants,
+                value_types,
+                op,
+                value_types.last_local(),
+            ),
 
             // Overflow variants: compute result + overflow flag
             OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf => {
@@ -3251,7 +3688,7 @@ fn build_function(
                     value_types,
                     op,
                     binop,
-                    value_types.count(),
+                    value_types.last_local(),
                     ovf_flag_local,
                     fused_guard.map(|guard| guard.opcode),
                 ) {
@@ -3266,6 +3703,7 @@ fn build_function(
                             guard_idx,
                             guard,
                             block_exit_depth,
+                            guard_dispatch,
                         );
                         guard_idx += 1;
                         fused_guard_at = Some(op_idx + 1);
@@ -3770,6 +4208,7 @@ fn build_function(
                         guard_idx,
                         op,
                         block_exit_depth,
+                        guard_dispatch,
                     );
                 }
                 guard_idx += 1;
@@ -3845,6 +4284,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3971,13 +4411,32 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
-                // GuardAlwaysFails always exits.
-                sink.i32_const(guard_idx as i32);
-                sink.local_set(bridge_slot_local);
+                // GuardAlwaysFails always exits. This arm writes neither the
+                // fail args nor `frame[0]`, so it keeps branching to the shared
+                // epilogue — giving it the ordinary guard spill would change
+                // what the exit reports, not just how it gets there. The
+                // epilogue takes a cell address when bridge dispatch is on;
+                // otherwise retain the unused index write unchanged.
+                if !guard_dispatch.param_type_indices.is_empty() {
+                    emit_guard_param_tail_call(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        guard_idx,
+                        op,
+                        guard_dispatch,
+                    );
+                } else if guard_dispatch.enabled {
+                    emit_guard_bridge_dispatch(&mut sink, guard_idx, guard_dispatch);
+                } else {
+                    sink.i32_const(guard_idx as i32);
+                    sink.local_set(bridge_slot_local);
+                }
                 sink.br(block_exit_depth);
                 guard_idx += 1;
             }
@@ -4069,8 +4528,9 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) && !hoisted_gc_table_loads.contains(&op.pos.get()) {
                     let index = resolve_const_bits(constants, op.arg(0).to_opref());
-                    let slot = gc_table_base as u64
-                        + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+                    let base = gc_table_bases.get(&vi).copied().unwrap_or(gc_table_base);
+                    let slot =
+                        base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
                     sink.i32_const(slot as i32);
                     sink.i32_load(MemArg {
                         offset: 0,
@@ -5402,30 +5862,13 @@ fn build_function(
     sink.return_();
     sink.end(); // end A $hot_exit
 
-    // Epilogue bridge dispatch. Control reaches here only
-    // after a guard `br`'d out of the exit block, having written its
-    // `fail_index` into `frame[0]`. Look up that guard's bridge slot in the
-    // shared cell array; if a bridge has been compiled (slot != 0), tail into
-    // it via `call_indirect` through the shared table — staying inside wasm —
-    // and return its result. Otherwise fall through to the host round-trip
-    // (return `frame_ptr`, the metainterp reads `frame[0]`). With every cell 0
-    // (no bridge yet) this is inert and behavior is unchanged.
-    if bridge_dispatch {
-        // slot = *(cells_base + (fail_index - fail_index_base) * 4)
-        // The cell array is local to this trace (one i32 per local guard);
-        // `frame[0]` carries the GLOBAL fail index, so subtract this trace's
-        // base back to a local cell index.
-        sink.i32_const(cells_base as i32);
-        sink.local_get(0);
-        sink.i64_load(mem64(0)); // frame[0] = fail_index
-        sink.i32_wrap_i64();
-        if fail_index_base != 0 {
-            sink.i32_const(fail_index_base as i32);
-            sink.i32_sub();
-        }
-        sink.i32_const(4);
-        sink.i32_mul();
-        sink.i32_add();
+    // Frame-entry bridge dispatch for exits that branch out of the hot exit
+    // block. Parameter-entry bridges tail-call from their own guard arm: that
+    // arm knows the fixed failure arity and therefore the fixed wasm type.
+    // The shared epilogue remains only for the established frame-entry form.
+    if bridge_dispatch && bridge_param_type_indices.is_empty() {
+        // slot = *(bridge_slot_local), where the local holds a cell address.
+        sink.local_get(bridge_slot_local);
         sink.i32_load(memarg(0, 2));
         sink.local_tee(bridge_slot_local);
         sink.if_(BlockType::Empty);
@@ -5479,6 +5922,57 @@ pub fn resumable_label_count(ops: &[Op]) -> usize {
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
         .count()
+}
+
+/// Number of entry-dispatch keys an armed trace module can observe. Ordinary
+/// traces have only the fresh-entry bucket; a resumable peeled loop has key 0
+/// plus one bucket for each `br_table` resume arm.
+pub fn entry_dispatch_key_count(ops: &[Op]) -> usize {
+    if is_resumable_peeled(ops) {
+        resumable_label_count(ops) + 1
+    } else {
+        1
+    }
+}
+
+/// Increment one module's guest-memory entry counter. `key_local` holds the
+/// i32 value consumed by the entry `br_table`; out-of-range values retain that
+/// table's normal default-to-fresh-entry behaviour but do not index beyond the
+/// fixed counter array.
+fn emit_trace_entry_census(
+    sink: &mut PeepSink<'_, '_>,
+    census: crate::TraceEntryCensusStorage,
+    scratch_local: u32,
+    key_local: Option<u32>,
+) {
+    if let Some(key_local) = key_local {
+        sink.local_get(key_local);
+        sink.i32_const(census.key_count as i32);
+        sink.i32_lt_u();
+        sink.if_(BlockType::Empty);
+        sink.i32_const(census.base as i32);
+        sink.local_get(key_local);
+        sink.i32_const(std::mem::size_of::<u64>() as i32);
+        sink.i32_mul();
+        sink.i32_add();
+        sink.local_set(scratch_local);
+        sink.local_get(scratch_local);
+        sink.local_get(scratch_local);
+        sink.i64_load(mem64(0));
+        sink.i64_const(1);
+        sink.i64_add();
+        sink.i64_store(mem64(0));
+        sink.end();
+    } else {
+        sink.i32_const(census.base as i32);
+        sink.local_set(scratch_local);
+        sink.local_get(scratch_local);
+        sink.local_get(scratch_local);
+        sink.i64_load(mem64(0));
+        sink.i64_const(1);
+        sink.i64_add();
+        sink.i64_store(mem64(0));
+    }
 }
 
 /// The single-label subset of `is_resumable_peeled`: exactly one LABEL.
@@ -5639,6 +6133,7 @@ fn emit_seed_gc_table_ref(
     ref_homes: &RefHomes,
     frame: FrameGeometry,
     gc_table_base: u32,
+    gc_table_bases: &HashMap<u32, u32>,
     result: OpRef,
 ) {
     let producer = ops
@@ -5646,7 +6141,11 @@ fn emit_seed_gc_table_ref(
         .find(|op| op.pos.get() == result)
         .expect("hoisted GC-table result must have a producer");
     let index = resolve_const_bits(constants, producer.arg(0).to_opref());
-    let slot = gc_table_base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+    let base = gc_table_bases
+        .get(&result.raw())
+        .copied()
+        .unwrap_or(gc_table_base);
+    let slot = base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
     sink.i32_const(slot as i32);
     sink.i32_load(MemArg {
         offset: 0,
@@ -5833,6 +6332,27 @@ fn emit_array_addr(
 
 // ── Guard emission helpers ──
 
+#[derive(Clone, Copy)]
+struct InlineGuard<'a> {
+    guard_idx: u32,
+    inputargs: &'a [InputArg],
+    branch_depth: u32,
+}
+
+#[derive(Clone, Copy)]
+struct BridgeDispatch<'a> {
+    cells_base: u32,
+    fail_index_base: u32,
+    bridge_slot_local: u32,
+    enabled: bool,
+    /// `arity -> indirect-call type` for armed parameter dispatch. Every
+    /// signature carries values as i64, including Float bit patterns.
+    param_type_indices: &'a indexmap::IndexMap<usize, u32>,
+    inline_guards: &'a [InlineGuard<'a>],
+    ref_homes: &'a RefHomes,
+    frame: FrameGeometry,
+}
+
 fn emit_guard_true(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -5840,6 +6360,7 @@ fn emit_guard_true(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
+    dispatch: BridgeDispatch<'_>,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_eqz();
@@ -5850,6 +6371,7 @@ fn emit_guard_true(
         guard_idx,
         op,
         block_exit_depth,
+        dispatch,
     );
 }
 
@@ -5860,6 +6382,7 @@ fn emit_guard_false(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
+    dispatch: BridgeDispatch<'_>,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_const(0);
@@ -5871,6 +6394,7 @@ fn emit_guard_false(
         guard_idx,
         op,
         block_exit_depth,
+        dispatch,
     );
 }
 
@@ -5943,7 +6467,7 @@ fn next_ovf_guard(ops: &[Op], i: usize) -> Option<&Op> {
     matches!(next.opcode, OpCode::GuardNoOverflow | OpCode::GuardOverflow).then_some(next)
 }
 
-/// Common guard exit: condition is on stack (i32), spill and branch on failure.
+/// Common guard exit: condition is on stack (i32), spill and leave on failure.
 ///
 /// The spill belongs in this arm rather than in one shared exit handler after
 /// the trace. x86/assembler.py:835-846 `write_pending_failure_recoveries` can
@@ -5961,7 +6485,9 @@ fn next_ovf_guard(ops: &[Op], i: usize) -> Option<&Op> {
 /// `block_exit_depth` is the statement-level depth of the enclosing exit
 /// `block` (preamble = 0, loop body = 1); the `+ 1` accounts for the `if`
 /// this opens. The stores run only on the failing edge, so the fallthrough
-/// carries no frame traffic.
+/// carries no frame traffic. With bridge dispatch enabled, the failing arm
+/// writes its fail index to `frame[0]`, records its constant bridge-cell
+/// address in a local, and branches to the shared dispatch epilogue.
 fn emit_guard_if_exit(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -5969,11 +6495,155 @@ fn emit_guard_if_exit(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
+    dispatch: BridgeDispatch<'_>,
 ) {
     sink.if_(BlockType::Empty);
-    emit_guard_spill(sink, constants, value_types, guard_idx, op);
-    sink.br(block_exit_depth + 1);
+    emit_guard_exit(
+        sink,
+        constants,
+        value_types,
+        guard_idx,
+        op,
+        block_exit_depth + 1,
+        dispatch,
+    );
     sink.end();
+}
+
+fn emit_guard_exit(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    guard_idx: u32,
+    op: &Op,
+    block_exit_depth: u32,
+    dispatch: BridgeDispatch<'_>,
+) {
+    if let Some(inline) = dispatch
+        .inline_guards
+        .iter()
+        .find(|g| g.guard_idx == guard_idx)
+    {
+        emit_guard_inline_bridge_move(
+            sink,
+            constants,
+            value_types,
+            dispatch.ref_homes,
+            dispatch.frame,
+            op,
+            inline.inputargs,
+        );
+        // The target depth is measured outside this failing `if`; include the
+        // `if` itself before selecting the enclosing bridge block.
+        sink.br(inline.branch_depth + 1);
+        return;
+    }
+    if dispatch.param_type_indices.is_empty() {
+        emit_guard_spill(sink, constants, value_types, guard_idx, op);
+        if dispatch.enabled {
+            emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
+        }
+    } else {
+        emit_guard_param_tail_call(sink, constants, value_types, guard_idx, op, dispatch);
+        // A missing cell keeps the historical recovery path. It is deliberately
+        // after the cell test so a bridge crossing performs no frame spill.
+        emit_guard_spill(sink, constants, value_types, guard_idx, op);
+    }
+    sink.br(block_exit_depth);
+}
+
+/// Tail-call this guard's bridge directly when its cell is armed. The guard's
+/// failure list fixes both the values and the wasm function type, so this path
+/// needs neither an arity tag nor staging locals.
+fn emit_guard_param_tail_call(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    guard_idx: u32,
+    op: &Op,
+    dispatch: BridgeDispatch<'_>,
+) {
+    let fail_args: Vec<OpRef> = op
+        .getfailargs()
+        .map(|args| args.iter().map(|arg| arg.to_opref()).collect())
+        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+    let arity = fail_args.len();
+    let type_idx = *dispatch
+        .param_type_indices
+        .get(&arity)
+        .expect("parameter dispatch type missing for guard fail arity");
+    debug_assert!(dispatch.enabled);
+    debug_assert!(guard_idx >= dispatch.fail_index_base);
+    let cell_addr = dispatch.cells_base
+        + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
+    sink.i32_const(cell_addr as i32);
+    sink.i32_load(memarg(0, 2));
+    sink.local_tee(dispatch.bridge_slot_local);
+    sink.if_(BlockType::Empty);
+    sink.local_get(0);
+    for arg in fail_args {
+        if arg.ty() == Some(Type::Float) {
+            emit_resolve_f64(sink, constants, value_types, arg);
+            sink.i64_reinterpret_f64();
+        } else {
+            emit_resolve(sink, constants, value_types, arg);
+        }
+    }
+    sink.local_get(dispatch.bridge_slot_local);
+    sink.return_call_indirect(0, type_idx);
+    sink.end();
+}
+
+/// Transfer a failing guard directly into an inlined bridge.  All sources are
+/// pushed before any destination local is written, preserving parallel-move
+/// semantics when fail arguments overlap bridge input locals.
+fn emit_guard_inline_bridge_move(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+    op: &Op,
+    inputargs: &[InputArg],
+) {
+    let fail_args: Vec<OpRef> = op
+        .getfailargs()
+        .map(|args| args.iter().map(|arg| arg.to_opref()).collect())
+        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+    assert_eq!(
+        fail_args.len(),
+        inputargs.len(),
+        "guard and bridge input arity diverged"
+    );
+    for (arg, input) in fail_args.iter().zip(inputargs) {
+        if value_types.ty(input.index) == ValType::F64 {
+            emit_resolve_f64(sink, constants, value_types, *arg);
+        } else {
+            emit_resolve(sink, constants, value_types, *arg);
+        }
+    }
+    for input in inputargs.iter().rev() {
+        sink.local_set(value_types.local(input.index));
+    }
+    for input in inputargs {
+        if let Some(home) = ref_homes.home_id(input.index) {
+            sink.local_get(0);
+            sink.local_get(value_types.local(input.index));
+            sink.i64_store(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
+        }
+    }
+}
+
+fn emit_guard_bridge_dispatch(
+    sink: &mut PeepSink<'_, '_>,
+    guard_idx: u32,
+    dispatch: BridgeDispatch<'_>,
+) {
+    debug_assert!(guard_idx >= dispatch.fail_index_base);
+    let cell_addr = dispatch.cells_base
+        + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
+    sink.i32_const(cell_addr as i32);
+    sink.local_set(dispatch.bridge_slot_local);
 }
 
 fn emit_guard_spill(
@@ -5981,6 +6651,16 @@ fn emit_guard_spill(
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     guard_idx: u32,
+    op: &Op,
+) {
+    emit_guard_fail_args_spill(sink, constants, value_types, op);
+    emit_guard_fail_index_store(sink, guard_idx);
+}
+
+fn emit_guard_fail_args_spill(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
     op: &Op,
 ) {
     let fail_args: Vec<OpRef> = op
@@ -5994,7 +6674,9 @@ fn emit_guard_spill(
         emit_resolve(sink, constants, value_types, arg_ref);
         sink.i64_store(mem64(offset));
     }
+}
 
+fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {
     sink.local_get(0);
     sink.i64_const(guard_idx as i64);
     sink.i64_store(mem64(0));
