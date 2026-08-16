@@ -3266,6 +3266,19 @@ pub fn walk<Sym: WalkSym>(
                     let recording_opcode_position =
                         ctx.session.borrow().recording_opcode_position;
                     if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                        // Emit at runtime too, not only for the recording pass.
+                        // Leaving the node to the interpreter holds only for a
+                        // trace the interpreter entered: `CALL_ASSEMBLER` enters
+                        // this trace from another trace's compiled code, and the
+                        // `exit_frame_with_exception` it finishes with dispatches
+                        // to `handle_fail_exit_frame_with_exception`, which
+                        // republishes the value and returns into the caller's
+                        // machine code.  No interpreter sees the error, so this
+                        // frame contributes no node and the traceback is one
+                        // frame short per `CALL_ASSEMBLER` entry.  The
+                        // interpreter-entry case stays single-node: the second
+                        // record is screened by `screen_frame_already_recorded`
+                        // clearing `attach_tb` for a frame the chain head names.
                         record_top_level_application_traceback(
                             ctx,
                             exc,
@@ -3275,10 +3288,10 @@ pub fn walk<Sym: WalkSym>(
                             false,
                         );
                     }
-                    // The interpreter records this frame's own traceback node
-                    // when the trace hands it the exception, and it reads the
-                    // raise coordinate out of `frame.last_instr`.  Compiled
-                    // code never wrote that field, so publish it here.
+                    // The node reads the raise coordinate out of
+                    // `frame.last_instr`, on both routes — the interpreter's
+                    // recorder and the emitted one, which falls back to that
+                    // field.  Compiled code never wrote it, so publish it here.
                     fbw_publish_exit_last_instr(ctx, recording_opcode_position);
                     // `pyjitpl.py:3261 compile_exit_frame_with_exception` opens
                     // with `store_token_in_vable()`, exactly as
@@ -3304,6 +3317,23 @@ pub fn walk<Sym: WalkSym>(
                     // `store_token_in_vable` takes on `vbox is
                     // self.forced_virtualizable`.
                     fbw_force_virtualizable_before_return(ctx);
+                    // The runtime half of the node, emitted here rather than
+                    // beside the recording half above: it is the only consumer
+                    // of the frame on this arm, and reading the frame before
+                    // the store-back moves the escape ahead of it, which costs
+                    // the trace bridges and guard failures for no gain.  The
+                    // publish above has already settled `last_instr`, which the
+                    // recorder falls back to.
+                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                        record_top_level_application_traceback(
+                            ctx,
+                            exc,
+                            exc_concrete,
+                            recording_opcode_position,
+                            false,
+                            true,
+                        );
+                    }
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms
@@ -3318,16 +3348,13 @@ pub fn walk<Sym: WalkSym>(
                 } else {
                     if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
                         // Emit the node at runtime as well as applying it for
-                        // the recording pass.  The top-level arm above can
-                        // leave this to the interpreter: its frame is a real
-                        // `PyFrame`, so the `exit_frame_with_exception` the
-                        // trace finishes with surfaces as an error on that
-                        // frame and `handle_operation_error` records the node.
-                        // An inlined callee has no frame to return to — the
-                        // walk pops it symbolically — so unless the trace
-                        // carries the record itself, the callee contributes no
-                        // node once the trace runs compiled and the exception
-                        // reaches its handler one frame short.
+                        // the recording pass, for the same reason the top-level
+                        // arm above does — here because an inlined callee has
+                        // no frame to return to at all: the walk pops it
+                        // symbolically, so unless the trace carries the record
+                        // itself the callee contributes no node once the trace
+                        // runs compiled, and the exception reaches its handler
+                        // one frame short.
                         let emit_runtime = !record_prepend_application_traceback(
                             ctx,
                             exc,
