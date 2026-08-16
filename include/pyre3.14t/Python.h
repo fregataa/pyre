@@ -1,102 +1,54 @@
+/* The header a C extension includes.
+ *
+ * Nothing else here is meant to be included directly. The entry points
+ * are declared in `pyre_decl.h`, written by `scripts/cpyext-abi.py`
+ * from the exports themselves; the rest is the hand-written half --
+ * the structs an extension lays out, and the macros it expands.
+ */
 #ifndef PYRE_PYTHON_H
 #define PYRE_PYTHON_H
 
+#include <assert.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <wchar.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include "patchlevel.h"
+#include "pyport.h"
+#include "pymacro.h"
+#include "pytypedefs.h"
+#include "object.h"
+#include "typeslots.h"
 
-#define PY_MAJOR_VERSION 3
-#define PY_MINOR_VERSION 14
-#define PY_MICRO_VERSION 6
-/* 3.14.6 final, matching sys.hexversion. The release-level nibble is 0xF for a
-   final release, so a value ending in 0x00 would put every `#if PY_VERSION_HEX
-   >= 0x030E00F0` extension on its pre-release branch. */
-#define PY_VERSION_HEX 0x030E06F0
-#define PYTHON_API_VERSION 1013
+/* Every exported entry point. It sits here because the headers above
+   name the types it uses, and the ones below define `static inline`
+   functions that call it. */
+#include "pyre_decl.h"
+#include "pymem.h"
+#include "objimpl.h"
+#include "methodobject.h"
+#include "structmember.h"
+#include "moduleobject.h"
+#include "pyerrors.h"
+#include "bytesobject.h"
+#include "unicodeobject.h"
+#include "longobject.h"
+#include "floatobject.h"
+#include "tupleobject.h"
+#include "listobject.h"
+#include "dictobject.h"
+#include "setobject.h"
+#include "sliceobject.h"
+#include "memoryobject.h"
+#include "pycapsule.h"
+#include "import.h"
+#include "modsupport.h"
+#include "abstract.h"
 
-#if defined(_WIN32)
-#  define PyAPI_FUNC(RTYPE) __declspec(dllimport) RTYPE
-#  define PyMODINIT_FUNC __declspec(dllexport) PyObject *
-#elif defined(__cplusplus)
-#  define PyAPI_FUNC(RTYPE) __attribute__((visibility("default"))) RTYPE
-#  define PyMODINIT_FUNC extern "C" __attribute__((visibility("default"))) PyObject *
-#else
-#  define PyAPI_FUNC(RTYPE) __attribute__((visibility("default"))) RTYPE
-#  define PyMODINIT_FUNC __attribute__((visibility("default"))) PyObject *
-#endif
-
-typedef intptr_t Py_ssize_t;
-typedef struct _typeobject PyTypeObject;
-typedef struct _object {
-    Py_ssize_t ob_refcnt;
-    Py_ssize_t ob_pyre_link;
-    PyTypeObject *ob_type;
-} PyObject;
-
-#define PyObject_HEAD PyObject ob_base;
-#define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
-#define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
-PyAPI_FUNC(void) Py_IncRef(PyObject *ob);
-PyAPI_FUNC(void) Py_DecRef(PyObject *ob);
-#define Py_INCREF(ob) Py_IncRef((PyObject *)(ob))
-#define Py_DECREF(ob) Py_DecRef((PyObject *)(ob))
-#define Py_XINCREF(ob) do { if ((ob) != NULL) Py_INCREF(ob); } while (0)
-#define Py_XDECREF(ob) do { if ((ob) != NULL) Py_DECREF(ob); } while (0)
-
-typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
-typedef int (*visitproc)(PyObject *, void *);
-typedef int (*traverseproc)(PyObject *, visitproc, void *);
-typedef int (*inquiry)(PyObject *);
-typedef void (*freefunc)(void *);
-typedef struct PyMethodDef {
-    const char *ml_name;
-    PyCFunction ml_meth;
-    int ml_flags;
-    const char *ml_doc;
-} PyMethodDef;
-
-#define METH_VARARGS 0x0001
-#define METH_KEYWORDS 0x0002
-#define METH_NOARGS 0x0004
-#define METH_O 0x0008
-
-typedef struct PyModuleDef_Base {
-    PyObject ob_base;
-    PyObject *(*m_init)(void);
-    Py_ssize_t m_index;
-    PyObject *m_copy;
-} PyModuleDef_Base;
-
-typedef struct PyModuleDef_Slot {
-    int slot;
-    void *value;
-} PyModuleDef_Slot;
-
-typedef struct PyModuleDef {
-    PyModuleDef_Base m_base;
-    const char *m_name;
-    const char *m_doc;
-    Py_ssize_t m_size;
-    PyMethodDef *m_methods;
-    PyModuleDef_Slot *m_slots;
-    traverseproc m_traverse;
-    inquiry m_clear;
-    freefunc m_free;
-} PyModuleDef;
-
-#define PyModuleDef_HEAD_INIT \
-    { { 1, 0, NULL }, NULL, 0, NULL }
-
-PyAPI_FUNC(PyObject *) PyModuleDef_Init(PyModuleDef *def);
-PyAPI_FUNC(PyObject *) PyModule_Create2(PyModuleDef *def, int api_version);
-#define PyModule_Create(module) PyModule_Create2((module), PYTHON_API_VERSION)
-
-#define PyDoc_STRVAR(name, str) static const char name[] = str
-
-#ifdef __cplusplus
-}
-#endif
-#endif
+#endif /* !PYRE_PYTHON_H */

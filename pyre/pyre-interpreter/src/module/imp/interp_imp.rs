@@ -1110,7 +1110,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "exec_dynamic",
         crate::make_builtin_function_with_arity(
             "exec_dynamic",
-            |_| Ok(pyre_object::w_none()),
+            |_args| {
+                #[cfg(all(
+                    feature = "cpyext",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                ))]
+                {
+                    crate::cpyext::exec_dynamic(_args[0])
+                }
+                #[cfg(not(all(
+                    feature = "cpyext",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                )))]
+                Ok(pyre_object::w_none())
+            },
             1,
         ),
     );
@@ -1142,7 +1157,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     any(target_os = "macos", target_os = "linux")
                 ))]
                 {
-                    return crate::cpyext::create_dynamic(spec);
+                    crate::cpyext::create_dynamic(spec)
                 }
                 #[cfg(not(all(
                     feature = "cpyext",
@@ -1238,9 +1253,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     any(target_os = "macos", target_os = "linux")
                 ))]
                 {
-                    return Ok(pyre_object::w_list_new(vec![pyre_object::w_str_new(
+                    Ok(pyre_object::w_list_new(vec![pyre_object::w_str_new(
                         crate::cpyext::extension_suffix(),
-                    )]));
+                    )]))
                 }
                 #[cfg(not(all(
                     feature = "cpyext",
