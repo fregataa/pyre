@@ -2452,6 +2452,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // the legacy walker and codewriter already handle, so it runs
         // unconditionally.
         let mut fmt_collapsed = collapse_fmt_chains(&mut lo.graph);
+        // Constant `format!("literal")` — a zero-placeholder format charon has
+        // already folded to the fully-rendered constant string, so the format
+        // op's argument is a bare `__str_const` with no pieces/args chain.
+        // Replace the op with that constant string in place.
+        fmt_collapsed += collapse_const_fmt(&mut lo.graph);
         // Multi-argument `format!("{a}…{b}", …)` chains build an N-field
         // argument tuple and N `Argument::new_display` ctors across several
         // blocks — a shape the single-argument collapser above does not
@@ -7149,11 +7154,16 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<str|String as ToString>::to_string` on a string-family
-                // receiver — a `String` clone that is an identity in the
-                // lifted value model, so alias the destination to the
-                // receiver instead of emitting an unregistered `to_string`.
-                if args.len() == 1 && self.is_to_string_identity(&reg, first_arg_ty.as_ref()) {
+                // `<str|String as ToString>::to_string`, `Wtf8::to_wtf8_buf`,
+                // `<str>::to_owned`, and a string-family `Clone::clone` on a
+                // string-family receiver — each an owned copy of a value that
+                // is already the immutable rpy_string in the lifted model, so
+                // alias the destination to the receiver instead of emitting an
+                // unregistered clone/to_owned/to_string.
+                if args.len() == 1
+                    && (self.is_to_string_identity(&reg, first_arg_ty.as_ref())
+                        || self.is_string_clone_identity(&reg, first_arg_ty.as_ref()))
+                {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -10151,6 +10161,35 @@ impl<'a> Lowering<'a> {
         first_arg_ty.is_some_and(|ty| {
             tyref_is_string_adt(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
         })
+    }
+
+    /// `Wtf8::to_wtf8_buf(&self) -> Wtf8Buf`, `<str as ToOwned>::to_owned
+    /// (&self) -> String`, and a string-family `<_ as Clone>::clone(&self)`
+    /// — an owned copy of a value that is already a string in the lifted
+    /// model (`String`/`&str`/`str`/`Wtf8`/`Wtf8Buf` all lower to the
+    /// immutable rpy_string), so it is an identity on the receiver, the same
+    /// alias shape as `to_string`.  `clone` / `to_owned` are generic leaves
+    /// shared by every `Clone` / `ToOwned` impl, so gate on the receiver
+    /// being a string value (`tyref_is_string_value`): a `Vec`/`BigInt`/`[T]`
+    /// (`<[T]>::to_owned -> Vec<T>`) receiver is outside the family and keeps
+    /// its ordinary lowering.  A receiver-string `clone`/`to_owned`/
+    /// `to_wtf8_buf` returns the same string family, so the receiver gate
+    /// alone fixes the result value model; no destination check is needed.
+    fn is_string_clone_identity(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        let Some(leaf) = np.rsplit("::").next() else {
+            return false;
+        };
+        if !matches!(leaf, "to_wtf8_buf" | "to_owned" | "clone") {
+            return false;
+        }
+        first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
     }
 
     /// `Option::<&T>::copied` / `Option::<T: Clone>::cloned` — reads the
@@ -16637,7 +16676,7 @@ fn ref_return_is_single_word(ast: &str) -> bool {
     false
 }
 
-fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
+pub(crate) fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(|n| raw_ptr_pointee_class_root(n, llbc))
@@ -19404,6 +19443,76 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
             .splice(idx..idx + 1, expansion);
     }
     sites.len()
+}
+
+/// Collapse a constant `format!("literal")` — a zero-placeholder format whose
+/// `format_args!` charon has already folded to the fully-rendered constant
+/// string, so `alloc::fmt::format`'s single argument resolves to a
+/// `__str_const` rather than to an `Arguments::new(pieces, args)` chain.  The
+/// format of a constant string IS that string, so replace the `fmt::format` op
+/// in place with the same `__str_const`, keeping the result var; the now-unread
+/// producer is reclaimed by the dead-op sweep.  No pieces/args arrays exist
+/// (unlike the single/multi-arg Display collapsers), so no link re-threading is
+/// needed.  Retires the graph-less `alloc::fmt::format` extern with only the
+/// `__str_const` op the rtyper natively types `SomeString`.
+fn collapse_const_fmt(graph: &mut FunctionGraph) -> usize {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    // `__str_const` carries its text as the second path segment (see
+    // `emit_str_const`), so a zero-arg `["__str_const", text]` producer is the
+    // whole rendered message.
+    let mut rewrites: Vec<(BlockId, usize, String)> = Vec::new();
+    for block in &graph.blocks {
+        for (fi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !fmt_path_ends_with(segments, &["fmt", "format"]) || op.result.is_none() {
+                continue;
+            }
+            let Some(arg) = args.first() else {
+                continue;
+            };
+            let Some((pbid, pidx)) = resolve_to_producer_op(graph, arg) else {
+                continue;
+            };
+            let text = match graph
+                .blocks
+                .iter()
+                .find(|b| b.id == pbid)
+                .and_then(|b| b.operations.get(pidx))
+                .map(|o| &o.kind)
+            {
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments: pseg },
+                    args: pargs,
+                    ..
+                }) if pargs.is_empty() && pseg.len() == 2 && pseg[0] == "__str_const" => {
+                    pseg[1].clone()
+                }
+                _ => continue,
+            };
+            rewrites.push((block.id, fi, text));
+        }
+    }
+    let n = rewrites.len();
+    // In-place kind replacement keeps every op index valid across the batch.
+    for (bid, fi, text) in rewrites {
+        if let Some(op) = graph.block_mut(bid).operations.get_mut(fi) {
+            op.kind = OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), text],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            };
+        }
+    }
+    n
 }
 
 /// A recognized multi-argument `format!` chain ready to collapse.  Unlike
