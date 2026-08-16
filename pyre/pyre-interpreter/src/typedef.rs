@@ -8093,7 +8093,16 @@ fn dict_view_all_contained_in(
     other: pyre_object::PyObjectRef,
 ) -> Result<bool, crate::PyError> {
     let snapshot = crate::type_methods::dict_view_snapshot(view);
-    for item in snapshot {
+    // `contains` runs a user `__contains__`/`__eq__`, so `other` and every
+    // item still waiting in this native Vec move under the loop.  Pin them and
+    // read each one back at its use.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let other_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(other);
+    let item_base = pyre_object::gc_roots::pin_roots(&snapshot);
+    for i in 0..snapshot.len() {
+        let other = pyre_object::gc_roots::shadow_stack_get(other_slot);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
         if !crate::baseobjspace::contains(other, item)? {
             return Ok(false);
         }
@@ -8155,7 +8164,16 @@ fn dict_view_isdisjoint(
         ));
     }
     let other_items = crate::builtins::collect_iterable(other)?;
-    for item in other_items {
+    // `collect_iterable`'s own scope has popped by the time it returns, so the
+    // items sit in an untraced native Vec while each `contains` runs a user
+    // `__eq__`.  Same shape as `dict_view_all_contained_in` above.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let view_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_view);
+    let item_base = pyre_object::gc_roots::pin_roots(&other_items);
+    for index in 0..other_items.len() {
+        let self_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_base + index);
         if crate::baseobjspace::contains(self_view, item)? {
             return Ok(pyre_object::w_bool_from(false));
         }
@@ -25168,8 +25186,18 @@ fn setlike_descr_isdisjoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             args[0], args[1],
         )?));
     }
-    for item in crate::builtins::collect_iterable(args[1])? {
-        if crate::type_methods::set_contains_checked(args[0], item)? {
+    let items = crate::builtins::collect_iterable(args[1])?;
+    // `set_contains_checked` hashes the element, which runs a user `__hash__`
+    // before the unhashable-type error can be raised — so the receiver and the
+    // items still waiting in this native Vec both move under the loop.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let set_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let item_base = pyre_object::gc_roots::pin_roots(&items);
+    for index in 0..items.len() {
+        let receiver = pyre_object::gc_roots::shadow_stack_get(set_slot);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_base + index);
+        if crate::type_methods::set_contains_checked(receiver, item)? {
             return Ok(pyre_object::w_bool_from(false));
         }
     }
