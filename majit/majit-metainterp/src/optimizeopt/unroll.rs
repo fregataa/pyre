@@ -3450,12 +3450,41 @@ impl OptUnroll {
             // unconditionally on the GUARD_FUTURE_CONDITION emitted at
             // `reached_loop_header` (pyjitpl.py:2969), so by the time
             // `_jump_to_existing_trace` runs `self.optimizer.patchguardop` is
-            // always populated. pyre mirrors this: `close_loop_args_at`
-            // (trace_opcode.rs:1863) emits the same GFC, and Phase 1 captures
-            // it into `patchguardop` (rewrite.rs:2737), which Phase 2 inherits
-            // (unroll.rs:513). Skip the read when `extra_guards` is empty —
-            // RPython's `for guard in extra_guards.extra_guards` loop body is
-            // also skipped in that case.
+            // always populated.
+            //
+            // pyre mirrors that on the LOOP path only: the GFC comes from the
+            // close-loop path and Phase 1 captures it into `patchguardop`,
+            // which Phase 2 inherits. A bridge records no GFC at all, so on
+            // the `optimize_bridge` -> `try_jump_to_existing_trace` route the
+            // only patchguardop is the stand-in `optimize_bridge` synthesizes
+            // from one of the bridge's own body guards — and a bridge whose
+            // body carries no guard with a resume position leaves even that
+            // unset. Upstream cannot reach that state, because :2991-2993
+            // emits the GFC before the closing JUMP of every trace that
+            // reaches `reached_loop_header`, a bridge grown from a
+            // ResumeGuardDescr included.
+            //
+            // Decline this target token rather than dereference a None, the
+            // way the replayed-guard arm of `inline_short_preamble` does.  The
+            // check sits here, BEFORE any `send_extra_operation`, because the
+            // stamp loop below streams ops into the trace as it goes: bailing
+            // out from inside it would leave a partially-guarded target
+            // behind.  Declining costs this target token only; the caller
+            // tries the next one and otherwise falls back to jump_to_preamble
+            // (unroll.py:208-210), so the bridge still compiles.
+            if !extra_guards.is_empty() && ctx.patchguardop.is_none() {
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] jump_to_existing_trace: target_token #{tt_idx} needs \
+                         {} extra guard(s) but the trace has no patchguardop — declining",
+                        extra_guards.len(),
+                    );
+                }
+                continue;
+            }
+            // Skip the read when `extra_guards` is empty — RPython's
+            // `for guard in extra_guards.extra_guards` loop body is also
+            // skipped in that case.
             for guard_req in &extra_guards {
                 let emitted = guard_req.to_ops(&args, ctx);
                 if emitted.is_empty() {
@@ -3466,9 +3495,9 @@ impl OptUnroll {
                 // the invariant is asserted before any op streams out.
                 let patch = ctx.patchguardop.as_ref().unwrap_or_else(|| {
                     panic!(
-                        "unroll.py:333 invariant: patchguardop must be set \
-                         when extra_guards is non-empty (target_token #{}, \
-                         {} extra guard(s), force_boxes={})",
+                        "unroll.py:333 invariant: the non-empty-extra_guards \
+                         decline above must have skipped this target token \
+                         (target_token #{}, {} extra guard(s), force_boxes={})",
                         tt_idx,
                         extra_guards.len(),
                         force_boxes,
@@ -3973,13 +4002,39 @@ impl OptUnroll {
                     new_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     new_op.clearfailargs();
                     new_op.clear_fail_arg_types();
-                    // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
-                    // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
-                    if let Some(ref patch) = ctx.patchguardop {
-                        new_op
-                            .rd_resume_position
-                            .set(patch.rd_resume_position.get());
-                    }
+                    // unroll.py:409: op.rd_resume_position =
+                    // patchguardop.rd_resume_position — an unconditional
+                    // dereference, so upstream has no branch for an absent
+                    // patchguardop.
+                    //
+                    // `new_op` is a clone of the short-preamble entry, which is
+                    // itself a whole-op clone of a guard from the PREAMBLE
+                    // trace, so it arrives carrying that trace's
+                    // rd_resume_position. Skipping the stamp does not leave the
+                    // guard unstamped — it leaves it stamped with a coordinate
+                    // from another trace's numbering, which
+                    // `store_final_boxes_in_guard` then resolves against this
+                    // one. Decline the inlining instead, exactly as the unmapped
+                    // -arg arm above does: the caller falls back to
+                    // jump_to_preamble and the trace still compiles.
+                    let Some(patch_pos) = ctx
+                        .patchguardop
+                        .as_ref()
+                        .map(|p| p.rd_resume_position.get())
+                    else {
+                        if crate::optimizeopt::majit_log_enabled() {
+                            eprintln!(
+                                "[jit] inline_short_preamble: no patchguardop for replayed \
+                                 {:?} — InvalidLoop",
+                                new_op.opcode
+                            );
+                        }
+                        ctx.signal_invalid_loop(
+                            "inline_short_preamble: replayed guard with no patchguardop",
+                        );
+                        return Vec::new();
+                    };
+                    new_op.rd_resume_position.set(patch_pos);
                     // history.py:227/268/314 — Const values ride inline
                     // on the OpRef (ConstInt/ConstFloat/
                     // ConstPtr). No pool replay needed.
@@ -8644,5 +8699,111 @@ mod tests {
         )];
 
         assert_eq!(closing_loop_contract_arity(&ops, 5), 3);
+    }
+
+    /// unroll.py:409 stamps every replayed short-preamble guard with
+    /// `patchguardop.rd_resume_position`, unconditionally. A short-preamble
+    /// entry is a whole-op clone of a guard from the preamble trace, so it
+    /// arrives carrying that trace's coordinate; leaving it in place when no
+    /// patchguardop exists hands `store_final_boxes_in_guard` a position from
+    /// another trace's numbering. Decline the inlining instead.
+    #[test]
+    fn inline_short_preamble_declines_a_replayed_guard_with_no_patchguardop() {
+        use crate::optimizeopt::shortpreamble::{ShortPreamble, ShortPreambleOp};
+
+        let mut optimizer = Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(2, 0);
+
+        let short_input_operand = rooted_resop_operand(Type::Int, 11);
+        let short_input = short_input_operand.to_opref();
+        let jump_arg = OpRef::int_op(12);
+        ctx.materialize_operand_at(jump_arg);
+
+        // A guard carrying the PREAMBLE trace's resume coordinate.
+        let mut guard = Op::new(OpCode::GuardTrue, &[short_input_operand]);
+        guard.pos.set(OpRef::void_op(13));
+        guard.rd_resume_position.set(4242);
+
+        let mut short_preamble = ShortPreamble::empty();
+        short_preamble.inputargs = vec![short_input];
+        short_preamble.ops = vec![ShortPreambleOp {
+            op: guard,
+            arg_mapping: Vec::new(),
+            fail_arg_mapping: Vec::new(),
+        }];
+
+        assert!(ctx.patchguardop.is_none());
+        let extra = OptUnroll::inline_short_preamble(
+            &[jump_arg],
+            &[jump_arg],
+            &short_preamble,
+            &mut optimizer,
+            &mut ctx,
+        );
+
+        assert!(extra.is_empty(), "declined inlining returns no extra args");
+        assert!(
+            ctx.take_invalid_loop().is_some(),
+            "the caller must see an InvalidLoop and fall back to jump_to_preamble"
+        );
+    }
+
+    /// unroll.py:333 dereferences `self.optimizer.patchguardop` before stamping
+    /// the guards `generate_guards` produced, which upstream can do because
+    /// `reached_loop_header` emits a GUARD_FUTURE_CONDITION before the closing
+    /// JUMP of every trace that reaches it — a bridge included
+    /// (pyjitpl.py:2991-2993). pyre records that GFC only on the loop path, so
+    /// a bridge arrives here with whatever `optimize_bridge` could synthesize
+    /// from its own body guards, and a bridge with no such guard arrives with
+    /// none. Skip the target token instead of dereferencing.
+    #[test]
+    fn jump_to_existing_trace_declines_a_target_needing_guards_with_no_patchguardop() {
+        use crate::history::TargetToken;
+        use crate::optimizeopt::intutils::IntBound;
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+
+        let mut optimizer = Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(1, 0);
+
+        let arg_operand = rooted_resop_operand(Type::Int, 11);
+        let arg = arg_operand.to_opref();
+
+        // The incoming state knows nothing statically; the target demands a
+        // narrow bound and the concrete runtime value falls inside it, which is
+        // virtualstate.py:493-498's runtime fallback — it manufactures
+        // INT_GE/INT_LE + GUARD_TRUE pairs (intutils.py:1264
+        // `IntBound.make_guards`) rather than rejecting the target.
+        let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
+        let runtime_box = OpRef::const_int(5);
+        let mut target_tokens = vec![TargetToken::new_loop(1)];
+        target_tokens[0].virtual_state =
+            Some(VirtualState::new(vec![VirtualStateInfo::IntBounded(
+                IntBound::bounded(0, 10),
+            )]));
+
+        let unroll = OptUnroll::default();
+        assert!(ctx.patchguardop.is_none());
+        assert!(optimizer.patchguardop.is_none());
+        let vs = unroll.jump_to_existing_trace_with_vs(
+            &[arg],
+            None,
+            &mut target_tokens,
+            &mut optimizer,
+            &mut ctx,
+            false,
+            &[runtime_box],
+            Some(incoming),
+        );
+
+        // unroll.py:207-211 reads the result as "None means a target matched and
+        // the jump was retargeted"; a returned virtual state means none did, and
+        // `optimize_bridge` falls back to jump_to_preamble. The point of the test
+        // is that the declined target reaches that fallback instead of
+        // dereferencing the absent patchguardop.
+        assert!(
+            vs.is_some(),
+            "the only target token needed extra guards it could not stamp, so it \
+             must be declined and the caller left to jump_to_preamble"
+        );
     }
 }
