@@ -394,12 +394,20 @@ pub struct JitStats {
 
 /// # The `u64` this type is keyed by is a CELL key, not a bucket hash
 ///
-/// Every `green_key_hash: u64` parameter below names one cell
+/// Every `cell_key: u64` parameter below names one cell
 /// ([`BaseJitCell::cell_key`]), not a celltable bucket. The two are the same
 /// number whenever a bucket holds one cell — which is every collision-free
 /// workload, so nothing observable changes there — and differ only for a cell
 /// that had to be minted a key because a sibling already held the bucket's raw
 /// hash.
+///
+/// The parameter name says which side of the resolve the value sits on, so the
+/// two entry points that genuinely take a PRE-resolve raw bucket hash keep the
+/// `green_key_hash` spelling: [`WarmEnterState::bucket_is_chained`] (the test
+/// [`WarmEnterState::resolve_cell_key`] asks before it decides whether a
+/// `GreenKey` has to be built at all) and
+/// [`WarmEnterState::trace_next_iteration`] (whose whole identity is the hash,
+/// see its own doc).
 ///
 /// The distinction exists because pyre carries a `u64` where upstream carries
 /// the cell object. `maybe_compile_and_run` (warmstate.py:458-464) resolves
@@ -465,7 +473,7 @@ pub struct WarmEnterState {
     /// Quasi-immutable field invalidation registry.
     ///
     /// Maps a quasi-immutable field key (hash of object_id + field_index)
-    /// to the set of green_key_hashes whose compiled loops depend on that field.
+    /// to the set of cell keys whose compiled loops depend on that field.
     /// When a quasi-immutable field is mutated, all dependent loops are invalidated.
     quasiimmut_deps: indexmap::IndexMap<u64, Vec<u64>>,
     // Function-entry hotness rides on the shared `counter: JitCounter`
@@ -527,7 +535,7 @@ impl WarmEnterState {
     /// so neither does this.
     fn should_start_dont_trace_here_trace(
         &mut self,
-        green_key_hash: u64,
+        cell_key: u64,
         flags: u8,
         has_seen_a_procedure_token: bool,
     ) -> bool {
@@ -535,18 +543,18 @@ impl WarmEnterState {
             return false;
         }
         if flags & jc_flags::TRACING_OCCURRED != 0 {
-            let bucket = self.bucket_of(green_key_hash);
+            let bucket = self.bucket_of(cell_key);
             self.counter.tick(bucket, self.increment_threshold)
         } else {
             true
         }
     }
 
-    fn start_tracing_cell(&mut self, green_key_hash: u64) -> HotResult {
-        self.counter.reset(self.bucket_of(green_key_hash));
+    fn start_tracing_cell(&mut self, cell_key: u64) -> HotResult {
+        self.counter.reset(self.bucket_of(cell_key));
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
-        let cell = self.ensure_cell_by_key(green_key_hash);
+        let cell = self.ensure_cell_by_key(cell_key);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
@@ -606,8 +614,8 @@ impl WarmEnterState {
     /// Returns a `HotResult` telling the interpreter what to do next.
     /// Mark a green key as DONT_TRACE_HERE permanently.
     /// Clear the loop token for a cell, so is_compiled() returns false.
-    pub fn clear_loop_token(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
+    pub fn clear_loop_token(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.loop_token = None;
         }
     }
@@ -630,8 +638,8 @@ impl WarmEnterState {
         }
     }
 
-    pub fn mark_dont_trace(&mut self, green_key_hash: u64) {
-        self.disable_noninlinable_function(green_key_hash);
+    pub fn mark_dont_trace(&mut self, cell_key: u64) {
+        self.disable_noninlinable_function(cell_key);
     }
 
     /// TODO: pyre-only cold fast path check. RPython
@@ -639,8 +647,8 @@ impl WarmEnterState {
     /// directly; this read-only peek exists to skip GreenKey allocation
     /// in jitdriver.rs for cold keys.
     #[inline]
-    pub fn counter_would_fire(&self, green_key_hash: u64) -> bool {
-        if let Some(cell) = self.cell_by_key(green_key_hash) {
+    pub fn counter_would_fire(&self, cell_key: u64) -> bool {
+        if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
@@ -652,12 +660,12 @@ impl WarmEnterState {
             }
         }
         self.counter
-            .would_tick_fire(self.bucket_of(green_key_hash), self.increment_threshold)
+            .would_tick_fire(self.bucket_of(cell_key), self.increment_threshold)
     }
 
     /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).
-    pub fn counter_tick(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cell_by_key(green_key_hash) {
+    pub fn counter_tick(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 return;
             }
@@ -665,13 +673,13 @@ impl WarmEnterState {
                 return;
             }
         }
-        let bucket = self.bucket_of(green_key_hash);
+        let bucket = self.bucket_of(cell_key);
         let _ = self.counter.tick(bucket, self.increment_threshold);
     }
 
-    pub fn counter_tick_checked(&mut self, green_key_hash: u64) -> bool {
+    pub fn counter_tick_checked(&mut self, cell_key: u64) -> bool {
         let mut cleanup_dead_token_cell = false;
-        if let Some(cell) = self.cell_by_key(green_key_hash) {
+        if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
@@ -692,16 +700,16 @@ impl WarmEnterState {
         if cleanup_dead_token_cell {
             // warmstate.py:483-500 — loop-header counter entry must also
             // remove invalidated token cells before it starts counting again.
-            self.cleanup_chain(self.bucket_of(green_key_hash));
+            self.cleanup_chain(self.bucket_of(cell_key));
             return false;
         }
-        let bucket = self.bucket_of(green_key_hash);
+        let bucket = self.bucket_of(cell_key);
         self.counter.tick(bucket, self.increment_threshold)
     }
 
-    pub fn maybe_compile(&mut self, green_key_hash: u64) -> HotResult {
+    pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
         let mut cleanup_dead_token_cell = false;
-        if let Some(cell) = self.cell_by_key(green_key_hash) {
+        if let Some(cell) = self.cell_by_key(cell_key) {
             let has_procedure_token = cell.get_procedure_token().is_some();
             let is_compiled = cell.is_compiled();
             let is_tracing = cell.is_tracing();
@@ -713,12 +721,9 @@ impl WarmEnterState {
             if is_tracing {
                 return HotResult::AlreadyTracing;
             }
-            if self.should_start_dont_trace_here_trace(
-                green_key_hash,
-                flags,
-                has_seen_a_procedure_token,
-            ) {
-                return self.start_tracing_cell(green_key_hash);
+            if self.should_start_dont_trace_here_trace(cell_key, flags, has_seen_a_procedure_token)
+            {
+                return self.start_tracing_cell(cell_key);
             }
             // A JC_DONT_TRACE_HERE cell declines here, except when it once saw a
             // procedure token that has since been invalidated — that dead entry
@@ -736,18 +741,18 @@ impl WarmEnterState {
         if cleanup_dead_token_cell {
             // warmstate.py:483-500 — an invalidated/dead procedure token is
             // removed from the chain, resetting the hot counter so it re-arms.
-            self.cleanup_chain(self.bucket_of(green_key_hash));
+            self.cleanup_chain(self.bucket_of(cell_key));
             return HotResult::NotHot;
         }
 
         if !self
             .counter
-            .tick(self.bucket_of(green_key_hash), self.increment_threshold)
+            .tick(self.bucket_of(cell_key), self.increment_threshold)
         {
             return HotResult::NotHot;
         }
 
-        self.start_tracing_cell(green_key_hash)
+        self.start_tracing_cell(cell_key)
     }
 
     /// warmstate.py:446-511 `WarmEnterState.maybe_compile_and_run` —
@@ -926,8 +931,8 @@ impl WarmEnterState {
     ///
     /// Used by function-entry tracing where the caller has already
     /// determined that tracing should begin.
-    pub fn force_start_tracing(&mut self, green_key_hash: u64) -> HotResult {
-        if let Some(cell) = self.cell_by_key(green_key_hash) {
+    pub fn force_start_tracing(&mut self, cell_key: u64) -> HotResult {
+        if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() {
                 return HotResult::RunCompiled;
             }
@@ -944,7 +949,7 @@ impl WarmEnterState {
             }
         }
 
-        self.start_tracing_cell(green_key_hash)
+        self.start_tracing_cell(cell_key)
     }
 
     /// Typed-key variant of [`Self::force_start_tracing`]: reads the
@@ -987,8 +992,8 @@ impl WarmEnterState {
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
     /// The caller is responsible for compiling the trace and calling
     /// `attach_procedure_to_interp` with the resulting JitCellToken.
-    pub fn finish_tracing(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
+    pub fn finish_tracing(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags &= !jc_flags::TRACING;
             // State remains Tracing until attach_procedure_to_interp is called.
         }
@@ -998,8 +1003,8 @@ impl WarmEnterState {
     ///
     /// Non-permanent aborts clear `JC_TRACING` and allow a future retry until
     /// pyre's abort ceiling marks the location `DONT_TRACE_HERE`.
-    pub fn abort_tracing(&mut self, green_key_hash: u64, disable_noninlinable_function: bool) {
-        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
+    pub fn abort_tracing(&mut self, cell_key: u64, disable_noninlinable_function: bool) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
             if disable_noninlinable_function || (cell.flags & jc_flags::DONT_TRACE_HERE != 0) {
@@ -1015,7 +1020,7 @@ impl WarmEnterState {
         }
 
         if disable_noninlinable_function {
-            self.disable_noninlinable_function(green_key_hash);
+            self.disable_noninlinable_function(cell_key);
         }
         if let Some(log) = &mut self.jitlog {
             log.log_abort();
@@ -1038,11 +1043,11 @@ impl WarmEnterState {
     /// itself is in scope.
     pub fn attach_procedure_to_interp(
         &mut self,
-        green_key_hash: u64,
+        cell_key: u64,
         token: impl Into<Arc<JitCellToken>>,
     ) -> Option<Arc<JitCellToken>> {
         let token = token.into();
-        let cell = self.ensure_cell_by_key(green_key_hash);
+        let cell = self.ensure_cell_by_key(cell_key);
         cell.flags &= !jc_flags::TRACING;
         cell.set_procedure_token(token, false)
     }
@@ -1082,11 +1087,11 @@ impl WarmEnterState {
     /// the point a caller appears, not before.
     pub fn attach_tmp_callback_to_interp(
         &mut self,
-        green_key_hash: u64,
+        cell_key: u64,
         token: impl Into<Arc<JitCellToken>>,
     ) {
         let token = token.into();
-        let cell = self.ensure_cell_by_key(green_key_hash);
+        let cell = self.ensure_cell_by_key(cell_key);
         let _old = cell.set_procedure_token(token, true);
     }
 
@@ -1097,8 +1102,8 @@ impl WarmEnterState {
     /// installed under a different inner cell. Does not alter state: the
     /// companion `attach_procedure_to_interp` / `abort_tracing` calls own
     /// the state transition for whichever cell they touch.
-    pub fn clear_tracing_flag(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
+    pub fn clear_tracing_flag(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags &= !jc_flags::TRACING;
         }
     }
@@ -1143,8 +1148,8 @@ impl WarmEnterState {
     /// second uncalled entry point, so it gets a reason instead, the same call
     /// [`Self::attach_tmp_callback_to_interp`] got. Give it a typed form at
     /// the point a caller appears, not before.
-    pub fn take_procedure_token(&mut self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
-        self.cell_by_key_mut(green_key_hash)
+    pub fn take_procedure_token(&mut self, cell_key: u64) -> Option<Arc<JitCellToken>> {
+        self.cell_by_key_mut(cell_key)
             .and_then(|cell| cell.loop_token.take())
     }
 
@@ -1159,8 +1164,8 @@ impl WarmEnterState {
     /// PyPy provides — invalidated tokens never reach the warm-entry
     /// runner, the CALL_ASSEMBLER inline gate, or the bridge stitch
     /// surface.
-    pub fn get_compiled(&self, green_key_hash: u64) -> Option<&Arc<JitCellToken>> {
-        self.cell_by_key(green_key_hash)
+    pub fn get_compiled(&self, cell_key: u64) -> Option<&Arc<JitCellToken>> {
+        self.cell_by_key(cell_key)
             .and_then(|cell| cell.get_procedure_token())
     }
 
@@ -1172,8 +1177,8 @@ impl WarmEnterState {
     /// ([`Self::cell_key_for`]). Handing this a raw bucket hash instead is a
     /// different question with a different answer: it names the bucket's first
     /// occupant.
-    pub fn get_procedure_token(&self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
-        self.cell_by_key(green_key_hash)
+    pub fn get_procedure_token(&self, cell_key: u64) -> Option<Arc<JitCellToken>> {
+        self.cell_by_key(cell_key)
             .and_then(|cell| cell.get_procedure_token().cloned())
     }
 
@@ -1233,8 +1238,8 @@ impl WarmEnterState {
     }
 
     /// Reset the hot counter for a specific green key to zero.
-    pub fn reset_counter(&mut self, green_key_hash: u64) {
-        self.counter.reset(self.bucket_of(green_key_hash));
+    pub fn reset_counter(&mut self, cell_key: u64) {
+        self.counter.reset(self.bucket_of(cell_key));
     }
 
     /// Reset ALL counters to zero. Used after invalidation with incomplete
@@ -1246,14 +1251,14 @@ impl WarmEnterState {
     }
 
     /// Check if a green key is marked DontTraceHere.
-    pub fn is_dont_trace_here(&self, green_key_hash: u64) -> bool {
-        self.cell_by_key(green_key_hash)
+    pub fn is_dont_trace_here(&self, cell_key: u64) -> bool {
+        self.cell_by_key(cell_key)
             .is_some_and(|c| c.state == BaseJitCellState::DontTraceHere)
     }
 
     /// Get a reference to the BaseJitCell for a green key, if it exists.
-    pub fn get_cell(&self, green_key_hash: u64) -> Option<&BaseJitCell> {
-        self.cell_by_key(green_key_hash)
+    pub fn get_cell(&self, cell_key: u64) -> Option<&BaseJitCell> {
+        self.cell_by_key(cell_key)
     }
 
     /// Typed-key variant of [`Self::get_cell`]:
@@ -1330,13 +1335,13 @@ impl WarmEnterState {
     /// / `greenboxes` bundle without threading them through WarmEnterState.
     pub fn get_assembler_token<E, F>(
         &mut self,
-        green_key_hash: u64,
+        cell_key: u64,
         make_token: F,
     ) -> Result<Arc<JitCellToken>, E>
     where
         F: FnOnce() -> Result<Arc<JitCellToken>, E>,
     {
-        let cell = self.ensure_cell_by_key(green_key_hash);
+        let cell = self.ensure_cell_by_key(cell_key);
         if let Some(token) = cell.get_procedure_token() {
             return Ok(token.clone());
         }
@@ -1678,8 +1683,8 @@ impl WarmEnterState {
     /// Installs under the bare hash, so the cell it creates carries no
     /// `comparekey`. Prefer [`Self::mark_force_finish_tracing_for_key`]
     /// wherever the green key itself is in scope.
-    pub fn mark_force_finish_tracing(&mut self, green_key_hash: u64) {
-        let cell = self.ensure_cell_by_key(green_key_hash);
+    pub fn mark_force_finish_tracing(&mut self, cell_key: u64) {
+        let cell = self.ensure_cell_by_key(cell_key);
         cell.flags |= jc_flags::FORCE_FINISH;
     }
 
@@ -1701,8 +1706,8 @@ impl WarmEnterState {
     /// explicitly: `should_remove_jitcell` (warmstate.py:222) keeps the cell
     /// alive while it is set, and once set it persists until the cell itself
     /// is removed.
-    pub fn should_force_finish_tracing(&self, green_key_hash: u64) -> bool {
-        self.cell_by_key(green_key_hash)
+    pub fn should_force_finish_tracing(&self, cell_key: u64) -> bool {
+        self.cell_by_key(cell_key)
             .is_some_and(|cell| cell.flags & jc_flags::FORCE_FINISH != 0)
     }
 
@@ -1728,9 +1733,9 @@ impl WarmEnterState {
     /// warmstate.py:467 jitcounter.tick(hash, increment_threshold) parity.
     ///
     /// warmstate.py:256-257: jitcounter.tick(hash, increment_function_threshold).
-    pub fn should_trace_function_entry(&mut self, green_key_hash: u64) -> bool {
+    pub fn should_trace_function_entry(&mut self, cell_key: u64) -> bool {
         let mut cleanup_dead_token_cell = false;
-        if let Some(cell) = self.cell_by_key(green_key_hash) {
+        if let Some(cell) = self.cell_by_key(cell_key) {
             // Slot 23 is the total; 64/65 are its two terms, evaluated
             // independently rather than short-circuited so a cell that is both
             // reaches both tallies. `is_compiled()` fires on every probe of
@@ -1804,14 +1809,12 @@ impl WarmEnterState {
             // warmstate.py:483-500 — function-entry warmup must see an
             // invalidated token as a removed cell and re-count from cold.
             crate::mc_diag_bump(24);
-            self.cleanup_chain(self.bucket_of(green_key_hash));
+            self.cleanup_chain(self.bucket_of(cell_key));
             return false;
         }
         crate::mc_diag_bump(25);
-        self.counter.tick(
-            self.bucket_of(green_key_hash),
-            self.increment_function_threshold,
-        )
+        self.counter
+            .tick(self.bucket_of(cell_key), self.increment_function_threshold)
     }
 
     /// Check if inlining is allowed at the given depth.
@@ -1828,7 +1831,7 @@ impl WarmEnterState {
 
     // ── Quasi-immutable field invalidation ──
 
-    /// Register that the compiled loop at `green_key_hash` depends on the
+    /// Register that the compiled loop at `cell_key` depends on the
     /// quasi-immutable field identified by `qmut_key`.
     ///
     /// When `invalidate_quasiimmut(qmut_key)` is called later, the compiled
@@ -1836,10 +1839,13 @@ impl WarmEnterState {
     /// to fail and forcing a retrace.
     ///
     /// `qmut_key` should be a hash of (object_id, field_index) or similar.
-    pub fn register_quasiimmut_dependency(&mut self, qmut_key: u64, green_key_hash: u64) {
+    /// `cell_key` is a resolved cell identity, not a raw green-key hash: it is
+    /// what names one cell among a bucket's occupants, so it is what the
+    /// invalidation below can resolve back to the dependent it was recorded for.
+    pub fn register_quasiimmut_dependency(&mut self, qmut_key: u64, cell_key: u64) {
         let deps = self.quasiimmut_deps.entry(qmut_key).or_default();
-        if !deps.contains(&green_key_hash) {
-            deps.push(green_key_hash);
+        if !deps.contains(&cell_key) {
+            deps.push(cell_key);
         }
     }
 
@@ -1852,19 +1858,19 @@ impl WarmEnterState {
     ///
     /// Returns the number of loops invalidated.
     ///
-    /// No typed twin, and unlike the other two abstainers this one is not a
-    /// choice. Its green keys arrive as the *values* of `quasiimmut_deps`,
-    /// which stores them as `u64` hashes, so there is no caller that holds a
-    /// `GreenKey` to hand one down: a twin cannot be given a key to take until
-    /// that table is widened. Dead in production today — its only registrar,
+    /// No typed twin, and this one needs none. Its dependents arrive as the
+    /// *values* of `quasiimmut_deps`, which records a `cell_key` each — the
+    /// identity [`Self::cell_by_key_mut`] resolves, and that resolve walks the
+    /// whole chain rather than answering with the bucket head. So a colliding
+    /// neighbour cannot be invalidated in a dependent's place, and a dependent
+    /// sitting behind a chained head cannot be skipped: the property
+    /// [`Self::invalidate_all`] below is written for — *skipping a cell is a
+    /// WRONG ANSWER rather than a leak* — holds here for the same reason,
+    /// without a `GreenKey` having to reach this far.
+    ///
+    /// Dead in production today: its only registrar,
     /// `register_quasiimmut_dependency`, has no production caller either, so
     /// `quasiimmut_deps` is empty and this returns 0 at the first line.
-    ///
-    /// That is what makes it a trap rather than a bug: [`Self::invalidate_all`]
-    /// below was fixed to walk chains because *"skipping a cell is a WRONG
-    /// ANSWER rather than a leak"*, and this targeted sibling still reads the
-    /// bucket head. Whoever wires the registrar inherits that, and a sweep
-    /// selecting whole-map `.values()` walks will not see it.
     pub fn invalidate_quasiimmut(&mut self, qmut_key: u64) -> usize {
         let deps = match self.quasiimmut_deps.swap_remove(&qmut_key) {
             Some(deps) => deps,
@@ -1872,8 +1878,8 @@ impl WarmEnterState {
         };
 
         let mut invalidated = 0;
-        for green_key_hash in &deps {
-            if let Some(cell) = self.cell_by_key_mut(*green_key_hash)
+        for cell_key in &deps {
+            if let Some(cell) = self.cell_by_key_mut(*cell_key)
                 && let Some(token) = &cell.loop_token
             {
                 token.invalidate();
@@ -1911,8 +1917,8 @@ impl WarmEnterState {
     /// Get the explicit state of a BaseJitCell for a green key.
     /// Returns `NotHot` if no cell exists.
     #[inline]
-    pub fn get_cell_state(&self, green_key_hash: u64) -> BaseJitCellState {
-        self.cell_by_key(green_key_hash)
+    pub fn get_cell_state(&self, cell_key: u64) -> BaseJitCellState {
+        self.cell_by_key(cell_key)
             .map(|c| c.state)
             .unwrap_or(BaseJitCellState::NotHot)
     }
@@ -1927,8 +1933,8 @@ impl WarmEnterState {
     /// comparator-less cells it installs exist only in fixtures. That also
     /// makes it a way for a test to build the split-cell state deliberately.
     /// A twin becomes necessary if production ever calls this.
-    pub fn transition_cell(&mut self, green_key_hash: u64, new_state: BaseJitCellState) {
-        let cell = self.ensure_cell_by_key(green_key_hash);
+    pub fn transition_cell(&mut self, cell_key: u64, new_state: BaseJitCellState) {
+        let cell = self.ensure_cell_by_key(cell_key);
 
         match new_state {
             BaseJitCellState::NotHot => {
@@ -2387,6 +2393,27 @@ impl WarmEnterState {
     /// that cell — no `GreenKey` has to be built to prove it. Normally the
     /// answer is `hash` itself; it differs only when the cell that held the
     /// raw hash has been evicted out from under a minted sibling.
+    ///
+    /// **Why no comparator is consulted.** `warmstate.py:458-464` accepts a
+    /// cell only after `comparekey` matches, because upstream buckets are
+    /// indexed slots of a sized table (`counter.py:239-240`) and genuinely mix
+    /// unrelated green keys. This table is keyed by the FULL `get_uhash`, so
+    /// short of a 64-bit collision a bucket holds one green key's cells and
+    /// nothing else — the several occupants of a chained bucket are that one
+    /// key's hash-written cell and its typed twin, which a comparator would
+    /// only tell apart from each other. Two consequences:
+    ///
+    /// * the sole occupant of an unchained bucket IS this key's cell, and
+    /// * where it is not — an occupant a hash-written creator installed with no
+    ///   comparator — the full typed resolve reaches the same key anyway:
+    ///   [`Self::cell_key_for`] misses the chain, finds `hash` taken, and
+    ///   `unwrap_or(hash)` lands back on that same cell. So the shortcut is not
+    ///   trading a typed miss for a wrong cell; there is no typed miss to take.
+    ///
+    /// A 64-bit `get_uhash` collision breaks the invariant, and then this can
+    /// answer with a neighbour's cell. That is the condition under which a
+    /// comparator-less cell is unresolvable rather than resolvable-but-unsound
+    /// (see [`BaseJitCell::comparekey`]) — no accept rule fixes it here.
     #[inline]
     pub fn sole_cell_key(&self, hash: u64) -> Option<u64> {
         let head = self.cells.get(&hash)?;
@@ -5015,6 +5042,14 @@ mod tests {
     /// (`raise EnterJitAssembler(procedure_token, *execute_args)`) rather than
     /// handing on the key for a second lookup — which is why upstream has no
     /// second reader that could disagree.
+    ///
+    /// The entry path now carries the token the same way: `back_edge_internal`
+    /// binds it at the decision and hands it to
+    /// `MetaInterp::execute_assembler_at_dispatch_key` as an argument, so on
+    /// that route there is no longer a second reader for the resolved key to
+    /// keep honest — only the one modelled below. The u64 reader survives for
+    /// callers that reach a run without having decided anything about the cell
+    /// first, which is what the `executed` line stands in for.
     ///
     /// # What this used to pin, and what it pins now
     ///

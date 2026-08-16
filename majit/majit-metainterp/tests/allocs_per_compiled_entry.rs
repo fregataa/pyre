@@ -588,28 +588,42 @@ fn main() {
 /// because it owns the last rows below; pinning one number for both would make
 /// whichever leg ran second fail with a message about a regression that is
 /// really a configuration difference. The figure was briefly one number for
-/// both at 10, before cranelift's frame moved to the nursery.
+/// both, before cranelift's frame moved to the nursery.
 ///
-/// Eight of the allocations are shared by both backends:
+/// Four of the allocations are shared by both backends:
 ///
 /// | n | site |
 /// |---|------|
-/// | 2 | `CounterState::extract_live_into` — the `Vec<i64>` the macro's `extract_live` returns, and its one regrowth |
+/// | 2 | `CounterState::extract_live_into` — TWO separate `extract_live()` calls, one `Vec<i64>` each: `extract_live_values`'s default (`jit_state.rs:186-187`) calls it and then `live_value_types`, whose default (`jit_state.rs:194`) calls it AGAIN. A two-int-scalar state builds each Vec in one allocation (capacity 0→4, no regrowth); the 2 is a doubled traversal, not a regrowth |
 /// | 1 | `JitState::extract_live_values` default body, `jit_state.rs:190` — the `Vec<Value>` it collects into |
 /// | 1 | `JitState::live_value_types` default body, `jit_state.rs:194` — the `Vec<Type>` it collects into |
-/// | 1 | `<[Type]>::to_vec` — `descr.fail_arg_types().to_vec()` |
-/// | 1 | `<[Value]>::to_vec` — the FINISH values copied out of the run result |
-/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key`, `pyjitpl.rs:10547` — `values` |
-/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key`, `pyjitpl.rs:10548` — `typed_values` |
 ///
-/// ⚠ THE FIRST FOUR ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
+/// Four shared rows have gone since:
+///
+/// - `<[Type]>::to_vec`, the exit's type list copied out of the failing descr
+///   into the exit layout. `CompiledExitLayout::exit_types` is now inline
+///   storage wide enough for the exits a steady entry produces, so the copy
+///   costs the allocator nothing until an exit is wider than that.
+/// - `<[Value]>::to_vec`, the FINISH values copied out of the run result. The
+///   FINISH arm returns immediately after publishing them, so nothing reads
+///   the source and the values are moved instead.
+/// - `run_compiled_detailed_with_values_at_dispatch_key` — `values`, the run
+///   result's own machine-word output buffer.
+/// - the same function's `typed_values`, its typed twin. Both are now inline
+///   storage on the result, sized to the exit widths a steady entry returns,
+///   so decoding an exit asks the allocator for nothing. The buffers could not
+///   be pooled and reused instead: each one leaves the function owned — into
+///   the finish latch, into the public run outcome, into the guard arm's own
+///   copy — so there is nothing to hand back.
+///
+/// ⚠ ALL FOUR ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
 /// entry path in general. `codegen_state.rs:1731` emits the non-allocating
 /// `extract_live_values_into` / `live_value_types_into` overrides only when the
 /// state has a ref scalar, a float scalar or a virt array; a state of int
 /// scalars only — which `CounterState` is — gets neither, and falls back to the
 /// allocating `JitState` defaults. A state that clears that gate pays 4 fewer.
 ///
-/// `dynasm` adds two, for 10:
+/// `dynasm` adds two, for 6:
 ///
 /// | n | site |
 /// |---|------|
@@ -622,11 +636,7 @@ fn main() {
 /// so the copy had no upstream counterpart; the frame now lives as long as the
 /// deadframe does and the accessors read it in place.
 ///
-/// `cranelift` adds ONE, for 9:
-///
-/// | n | site |
-/// |---|------|
-/// | 1 | `deadframe_from_jitframe` — the `Box<JitFrameDeadFrame>` inside `DeadFrame`, the `llmodel.py:240` `cast_opaque_ptr` |
+/// `cranelift` adds NOTHING, and its four are the four shared rows above.
 ///
 /// There is no cranelift row for the frame itself, and that is the difference
 /// between the two backends. `run_compiled_code_inner` takes the JITFRAME from
@@ -636,8 +646,17 @@ fn main() {
 /// allocates its entry frame off the GC unconditionally, so it keeps paying
 /// for one; installing a GC does not move its figure.
 ///
-/// It used to add four. The three that went:
+/// It used to add four. The four that went:
 ///
+/// - `deadframe_from_jitframe` — the `Box<JitFrameDeadFrame>` inside
+///   `DeadFrame`. The box was not the `llmodel.py:240` `cast_opaque_ptr` it was
+///   annotated as; it was a PIN. The deadframe's frame pointer was rooted by
+///   registering the address of the field holding it, and a field address is
+///   only a valid root while its owner stays put, so the owner had to be given
+///   a fixed address before it could be returned. The pointer now lives in a
+///   root slot addressed by POSITION (`shadowstack.py:100-106`), which the
+///   collector rewrites in place, so the holder may move and `DeadFrame` holds
+///   the frame by value.
 /// - `CraneliftBackend::execute_token_with_dispatch_key` unwrapped the
 ///   metainterp's `&[Value]` into an owned `Vec<i64>` before the frame
 ///   existed. `llmodel.py:306-315` unwraps each argument *at* the store into
@@ -654,4 +673,4 @@ fn main() {
 ///   `run_compiled_code_inner`, reached because this fixture had no GC at all;
 ///   see [`install_gc`]. The branch itself remains for a backend running
 ///   without a collector.
-const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 9 } else { 10 };
+const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 4 } else { 6 };

@@ -95,7 +95,7 @@ use crate::compile;
 use crate::compile::make_jitcell_token;
 pub use crate::compile::{
     CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
-    DeadFrameArtifacts, RawCompileResult,
+    DeadFrameArtifacts, ExitRawValues, ExitTypes, ExitValues, RawCompileResult,
 };
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
@@ -358,13 +358,13 @@ impl StoredExitLayout {
             trace_id,
             fail_index,
             source_op_index: self.source_op_index,
-            exit_types: self.resolve_exit_types().to_vec(),
+            exit_types: ExitTypes::from_slice(self.resolve_exit_types()),
             is_finish: self.resolve_is_finish(),
             is_exception_exit: self.resolve_is_exception_exit(),
             gc_ref_slots: self.gc_ref_slots.clone(),
             force_token_slots: self.force_token_slots.clone(),
-            recovery_layout: self.recovery_layout.clone(),
-            resume_layout: self.resume_layout.clone(),
+            recovery_layout: self.recovery_layout.clone().map(Box::new),
+            resume_layout: self.resume_layout.clone().map(Box::new),
             storage: self.storage.clone(),
         }
     }
@@ -1392,7 +1392,7 @@ pub struct MetaInterp<M: Clone> {
     /// `Option<resume_pc>` back-edge signature cannot express the outcome —
     /// this carries the result value out of band instead. Set by
     /// `back_edge_internal`, `take`n by `JitDriver::take_back_edge_finish*`.
-    pub(crate) back_edge_finish: Option<Vec<Value>>,
+    pub(crate) back_edge_finish: Option<ExitValues>,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -2616,7 +2616,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
-        let exit_types = descr.fail_arg_types().to_vec();
+        let exit_types = ExitTypes::from_slice(descr.fail_arg_types());
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
             .enumerate()
@@ -2816,11 +2816,13 @@ impl<M: Clone> MetaInterp<M> {
                         layout.rd_pendingfields.clone().unwrap_or_default(),
                     )
                 });
-                let exit_types = if layout.fail_arg_types.is_empty() {
+                // `from_vec`, so whichever arm wins hands over the buffer it
+                // already owns instead of being copied into a fresh one.
+                let exit_types = ExitTypes::from_vec(if layout.fail_arg_types.is_empty() {
                     frontend_exit_types.unwrap_or_default()
                 } else {
                     layout.fail_arg_types
-                };
+                });
                 let gc_ref_slots = if layout.gc_ref_slots.is_empty() {
                     exit_types
                         .iter()
@@ -2840,7 +2842,7 @@ impl<M: Clone> MetaInterp<M> {
                     is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
-                    recovery_layout: layout.recovery_layout,
+                    recovery_layout: layout.recovery_layout.map(Box::new),
                     resume_layout: None,
                     storage,
                 }
@@ -2860,12 +2862,12 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index: layout.fail_index,
                 source_op_index: Some(layout.op_index),
-                exit_types: layout.exit_types,
+                exit_types: ExitTypes::from_vec(layout.exit_types),
                 is_finish: layout.is_finish,
                 is_exception_exit: layout.is_exception_exit,
                 gc_ref_slots: layout.gc_ref_slots,
                 force_token_slots: layout.force_token_slots,
-                recovery_layout: layout.recovery_layout,
+                recovery_layout: layout.recovery_layout.map(Box::new),
                 resume_layout: None,
                 storage: None,
             })
@@ -2907,12 +2909,12 @@ impl<M: Clone> MetaInterp<M> {
                         trace_id,
                         fail_index: layout.fail_index,
                         source_op_index: layout.source_op_index,
-                        exit_types: layout.fail_arg_types,
+                        exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                         is_finish: layout.is_finish,
                         is_exception_exit: layout.is_exception_exit,
                         gc_ref_slots: layout.gc_ref_slots,
                         force_token_slots: layout.force_token_slots,
-                        recovery_layout: layout.recovery_layout,
+                        recovery_layout: layout.recovery_layout.map(Box::new),
                         resume_layout: merged
                             .get(&layout.fail_index)
                             .and_then(|existing| existing.resume_layout.clone()),
@@ -2963,12 +2965,12 @@ impl<M: Clone> MetaInterp<M> {
                             trace_id,
                             fail_index: layout.fail_index,
                             source_op_index: Some(layout.op_index),
-                            exit_types: layout.exit_types,
+                            exit_types: ExitTypes::from_vec(layout.exit_types),
                             is_finish: layout.is_finish,
                             is_exception_exit: layout.is_exception_exit,
                             gc_ref_slots: layout.gc_ref_slots,
                             force_token_slots: layout.force_token_slots,
-                            recovery_layout: layout.recovery_layout,
+                            recovery_layout: layout.recovery_layout.map(Box::new),
                             resume_layout: merged
                                 .get(&layout.op_index)
                                 .and_then(|existing| existing.exit_layout.resume_layout.clone()),
@@ -4823,6 +4825,19 @@ impl<M: Clone> MetaInterp<M> {
         let Some(driver) = driver_descriptor else {
             return input_types;
         };
+        // A driver that declares a flat entry contract has no red list to
+        // synthesise the shape from — its entry slots ARE the leading
+        // inputargs, in the order `extract_live_values()` emits them, so the
+        // contract is the prefix of the types already in hand. Take it before
+        // the red-list path below, which would answer with a red count that
+        // describes a different model.
+        if let Some(flat) = driver.flat_entry_contract() {
+            let mut input_types = input_types;
+            if input_types.len() > flat.len {
+                input_types.truncate(flat.len);
+            }
+            return input_types;
+        }
         let Some(_) = driver.virtualizable_arg_index() else {
             return input_types;
         };
@@ -5799,8 +5814,21 @@ impl<M: Clone> MetaInterp<M> {
         let Some(index_of_vable) = driver.virtualizable_arg_index() else {
             return;
         };
-        let num_red_args = driver.num_reds();
-        if inputargs.len() <= num_red_args {
+        // compile.py:431 spells the entry contract's width as
+        // `jitdriver_sd.num_red_args`, because upstream's compiled entry is
+        // invoked with the jitdriver's reds (`warmstate.py:387
+        // execute_assembler`). A driver whose entry is a flat state-field
+        // prefix has a different width — its reds describe the merge-point
+        // payload, in which the whole state is a single red — and the red
+        // count is neither an upper bound on nor a scaled version of it, so
+        // using it there would truncate in the middle of the live entry values
+        // and reinterpret the rest as virtualizable fields. Ask the descriptor
+        // which model it is in.
+        let entry_prefix_len = match driver.flat_entry_contract() {
+            Some(flat) => flat.len,
+            None => driver.num_reds(),
+        };
+        if inputargs.len() <= entry_prefix_len {
             // Trace was never expanded (no virtualizable fields live at entry).
             return;
         }
@@ -5835,7 +5863,7 @@ impl<M: Clone> MetaInterp<M> {
             inputargs,
             vinfo,
             &array_lengths,
-            num_red_args,
+            entry_prefix_len,
             index_of_vable,
             constants,
         );
@@ -10218,7 +10246,7 @@ impl<M: Clone> MetaInterp<M> {
                 let trace_layout_ref = trace_layout.as_ref();
                 let mut resume_layout = trace_layout
                     .as_ref()
-                    .and_then(|tl| tl.resume_layout.clone());
+                    .and_then(|tl| tl.resume_layout.as_deref().cloned());
                 compile::enrich_resume_layout_with_frame_stack(
                     &mut resume_layout,
                     layout.frame_stack.as_deref(),
@@ -10230,15 +10258,15 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: layout
                         .source_op_index
                         .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index)),
-                    exit_types: layout.fail_arg_types,
+                    exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots: layout.gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
-                    recovery_layout: layout.recovery_layout.or_else(|| {
+                    recovery_layout: layout.recovery_layout.map(Box::new).or_else(|| {
                         trace_layout_ref.and_then(|layout| layout.recovery_layout.clone())
                     }),
-                    resume_layout,
+                    resume_layout: resume_layout.map(Box::new),
                     storage: trace_layout_ref.and_then(|layout| layout.storage.clone()),
                 }
             })
@@ -10301,8 +10329,10 @@ impl<M: Clone> MetaInterp<M> {
         let descr_arc = result.descr_arc.clone();
 
         Some(RawCompileResult {
-            values: result.outputs,
-            typed_values: result.typed_outputs,
+            // The backend already owns these as heap vectors, so the inline
+            // spelling adopts the buffers rather than re-decoding into them.
+            values: ExitRawValues::from_vec(result.outputs),
+            typed_values: ExitValues::from_vec(result.typed_outputs),
             meta,
             fail_index,
             trace_id,
@@ -10342,7 +10372,10 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
-        let exit_types = descr.fail_arg_types().to_vec();
+        // Borrowed, not copied — see the sibling
+        // `run_compiled_detailed_with_values_at_dispatch_key` for why the copy
+        // does not belong on a path every entry takes.
+        let exit_types: &[Type] = descr.fail_arg_types();
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
             .enumerate()
@@ -10383,7 +10416,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.clone(),
+                exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
                 gc_ref_slots,
@@ -10412,7 +10445,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     fail_index,
                     source_op_index: None,
-                    exit_types: exit_types.clone(),
+                    exit_types: ExitTypes::from_slice(exit_types),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
@@ -10433,8 +10466,8 @@ impl<M: Clone> MetaInterp<M> {
         if exit_types.len() > exit_layout.exit_types.len() {
             exit_layout.exit_types.resize(exit_types.len(), Type::Int);
         }
-        let mut values = Vec::with_capacity(exit_arity);
-        let mut typed_values = Vec::with_capacity(exit_arity);
+        let mut values = ExitRawValues::with_capacity(exit_arity);
+        let mut typed_values = ExitValues::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {
             match tp {
                 Type::Int => {
@@ -10509,15 +10542,47 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         dispatch_key: u32,
     ) -> Option<CompileResult<M>> {
-        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         // warmstate.py:398: execute the token returned by the JitCell, not
         // the compiled-metadata index's possibly retired predecessor.
+        //
+        // This is the resolving form, for callers that reach the run without
+        // having decided anything about the cell first. A caller that already
+        // gated on the token holds it and calls the run directly.
         let token = self.warm_state.get_procedure_token(green_key)?;
+        self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
+    }
+
+    /// `warmstate.py:405-419 execute_assembler(loop_token, *args)`: the run
+    /// RECEIVES the token whoever decided to enter already resolved, and never
+    /// looks the cell up again. Upstream hands it over the same way —
+    /// `warmstate.py:483` reads `procedure_token = cell.get_procedure_token()`
+    /// once per `maybe_compile_and_run` and `:509-511` carries it out through
+    /// `raise EnterJitAssembler(procedure_token, *execute_args)`.
+    ///
+    /// A caller that holds no token yet goes through
+    /// [`Self::run_compiled_detailed_with_values_at_dispatch_key`], which is
+    /// this one with the resolve in front.
+    ///
+    /// What is passed must be a token read off the JitCell — the artifact
+    /// `compiled_loops` indexes is metadata and can still name a predecessor a
+    /// recompile or redirect has already replaced, and entering that one
+    /// re-enters invalidated machine code and fails GUARD_NOT_INVALIDATED on
+    /// every iteration.
+    pub fn execute_assembler_at_dispatch_key(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        live_values: &[Value],
+        dispatch_key: u32,
+    ) -> Option<CompileResult<M>> {
+        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
 
         Self::prepare_compiled_run_io();
-        let frame = self
-            .backend
-            .execute_token_with_dispatch_key(&token, live_values, dispatch_key);
+        let frame = self.backend.execute_token_with_dispatch_key(
+            procedure_token,
+            live_values,
+            dispatch_key,
+        );
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
@@ -10575,7 +10640,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.to_vec(),
+                exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
                 // Moved rather than cloned: the `else` arm below is the only
@@ -10604,7 +10669,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     fail_index,
                     source_op_index: None,
-                    exit_types: exit_types.to_vec(),
+                    exit_types: ExitTypes::from_slice(exit_types),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
@@ -10625,8 +10690,8 @@ impl<M: Clone> MetaInterp<M> {
         if exit_types.len() > exit_layout.exit_types.len() {
             exit_layout.exit_types.resize(exit_types.len(), Type::Int);
         }
-        let mut values = Vec::with_capacity(exit_arity);
-        let mut typed_values = Vec::with_capacity(exit_arity);
+        let mut values = ExitRawValues::with_capacity(exit_arity);
+        let mut typed_values = ExitValues::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {
             match tp {
                 Type::Int => {
@@ -11429,17 +11494,35 @@ impl<M: Clone> MetaInterp<M> {
     /// `is_invalidated` AND here.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
-        // warmstate.py:482-511 maybe_compile_and_run gates execution entry on
-        // `cell.get_procedure_token() is not None` (code present), NOT on
-        // has_compiled_targets. An entry bridge (ResumeFromInterpDescr) has
-        // compiled code but may carry 0 target_tokens; gating on
-        // has_target_tokens() refused to dispatch it, so the interp re-ticked
-        // the green key every back-edge -> bound_reached -> decay_all_counters
-        // flood that starved the guard-failure bridge counter. Gate on
-        // has_compiled_code() so a code-present token is entered directly.
+        self.entry_procedure_token(green_key).is_some()
+    }
+
+    /// `warmstate.py:483` `procedure_token = cell.get_procedure_token()` — the
+    /// entry decision's single read of the cell's current token, handed back so
+    /// the caller can carry it into the run instead of resolving a second time.
+    /// Upstream carries it the same way: `warmstate.py:509-511 raise
+    /// EnterJitAssembler(procedure_token, *execute_args)` passes the resolved
+    /// token to `execute_assembler`, which never re-reads the cell.
+    ///
+    /// `None` is upstream's `procedure_token is None`, where the entry falls
+    /// through to the counter tick. [`Self::has_compiled_loop`] is the boolean
+    /// form of exactly this question and is defined in terms of it, so a
+    /// decision taken through the predicate and a run taken through the token
+    /// cannot be about different objects.
+    ///
+    /// warmstate.py:482-511 maybe_compile_and_run gates execution entry on
+    /// `cell.get_procedure_token() is not None` (code present), NOT on
+    /// has_compiled_targets. An entry bridge (ResumeFromInterpDescr) has
+    /// compiled code but may carry 0 target_tokens; gating on
+    /// has_target_tokens() refused to dispatch it, so the interp re-ticked
+    /// the green key every back-edge -> bound_reached -> decay_all_counters
+    /// flood that starved the guard-failure bridge counter. Gate on
+    /// has_compiled_code() so a code-present token is entered directly.
+    #[inline]
+    pub fn entry_procedure_token(&self, green_key: u64) -> Option<std::sync::Arc<JitCellToken>> {
         self.warm_state
             .get_procedure_token(green_key)
-            .is_some_and(|token| token.has_compiled_code())
+            .filter(|token| token.has_compiled_code())
     }
 
     /// `warmstate.py:458-464` — the same code-presence gate as
@@ -11499,15 +11582,15 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn resolve_cell_key(
         &self,
-        green_key: u64,
+        green_key_hash: u64,
         structured_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
     ) -> u64 {
         match structured_green_key {
-            Some(make_key) => self.warm_state.resolve_cell_key(green_key, make_key),
+            Some(make_key) => self.warm_state.resolve_cell_key(green_key_hash, make_key),
             None => self
                 .warm_state
-                .sole_cell_key(green_key)
-                .unwrap_or(green_key),
+                .sole_cell_key(green_key_hash)
+                .unwrap_or(green_key_hash),
         }
     }
 
@@ -11957,7 +12040,7 @@ impl<M: Clone> MetaInterp<M> {
             self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
         Some(Self::recovery_slot_types_from_exit_types_and_layout(
             &exit_layout.exit_types,
-            exit_layout.recovery_layout.as_ref(),
+            exit_layout.recovery_layout.as_deref(),
         ))
     }
 
@@ -12048,7 +12131,7 @@ impl<M: Clone> MetaInterp<M> {
             storage,
             Self::recovery_slot_types_from_exit_types_and_layout(
                 &layout.exit_types,
-                layout.recovery_layout.as_ref(),
+                layout.recovery_layout.as_deref(),
             ),
         ))
     }
@@ -12062,7 +12145,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<Vec<Type>> {
         let exit_layout =
             self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
-        Some(exit_layout.exit_types.clone())
+        Some(exit_layout.exit_types.to_vec())
     }
 
     /// resume.py:924-926 _prepare: get rd_virtuals + rd_pendingfields
@@ -13931,7 +14014,7 @@ impl<M: Clone> MetaInterp<M> {
             .resume_layout
             .as_ref()
             .map(|layout| layout.reconstruct_state(fail_values));
-        let resume_layout = exit_layout.resume_layout.clone();
+        let resume_layout = exit_layout.resume_layout.as_deref().cloned();
         let reconstructed = reconstructed_state
             .as_ref()
             .map(|state| state.frames.clone());
@@ -13970,7 +14053,7 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
         let is_finish = result.is_finish;
-        let values = result.values.clone();
+        let values = result.values.to_vec();
         let typed_values = result.typed_values.clone();
         let savedata = result.savedata;
         let exception = result.exception.clone();
@@ -16085,6 +16168,17 @@ impl<M: Clone> MetaInterp<M> {
             args.len(),
             target_sd.num_reds(),
             "pyjitpl.py:3596 — direct_assembler_call args.len() must match num_red_args",
+        );
+        // `args` is that red list, and the vable is picked out of it below by
+        // the index the target token carries, so the token's index has to be a
+        // position among the reds (`warmspot.py:537`). A driver whose compiled
+        // entry is a flat state-field prefix numbers its virtualizable in the
+        // entry instead; the two coordinate systems have never met because no
+        // such driver mints a CALL_ASSEMBLER token, and this says so.
+        debug_assert!(
+            target_sd.flat_entry_contract().is_none(),
+            "a flat-entry driver's virtualizable index is not a position in \
+             the reds, but direct_assembler_call selects out of the red list",
         );
         // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs).
         //
@@ -19110,6 +19204,7 @@ mod metainterp_static_data_tests {
             index: None,
             vars: vec![],
             virtualizable: None,
+            flat_entry: None,
             result_type: majit_ir::Type::Ref,
             is_recursive: false,
             mainjitcode: None,
@@ -23295,7 +23390,7 @@ mod tests {
         let layout = meta
             .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
             .expect("previous token backend layout should remain visible");
-        assert_eq!(layout.exit_types, vec![Type::Int]);
+        assert_eq!(layout.exit_types.as_slice(), [Type::Int]);
         assert!(!layout.is_finish);
         assert_eq!(
             meta.get_exit_types(green_key, trace_id, fail_index),
@@ -23407,7 +23502,10 @@ mod tests {
                 .map(|storage| storage.rd_numb.clone()),
             expected_rd_numb
         );
-        assert_eq!(recovery.exit_layout.exit_types, expected_exit_types);
+        assert_eq!(
+            recovery.exit_layout.exit_types.as_slice(),
+            expected_exit_types
+        );
     }
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]

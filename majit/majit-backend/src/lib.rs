@@ -68,6 +68,7 @@ pub fn fallback_cpu_tracker() -> &'static CpuTotalTracker {
 }
 
 pub mod call_stub;
+pub mod deadframe;
 pub mod finish_descrs;
 pub mod jitframe;
 pub mod llmodel;
@@ -1588,9 +1589,62 @@ unsafe impl Sync for JitCellToken {}
 /// A "dead frame" — the state after JIT execution finishes or hits a guard.
 ///
 /// The backend stores register/stack values here so the frontend can read them.
-pub struct DeadFrame {
+///
+/// A backend whose frames are jitframes puts its frame in [`DeadFrame::JitFrame`]
+/// BY VALUE. `llmodel.py:323` hands back the JITFRAMEPTR the run returned and
+/// nothing wraps it, so an erased payload behind a per-exit heap allocation had
+/// no upstream counterpart; it existed only to give the frame pointer a fixed
+/// address to be registered at, which addressing the root by POSITION removes
+/// the need for (see [`deadframe::JitFrameDeadFrame`]).
+///
+/// [`DeadFrame::Boxed`] keeps the erasure for backends whose deadframe is not a
+/// jitframe, or is a jitframe held under a different ownership discipline.
+///
+/// **A deadframe is thread-confined**: it must be created and dropped on the
+/// same thread. The root slot [`DeadFrame::JitFrame`] holds names a position in
+/// the acquiring thread's root vector, so releasing it anywhere else would free
+/// a foreign thread's slot. That is what the guard's own thread-pinning
+/// enforces, and it is the rule for the enum as a whole — the erased variant
+/// states no weaker one, so its payload carries no `Send` bound either.
+pub enum DeadFrame {
+    /// `llmodel.py:323` — the deadframe IS the jitframe the run returned.
+    JitFrame(deadframe::JitFrameDeadFrame),
     /// Backend-specific frame data.
-    pub data: Box<dyn std::any::Any + Send>,
+    Boxed(Box<dyn std::any::Any>),
+}
+
+impl DeadFrame {
+    /// Wrap backend-specific frame data that is not a [`deadframe::JitFrameDeadFrame`].
+    pub fn boxed(data: impl std::any::Any) -> Self {
+        DeadFrame::Boxed(Box::new(data))
+    }
+
+    /// The jitframe this deadframe reads through, if it has one.
+    #[inline]
+    pub fn as_jitframe(&self) -> Option<&deadframe::JitFrameDeadFrame> {
+        match self {
+            DeadFrame::JitFrame(jf) => Some(jf),
+            DeadFrame::Boxed(_) => None,
+        }
+    }
+
+    /// Mutable counterpart of [`DeadFrame::as_jitframe`].
+    #[inline]
+    pub fn as_jitframe_mut(&mut self) -> Option<&mut deadframe::JitFrameDeadFrame> {
+        match self {
+            DeadFrame::JitFrame(jf) => Some(jf),
+            DeadFrame::Boxed(_) => None,
+        }
+    }
+
+    /// The erased payload, for backends that still carry one.
+    #[inline]
+    pub fn boxed_data(&self) -> Option<&dyn std::any::Any> {
+        match self {
+            DeadFrame::Boxed(data) => Some(&**data),
+            DeadFrame::JitFrame(_) => None,
+        }
+    }
 }
 
 /// `compile.py:665-674` `make_and_attach_done_descrs` + `pyjitpl.py:2283`
