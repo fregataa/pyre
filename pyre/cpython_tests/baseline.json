@@ -1045,7 +1045,7 @@
       "dynasm": "PASS"
     },
     "test.test_sort": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_source_encoding": {
       "dynasm": "IMPORTERROR"
