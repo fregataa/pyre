@@ -919,7 +919,7 @@ def _jit_stats_merged(stderr):
     return fields if seen else None
 
 
-def _jit_stats_snapshot(stderr):
+def _jit_stats_snapshot(stderr, ungated=()):
     """Return every jit-stats line merged into normalized key/value text.
 
     The interpreter emits more than one `[jit-stats]` line — the counters, the
@@ -941,11 +941,21 @@ def _jit_stats_snapshot(stderr):
     a run may read and what a committed baseline may contain are two different
     questions: merging arms the floor, the filter keeps the recorded surface
     host-stable.
+
+    *ungated* names counters this fixture's header exempted
+    (`synth_ungated_jitstats`). They are dropped here rather than at the
+    comparison, so the recorded baseline never carries them either: a field
+    absent from both sides compares equal, which is what makes one filter serve
+    the record and the gate at once.
     """
     fields = _jit_stats_merged(stderr)
     if fields is None:
         return None
-    fields = {k: v for k, v in fields.items() if k in JITSTATS_SNAPSHOT_FIELDS}
+    fields = {
+        k: v
+        for k, v in fields.items()
+        if k in JITSTATS_SNAPSHOT_FIELDS and k not in ungated
+    }
     # This watches what the JIT compiles, never how well. A regression that
     # changes no structure (for example, an extra spill) is invisible here.
     return "".join(f"{key}={fields[key]}\n" for key in sorted(fields))
@@ -962,7 +972,9 @@ def _parse_jit_stats(snapshot):
 
 # Every counter a `.jitstats` baseline records is gated, in BOTH directions: the
 # recorded surface and the gated surface are the same set, so a baseline can
-# never carry a number nobody checks.
+# never carry a number nobody checks. A fixture header may drop a structural
+# counter from that set (`synth_ungated_jitstats`), and it leaves both halves at
+# once for exactly this reason.
 #
 # Both directions, because an improvement has to be recorded too. A counter that
 # falls is a real change in what the JIT compiles, and leaving the fall ungated
@@ -1620,6 +1632,78 @@ def synth_no_cpython(path):
     )
 
 
+def synth_selfcheck(path):
+    """Read an optional self-checking fixture marker from its header:
+        # pyre-check: selfcheck
+
+    These fixtures assert their own invariant and print ``PASS`` instead of
+    producing stable output for the cpython/pypy parity comparison.  Keeping
+    the marker on the fixture lets the synthetic suite discover it normally
+    without a second, hard-coded list in ``main``.
+    """
+    return _synth_header_flag(
+        path,
+        "# pyre-check: selfcheck",
+        "synthetic selfcheck marker takes no value",
+    )
+
+
+def synth_ungated_jitstats(path):
+    """Read an optional per-fixture jit-stats exemption from its header:
+        # pyre-check: ungated-jitstats=bridges_compiled,guard_failures
+
+    For a fixture whose named counters are demonstrably not a function of the
+    tree — the same binary, the same fixture and the same child environment
+    read two different values. The names are dropped from both sides of the
+    comparison and from the recorded baseline, so the file carries no number
+    nobody checks, which is the rule the recorded surface is built on.
+
+    Only the structural counters may be named. The badness fields are
+    assertions that must hold in every run (`internal_compile_panics` is an
+    internal compile bug, the descr-universe counters are invariants upstream
+    spells as `assert`), and a run that reaches one has a defect no
+    per-run input excuses, so naming one here is an error rather than an
+    exemption. An unknown name is an error too — a typo would otherwise read
+    as "exempted".
+
+    Like the other directives, one below the 20-line window is not honored:
+    the fixture simply stays gated, which is the safe direction. The header
+    must also carry what was measured, so the next reader can check the claim
+    rather than take it.
+
+    Read from `_apply_snapshot_gate`, so unlike the rest of this family it
+    reaches the regular benches too — the gate it exempts is the one they
+    share, and a counter that will not reproduce is not a synthetic-only
+    condition.
+    """
+    prefix = "# pyre-check: ungated-jitstats="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            names = [n.strip() for n in line[len(prefix):].split(",")]
+            names = [n for n in names if n]
+            if not names:
+                raise ValueError(f"empty jit-stats exemption in {path}: {line.strip()}")
+            unknown = [n for n in names if n not in JITSTATS_SNAPSHOT_FIELDS]
+            if unknown:
+                raise ValueError(
+                    f"unknown counter(s) {unknown} in jit-stats exemption in {path}: "
+                    f"{line.strip()}"
+                )
+            badness = [n for n in names if n in JITSTATS_BADNESS_FIELDS]
+            if badness:
+                raise ValueError(
+                    f"badness counter(s) {badness} cannot be exempted in {path}: "
+                    f"{line.strip()}"
+                )
+            return tuple(names)
+    return ()
+
+
 def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
@@ -1767,6 +1851,11 @@ class Check:
         # Benches whose gated counters moved only inside a declared per-fixture
         # band. Reported, never failed.
         self.jitstats_banded = []
+        # "<backend>/<bench>: <counters>" for fixtures whose header exempted a
+        # counter (`synth_ungated_jitstats`). An exempted counter and a matching
+        # one print the same green, so the exemptions are named in the summary:
+        # a gate nobody applied should not read as a gate nobody had to.
+        self.jitstats_ungated = []
         self.jitstats_missing = []
         # Benches whose run printed no `[jit-stats]` line at all. Tracked apart
         # from `jitstats_missing` because the two say opposite things: a missing
@@ -1914,12 +2003,16 @@ class Check:
     def _snapshot_path(self, backend, name, suffix):
         return Path(SNAP_DIR) / backend / f"{name}.{suffix}"
 
-    def _jitstats_repeats(self, backend, script, timeout):
+    def _jitstats_repeats(self, backend, script, timeout, ungated=()):
         """Re-run the fixture and return each repeat's jit-stats snapshot.
 
         Returns None if a repeat did not exit cleanly, so a crashing re-run
         cannot argue a real diff away — the caller then gates on the first run
         as if no repeat had happened.
+
+        *ungated* is the caller's, so a repeat is narrowed the same way the run
+        being compared was: narrowing one side only would report every exempted
+        counter as instability.
         """
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
         snapshots = []
@@ -1930,7 +2023,7 @@ class Check:
             )
             if code != 0:
                 return None
-            snapshots.append(_jit_stats_snapshot(stderr))
+            snapshots.append(_jit_stats_snapshot(stderr, ungated))
         return snapshots
 
     def _jitstats_baseline_path(self, backend, script):
@@ -2003,7 +2096,10 @@ class Check:
         out_path = self._snapshot_path(backend, name, "out")
         time_path = self._snapshot_path(backend, name, "time")
         jitstats_path = self._jitstats_baseline_path(backend, script)
-        jitstats = _jit_stats_snapshot(stderr)
+        ungated = synth_ungated_jitstats(script)
+        if ungated:
+            self.jitstats_ungated.append(f"{backend}/{name}: {', '.join(ungated)}")
+        jitstats = _jit_stats_snapshot(stderr, ungated)
         jitstats_bands = synth_jitstats_bands(script)
 
         # The jit-stats gate — enforced on EVERY run, so a structural JIT change
@@ -2055,7 +2151,7 @@ class Check:
                 jitstats_path.read_text(encoding="utf-8"), jitstats, jitstats_bands
             )
             if regressions or improvements:
-                repeats = self._jitstats_repeats(backend, script, timeout)
+                repeats = self._jitstats_repeats(backend, script, timeout, ungated)
                 drifted = next(
                     (s for s in repeats or () if s != jitstats), None
                 )
@@ -2905,8 +3001,8 @@ class Check:
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
         check.py only honors the exit code and the required marker. Used for
-        guards whose signal is a timing ratio, not byte-identical output, so
-        they cannot go through `run_bench` or the synthetic suite.
+        guards whose signal is an asserted invariant, not byte-identical
+        output, so they cannot go through `run_bench` or synthetic parity.
 
         *skip_backends* names backends the guard does not apply to (e.g. a
         `time`-module timing guard cannot run on the wasm guest, which has no
@@ -3158,9 +3254,23 @@ class Check:
         print(bold("synthetic parity suite"))
         print(dim(f"{len(paths)} benchmark(s), pattern={pattern!r}"))
         for path in paths:
-            self.run_synthetic_bench(
-                str(path), self.args.synthetic_timeout,
-            )
+            try:
+                selfcheck = synth_selfcheck(path)
+                skip_backends = synth_skip_backends(path) if selfcheck else ()
+            except ValueError as e:
+                print(f"{red('ERROR')}: {e}")
+                sys.exit(1)
+            if selfcheck:
+                self.run_selfcheck(
+                    f"synth/{path.stem}",
+                    str(path),
+                    self.args.synthetic_timeout,
+                    skip_backends=skip_backends,
+                )
+            else:
+                self.run_synthetic_bench(
+                    str(path), self.args.synthetic_timeout,
+                )
         # A fixture that loses its cpython reference also loses the
         # cpython/pypy output cross-check, so the count belongs in the summary
         # rather than only in the per-fixture line it scrolled past. A fixture
@@ -3185,6 +3295,17 @@ class Check:
                     f"{len(self.wasm_ratio_ungated)} fixture(s): dynasm did not run "
                     f"them in this invocation, or its execution-only time stayed "
                     f"under {FLOOR_GATE_MIN_BASELINE_S * 1000:g}ms"
+                )
+            )
+        # Counters a fixture's header took out of its own gate. Named for the
+        # same reason as the two above: the fixture prints green either way, and
+        # the exemption is only reviewable if it is said out loud.
+        if self.jitstats_ungated:
+            print(
+                dim(
+                    f"jit-stats counters ungated by header for "
+                    f"{len(self.jitstats_ungated)}: "
+                    + "; ".join(self.jitstats_ungated)
                 )
             )
         # The same weaker baseline, asked for rather than discovered. Listed
@@ -3376,6 +3497,11 @@ def parse_args():
         f"(default: {','.join(DEFAULT_BACKENDS)})",
     )
     parser.add_argument(
+        "--no-build",
+        action="store_true",
+        help="use existing release backend binaries instead of running cargo build",
+    )
+    parser.add_argument(
         "--wasm-engine",
         choices=["wasmtime", "wasmi"],
         default="wasmtime",
@@ -3462,14 +3588,30 @@ def main():
     backends = args.backends
 
     for backend in backends:
-        chk.build_backend(backend)
+        if not args.no_build:
+            chk.build_backend(backend)
         pyre_bin = args.pyre_path if args.pyre_path else default_binary(backend)
         if not Path(pyre_bin).exists():
             alt = pyre_bin + EXE
             if Path(alt).exists():
                 pyre_bin = alt
         if not os.access(pyre_bin, os.X_OK) and not Path(pyre_bin).exists():
-            print(f"ERROR: build failed for backend '{backend}' (missing executable: {pyre_bin})")
+            if args.no_build:
+                print(
+                    f"ERROR: --no-build requested for backend '{backend}', but "
+                    f"the executable is missing: {pyre_bin}"
+                )
+            else:
+                print(
+                    f"ERROR: build failed for backend '{backend}' "
+                    f"(missing executable: {pyre_bin})"
+                )
+            sys.exit(1)
+        if backend == "wasm" and args.no_build and not Path(WASM_MODULE_PATH).is_file():
+            print(
+                "ERROR: --no-build requested for backend 'wasm', but the "
+                f"wasm-host module is missing: {WASM_MODULE_PATH}"
+            )
             sys.exit(1)
         chk._set_pyre(backend, pyre_bin)
 
@@ -3516,76 +3658,6 @@ def main():
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       0.5,     5,       1,       5,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
-        # Skipped on wasm: the guard times calls with `time.perf_counter()`, and
-        # the wasm guest has no `time` module (import fails before any output),
-        # so the guard is native-JIT-backend only.
-        chk.run_selfcheck(
-            "loop_reentry",
-            f"{B}/loop_reentry_regression.py",
-            15,
-            skip_backends=("wasm",),
-        )
-        # Skipped on wasm: the guest has no os/filesystem — open() raises
-        # NotImplementedError and `import os` has no posix backend — so the
-        # errno-specific OSError subclass behaviour is native-JIT-backend only.
-        chk.run_selfcheck(
-            "oserror_errno_fields",
-            f"{B}/oserror_errno_fields_regression.py",
-            15,
-            skip_backends=("wasm",),
-        )
-        # Skipped on wasm for the same reason: os.replace needs a filesystem.
-        chk.run_selfcheck(
-            "posix_replace",
-            f"{B}/posix_replace_regression.py",
-            15,
-            skip_backends=("wasm",),
-        )
-        # The f_locals write-through it drives is a 3.14 FrameLocalsProxy
-        # behaviour PyPy 3.11 lacks (its f_locals is a snapshot), so cpython and
-        # pypy disagree on the mutated value and it cannot be a synthetic bench.
-        # The guard is pyre-internal: a forcing callee's escape flush must resume
-        # past the abort, else the in-flight FOR_ITER iteration drops and the
-        # loop total comes up short. Asserted inside the script.
-        chk.run_selfcheck(
-            "getframe_escape_flush_writethrough",
-            f"{B}/getframe_escape_flush_writethrough_regression.py",
-            15,
-        )
-        # The coordinate a frame reports WHILE it is still running: compiled code
-        # runs no per-opcode `last_instr` store, so a replayed frame answers for
-        # the instruction it is on only if the blackhole publishes at the
-        # `-live-` marker. Runs on every backend -- it is also the guard that
-        # catches a store whose width overruns `valuestackdepth` onto the
-        # `last_instr` next to it, which is a 32-bit-only failure.
-        chk.run_selfcheck(
-            "frame_lineno_mid_replay",
-            f"{B}/frame_lineno_mid_replay_regression.py",
-            20,
-        )
-        # The sibling shape: the frame handed out is the INLINED CALLEE's own,
-        # not the virtualizable its caller runs as. That frame carries the `-1`
-        # `last_instr` sentinel and is not what the escape flush writes, so its
-        # `f_lineno` / `f_locals` are only right because `sys._getframe` forces
-        # and the resulting abort finishes the iteration interpreted. Pins the
-        # answer so a change that retires that abort has to keep it -- the whole
-        # synthetic corpus stayed green while these three reads broke.
-        chk.run_selfcheck(
-            "frame_inlined_callee_own_image",
-            f"{B}/frame_inlined_callee_own_image_regression.py",
-            20,
-        )
-        # The third frame-image shape: an inlined callee reads its CALLER's
-        # real frame via `sys._getframe(1)` while the caller's compiled loop is
-        # still active.  The two sibling guards miss this because one reads
-        # after the loop and the other reads the callee's own frame.  The read
-        # stays on non-forcing coordinates (`f_lasti` / `f_lineno`) so a bad
-        # escape flush cannot be masked by routing back through the interpreter.
-        chk.run_selfcheck(
-            "frame_caller_image_from_inlined_callee",
-            f"{B}/frame_caller_image_from_inlined_callee_regression.py",
-            20,
-        )
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
         # `# pyre-check: max-pypy-ratio`; a decline that keeps every crossing

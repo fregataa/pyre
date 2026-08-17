@@ -218,6 +218,7 @@ pub use inline_call::*;
 mod residual_call;
 pub use residual_call::*;
 mod fbw_state;
+mod symbolic_fold;
 pub use fbw_state::*;
 mod resume_snapshot;
 pub use resume_snapshot::*;
@@ -2139,6 +2140,12 @@ pub enum DispatchError {
     /// abort the trace gracefully (interpreter fallback) instead of committing
     /// a trace that SIGSEGVs on its first side exit.  Default OFF.
     OrthodoxSubWalkTraceUnsupported { pc: usize, symbolic: i64 },
+    /// A `new` descriptor cannot resolve to a type id present in the active
+    /// collector's registered type table. The walker must stop before either
+    /// executing or recording the allocation: both paths would stamp the same
+    /// invalid header. This error deliberately keeps legacy entry replay;
+    /// blackhole resume at this opcode would use the same descriptor fallback.
+    UnregisteredNewGcType { pc: usize, type_id: u64 },
     /// The LIST_APPEND opcode's void `jit_list_append` residual
     /// (`ListAppendValue`) reached the authoritative full-body walker but the
     /// orthodox `w_list_append` fold declined (the list needs a resize, or the
@@ -2498,6 +2505,7 @@ impl DispatchError {
             Self::LoopBearingCalleeInlineUnsupported { .. } => "LoopBearingCalleeInlineUnsupported",
             Self::FieldDescrMissingParentDescr { .. } => "FieldDescrMissingParentDescr",
             Self::OrthodoxSubWalkTraceUnsupported { .. } => "OrthodoxSubWalkTraceUnsupported",
+            Self::UnregisteredNewGcType { .. } => "UnregisteredNewGcType",
             Self::UnfoldableListAppendResidualUnsupported { .. } => {
                 "UnfoldableListAppendResidualUnsupported"
             }
@@ -2566,6 +2574,7 @@ impl DispatchError {
             | Self::LoopBearingCalleeInlineUnsupported { pc, .. }
             | Self::FieldDescrMissingParentDescr { pc, .. }
             | Self::OrthodoxSubWalkTraceUnsupported { pc, .. }
+            | Self::UnregisteredNewGcType { pc, .. }
             | Self::UnfoldableListAppendResidualUnsupported { pc, .. }
             | Self::BranchGuardUnrestorableKeptStackPermanent { pc, .. }
             | Self::InplaceContainerMutationUnsupported { pc, .. }
@@ -10781,6 +10790,17 @@ fn handle<Sym: WalkSym>(
         // vtable word, so nothing is known about its class.
         "new/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
+            // Every header-writing allocation must carry a tid in the active
+            // collector's type table; tracing a fabricated header records
+            // garbage that the concrete and compiled allocation paths share.
+            if !ctx.trace_ctx.new_allocation_tid_is_sound(&descr) {
+                return Err(DispatchError::UnregisteredNewGcType {
+                    pc: op.pc,
+                    type_id: descr
+                        .as_size_descr()
+                        .map_or(0, |size| size.type_id() as u64),
+                });
+            }
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, false);
             // The `set_opref_concrete` below is what roots this object: it
             // stamps the allocation onto the recorded op's `value` cell, which
@@ -10821,6 +10841,14 @@ fn handle<Sym: WalkSym>(
         // `new_with_vtable` pushes the descr u16 then the result reg).
         "new_with_vtable/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
+            if !ctx.trace_ctx.new_allocation_tid_is_sound(&descr) {
+                return Err(DispatchError::UnregisteredNewGcType {
+                    pc: op.pc,
+                    type_id: descr
+                        .as_size_descr()
+                        .map_or(0, |size| size.type_id() as u64),
+                });
+            }
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, true);
             // Rooted by the `set_opref_concrete` stamp below, as in `new/d>r`.
             if let Some(Value::Ref(majit_ir::GcRef(ptr))) = concrete
