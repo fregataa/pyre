@@ -4396,14 +4396,15 @@ fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_interpreter_global_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_parked_exception_roots);
     majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_store_roots);
-    // The mapdict side tables are keyed by owner address and root their
-    // values, so a major collection has to drop the entries whose owner it is
-    // about to sweep.
+    // The mapdict side tables are keyed by owner address. Their values are
+    // conditional edges, matching the instance-dict and weakref fields PyPy
+    // stores on the owner itself, so major marking keeps a value only after
+    // its owner is known live and drops entries whose owner is about to sweep.
     majit_gc::shadow_stack::register_ephemeron_pruner(
         pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
     );
     majit_gc::shadow_stack::register_ephemeron_marker(
-        pyre_interpreter::objspace::std::mapdict::mark_live_weakref_entries,
+        pyre_interpreter::objspace::std::mapdict::mark_live_side_table_entries,
     );
     // An owner that dies in the nursery cannot wait for that major: the reset
     // hands its address to the next allocation, which would then answer to its
@@ -4531,6 +4532,11 @@ fn install_pyre_object_hooks() {
             (T, fl::PYFRAME_VALUESTACKDEPTH_OFFSET, "valuestackdepth"),
             (T, fl::PYFRAME_LAST_INSTR_OFFSET, "last_instr"),
             (T, fl::PYFRAME_FLAGS_OFFSET, "flags"),
+            (
+                T,
+                fl::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+                "failed_attr_cleanup",
+            ),
             (T, fl::PYFRAME_DEBUGDATA_OFFSET, "debugdata"),
             (T, fl::PYFRAME_LASTBLOCK_OFFSET, "lastblock"),
             (T, fl::PYFRAME_VABLE_TOKEN_OFFSET, "vable_token"),
@@ -8538,6 +8544,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // pending the actionflag port.
         let ec_ptr = unsafe { &*f }.execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
+            // Keep the JIT portal's concrete dispatch in lockstep with
+            // `pyre_interpreter::eval::eval_loop`'s opcode boundary.  The
+            // failed-attribute request is ordinary state on this concrete red
+            // frame, so both warm execution and generated traces must consume
+            // it here, before the next opcode runs.  Running finalizers may
+            // collect and move the frame; re-resolve it from the shadow-stack
+            // root before any further access.
+            if unsafe { &mut *f }.take_failed_attr_before_opcode() {
+                unsafe { (*ec_ptr).run_failed_attr_finalizers() };
+            }
+            let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A compiled back-edge deopts when the process breaker is armed.
             // On resume, run the live frame's ordinary bytecode_trace so its

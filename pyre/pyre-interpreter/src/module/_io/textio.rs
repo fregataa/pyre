@@ -1268,6 +1268,11 @@ impl W_TextIOWrapper {
         Ok(())
     }
 
+    fn _dealloc_warn(&self, w_source: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        self.check_attached()?;
+        super::call_method_result(self.w_buffer, "_dealloc_warn", &[w_source])
+    }
+
     fn detach(&mut self) -> Result<PyObjectRef, crate::PyError> {
         self.check_attached()?;
         super::call_method_result(self.self_obj(), "flush", &[])?;
@@ -1610,6 +1615,16 @@ impl W_TextIOWrapper {
             let encoding = new_encoding
                 .as_deref()
                 .unwrap_or_else(|| unsafe { pyre_object::w_str_get_value(self.w_encoding) });
+            // CPython 3.14's TextIOWrapper reconfigure path reaches codec
+            // lookup with this value (test_io:test_reconfigure_errors), where
+            // an embedded NUL is an unknown encoding rather than the
+            // `text0_w` ValueError exposed by codecs.lookup itself.
+            if encoding.contains('\0') {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::LookupError,
+                    format!("unknown encoding: {encoding}"),
+                ));
+            }
             Some(Self::lookup_text_codec(encoding)?)
         } else {
             None

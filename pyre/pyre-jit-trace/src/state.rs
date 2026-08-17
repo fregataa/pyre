@@ -840,6 +840,35 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
     });
 }
 
+/// Publish one frozen source-translation JitCode into the unified runtime
+/// registry on demand. RPython's `warmspot.py` installs the complete
+/// `CodeWriter.make_jitcodes()` list, so an `MIFrame` created for a translated
+/// helper resolves through the same absolute index as a portal frame. Pyre
+/// keeps the frozen table lazy; materialize the selected entry without
+/// changing that ownership or numbering shape.
+pub fn ensure_build_time_jitcode_at(index: usize) -> Option<std::sync::Arc<crate::PyJitCode>> {
+    ensure_finish_setup();
+    if let Some(payload) = METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(index)
+            .filter(|entry| !entry.payload.is_skeleton())
+            .map(|entry| std::sync::Arc::clone(&entry.payload))
+    }) {
+        return Some(payload);
+    }
+
+    let canonical = crate::jitcode_runtime::get_jitcode_by_index(index)?;
+    let runtime = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+    let payload = std::sync::Arc::new(crate::PyJitCode::from_core_degenerate(
+        std::sync::Arc::new(runtime),
+        std::ptr::null(),
+        false,
+    ));
+    install_build_time_jitcode_at(index, std::sync::Arc::clone(&payload));
+    Some(payload)
+}
+
 /// `framework.py root_walker.walk_roots` parity for the persistent
 /// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
 /// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode
@@ -5631,9 +5660,17 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     else {
         return false;
     };
-    if want_below != below.len() || below.iter().any(|slot| slot.is_null()) {
+    if want_below != below.len() {
         return false;
     }
+    // `below` is not restricted to ordinary Python object pointers.  CPython
+    // 3.14 LOAD_SPECIAL leaves `[exit_func, NULL]` below the body of a `with`
+    // statement, and a nested CALL therefore legitimately carries that NULL
+    // through this post-CALL handoff.  The carrier has already proved every
+    // slot before it becomes a raw `PyObjectRef`: NULL is admitted only from
+    // an inline `ConstPtr(NULL)` (RPython history.py:361 `CONST_NULL`) or the
+    // CALL layout's named null-or-self slot.  Rejecting it here collapses that
+    // distinction again and forces the effectful callee prologue to replay.
     let base = info.num_static_extra_boxes;
     if let Some(abs) = (0..nlocals).find(|&abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {

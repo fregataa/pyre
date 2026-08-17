@@ -10716,6 +10716,19 @@ impl CodeWriter {
                             // `malloc_typed`-immortal wrapper at frame construction,
                             // so its pointer is fixed and GC-stable at jitcode build
                             // time (see the LOAD_GLOBAL namespace fold above).
+                            //
+                            // Reading the live frame's `w_globals` here instead —
+                            // the shape `pyopcode.py:1457` has, and the one that
+                            // would honour an `exec(code, ns)` override — needs the
+                            // vable read to be trustworthy off a NONSTANDARD
+                            // virtualizable.  It is not: that path answers from a
+                            // heapcache keyed by `fielddescr.index()`, which is
+                            // `u32::MAX` for every descriptor that was never
+                            // assigned one, so a Ref field read can return another
+                            // field's Int.  `jit_make_function_from_globals`
+                            // dereferences whatever it gets
+                            // (`synth/raise_reg_unbound_jitstress` faulted on 0x1).
+                            // The constant stays until that keying is fixed.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let code_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let globals_obj = unsafe {

@@ -2203,6 +2203,9 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // no-tracer hot path is a single null-check + ticker decrement.
         let ec = frame.execution_context as *mut crate::PyExecutionContext;
         if !ec.is_null() {
+            if frame.take_failed_attr_before_opcode() {
+                unsafe { (*ec).run_failed_attr_finalizers() };
+            }
             let trace_result = unsafe {
                 (*ec).bytecode_trace(
                     frame as *mut PyFrame,
@@ -2264,6 +2267,19 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             }
         }
     }
+}
+
+/// CPython 3.14's failed-attribute refcount boundary: once `LOAD_ATTR` has
+/// popped a finalizable receiver, an otherwise-unreferenced temporary runs its
+/// finalizer before the surrounding exception handler continues. This is
+/// observable in `test_io.test_error_through_destructor` for both native and
+/// `_pyio` streams. A reachability pass, rather than an IO/type shortcut,
+/// decides whether the receiver is actually dead.
+#[majit_macros::dont_look_inside]
+pub(crate) fn finalize_failed_attr_receiver_now(obj: PyObjectRef) -> bool {
+    crate::typedef::r#type(obj).is_some_and(|w_type| unsafe {
+        crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__del__").is_some()
+    })
 }
 
 impl SharedOpcodeHandler for PyFrame {
@@ -2357,7 +2373,16 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        getattr_str(obj, name)
+        getattr_str(obj, name).map_err(|error| {
+            if finalize_failed_attr_receiver_now(obj) {
+                // Keep this write on the live virtualizable red frame.  The
+                // opaque helper only answers the semantic type question;
+                // writing `frame.flags` inside it would race the JIT's
+                // register-resident copy of the same field.
+                self.defer_failed_attr_until_pop_except();
+            }
+            error
+        })
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
@@ -3364,6 +3389,12 @@ pub fn with_except_start_values(
 }
 
 impl OpcodeStepExecutor for PyFrame {
+    fn pop_top(&mut self) -> Result<(), PyError> {
+        let _ = self.pop_value()?;
+        self.failed_attr_after_stack_pop();
+        Ok(())
+    }
+
     /// SETUP_ANNOTATIONS — ensure `__annotations__` exists in the
     /// current locals namespace. PyPy: pyopcode.py SETUP_ANNOTATIONS
     /// (typeobject.py auto-fills the slot at class creation, but the
@@ -4019,6 +4050,7 @@ impl OpcodeStepExecutor for PyFrame {
         // the same codewriter-resolvability reason as `push_exc_info`.
         let prev_exc = self.pop();
         set_current_exception(prev_exc);
+        self.failed_attr_after_pop_except();
         Ok(())
     }
 
@@ -4710,7 +4742,13 @@ impl OpcodeStepExecutor for PyFrame {
                 nameindex,
                 name,
             )
-        }?;
+        }
+        .map_err(|error| {
+            if finalize_failed_attr_receiver_now(obj) {
+                self.defer_failed_attr_until_pop_except();
+            }
+            error
+        })?;
         self.push(w_value);
         Ok(())
     }

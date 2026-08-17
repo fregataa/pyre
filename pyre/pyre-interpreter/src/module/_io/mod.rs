@@ -30,6 +30,47 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
 // 128 KiB.  Keep one module-owned value shared by every buffered type.
 pub(crate) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;
 
+/// `interp_bufferedio.py:41-60 TryLock` — one native lock and its owning
+/// thread per buffered stream. The stream stores the opaque handle directly,
+/// never in a side table.
+struct BufferedTryLock {
+    lock: *mut crate::baseobjspace::Lock,
+    owner: std::sync::atomic::AtomicI64,
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn allocate_buffered_lock() -> usize {
+    Box::into_raw(Box::new(BufferedTryLock {
+        lock: crate::baseobjspace::allocate_lock(),
+        owner: std::sync::atomic::AtomicI64::new(0),
+    })) as usize
+}
+
+/// Acquire a buffered stream's `TryLock`. `false` is the same-thread
+/// reentrant arm; contention from another thread blocks until it can acquire.
+#[majit_macros::dont_look_inside]
+pub(crate) fn acquire_buffered_lock(handle: usize) -> bool {
+    let lock = unsafe { &*(handle as *const BufferedTryLock) };
+    let current = crate::module::thread::current_ident();
+    let native = unsafe { &*lock.lock };
+    if !native.acquire(false) {
+        if lock.owner.load(std::sync::atomic::Ordering::Acquire) == current {
+            return false;
+        }
+        native.acquire(true);
+    }
+    lock.owner
+        .store(current, std::sync::atomic::Ordering::Release);
+    true
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn release_buffered_lock(handle: usize) {
+    let lock = unsafe { &*(handle as *const BufferedTryLock) };
+    lock.owner.store(0, std::sync::atomic::Ordering::Release);
+    unsafe { &*lock.lock }.release();
+}
+
 // The module-local exception class is process-global, like PyPy's module
 // definition object.  Keep the immortal type pointer shared across threads;
 // runtime semantic state must not be duplicated in TLS.
@@ -44,9 +85,7 @@ fn type_method(ns: PyObjectRef, name: &str, function: PyObjectRef) {
 fn io_closed(obj: PyObjectRef) -> bool {
     crate::baseobjspace::getattr_str(obj, "closed")
         .ok()
-        .and_then(|value| unsafe {
-            pyre_object::is_bool(value).then(|| pyre_object::w_bool_get_value(value))
-        })
+        .and_then(|value| crate::baseobjspace::is_true(value).ok())
         .unwrap_or(false)
 }
 
@@ -113,7 +152,7 @@ pub(crate) fn unsupported(message: &str) -> crate::PyError {
     }
 }
 
-fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
+pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
     let self_obj = args
         .first()
         .copied()
@@ -121,10 +160,17 @@ fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
     if iobase_internal_closed(self_obj) {
         return Ok(w_none());
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
     // PyPy `close_w`: `flush()` runs while `closed` is still false, and the
     // internal flag is set in `finally`, even when the virtual flush raises.
-    let flushed = call_method_result(self_obj, "flush", &[]);
-    iobase_set_internal_closed(self_obj, true)?;
+    let flushed = call_method_result(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "flush",
+        &[],
+    );
+    iobase_set_internal_closed(pyre_object::gc_roots::shadow_stack_get(self_slot), true)?;
     flushed.map(|_| w_none())
 }
 
@@ -485,9 +531,31 @@ fn iobase_del(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(&self_obj) = args.first() else {
         return Ok(w_none());
     };
-    // PyPy `descr_del` deliberately suppresses failures while finalizing.
-    if !io_closed(self_obj) {
-        let _ = call_method_result(self_obj, "close", &[]);
+    // pypy/module/_io/interp_iobase.py:96-111 `descr_del` and CPython 3.14
+    // Modules/_io/iobase.c:275-310 `iobase_finalize`: failure to obtain or
+    // truth-test `closed` means the partially initialized/detached object is
+    // unusable and finalization stops quietly.  This check must not collapse
+    // the error to `closed == false` and call close(), or tracing-GC latency
+    // leaks a stale ValueError into a later `catch_unraisable_exception`.
+    let closed = match crate::baseobjspace::getattr_str(self_obj, "closed") {
+        Ok(value) => match crate::baseobjspace::is_true(value) {
+            Ok(closed) => closed,
+            Err(_) => return Ok(w_none()),
+        },
+        Err(_) => return Ok(w_none()),
+    };
+    if !closed {
+        // CPython sets this best-effort marker before the dynamic close call;
+        // FileIO uses it to distinguish implicit-close warnings.  PyPy's
+        // `_dealloc_warn_w` followed by `space.call_method(self, "close")`
+        // supplies the same call order.
+        let _ = crate::baseobjspace::setattr_str(self_obj, "_finalizing", w_bool_from(true));
+        let _ = call_method_result(self_obj, "_dealloc_warn", &[self_obj]);
+
+        // CPython 3.14 reports a real close failure via unraisablehook
+        // (test_io.py:test_error_through_destructor).  UserDelAction owns that
+        // reporting boundary in pyre, so preserve the close error here.
+        call_method_result(self_obj, "close", &[])?;
     }
     Ok(w_none())
 }
@@ -498,7 +566,7 @@ fn iobase_getstate(args: &[PyObjectRef]) -> crate::PyResult {
         .copied()
         .ok_or_else(|| crate::PyError::type_error("__getstate__() requires self"))?;
     Err(crate::PyError::type_error(format!(
-        "cannot serialize '{}' object",
+        "cannot pickle '{}' object",
         crate::type_methods::arg_type_name(self_obj)
     )))
 }
@@ -824,6 +892,11 @@ fn init_iobase_type(ns: PyObjectRef) {
         ns,
         "__getstate__",
         crate::make_builtin_function_with_arity("__getstate__", iobase_getstate, 1),
+    );
+    type_method(
+        ns,
+        "_dealloc_warn",
+        crate::make_builtin_function_with_arity("_dealloc_warn", |_| Ok(w_none()), 2),
     );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1155,7 +1228,7 @@ pub(crate) fn fileio_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
-            "FileIO",
+            "_io.FileIO",
             |type_ns| {
                 crate::builtins::init_file_wrapper_type(type_ns);
                 crate::builtins::init_fileio_type(type_ns);
@@ -1222,7 +1295,11 @@ fn text_iobase_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-fn call_method_result(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> crate::PyResult {
+pub(crate) fn call_method_result(
+    obj: PyObjectRef,
+    name: &str,
+    args: &[PyObjectRef],
+) -> crate::PyResult {
     let result = crate::baseobjspace::call_method(obj, name, args);
     if result.is_null() {
         Err(crate::call::take_call_error()
@@ -1230,6 +1307,29 @@ fn call_method_result(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> cra
     } else {
         Ok(result)
     }
+}
+
+/// CPython 3.14 `_io.text_encoding`: select the PEP 597 spelling and emit the
+/// default-encoding warning at the caller-selected stack depth.
+pub(crate) fn text_encoding(
+    encoding: PyObjectRef,
+    stacklevel: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { !pyre_object::is_none(encoding) } {
+        return Ok(encoding);
+    }
+    if crate::importing::warn_default_encoding_flag() {
+        crate::warn::warn_category(
+            "'encoding' argument not specified.",
+            "EncodingWarning",
+            stacklevel + 1,
+        )?;
+    }
+    Ok(w_str_new(if crate::importing::utf8_mode_flag() != 0 {
+        "utf-8"
+    } else {
+        "locale"
+    }))
 }
 
 crate::py_module! {
@@ -1245,7 +1345,12 @@ crate::py_module! {
             let path = args.first().copied().unwrap_or_else(w_none);
             crate::builtins::builtin_open(&[path, w_str_new("rb")])
         },
-        "text_encoding"   / * = |args| Ok(args.first().copied().unwrap_or_else(|| w_str_new("utf-8"))),
+        "text_encoding"   / * = |args| {
+            let encoding = args.first().copied().unwrap_or_else(w_none);
+            let stacklevel = args.get(1).copied().map(crate::builtins::space_index_w)
+                .transpose()?.unwrap_or(2);
+            text_encoding(encoding, stacklevel)
+        },
     },
     extra_init: |ns| {
         // `Modules/_io/_iomodule.c`:

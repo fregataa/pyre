@@ -1420,6 +1420,18 @@ pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
+    // RPython history.py:361 defines CONST_NULL as a real
+    // `ConstPtr(lltype.nullptr(llmemory.GCREF.TO))`.  Preserve that typed
+    // constant before consulting the runtime-concrete table.  A symbolic Ref
+    // operation whose concrete lookup happens to return Ref(NULL) is still an
+    // unresolved box and must remain absent, but an inline ConstPtr(NULL) is
+    // positive proof that this operand-stack slot contains Python's call
+    // sentinel.  LOAD_SPECIAL records exactly that constant for its
+    // `self_or_null` half, including the `__exit__` pair retained below a
+    // nested CALL inside a `with` body.
+    if let OpRef::ConstPtr(value) = opref {
+        return Some(value.as_usize() as pyre_object::PyObjectRef);
+    }
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
         _ => None,
@@ -2252,27 +2264,65 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         .borrow()
         .framestack
         .last()
-        .map(|frame| frame.w_code)
-        .ok_or_else(|| unavail("Unavail::Helper/NoFramestack"))?;
-    let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
-        .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))? as u32;
-    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-        .ok_or_else(|| unavail("Unavail::Helper/NoPjc"))?;
+        .map(|frame| frame.w_code);
+    let (jitcode_index, pjc) = if let Some(caller_code) = caller_code {
+        let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
+            .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))?
+            as u32;
+        let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+            .ok_or_else(|| unavail("Unavail::Helper/NoPjc"))?;
+        (jitcode_index, pjc)
+    } else {
+        let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if caller_sym_ptr.is_null() {
+            return Err(unavail("Unavail::Helper/NoSym"));
+        }
+        // SAFETY: `snapshot_sym` is installed for the lifetime of the
+        // full-body walk and only its immutable JitCode payload is read here.
+        let caller_sym = unsafe { &*caller_sym_ptr };
+        if caller_sym.jitcode().is_null() {
+            return Err(unavail("Unavail::Helper/NoJitCode"));
+        }
+        let jc = unsafe { &*caller_sym.jitcode() };
+        (jc.index as u32, jc.payload.clone())
+    };
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Helper/NotPopulated"));
     }
     let resume_marker_jit_pc = pjc
         .resume_marker_for_jitcode_pc(call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
-    let boxes = collect_callee_active_boxes(
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        jitcode_index,
-        call_jit_pc,
-        resume_marker_jit_pc as i32,
-    )
-    .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?;
+    let boxes = if caller_code.is_some() {
+        collect_callee_active_boxes(
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            jitcode_index,
+            call_jit_pc,
+            resume_marker_jit_pc as i32,
+        )
+        .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
+    } else {
+        let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
+        // SAFETY: checked non-null above and valid for this full-body walk.
+        let caller_sym = unsafe { &*caller_sym_ptr };
+        collect_outer_active_boxes(
+            caller_sym,
+            ctx.trace_ctx,
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            jitcode_index,
+            false,
+            resume_marker_jit_pc as i32,
+            call_jit_pc as i32,
+            OuterActiveBoxesEntryTwin::Plain,
+            "builtin_wrapper_call_entry",
+            None,
+            &[],
+            None,
+        )
+    };
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
