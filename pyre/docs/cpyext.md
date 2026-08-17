@@ -47,7 +47,9 @@ declaration waits on a definition.
 `scripts/cpyext-abi.py` from the `#[unsafe(no_mangle)] extern "C"` functions
 themselves, so a declaration cannot drift from its implementation. It is
 included after the headers that name the types it uses and before the ones
-defining `static inline` functions that call it.
+defining `static inline` functions that call it. `refcount.h` is the first of
+those: `Py_INCREF` expands to the `Py_IncRef` it declares, and `Py_NewRef` is an
+inline function calling that macro.
 
 The generator does not spell the declaration from the Rust signature where
 CPython has one of its own. It emits **CPython's** declaration -- `PyLongObject
@@ -56,9 +58,14 @@ describe the same call. That check is `scripts/cpyext-abi.py check`, and it is
 a CI gate:
 
 ```sh
-python3 pyre/scripts/cpyext-abi.py check          # every export vs. CPython
+python3 pyre/scripts/cpyext-abi.py check          # every entry point vs. CPython
 python3 pyre/scripts/cpyext-abi.py generate --check
 ```
+
+An *entry point* is either an export or a `static inline` function in the
+header. Both reach the extension as a call it compiles against, so both are
+checked; a header inline is the one an export cannot catch, because it is
+written by hand rather than generated.
 
 It compares ABI slots rather than spellings, resolving CPython's typedefs, so
 `Py_hash_t` and `Py_ssize_t` agree and `long` and `Py_ssize_t` do not. The
@@ -73,10 +80,17 @@ only on a platform where the widths differ. `PyModule_AddIntConstant` took a
 `Py_ssize_t` where the reference declaration says `long`, which is the same on
 LP64 and 32 bits against 64 on Windows.
 
-The 35 exports CPython does not declare are the macros it spells over struct
+The exports CPython does not declare are the macros it spells over struct
 fields -- `PyLong_Check`, `PySequence_Fast_GET_ITEM`, `PyBytes_AS_STRING` --
 which have to be calls here, plus the two `_PyPyre_*` helpers the header's own
 `static inline` functions use.
+
+`patchlevel.h` carries the version in parts -- `PY_MAJOR_VERSION`,
+`PY_RELEASE_LEVEL`, `PY_RELEASE_SERIAL` -- and computes `PY_VERSION_HEX` from
+them, so an extension testing any one of them reads the same number the runtime
+reports. `PYRE_VERSION` is the interpreter's own version beside it, the slot
+`PYPY_VERSION` fills upstream. `cpyext_methods` compares the whole set against
+`sys.version_info`, `sys.hexversion` and `sys.pyre_version_info`.
 
 ## What is implemented
 
@@ -93,6 +107,23 @@ the header below.
   references owned by their container, the per-mirror byte cache behind
   `PyUnicode_AsUTF8` / `PyBytes_AsString`, and the immortal singletons
   `Py_None` / `Py_True` / `Py_False` / `Py_Ellipsis` / `Py_NotImplemented`;
+- the type mirror `Py_TYPE(x)` answers with. A type an extension defined is its
+  own `PyTypeObject` static, which `PyType_Ready` links in place and which is
+  immortal because that storage is the library's; a type pyre defines gets a
+  synthesized block carrying the ordinary link share, so a class the extension
+  merely observed dies with the interpreter's own last reference to it. Its
+  `tp_flags` carry `Py_TPFLAGS_HEAPTYPE` for a heap type, which is what decides
+  whether a block holds a reference to its own type (`pyobject.py:91-93`,
+  `object.py:72-73`) and whose storage the mirror is
+  (`typeobject.py:716-722`);
+- the two forms a mirror is handed out in before its interpreter object exists
+  (`cpyext/unicodeobject.rs`, `cpyext/bytesobject.rs`): `PyUnicode_New(size,
+  maxchar)` and `PyBytes_FromStringAndSize(NULL, size)` return an unlinked
+  mirror over a buffer the caller fills, and `pyobject::realize` builds the
+  `str` or `bytes` the first time it is read as a value, which is where
+  `pyobject.py:330-337` reaches the type descriptor's `realize`. The type tests
+  and the length are answered from the buffer, so asking them mid-fill does not
+  decide the contents early;
 - the C exception indicator (`cpyext/pyerrors.rs`): 37 `PyExc_*` class mirrors
   and `PyErr_SetString` / `SetObject` / `SetNone` / `Occurred` / `Clear` /
   `Fetch` / `Restore` / `ExceptionMatches` / `NoMemory` / `BadArgument` /
@@ -195,9 +226,6 @@ Known divergences, each documented at its definition:
   no container for the borrow to belong to;
 - the module state block is never released, pyre having no module deallocation
   path;
-- `PyBytes_FromStringAndSize(NULL, n)` is rejected: pyre's `bytes` is immutable
-  from construction and its storage is not the address `PyBytes_AsString`
-  returns;
 - `PyObject_GC_IsTracked` is the constant 1 and `PyObject_GC_IsFinalized` the
   constant 0: every object pyre holds is reachable by its collector, and
   nothing runs `tp_finalize`;

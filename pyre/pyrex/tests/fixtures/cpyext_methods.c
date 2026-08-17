@@ -410,6 +410,52 @@ static PyObject *m_caught(PyObject *self, PyObject *unused)
                          cleared, text);
 }
 
+/* The version macros, as an extension expands them: the string ones inside a
+   banner, the numeric ones as values. A mismatch against what the runtime
+   reports is a stale header. */
+static PyObject *m_version_macros(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    static const char banner[] = "python " PY_VERSION " / pyre " PYRE_VERSION;
+    return Py_BuildValue("(siiiiisi)", banner, PY_MAJOR_VERSION, PY_MINOR_VERSION,
+                         PY_MICRO_VERSION, PY_RELEASE_LEVEL, PY_RELEASE_SERIAL,
+                         PY_VERSION, PY_VERSION_HEX);
+}
+
+/* `PyErr_Restore` puts back what `PyErr_Fetch` took, and its three degenerate
+   inputs: a NULL class clears whatever was set, a NULL value is built into a
+   bare instance, and a fetched pair goes back unchanged. */
+static PyObject *m_restore(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    /* A NULL class clears an indicator that is already set. */
+    PyErr_SetString(PyExc_IndexError, "dropped");
+    PyErr_Restore(NULL, NULL, NULL);
+    int cleared = PyErr_Occurred() == NULL;
+
+    /* A class with no value becomes a bare instance of that class. */
+    PyErr_Restore(Py_NewRef(PyExc_KeyError), NULL, NULL);
+    int bare_is_key = PyErr_ExceptionMatches(PyExc_KeyError);
+    PyObject *type = NULL, *value = NULL, *traceback = NULL;
+    PyErr_Fetch(&type, &value, &traceback);
+    int bare_instance = value != NULL && PyObject_IsInstance(value, PyExc_KeyError) == 1;
+
+    /* The fetched pair restores to the same indicator it came from. */
+    PyErr_Restore(type, value, traceback);
+    int round_trip = PyErr_ExceptionMatches(PyExc_KeyError);
+    PyErr_Clear();
+
+    /* A NULL class clears even when a value is handed along with it. */
+    PyErr_SetString(PyExc_TypeError, "also dropped");
+    PyErr_Restore(NULL, PyUnicode_FromString("orphan"), NULL);
+    int cleared_with_value = PyErr_Occurred() == NULL;
+
+    return Py_BuildValue("(iiiii)", cleared, bare_is_key, bare_instance,
+                         round_trip, cleared_with_value);
+}
+
 /* Drive every call entry point at one callable and hand back what each
    returned, so the test can compare them against the same call made from
    Python.  `args` is (callable, one_arg, keyword_value). */
@@ -1164,6 +1210,129 @@ static PyObject *m_bytes_from(PyObject *self, PyObject *arg)
     return PyBytes_FromObject(arg);
 }
 
+/* The allocate-then-fill shape `PyBytes_FromStringAndSize(NULL, size)` exists
+   for: the caller writes through `PyBytes_AS_STRING` and the object is a
+   `bytes` by the time it is handed back. */
+static PyObject *m_bytes_fill(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    Py_ssize_t size = PyLong_AsSsize_t(arg);
+    if (size < 0 && PyErr_Occurred()) {
+        return NULL;
+    }
+    PyObject *out = PyBytes_FromStringAndSize(NULL, size);
+    if (out == NULL) {
+        return NULL;
+    }
+    /* The type tests and the size are answered while the buffer is still being
+       written, so asking them does not decide the contents early. */
+    if (!PyBytes_Check(out) || !PyBytes_CheckExact(out) || PyBytes_GET_SIZE(out) != size) {
+        Py_DECREF(out);
+        PyErr_SetString(PyExc_SystemError, "a bytes being filled reads as something else");
+        return NULL;
+    }
+    char *data = PyBytes_AS_STRING(out);
+    if (data == NULL) {
+        Py_DECREF(out);
+        return NULL;
+    }
+    for (Py_ssize_t index = 0; index < size; index++) {
+        data[index] = (char)('a' + (index % 26));
+    }
+    return out;
+}
+
+/* The same buffer handed to another entry point instead of being returned. */
+static PyObject *m_bytes_pairs(PyObject *self, PyObject *unused)
+{
+    (void)self; (void)unused;
+    PyObject *dict = PyDict_New();
+    if (dict == NULL) {
+        return NULL;
+    }
+    PyObject *key = PyBytes_FromStringAndSize(NULL, 2);
+    PyObject *value = PyBytes_FromStringAndSize(NULL, 3);
+    if (key == NULL || value == NULL) {
+        Py_XDECREF(key);
+        Py_XDECREF(value);
+        Py_DECREF(dict);
+        return NULL;
+    }
+    memcpy(PyBytes_AS_STRING(key), "kk", 2);
+    memcpy(PyBytes_AS_STRING(value), "vv\0", 3);
+    int failed = PyDict_SetItem(dict, key, value);
+    Py_DECREF(key);
+    Py_DECREF(value);
+    if (failed < 0) {
+        Py_DECREF(dict);
+        return NULL;
+    }
+    return dict;
+}
+
+/* An empty allocation, and the checked accessors reading the buffer back. */
+static PyObject *m_bytes_empty(PyObject *self, PyObject *unused)
+{
+    (void)self; (void)unused;
+    PyObject *out = PyBytes_FromStringAndSize(NULL, 0);
+    if (out == NULL) {
+        return NULL;
+    }
+    char *data = NULL;
+    Py_ssize_t size = -1;
+    if (PyBytes_AsStringAndSize(out, &data, &size) < 0) {
+        Py_DECREF(out);
+        return NULL;
+    }
+    if (size != 0 || data == NULL || data[0] != '\0' || PyBytes_Size(out) != 0
+        || PyBytes_AsString(out) != data) {
+        Py_DECREF(out);
+        PyErr_SetString(PyExc_SystemError, "an empty allocation reads back wrong");
+        return NULL;
+    }
+    /* A buffer released without ever having been read as a value, so its
+       mirror is freed with no `bytes` behind it. */
+    PyObject *dropped = PyBytes_FromStringAndSize(NULL, 4);
+    if (dropped == NULL) {
+        Py_DECREF(out);
+        return NULL;
+    }
+    memcpy(PyBytes_AS_STRING(dropped), "abcd", 4);
+    Py_DECREF(dropped);
+    if (PyBytes_FromStringAndSize(NULL, -1) != NULL || !PyErr_Occurred()) {
+        Py_DECREF(out);
+        PyErr_SetString(PyExc_SystemError, "a negative size was accepted");
+        return NULL;
+    }
+    PyErr_Clear();
+    return out;
+}
+
+/* `Py_NewRef` and `Py_XNewRef` -- a reference taken and handed back in one
+   expression, including the NULL the `X` spelling admits. */
+static PyObject *m_new_ref(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    if (Py_XNewRef(NULL) != NULL) {
+        PyErr_SetString(PyExc_SystemError, "Py_XNewRef(NULL) is not NULL");
+        return NULL;
+    }
+    /* `N` takes over each reference, so both are handed straight on. */
+    return Py_BuildValue("(NN)", Py_NewRef(Py_True), Py_XNewRef(arg));
+}
+
+/* The type mirror behind `Py_TYPE`: its name, and whether it is a heap type.
+   A class written in Python is one and a built-in is not, which is what
+   decides whose storage the mirror is and whether this block holds a
+   reference to it. */
+static PyObject *m_type_mirror(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    PyTypeObject *tp = Py_TYPE(arg);
+    return Py_BuildValue("(si)", tp->tp_name,
+                         PyType_HasFeature(tp, Py_TPFLAGS_HEAPTYPE) ? 1 : 0);
+}
+
 /* The object allocator, whose blocks go back through `PyObject_Free`. */
 static PyObject *m_object_blocks(PyObject *self, PyObject *unused)
 {
@@ -1432,6 +1601,11 @@ static PyMethodDef methods[] = {
     {"object_values", m_object_values, METH_VARARGS, "comparison, hashing and formatting"},
     {"object_bytes", m_object_bytes, METH_O, "PyObject_Bytes"},
     {"bytes_from", m_bytes_from, METH_O, "PyBytes_FromObject"},
+    {"bytes_fill", m_bytes_fill, METH_O, "PyBytes_FromStringAndSize(NULL, size)"},
+    {"bytes_pairs", m_bytes_pairs, METH_NOARGS, "a filled buffer as a dict key and value"},
+    {"bytes_empty", m_bytes_empty, METH_NOARGS, "the empty allocation and the size check"},
+    {"new_ref", m_new_ref, METH_O, "Py_NewRef and Py_XNewRef"},
+    {"type_mirror", m_type_mirror, METH_O, "Py_TYPE's name and heap-type flag"},
     {"object_blocks", m_object_blocks, METH_NOARGS, "the object allocator"},
     {"int_convert", m_int_convert, METH_O, "the int conversions"},
     {"module_ops", m_module_ops, METH_NOARGS, "the module constructors"},
@@ -1456,6 +1630,8 @@ static PyMethodDef methods[] = {
     {"predicates", (PyCFunction)m_predicates, METH_VARARGS, NULL},
     {"fail", (PyCFunction)m_fail, METH_VARARGS, NULL},
     {"caught", (PyCFunction)m_caught, METH_NOARGS, NULL},
+    {"restore", (PyCFunction)m_restore, METH_NOARGS, "PyErr_Restore and its degenerate inputs"},
+    {"version_macros", (PyCFunction)m_version_macros, METH_NOARGS, "the patchlevel.h macros"},
     {"call_surface", (PyCFunction)m_call_surface, METH_VARARGS, NULL},
     {"set_ops", (PyCFunction)m_set_ops, METH_VARARGS, NULL},
     {"dict_more", (PyCFunction)m_dict_more, METH_VARARGS, NULL},

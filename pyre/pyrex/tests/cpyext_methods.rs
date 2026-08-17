@@ -143,6 +143,21 @@ raises('argument', TypeError, 'bad argument type for built-in operation')
 raises('other', RuntimeError, 'unknown failure kind')
 
 assert m.caught() == (1, 1, 0, 1, 'swallowed')
+# PyErr_Restore: (cleared by NULL class, bare instance matches, is an instance,
+# fetched pair round-trips, NULL class clears even with a value)
+assert m.restore() == (1, 1, 1, 1, 1), m.restore()
+
+# patchlevel.h, as an extension expands it: a banner string, the parts, and the
+# packed hex.  Each is compared against what the runtime reports, so a header
+# that drifts from sys is a failure rather than a silent disagreement.
+banner, major, minor, micro, level, serial, version, hexversion = m.version_macros()
+assert (major, minor, micro) == sys.version_info[:3], (major, minor, micro)
+assert version == '%d.%d.%d' % sys.version_info[:3], version
+assert (level, serial) == (0xF, 0), (level, serial)
+assert sys.version_info.releaselevel == 'final'
+assert hexversion == sys.hexversion, (hex(hexversion), hex(sys.hexversion))
+assert banner.startswith('python ' + version + ' / pyre '), banner
+assert banner.endswith('.'.join(str(p) for p in sys.pyre_version_info[:3])), banner
 # The swallowed exception must not leak into the caller.
 assert m.bump() == 4
 
@@ -393,9 +408,61 @@ for converter in (m.object_bytes, m.bytes_from):
     else:
         raise AssertionError('a str was converted to bytes')
 
+# PyBytes_FromStringAndSize(NULL, size): the buffer is written through
+# PyBytes_AS_STRING and the result is an ordinary bytes.
+assert m.bytes_fill(3) == b'abc'
+assert type(m.bytes_fill(3)) is bytes
+assert m.bytes_fill(0) == b''
+assert m.bytes_fill(30) == bytes(ord('a') + i % 26 for i in range(30))
+# The written bytes are a bytes in every way, not just by value.
+assert len(m.bytes_fill(5)) == 5
+assert m.bytes_fill(5).upper() == b'ABCDE'
+assert {m.bytes_fill(2): 1}[b'ab'] == 1
+# A buffer handed to another entry point instead of returned. Its value is
+# built where it first crosses back into the interpreter.
+assert m.bytes_pairs() == {b'kk': b'vv\x00'}, m.bytes_pairs()
+assert m.bytes_empty() == b''
+
+# Py_NewRef / Py_XNewRef.
+marker = ['kept']
+assert m.new_ref(marker) == (True, marker)
+assert m.new_ref(marker)[1] is marker
+
 # The object allocator: contents survive a realloc, a calloc is zeroed, and a
 # wrapping product is refused.
 assert m.object_blocks() == (1, 1, 1), m.object_blocks()
+
+# ── the type mirror behind Py_TYPE ─────────────────────────────────────
+# A built-in type is not a heap type; a class written in Python is.
+assert m.type_mirror(1) == ('int', 0), m.type_mirror(1)
+assert m.type_mirror('x') == ('str', 0), m.type_mirror('x')
+
+class Named:
+    pass
+
+assert m.type_mirror(Named()) == ('Named', 1), m.type_mirror(Named())
+# A mirror is minted once and read back the same however many times it is
+# asked for, and an instance keeps its own type's mirror readable.
+kept = Named()
+assert m.type_mirror(kept) == m.type_mirror(Named())
+# Classes minted and dropped in a loop: each one's mirror is released with the
+# class rather than pinning it, so the name read here is this class's own.
+for index in range(64):
+    made = type('T%d' % index, (), {})
+    assert m.type_mirror(made()) == ('T%d' % index, 1)
+assert m.type_mirror(kept) == ('Named', 1)
+# The mirror carries the ordinary link share, so having been read from C does
+# not make the class outlive the last reference to it.  Two collections: the
+# instance's mirror holds a reference to its heap type's mirror, and it is the
+# first collection's drain that gives that one back.
+import gc, weakref
+gone = type('Gone', (), {})
+assert m.type_mirror(gone()) == ('Gone', 1)
+watch = weakref.ref(gone)
+del gone
+gc.collect()
+gc.collect()
+assert watch() is None, watch()
 
 # ── the int conversions ────────────────────────────────────────────────
 (from_small, from_wide, narrow, wide, overflow, too_big, needed,
