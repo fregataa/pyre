@@ -2351,6 +2351,40 @@ impl TraceCtx {
         self.virtualizable_boxes.clone()
     }
 
+    /// history.py:809-816 `record_same_as`:
+    ///
+    /// ```python
+    /// def record_same_as(self, box):
+    ///     if box.type == 'i':
+    ///         return self.record1(rop.SAME_AS_I, box, box.getint())
+    ///     elif box.type == 'r':
+    ///         return self.record1(rop.SAME_AS_R, box, box.getref_base())
+    ///     else:
+    ///         assert box.type == 'f'
+    ///         return self.record1(rop.SAME_AS_F, box, box.getfloatstorage())
+    /// ```
+    /// `record1`'s third argument is the value, so the wrapper carries the
+    /// source box's observed value; the closing JUMP's `runtime_boxes` deliver
+    /// it to `_jump_to_existing_trace`'s runtime fallbacks.
+    /// A virtualizable payload's concrete half lives in `virtualizable_values`,
+    /// which is why the recorder lookup has a fallback here.
+    pub fn record_same_as(&mut self, opref: OpRef, tp: majit_ir::Type) -> OpRef {
+        let value = self
+            .concrete_of_opref(opref)
+            .or_else(|| self.virtualizable_payload_concrete(opref));
+        let same_as = self.record_op(majit_ir::OpCode::same_as_for_type(tp), &[opref]);
+        if let Some(value) = value {
+            self.try_set_opref_concrete(same_as, value);
+        }
+        same_as
+    }
+
+    fn virtualizable_payload_concrete(&self, opref: OpRef) -> Option<Value> {
+        let boxes = self.virtualizable_boxes.as_ref()?;
+        let index = boxes.iter().position(|&candidate| candidate == opref)?;
+        self.virtualizable_entry_at(index).map(|(_, value)| value)
+    }
+
     /// pyjitpl.py:2958-2964 `remove_consts_and_duplicates`:
     ///
     /// ```python
@@ -2394,7 +2428,7 @@ impl TraceCtx {
                 tp == declared || opref.is_constant(),
                 "loop-carried slot declared {declared:?} but its box is {tp:?}",
             );
-            let same_as = self.record_op(majit_ir::OpCode::same_as_for_type(tp), &[opref]);
+            let same_as = self.record_same_as(opref, tp);
             *slot = (same_as, declared);
         }
     }
@@ -5567,6 +5601,86 @@ mod tests {
         ctx.remove_consts_and_duplicates(&mut again);
         assert_eq!(again, boxes, "a normalized list is unchanged");
         assert_eq!(ctx.num_ops(), ops_after, "and records nothing");
+    }
+
+    /// history.py:809-816 `record_same_as` carries the source box's value on
+    /// the freshly recorded `SAME_AS` result.
+    #[test]
+    fn remove_consts_and_duplicates_carries_the_source_box_value() {
+        let mut recorder = Trace::new();
+        let b1 = recorder.record_input_arg(Type::Int);
+        let b2 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_opref_concrete(b1, majit_ir::Value::Int(7));
+        let c3 = ctx.const_int(3);
+        let mut boxes = [
+            (b1, Type::Int),
+            (b2, Type::Int),
+            (b1, Type::Int),
+            (c3, Type::Int),
+        ];
+
+        ctx.remove_consts_and_duplicates(&mut boxes);
+
+        assert_eq!(
+            ctx.concrete_of_opref(boxes[2].0),
+            Some(Value::Int(7)),
+            "the duplicate's wrapper carries the source box's value"
+        );
+        assert_eq!(
+            ctx.concrete_of_opref(boxes[3].0),
+            Some(Value::Int(3)),
+            "the constant's wrapper carries the constant's value"
+        );
+    }
+
+    /// history.py:809-816 `record_same_as` also carries a standard
+    /// virtualizable payload box's value from its concrete shadow.
+    #[test]
+    fn remove_consts_and_duplicates_carries_virtualizable_payload_value() {
+        let info = make_test_vable_info();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let payload = recorder.record_input_arg(Type::Int);
+        let other = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[payload, other],
+            &[Value::Int(37), ph(Type::Int)],
+            &[],
+        );
+
+        assert_eq!(
+            ctx.concrete_of_opref(payload),
+            None,
+            "the recorder's per-position table has no payload value"
+        );
+        assert_eq!(
+            ctx.virtualizable_entry_at(0),
+            Some((payload, Value::Int(37))),
+            "the virtualizable shadow pairs the payload with its value"
+        );
+
+        let mut boxes = [(payload, Type::Int), (payload, Type::Int)];
+        ctx.remove_consts_and_duplicates(&mut boxes);
+
+        assert_ne!(boxes[1].0, payload, "the duplicate becomes a SAME_AS");
+        assert_eq!(
+            ctx.concrete_of_opref(boxes[1].0),
+            Some(Value::Int(37)),
+            "the duplicate's wrapper carries the virtualizable payload value"
+        );
     }
 
     /// vable_getfield_ref cache-hit (pyjitpl.py:939
