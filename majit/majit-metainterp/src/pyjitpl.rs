@@ -158,7 +158,7 @@ pub struct BridgeRetraceResult {
 }
 
 /// Result of checking a back-edge.
-/// pyjitpl.py:2807 `raise SwitchToBlackhole(Counters.ABORT_TOO_LONG)` —
+/// pyjitpl.py:2831 `raise SwitchToBlackhole(Counters.ABORT_TOO_LONG)` —
 /// reason attached to an abort.  RPython uses `Counters.ABORT_*` ints
 /// (`resoperation.Counters.ABORT_TOO_LONG`, `ABORT_BRIDGE`, ...); pyre
 /// tracks only the variants that propagate through the blackhole flow.
@@ -489,8 +489,9 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
     slots
 }
 
-/// RAII guard that empties `MetaInterp.compile_snapshot_refs` when
-/// dropped. Every compile entry point that calls
+/// RAII guard that empties `MetaInterp.compile_snapshot_refs` and unpublishes
+/// `MetaInterp.compile_short_preamble_producer` when dropped. Every compile
+/// entry point that calls
 /// `collect_snapshot_const_ptr_slots` stores raw `*mut OpRef`
 /// pointers into local `SnapshotBoxes` storage; once the enclosing
 /// compile returns, those locals are dropped and the raw pointers
@@ -500,12 +501,14 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
 /// stale pointers.
 pub(crate) struct CompileSnapshotRootsGuard {
     refs: *mut Vec<usize>,
+    short_preamble_producer: *mut Option<usize>,
 }
 
 impl CompileSnapshotRootsGuard {
-    pub(crate) fn new(refs: &mut Vec<usize>) -> Self {
+    pub(crate) fn new(refs: &mut Vec<usize>, short_preamble_producer: &mut Option<usize>) -> Self {
         Self {
             refs: refs as *mut _,
+            short_preamble_producer: short_preamble_producer as *mut _,
         }
     }
 }
@@ -520,6 +523,7 @@ impl Drop for CompileSnapshotRootsGuard {
         // observed the original `&mut` at construction.
         unsafe {
             (*self.refs).clear();
+            *self.short_preamble_producer = None;
         }
     }
 }
@@ -1516,7 +1520,7 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
     /// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` runtime hook.
     pub(crate) string_content_resolver: Option<crate::optimizeopt::info::StringContentResolver>,
-    /// history.py:377 `get_const_ptr_for_string(s)` runtime hook.
+    /// history.py:384 `get_const_ptr_for_string(s)` runtime hook.
     pub(crate) string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
     /// pyjitpl.py:2389: partial trace from a failed bridge compilation attempt.
     /// When bridge optimization returns "not final" (retrace needed), the
@@ -1564,6 +1568,10 @@ pub struct MetaInterp<M: Clone> {
     /// slots directly so a moving GC updates the snapshot boxes the
     /// optimizer will read.
     pub(crate) compile_snapshot_refs: Vec<usize>,
+    /// Address of the in-flight phase-2 optimizer's extended short-preamble
+    /// producer. Installed only while that optimizer is alive so the
+    /// registered root walker can forward its inline ConstPtr fields.
+    pub(crate) compile_short_preamble_producer: Option<usize>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -2172,9 +2180,19 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(sp) = tt.short_preamble.as_mut() {
                     sp.walk_const_ptr_refs_mut(&mut visitor);
                 }
-                if let Some(builder) = tt.short_preamble_producer.as_mut() {
-                    builder.walk_const_ptr_refs_mut(&mut visitor);
-                }
+            }
+        }
+        if let Some(slot_addr) = self.compile_short_preamble_producer {
+            // SAFETY: UnrollOptimizer publishes the address of the in-flight
+            // `Optimizer.short_preamble_producer` for one compile, and
+            // `CompileSnapshotRootsGuard` clears it before that optimizer is
+            // dropped. Phases run on the same thread as this root walker.
+            let producer = unsafe {
+                &mut *(slot_addr
+                    as *mut Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>)
+            };
+            if let Some(builder) = producer.as_mut() {
+                builder.walk_const_ptr_refs_mut(&mut visitor);
             }
         }
     }
@@ -3038,6 +3056,7 @@ impl<M: Clone> MetaInterp<M> {
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
+            compile_short_preamble_producer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
             declined_bridge_guards: std::collections::HashSet::new(),
@@ -5666,7 +5685,7 @@ impl<M: Clone> MetaInterp<M> {
                 green_key
             );
         }
-        // pyjitpl.py:2807 `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
+        // pyjitpl.py:2831 `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
         // Return the reason; caller unwinds with abort_trace_live +
         // aborted_tracing(reason) exactly once.
         Some(AbortReason::TooLong)
@@ -5696,7 +5715,7 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(outer_key) = outermost_merge_key {
             // pyjitpl.py:2819 `JitCell.trace_next_iteration(greenkey)`.
             self.warm_state.trace_next_iteration(outer_key);
-            // pyjitpl.py:2820 `warmstate.mark_force_finish_tracing(greenkey)`.
+            // pyjitpl.py:2844 `warmstate.mark_force_finish_tracing(greenkey)`.
             self.warm_state.mark_force_finish_tracing(outer_key);
             // pyjitpl.py:2822 `warmstate.dont_trace_here(greenkey)`.
             self.warm_state.disable_noninlinable_function(outer_key);
@@ -6048,7 +6067,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         // Only this call's own give-up decides the reason the caller accounts.
         self.pending_abort_reason = None;
         self.single_pass_compact_label_values = None;
@@ -6482,22 +6504,25 @@ impl<M: Clone> MetaInterp<M> {
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
-        // NOTE: the `prior_retraced_count == u32::MAX` early Cancelled
-        // path fires above (before ctx take) so we only reach this point
-        // when a recompile is actually attempted. `pending_preamble_tokens`
-        // must be consumed here because the tokens from a previous
-        // InvalidLoop attempt are now being resupplied to the unroller.
-        let prior_front_target_tokens = self
-            .compiled_loops
-            .get(&green_key)
-            .map(|compiled| compiled.front_target_tokens.clone())
-            .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
-            .unwrap_or_default();
+        // `compile.py:245` and `:290` assign `jitcell_token.target_tokens` a
+        // fresh single-element list, so a token-minting compile carries only
+        // its own labels. `ensure_preamble_target_token`
+        // (`optimizeopt/unroll.rs`) inserts that one element, so an empty list
+        // here is `[start_descr]`, not an absent label.
+        //
+        // The drain stays: the `prior_retraced_count == u32::MAX` early
+        // Cancelled path returns above, so reaching this point means a
+        // recompile is under way and the tokens a previous InvalidLoop attempt
+        // parked for this green key are spent either way.
+        self.pending_preamble_tokens.swap_remove(&green_key);
+        let prior_front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_short_preamble_producer_slot =
+            Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         unroll_opt.retraced_count = prior_retraced_count_early;
@@ -7087,9 +7112,11 @@ impl<M: Clone> MetaInterp<M> {
         // exists, so `record_loop_or_bridge`'s JUMP branch
         // (`compile.py:197-199`) can read it.
         //
-        // `compile.py:286-296` `jitcell_token.target_tokens = [start_descr]
-        // + ...` — populate the JCT-side descr list for
-        // `has_compiled_targets` parity (`pyjitpl.py:3898`).
+        // `compile.py:290` `jitcell_token.target_tokens = [start_descr]` —
+        // populate the JCT-side descr list for `has_compiled_targets` parity
+        // (`pyjitpl.py:3922-3923`). The assignment is a single element, not
+        // an append; this loop reaches the same state because the seed on
+        // this path holds only the tokens this compile produced.
         for target_token in &front_target_tokens {
             target_token.set_original_jitcell_token_number(token_num);
             token.record_target_token(target_token.as_jump_target_descr());
@@ -7673,7 +7700,10 @@ impl<M: Clone> MetaInterp<M> {
         finish_descr: Option<majit_ir::DescrRef>,
         entry_bridge: Option<(u64, M)>,
     ) -> CompileOutcome {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
@@ -7701,6 +7731,26 @@ impl<M: Clone> MetaInterp<M> {
             // `jitdriver.rs:6288` keeps an invalidated loop's target tokens on
             // purpose. Reading both halves off the token is what makes the
             // filter cover the target as well as the gate.
+            //
+            // Resolving to a TargetToken descr here, where `pyjitpl.py:3213-3214`
+            // records the JitCellToken itself, is early binding rather than a
+            // different answer. Upstream's cell-token descr is a placeholder the
+            // optimizer always consumes, in one of two ways: `unroll.py:196-199`
+            // takes `jump_to_preamble` when the target list holds one entry, and
+            // `:238-241` rewrites the descr to `cell_token.target_tokens[0]` —
+            // element zero, unconditionally, exactly what `first_target_token`
+            // answers; otherwise `:320-359` virtual-state matches and rewrites to
+            // the token it picked. Both consumers exist here:
+            // `jump_to_existing_trace_impl` (`unroll.rs`) iterates every
+            // candidate, and its `unroll.py:357-359` arm re-points this JUMP's
+            // descr at whichever token matched. So the ladder is not bypassed by
+            // binding early; only the preamble arm keeps what is recorded here.
+            //
+            // The equivalence needs the list to be unchanged between the two
+            // points, and it is: recording and optimizing are one synchronous
+            // sequence in this function (cut → record → snapshot → optimize) on
+            // the single JIT thread, and `optimize_bridge` mints no target
+            // tokens.
             let jump_descr = self
                 .warm_state
                 .get_procedure_token(green_key)
@@ -7718,6 +7768,26 @@ impl<M: Clone> MetaInterp<M> {
                 crate::mc_diag_bump(29); // compile_trace: no front target token
                 return CompileOutcome::Cancelled;
             };
+            // The descr list on the token and the value list in
+            // `compiled_loops` are two projections of one thing, written by
+            // separate statements, and nothing else checks that they agree.
+            // Upstream cannot drift because `token.target_tokens` holds the
+            // TargetTokens themselves; the split here is forced by the crate
+            // layering (`JitCellToken` lives in majit-backend, which cannot
+            // name a `VirtualState`). This asserts what that layering costs us
+            // the ability to guarantee: the head the optimizer will see is the
+            // head whose value the ladder reads.
+            debug_assert!(
+                self.compiled_loops
+                    .get(&green_key)
+                    .and_then(|compiled| compiled.front_target_tokens.first())
+                    .is_none_or(
+                        |front| majit_ir::descr_identity(&front.as_jump_target_descr())
+                            == majit_ir::descr_identity(&jump_descr)
+                    ),
+                "compile_trace: token target-descr head disagrees with \
+                 front_target_tokens head for key={green_key}"
+            );
             ctx.recorder
                 .close_loop_with_descr(finish_args, Some(jump_descr));
         }
@@ -7994,7 +8064,10 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
         // the rare missing-token path does not drain the active retrace.
@@ -8184,26 +8257,54 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // compile.py:362-367: optimize using UnrolledLoopData with start_state.
-        let prior_front_target_tokens = self
-            .compiled_loops
-            .get(&green_key)
-            .map(|compiled| compiled.front_target_tokens.clone())
-            .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
-            .unwrap_or_default();
+        //
+        // `compile.py:355-356` resolves the retrace's token with
+        // `get_procedure_token(greenkey)` and asserts it, so a retrace runs
+        // against a token that already owns the accumulated target tokens and
+        // carrying them is that token's own state. The arm below without a
+        // resumekey has no such token: it mints one at `compile.py:1013`, and
+        // `ResumeFromInterpDescr.compile_and_attach` (`:1006-1022`) never
+        // assigns that token's `target_tokens` at all — `target_tokens` has
+        // exactly three writers upstream, the `history.py:440` class default
+        // `None` and the two assignments at `compile.py:245` and `:290`, both
+        // of which are inside `compile_simple_loop` / `compile_loop` and so
+        // are not on this route. The minted token therefore starts owning
+        // nothing. Drain the parked tokens on both arms — `swap_remove` is
+        // what spends them — and hand them on only where a token already owns
+        // them.
+        //
+        // The binding, not the seed argument, is emptied: on the minting arm
+        // it also feeds the ownership rebind and the republication fallback
+        // further down, and that fallback fires precisely when the optimizer
+        // produced no tokens of its own.
+        let prior_front_target_tokens = {
+            let prior_front_target_tokens = self
+                .compiled_loops
+                .get(&green_key)
+                .map(|compiled| compiled.front_target_tokens.clone())
+                .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
+                .unwrap_or_default();
+            if retrace_resumekey.is_some() {
+                prior_front_target_tokens
+            } else {
+                Vec::new()
+            }
+        };
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_short_preamble_producer_slot =
+            Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
-        // `compile.py:797-811` — a retrace grown from a guard failure is
-        // installed under the source guard's own loop token, so a close onto
-        // one of that token's target tokens stays inside a single live code
-        // buffer and may be admitted. Without a resumekey the retrace mints a
-        // fresh JitCellToken below and re-stamps the prior tokens onto it, so
-        // every seeded candidate is foreign at the moment the close is chosen
-        // and none may be admitted.
+        // `AbstractResumeGuardDescr.compile_and_attach`, `compile.py:797-811`,
+        // installs a retrace grown from a guard failure under
+        // `resumekey_original_loop_token`, so a close onto one of that token's
+        // target tokens stays inside a single live code buffer and may be
+        // admitted. The arm without a resumekey seeds nothing, so it has no
+        // candidate to admit.
         unroll_opt.attach_jitcell_token_number = retrace_resumekey
             .as_ref()
             .and_then(|bridge| bridge.source_descr.as_fail_descr())
@@ -8444,7 +8545,14 @@ impl<M: Clone> MetaInterp<M> {
             .set_callinfocollection(self.callinfocollection.clone());
 
         let token_num = self.warm_state.alloc_token_number();
-        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
+        // `compile.py:1013` — `ResumeFromInterpDescr.compile_and_attach` does
+        // `new_loop.original_jitcell_token = jitcell_token =
+        // make_jitcell_token(jitdriver_sd)`. `compile.py:392-393` dispatches
+        // `compile_and_attach` on the resumekey's class, and this is the arm
+        // without a guard resumekey, so a fresh token is the identity the
+        // trace is installed under. The token `compile.py:355-356` resolves is
+        // the optimization-time one — it carries the closing JUMP descr and
+        // the retrace budget, not the installation identity.
         let mut token =
             make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(
@@ -8490,28 +8598,17 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
                 self.assign_guard_hashes(token.as_ref());
-                // `compile.py:237` / `compile.py:289` — every TargetToken
-                // whose LABEL or JUMP appears in `combined_ops` carries
-                // `original_jitcell_token = jitcell_token`.  In the retrace
-                // path, `combined_ops = old_front + new_body`, so the old
-                // front's TargetTokens (created under the previous
-                // jitcell_token) still point at the old number.  RPython
-                // avoids this entirely by reusing the same
-                // `loop_jitcell_token` for retrace (`compile.py:356`); pyre
-                // allocates a new `token_num` for cranelift bridge
-                // migration, so we rebind the prior tokens to the new
-                // number here.  Without this, `record_loop_or_bridge`'s
-                // JUMP arm sees `target_owner_num == old_num !=
-                // new_token.number` and records a false self-loop keepalive.
-                // `compile.py:286-296` / `:312-323` retrace path —
-                // both prior + freshly produced TargetTokens are owned
-                // by the new JCT.  Mirror their descrs onto
-                // `JitCellToken.target_tokens` for `has_compiled_targets`
-                // parity (`pyjitpl.py:3898`).
-                for target_token in &prior_front_target_tokens {
-                    target_token.set_original_jitcell_token_number(token_num);
-                    token.record_target_token(target_token.as_jump_target_descr());
-                }
+                // `compile.py:1014` `propagate_original_jitcell_token(new_loop)`,
+                // whose body at `:463-468` walks the trace's LABELs and sets
+                // each `TargetToken.original_jitcell_token` to the token this
+                // compile installs under. Both `compile_and_attach` arms run
+                // it (`:806` and `:1014`), so re-stamping is upstream's own
+                // step on this path, not a consequence of minting.
+                //
+                // Their descrs are mirrored onto `JitCellToken.target_tokens`
+                // for `has_compiled_targets` (`pyjitpl.py:3922-3923`); see the
+                // note there about upstream leaving the minted token's list
+                // empty on this arm.
                 for target_token in &unroll_opt.target_tokens {
                     target_token.set_original_jitcell_token_number(token_num);
                     token.record_target_token(target_token.as_jump_target_descr());
@@ -8833,7 +8930,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_and_attach` just set to the SOURCE loop's token.
                 // `unroll.py:290-297` separately appended the freshly minted
                 // one to `loop_jitcell_token.target_tokens`
-                // (`compile.py:356`'s `get_procedure_token(greenkey)`), which
+                // (`compile.py:355`'s `get_procedure_token(greenkey)`), which
                 // is what `pyjitpl.py:3923 has_compiled_targets` reads.
                 for target_token in &unroll_opt.target_tokens {
                     target_token.set_original_jitcell_token_number(source_jct.number);
@@ -9122,7 +9219,10 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
         // Cache driver descriptor before ctx is partially consumed below.
@@ -9519,7 +9619,7 @@ impl<M: Clone> MetaInterp<M> {
                     // never builds a `TargetToken`/LABEL and never adds to
                     // `jitcell_token.target_tokens`.  So a FINISH-only trace
                     // leaves `front_target_tokens` empty: `has_compiled_targets`
-                    // (`pyjitpl.py:3898` = `bool(token.target_tokens)`) is
+                    // (`pyjitpl.py:3922-3923` = `bool(token.target_tokens)`) is
                     // false, while the trace stays enterable through
                     // `has_compiled_loop`
                     // (`get_procedure_token().has_compiled_code()`, mod.rs:8273
@@ -9600,7 +9700,10 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns the green_key on success (caller must call
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take()?;
@@ -9763,7 +9866,7 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:237 target_token.original_jitcell_token = jitcell_token`.
         target_token.set_original_jitcell_token_number(token_num);
         // `compile.py:245 jitcell_token.target_tokens = [target_token]` —
-        // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py:3898`).
+        // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py:3922-3923`).
         token.record_target_token(target_token.as_jump_target_descr());
         let mut compiled_ops = optimized_ops.clone();
         if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
@@ -11107,7 +11210,7 @@ impl<M: Clone> MetaInterp<M> {
             let _ = self
                 .backend
                 .redirect_call_assembler(&old_token, &attach_token);
-            // `warmstate.py:347` `old_token.record_jump_to(procedure_token)`.
+            // `warmstate.py:348` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
         }
     }
@@ -11488,12 +11591,13 @@ impl<M: Clone> MetaInterp<M> {
     /// reads `cell.loop_token.as_ref()` directly per F.1 audit
     /// (`tfinal_f0_f1_landed_2026_05_07`).
     ///
-    /// `pyjitpl.py:3898` `has_compiled_targets(token)` parity:
-    /// `bool(token) and bool(token.target_tokens)`.  pyre stores the
-    /// per-target descr identity on `JitCellToken.target_tokens`
-    /// (`backend/src/lib.rs`); each successful `compile_loop` /
-    /// `compile_retrace` populates it through `record_target_token` so
-    /// `has_target_tokens` returns the same signal PyPy reads.
+    /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` is
+    /// `bool(token) and bool(token.target_tokens)`. pyre answers that
+    /// question from the `compiled_loops` side table instead
+    /// ([`Self::has_compiled_targets`]); the per-target descr identity
+    /// mirrored onto `JitCellToken.target_tokens` (`backend/src/lib.rs`) is
+    /// read only by `first_target_token`, and `has_target_tokens` has no
+    /// callers at all.
     /// Invalidation in PyPy is `quasiimmut.py:99 looptoken.invalidated = True`
     /// — a single boolean flag, not a clear of `target_tokens`. Pyre
     /// routes the `bool(token)` half through `WarmEnterState::
