@@ -49,5 +49,7 @@ language differences between RPython and Rust. Mark those separately under
 - [ ] I fully resolved all reasonable code review comments from Codex and CodeRabbit.
   - [ ] Auto-review section 1 is clear. This check is mandatory.
   - [ ] Auto-review section 2 is clear. If this is not checked, please add a comment explaining why.
-- [ ] I did not use AI to write the code of this patch.
-  - If this is not checked, commits must include `Assisted-by`
+- One of checkbox below must be checked.
+  - [ ] I added `Assisted-by` to commit messages to the commits AI wrote.
+  - [ ] I did not use AI to write the code of this patch.
+
