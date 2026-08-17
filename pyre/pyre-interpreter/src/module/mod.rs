@@ -15,6 +15,8 @@ pub mod _bisect;
 #[allow(non_snake_case)]
 pub mod _blake2;
 #[allow(non_snake_case)]
+pub mod _bz2;
+#[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -32,6 +34,8 @@ pub mod _ctypes;
 pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _hashlib;
+#[allow(non_snake_case)]
+pub mod _heapq;
 #[allow(non_snake_case)]
 pub mod _immutables_map;
 pub mod _io;
@@ -69,6 +73,8 @@ pub mod _sre;
 #[allow(non_snake_case)]
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod _ssl;
+#[allow(non_snake_case)]
+pub mod _stat;
 #[allow(non_snake_case)]
 pub mod _symtable;
 #[allow(non_snake_case)]
