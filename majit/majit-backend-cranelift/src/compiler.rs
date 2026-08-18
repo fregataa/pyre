@@ -3464,6 +3464,139 @@ fn emit_call_footer_shadowstack(
         .store(MemFlagsData::trusted(), new_rst, rst_addr_val, 0);
 }
 
+/// Marks a `dispatch_key` as reaching the entry from compiled code rather than
+/// from the host `execute_token` wrapper.
+///
+/// `assembler.py:987 patch_jump_for_descr` rewrites a failing guard's branch to
+/// land inside the bridge, and `:2456-2462 closing_jump` emits a raw
+/// `JMP imm(target._ll_loop_code)` at a JUMP.  Neither site probes the stack and
+/// neither touches the shadow stack: no machine frame and no root-stack entry
+/// come into existence, because the target keeps running on the JITFRAME the
+/// source was already registered with.  Cranelift cannot branch into the middle
+/// of another function, so both transfers go through the target's function
+/// entry, and the entry prologue has to be told which kind of entry it is.  The
+/// low bits of `dispatch_key` carry the LABEL selector (0 = preamble,
+/// `label_block_id + 1` = re-enter at that LABEL); this bit carries the answer.
+///
+/// The host paths (`run_compiled_code`, `host_reentry_dispatch_key`) never set
+/// it, so they keep the full `_call_header_with_stack_check` prologue.
+const IN_CODE_ENTRY_KEY_FLAG: i32 = 1 << 30;
+
+/// `x86/assembler.py:182-184 _build_frame_realloc_slowpath` parity:
+/// `_load_shadowstack_top_in_ebx(mc, gcrootmap)` followed by
+/// `MOV_mr((ebx.value, -WORD), eax.value)`.
+///
+/// After `_frame_realloc_slowpath` the shadow-stack entry the caller pushed
+/// still names the old JITFRAME, so it is retargeted at the new one in place.
+/// An in-code entry inherits the caller's entry instead of pushing its own, so
+/// this is the only place its frame word can be refreshed.
+fn emit_shadowstack_retarget(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    jf_ptr: CValue,
+) {
+    let word = std::mem::size_of::<usize>() as i32;
+    let rst_addr_val = builder.ins().iconst(
+        ptr_type,
+        majit_gc::shadow_stack::get_root_stack_top_addr() as i64,
+    );
+    let rst = builder
+        .ins()
+        .load(ptr_type, MemFlagsData::trusted(), rst_addr_val, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), jf_ptr, rst, -word);
+}
+
+/// Flags for a two-slot frame access.  `trusted()` also claims 16-byte
+/// alignment, which a `Signed` slot pair does not have — a JITFRAME slot is
+/// only word-aligned — so promise no more than "cannot trap".
+fn paired_slot_flags() -> MemFlagsData {
+    MemFlagsData::new().with_notrap()
+}
+
+/// Batches consecutive JITFRAME slot stores so that two adjacent slots leave as
+/// a single `store` of an `I128`.
+///
+/// `_push_all_regs_to_frame` (x86/assembler.py:1745) writes one slot per
+/// register, and a guard exit / JUMP publish is that same shape: a run of
+/// `Signed` slots at `ITEM0 + i*WORD`.  aarch64 has `STP` for exactly this, and
+/// cranelift reaches it through an `I128` store
+/// (`aarch64/lower.isle:2767` → `aarch64_storep64`).  x86 splits an `I128` store
+/// back into the two 64-bit halves it emits today
+/// (`x64/lower.isle:3236` "store the two 64-bit halves separately"), so batching
+/// changes nothing there.
+///
+/// Only the store is deferred, never the computation of the value, so the order
+/// in which fail args are resolved is unchanged.
+#[derive(Default)]
+struct PairedSlotStores {
+    pending: Option<(i32, CValue)>,
+}
+
+impl PairedSlotStores {
+    fn store(&mut self, builder: &mut FunctionBuilder, jf_ptr: CValue, offset: i32, val: CValue) {
+        if let Some((held_ofs, held_val)) = self.pending.take() {
+            let both_word_sized = builder.func.dfg.value_type(held_val) == cl_types::I64
+                && builder.func.dfg.value_type(val) == cl_types::I64;
+            if held_ofs + 8 == offset && both_word_sized {
+                let pair = builder.ins().iconcat(held_val, val);
+                builder
+                    .ins()
+                    .store(paired_slot_flags(), pair, jf_ptr, held_ofs);
+                return;
+            }
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), held_val, jf_ptr, held_ofs);
+        }
+        self.pending = Some((offset, val));
+    }
+
+    fn flush(&mut self, builder: &mut FunctionBuilder, jf_ptr: CValue) {
+        if let Some((offset, val)) = self.pending.take() {
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), val, jf_ptr, offset);
+        }
+    }
+}
+
+/// The read direction of `PairedSlotStores`: load a run of `Signed` frame slots,
+/// taking two adjacent ones per `load` of an `I128` (`aarch64/lower.isle:2655` →
+/// `aarch64_loadp64`, i.e. `LDP`; x86 splits it into the two halves again).
+///
+/// `offsets` is in the order the caller wants the values back; only neighbours
+/// that are genuinely adjacent in the frame are paired.
+fn load_frame_slot_run(
+    builder: &mut FunctionBuilder,
+    jf_ptr: CValue,
+    offsets: &[i32],
+) -> Vec<CValue> {
+    let mut vals = Vec::with_capacity(offsets.len());
+    let mut i = 0;
+    while i < offsets.len() {
+        if i + 1 < offsets.len() && offsets[i] + 8 == offsets[i + 1] {
+            let pair = builder
+                .ins()
+                .load(cl_types::I128, paired_slot_flags(), jf_ptr, offsets[i]);
+            let (lo, hi) = builder.ins().isplit(pair);
+            vals.push(lo);
+            vals.push(hi);
+            i += 2;
+        } else {
+            vals.push(builder.ins().load(
+                cl_types::I64,
+                MemFlagsData::trusted(),
+                jf_ptr,
+                offsets[i],
+            ));
+            i += 1;
+        }
+    }
+    vals
+}
+
 /// x86/assembler.py:1630-1641 `genop_discard_check_memory_error` /
 /// aarch64/assembler.rs `emit_propagate_memory_error_if_null`: branch to the
 /// `propagate_exception_descr` exit when `ptr_val` is NULL.  The metainterp
@@ -6727,17 +6860,20 @@ fn emit_attached_bridge_dispatch(
     // code_ptr cell is unusable here — its call conv is not tail-callable.
     // Dynasm patches the guard branch into a jump to the bridge, so the
     // parent trace no longer contributes a separate shadowstack entry while
-    // the bridge runs.  Pop before the transfer; the bridge prologue pushes
-    // the same jitframe for its own execution and pops it on exit.
-    emit_call_footer_shadowstack(builder, ptr_type);
+    // the bridge runs — and neither does the bridge, which continues on the
+    // same jitframe the parent registered.  `IN_CODE_ENTRY_KEY_FLAG` tells the
+    // bridge's entry to inherit that entry rather than push a second one, so
+    // this side pops nothing.  The deadframe arm below keeps its own pop.
     let mut bridge_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     bridge_sig.params.push(AbiParam::new(ptr_type));
     bridge_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
     bridge_sig.returns.push(AbiParam::new(ptr_type));
     let bridge_sig_ref = builder.import_signature(bridge_sig);
     // A bridge is linear (no LABELs): it always enters at its start, so the
-    // dispatch_key is 0.
-    let bridge_dispatch_key = builder.ins().iconst(cl_types::I32, 0);
+    // LABEL selector is 0.
+    let bridge_dispatch_key = builder
+        .ins()
+        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
     builder
         .ins()
         .return_call_indirect(bridge_sig_ref, bridge_body, &[jf_ptr, bridge_dispatch_key]);
@@ -6897,6 +7033,13 @@ fn emit_attached_loop_dispatch(
             .ins()
             .call_indirect(realloc_sig_ref, realloc_addr, &[jf_ptr, target_depth]);
     let new_jf = builder.inst_results(realloc_call)[0];
+    // x86/assembler.py:182-184 `_build_frame_realloc_slowpath`:
+    //   self._load_shadowstack_top_in_ebx(mc, gcrootmap)
+    //   mc.MOV_mr((ebx.value, -WORD), eax.value)
+    // The transfer below keeps this chain's single root-stack entry standing
+    // (the target enters in-code and pushes nothing), so the entry has to be
+    // pointed at the frame this realloc just forwarded to.
+    emit_shadowstack_retarget(builder, ptr_type, new_jf);
     builder.ins().jump(
         take_block,
         &[
@@ -6917,7 +7060,12 @@ fn emit_attached_loop_dispatch(
     // dispatch stranded a return frame.  With the bridge dispatch itself
     // now a tail-call, this loop dispatch is balanced on both x86_64 and
     // aarch64 (tail_sp_leak.rs: zero drift over 5M tail-calls).
-    emit_call_footer_shadowstack(builder, ptr_type);
+    //
+    // The shadow stack is left alone: `closing_jump` transfers to the target on
+    // the source's own JITFRAME, and `IN_CODE_ENTRY_KEY_FLAG` makes the target's
+    // entry inherit the source's root-stack entry instead of pushing a second
+    // one.  The `miss_block` fall-through below reaches the deadframe exit,
+    // which keeps its own `_call_footer_shadowstack`.
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
     // frame with the callee's — the cranelift analogue of
@@ -6935,7 +7083,10 @@ fn emit_attached_loop_dispatch(
     // target at the LABEL the JUMP names, not always the first.  The target
     // body's entry `br_table` reserves dispatch_key 0 for its preamble, so a
     // re-entry at LABEL L passes `label_block_id + 1`.
-    let dispatch_key = builder.ins().iadd_imm(lbid, 1);
+    let label_selector = builder.ins().iadd_imm(lbid, 1);
+    let dispatch_key = builder
+        .ins()
+        .bor_imm(label_selector, IN_CODE_ENTRY_KEY_FLAG as i64);
     builder.ins().return_call_indirect(
         target_sig_ref,
         target_code_ptr,
@@ -6974,6 +7125,7 @@ fn emit_guard_exit(
         .map(|ai| (ai.failargs_pos, ai))
         .collect();
 
+    let mut publish = PairedSlotStores::default();
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         let offset = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
 
@@ -7009,9 +7161,7 @@ fn emit_guard_exit(
                     op => panic!("unsupported accum_operation '{op}'"),
                 }
             };
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), reduced, jf_ptr, offset);
+            publish.store(builder, jf_ptr, offset, reduced);
         } else {
             let val = resolve_failarg_opref(
                 builder,
@@ -7023,11 +7173,10 @@ fn emit_guard_exit(
                 ref_root_base_ofs,
                 arg_ref,
             );
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), val, jf_ptr, offset);
+            publish.store(builder, jf_ptr, offset, val);
         }
     }
+    publish.flush(builder, jf_ptr);
     // _build_failure_recovery (assembler.py:2102-2105) parity:
     //   POP [ebp + jf_gcmap]   — #2104
     //   POP [ebp + jf_descr]   — #2105
@@ -9413,16 +9562,42 @@ impl CraneliftBackend {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
+        let initial_jf_ptr = builder.block_params(entry_block)[0];
+        // `IN_CODE_ENTRY_KEY_FLAG`: a patched guard jump (assembler.py:987) and
+        // a closing jump (:2456-2462) transfer inside compiled code, so RPython
+        // runs neither `_call_header_with_stack_check` nor
+        // `_call_header_shadowstack` at the target.  Split the prologue on the
+        // flag so an in-code entry pays for neither.
+        let raw_dispatch_key = builder.block_params(entry_block)[1];
+        let in_code_bit = builder
+            .ins()
+            .band_imm(raw_dispatch_key, IN_CODE_ENTRY_KEY_FLAG as i64);
+        let zero_key = builder.ins().iconst(cl_types::I32, 0);
+        let is_in_code_entry = builder.ins().icmp(IntCC::NotEqual, in_code_bit, zero_key);
+
         // assembler.py:1080 _call_header_with_stack_check — inline
         // fast path (load stack_end/length, compare against current
         // stack slot address), calling the registered slowpath only on
         // a miss. If no stack-check addresses are registered
         // (backend-only tests), the probe is elided or falls back to
         // the combined helper.
-        let initial_jf_ptr = builder.block_params(entry_block)[0];
+        //
+        // A tail-call entry reuses the caller's machine frame, so it consumes
+        // no additional native stack and has nothing to probe.
+        let host_stack_check_block = builder.create_block();
+        let stack_check_continue = builder.create_block();
+        builder.ins().brif(
+            is_in_code_entry,
+            stack_check_continue,
+            &[],
+            host_stack_check_block,
+            &[],
+        );
+
+        builder.switch_to_block(host_stack_check_block);
+        builder.seal_block(host_stack_check_block);
         let stack_check_result = emit_stack_check_result(&mut builder, ptr_type, call_conv);
         let stack_overflow_block = builder.create_block();
-        let stack_check_continue = builder.create_block();
         builder.ins().brif(
             stack_check_result,
             stack_overflow_block,
@@ -9508,6 +9683,25 @@ impl CraneliftBackend {
                 &[initial_jf_ptr, expected_v],
             );
             let new_jf = builder.inst_results(realloc_call)[0];
+            // x86/assembler.py:182-184 `_build_frame_realloc_slowpath`:
+            //   self._load_shadowstack_top_in_ebx(mc, gcrootmap)
+            //   mc.MOV_mr((ebx.value, -WORD), eax.value)
+            // The root-stack entry still names the frame that was just
+            // forwarded.  A host entry pushes its own entry below and would
+            // overwrite whatever is retargeted here, so only an in-code entry —
+            // which inherits the caller's entry and pushes nothing — needs it.
+            let retarget_block = builder.create_block();
+            builder.ins().brif(
+                is_in_code_entry,
+                retarget_block,
+                &[],
+                frame_ok_block,
+                &[BlockArg::from(new_jf)],
+            );
+
+            builder.switch_to_block(retarget_block);
+            builder.seal_block(retarget_block);
+            emit_shadowstack_retarget(&mut builder, ptr_type, new_jf);
             builder
                 .ins()
                 .jump(frame_ok_block, &[BlockArg::from(new_jf)]);
@@ -9528,7 +9722,28 @@ impl CraneliftBackend {
         //   MOV [ebx + WORD], ebp   // jf_ptr
         //   ADD ebx, 2*WORD
         //   MOV [root_stack_top_addr], ebx
+        //
+        // Only a host entry pushes.  An in-code entry continues on the JITFRAME
+        // the transferring trace already registered, and that trace left its
+        // entry standing (`emit_attached_bridge_dispatch` /
+        // `emit_attached_loop_dispatch`), so pushing here would stack a second
+        // entry for one frame and the matching pop at the deadframe exit would
+        // leave it behind.
+        let host_shadowstack_block = builder.create_block();
+        let shadowstack_done_block = builder.create_block();
+        builder.ins().brif(
+            is_in_code_entry,
+            shadowstack_done_block,
+            &[],
+            host_shadowstack_block,
+            &[],
+        );
+        builder.switch_to_block(host_shadowstack_block);
+        builder.seal_block(host_shadowstack_block);
         emit_call_header_shadowstack(&mut builder, ptr_type, jf_ptr);
+        builder.ins().jump(shadowstack_done_block, &[]);
+        builder.switch_to_block(shadowstack_done_block);
+        builder.seal_block(shadowstack_done_block);
         // Ref root slots live in jf_frame after output/fail_args area.
         // RPython: refs are always in jf_frame; gcmap marks which slots
         // are live at each GC point (regalloc.py get_gcmap).
@@ -9819,14 +10034,10 @@ impl CraneliftBackend {
         // `br_table` re-entry path reads each LABEL's carried values directly
         // from the frame in its loader, so the entry block only needs the
         // host-entry inputs.
-        let entry_input_vals: Vec<CValue> = (0..num_inputs)
-            .map(|i| {
-                let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
-                builder
-                    .ins()
-                    .load(cl_types::I64, MemFlagsData::trusted(), inputs_ptr, offset)
-            })
+        let entry_input_offsets: Vec<i32> = (0..num_inputs)
+            .map(|i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
             .collect();
+        let entry_input_vals = load_frame_slot_run(&mut builder, inputs_ptr, &entry_input_offsets);
 
         // Always def_var inputargs in the entry block. When the trace
         // starts with LABEL, the LABEL block will override these via
@@ -9982,7 +10193,12 @@ impl CraneliftBackend {
             //             fastlocals writeback and read stale values.
             // The closing-jump passes `label_block_id + 1`; key 0 is reserved
             // for the preamble so it never collides with LABEL 0's re-entry.
-            let dispatch_key = builder.block_params(entry_block)[1];
+            // `IN_CODE_ENTRY_KEY_FLAG` rides in a high bit and is masked off
+            // here so it never reaches the table.
+            let label_selector_mask = (!IN_CODE_ENTRY_KEY_FLAG) as i64;
+            let dispatch_key = builder
+                .ins()
+                .band_imm(raw_dispatch_key, label_selector_mask);
             let preamble_block = builder.create_block();
             let loaders: Vec<cranelift_codegen::ir::Block> = label_blocks
                 .iter()
@@ -10053,15 +10269,11 @@ impl CraneliftBackend {
                         demoted_root_syncs.push((v, home_ofs));
                     }
                 }
-                let vals: Vec<CValue> = (0..arity)
+                let carried_offsets: Vec<i32> = (0..arity)
                     .filter(|&i| loop_phi_keep.is_none_or(|keep| keep[i]))
-                    .map(|i| {
-                        let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
-                        builder
-                            .ins()
-                            .load(cl_types::I64, MemFlagsData::trusted(), cur_jf, offset)
-                    })
+                    .map(|i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
                     .collect();
+                let vals = load_frame_slot_run(&mut builder, cur_jf, &carried_offsets);
                 // Ref-root re-syncs go after every dense carried-slot load:
                 // when `max_output_slots < arity` the ref-root region aliases
                 // the tail of the dense slots, and a store emitted before the
@@ -10216,6 +10428,30 @@ impl CraneliftBackend {
                     // deopt-only (never use_var'd in the body), so the loop header
                     // must not reload it every iteration.  Its home is seeded on
                     // the fall-through/loader edges and read directly by guards.
+                    // A kept param whose raw is NOT frame-resident needs no
+                    // ref-root store here: `regalloc.py` publishes a reference to
+                    // its frame home at `before_call()`, not at a LABEL, and every
+                    // reader agrees.  A guard's map is
+                    // `allocate_gcmap(&failarg_ref_slots)` and so never names the
+                    // ref-root region; `get_gcmap`, which does name it, is a
+                    // call-site map that `spill_ref_roots` refreshes on the
+                    // instruction before; and `resolve_failarg_opref` reaches the
+                    // raw through `use_var`.  Storing every one of them here put a
+                    // store per live reference on the loop header, i.e. on every
+                    // iteration of the loop.
+                    //
+                    // A raw carried in `demoted_failarg_slots` is the exception and
+                    // still has to be reconciled.  That map is trace-global while
+                    // `loop_phi_keep` is per LABEL, so a raw demoted at an earlier
+                    // LABEL can be a kept block param at this one — and for that
+                    // raw the home, not the SSA value, is what the readers use:
+                    // `get_gcmap` marks it with no liveness test, `spill_ref_roots`
+                    // and `reload_ref_roots` refuse to write it, and
+                    // `resolve_failarg_opref` tests the demoted offset before it
+                    // falls back to `use_var`.  Nothing else writes that word on a
+                    // loader re-entry, so dropping the store would leave the
+                    // collector tracing a slot this entry never wrote and guard
+                    // exits publishing an earlier iteration's object.
                     let mut param_idx = 0usize;
                     let mut label_param_sync_jf_ptr = None;
                     for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
@@ -10235,17 +10471,20 @@ impl CraneliftBackend {
                             && !arg_ref.is_constant()
                             && !constants.contains_key(&arg_ref.to_opref().raw())
                         {
-                            builder.def_var(var(arg_ref.to_opref().raw()), param);
-                            sync_ref_root_var(
-                                &mut builder,
-                                ptr_type,
-                                &mut label_param_sync_jf_ptr,
-                                &ref_root_slots,
-                                arg_ref.to_opref().raw(),
-                                param,
-                                ref_root_base_ofs,
-                                &mut synced_ref_vars,
-                            );
+                            let raw = arg_ref.to_opref().raw();
+                            builder.def_var(var(raw), param);
+                            if is_demoted_failarg(&demoted_failarg_slots, raw) {
+                                sync_ref_root_var(
+                                    &mut builder,
+                                    ptr_type,
+                                    &mut label_param_sync_jf_ptr,
+                                    &ref_root_slots,
+                                    raw,
+                                    param,
+                                    ref_root_base_ofs,
+                                    &mut synced_ref_vars,
+                                );
+                            }
                         }
                     }
                     // Entering the body LABEL (not the first label): body is
