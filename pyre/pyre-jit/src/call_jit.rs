@@ -766,6 +766,46 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     }
 }
 
+/// `pypy/interpreter/error.py:410-420 record_context` for an exception whose
+/// handler is part of the trace, split so the trace records the store itself.
+///
+/// The implicit `__context__` is derived by `handle_exception_with_context`,
+/// and a raise the walk routes straight to a handler in the same trace never
+/// surfaces an error the interpreter dispatches — the same gap
+/// [`record_inline_traceback_for_recording`] closes for the traceback node.
+/// Without this, the compiled iterations of a loop raising under a live handler
+/// leave `__context__` null while the interpreted ones set it.
+///
+/// Chains through `chain_context`, so the active exception is selected, a
+/// non-exception or self-referential pair is refused, and a chain that would
+/// close a cycle is broken by nulling the offending link — all exactly as the
+/// interpreter does it — and then answers the slot's resulting value.  The
+/// trace's own `SetfieldGc` therefore stores what is already there; `0` means
+/// the slot stays null.
+///
+/// The cycle break writes the `__context__` of an exception other than
+/// `w_exc`, which the emitted store does not describe, so the call is declared
+/// `cannot_raise_effect_info()` — a heap mutator that cannot raise — rather
+/// than as having no heap effect.
+pub(crate) extern "C" fn resolve_exception_context(exc_value: i64) -> i64 {
+    if exc_value == 0 {
+        return 0;
+    }
+    let w_exc = exc_value as PyObjectRef;
+    if !unsafe { pyre_object::is_exception(w_exc) } {
+        return 0;
+    }
+    let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_exc) };
+    if !existing.is_null() {
+        return existing as i64;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_exc);
+    let active = pyre_interpreter::eval::get_sys_exception();
+    pyre_interpreter::error::chain_context(w_exc, active);
+    unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_exc) as i64 }
+}
+
 pub(crate) extern "C" fn record_inline_traceback_for_recording(
     exc_value: i64,
     w_code_value: i64,
