@@ -96,6 +96,37 @@ pub(super) fn result(value: Result<PyObjectRef, crate::PyError>) -> *mut CPyObje
     }
 }
 
+/// `object.name(*arguments)`.
+///
+/// The attribute lookup can collect, and an argument that is a list or a dict
+/// moves when it does, so everything is pinned across it and read back after.
+pub(super) fn call_method(
+    object: PyObjectRef,
+    name: &str,
+    arguments: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(object);
+    let first_argument = pyre_object::gc_roots::shadow_stack_len();
+    for &argument in arguments {
+        roots.pin_root(argument);
+    }
+    let method = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+        name,
+    )?;
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(method);
+    let reloaded: Vec<PyObjectRef> = (0..arguments.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(first_argument + index))
+        .collect();
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &reloaded,
+    )
+}
+
 /// The attribute name an entry point was handed, as the `str` it must be.
 fn attribute_name(name: *mut CPyObject) -> Option<PyObjectRef> {
     let name = argument(name)?;
@@ -760,9 +791,9 @@ pub unsafe extern "C" fn PyObject_HasAttr(object: *mut CPyObject, name: *mut CPy
 pub unsafe extern "C" fn PyObject_Call(
     callable: *mut CPyObject,
     args: *mut CPyObject,
-    kwargs: *mut CPyObject,
+    keywords: *mut CPyObject,
 ) -> *mut CPyObject {
-    realize_all([callable, args, kwargs]);
+    realize_all([callable, args, keywords]);
     let Some([callable, args]) = arguments([callable, args]) else {
         return std::ptr::null_mut();
     };
@@ -772,8 +803,18 @@ pub unsafe extern "C" fn PyObject_Call(
         ));
         return std::ptr::null_mut();
     }
-    let kwargs = unsafe { pyobject::from_ref(kwargs) };
-    if !kwargs.is_null() && !unsafe { pyre_object::is_dict(kwargs) } {
+    let keywords = unsafe { pyobject::from_ref(keywords) };
+    // A `dict` subclass is accepted, and what goes on is its mapping: the
+    // unpack below reads dict storage directly, and a subclass instance is an
+    // object holding a dict rather than being one.
+    let kwargs = if keywords.is_null() {
+        keywords
+    } else if unsafe { crate::baseobjspace::isinstance_dict_w(keywords) } {
+        crate::type_methods::resolve_dict_backing(keywords)
+    } else {
+        pyre_object::PY_NULL
+    };
+    if kwargs.is_null() && !keywords.is_null() {
         super::pyerrors::set_pending_error(crate::PyError::type_error(
             "keyword arguments must be a dict",
         ));
@@ -1016,7 +1057,110 @@ pub unsafe extern "C" fn PyObject_Type(object: *mut CPyObject) -> *mut CPyObject
     pyobject::make_ref(class.as_ptr())
 }
 
+// ── the constants an extension asks for by identifier ───────────────────
+
+/// The object `Py_CONSTANT_<n>` names, `n` being an index this array covers.
+fn constant_object(identifier: usize) -> PyObjectRef {
+    match identifier {
+        0 => pyre_object::w_none(),
+        1 => pyre_object::boolobject::w_bool_from(false),
+        2 => pyre_object::boolobject::w_bool_from(true),
+        3 => pyre_object::w_ellipsis(),
+        4 => pyre_object::w_not_implemented(),
+        5 => pyre_object::w_int_new(0),
+        6 => pyre_object::w_int_new(1),
+        7 => pyre_object::w_str_new(""),
+        8 => pyre_object::bytesobject::w_bytes_from_bytes(b""),
+        9 => pyre_object::tupleobject::w_tuple_new(Vec::new()),
+        _ => unreachable!("the caller indexed CONSTANT_MIRRORS first"),
+    }
+}
+
+/// One mirror per constant, minted on first ask.
+///
+/// The mirror rather than the object: `Py_GetConstantBorrowed` hands it out
+/// without a reference, so it has to outlive every caller, and two asks for
+/// the same identifier have to answer the same pointer — which for `0` and
+/// `1` and the empty containers they would not, each `w_int_new` being its own
+/// object.
+static CONSTANT_MIRRORS: [std::sync::OnceLock<usize>; 10] =
+    [const { std::sync::OnceLock::new() }; 10];
+
+fn constant_mirror(identifier: std::ffi::c_uint) -> Option<*mut CPyObject> {
+    let index = identifier as usize;
+    let slot = CONSTANT_MIRRORS.get(index)?;
+    let held = *slot.get_or_init(|| {
+        let raw = pyobject::make_ref(constant_object(index));
+        unsafe { (*raw).ob_refcnt = pyobject::REFCNT_IMMORTAL };
+        raw as usize
+    });
+    Some(held as *mut CPyObject)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_GetConstant(identifier: std::ffi::c_uint) -> *mut CPyObject {
+    let Some(raw) = constant_mirror(identifier) else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    };
+    unsafe { pyobject::incref(raw) };
+    raw
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_GetConstantBorrowed(identifier: std::ffi::c_uint) -> *mut CPyObject {
+    let Some(raw) = constant_mirror(identifier) else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    };
+    raw
+}
+
+/// `Py_ReprEnter(obj)` — 0 when the caller may go on to render `obj`, 1 when
+/// it is already being rendered on this thread and the caller should emit its
+/// own elision instead.
+///
+/// The set is the interpreter's own, so a container reached from a C `tp_repr`
+/// and one reached from Python see the same recursion.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_ReprEnter(object: *mut CPyObject) -> c_int {
+    let Some(object) = argument(object) else {
+        // Nothing to record the entry against, which is answered the way a
+        // missing thread state is: the caller may go ahead.
+        return 0;
+    };
+    (!crate::display::repr_enter(object)) as c_int
+}
+
+/// `Py_ReprLeave(obj)` — undo the entry [`Py_ReprEnter`] recorded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_ReprLeave(object: *mut CPyObject) {
+    let object = unsafe { super::pyobject::from_ref(object) };
+    if !object.is_null() {
+        crate::display::repr_leave(object);
+    }
+}
+
+/// `Py_HashBuffer(ptr, len)` — the hash `bytes` of the same content has.
+///
+/// # Safety
+/// `pointer` must address `length` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_HashBuffer(pointer: *const std::ffi::c_void, length: isize) -> isize {
+    if pointer.is_null() || length < 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pointer as *const u8, length as usize) };
+    crate::builtins::hash_buffer(bytes) as isize
+}
+
 pub(super) fn ensure_linked() {
+    std::hint::black_box(Py_ReprEnter as *const ());
+    std::hint::black_box(Py_ReprLeave as *const ());
+    std::hint::black_box(Py_HashBuffer as *const ());
+    std::hint::black_box(Py_GetConstant as *const ());
+    std::hint::black_box(Py_GetConstantBorrowed as *const ());
     std::hint::black_box(PyObject_GetAttrString as *const ());
     std::hint::black_box(PyObject_SetAttrString as *const ());
     std::hint::black_box(PyObject_HasAttrString as *const ());

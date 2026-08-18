@@ -31,16 +31,30 @@ PyAPI_FUNC(int) PyObject_CheckReadBuffer(PyObject *);
 PyAPI_FUNC(int) PyObject_CopyData(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyObject_GetBuffer(PyObject *, Py_buffer *, int);
 
+/* cpyext/bytearrayobject.rs */
+PyAPI_FUNC(char *) PyByteArray_AsString(PyObject *);
+PyAPI_FUNC(int) PyByteArray_Check(PyObject *);
+PyAPI_FUNC(int) PyByteArray_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyByteArray_Concat(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyByteArray_FromObject(PyObject *);
+PyAPI_FUNC(PyObject *) PyByteArray_FromStringAndSize(const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyByteArray_Resize(PyObject *, Py_ssize_t);
+PyAPI_FUNC(Py_ssize_t) PyByteArray_Size(PyObject *);
+
 /* cpyext/bytesobject.rs */
 PyAPI_FUNC(char *) PyBytes_AS_STRING(void *);
 PyAPI_FUNC(char *) PyBytes_AsString(PyObject *);
 PyAPI_FUNC(int) PyBytes_AsStringAndSize(PyObject *, char **, Py_ssize_t *);
 PyAPI_FUNC(int) PyBytes_Check(PyObject *);
 PyAPI_FUNC(int) PyBytes_CheckExact(PyObject *);
+PyAPI_FUNC(void) PyBytes_Concat(PyObject **, PyObject *);
+PyAPI_FUNC(void) PyBytes_ConcatAndDel(PyObject **, PyObject *);
 PyAPI_FUNC(PyObject *) PyBytes_FromObject(PyObject *);
 PyAPI_FUNC(PyObject *) PyBytes_FromString(const char *);
 PyAPI_FUNC(PyObject *) PyBytes_FromStringAndSize(const char *, Py_ssize_t);
+PyAPI_FUNC(PyObject *) PyBytes_Join(PyObject *, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyBytes_Size(PyObject *);
+PyAPI_FUNC(int) _PyBytes_Resize(PyObject **, Py_ssize_t);
 
 /* cpyext/capsule.rs */
 PyAPI_FUNC(int) PyCapsule_CheckExact(PyObject *);
@@ -56,7 +70,17 @@ PyAPI_FUNC(int) PyCapsule_SetDestructor(PyObject *, PyCapsule_Destructor);
 PyAPI_FUNC(int) PyCapsule_SetName(PyObject *, const char *);
 PyAPI_FUNC(int) PyCapsule_SetPointer(PyObject *, void *);
 
+/* cpyext/complexobject.rs */
+PyAPI_FUNC(Py_complex) PyComplex_AsCComplex(PyObject *);
+PyAPI_FUNC(int) PyComplex_Check(PyObject *);
+PyAPI_FUNC(int) PyComplex_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyComplex_FromCComplex(Py_complex);
+PyAPI_FUNC(PyObject *) PyComplex_FromDoubles(double, double);
+PyAPI_FUNC(double) PyComplex_ImagAsDouble(PyObject *);
+PyAPI_FUNC(double) PyComplex_RealAsDouble(PyObject *);
+
 /* cpyext/dictobject.rs */
+PyAPI_FUNC(PyObject *) PyDictProxy_New(PyObject *);
 PyAPI_FUNC(int) PyDict_Check(PyObject *);
 PyAPI_FUNC(int) PyDict_CheckExact(PyObject *);
 PyAPI_FUNC(void) PyDict_Clear(PyObject *);
@@ -75,11 +99,27 @@ PyAPI_FUNC(int) PyDict_Merge(PyObject *, PyObject *, int);
 PyAPI_FUNC(int) PyDict_MergeFromSeq2(PyObject *, PyObject *, int);
 PyAPI_FUNC(PyObject *) PyDict_New(void);
 PyAPI_FUNC(int) PyDict_Next(PyObject *, Py_ssize_t *, PyObject **, PyObject **);
+PyAPI_FUNC(int) PyDict_Pop(PyObject *, PyObject *, PyObject **);
+PyAPI_FUNC(int) PyDict_PopString(PyObject *, const char *, PyObject **);
+PyAPI_FUNC(int) PyDict_SetDefaultRef(PyObject *, PyObject *, PyObject *, PyObject **);
 PyAPI_FUNC(int) PyDict_SetItem(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(int) PyDict_SetItemString(PyObject *, const char *, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyDict_Size(PyObject *);
 PyAPI_FUNC(int) PyDict_Update(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyDict_Values(PyObject *);
+
+/* cpyext/exception.rs */
+PyAPI_FUNC(int) PyExceptionClass_Check(PyObject *);
+PyAPI_FUNC(const char *) PyExceptionClass_Name(PyObject *);
+PyAPI_FUNC(int) PyExceptionInstance_Check(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetArgs(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetCause(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetContext(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetTraceback(PyObject *);
+PyAPI_FUNC(void) PyException_SetArgs(PyObject *, PyObject *);
+PyAPI_FUNC(void) PyException_SetCause(PyObject *, PyObject *);
+PyAPI_FUNC(void) PyException_SetContext(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyException_SetTraceback(PyObject *, PyObject *);
 
 /* cpyext/floatobject.rs */
 PyAPI_FUNC(double) PyFloat_AsDouble(PyObject *);
@@ -87,15 +127,24 @@ PyAPI_FUNC(int) PyFloat_Check(PyObject *);
 PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double);
 
+/* cpyext/gc.rs */
+PyAPI_FUNC(void) PyObject_GC_Track(void *);
+PyAPI_FUNC(void) PyObject_GC_UnTrack(void *);
+
+/* cpyext/genericaliasobject.rs */
+PyAPI_FUNC(PyObject *) Py_GenericAlias(PyObject *, PyObject *);
+
 /* cpyext/import_.rs */
 PyAPI_FUNC(PyObject *) PyImport_AddModuleRef(const char *);
 PyAPI_FUNC(PyObject *) PyImport_GetModule(PyObject *);
 PyAPI_FUNC(PyObject *) PyImport_Import(PyObject *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModule(const char *);
+PyAPI_FUNC(PyObject *) PyImport_ImportModuleAttr(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyImport_ImportModuleAttrString(const char *, const char *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModuleNoBlock(const char *);
 
 /* cpyext/iterator.rs */
-PyAPI_FUNC(int) PyAiter_Check(PyObject *);
+PyAPI_FUNC(int) PyAIter_Check(PyObject *);
 PyAPI_FUNC(int) PyIter_Check(PyObject *);
 PyAPI_FUNC(PyObject *) PyIter_Next(PyObject *);
 PyAPI_FUNC(int) PyIter_NextItem(PyObject *, PyObject **);
@@ -109,6 +158,8 @@ PyAPI_FUNC(int) PyList_Append(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyList_AsTuple(PyObject *);
 PyAPI_FUNC(int) PyList_Check(PyObject *);
 PyAPI_FUNC(int) PyList_CheckExact(PyObject *);
+PyAPI_FUNC(int) PyList_Clear(PyObject *);
+PyAPI_FUNC(int) PyList_Extend(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyList_GetItem(PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyList_GetItemRef(PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyList_GetSlice(PyObject *, Py_ssize_t, Py_ssize_t);
@@ -119,6 +170,17 @@ PyAPI_FUNC(int) PyList_SetItem(PyObject *, Py_ssize_t, PyObject *);
 PyAPI_FUNC(int) PyList_SetSlice(PyObject *, Py_ssize_t, Py_ssize_t, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyList_Size(PyObject *);
 PyAPI_FUNC(int) PyList_Sort(PyObject *);
+
+/* cpyext/lock.rs */
+PyAPI_FUNC(int) PyMutex_IsLocked(PyMutex *);
+PyAPI_FUNC(void) PyMutex_Lock(PyMutex *);
+PyAPI_FUNC(void) PyMutex_Unlock(PyMutex *);
+PyAPI_FUNC(int) PyThread_acquire_lock(PyThread_type_lock, int);
+PyAPI_FUNC(PyLockStatus) PyThread_acquire_lock_timed(PyThread_type_lock, PY_TIMEOUT_T, int);
+PyAPI_FUNC(PyThread_type_lock) PyThread_allocate_lock(void);
+PyAPI_FUNC(void) PyThread_free_lock(PyThread_type_lock);
+PyAPI_FUNC(unsigned long) PyThread_get_thread_ident(void);
+PyAPI_FUNC(void) PyThread_release_lock(PyThread_type_lock);
 
 /* cpyext/longobject.rs */
 PyAPI_FUNC(PyObject *) PyBool_FromLong(long);
@@ -166,6 +228,8 @@ PyAPI_FUNC(PyObject *) _PyLong_FromByteArray(const unsigned char *, size_t, int,
 PyAPI_FUNC(int) PyMapping_Check(PyObject *);
 PyAPI_FUNC(int) PyMapping_DelItemString(PyObject *, const char *);
 PyAPI_FUNC(PyObject *) PyMapping_GetItemString(PyObject *, const char *);
+PyAPI_FUNC(int) PyMapping_GetOptionalItem(PyObject *, PyObject *, PyObject **);
+PyAPI_FUNC(int) PyMapping_GetOptionalItemString(PyObject *, const char *, PyObject **);
 PyAPI_FUNC(int) PyMapping_HasKey(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyMapping_HasKeyString(PyObject *, const char *);
 PyAPI_FUNC(PyObject *) PyMapping_Items(PyObject *);
@@ -200,6 +264,7 @@ PyAPI_FUNC(PyObject *) PyModule_NewObject(PyObject *);
 PyAPI_FUNC(int) PyModule_SetDocString(PyObject *, const char *);
 
 /* cpyext/number.rs */
+PyAPI_FUNC(int) PyIndex_Check(PyObject *);
 PyAPI_FUNC(PyObject *) PyNumber_Absolute(PyObject *);
 PyAPI_FUNC(PyObject *) PyNumber_Add(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyNumber_And(PyObject *, PyObject *);
@@ -290,22 +355,45 @@ PyAPI_FUNC(PyObject *) PyObject_Type(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Vectorcall(PyObject *, PyObject *const *, size_t, PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_VectorcallMethod(PyObject *, PyObject *const *, size_t, PyObject *);
 PyAPI_FUNC(PyObject *) PyVectorcall_Call(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) Py_GetConstant(unsigned int);
+PyAPI_FUNC(PyObject *) Py_GetConstantBorrowed(unsigned int);
+PyAPI_FUNC(Py_hash_t) Py_HashBuffer(const void *, Py_ssize_t);
+PyAPI_FUNC(int) Py_ReprEnter(PyObject *);
+PyAPI_FUNC(void) Py_ReprLeave(PyObject *);
+
+/* cpyext/osmodule.rs */
+PyAPI_FUNC(PyObject *) PyOS_FSPath(PyObject *);
 
 /* cpyext/pyerrors.rs */
 PyAPI_FUNC(int) PyErr_BadArgument(void);
 PyAPI_FUNC(void) PyErr_BadInternalCall(void);
+PyAPI_FUNC(int) PyErr_CheckSignals(void);
 PyAPI_FUNC(void) PyErr_Clear(void);
 PyAPI_FUNC(int) PyErr_ExceptionMatches(PyObject *);
 PyAPI_FUNC(void) PyErr_Fetch(PyObject **, PyObject **, PyObject **);
+PyAPI_FUNC(void) PyErr_GetExcInfo(PyObject **, PyObject **, PyObject **);
+PyAPI_FUNC(PyObject *) PyErr_GetHandledException(void);
+PyAPI_FUNC(PyObject *) PyErr_GetRaisedException(void);
 PyAPI_FUNC(int) PyErr_GivenExceptionMatches(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyErr_NoMemory(void);
 PyAPI_FUNC(void) PyErr_NormalizeException(PyObject **, PyObject **, PyObject **);
 PyAPI_FUNC(PyObject *) PyErr_Occurred(void);
 PyAPI_FUNC(void) PyErr_Restore(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(void) PyErr_SetExcInfo(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrno(PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilename(PyObject *, const char *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilenameObject(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilenameObjects(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(void) PyErr_SetHandledException(PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetImportError(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetImportErrorSubclass(PyObject *, PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetNone(PyObject *);
 PyAPI_FUNC(void) PyErr_SetObject(PyObject *, PyObject *);
+PyAPI_FUNC(void) PyErr_SetRaisedException(PyObject *);
 PyAPI_FUNC(void) PyErr_SetString(PyObject *, const char *);
-PyAPI_FUNC(PyObject *) _PyPyre_ErrFormatted(PyObject *, const char *);
+PyAPI_FUNC(void) _PyErr_BadInternalCall(const char *, int);
+PyAPI_FUNC(void) _PyErr_ChainExceptions1(PyObject *);
+PyAPI_FUNC(void) _Py_FatalErrorFunc(const char *, const char *);
 
 /* cpyext/pymem.rs */
 PyAPI_FUNC(void *) PyMem_Calloc(size_t, size_t);
@@ -321,6 +409,19 @@ PyAPI_FUNC(void *) PyMem_Realloc(void *, size_t);
 PyAPI_FUNC(void) Py_DecRef(PyObject *);
 PyAPI_FUNC(void) Py_IncRef(PyObject *);
 PyAPI_FUNC(Py_ssize_t) _PyPyre_RefCount(PyObject *);
+
+/* cpyext/pystate.rs */
+PyAPI_FUNC(void) PyEval_AcquireThread(PyThreadState *);
+PyAPI_FUNC(void) PyEval_InitThreads(void);
+PyAPI_FUNC(void) PyEval_ReleaseThread(PyThreadState *);
+PyAPI_FUNC(void) PyEval_RestoreThread(PyThreadState *);
+PyAPI_FUNC(PyThreadState *) PyEval_SaveThread(void);
+PyAPI_FUNC(int) PyEval_ThreadsInitialized(void);
+PyAPI_FUNC(int) PyGILState_Check(void);
+PyAPI_FUNC(PyThreadState *) PyGILState_GetThisThreadState(void);
+PyAPI_FUNC(PyThreadState *) PyThreadState_Get(void);
+PyAPI_FUNC(PyThreadState *) PyThreadState_Swap(PyThreadState *);
+PyAPI_FUNC(PyThreadState *) _PyThreadState_UncheckedGet(void);
 
 /* cpyext/sequence.rs */
 PyAPI_FUNC(int) PySequence_Check(PyObject *);
@@ -367,6 +468,9 @@ PyAPI_FUNC(int) PySlice_GetIndicesEx(PyObject *, Py_ssize_t, Py_ssize_t *, Py_ss
 PyAPI_FUNC(PyObject *) PySlice_New(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(int) PySlice_Unpack(PyObject *, Py_ssize_t *, Py_ssize_t *, Py_ssize_t *);
 
+/* cpyext/sysmodule.rs */
+PyAPI_FUNC(int) PySys_AuditTuple(const char *, PyObject *);
+
 /* cpyext/tupleobject.rs */
 PyAPI_FUNC(int) PyTuple_Check(PyObject *);
 PyAPI_FUNC(int) PyTuple_CheckExact(PyObject *);
@@ -407,22 +511,91 @@ PyAPI_FUNC(Py_ssize_t) PyType_GetTypeDataSize(PyTypeObject *);
 PyAPI_FUNC(int) PyType_IsSubtype(PyTypeObject *, PyTypeObject *);
 PyAPI_FUNC(void) PyType_Modified(PyTypeObject *);
 PyAPI_FUNC(int) PyType_Ready(PyTypeObject *);
+PyAPI_FUNC(const char *) _PyType_Name(PyTypeObject *);
 
 /* cpyext/unicodeobject.rs */
+PyAPI_FUNC(void) PyUnicode_Append(PyObject **, PyObject *);
+PyAPI_FUNC(void) PyUnicode_AppendAndDel(PyObject **, PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_AsASCIIString(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_AsEncodedString(PyObject *, const char *, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_AsLatin1String(PyObject *);
 PyAPI_FUNC(const char *) PyUnicode_AsUTF8(PyObject *);
 PyAPI_FUNC(const char *) PyUnicode_AsUTF8AndSize(PyObject *, Py_ssize_t *);
+PyAPI_FUNC(PyObject *) PyUnicode_AsUTF8String(PyObject *);
+PyAPI_FUNC(Py_ssize_t) PyUnicode_AsWideChar(PyObject *, wchar_t *, Py_ssize_t);
+PyAPI_FUNC(wchar_t *) PyUnicode_AsWideCharString(PyObject *, Py_ssize_t *);
 PyAPI_FUNC(int) PyUnicode_Check(PyObject *);
 PyAPI_FUNC(int) PyUnicode_CheckExact(PyObject *);
+PyAPI_FUNC(int) PyUnicode_Compare(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyUnicode_CompareWithASCIIString(PyObject *, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_Concat(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyUnicode_Contains(PyObject *, PyObject *);
 PyAPI_FUNC(void *) PyUnicode_DATA(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_Decode(const char *, Py_ssize_t, const char *, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeASCII(const char *, Py_ssize_t, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeFSDefault(const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeFSDefaultAndSize(const char *, Py_ssize_t);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeLatin1(const char *, Py_ssize_t, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeLocale(const char *, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeLocaleAndSize(const char *, Py_ssize_t, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeUTF8(const char *, Py_ssize_t, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_EncodeFSDefault(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_EncodeLocale(PyObject *, const char *);
+PyAPI_FUNC(int) PyUnicode_Equal(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyUnicode_EqualToUTF8(PyObject *, const char *);
+PyAPI_FUNC(int) PyUnicode_EqualToUTF8AndSize(PyObject *, const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicode_FSConverter(PyObject *, void *);
+PyAPI_FUNC(int) PyUnicode_FSDecoder(PyObject *, void *);
+PyAPI_FUNC(Py_ssize_t) PyUnicode_FindChar(PyObject *, Py_UCS4, Py_ssize_t, Py_ssize_t, int);
+PyAPI_FUNC(PyObject *) PyUnicode_FromKindAndData(int, const void *, Py_ssize_t);
+PyAPI_FUNC(PyObject *) PyUnicode_FromObject(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_FromOrdinal(int);
 PyAPI_FUNC(PyObject *) PyUnicode_FromString(const char *);
 PyAPI_FUNC(PyObject *) PyUnicode_FromStringAndSize(const char *, Py_ssize_t);
+PyAPI_FUNC(PyObject *) PyUnicode_FromWideChar(const wchar_t *, Py_ssize_t);
 PyAPI_FUNC(Py_ssize_t) PyUnicode_GetLength(PyObject *);
 PyAPI_FUNC(unsigned int) PyUnicode_IS_ASCII(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_InternFromString(const char *);
+PyAPI_FUNC(void) PyUnicode_InternInPlace(PyObject **);
+PyAPI_FUNC(PyObject *) PyUnicode_Join(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyUnicode_KIND(PyObject *);
 PyAPI_FUNC(unsigned int) PyUnicode_MAX_CHAR_VALUE(PyObject *);
 PyAPI_FUNC(PyObject *) PyUnicode_New(Py_ssize_t, Py_UCS4);
 PyAPI_FUNC(Py_UCS4) PyUnicode_ReadChar(PyObject *, Py_ssize_t);
+PyAPI_FUNC(PyObject *) PyUnicode_RichCompare(PyObject *, PyObject *, int);
+PyAPI_FUNC(PyObject *) PyUnicode_Substring(PyObject *, Py_ssize_t, Py_ssize_t);
 PyAPI_FUNC(int) PyUnicode_WriteChar(PyObject *, Py_ssize_t, Py_UCS4);
+
+/* cpyext/unicodewriter.rs */
+PyAPI_FUNC(PyUnicodeWriter *) PyUnicodeWriter_Create(Py_ssize_t);
+PyAPI_FUNC(void) PyUnicodeWriter_Discard(PyUnicodeWriter *);
+PyAPI_FUNC(PyObject *) PyUnicodeWriter_Finish(PyUnicodeWriter *);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteASCII(PyUnicodeWriter *, const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteChar(PyUnicodeWriter *, Py_UCS4);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteRepr(PyUnicodeWriter *, PyObject *);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteStr(PyUnicodeWriter *, PyObject *);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteSubstring(PyUnicodeWriter *, PyObject *, Py_ssize_t, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteUCS4(PyUnicodeWriter *, Py_UCS4 *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteUTF8(PyUnicodeWriter *, const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteWideChar(PyUnicodeWriter *, const wchar_t *, Py_ssize_t);
+
+/* cpyext/warnings.rs */
+PyAPI_FUNC(int) PyErr_WarnEx(PyObject *, const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyErr_WarnExplicit(PyObject *, const char *, const char *, int, const char *, PyObject *);
+PyAPI_FUNC(int) PyErr_WarnExplicitObject(PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject *);
+PyAPI_FUNC(int) _PyPyre_WarnExplicitMessage(PyObject *, PyObject *, const char *, int, const char *, PyObject *);
+PyAPI_FUNC(int) _PyPyre_WarnUnicode(PyObject *, PyObject *, PyObject *, Py_ssize_t);
+
+/* cpyext/weakrefobject.rs */
+PyAPI_FUNC(int) PyWeakref_Check(PyObject *);
+PyAPI_FUNC(int) PyWeakref_CheckProxy(PyObject *);
+PyAPI_FUNC(int) PyWeakref_CheckRef(PyObject *);
+PyAPI_FUNC(int) PyWeakref_CheckRefExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyWeakref_GetObject(PyObject *);
+PyAPI_FUNC(int) PyWeakref_GetRef(PyObject *, PyObject **);
+PyAPI_FUNC(int) PyWeakref_IsDead(PyObject *);
+PyAPI_FUNC(PyObject *) PyWeakref_NewProxy(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyWeakref_NewRef(PyObject *, PyObject *);
 
 #ifdef __cplusplus
 }

@@ -26,6 +26,10 @@ static inline void _PyPyre_ArgError(const char *fname, const char *message)
     PyErr_SetString(PyExc_TypeError, buffer);
 }
 
+/* Declared here because the nested unit below counts the units it contains. */
+static inline void _PyPyre_ArgCount(const char *format, Py_ssize_t *total,
+                                    Py_ssize_t *required, const char **fname);
+
 /* Convert one argument according to *format, advancing it past the unit. */
 static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
                                      va_list *va, const char *fname)
@@ -118,7 +122,10 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
         Py_ssize_t length = 0;
         if (code == 'z' && Py_IsNone(arg)) {
             text = NULL;
-        } else if (code == 'y') {
+        } else if (code == 'y' || (with_size && PyBytes_Check(arg))) {
+            /* `s#` and `z#` take a read-only bytes-like object as well as a
+               str; `s` and `z` take a str alone. A `bytearray` is neither,
+               having a release the pointer this hands over cannot run. */
             char *buffer = NULL;
             if (PyBytes_AsStringAndSize(arg, &buffer, &length) < 0) {
                 return 0;
@@ -129,6 +136,14 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
             if (text == NULL) {
                 return 0;
             }
+        }
+        /* Without a size the pointer is all the caller is given, so what it
+           names has to end where the object does. */
+        if (!with_size && text != NULL && strlen(text) != (size_t)length) {
+            PyErr_SetString(PyExc_ValueError, code == 'y'
+                                                  ? "embedded null byte"
+                                                  : "embedded null character");
+            return 0;
         }
         *va_arg(*va, const char **) = text;
         if (with_size) {
@@ -178,16 +193,58 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
         *va_arg(*va, PyObject **) = arg;
         return 1;
     }
+    case '(': {
+        /* A sequence whose items the units up to the matching `)` convert.
+           `str` is excluded the way `converttuple` excludes it: a two-item
+           string is not a two-item argument list. */
+        Py_ssize_t items = 0, ignored = 0;
+        _PyPyre_ArgCount(*format, &items, &ignored, NULL);
+        char buffer[128];
+        if (!PySequence_Check(arg) || PyUnicode_Check(arg)) {
+            snprintf(buffer, sizeof(buffer), "argument must be %zd-item tuple, not %s",
+                     items, arg == Py_None ? "None" : Py_TYPE(arg)->tp_name);
+            _PyPyre_ArgError(fname, buffer);
+            return 0;
+        }
+        Py_ssize_t length = PySequence_Size(arg);
+        if (length < 0) {
+            return 0;
+        }
+        if (length != items) {
+            snprintf(buffer, sizeof(buffer),
+                     "argument must be tuple of length %zd, not %zd", items, length);
+            _PyPyre_ArgError(fname, buffer);
+            return 0;
+        }
+        for (Py_ssize_t index = 0; index < items; index++) {
+            PyObject *item = PySequence_GetItem(arg, index);
+            if (item == NULL) {
+                return 0;
+            }
+            int converted = _PyPyre_ArgConvert(item, format, va, fname);
+            Py_DECREF(item);
+            if (!converted) {
+                return 0;
+            }
+        }
+        if (**format == ')') {
+            (*format)++;
+        }
+        return 1;
+    }
     case 'O': {
         if (**format == '!') {
             (*format)++;
-            PyObject *expected = (PyObject *)va_arg(*va, PyTypeObject *);
-            int matched = PyObject_IsInstance(arg, expected);
-            if (matched < 0) {
-                return 0;
-            }
-            if (!matched) {
-                _PyPyre_ArgError(fname, "argument has the wrong type");
+            PyTypeObject *expected = va_arg(*va, PyTypeObject *);
+            /* The layout, not `isinstance`: the caller goes on to read the
+               object through the fields that type declares, so an object
+               whose `__class__` merely answers with it must be refused. */
+            if (!PyType_IsSubtype(Py_TYPE(arg), expected)) {
+                char buffer[128];
+                snprintf(buffer, sizeof(buffer), "argument must be %.50s, not %.50s",
+                         expected->tp_name,
+                         arg == Py_None ? "None" : Py_TYPE(arg)->tp_name);
+                _PyPyre_ArgError(fname, buffer);
                 return 0;
             }
             *va_arg(*va, PyObject **) = arg;
@@ -233,6 +290,15 @@ static inline void _PyPyre_ArgSkip(const char **format, va_list *va)
         }
         (void)va_arg(*va, void *);
         break;
+    case '(':
+        /* Every unit inside the nested one, then its closing paren. */
+        while (**format != ')' && **format != '\0') {
+            _PyPyre_ArgSkip(format, va);
+        }
+        if (**format == ')') {
+            (*format)++;
+        }
+        break;
     default:
         (void)va_arg(*va, void *);
         break;
@@ -260,6 +326,23 @@ static inline void _PyPyre_ArgCount(const char *format, Py_ssize_t *total,
             goto done;
         case '#': case '!': case '&': case '*':
             break;
+        case ')':
+            /* The end of the nested unit this format is the inside of. */
+            goto done;
+        case '(': {
+            /* One argument, however many units name its items. */
+            int depth = 0;
+            do {
+                depth += *cursor == '(';
+                depth -= *cursor == ')';
+                if (depth == 0) {
+                    break;
+                }
+                cursor++;
+            } while (*cursor);
+            count++;
+            break;
+        }
         default:
             count++;
             break;
@@ -347,6 +430,37 @@ static inline int PyArg_ParseTuple(PyObject *args, const char *format, ...)
     va_list va;
     va_start(va, format);
     int parsed = _PyPyre_VaParse(args, NULL, format, NULL, &va, NULL);
+    va_end(va);
+    return parsed;
+}
+
+/* The pre-2.0 parser: `args` is the single argument rather than a tuple of
+   them, so a format naming one unit converts `args` itself and a format naming
+   more has nowhere to take them from. */
+static inline int PyArg_Parse(PyObject *args, const char *format, ...)
+{
+    Py_ssize_t total = 0, required = 0;
+    const char *fname = NULL;
+    _PyPyre_ArgCount(format, &total, &required, &fname);
+    if (total > 1) {
+        PyErr_SetString(PyExc_SystemError, "old style getargs format uses new features");
+        return 0;
+    }
+    if (total == 0) {
+        if (args == NULL) {
+            return 1;
+        }
+        _PyPyre_ArgError(fname, "takes no arguments");
+        return 0;
+    }
+    if (args == NULL) {
+        _PyPyre_ArgError(fname, "takes at least one argument");
+        return 0;
+    }
+    va_list va;
+    va_start(va, format);
+    const char *cursor = format;
+    int parsed = _PyPyre_ArgConvert(args, &cursor, &va, fname);
     va_end(va);
     return parsed;
 }
@@ -604,6 +718,24 @@ static inline PyObject *Py_BuildValue(const char *format, ...)
     const char *cursor = format;
     PyObject *value = _PyPyre_BuildValue(&cursor, &va);
     va_end(va);
+    return value;
+}
+
+/* The same build over a list the caller already opened, which is how a
+   variadic entry point of its own passes its arguments on.
+
+   The walk goes over a `va_copy`, not over `&va`: an argument of type
+   `va_list` is an array on some ABIs, where it decays to a pointer and `&va`
+   names the parameter slot rather than the list.  Copying gives an object of
+   the type the walker takes the address of, on every ABI, and leaves the
+   caller's own list where it was. */
+static inline PyObject *Py_VaBuildValue(const char *format, va_list va)
+{
+    va_list copy;
+    va_copy(copy, va);
+    const char *cursor = format;
+    PyObject *value = _PyPyre_BuildValue(&cursor, &copy);
+    va_end(copy);
     return value;
 }
 

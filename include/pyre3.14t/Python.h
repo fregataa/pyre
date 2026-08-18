@@ -25,6 +25,12 @@
 #include "pytypedefs.h"
 #include "object.h"
 #include "typeslots.h"
+/* Name the types entry points below take and answer with by value:
+   `PyThreadState` and `PyGILState_STATE`, and `Py_complex`. */
+#include "pystate.h"
+#include "lock.h"
+#include "pythread.h"
+#include "complexobject.h"
 
 /* Every exported entry point. It sits here because the headers above
    name the types it uses, and the ones below define `static inline`
@@ -37,6 +43,11 @@
 #include "structmember.h"
 #include "moduleobject.h"
 #include "pyerrors.h"
+/* The `%`-format engine and the three variadic entry points over it. It
+   follows `pyerrors.h` for the `PyExc_*` names it reports failures through. */
+#include "pyre_format.h"
+/* The variadic warning entry points, written over that engine. */
+#include "warnings.h"
 #include "bytesobject.h"
 #include "unicodeobject.h"
 #include "longobject.h"
@@ -50,6 +61,7 @@
 #include "pycapsule.h"
 #include "import.h"
 #include "modsupport.h"
+#include "audit.h"
 #include "abstract.h"
 
 #endif /* !PYRE_PYTHON_H */

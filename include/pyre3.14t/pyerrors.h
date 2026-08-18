@@ -16,22 +16,38 @@ PyAPI_DATA(PyObject *) PyExc_Exception;
 PyAPI_DATA(PyObject *) PyExc_ArithmeticError;
 PyAPI_DATA(PyObject *) PyExc_AssertionError;
 PyAPI_DATA(PyObject *) PyExc_AttributeError;
+PyAPI_DATA(PyObject *) PyExc_BaseExceptionGroup;
+PyAPI_DATA(PyObject *) PyExc_BlockingIOError;
+PyAPI_DATA(PyObject *) PyExc_BrokenPipeError;
 PyAPI_DATA(PyObject *) PyExc_BufferError;
+PyAPI_DATA(PyObject *) PyExc_ChildProcessError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionAbortedError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionRefusedError;
+PyAPI_DATA(PyObject *) PyExc_ConnectionResetError;
 PyAPI_DATA(PyObject *) PyExc_EOFError;
+PyAPI_DATA(PyObject *) PyExc_FileExistsError;
 PyAPI_DATA(PyObject *) PyExc_FileNotFoundError;
 PyAPI_DATA(PyObject *) PyExc_FloatingPointError;
 PyAPI_DATA(PyObject *) PyExc_GeneratorExit;
 PyAPI_DATA(PyObject *) PyExc_ImportError;
+PyAPI_DATA(PyObject *) PyExc_IndentationError;
 PyAPI_DATA(PyObject *) PyExc_IndexError;
+PyAPI_DATA(PyObject *) PyExc_InterruptedError;
+PyAPI_DATA(PyObject *) PyExc_IsADirectoryError;
 PyAPI_DATA(PyObject *) PyExc_KeyError;
 PyAPI_DATA(PyObject *) PyExc_KeyboardInterrupt;
 PyAPI_DATA(PyObject *) PyExc_LookupError;
 PyAPI_DATA(PyObject *) PyExc_MemoryError;
 PyAPI_DATA(PyObject *) PyExc_ModuleNotFoundError;
 PyAPI_DATA(PyObject *) PyExc_NameError;
+PyAPI_DATA(PyObject *) PyExc_NotADirectoryError;
 PyAPI_DATA(PyObject *) PyExc_NotImplementedError;
 PyAPI_DATA(PyObject *) PyExc_OSError;
 PyAPI_DATA(PyObject *) PyExc_OverflowError;
+PyAPI_DATA(PyObject *) PyExc_PermissionError;
+PyAPI_DATA(PyObject *) PyExc_ProcessLookupError;
+PyAPI_DATA(PyObject *) PyExc_PythonFinalizationError;
 PyAPI_DATA(PyObject *) PyExc_RecursionError;
 PyAPI_DATA(PyObject *) PyExc_ReferenceError;
 PyAPI_DATA(PyObject *) PyExc_RuntimeError;
@@ -40,6 +56,8 @@ PyAPI_DATA(PyObject *) PyExc_StopIteration;
 PyAPI_DATA(PyObject *) PyExc_SyntaxError;
 PyAPI_DATA(PyObject *) PyExc_SystemError;
 PyAPI_DATA(PyObject *) PyExc_SystemExit;
+PyAPI_DATA(PyObject *) PyExc_TabError;
+PyAPI_DATA(PyObject *) PyExc_TimeoutError;
 PyAPI_DATA(PyObject *) PyExc_TypeError;
 PyAPI_DATA(PyObject *) PyExc_UnboundLocalError;
 PyAPI_DATA(PyObject *) PyExc_UnicodeDecodeError;
@@ -49,81 +67,61 @@ PyAPI_DATA(PyObject *) PyExc_UnicodeTranslateError;
 PyAPI_DATA(PyObject *) PyExc_ValueError;
 PyAPI_DATA(PyObject *) PyExc_ZeroDivisionError;
 
-/* `%S`, `%R`, `%U` and `%A` take a `PyObject *`; everything else is handed to
-   `snprintf` one conversion at a time. */
-static inline PyObject *PyErr_Format(PyObject *type, const char *format, ...)
+/* `OSError` under the two names it answered to before 3.3. */
+PyAPI_DATA(PyObject *) PyExc_EnvironmentError;
+PyAPI_DATA(PyObject *) PyExc_IOError;
+
+/* Warnings. */
+PyAPI_DATA(PyObject *) PyExc_Warning;
+PyAPI_DATA(PyObject *) PyExc_BytesWarning;
+PyAPI_DATA(PyObject *) PyExc_DeprecationWarning;
+PyAPI_DATA(PyObject *) PyExc_EncodingWarning;
+PyAPI_DATA(PyObject *) PyExc_FutureWarning;
+PyAPI_DATA(PyObject *) PyExc_ImportWarning;
+PyAPI_DATA(PyObject *) PyExc_PendingDeprecationWarning;
+PyAPI_DATA(PyObject *) PyExc_ResourceWarning;
+PyAPI_DATA(PyObject *) PyExc_RuntimeWarning;
+PyAPI_DATA(PyObject *) PyExc_SyntaxWarning;
+PyAPI_DATA(PyObject *) PyExc_UnicodeWarning;
+PyAPI_DATA(PyObject *) PyExc_UserWarning;
+
+/* `vsnprintf` with the two guarantees the name adds: at most `size` bytes
+   including the terminator, and a NUL at `str[size - 1]` whatever happened.
+   The return value is `vsnprintf`'s, so a truncated conversion still reports
+   the length it would have needed. */
+static inline int PyOS_vsnprintf(char *str, size_t size, const char *format, va_list va)
 {
-    char message[1024];
-    size_t filled = 0;
+    int written = vsnprintf(str, size, format, va);
+    if (size > 0) {
+        str[size - 1] = '\0';
+    }
+    return written;
+}
+
+static inline int PyOS_snprintf(char *str, size_t size, const char *format, ...)
+{
     va_list va;
     va_start(va, format);
-    for (const char *cursor = format; *cursor && filled + 1 < sizeof(message);) {
-        if (*cursor != '%') {
-            message[filled++] = *cursor++;
-            continue;
-        }
-        const char *start = cursor++;
-        while (*cursor && strchr("0123456789.-+ #lzhj", *cursor) != NULL) {
-            cursor++;
-        }
-        char code = *cursor;
-        if (code == '\0') {
-            break;
-        }
-        cursor++;
-        char spec[32];
-        size_t spec_length = (size_t)(cursor - start);
-        if (spec_length >= sizeof(spec)) {
-            spec_length = sizeof(spec) - 1;
-        }
-        memcpy(spec, start, spec_length);
-        spec[spec_length] = '\0';
-        size_t room = sizeof(message) - filled;
-        int written = 0;
-        switch (code) {
-        case '%':
-            message[filled++] = '%';
-            continue;
-        case 'S': case 'R': case 'A': case 'U': case 'V': {
-            PyObject *object = va_arg(va, PyObject *);
-            PyObject *text = (code == 'R' || code == 'A') ? PyObject_Repr(object)
-                                                          : PyObject_Str(object);
-            const char *utf8 = text == NULL ? "<unprintable>" : PyUnicode_AsUTF8(text);
-            written = snprintf(message + filled, room, "%s", utf8 ? utf8 : "<unprintable>");
-            Py_XDECREF(text);
-            break;
-        }
-        case 's':
-            written = snprintf(message + filled, room, spec, va_arg(va, const char *));
-            break;
-        case 'p':
-            written = snprintf(message + filled, room, spec, va_arg(va, void *));
-            break;
-        case 'f': case 'g': case 'e':
-            written = snprintf(message + filled, room, spec, va_arg(va, double));
-            break;
-        case 'c':
-            written = snprintf(message + filled, room, spec, va_arg(va, int));
-            break;
-        default:
-            if (strstr(spec, "ll") != NULL) {
-                written = snprintf(message + filled, room, spec, va_arg(va, long long));
-            } else if (strchr(spec, 'l') != NULL || strchr(spec, 'z') != NULL) {
-                written = snprintf(message + filled, room, spec, va_arg(va, long));
-            } else {
-                written = snprintf(message + filled, room, spec, va_arg(va, int));
-            }
-            break;
-        }
-        if (written < 0) {
-            break;
-        }
-        filled += (size_t)written < room ? (size_t)written : room - 1;
-    }
+    int written = PyOS_vsnprintf(str, size, format, va);
     va_end(va);
-    message[filled < sizeof(message) ? filled : sizeof(message) - 1] = '\0';
-    return _PyPyre_ErrFormatted(type, message);
+    return written;
 }
+
+/* Name the caller's own file and line in the report, the way the reference
+   header does.  A call made inside the runtime has no such place to name and
+   reaches the plain entry point instead. */
+#define PyErr_BadInternalCall() _PyErr_BadInternalCall(__FILE__, __LINE__)
+
+/* End the process, reporting a caller that cannot go on.  A macro so that the
+   report names the function it gave up in, the way the reference header's is. */
+PyAPI_FUNC(void) _Py_FatalErrorFunc(const char *func, const char *message);
+#define Py_FatalError(message) _Py_FatalErrorFunc(__func__, message)
+
+/* An instance's class.  The two classification spellings beside it --
+   `PyExceptionClass_Check` and `PyExceptionInstance_Check` -- are entry points
+   rather than flag tests, since a pyre type mirror carries no `tp_flags` bit
+   for its base chain. */
+#define PyExceptionInstance_Class(x) ((PyObject *)Py_TYPE(x))
 
 #ifdef __cplusplus
 }

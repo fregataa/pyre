@@ -34,7 +34,13 @@ RECORD = pathlib.Path(__file__).resolve().parent / "cpython-abi.txt"
 
 def strip_comments(text):
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    return re.sub(r"//[^\n]*", " ", text)
+    text = re.sub(r"//[^\n]*", " ", text)
+    # A `printf`-checking attribute sits between the parameter list and the
+    # semicolon, so a declaration that carries one reads as a parameter list
+    # ending at the attribute's own closing paren.  It says nothing about the
+    # calling convention, so it goes before anything is matched.
+    return re.sub(r"Py_GCC_ATTRIBUTE\s*\(\((?:[^()]|\([^()]*\))*\)\)", " ", text,
+                  flags=re.S)
 
 
 def tidy(text):
@@ -91,6 +97,23 @@ DECLARATION = re.compile(
     re.S)
 
 
+DATA = re.compile(
+    r"PyAPI_DATA\s*\(\s*(?P<type>[^;()]*?)\s*\)\s*(?P<stars>\**)\s*"
+    r"(?P<name>[A-Za-z_]\w*)\s*;",
+    re.S)
+
+
+def read_data(paths):
+    """name -> the C type of every `PyAPI_DATA` object the headers declare."""
+    found = {}
+    for path in paths:
+        text = strip_comments(path.read_text(errors="replace"))
+        for match in DATA.finditer(text):
+            found.setdefault(match.group("name"),
+                             tidy(match.group("type") + " " + match.group("stars")))
+    return found
+
+
 def read_declarations(paths):
     found = {}
     for path in paths:
@@ -119,7 +142,10 @@ SCALARS = {
     "i32": "int32_t", "u32": "uint32_t", "i64": "int64_t", "u64": "uint64_t",
     # Named aliases the Rust side spells the same way the header does, so the
     # comparison is against the reference name rather than its width.
-    "Py_UCS4": "Py_UCS4",
+    "Py_UCS4": "Py_UCS4", "wchar_t": "wchar_t",
+    # A Rust function that never returns has no C spelling of its own: the
+    # header declares it `void` and marks the fact separately.
+    "!": "void",
 }
 
 STRUCTS = {
@@ -128,6 +154,9 @@ STRUCTS = {
     "CPyModuleDef": "PyModuleDef", "CPyTypeSpec": "PyType_Spec",
     "CPyMethodDef": "PyMethodDef", "CPyMemberDef": "PyMemberDef",
     "CPyGetSetDef": "PyGetSetDef", "c_void": "void",
+    "CPyThreadState": "PyThreadState", "CPyComplex": "Py_complex",
+    "CPyMutex": "PyMutex",
+    "CPyUnicodeWriter": "PyUnicodeWriter",
 }
 
 
@@ -171,6 +200,16 @@ def read_exports():
 FUNCTION_POINTER = re.compile(r"typedef\s+[^;]*?\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\(", re.S)
 ENUM = re.compile(r"typedef\s+enum\b[^;{]*\{.*?\}\s*([A-Za-z_]\w*)\s*;", re.S)
 ALIAS = re.compile(r"typedef\s+([A-Za-z_][\w \t]*?)\s+([A-Za-z_]\w*)\s*;")
+# `typedef void *PyThread_type_lock;` -- the alias names a pointer, which the
+# word-only ALIAS above cannot see because of the star.
+POINTER_ALIAS = re.compile(
+    r"typedef\s+(?:(?:struct|union|enum)\s+)?[A-Za-z_][\w \t]*?\s*\*\s*([A-Za-z_]\w*)\s*;")
+# `#define PY_TIMEOUT_T long long` -- an object-like macro whose body is only
+# type words stands for a type the same way a typedef does.
+TYPE_MACRO = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+"
+                        r"((?:unsigned|signed|const|long|short|int|char|float|double|void"
+                        r"|[A-Za-z_]\w*)(?:[ \t]+(?:unsigned|signed|long|short|int|char"
+                        r"|float|double|void|[A-Za-z_]\w*))*[ \t]*\**)[ \t]*$", re.M)
 
 
 INLINE = re.compile(
@@ -197,6 +236,49 @@ def read_header_inlines():
             yield path.name, match.group("name"), params or ["void"], ret
 
 
+STATIC = re.compile(
+    r"#\[unsafe\(no_mangle\)\]\s*pub\s+static\s+(?:mut\s+)?"
+    r"(?P<name>\w+)\s*:\s*(?P<type>[^=]+?)\s*=",
+    re.S)
+
+MACRO = re.compile(
+    r"macro_rules!\s+(?P<macro>\w+)\s*\{.*?"
+    r"pub\s+static\s+(?:mut\s+)?\$(?P<variable>\w+)\s*:\s*(?P<type>[^=]+?)\s*=",
+    re.S)
+
+
+def read_statics():
+    """name -> the C type of every global the cpyext layer defines.
+
+    A global a table-driven macro declares carries its attribute inside the
+    expansion, so the plain scan cannot see it; the macro's own body says what
+    type it declares and its invocation says under which names.
+    """
+    found = {}
+    for path in sorted(CPYEXT.glob("*.rs")):
+        text = path.read_text()
+        for match in STATIC.finditer(text):
+            found[match.group("name")] = rust_to_c(match.group("type"))
+        for macro in MACRO.finditer(text):
+            c_type = rust_to_c(macro.group("type"))
+            for name in macro_table_names(text, macro.group("macro")):
+                found[name] = c_type
+    return found
+
+
+def macro_table_names(text, macro):
+    """The left-hand side of every row the named macro is invoked with."""
+    body = text.split(f"{macro}! {{")
+    if len(body) < 2:
+        return []
+    names = []
+    for line in body[1].split("\n}")[0].splitlines():
+        name = line.strip().split(" =>")[0]
+        if name and all(c.isalnum() or c == "_" for c in name):
+            names.append(name)
+    return names
+
+
 def read_typedefs(paths):
     """name -> what it stands for, so an alias is not read as a distinct type."""
     table = {}
@@ -210,6 +292,12 @@ def read_typedefs(paths):
             base = " ".join(match.group(1).split())
             if not base.startswith(("struct", "enum", "union")):
                 table.setdefault(match.group(2), base)
+        for match in POINTER_ALIAS.finditer(text):
+            table.setdefault(match.group(1), "void *")
+        for match in TYPE_MACRO.finditer(text):
+            name, base = match.group(1), " ".join(match.group(2).split())
+            if name != base:
+                table.setdefault(name, base)
     return table
 
 
@@ -236,7 +324,7 @@ def abi_slot(c_type, typedefs):
 def load_record():
     if not RECORD.exists():
         sys.exit(f"{RECORD} is missing; run `{sys.argv[0]} snapshot <Include dir>` first")
-    declarations, typedefs, section = {}, {}, None
+    declarations, data, typedefs, section = {}, {}, {}, None
     for line in RECORD.read_text().splitlines():
         if line.startswith("#") or not line.strip():
             if line.startswith("# ["):
@@ -246,12 +334,15 @@ def load_record():
         if section == "typedefs":
             typedefs[name] = rest
             continue
+        if section == "data":
+            data[name] = rest
+            continue
         args, _, ret = rest.partition(" -> ")
         # The record was written with `split_commas`, so a parameter that
         # carries a comma of its own -- a function pointer's own list -- must
         # be read back with the same depth-aware split.
         declarations[name] = ([a.strip() for a in split_commas(args)], ret.strip())
-    return declarations, typedefs
+    return declarations, data, typedefs
 
 
 # ── commands ───────────────────────────────────────────────────────────────
@@ -262,6 +353,7 @@ def command_snapshot(args):
     if not headers:
         sys.exit(f"no headers under {include}")
     declarations = read_declarations(headers)
+    data = read_data(headers)
     typedefs = read_typedefs(sorted(include.rglob("*.h")))
     lines = [
         "# The declarations pyre's extension ABI is measured against.",
@@ -271,16 +363,24 @@ def command_snapshot(args):
         "# [declarations]",
     ]
     lines += [f"{n} :: {', '.join(a)} -> {r}" for n, (a, r) in sorted(declarations.items())]
+    lines += ["", "# [data]"]
+    lines += [f"{n} :: {c}" for n, c in sorted(data.items())]
     lines += ["", "# [typedefs]"]
     lines += [f"{n} :: {t}" for n, t in sorted(typedefs.items())]
     RECORD.write_text("\n".join(lines) + "\n")
-    print(f"{len(declarations)} declarations, {len(typedefs)} typedefs -> {RECORD}")
+    print(f"{len(declarations)} declarations, {len(data)} data objects, "
+          f"{len(typedefs)} typedefs -> {RECORD}")
     return 0
 
 
 def command_check(args):
-    declarations, typedefs = load_record()
-    disagree, converted = [], []
+    declarations, data, typedefs = load_record()
+    # An entry point CPython does not declare is ordinary -- the macros it
+    # spells over struct fields have to be calls here.  One that differs from a
+    # declared name only in case is not: it is a misspelling, and an extension
+    # calling the real name finds no symbol.
+    by_lowercase = {n.lower(): n for n in declarations}
+    disagree, converted, misspelled = [], [], []
     checked = {"export": 0, "header inline": 0}
     entry_points = [("export", f"cpyext/{m}.rs", n, p, r)
                     for m, n, p, r in read_exports()]
@@ -288,6 +388,9 @@ def command_check(args):
                      for h, n, p, r in read_header_inlines()]
     for kind, where_defined, name, params, ret in entry_points:
         if name not in declarations:
+            spelled = by_lowercase.get(name.lower())
+            if spelled is not None:
+                misspelled.append((where_defined, name, spelled))
             converted.append((where_defined, name))
             continue
         theirs, their_ret = declarations[name]
@@ -298,23 +401,71 @@ def command_check(args):
             disagree.append((where_defined, name, params, theirs, "arguments"))
         elif abi_slot(ret, typedefs) != abi_slot(their_ret, typedefs):
             disagree.append((where_defined, name, [ret], [their_ret], "return"))
+    disagree += check_data(data, typedefs, misspelled)
     print(f"{checked['export']} exports and {checked['header inline']} header "
           f"inlines checked against the recorded CPython ABI; "
           f"{len(converted)} have no CPython declaration")
+    for where_defined, name, spelled in misspelled:
+        print(f"\n{name} is spelled {spelled} by CPython  [{where_defined}]")
     for where_defined, name, ours, theirs, where in disagree:
         print(f"\n{name} disagrees on its {where}  [{where_defined}]")
         print(f"    pyre    ({', '.join(ours)})")
         print(f"    cpython ({', '.join(theirs)})")
-    if disagree:
-        print(f"\n{len(disagree)} entry point(s) do not match the C declaration "
-              f"an extension is compiled against.")
+    if disagree or misspelled:
+        print(f"\n{len(disagree) + len(misspelled)} entry point(s) do not match "
+              f"the C declaration an extension is compiled against.")
         return 1
     print("every entry point matches.")
     return 0
 
 
+# A mirror is a `PyObject` whatever it stands for, so a singleton CPython
+# declares under the layout of its own value cannot agree: the pyre headers
+# offer no `PyLongObject` for the declaration to name, and `Py_True` casts the
+# address to `PyObject *` on both sides, so nothing an extension writes can see
+# the difference.  `api.py:711-713` registers the same two as `PyObject*`.
+DATA_DIVERGENCES = {"_Py_TrueStruct", "_Py_FalseStruct"}
+
+
+def check_data(record, typedefs, misspelled):
+    """Every `PyAPI_DATA` object the pyre headers declare, three ways.
+
+    A data object is invisible to the entry-point pass above: nothing about it
+    is a `PyAPI_FUNC`, and its Rust side is a `static` rather than a function.
+    It is still ABI an extension resolves at `dlopen` time, and getting it
+    wrong fails there rather than at build time, so it is checked here for the
+    type CPython gives it and for a definition actually existing behind the
+    declaration.
+    """
+    declared = read_data(sorted(HEADER_DIR.glob("*.h")))
+    defined = read_statics()
+    by_lowercase = {n.lower(): n for n in record}
+    disagree = []
+    for name, c_type in sorted(declared.items()):
+        where_declared = f"{HEADER_DIR.name}/*.h"
+        if name in DATA_DIVERGENCES:
+            continue
+        if name not in defined:
+            disagree.append((where_declared, name, [c_type],
+                             ["no cpyext static defines it"], "definition"))
+            continue
+        if abi_slot(defined[name], typedefs) != abi_slot(c_type, typedefs):
+            disagree.append((where_declared, name, [c_type], [defined[name]], "type"))
+            continue
+        if name not in record:
+            spelled = by_lowercase.get(name.lower())
+            if spelled is not None:
+                misspelled.append((where_declared, name, spelled))
+            continue
+        if abi_slot(c_type, typedefs) != abi_slot(record[name], typedefs):
+            disagree.append((where_declared, name, [c_type], [record[name]], "type"))
+    print(f"{len(declared) - len(DATA_DIVERGENCES & declared.keys())} data objects "
+          f"checked against the recorded CPython ABI")
+    return disagree
+
+
 def command_generate(args):
-    declarations, _ = load_record()
+    declarations, _, _ = load_record()
     by_module = {}
     for module, name, params, ret in read_exports():
         # CPython's own spelling wherever it has one: `check` has already

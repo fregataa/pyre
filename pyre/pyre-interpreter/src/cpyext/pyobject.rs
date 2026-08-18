@@ -21,9 +21,11 @@
 //!
 //! The rule's other half is that a count *above* the link share does root the
 //! object — `rawrefcount.rst`'s "mark 'p' as surviving, as well as all its
-//! dependencies".  A reference cycle that runs through a C reference therefore
-//! stays alive, upstream included: breaking one needs the type's `tp_traverse`
-//! and `tp_clear`, which no `rawrefcount` collection consults.
+//! dependencies".  Read on its own that keeps a reference cycle running through
+//! a C reference alive for good, which is where it stands upstream; what a
+//! collection here also has is the block's own references, reported by
+//! [`super::gc`] out of its `tp_traverse`, so that a reference from inside the
+//! cycle is told apart from one from outside it.
 
 use super::ForkMutex;
 use super::typeobject::CPyTypeObject;
@@ -450,6 +452,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
     super::typeobject::forget_type_name(address);
+    super::gc::forget(address);
     let block = block_at(address);
     let returned = if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };
@@ -568,6 +571,10 @@ pub(super) unsafe fn free_block(raw: *mut CPyObject) {
 /// mirror can decref others, which is why the queue is re-read every iteration
 /// rather than drained into a list.
 pub fn drain_dead() {
+    // First, because a block the collector could not bring to zero is one the
+    // queue never names: its remaining references are a cycle's, and breaking
+    // them is what lets the deallocators below run at all.
+    super::gc::clear_garbage();
     loop {
         let raw = majit_gc::gc_rawrefcount_next_dead() as *mut CPyObject;
         if raw.is_null() {
@@ -595,6 +602,11 @@ pub fn drain_dead() {
 /// A set, not a list: the membership test below runs once per item read, so a
 /// C loop over `PyTuple_GetItem` for every item of an n-item container would
 /// otherwise scan n/2 entries per step.
+///
+/// Each entry roots the item's object, and a collection is told which container
+/// that root belongs to -- [`borrowed_edges`].  Without that the retention above
+/// is unbounded rather than merely wide: an item referring back to its container
+/// keeps the container, which is what would release the entry.
 type BorrowSet = std::collections::HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
 type BorrowMap = HashMap<usize, BorrowSet, BuildHasherDefault<std::hash::DefaultHasher>>;
 static BORROWED: ForkMutex<BorrowMap> =
@@ -634,6 +646,29 @@ fn release_borrowed(container: *mut CPyObject) {
     }
 }
 
+/// This table read as [`super::gc::c_edges`] reads a `tp_traverse`.
+///
+/// Each entry is a reference one mirror holds in another, released exactly when
+/// the container mirror is deallocated, so it is an edge of the same kind as a C
+/// field -- and one no traverse can report, the reference living here rather
+/// than in the block. Without it a container that handed C a borrowed reference
+/// to something referring back to the container is a cycle neither side can
+/// see: the item's count roots the item, the item roots the container, and the
+/// container is what would release the count.
+///
+/// Reported as separate entries rather than merged into a block's own, which the
+/// collector sums either way.
+pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
+    let borrowed = BORROWED.lock();
+    edges.reserve(borrowed.len());
+    for (&container, items) in borrowed.iter() {
+        if items.is_empty() {
+            continue;
+        }
+        edges.push((container, items.iter().copied().collect()));
+    }
+}
+
 /// The NUL-terminated byte view of a mirror, filled on first use.
 ///
 /// This is the counterpart of the `c_utf8` field PyPy fills on its
@@ -668,6 +703,35 @@ pub(super) unsafe fn cached_bytes(
     (entry.as_ptr() as *const c_char, entry.len() - 1)
 }
 
+/// Give a mirror's cached bytes a new length, keeping what still fits and
+/// zeroing what is new, and answer the address the caller reads from now.
+///
+/// The address moves, the box being replaced.  That is what resizing the tail
+/// an object carries does upstream too, and the caller re-reads it through
+/// `PyBytes_AS_STRING(*pv)` afterwards either way.
+///
+/// `None` is a request there was no room for; a mirror with nothing cached
+/// cannot reach this, the only caller being a resize of a buffer it handed
+/// out.
+///
+/// # Safety
+/// `raw` must be a live mirror whose bytes are already cached.
+pub(super) unsafe fn resize_cached_bytes(
+    raw: *mut CPyObject,
+    size: usize,
+) -> Option<*const c_char> {
+    let mut cache = BYTE_CACHE.lock();
+    let entry = cache.get_mut(&(raw as usize))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    if bytes.try_reserve_exact(size + 1).is_err() {
+        return None;
+    }
+    bytes.extend_from_slice(&entry[..(entry.len() - 1).min(size)]);
+    bytes.resize(size + 1, 0);
+    *entry = bytes.into_boxed_slice();
+    Some(entry.as_ptr() as *const c_char)
+}
+
 /// `state.py:106-107` — give the collector the callback it fires when it has
 /// queued mirrors, before anything can create the first link.
 ///
@@ -677,6 +741,7 @@ pub(super) unsafe fn cached_bytes(
 /// right moment.
 pub(super) fn init_rawrefcount() {
     majit_gc::gc_rawrefcount_init(schedule_drain);
+    majit_gc::gc_rawrefcount_set_c_edge_census(super::gc::c_edges);
 }
 
 /// Fired from inside a collection, so it may only schedule.
