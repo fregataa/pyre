@@ -391,12 +391,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
             // rather than seeding them from `sym.jitcode` /
             // `collect_outer_active_boxes` like the retired per-opcode
-            // arm entry did.  A specialized
-            // `generated_store_subscr_value` guard captured via
+            // arm entry did.  A guard captured via
             // `walker_capture_snapshot_for_last_guard` would attach
-            // resume data pointing at the wrong frame, so keep
-            // STORE_SUBSCR specialization off on this entry.
-            store_subscr_fn_addr: None,
+            // resume data pointing at the wrong frame.
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
             vstack_depth: 0,
@@ -1315,7 +1312,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // never run pre-deopt (the deopt cut the trace there), so this is its
             // first and only concrete execution.
             is_authoritative_executor: true,
-            store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
             vstack_depth: 0,
