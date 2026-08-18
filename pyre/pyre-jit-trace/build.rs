@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v7";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v9";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -30,6 +30,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "descrs.bin",
     "descrs_index.bin",
     "ei_descr_mints.bin",
+    "ei_descr_mints_index.bin",
     "field_mint_census.bin",
     "liveness.bin",
     "fnaddr_bindings.bin",
@@ -68,14 +69,16 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 ///
 /// What decides the cross-process verdict after these exclusions:
 /// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
-/// `descrs_index.bin`, `ei_descr_mints.bin`, `liveness.bin`.
+/// `descrs_index.bin`, `ei_descr_mints.bin`, `ei_descr_mints_index.bin`,
+/// `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
 /// `i64` there, so a change in jitcode population, order or body length still
 /// moves it while an address change alone does not.
-/// `descrs_index.bin` is likewise a pure byte-offset table: `descrs.bin`
+/// `descrs_index.bin` is likewise a pure byte-offset/kind table: `descrs.bin`
 /// remains host-addressed, but its index contains no address and stays in the
-/// cross-process verdict to judge descriptor population, order, and lengths.
+/// cross-process verdict to judge descriptor population, order, lengths, and
+/// setup-pass classification.
 ///
 /// Caching them is still sound: a restore serves these tables and the
 /// `constants_i` baked against them from the *same* generation, so they stay
@@ -254,12 +257,13 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(format!("{out_dir}/descrs.bin"), b"").unwrap();
     std::fs::write(
         format!("{out_dir}/descrs_index.bin"),
-        bincode::serialize(&vec![0_u32]).unwrap(),
+        bincode::serialize(&(vec![0_u32], Vec::<u8>::new())).unwrap(),
     )
     .unwrap();
+    std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), b"").unwrap();
     std::fs::write(
-        format!("{out_dir}/ei_descr_mints.bin"),
-        bincode::serialize(&Vec::<majit_ir::effectinfo::DescrMintEntry>::new()).unwrap(),
+        format!("{out_dir}/ei_descr_mints_index.bin"),
+        bincode::serialize(&vec![0_u32]).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -1065,8 +1069,20 @@ fn real_main() {
         // reconstituting every descriptor in this process.
         let mut descrs_bin = Vec::new();
         let mut descr_offsets = Vec::with_capacity(pipeline.descrs.len() + 1);
+        let mut descr_kinds = Vec::with_capacity(pipeline.descrs.len());
         descr_offsets.push(0_u32);
         for descr in &pipeline.descrs {
+            // `GcCache.setup_descrs` publishes structural descriptors before
+            // call descriptors.  Persist that two-pass classification beside
+            // the dense offsets so runtime can preserve the ordering without
+            // deserializing every entry once merely to discover its variant.
+            // One byte per dense slot retains upstream's list shape and avoids
+            // introducing a second keyed registry.
+            descr_kinds.push(match descr {
+                majit_translate::jitcode::BhDescr::Call { .. }
+                | majit_translate::jitcode::BhDescr::JitCode { .. } => 1_u8,
+                _ => 0_u8,
+            });
             descrs_bin.extend(bincode::serialize(descr).unwrap());
             descr_offsets.push(
                 u32::try_from(descrs_bin.len())
@@ -1074,10 +1090,11 @@ fn real_main() {
             );
         }
         assert_eq!(descr_offsets.len(), pipeline.descrs.len() + 1);
+        assert_eq!(descr_kinds.len(), pipeline.descrs.len());
         assert_eq!(descr_offsets.first().copied(), Some(0));
         assert_eq!(descr_offsets.last().copied(), Some(descrs_bin.len() as u32));
         assert!(descr_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-        let descrs_index_bin = bincode::serialize(&descr_offsets).unwrap();
+        let descrs_index_bin = bincode::serialize(&(descr_offsets, descr_kinds)).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
         std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
 
@@ -1109,8 +1126,27 @@ fn real_main() {
         // raw-set members no opcode names would have no slot on the far side;
         // persist their mint arguments and let the runtime cache take the same
         // `descr.py:224-238` miss branch this one did.
-        let ei_descr_mints_bin = bincode::serialize(&pipeline.ei_descr_mints).unwrap();
+        // Mint specs are one-shot setup inputs.  Keep the same indexed-entry
+        // shape as `descrs.bin` so the runtime can deserialize and publish one
+        // spec at a time instead of retaining all member/spec strings at the
+        // peak of first-JIT setup.
+        let mut ei_descr_mints_bin = Vec::new();
+        let mut ei_descr_mint_offsets = Vec::with_capacity(pipeline.ei_descr_mints.len() + 1);
+        ei_descr_mint_offsets.push(0_u32);
+        for entry in &pipeline.ei_descr_mints {
+            ei_descr_mints_bin.extend(bincode::serialize(entry).unwrap());
+            ei_descr_mint_offsets.push(
+                u32::try_from(ei_descr_mints_bin.len())
+                    .expect("serialized ei_descr_mints.bin exceeds the u32 offset range"),
+            );
+        }
+        let ei_descr_mints_index_bin = bincode::serialize(&ei_descr_mint_offsets).unwrap();
         std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), &ei_descr_mints_bin).unwrap();
+        std::fs::write(
+            format!("{out_dir}/ei_descr_mints_index.bin"),
+            &ei_descr_mints_index_bin,
+        )
+        .unwrap();
 
         // Analyzer-side descriptor producers run in this build-script process,
         // while the runtime formats the field-position report. Persist the
