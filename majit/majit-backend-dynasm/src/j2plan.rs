@@ -171,8 +171,14 @@ pub(crate) struct TracePlan {
 }
 
 impl TracePlan {
+    /// Production lowering entry point. Register allocation uses only lowered
+    /// operations, while reverse liveness is for diagnostics.
+    pub(crate) fn lower_ops(ops: &[Op]) -> Vec<LirOp> {
+        ops.iter().map(lower_op).collect()
+    }
+
     pub(crate) fn build(inputargs: &[InputArg], ops: &[Op]) -> Self {
-        let lowered: Vec<LirOp> = ops.iter().map(lower_op).collect();
+        let lowered = Self::lower_ops(ops);
         let live_points = compute_live_points(&lowered);
         let max_live = live_points
             .iter()
@@ -611,33 +617,39 @@ mod tests {
         let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
-        let plan = TracePlan::build(
-            &[InputArg::from_type(Type::Int, 0)],
-            &[label, add, lt, guard, jump],
+        let ops = vec![label, add, lt, guard, jump];
+        let plan = TracePlan::build(&[InputArg::from_type(Type::Int, 0)], &ops);
+
+        let lowered = TracePlan::lower_ops(&ops);
+        assert_eq!(
+            lowered,
+            vec![
+                LirOp::Label { args: vec![i0] },
+                LirOp::IntBin {
+                    kind: IntBinKind::Add,
+                    dst: OpRef::int_op(1),
+                    lhs: i0,
+                    rhs: c1,
+                },
+                LirOp::IntCmp {
+                    kind: IntCmpKind::SignedLt,
+                    dst: OpRef::int_op(2),
+                    lhs: OpRef::int_op(1),
+                    rhs: c10,
+                },
+                LirOp::Guard {
+                    kind: GuardKind::True,
+                    args: vec![OpRef::int_op(2)],
+                    fail_args: vec![OpRef::int_op(1)],
+                },
+                LirOp::Jump {
+                    args: vec![OpRef::int_op(1)],
+                },
+            ]
         );
+        assert_eq!(lowered, plan.ops);
 
         assert_eq!(plan.fallback_ops, 0);
-        assert!(matches!(
-            plan.ops[1],
-            LirOp::IntBin {
-                kind: IntBinKind::Add,
-                ..
-            }
-        ));
-        assert!(matches!(
-            plan.ops[2],
-            LirOp::IntCmp {
-                kind: IntCmpKind::SignedLt,
-                ..
-            }
-        ));
-        assert!(matches!(
-            plan.ops[3],
-            LirOp::Guard {
-                kind: GuardKind::True,
-                ..
-            }
-        ));
     }
 
     #[test]
