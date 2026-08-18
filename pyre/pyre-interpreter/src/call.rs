@@ -106,6 +106,60 @@ pub fn clear_call_error() {
     });
 }
 
+thread_local! {
+    /// Errors held across a hook that itself runs interpreter code.
+    ///
+    /// `baseobjspace.py:1274-1276`'s `except OperationError:
+    /// ec.c_exception_trace(frame, w_func); raise` re-raises the *saved*
+    /// exception, but [`PENDING_CALL_ERROR`] is a single cell that every call
+    /// the tracer makes resets — so without parking, a profiled builtin that
+    /// raises reports whatever the tracer left behind instead of its own
+    /// error.  A stack rather than a cell: the tracer can reach the same path.
+    static PARKED_CALL_ERRORS: RefCell<Vec<PyError>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Move the pending error out of the way of code that resets the stash.
+/// Returns whether anything was parked, which is what [`unpark_call_error`]
+/// must be called for.
+#[majit_macros::dont_look_inside]
+pub fn park_call_error() -> bool {
+    let Some(err) = take_call_error() else {
+        return false;
+    };
+    PARKED_CALL_ERRORS.with(|stack| stack.borrow_mut().push(err));
+    true
+}
+
+/// Restore the innermost parked error as the pending one.
+#[majit_macros::dont_look_inside]
+pub fn unpark_call_error() {
+    if let Some(err) = PARKED_CALL_ERRORS.with(|stack| stack.borrow_mut().pop()) {
+        set_call_error(err);
+    }
+}
+
+pub(crate) fn capture_parked_call_errors_area() -> *const () {
+    PARKED_CALL_ERRORS.with(|stack| stack as *const _ as *const ())
+}
+
+/// Walk the parked call errors belonging to one stopped mutator.
+///
+/// # Safety
+/// `data` must come from [`capture_parked_call_errors_area`], and the owning
+/// mutator must be quiesced.
+pub(crate) unsafe fn walk_parked_call_errors_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let stack = unsafe { &*(data as *const RefCell<Vec<PyError>>) };
+    // Same raw access `walk_pending_call_error_area` uses, and for the same
+    // reason: the owning mutator is stopped, so no borrow can be live.
+    let parked = unsafe { &mut *stack.as_ptr() };
+    for err in parked.iter_mut() {
+        err.walk_gc_refs(visitor);
+    }
+}
+
 /// Root the deferred call error stashed in `PENDING_CALL_ERROR`. Its `PyError`
 /// holds up to three GC-managed references — the cached exception object and
 /// the lazy NameError/AttributeError name/obj context — none reached by the
@@ -3065,11 +3119,12 @@ fn call_with_kwargs_in_ctx_impl(
         }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
-        // The `function`, `memoryview`, and deque iterator types are
-        // non-acceptable-as-base too, but their `tp_new` functions accept
-        // keywords: FunctionType has `kwdefaults=...`, CPython 3.14 exposes
-        // `memoryview(object=...)`, and the deque iterator constructors accept
-        // (and ignore) `index=...`.  Route them through `__new__`.
+        // The `function`, `memoryview`, deque iterator, and `_lzma` stream
+        // types are non-acceptable-as-base too, but their `tp_new` functions
+        // accept keywords: FunctionType has `kwdefaults=...`, CPython 3.14
+        // exposes `memoryview(object=...)`, the deque iterator constructors
+        // accept (and ignore) `index=...`, and both `_lzma` constructors take
+        // `format=`/`preset=`/`filters=`.  Route them through `__new__`.
         let accepts_keywords_despite_nonbase =
             std::ptr::eq(
                 current_type(),
@@ -3086,7 +3141,9 @@ fn call_with_kwargs_in_ctx_impl(
             ) || std::ptr::eq(
                 current_type(),
                 crate::module::_contextvars::context_var_type(),
-            ) || crate::_structseq::is_structseq_type(current_type());
+            ) || std::ptr::eq(current_type(), crate::module::_lzma::compressor_type())
+                || std::ptr::eq(current_type(), crate::module::_lzma::decompressor_type())
+                || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }

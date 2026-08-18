@@ -170,6 +170,10 @@ zlib-rs = { version = "0.6.5", default-features = false, features = ["rust-alloc
 # libbz2-rs-sys, the pure-Rust libbz2 port from the same source as zlib-rs,
 # whose output is byte-identical to the reference C libbz2.
 bzip2 = "0.6.1"
+# liblzma backend (pyre-native only): xz-core is the pure-Rust port of
+# liblzma, with the same entry points `Modules/_lzmamodule.c` calls, so
+# `_lzma` needs no C toolchain and builds for wasm32 like the others.
+xz-core = "0.1.0-rc.0"
 # binascii transforms (pure-Rust logic).
 base64 = "0.22"
 crc32fast = "1.4"
@@ -197,6 +201,17 @@ rustyline = "17"
 tempfile = "3"
 walkdir = "2"
 insta = "1"
+
+# xz-core 0.1.0-rc.0 files its `lzma12_optmap` static initializer in the MSVC
+# `.CRT$XIB` group.  `_initterm_e` walks that table as `int (__cdecl *)(void)`
+# and `__scrt_common_main_seh` returns 255 when an entry reports non-zero, but
+# the initializer's Rust signature returns `()`, so nothing defines the value
+# that is read.  Every pyre invocation on windows-latest exited 255 with empty
+# stdout and stderr.  The fork moves the table to `.CRT$XCU`, which `_initterm`
+# walks as `_PVFV` and whose result is discarded; the change is
+# simnalamburt/xz-rs#20 and this pin drops when it is released.
+[patch.crates-io]
+xz-core = { git = "https://github.com/youknowone/xz-rs-simnalamburt", rev = "9c5cc27154e90b48348f713e28ab02bb2c5b52b4" }
 
 # `cargo run --release` is the benchmark/developer performance surface too.
 # Give it the same cross-crate optimization used by distributable binaries;

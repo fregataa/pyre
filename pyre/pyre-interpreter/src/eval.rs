@@ -55,6 +55,7 @@ thread_local! {
             .with(|cell| cell as *const _),
         jit_pending_exception: crate::stack_check::capture_jit_pending_exception_area(),
         pending_call_error: crate::call::capture_pending_call_error_area(),
+        parked_call_errors: crate::call::capture_parked_call_errors_area(),
         pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
     };
 }
@@ -68,6 +69,7 @@ struct PyFrameRootArea {
     guard_exception: *const Cell<i64>,
     jit_pending_exception: *const Cell<i64>,
     pending_call_error: *const (),
+    parked_call_errors: *const (),
     pending_hash_error: *const (),
 }
 use crate::pyframe::PyFrame;
@@ -869,6 +871,7 @@ pub unsafe fn walk_pyframe_roots_area(
         walk_raw_exception_cell_area(area.guard_exception, visitor);
         walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
         crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
+        crate::call::walk_parked_call_errors_area(area.parked_call_errors, visitor);
         crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);
     }
     // incminimark.py:339-355 prebuilt-object scanning parity: a minor
@@ -1200,6 +1203,7 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     #[cfg(not(target_arch = "wasm32"))]
     crate::module::signal::interp_signal::walk_check_signal_action_roots(visitor);
     crate::module::gc::hook::walk_hook_roots(visitor);
+    crate::module::sys::vm::walk_monitoring_tool_roots(visitor);
     crate::module::thread::walk_thread_roots(visitor);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     crate::module::faulthandler::handler::walk_faulthandler_roots(visitor);
