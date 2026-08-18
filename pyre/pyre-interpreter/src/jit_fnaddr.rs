@@ -802,6 +802,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         w_dict_new as *const (),
     );
     push_fnaddr(&mut entries, "w_dict_new", w_dict_new as *const ());
+    // `w_dict_new_instance` is `#[dont_look_inside]` (it dispatches through the
+    // `MAKE_INSTANCE_DICT_HOOK` fn-pointer cell); bind its zero-arg
+    // `fn() -> PyObjectRef` so the residual call resolves, mirroring `w_dict_new`.
+    let w_dict_new_instance: fn() -> pyre_object::PyObjectRef =
+        pyre_object::dictmultiobject::w_dict_new_instance;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_new_instance",
+        "pyre_object::w_dict_new_instance",
+        w_dict_new_instance as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "w_dict_new_instance",
+        w_dict_new_instance as *const (),
+    );
     // `bool_invert_deprecation_text` is `#[dont_look_inside]` (it hides a
     // `static` prebuilt cell the front-end cannot lift); bind its zero-arg
     // `fn() -> PyObjectRef` so `invert`'s residual call to it resolves.
@@ -3604,6 +3620,26 @@ mod tests {
         assert_eq!(
             bindings["module::_collections::deque_iter::type_object"],
             expected
+        );
+    }
+
+    /// The `_csv::dialect_class::type_object` accessor is hand-written (not
+    /// `#[pyre_methods]` / `py_class!`), yet the front recognizer stamps every
+    /// `type_object` accessor `dont_look_inside`.  It must still publish a
+    /// residual address, or a traced `_csv.Dialect` type lookup residualizes to
+    /// a symbolic fnaddr and inline JIT descent aborts.  Guards the invariant
+    /// that every `type_object` generator (macro or hand-written) registers.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn jit_trace_fnaddrs_covers_hand_written_csv_dialect_type_object() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("pyre_interpreter::module::_csv::dialect_class::type_object"),
+            "hand-written _csv::dialect_class::type_object must publish a residual fnaddr",
+        );
+        assert!(
+            bindings.contains_key("module::_csv::dialect_class::type_object"),
+            "the crate-stripped alias must resolve too",
         );
     }
 
