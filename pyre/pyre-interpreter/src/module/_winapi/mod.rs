@@ -1,4 +1,4 @@
-//! _winapi module — partial port of `lib_pypy/_winapi.py`.
+//! _winapi module — the Win32 calls the stdlib's Windows branches reach for.
 //!
 //! The Windows build reports `sys.platform == "win32"` and installs the posix
 //! module under `os.name == "nt"`, so both the stdlib's `os.name == "nt"` and
@@ -6,29 +6,111 @@
 //! `_winapi`, and without the module `import shutil` — hence `tempfile`, and
 //! everything downstream — fails outright.
 //!
-//! The one name a shutil call then goes on to need is
-//! `NeedCurrentDirectoryForExePath`, which `shutil.which` invokes on every
-//! executable lookup; the `CopyFile2` flag and error constants round out
-//! that part of the module surface, though `shutil.copyfile` reads them
-//! only behind a `hasattr(_winapi, "CopyFile2")` probe.  `CopyFile2` is
-//! deliberately absent, so the probe fails and the generic read/write copy
-//! runs, which is the path pyre wants.  Neither name appears in
-//! `lib_pypy/_winapi.py`, which predates the stdlib revision pyre ships, so
-//! both are defined against the Win32 headers instead.
+//! `lib_pypy/_winapi.py` predates the stdlib revision pyre ships and stops
+//! well short of it, so the shapes here follow `PC/_winapi.c` and the Win32
+//! headers instead.  The module comes in three parts: the constants and the
+//! few calls made straight against `windows-sys` are below; [`process`] is
+//! the launch half `subprocess.Popen` spawns through — `CreatePipe`,
+//! `DuplicateHandle`, `GetStdHandle`, `CreateProcess`, `TerminateProcess`,
+//! `GetFileType` — and [`host`] is everything
+//! `rustpython_host_env::winapi` backs, which is the named-pipe, event,
+//! mutex, file-mapping, path and locale surface `multiprocessing`,
+//! `ntpath.normcase`, `mimetypes` and `shutil.copy2` walk.
 //!
-//! `subprocess` picks its Windows implementation on the presence of `msvcrt`
-//! (now installed), so its module body imports the process/priority constants
-//! and captures `CloseHandle`/`WaitForSingleObject`/`GetExitCodeProcess` as
-//! default arguments.  The launch itself — `CreatePipe`, `DuplicateHandle`,
-//! `GetStdHandle`, `CreateProcess`, `TerminateProcess`, `GetFileType` — is in
-//! [`process`], which is what `Popen` actually spawns through.
+//! `subprocess` picks its Windows implementation on the presence of `msvcrt`,
+//! so its module body imports the process/priority constants and captures
+//! `CloseHandle`/`WaitForSingleObject`/`GetExitCodeProcess` as default
+//! arguments.
+//!
+//! [`overlapped`] holds the `Overlapped` object and the asynchronous form of
+//! `ConnectNamedPipe`, `ReadFile` and `WriteFile` that produces one, which is
+//! what `multiprocessing.connection`'s `PipeConnection` is written against.
+
+use windows_sys::Win32::Foundation::HANDLE;
+
+use crate::PyError;
 
 /// Map the current thread's last OS error to an `OSError`
 /// (`PyErr_SetFromWindowsErr`): the code is the one `winerror` reports.
 fn last_os_error() -> crate::PyError {
-    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    crate::PyError::os_error_win32_syscall2(code, pyre_object::PY_NULL, pyre_object::PY_NULL)
+    win32_err(std::io::Error::last_os_error())
 }
+
+/// The `OSError` a failed Win32 call reports (`PyErr_SetFromWindowsErr`).
+fn win32_err(error: std::io::Error) -> crate::PyError {
+    crate::PyError::os_error_win32_syscall2(
+        error.raw_os_error().unwrap_or(0),
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    )
+}
+
+/// [`win32_err`] for a call that reports its error code rather than setting
+/// the thread's.
+fn win32_code(code: u32) -> crate::PyError {
+    crate::PyError::os_error_win32_syscall2(code as i32, pyre_object::PY_NULL, pyre_object::PY_NULL)
+}
+
+/// How a call names an integer argument in the `TypeError` it raises for one
+/// that is not an integer at all.
+enum IntArg<'a> {
+    /// The only parameter of `function`.
+    Only(&'a str),
+    /// Parameter `position` of `function`, counted from one.
+    At { function: &'a str, position: usize },
+    /// An element of a sequence argument, which the message does not name.
+    Element,
+}
+
+/// The value an integer parameter carries: read through `__index__`, then
+/// taken modulo the width the call passes it in.  Both `_Py_PARSE_UINTPTR`
+/// and the `DWORD` converter work that way, so a handle may be written as the
+/// negative it is or as the unsigned value it prints as, and a flag word may
+/// be written either way round too.
+fn masked_int_w(w_value: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Result<i64, PyError> {
+    if !unsafe { pyre_object::pyobject::is_int_or_long(w_value) }
+        && unsafe { crate::baseobjspace::lookup(w_value, "__index__") }.is_none()
+    {
+        let got = crate::gateway::short_type_name(w_value);
+        return Err(PyError::type_error(match argument {
+            IntArg::Only(function) => format!("{function}() argument must be int, not {got}"),
+            IntArg::At { function, position } => {
+                format!("{function}() argument {position} must be int, not {got}")
+            }
+            IntArg::Element => format!("argument must be int, not {got}"),
+        }));
+    }
+    crate::baseobjspace::truncatedint_w(w_value)
+}
+
+/// [`masked_int_w`] for a `HANDLE` parameter.
+fn handle_w(w_handle: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Result<HANDLE, PyError> {
+    Ok(masked_int_w(w_handle, argument)? as isize as HANDLE)
+}
+
+/// [`masked_int_w`] for a `DWORD` parameter.
+fn dword_w(w_value: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Result<u32, PyError> {
+    Ok(masked_int_w(w_value, argument)? as u32)
+}
+
+/// The integer a handle comes back as (`PyLong_FromVoidPtr`): the unsigned
+/// value, which is how the pseudo handles print.
+fn w_handle(handle: HANDLE) -> pyre_object::PyObjectRef {
+    let value = handle as usize as u64;
+    match i64::try_from(value) {
+        Ok(fits) => pyre_object::w_int_new(fits),
+        Err(_) => {
+            pyre_object::longobject::w_long_new(majit_rlib::rbigint::RBigInt::from(value as i128))
+        }
+    }
+}
+
+#[cfg(feature = "host_env")]
+mod host;
+// The asynchronous half reaches the host's overlapped I/O directly, so a
+// sandbox build leaves it out along with `_overlapped`.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+pub mod overlapped;
 
 /// The process-launch half of the module, which `subprocess.Popen` walks in
 /// order: `CreatePipe` for each redirected stream, `DuplicateHandle` to make
@@ -43,24 +125,7 @@ mod process {
     use rustpython_host_env::winapi as host_winapi;
     use windows_sys::Win32::Foundation::HANDLE;
 
-    /// The OSError a failed Win32 call reports (`PyErr_SetFromWindowsErr`).
-    fn win32_err(error: std::io::Error) -> crate::PyError {
-        crate::PyError::os_error_win32_syscall2(
-            error.raw_os_error().unwrap_or(0),
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-        )
-    }
-
-    /// A handle as Python spells it — an integer, which is what every call
-    /// here takes and gives back.
-    fn handle_w(w_handle: PyObjectRef) -> Result<HANDLE, crate::PyError> {
-        Ok(crate::baseobjspace::int_w(w_handle)? as isize as HANDLE)
-    }
-
-    fn w_handle(handle: HANDLE) -> PyObjectRef {
-        w_int_new(handle as isize as i64)
-    }
+    use super::{IntArg, handle_w, w_handle, win32_err};
 
     fn arg(args: &[PyObjectRef], index: usize, name: &str) -> Result<PyObjectRef, crate::PyError> {
         args.get(index).copied().ok_or_else(|| {
@@ -72,7 +137,7 @@ mod process {
     /// does not have, which is what the caller tests for before making a pipe
     /// of its own.
     pub fn get_std_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let id = crate::baseobjspace::c_uint_w(arg(args, 0, "GetStdHandle")?)?;
+        let id = super::dword_w(arg(args, 0, "GetStdHandle")?, IntArg::Only("GetStdHandle"))?;
         match host_winapi::get_std_handle(id) {
             Ok(Some(handle)) => Ok(w_handle(handle)),
             Ok(None) => Ok(w_none()),
@@ -89,7 +154,7 @@ mod process {
     /// `_winapi.GetFileType(handle)` — a console handle is the one kind that
     /// cannot be passed in an inherited handle list.
     pub fn get_file_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let handle = handle_w(arg(args, 0, "GetFileType")?)?;
+        let handle = handle_w(arg(args, 0, "GetFileType")?, IntArg::Only("GetFileType"))?;
         host_winapi::get_file_type(handle)
             .map(|file_type| w_int_new(file_type as i64))
             .map_err(win32_err)
@@ -120,7 +185,10 @@ mod process {
     /// count would append that terminator to the path.
     pub fn get_module_file_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         const MAX_PATH: usize = 260;
-        let module = handle_w(arg(args, 0, "GetModuleFileName")?)? as *mut core::ffi::c_void;
+        let module = handle_w(
+            arg(args, 0, "GetModuleFileName")?,
+            IntArg::Only("GetModuleFileName"),
+        )? as *mut core::ffi::c_void;
         let mut buffer = [0u16; MAX_PATH];
         let length = host_winapi::get_module_file_name(module, &mut buffer);
         if length == 0 {
@@ -135,8 +203,20 @@ mod process {
 
     /// `_winapi.TerminateProcess(handle, exit_code)`
     pub fn terminate_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let handle = handle_w(arg(args, 0, "TerminateProcess")?)?;
-        let exit_code = crate::baseobjspace::c_uint_w(arg(args, 1, "TerminateProcess")?)?;
+        let handle = handle_w(
+            arg(args, 0, "TerminateProcess")?,
+            IntArg::At {
+                function: "TerminateProcess",
+                position: 1,
+            },
+        )?;
+        let exit_code = super::dword_w(
+            arg(args, 1, "TerminateProcess")?,
+            IntArg::At {
+                function: "TerminateProcess",
+                position: 2,
+            },
+        )?;
         if host_winapi::terminate_process(handle, exit_code) == 0 {
             return Err(super::last_os_error());
         }
@@ -148,7 +228,13 @@ mod process {
     /// the default of; neither end is inheritable until one is duplicated
     /// into an inheritable copy.
     pub fn create_pipe(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let size = crate::baseobjspace::c_uint_w(arg(args, 1, "CreatePipe")?)?;
+        let size = super::dword_w(
+            arg(args, 1, "CreatePipe")?,
+            IntArg::At {
+                function: "CreatePipe",
+                position: 2,
+            },
+        )?;
         let (read, write) = host_winapi::create_pipe(size).map_err(win32_err)?;
         Ok(w_tuple_new(vec![w_handle(read), w_handle(write)]))
     }
@@ -156,13 +242,18 @@ mod process {
     /// `_winapi.DuplicateHandle(source_process, source, target_process,
     /// desired_access, inherit_handle, options=0)` -> handle
     pub fn duplicate_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let source_process = handle_w(arg(args, 0, "DuplicateHandle")?)?;
-        let source = handle_w(arg(args, 1, "DuplicateHandle")?)?;
-        let target_process = handle_w(arg(args, 2, "DuplicateHandle")?)?;
-        let access = crate::baseobjspace::c_uint_w(arg(args, 3, "DuplicateHandle")?)?;
-        let inherit = crate::baseobjspace::c_int_w(arg(args, 4, "DuplicateHandle")?)?;
+        const NAME: &str = "DuplicateHandle";
+        let at = |position| IntArg::At {
+            function: NAME,
+            position,
+        };
+        let source_process = handle_w(arg(args, 0, NAME)?, at(1))?;
+        let source = handle_w(arg(args, 1, NAME)?, at(2))?;
+        let target_process = handle_w(arg(args, 2, NAME)?, at(3))?;
+        let access = super::dword_w(arg(args, 3, NAME)?, at(4))?;
+        let inherit = crate::baseobjspace::index_c_int_w(arg(args, 4, NAME)?)?;
         let options = match args.get(5) {
-            Some(&w) => crate::baseobjspace::c_uint_w(w)?,
+            Some(&w) => super::dword_w(w, at(6))?,
             None => 0,
         };
         host_winapi::duplicate_handle(
@@ -334,13 +425,48 @@ mod process {
 crate::py_module! {
     "_winapi",
     int_constants: {
-        // CopyFileEx flags (winbase.h).
+        // CopyFileEx / CopyFile2 flags (winbase.h).
         "COPY_FILE_ALLOW_DECRYPTED_DESTINATION" => 0x0000_0008,
         "COPY_FILE_COPY_SYMLINK" => 0x0000_0800,
+        "COPY_FILE_DIRECTORY" => 0x0000_0080,
+        "COPY_FILE_FAIL_IF_EXISTS" => 0x0000_0001,
+        "COPY_FILE_NO_BUFFERING" => 0x0000_1000,
+        "COPY_FILE_NO_OFFLOAD" => 0x0004_0000,
+        "COPY_FILE_OPEN_SOURCE_FOR_WRITE" => 0x0000_0004,
+        "COPY_FILE_REQUEST_COMPRESSED_TRAFFIC" => 0x1000_0000,
+        "COPY_FILE_REQUEST_SECURITY_PRIVILEGES" => 0x0000_2000,
+        "COPY_FILE_RESTARTABLE" => 0x0000_0002,
+        "COPY_FILE_RESUME_FROM_PAUSE" => 0x0000_4000,
+        // The reasons a `CopyFile2` progress routine is called and the
+        // answers it may give (winbase.h).  Nothing here calls one — the
+        // extended parameters leave the callback field unset — but the
+        // constants are part of the module's surface.
+        "COPYFILE2_CALLBACK_CHUNK_STARTED" => 1,
+        "COPYFILE2_CALLBACK_CHUNK_FINISHED" => 2,
+        "COPYFILE2_CALLBACK_STREAM_STARTED" => 3,
+        "COPYFILE2_CALLBACK_STREAM_FINISHED" => 4,
+        "COPYFILE2_CALLBACK_POLL_CONTINUE" => 5,
+        "COPYFILE2_CALLBACK_ERROR" => 6,
+        "COPYFILE2_PROGRESS_CONTINUE" => 0,
+        "COPYFILE2_PROGRESS_CANCEL" => 1,
+        "COPYFILE2_PROGRESS_STOP" => 2,
+        "COPYFILE2_PROGRESS_QUIET" => 3,
+        "COPYFILE2_PROGRESS_PAUSE" => 4,
         // System error codes (winerror.h) a caller compares
         // `OSError.winerror` against to decide whether to retry.
         "ERROR_ACCESS_DENIED" => 5,
         "ERROR_PRIVILEGE_NOT_HELD" => 1314,
+        "ERROR_ALREADY_EXISTS" => 183,
+        "ERROR_BROKEN_PIPE" => 109,
+        "ERROR_IO_PENDING" => 997,
+        "ERROR_MORE_DATA" => 234,
+        "ERROR_NETNAME_DELETED" => 64,
+        "ERROR_NO_DATA" => 232,
+        "ERROR_NO_SYSTEM_RESOURCES" => 1450,
+        "ERROR_OPERATION_ABORTED" => 995,
+        "ERROR_PIPE_BUSY" => 231,
+        "ERROR_PIPE_CONNECTED" => 535,
+        "ERROR_SEM_TIMEOUT" => 121,
         // `subprocess` imports these at module load (its Windows branch, taken
         // once `msvcrt` exists) — GetStdHandle ids, ShowWindow/STARTUPINFO
         // flags, and CreateProcess creation/priority flags (winbase.h,
@@ -353,6 +479,16 @@ crate::py_module! {
         "STARTF_USESTDHANDLES" => 0x0000_0100,
         "STARTF_FORCEONFEEDBACK" => 0x0000_0040,
         "STARTF_FORCEOFFFEEDBACK" => 0x0000_0080,
+        "STARTF_USESIZE" => 0x0000_0002,
+        "STARTF_USEPOSITION" => 0x0000_0004,
+        "STARTF_USECOUNTCHARS" => 0x0000_0008,
+        "STARTF_USEFILLATTRIBUTE" => 0x0000_0010,
+        "STARTF_RUNFULLSCREEN" => 0x0000_0020,
+        "STARTF_USEHOTKEY" => 0x0000_0200,
+        "STARTF_TITLEISLINKNAME" => 0x0000_0800,
+        "STARTF_TITLEISAPPID" => 0x0000_1000,
+        "STARTF_PREVENTPINNING" => 0x0000_2000,
+        "STARTF_UNTRUSTEDSOURCE" => 0x0000_8000,
         "CREATE_NEW_CONSOLE" => 0x0000_0010,
         "CREATE_NEW_PROCESS_GROUP" => 0x0000_0200,
         "CREATE_NO_WINDOW" => 0x0800_0000,
@@ -375,7 +511,6 @@ crate::py_module! {
         // `DuplicateHandle` options and the handle sentinel (handleapi.h).
         "DUPLICATE_SAME_ACCESS" => 0x0000_0002,
         "DUPLICATE_CLOSE_SOURCE" => 0x0000_0001,
-        "INVALID_HANDLE_VALUE" => -1,
         "NULL" => 0,
         // `GetFileType` answers.  A console handle is the one a caller drops
         // from an inherited handle list (`Popen._filter_handle_list`).
@@ -384,25 +519,97 @@ crate::py_module! {
         "FILE_TYPE_CHAR" => 0x0002,
         "FILE_TYPE_PIPE" => 0x0003,
         "FILE_TYPE_REMOTE" => 0x8000,
-        // `OpenProcess`/`DuplicateHandle` access rights (processthreadsapi.h).
+        // `OpenProcess`/`DuplicateHandle` access rights (processthreadsapi.h),
+        // and the one right every waitable object grants (winnt.h).
         "PROCESS_ALL_ACCESS" => 0x001F_FFFF,
         "PROCESS_DUP_HANDLE" => 0x0000_0040,
+        "SYNCHRONIZE" => 0x0010_0000,
+        // `CreateFile` access rights, share modes and creation dispositions
+        // (winnt.h, fileapi.h).
+        "GENERIC_READ" => 0x8000_0000u32,
+        "GENERIC_WRITE" => 0x4000_0000,
+        "FILE_GENERIC_READ" => 0x0012_0089,
+        "FILE_GENERIC_WRITE" => 0x0012_0116,
+        "OPEN_EXISTING" => 3,
+        "FILE_FLAG_OVERLAPPED" => 0x4000_0000,
+        "FILE_FLAG_FIRST_PIPE_INSTANCE" => 0x0008_0000,
+        // Named pipe open modes, pipe modes and waits (winbase.h).
+        "PIPE_ACCESS_INBOUND" => 0x0000_0001,
+        "PIPE_ACCESS_DUPLEX" => 0x0000_0003,
+        "PIPE_READMODE_MESSAGE" => 0x0000_0002,
+        "PIPE_TYPE_MESSAGE" => 0x0000_0004,
+        "PIPE_WAIT" => 0x0000_0000,
+        "PIPE_UNLIMITED_INSTANCES" => 255,
+        "NMPWAIT_WAIT_FOREVER" => 0xFFFF_FFFFu32,
+        // File-mapping protections, view access rights, section attributes
+        // and the region states `VirtualQuery` reports (winnt.h, memoryapi.h).
+        "PAGE_NOACCESS" => 0x0000_0001,
+        "PAGE_READONLY" => 0x0000_0002,
+        "PAGE_READWRITE" => 0x0000_0004,
+        "PAGE_WRITECOPY" => 0x0000_0008,
+        "PAGE_EXECUTE" => 0x0000_0010,
+        "PAGE_EXECUTE_READ" => 0x0000_0020,
+        "PAGE_EXECUTE_READWRITE" => 0x0000_0040,
+        "PAGE_EXECUTE_WRITECOPY" => 0x0000_0080,
+        "PAGE_GUARD" => 0x0000_0100,
+        "PAGE_NOCACHE" => 0x0000_0200,
+        "PAGE_WRITECOMBINE" => 0x0000_0400,
+        "FILE_MAP_COPY" => 0x0000_0001,
+        "FILE_MAP_WRITE" => 0x0000_0002,
+        "FILE_MAP_READ" => 0x0000_0004,
+        "FILE_MAP_EXECUTE" => 0x0000_0020,
+        "FILE_MAP_ALL_ACCESS" => 0x000F_001F,
+        "SEC_IMAGE" => 0x0100_0000,
+        "SEC_RESERVE" => 0x0400_0000,
+        "SEC_COMMIT" => 0x0800_0000,
+        "SEC_NOCACHE" => 0x1000_0000,
+        "SEC_WRITECOMBINE" => 0x4000_0000,
+        "SEC_LARGE_PAGES" => 0x8000_0000u32,
+        "MEM_COMMIT" => 0x0000_1000,
+        "MEM_RESERVE" => 0x0000_2000,
+        "MEM_FREE" => 0x0001_0000,
+        "MEM_PRIVATE" => 0x0002_0000,
+        "MEM_MAPPED" => 0x0004_0000,
+        "MEM_IMAGE" => 0x0100_0000,
+        // `LCMapStringEx` transforms and the longest locale name it takes
+        // (winnls.h).  The four that answer with a sort key or a hash rather
+        // than text are not among them — `LCMapStringEx` rejects those.
+        "LCMAP_LOWERCASE" => 0x0000_0100,
+        "LCMAP_UPPERCASE" => 0x0000_0200,
+        "LCMAP_TITLECASE" => 0x0000_0300,
+        "LCMAP_HIRAGANA" => 0x0010_0000,
+        "LCMAP_KATAKANA" => 0x0020_0000,
+        "LCMAP_HALFWIDTH" => 0x0040_0000,
+        "LCMAP_FULLWIDTH" => 0x0080_0000,
+        "LCMAP_LINGUISTIC_CASING" => 0x0100_0000,
+        "LCMAP_SIMPLIFIED_CHINESE" => 0x0200_0000,
+        "LCMAP_TRADITIONAL_CHINESE" => 0x0400_0000,
+        "LOCALE_NAME_MAX_LENGTH" => 85,
     },
     inline_functions: {
-        fn NeedCurrentDirectoryForExePath(exe_name: &str) -> bool {
-            unsafe extern "system" {
-                fn NeedCurrentDirectoryForExePathW(exe_name: *const u16) -> i32;
+        fn NeedCurrentDirectoryForExePath(
+            exe_name: &str,
+        ) -> Result<bool, crate::PyError> {
+            // The wide string ends at its first NUL, so a name carrying one
+            // would be answered for a shorter name than was passed.
+            let mut exe_name_w: Vec<u16> = exe_name.encode_utf16().collect();
+            if exe_name_w.contains(&0) {
+                return Err(crate::PyError::value_error("embedded null character"));
             }
-            let exe_name_w: Vec<u16> =
-                exe_name.encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe { NeedCurrentDirectoryForExePathW(exe_name_w.as_ptr()) != 0 }
+            exe_name_w.push(0);
+            Ok(unsafe {
+                windows_sys::Win32::System::Environment::NeedCurrentDirectoryForExePathW(
+                    exe_name_w.as_ptr(),
+                ) != 0
+            })
         }
         // `subprocess.Handle.Close` captures `_winapi.CloseHandle` as a default
         // argument at class-definition time, so the attribute must exist for
         // `import subprocess` to succeed.
-        fn CloseHandle(handle: i64) -> Result<(), crate::PyError> {
+        fn CloseHandle(handle: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+            let handle = handle_w(handle, IntArg::Only("CloseHandle"))?;
             let ok = unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(handle as *mut _)
+                windows_sys::Win32::Foundation::CloseHandle(handle)
             };
             if ok == 0 {
                 return Err(last_os_error());
@@ -412,23 +619,37 @@ crate::py_module! {
         // `subprocess.Popen._wait`/`poll` also capture these as default
         // arguments at import time, and reach them once a launch has a
         // process to wait on.
-        fn WaitForSingleObject(handle: i64, milliseconds: i64) -> i64 {
+        fn WaitForSingleObject(
+            handle: pyre_object::PyObjectRef,
+            milliseconds: pyre_object::PyObjectRef,
+        ) -> Result<i64, crate::PyError> {
+            const NAME: &str = "WaitForSingleObject";
+            let handle = handle_w(handle, IntArg::At { function: NAME, position: 1 })?;
+            let milliseconds =
+                dword_w(milliseconds, IntArg::At { function: NAME, position: 2 })?;
             // `rpython/rlib/rwin32.py` declares this through `winexternal`,
             // whose default `releasegil='auto'` runs the native call between
             // the rffi around-handlers.  In particular, an infinite wait must
             // let the Python thread which will signal the handle run.
-            let _blocked = crate::module::thread::before_external_block();
-            unsafe {
-                windows_sys::Win32::System::Threading::WaitForSingleObject(
-                    handle as *mut _,
-                    milliseconds as u32,
-                ) as i64
+            let result = {
+                let _blocked = crate::module::thread::before_external_block();
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(
+                        handle,
+                        milliseconds,
+                    )
+                }
+            };
+            if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+                return Err(last_os_error());
             }
+            Ok(i64::from(result))
         }
-        fn GetExitCodeProcess(handle: i64) -> Result<i64, crate::PyError> {
+        fn GetExitCodeProcess(handle: pyre_object::PyObjectRef) -> Result<i64, crate::PyError> {
+            let handle = handle_w(handle, IntArg::Only("GetExitCodeProcess"))?;
             let mut code: u32 = 0;
             let ok = unsafe {
-                windows_sys::Win32::System::Threading::GetExitCodeProcess(handle as *mut _, &mut code)
+                windows_sys::Win32::System::Threading::GetExitCodeProcess(handle, &mut code)
             };
             if ok == 0 {
                 return Err(last_os_error());
@@ -437,11 +658,19 @@ crate::py_module! {
         }
     },
     extra_init: |ns| {
+        // The handle sentinel is `(HANDLE)-1` (handleapi.h), which prints as
+        // the unsigned value and so does not fit the `int_constants` table.
+        crate::module_ns_store(
+            ns,
+            "INVALID_HANDLE_VALUE",
+            w_handle(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE),
+        );
         // The launch half, registered by hand: the module is built without
         // `host_env` too, and there it stops at the constants and the calls
         // above.
         #[cfg(feature = "host_env")]
         {
+            host::install(ns);
             for (name, arity, function) in [
                 ("GetStdHandle", 1, process::get_std_handle as crate::BuiltinCodeFn),
                 ("GetCurrentProcess", 0, process::get_current_process),
