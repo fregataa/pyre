@@ -217,6 +217,21 @@ xz-core = { git = "https://github.com/youknowone/xz-rs-simnalamburt", rev = "9c5
 # Give it the same cross-crate optimization used by distributable binaries;
 # codegen-units=1 additionally lets LLVM optimize the interpreter's large
 # dispatch/call graph as one unit instead of preserving parallel-CGU barriers.
+[profile.dev]
+# Line tables instead of full DWARF. Panic backtraces keep their file and line
+# numbers, which is what every crash report in this project is read from; what
+# goes away is the variable and type description a debugger would use to print
+# locals. Full debuginfo costs both link time and a great deal of disk: one
+# worktree's `target/debug/deps` measured 50 GB, and a machine hosting a dozen
+# worktrees of this workspace carries that a dozen times over.
+#
+# `debug-assertions` is a separate setting and is untouched, so every
+# `debug_assert!` and every `cfg(debug_assertions)` arm still compiles in.
+#
+# For a debugger session, ask for it on the command line instead of editing
+# this: `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
