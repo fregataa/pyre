@@ -8626,6 +8626,66 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+/// The `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",
+/// "w_fdel?"]` twin of [`walker_pin_type_version_tag`]: pin the accessor slot
+/// a property fold is about to bake.
+///
+/// The receiver pins the folds already hold — class, `w_class`, and the type's
+/// `_version_tag?` — make the DESCRIPTOR a compile-time answer, and stop
+/// there: `property.__init__` on an installed descriptor replaces `fget`/
+/// `fset` in place and bumps no type's version, so without this the trace kept
+/// calling the previous getter.  Upstream covers exactly that gap with the `?`
+/// on the slots themselves.
+///
+/// A marker, never a load: the descriptor is a baked `ConstPtr`, and reading a
+/// field through one is the hazard `try_walker_inline_resolved_user_call`'s
+/// `guards_the_callee_function` gate exists to avoid.  `record_quasiimmut_field`
+/// dereferences the owner only at record and compile time, and a property is
+/// allocated non-moving, so both reads see the object where the constant says
+/// it is.
+fn walker_pin_property_accessor<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    w_descr: pyre_object::PyObjectRef,
+    field: majit_ir::DescrRef,
+) -> Result<(), DispatchError> {
+    let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field);
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
+/// The `function.py:47 _immutable_fields_ = ['code?', 'w_func_globals?',
+/// 'closure?[*]', 'defs_w?[*]']` twin of [`walker_pin_property_accessor`]: pin
+/// the callee's code slot when the inline lever cannot re-prove it per
+/// iteration.
+///
+/// The inline bakes `code` by choosing which callee jitcode to walk into, so
+/// the value ends up spread across the inlined body rather than in one box a
+/// `GUARD_VALUE` could re-check.  Where the caller pins the callee function
+/// itself, that guard still runs and is the cheaper answer for a callee whose
+/// identity changes every iteration; everywhere else — a constant callable, or
+/// a specializer that dispatched on some other object — this marker is what
+/// makes `f.__code__ = g.__code__` revoke the loop.
+///
+/// A marker, never a load: the owner is dereferenced only at record and
+/// compile time, which is why this arm is clear of the baked-`ConstPtr` hazard
+/// that keeps the guard arm off a constant callable.  Both reads resolve the
+/// owner by raw address, so the caller refuses a callee the collector can
+/// relocate.
+fn walker_pin_function_code<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callable: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    let callable_const = ctx.trace_ctx.const_ref(callable as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        callable_const,
+        crate::descr::function_code_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
 /// The `celldict.py:34 _immutable_fields_ = ["version?"]` twin of
 /// [`walker_pin_type_version_tag`]: pin the module namespace's strategy version
 /// so the folds that bake a slot's stored cell (or the absence of a name) are

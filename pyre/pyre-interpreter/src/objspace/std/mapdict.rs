@@ -1760,6 +1760,88 @@ pub unsafe fn load_attr_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// The miss twin of [`load_attr_fast_path`]: return the ingredients for
+/// inlining the receiver type's `__getattr__` hook when `name` resolves
+/// nowhere.
+///
+/// `baseobjspace::instance_getattr_hook_or_err` is the tail this stands in for
+/// (`descroperation.py:242-245`): once the descriptor protocol has produced an
+/// AttributeError, the type's `__getattr__` is looked up and called with the
+/// receiver and the name. Reaching that tail is what the two returned pins
+/// prove, and both are guards the caller owes:
+///
+///   * `version_tag` — the class lookup stays constant, so `name` keeps
+///     resolving to nothing on the type and `__getattr__` keeps resolving to
+///     the returned hook;
+///   * `map` — the instance shape stays constant, so `name` keeps being absent
+///     from this receiver's own storage.
+///
+/// Together they make the whole `object_getattr_miss` walk a compile-time
+/// answer, which is the work the fold removes; the hook itself is what the
+/// caller then inlines.
+///
+/// Returns `None` for every shape those two guards cannot cover: a non-mapdict
+/// receiver, a custom `__getattribute__`, an uncacheable `version_tag`, a name
+/// the type or the instance actually owns, or a type with no `__getattr__`.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn getattr_hook_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+    // mapdict.py:1495 `if map is not None:` — also filters non-instances.
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    // mapdict.py:1496 `w_type = map.terminator.w_cls`.
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1497-1499 — a custom `__getattribute__` runs its own lookup,
+    // which neither pin describes.
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // The miss itself. A type-level hit is refused before the map is consulted:
+    // `classify_attr` reads a `__slots__` member under the `"slot"` name rather
+    // than its own, so a descriptor found here says nothing about what
+    // `find_map_attr(name)` below would answer.
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }.is_some() {
+        return None;
+    }
+    // A devolved instance keeps its attributes in a real dictionary, and
+    // mapdict.py:1534-1536 states that `find_map_attr` "will always return
+    // None if attrkind==DICT" for such a map.  The hit path reads that call
+    // for a Some, so a None costs it only the fold; this path reads it for its
+    // ABSENCE and would take an always-None answer as proof the name is not on
+    // the instance.  `LOAD_METHOD_mapdict_fill_cache_method` — upstream's own
+    // case of pinning a map to cache a negative instance lookup — refuses the
+    // shape outright (mapdict.py:1569 `if map is None or
+    // isinstance(map.terminator, DevolvedDictTerminator): return`), and the
+    // map pin cannot stand in: the devolved terminator is a per-class
+    // singleton, so the guarded map word is the same for every devolved
+    // instance and unchanged by a later `obj.<name> = ...`.
+    if unsafe { map_is_devolved(map) } {
+        return None;
+    }
+    // `classify_attr(w_type, None, false)` answers `(DICT, false)` — the
+    // no-descriptor arm (mapdict.py:1509-1510) — so this is the same
+    // `find_map_attr` call the hit path makes, read for its absence.
+    if unsafe { find_map_attr(map, Wtf8::new(name), DICT) }.is_some() {
+        return None;
+    }
+    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
+    Some((w_type, version_tag, map, w_getattr))
+}
+
 /// The [`load_attr_fast_path`] twin for a receiver that keeps its attributes in
 /// a `newdict(instance=True)` dictionary rather than in header mapdict storage
 /// (`mapdict.py:1299-1303 make_instance_dict`). It applies the same
@@ -1878,25 +1960,34 @@ unsafe fn property_descr_fast_path(
         return None;
     }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }?;
-    if !unsafe { pyre_object::descriptor::is_property(w_descr) } {
+    // Exact type: the fold calls `fget`/`fset` directly, which stands in for
+    // `type(w_descr).__get__` only where that cannot have been overridden
+    // (`descroperation.py:169-176`).  A `property` subclass keeps the base
+    // layout and retags only `w_class`, so the layout test admits it.
+    if !unsafe { pyre_object::descriptor::is_exact_property(w_descr) } {
         return None;
     }
     Some((w_type, version_tag, w_descr))
 }
 
-/// LOAD_ATTR `property` fast path: return the type, version tag, and Python
-/// `fget` when `obj.name` reads a property getter, so the full-body walker can
-/// inline `fget(obj)` in place of the opaque `getattr` residual.  Returns `None`
-/// (leave the residual) for a write-only property or any shape
-/// [`property_descr_fast_path`] declines.  A custom `__getattribute__` owns the
-/// read (mapdict.py:1497-1499), so it declines to the residual.
+/// LOAD_ATTR `property` fast path: return the type, version tag, the property
+/// object, and its Python `fget` when `obj.name` reads a property getter, so
+/// the full-body walker can inline `fget(obj)` in place of the opaque `getattr`
+/// residual.  Returns `None` (leave the residual) for a write-only property or
+/// any shape [`property_descr_fast_path`] declines.  A custom
+/// `__getattribute__` owns the read (mapdict.py:1497-1499), so it declines to
+/// the residual.
+///
+/// The property object is part of the answer because `fget` alone cannot be
+/// baked: `descriptor.py:175` declares the slot `w_fget?`, so the fold owes it
+/// a `QUASIIMMUT_FIELD` marker naming the owner.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
 pub unsafe fn property_get_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path(w_obj, name) }?;
     if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
         return None;
@@ -1905,22 +1996,22 @@ pub unsafe fn property_get_fast_path(
     if fget.is_null() || unsafe { pyre_object::pyobject::is_none(fget) } {
         return None;
     }
-    Some((w_type, version_tag, fget))
+    Some((w_type, version_tag, w_descr, fget))
 }
 
 /// STORE_ATTR `property` fast path: the setter twin of
-/// [`property_get_fast_path`], returning the type, version tag, and Python
-/// `fset` when `obj.name = value` writes a property setter.  Returns `None`
-/// (leave the residual) for a read-only property or any shape
-/// [`property_descr_fast_path`] declines.  A custom `__setattr__` owns the write
-/// (mapdict.py:1612-1614), so it declines to the residual.
+/// [`property_get_fast_path`], returning the type, version tag, the property
+/// object, and its Python `fset` when `obj.name = value` writes a property
+/// setter.  Returns `None` (leave the residual) for a read-only property or any
+/// shape [`property_descr_fast_path`] declines.  A custom `__setattr__` owns
+/// the write (mapdict.py:1612-1614), so it declines to the residual.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
 pub unsafe fn property_set_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path(w_obj, name) }?;
     if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
         return None;
@@ -1929,7 +2020,7 @@ pub unsafe fn property_set_fast_path(
     if fset.is_null() || unsafe { pyre_object::pyobject::is_none(fset) } {
         return None;
     }
-    Some((w_type, version_tag, fset))
+    Some((w_type, version_tag, w_descr, fset))
 }
 
 /// The unboxed counterpart of [`load_attr_fast_path`].  It applies the same

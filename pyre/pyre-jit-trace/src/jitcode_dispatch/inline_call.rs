@@ -1587,11 +1587,42 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 /// pure-leaf callee resume to the caller's CALL boundary via the inherited
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
 /// sound for side-effect-free leaves (re-execute the whole call on deopt).
+///
+/// That layout is a property of a subset of the CALL-family helpers, so the
+/// residual this reads from has to be one of them.  Every other entry the
+/// inline lever serves passes its own receiver-plus-metadata list, not an
+/// operand-stack image: `load_attr_fn(obj, code, name_idx)` is
+/// `r_args = [obj, code]` and `store_attr_fn` is `[obj, value, code]`, whose
+/// `code` operand is a code object the Python stack never held.  Publishing it
+/// as a stack slot resumes the interpreter with the code object where the
+/// receiver belongs — the `__getattr__`/`property` folds returned
+/// `AttributeError: 'code' object has no attribute <name>` for an attribute
+/// their own hook answers.  Decline for those instead; their operand image
+/// comes from the per-slot resume sources
+/// ([`reconstructed_call_stack_from_resume_sources`]).
+///
+/// `call_kw` is excluded for the same reason one step subtler: its list is a
+/// PERMUTATION of the stack rather than a different set of values.  The wire
+/// order is `(callable, null_or_self, kwnames, arg0..arg{n-1})`
+/// (`majit-ir effectinfo.rs` `PyreHelperKind::CallKw`), while `CALL_KW` pops
+/// `kwnames` FIRST (`eval.rs call_kw`), so the stack image is
+/// `[callable, null_or_self, arg0..arg{n-1}, kwnames]`.  A real `CALL_KW`
+/// always carries a non-empty kwnames tuple, so `n >= 1` on every reachable
+/// path and the two orders never coincide.  The flush's only structural check
+/// is a depth compare, which a permutation of the right length passes, and the
+/// re-executed `CALL_KW` would then pop `arg{n-1}` as its keyword-name tuple.
 pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
+    if !matches!(
+        call_descr.get_extra_info().pyre_helper,
+        majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallFunctionEx
+    ) {
+        return None;
+    }
     // The Ref list is NOT at a fixed offset: the method-form `CALL` helpers
     // this leg latches for lower through the mixed `iIRd>r` shape, whose
     // leading Int list shifts it (`dispatch_residual_call_iIRd_kind` reads it
@@ -1629,8 +1660,8 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     // Only `null_or_self@1` may be null, and the layout above names it by
     // index, so it is checked by position rather than by admitting a null
     // anywhere.  Everything else here is a Python value the rewound `CALL`
-    // pops — an argument, or `kwnames` in the `call_kw` layout — and a null in
-    // one of those slots is an UNRESOLVED register, not a value: the concrete
+    // pops, and a null in one of those slots is an UNRESOLVED register, not a
+    // value: the concrete
     // Ref bank holds `Ref(null)` for a box the walk never materialized, which
     // is why `concrete_ref_for_color` tests for it and why the prefix loop
     // above declines on it.  Publishing one lets the resumed interpreter pop a
@@ -2007,7 +2038,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     }
     if fbw_inline_diag_enabled() {
         eprintln!(
-            "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={}",
+            "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={} dst_bank={dst_bank}",
             op.pc,
             pyre_helper,
             r_args.len(),
@@ -3002,6 +3033,7 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
     is_top_inline: bool,
     unjournaled_before_subwalk: bool,
     executed_effects_before: usize,
@@ -3016,7 +3048,7 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord else {
         return;
     };
-    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
+    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr) {
         fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
     }
 }
@@ -3103,6 +3135,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
 /// user call nested inside a specialized builtin: it deliberately leaves the
 /// outer residual's destination untouched, so guards still snapshot the
 /// caller at the builtin-call boundary.
+/// Report which decline in [`try_walker_inline_resolved_user_call_inner`] a
+/// call hit.  The function has three dozen of them and reaches them from every
+/// call shape, so a caller that only learns "declined" has to guess; the
+/// `[binop-inline-decline]` and `[type-call-decline]` lines above name the
+/// call, and this names the test inside it that refused.
+#[inline]
+fn resolved_inline_decline<T>(op_pc: usize, line: u32) -> Result<Option<T>, DispatchError> {
+    if fbw_inline_diag_enabled() {
+        eprintln!("[resolved-inline-decline] pc={op_pc} inline_call.rs:{line}");
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3140,7 +3185,42 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let positional_only = fbw_callee_scope_is_positional_only(w_code);
     let vararg_slot = fbw_callee_vararg_slot(w_code);
     if !positional_only && vararg_slot.is_none() {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
+    }
+    // Not every caller pins the callee function itself.  A specializer that
+    // resolves an app-level method behind a builtin — `str(e)` reaching an
+    // exception subclass's `__str__` — passes the CALL's own operand, which is
+    // the `str` builtin, while `callable` is the resolved `Function`.  Reading
+    // `Function.code` off that operand is a type-confused load: it returns
+    // whatever sits at the same offset in a `PyCFunction`, so the guard
+    // compares a value that is not `code` and fails every iteration (99480
+    // failures and 497 bridges on `synth/exception_subclass_attrs`, a 31x
+    // slowdown).  Guard the fields only when the pinned object really is the
+    // function whose code this inline resolved.
+    let pinned_object_is_the_callee = unsafe {
+        (*callable_guard_value).ob_type as *const () as usize
+            == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
+            && pyre_interpreter::function_get_code(callable_guard_value) as usize
+                == w_code as pyre_object::PyObjectRef as usize
+    };
+    // A trace-constant callable is excluded for a second reason: the field
+    // reads would dereference a baked `ConstPtr`, and loading through one
+    // dangles as soon as a minor collection moves the object
+    // (`synth/inline_subwalk_property_mutates` — a property getter that
+    // allocates on every iteration — segfaulted on cranelift under CI's macOS
+    // runner with the reads in place).  Comparing against such a constant is
+    // fine; that is why the `code?` marker below covers this arm instead.
+    let guards_the_callee_function =
+        !callable_guard_op.is_constant() && pinned_object_is_the_callee;
+    if !guards_the_callee_function && majit_gc::can_move(majit_ir::GcRef(callable as usize)) {
+        // The arm below stands the baked code up on `function.py:47`'s `code?`
+        // instead of a per-iteration guard, and the marker names its owner by
+        // raw address at both record and compile time.  The jitcode
+        // `MAKE_FUNCTION` lowering allocates its function in the nursery, so
+        // such a callee can be relocated between those two reads; refuse the
+        // inline rather than bake a body no invalidation covers.  `rgc.can_move`
+        // parity — false when no moving GC is active.
+        return resolved_inline_decline(op.pc, line!());
     }
     // `Function.funccall_valuestack` fills every parameter the call left
     // unbound from `defs_w` before entering the frame
@@ -3164,7 +3244,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let Some(defaults) =
             (unsafe { positional_defaults_for_inline(callable, &missing, nparams) })
         else {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         };
         callee_args.resize(nparams, OpRef::NONE);
         callee_arg_concretes.resize(nparams, ConcreteValue::Null);
@@ -3186,22 +3266,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // below; folding the placeholder into the tuple would put the Method
         // object where the receiver belongs.  Decline that one shape.
         if bound_method.is_some() && nparams == 0 {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         if callee_arg_concretes.len() != callee_args.len() || callee_args.len() <= nparams {
             // The empty tuple is a runtime singleton (`() is tuple([])`), so a
             // freshly allocated walker tuple would not be the object the
             // interpreter installs for a zero-surplus call.
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         let surplus_ops: Vec<OpRef> = callee_args[nparams..].to_vec();
         let mut surplus_concretes = Vec::with_capacity(surplus_ops.len());
         for concrete in &callee_arg_concretes[nparams..] {
             let ConcreteValue::Ref(obj) = *concrete else {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             };
             if obj.is_null() {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             }
             surplus_concretes.push(obj);
         }
@@ -3209,7 +3289,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // same constructor `emit_object_tuple_inline` reproduces.
         let concrete = pyre_object::w_tuple_new_array_backed(surplus_concretes);
         if concrete.is_null() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         callee_args.truncate(nparams);
         callee_arg_concretes.truncate(nparams);
@@ -3245,38 +3325,38 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // needs fresh cell allocation and stays residual until that constructor
     // half is ported too.
     if callee_args.len() != seeded_locals {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     let raw_callee_code = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
     if raw_callee_code.is_null() {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     let callee_code = unsafe { &*raw_callee_code };
     let mut concrete_freevar_cells = Vec::new();
     let concrete_closure = if has_closure {
         if !callee_code.cellvars.is_empty() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         let closure = unsafe { pyre_interpreter::function_get_closure(callable) };
         if closure.is_null()
             || !unsafe { pyre_object::is_tuple(closure) }
             || unsafe { pyre_object::w_tuple_len(closure) } != callee_code.freevars.len()
         {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         for i in 0..callee_code.freevars.len() {
             let Some(cell) = (unsafe { pyre_object::w_tuple_getitem(closure, i as i64) }) else {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             };
             concrete_freevar_cells.push(cell);
         }
         closure
     } else {
         if !callee_code.freevars.is_empty() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         pyre_object::PY_NULL
     };
@@ -3294,7 +3374,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             .warm_state_mut()
             .can_inline_callable(callee_green_key)
     {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     if fbw_inline_recursion_count(ctx, callee_code_key) >= FBW_MAX_INLINE_RECURSION {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
@@ -3303,13 +3383,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .warm_state_mut()
                 .disable_noninlinable_function(callee_green_key);
         }
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     };
     if nparams > body.num_regs_r {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // Inlining a callee whose body carries an `abort_permanent` marker walks
     // the sub-walk straight into it.  That surfaces as
@@ -3336,10 +3416,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // means no installed body or descr pool, which the pool fetch immediately
     // below declines on regardless.
     let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     };
     if body_facts.has_abort_permanent {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // The callee body resolves its `d`/`j` descr operands through its OWN
     // per-fn pool, not the caller's.  Without this the sub-walk reads the
@@ -3348,7 +3428,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
         crate::state::sub_jitcode_descr_pool_for_code(w_code)
     else {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     };
     // EXACT int/float only.  These feed `fbw_callee_body_replay_safety`, whose
     // question is "will the walker specialize this body's BINARY_OP to a native
@@ -3451,7 +3531,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let subwalk_admit = ctx.fbw_mode.carrier_resume && !ctx.fbw_mode.snapshot_sym.is_null();
         let safe_root_bridge = root_bridge || subwalk_admit;
         if !safe_root_bridge {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         bridge_rec_root_selfrec = unsafe {
             let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -3472,7 +3552,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `SELFREC_CA_FOLD_ACTIVE` exemption from the hazard arm (:2696), so its
     // recursive residual is not what named the callee here.
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
@@ -3571,6 +3651,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table
                     && !fbw_foriter_deferred_call_denied(callee_code_key);
+                if !foriter_deferred_admit && fbw_inline_diag_enabled() {
+                    eprintln!(
+                        "[inline-foriter-deferred] pc={} boundary={entry_is_call_boundary} \
+                         header={loop_header_admitted} for_iter={} exc_table={} denied={}",
+                        op.pc,
+                        pyre_interpreter::code_has_for_iter(callee_code),
+                        body_facts.has_exception_table,
+                        fbw_foriter_deferred_call_denied(callee_code_key),
+                    );
+                }
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
@@ -3599,7 +3689,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // source handles it.  Stored bound methods instead take the explicit
         // multi-frame red-frame path above.
         if !legacy_admit {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
     }
     // A widened method-form body that also raises was declined here until the
@@ -3617,7 +3707,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // 15.3 once admitted, and `self.i >= self.n` 1207 -> 15.9.  Swapping that
     // `raise` for a `return` already measured 17.7, which is what named the
     // token rather than the branch or the attribute compare.
-    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+    if fbw_inline_diag_enabled() {
         let mut pc = 0usize;
         let mut shown = 0;
         while pc < body.code.len() && shown < 8 {
@@ -3670,7 +3760,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // and re-runs the instantiation, making the result discard unnecessary to
     // represent.
     if constructor_result.is_some() && !strict_inlinable {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // A zero-param callee has no positional argument to seed, so the register
     // convention above holds vacuously and the strict path serves it like any
@@ -3681,7 +3771,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // body still takes the residual rather than the decline-to-interpretation
     // below.
     if nparams == 0 && !strict_inlinable {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
 
     // A self-recursive callee unrolls until its own frame count reaches
@@ -3751,7 +3841,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 "InlineCallee::BranchyHandlerDirty"
             },
         );
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // A callee that raises inline needs the cross-frame bridge the carrier
     // drain builds once a guard inside the compiled chain fails.  The drain
@@ -3820,7 +3910,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         None
     };
     if foriter_dirty_bound && !try_multiframe {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     if !strict_inlinable && !try_multiframe && !force_caller_boundary_resume {
         // A non-self-recursive loop/branch callee that neither the strict nor
@@ -3833,13 +3923,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // cache; making an uninlineable method body blacklist the whole outer
         // loop turns a correct specialization into a compile regression.
         if method_form {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         // Full-portal cutover: instead of poisoning the trace, fall through to
         // the CALL_ASSEMBLER fold (`try_walker_call_assembler_self_recursive`,
         // reached next in the residual-call dispatch) so a recursive callee at
         // the inline cap enters via its own (possibly tmp-callback) loop token.
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
 
     let mut callable_guard_op = callable_guard_op;
@@ -3935,35 +4025,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     }
 
-    // Not every caller pins the callee function itself.  A specializer that
-    // resolves an app-level method behind a builtin — `str(e)` reaching an
-    // exception subclass's `__str__` — passes the CALL's own operand, which is
-    // the `str` builtin, while `callable` is the resolved `Function`.  Reading
-    // `Function.code` off that operand is a type-confused load: it returns
-    // whatever sits at the same offset in a `PyCFunction`, so the guard
-    // compares a value that is not `code` and fails every iteration (99480
-    // failures and 497 bridges on `synth/exception_subclass_attrs`, a 31x
-    // slowdown).  Guard the fields only when the pinned object really is the
-    // function whose code this inline resolved.
-    //
-    // A trace-constant callable is excluded for a second reason: the field
-    // reads would dereference a baked `ConstPtr`, and a baked constant object
-    // pointer is not GC-forwarded yet (gh #108 gc-table — see the note in
-    // `synth/exception_subclass_attrs.py`).  Comparing against such a constant
-    // is fine, but loading through one dangles as soon as a minor collection
-    // moves the object: `synth/inline_subwalk_property_mutates` — a property
-    // getter that allocates on every iteration — segfaults on cranelift under
-    // CI's macOS runner with the reads in place.  The callable being constant
-    // means something already pinned the object, so this only gives up the
-    // `f.__code__ = g.__code__` re-check on that path.
-    let guards_the_callee_function = !callable_guard_op.is_constant()
-        && unsafe {
-            (*callable_guard_value).ob_type as *const () as usize
-                == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
-                && pyre_interpreter::function_get_code(callable_guard_value) as usize
-                    == callee_code_key
-        };
-
     // Keep the closure cells as red operands.  A MAKE_FUNCTION in the caller's
     // loop creates a fresh function and fresh enclosing cells on every
     // iteration; the trace-time cell pointers are only the concrete shadow
@@ -3989,6 +4050,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .record_guard(OpCode::GuardValue, &[callable_guard_op, expected], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
+        // Pinning the operand pins none of the callee's fields, and this inline
+        // bakes `code` in the strongest form there is — it selects which callee
+        // body the trace walks into.  `function.py:47 _immutable_fields_ =
+        // ['code?', ...]` is what covers that, and the `?` costs one marker
+        // plus one `GUARD_NOT_INVALIDATED` per trace instead of a load and a
+        // `GUARD_VALUE` per iteration.  It is also the only form available
+        // here: the guard arm below reads the field off the pinned operand,
+        // which this arm either cannot do (the operand is not the callee) or
+        // must not do (a baked `ConstPtr`).
+        walker_pin_function_code(ctx, op.pc, callable)?;
     } else {
         // `function.py:91-96 getcode()` promotes `self.code`, never `self`.
         // The code object below and globals namespace in `InlineCalleeConsts`
@@ -4003,7 +4074,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `opimpl_getfield_gc_r` pairs each read with `record_quasiimmut_field`
         // and assigning the field invalidates the traces that folded it; the
         // value guards stay on top as the stricter identity check the reads
-        // below assume.
+        // below assume.  They also stay because this arm exists for a callee
+        // whose identity changes every iteration, so the field is re-read
+        // anyway, and because the marker resolves its owner by raw address —
+        // the guard is the only answer that keeps working for a callee the
+        // collector can relocate.
         //
         // Guarding the function OBJECT instead pinned its identity, which a
         // callee built by a `MAKE_FUNCTION` in the caller's own loop body can
@@ -4239,7 +4314,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             None => i,
         };
         if reg >= callee_regs_r.len() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         callee_regs_r[reg] = callee_args[i];
         callee_concrete_r[reg] = callee_arg_concretes[i];
@@ -4338,7 +4413,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `strict_seed` already excludes such a callee, so only the
             // multiframe path reaches this.
             if !callee_code.cellvars.is_empty() {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             }
             // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
             // identity residual call whose operands must be Ref (the codewriter
@@ -4407,7 +4482,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 });
                 if has_is_none_branch {
                     if try_multiframe {
-                        return Ok(None);
+                        return resolved_inline_decline(op.pc, line!());
                     }
                     seed_break_reason = "Collapse::IsNoneBranch";
                     break 'seed;
@@ -4421,7 +4496,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 crate::state::ensure_jitcode_index(callee_code_key as *const ())
             else {
                 if try_multiframe {
-                    return Ok(None);
+                    return resolved_inline_decline(op.pc, line!());
                 }
                 seed_break_reason = "Collapse::NoCalleeJitcode";
                 break 'seed;
@@ -4433,7 +4508,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 || ec_reg as usize >= callee_regs_r.len()
             {
                 if try_multiframe {
-                    return Ok(None);
+                    return resolved_inline_decline(op.pc, line!());
                 }
                 seed_break_reason = "Collapse::NoPortalRedRegs";
                 break 'seed;
@@ -4449,7 +4524,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
                 if try_multiframe {
-                    return Ok(None);
+                    return resolved_inline_decline(op.pc, line!());
                 }
                 seed_break_reason = "Collapse::NoSnapshotSym";
                 break 'seed;
@@ -5246,7 +5321,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let (outcome, _end_pc) = match callee_outcome {
         Ok(v) => v,
         Err(e) => {
-            if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[inline-abort] callee sub-walk err: {e:?}");
             }
             // gh#467: a supported abort fired inside this top-level inline
@@ -5284,6 +5359,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     code,
                     op,
                     ctx,
+                    call_descr,
                     is_top_inline,
                     unjournaled_before_subwalk,
                     executed_effects_before,
@@ -5314,6 +5390,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     code,
                     op,
                     ctx,
+                    call_descr,
                     is_top_inline,
                     unjournaled_before_subwalk,
                     executed_effects_before,
@@ -5338,7 +5415,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // observes and changes nothing (`exc_override_sample_safe`),
                 // and it keeps a legal program from killing the enclosing
                 // loop's trace, which `callee_inline_unsupported` would.
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             }
             // `descr_call` discards `__init__`'s result after checking it is
             // None and returns the instance instead (`check_init_returned_none`).
@@ -5357,6 +5434,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             code,
                             op,
                             ctx,
+                            call_descr,
                             is_top_inline,
                             unjournaled_before_subwalk,
                             executed_effects_before,
@@ -5385,6 +5463,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         code,
                         op,
                         ctx,
+                        call_descr,
                         is_top_inline,
                         unjournaled_before_subwalk,
                         executed_effects_before,
@@ -5467,8 +5546,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // pre-subwalk count so it can source the preferred rebuild
                 // while the fallback rewind remains provably disabled.
                 if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
-                    && let Some(stack) =
-                        reconstructed_all_ref_call_stack(code, op, ctx).or_else(|| {
+                    && let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr)
+                        .or_else(|| {
                             reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc)
                         })
                 {
@@ -5500,7 +5579,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     }
 }
 
-/// Route `str(exc)` / `repr(exc)` through an app-level exception override.
+/// Report why the instantiation emit declined, under `PYRE_FBW_INLINE_DIAG`.
+fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if fbw_inline_diag_enabled() {
+        eprintln!("[type-call-decline] {reason}");
+    }
+    Ok(None)
+}
+
 /// Instantiate a user-defined class inside the trace instead of leaving `P()`
 /// an opaque `bh_call_fn` residual that re-enters `type_descr_call_impl`,
 /// `object.__new__` and an interpreted `__init__` frame every iteration.
@@ -5518,14 +5604,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
 /// `new_with_vtable` is a virtual, so a constructor whose result never escapes
 /// the loop optimizes away entirely, as it does upstream.
 #[allow(clippy::too_many_arguments)]
-/// Report why the instantiation emit declined, under `PYRE_FBW_INLINE_DIAG`.
-fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
-        eprintln!("[type-call-decline] {reason}");
-    }
-    Ok(None)
-}
-
 pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -5537,15 +5615,44 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk || dst_bank != 'r' {
+        // These three reject far more calls than the instantiations this emit is
+        // about, so name the reason only for a call that does resolve to a
+        // class, and only while the reasons are being collected — the extra
+        // resolution below is diagnostic cost, not tracing cost.
+        if fbw_inline_diag_enabled()
+            && r_args.len() >= 2
+            && walker_concrete_ref_object(ctx, r_args[1]).is_none()
+            && walker_concrete_ref_object(ctx, r_args[0])
+                .is_some_and(|w_type| unsafe { pyre_object::is_type(w_type) })
+        {
+            return type_call_decline(if !ctx.is_authoritative_executor {
+                "not the authoritative executor"
+            } else if ctx.fbw_mode.inline_subwalk {
+                "inline sub-walk"
+            } else {
+                "destination is not a ref register"
+            });
+        }
         return Ok(None);
     }
     // `[callable, null_or_self, args...]`.  A method-form call (`null_or_self`
     // populated) never names a class as its callable.
-    if r_args.len() < 2 || walker_concrete_ref_object(ctx, r_args[1]).is_some() {
+    if r_args.len() < 2 {
         return Ok(None);
     }
+    // "No receiver" has two spellings in that slot: `call_kw` leaves it with no
+    // concrete shadow at all, `call_fn` fills it with the checked `PY_NULL`
+    // sentinel.  Reading a present shadow as a receiver rejects the whole
+    // `call_fn` spelling, which is the one an ordinary `C(...)` lowers to.
+    if walker_concrete_ref_object(ctx, r_args[1])
+        .is_some_and(|null_or_self| !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL)
+    {
+        return type_call_decline("receiver slot is populated");
+    }
     let Some(w_type) = walker_concrete_ref_object(ctx, r_args[0]) else {
-        return Ok(None);
+        // Whether this even was an instantiation is unknowable without the
+        // callable, so the reason is reported as the open question it is.
+        return type_call_decline("callable is not a concrete ref");
     };
     if !unsafe { pyre_object::is_type(w_type) } {
         return Ok(None);
@@ -5558,9 +5665,33 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     }
     // What follows is `type.__call__`.  A metaclass that overrides `__call__`
     // runs instead of it and may return anything at all, so it stays residual.
-    if !std::ptr::eq(unsafe { (*w_type).w_class }, w_metatype) {
-        return type_call_decline("metaclass overrides __call__");
-    }
+    //
+    // The question is which `__call__` the metatype resolves to, not whether it
+    // is `type` itself: `ABCMeta` supplies `__instancecheck__`,
+    // `__subclasscheck__` and `register` and leaves `__call__` alone, so every
+    // class that registers with a `numbers` / `collections.abc` ABC — which is
+    // every `Fraction`, `Decimal` and `deque` construction — resolves to the
+    // same `type.__call__` a plain class does.  Comparing the metatype's
+    // identity refused all of them.
+    let w_metaclass = unsafe { (*w_type).w_class };
+    let metaclass_to_pin = if std::ptr::eq(w_metaclass, w_metatype) {
+        None
+    } else {
+        let meta_call =
+            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metaclass, "__call__") };
+        let type_call =
+            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metatype, "__call__") };
+        if meta_call != type_call {
+            return type_call_decline("metaclass overrides __call__");
+        }
+        // The answer above is a dict lookup, so it needs the same pin the
+        // `__new__` / `__init__` answers get.  A metaclass whose dict changes
+        // are untracked cannot supply one.
+        if unsafe { pyre_object::typeobject::w_type_get_version_tag(w_metaclass) } == 0 {
+            return type_call_decline("metaclass has no version tag");
+        }
+        Some(w_metaclass)
+    };
     // A version tag of 0 is a type whose dict changes are not tracked, so the
     // `__new__` / `__init__` / `__del__` lookups below cannot be pinned.
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
@@ -5586,7 +5717,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     }
     let w_object = pyre_interpreter::typedef::w_object();
     if w_object.is_null() {
-        return Ok(None);
+        return type_call_decline("object type unavailable");
     }
     // Only `object.__new__` allocates the plain `[ob_type | w_class | map |
     // storage]` instance this emit builds; any other `__new__` picks its own
@@ -5616,9 +5747,9 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
 
     let mut arg_concretes = vec![ConcreteValue::Ref(w_type), ConcreteValue::Null];
     let mut callee_arg_concretes = Vec::with_capacity(r_args.len() - 1);
-    for &arg in &r_args[2..] {
+    for (i, &arg) in r_args[2..].iter().enumerate() {
         let Some(concrete) = walker_concrete_ref_object(ctx, arg) else {
-            return Ok(None);
+            return type_call_decline(&format!("argument {i} is not a concrete ref"));
         };
         arg_concretes.push(ConcreteValue::Ref(concrete));
         callee_arg_concretes.push(ConcreteValue::Ref(concrete));
@@ -5638,6 +5769,12 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         .heap_cache_mut()
         .replace_box(r_args[0], type_const);
     walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    // A metaclass that does not override `__call__` today can be given one, and
+    // that changes its own version tag rather than the class's.
+    if let Some(w_metaclass) = metaclass_to_pin {
+        let metaclass_const = ctx.trace_ctx.const_ref(w_metaclass as i64);
+        walker_pin_type_version_tag(ctx, op.pc, metaclass_const)?;
+    }
 
     // The walker is the executor here, so the instance the rest of this walk
     // reads has to be a real one — the same split `trace_box_int` makes between
@@ -5660,7 +5797,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         instance,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
     );
-    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+    if fbw_inline_diag_enabled() {
         eprintln!(
             "[type-call-inline] pc={} class={} init={}",
             op.pc,
@@ -5713,12 +5850,27 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         Some((instance, ConcreteValue::Ref(concrete_instance))),
     )?;
     if inlined.is_none() {
+        // The `[type-call-inline]` line above is printed before this sub-walk is
+        // attempted, because that is where the class and the `init` shape are
+        // known — so on its own it reports that the fold *began*, not that it
+        // stood.  Say so when it does not: without this line the diagnostic
+        // reads as a successful fold on a trace that ends up carrying the whole
+        // instantiation as a residual.
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[type-call-rewind] pc={} class={} why=__init__ sub-walk declined",
+                op.pc,
+                unsafe { pyre_object::w_type_get_name(w_type) },
+            );
+        }
         ctx.trace_ctx.cut_trace(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
     }
     Ok(inlined)
 }
 
+/// Route `str(exc)` / `repr(exc)` through an app-level exception override.
+///
 /// Pyre's exact `str` type call follows `str_descr_new` → `builtin_str` →
 /// `exc_user_dunder_obj`; the builtin `repr` follows `builtin_repr` →
 /// `py_repr_obj`. Both paths look up the receiver dunder before builtin
@@ -6126,7 +6278,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, fget)) = (unsafe {
+    let Some((w_type, version_tag, w_descr, fget)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::property_get_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -6156,7 +6308,12 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_obj),
     ];
     let fget_const = ctx.trace_ctx.const_ref(fget as i64);
-    try_walker_inline_resolved_user_call(
+    // Everything below emits, and the callee inline has decline paths of its
+    // own past this point, so keep a rewind point the way the type-call fold
+    // does.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    walker_pin_property_accessor(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
+    let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -6186,7 +6343,227 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         // read (same allowance the exception `__str__`/`__repr__` override uses).
         false,
         None,
-    )
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
+}
+
+/// Inline the receiver type's `__getattr__` hook for an attribute the type and
+/// the instance both lack — the miss twin of [`try_walker_inline_property_get`].
+///
+/// `descroperation.py:242-245` reaches the hook only after the descriptor
+/// protocol has raised, so pyre runs the whole `object_getattr_miss` walk (the
+/// `__dict__` / `__doc__` / `__class__` special names, the metaclass loops, the
+/// terminal miss) and then a fresh interpreter frame for the hook, on every
+/// access, behind one opaque `CALL_MAY_FORCE`. PyPy traces through all of it,
+/// so the miss const-folds and only the hook body is left.
+/// [`getattr_hook_fast_path`](pyre_interpreter::objspace::std::mapdict::getattr_hook_fast_path)
+/// is the oracle for that fold: the version-tag and map pins it asks for are
+/// what make the miss a compile-time answer.
+///
+/// All three spellings `get_and_call_function` binds are folded, because the
+/// version-tag pin makes the binding decision itself constant: a plain
+/// `Function` takes `funccall(w_obj, w_name)`, a `classmethod` is entered with
+/// the class the descriptor would bind, and a `staticmethod` with the name
+/// alone. A custom-descriptor hook stays on the residual.
+///
+/// The name argument is an interned immortal block rather than the fresh
+/// `w_str_new` the residual path allocates per access, which is the shape
+/// `pyopcode.py LOAD_ATTR` passes (`space.getattr(w_obj, w_name)` hands over
+/// `co_names_w[oparg]`, one object for the life of the code object).
+///
+/// A branching, raising body is admitted: a hook that raises `AttributeError`
+/// for an unknown name is the shape worth inlining, not an edge case. Same
+/// loop-header and top-frame restrictions as the sibling routes; every other
+/// shape declines to the residual (SAFE — no acceleration, unchanged
+/// semantics).
+/// The leading argument `get_and_call_function` binds ahead of the attribute
+/// name, one variant per descriptor spelling of a `__getattr__` hook.
+enum HookLeading {
+    /// Plain `Function`: `funccall(w_obj, w_name)` leads with the receiver.
+    Receiver,
+    /// `ClassMethod.__get__` leads with the class.
+    Class,
+    /// `StaticMethod.__get__` binds nothing; the name is the only argument.
+    None,
+}
+
+/// The wrapper slot a descriptor spelling of the hook unwrapped, so the fold
+/// can pin the value it read.  `function.py:673`/`:720`
+/// `_immutable_fields_ = ['w_function?']`.
+enum WrapperField {
+    ClassMethod,
+    StaticMethod,
+}
+
+impl WrapperField {
+    fn descr(&self) -> majit_ir::DescrRef {
+        match self {
+            Self::ClassMethod => crate::descr::classmethod_w_function_descr(),
+            Self::StaticMethod => crate::descr::staticmethod_w_function_descr(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, map, w_getattr)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::getattr_hook_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    // `get_and_call_function` (`descroperation.py:169-187`) leads the
+    // positionals with the receiver only for an exact `Function`; every other
+    // descriptor goes through `space.get` first and is called with the name
+    // alone.  The version-tag pin makes that binding decision a constant of the
+    // trace, so each spelling resolves to its own function and leading argument
+    // here instead of declining.
+    //
+    // The type tests are EXACT.  Upstream is explicit that they have to be
+    // ("isinstance(typ, Function) would not be correct here … because a builtin
+    // function binds differently than a normal function"), and the same holds
+    // for the two wrappers: a `classmethod` subclass overriding `__get__` binds
+    // through that override, so unwrapping `w_function` in its place calls the
+    // wrong callable.  `wrapper_field` names the slot that unwrapping read, for
+    // the guard below; the plain arm reads no field.
+    let (w_func, leading, wrapper_field) = unsafe {
+        if pyre_object::function::is_exact_classmethod(w_getattr) {
+            (
+                pyre_object::function::w_classmethod_get_func(w_getattr),
+                HookLeading::Class,
+                Some(WrapperField::ClassMethod),
+            )
+        } else if pyre_object::function::is_exact_staticmethod(w_getattr) {
+            (
+                pyre_object::function::w_staticmethod_get_func(w_getattr),
+                HookLeading::None,
+                Some(WrapperField::StaticMethod),
+            )
+        } else {
+            (w_getattr, HookLeading::Receiver, None)
+        }
+    };
+    if w_func.is_null() {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
+        return Ok(None);
+    };
+    // The name, plus the bound leading argument when the descriptor supplies
+    // one.  Any other arity is a shape the call would reject before the body
+    // runs.
+    if nparams != usize::from(!matches!(leading, HookLeading::None)) + 1 {
+        return Ok(None);
+    }
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+
+    // Everything below emits, and the callee inline has decline paths of its
+    // own past this point, so keep a rewind point the way the property twins
+    // do.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Both pins the oracle asked for, plus the layout guard its map read needs.
+    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    // The pins above make the DESCRIPTOR a constant; they say nothing about the
+    // callable inside it.  Re-initialising an installed wrapper swaps
+    // `w_function` without touching the owner type's version tag, which is the
+    // only thing those pins hold, so read the slot live and pin the value this
+    // fold unwrapped — the stand-in [`walker_guard_function_field`] already
+    // makes for a quasi-immutable field pyre's setters do not invalidate.
+    if let Some(field) = wrapper_field {
+        let wrapper = ctx.trace_ctx.const_ref(w_getattr as i64);
+        walker_guard_function_field(ctx, op.pc, wrapper, field.descr(), w_func as i64)?;
+    }
+
+    let name_obj =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
+            as pyre_object::PyObjectRef;
+    let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+    let leading_arg = match leading {
+        // The live receiver box: baking it would collapse instances that share
+        // this shape but not this identity.
+        HookLeading::Receiver => Some((obj, concrete_obj)),
+        // The class the `w_class` guard above already pinned.
+        HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
+        HookLeading::None => None,
+    };
+    // `[__getattr__, <self-placeholder>, <bound arg>?, name]`: the method-form
+    // call header the inline plumbing expects, then the positional args.
+    let mut arg_concretes = vec![ConcreteValue::Ref(w_func), ConcreteValue::Null];
+    let mut callee_args = Vec::with_capacity(2);
+    let mut callee_arg_concretes = Vec::with_capacity(2);
+    if let Some((arg, concrete)) = leading_arg {
+        arg_concretes.push(ConcreteValue::Ref(concrete));
+        callee_args.push(arg);
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+    }
+    arg_concretes.push(ConcreteValue::Ref(name_obj));
+    callee_args.push(name_const);
+    callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
+    let getattr_const = ctx.trace_ctx.const_ref(w_func as i64);
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        getattr_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_func,
+        getattr_const,
+        w_func,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        // The class and version pins are already emitted above, alongside the
+        // map pin this route additionally owes.
+        None,
+        None,
+        // The same LOAD_ATTR entry [`try_walker_inline_property_get`] admits.
+        true,
+        false,
+        None,
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
 }
 
 /// Inline a `property` setter store (`obj.value = x`) after the plain-attribute
@@ -6223,7 +6600,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, fset)) = (unsafe {
+    let Some((w_type, version_tag, w_descr, fset)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::property_set_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -6262,7 +6639,10 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_value),
     ];
     let fset_const = ctx.trace_ctx.const_ref(fset as i64);
-    try_walker_inline_resolved_user_call(
+    // Rewind point for the same reason as the getter twin.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    walker_pin_property_accessor(ctx, op.pc, w_descr, crate::descr::property_fset_descr())?;
+    let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -6291,7 +6671,12 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         true,
         false,
         None,
-    )
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
 }
 
 /// Whether a concrete object is the canonical machine-word `int` layout that
